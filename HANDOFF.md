@@ -35,7 +35,29 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): v1 preflight terminal; source aliases fixed; v2 prescribed
+### Latest checkpoint (2026-09-10): v2 client import terminal; direct entrypoint fixed; v3 prescribed
+
+V2 on `1bea1f616` passes preflight but its benchmark client fails before creating a
+campaign or starting a server: direct-file execution exposes `benchmarks/`, not
+its parent, so geometry validation cannot import `benchmarks.kernels`. Serve-child
+and audit exit1; zero model starts. Closure succeeds as terminal-failure, verifies
+359 source receipts/5,172 original files, unused cases unlaunched, GPUs released.
+All six serving caches across v1/v2 remain intact; both series are terminal.
+Raw `rmsnorm-geometry-serving-v2/closure.json`, SHA
+2b8bae9d33bcbec77982ce723c1bafcdbfe9a481ff20116473ad4fe5e96bf070.
+
+The direct-file benchmark entrypoint now adds its owned repository parent to the
+import path. CPU175 pass46.50s, including fresh subprocess tests without inherited
+PYTHONPATH: helper imports and the actual client/profile/real-manifest validation
+path pass, deliberately stopping before tokenizer/server work. Hardware discovery
+alone is replaced in the latter CPU test. No model/GPU execution or TPS claim.
+Raw `runtime-control/geometry-client-entry-cpu.xml`.
+
+NEXT after committing: NEW v3, same bounded three-case workload/failure policy at
+protocol tail and fresh caches under `rmsnorm-geometry-serving-v3/`. Freeze through
+closure. V3 not prepared/launched yet; do not reuse or launch unused v1/v2 cases.
+
+### Previous checkpoint (2026-09-10): v1 preflight terminal; source aliases fixed; v2 prescribed
 
 On `8074c504f`, v1 prepared all three copies but the first control stopped in CPU
 preflight. No server command, model start, forward, capture or GPU load occurred.

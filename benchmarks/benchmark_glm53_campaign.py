@@ -28,6 +28,11 @@ from pathlib import Path
 
 os.environ["VLLM_LOGGING_STREAM"] = "ext://sys.stderr"
 
+# Direct script execution puts only benchmarks/ on sys.path. Opt-in profile
+# validators also import benchmarks.kernels from this owned source checkout.
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from benchmark_dsv4_exact import exact_prompts, get_tokenizer
 
 from slimserve import hardware, registry

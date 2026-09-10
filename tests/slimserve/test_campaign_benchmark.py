@@ -4,6 +4,9 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -19,6 +22,32 @@ def _load(monkeypatch):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def test_direct_script_can_import_owned_kernel_helpers_without_pythonpath(tmp_path):
+    root = Path(__file__).resolve().parents[2]
+    helper = root / "benchmarks/kernels/check_glm53_attention_norms.py"
+    code = f"""
+import importlib.util, runpy, sys
+assert importlib.util.find_spec('benchmarks') is None
+sys.path.insert(0, {str(root / "benchmarks")!r})
+runpy.run_path({str(root / "benchmarks/benchmark_glm53_campaign.py")!r})
+from benchmarks.kernels import check_glm53_attention_norms
+assert check_glm53_attention_norms.__file__ == {str(helper)!r}
+print('direct-script-helper-import-passed')
+"""
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES="", PYTHONDONTWRITEBYTECODE="1")
+    env.pop("PYTHONPATH", None)
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "direct-script-helper-import-passed" in result.stdout
 
 
 @pytest.mark.parametrize(

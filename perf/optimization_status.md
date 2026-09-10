@@ -27104,3 +27104,24 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - Raw: `perf/results/2026-09-10/runtime-control/geometry-serving-v1-preflight-closure.json`,
   SHA c27e14186c71626478a923c9daa225cb0d4f53073f447acf5d02e5d26a2ecdba;
   `geometry-source-alias-cpu.xml`; original failed `rmsnorm-geometry-serving-v1/closure.json`.
+
+## 2026-09-10 - Geometry v2 catches direct-client import gap before model startup
+
+- Status: v2 terminal; direct-file bootstrap fixed and CPU-tested; v3 prescribed.
+- Baseline/hypothesis: the real direct-file benchmark entrypoint must import the
+  opt-in geometry helpers without relying on pytest/current-directory path setup.
+- Result on1bea1f616: v2 preparation/preflight pass. Benchmark client raises
+  `No module named benchmarks` in geometry plan validation before any campaign
+  directory/server creation. Serve-child and independent audit exit1; zero model
+  starts, forwards or GPU loads. No TPS/quality data collected or excluded.
+- Closure: terminal-failure;359 frozen receipts/5172 original files unchanged,
+  unused cases unlaunched, GPUs released. All six v1/v2 private copies retained.
+- Fix: direct-file bootstrap adds the owned repo parent to sys.path. CPU175 pass
+  46.50s includes independent-process helper imports and actual client/profile/
+  real-manifest validation without inherited PYTHONPATH; deliberate stop before
+  tokenizer/server work, hardware discovery replaced. No kernel/native/default change.
+- Decision: commit and NEW v3 identical three-case causal protocol/new copies,
+  source-frozen through closure. V1/V2 stay terminal; no retries/quality promotion.
+- Raw: `rmsnorm-geometry-serving-v2/closure.json` under2026-09-10, SHA
+  2b8bae9d33bcbec77982ce723c1bafcdbfe9a481ff20116473ad4fe5e96bf070;
+  `runtime-control/geometry-client-entry-cpu.xml`.

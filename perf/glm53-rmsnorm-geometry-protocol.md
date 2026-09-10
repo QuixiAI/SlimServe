@@ -10,7 +10,8 @@ inventory's graph/helper classification; v5 stops at post-compile call identity.
 No-weights AOT v6 now PASSES all eight loads/audits and final comparison; its
 commands are historical. The opt-in serving integration and workload controller
 are CPU-tested. Full-model v1 stopped during CPU preflight with zero model starts;
-the source-alias fix and NEW v2 prescription are at the tail.
+v2 then stops at a client import before any model start. The direct-entrypoint fix
+and NEW v3 prescription are at the tail.
 
 ## Question and fixed factors
 
@@ -777,7 +778,7 @@ Whole reference response hashes match their historical audits. Raw reports under
 This series answers a bounded causal question, not broader indexer correctness or
 the optimization campaign's remaining performance objective.
 
-## V1 terminal CPU preflight; canonical source aliases; NEW v2
+## V1 terminal CPU preflight; canonical source aliases; historical v2 (terminal)
 
 On8074c504f v1 prepares three copies, then the first control preflight rejects nine
 qualified source keys that the preparer canonicalized: seven virtualenv files and
@@ -832,3 +833,30 @@ systemd-run --user --scope --unit=glm53-geometry-serving-v2-close -p MemoryMax=8
 
 No retries, replacement starts, threshold changes or production promotion. V1 and
 all prior failed sequences stay terminal. Completed no-weights v6 stays completed.
+
+## V2 terminal client import; direct-file entrypoint fixed; NEW v3
+
+On1bea1f616, preparation/preflight pass; benchmark client fails at geometry plan
+validation with `No module named benchmarks`, before creating a campaign or server.
+Direct-file execution includes only the benchmarks directory in sys.path, while
+the opt-in validator imports repository-qualified helpers. Serve-child/audit exit1,
+zero model starts. Closure is terminal-failure,359 sources/5172 originals unchanged,
+unused cases unlaunched, GPUs released. All six v1/v2 serving copies retained.
+Raw v2 closure SHA2b8bae9d33bcbec77982ce723c1bafcdbfe9a481ff20116473ad4fe5e96bf070.
+V1/V2 terminal; freeze released. No quality/default/native/quant/performance change.
+
+Benchmark direct-file bootstrap now adds its repository parent. CPU175 pass46.50s
+includes two separate-process entrypoint probes without inherited PYTHONPATH.
+The actual client/profile/real-manifest validation reaches the deliberate stop
+before tokenizer/server work; only hardware discovery is replaced. No weights,
+GPU loads, model starts or TPS. Raw `runtime-control/geometry-client-entry-cpu.xml`.
+
+Commit the fix/protocol, then NEW v3 with the identical v1 workload, quality versus
+diagnostic distinction, ordered control/geometry/return-control and failure policy.
+Use the v2 commands immediately above, replacing `v2` with `v3` in BOTH every unit
+name and every series path. Root is exactly
+`perf/results/2026-09-10/rmsnorm-geometry-serving-v3/`. One preparation, one attempt
+per label conditional on all prior audits/release, and one terminal closure.
+Fresh copies, serving150GiB/controller+audit8GiB/swap0; one GPU workload and no
+source edits/builds through closure. No retries or unused v1/v2 attempts. No
+production promotion, threshold changes or performance eligibility from this test.

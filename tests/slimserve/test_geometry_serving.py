@@ -691,3 +691,48 @@ def test_real_prepared_manifest_roundtrip_with_current_source_freeze(
         )
         actual, checked = policy.read_manifest()
         assert actual == data and checked == path
+
+    # Reproduce the actual direct-file client entrypoint in a separate Python
+    # process with no inherited repository path. Stop after real profile/manifest
+    # validation but BEFORE tokenizer/model/server work. Hardware discovery alone
+    # is replaced, so this remains CPU-only on machines without the target GPUs.
+    from benchmarks.kernels.glm53_geometry_workload import command
+    from benchmarks.kernels.run_glm53_geometry_serving import environment
+
+    path = Path(runs[0]["manifest"])
+    data = json.loads(path.read_text())
+    argv = command(path, data)
+    code = f"""
+import os, runpy, sys
+from types import SimpleNamespace
+sys.path = [p for p in sys.path if p and p != {str(ROOT)!r}]
+sys.path.insert(0, {str(ROOT / "benchmarks")!r})
+ns = runpy.run_path({argv[0]!r})
+os.chdir({str(ROOT)!r})
+main = ns['main']
+g = main.__globals__
+g['hardware'].detect = lambda: SimpleNamespace(platform='rtx6000', count=4)
+g['compatible_profile_ids'] = lambda _: ['glm53-nvfp4-4']
+class Validated(Exception): pass
+def before_tokenizer(*args): raise Validated()
+g['get_tokenizer'] = before_tokenizer
+sys.argv = {argv!r}
+try:
+    main()
+except Validated:
+    print('real-client-profile-validated-without-model-start')
+else:
+    raise AssertionError('client did not reach validation boundary')
+"""
+    env = environment(path, data, cpu=True)
+    env.pop("PYTHONPATH", None)
+    result = subprocess.run(
+        [str(ROOT / ".venv/bin/python"), "-c", code],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "real-client-profile-validated-without-model-start" in result.stdout
