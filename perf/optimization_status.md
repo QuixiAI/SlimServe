@@ -27625,3 +27625,23 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   `indexer-cancellation-cpu-v1.xml` under2026-09-10. Analysis SHA
   3474f6692e98b1be257174827dd5387d8d08dedadd647f8c2935a0a18ec25a24.
   Commands and limits: `perf/glm53-attention-isolation.md`.
+
+## 2026-09-10 - Isolated indexer correction ready for prescribed GPU probe
+
+- Status: CPU-qualified diagnostic; GPU qualification pending.
+- Baseline/hypothesis: original rank-specific attention bundles retain failed
+  indexer oracle. Fixed2^-12 output/bias cancellation detection should permit
+  selective FP64 recomputation while preserving every unselected/sibling value.
+- Change: opt-in one-warp Triton correction after original bundle, guarded uint8
+  selection receipts, packed-input/output layout validation. No serving hook.
+  Separate fresh source freeze from completed evidence; no old frozen reader.
+- Correctness: 95 CPU tests pass/5.13s (initial5.15s). Actual preparation, JIT import/ABI/stream/
+  layout checks and independent output/selection/oracle tests; no GPU claim.
+- Decision: commit then run exactly120 all-rank cases/two phases with original
+  hashes, changed/restored graph replay, mutation/stride guards and unchanged
+  one-BF16-ULP gate. Timing only after all pass: fixed rank0 row matrix, three
+  paired repetitions,32-call graphs. Stop/audit first failure, no retry.
+- Limits: no model/TPS/native build/default/quant change. Historical oracle
+  remains failed; model-quality validation is separate. CPU8GiB/GPU16GiB, swap0.
+- Raw CPU: `runtime-control/indexer-correction-cpu-{v1,final}.xml` under2026-09-10.
+  Full prospective commands: `perf/glm53-indexer-correction-protocol.md`.

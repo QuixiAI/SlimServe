@@ -35,7 +35,26 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): cancellation detector CPU screen complete
+### Latest checkpoint (2026-09-10): isolated indexer correction CPU-qualified
+
+Opt-in probe only: `benchmarks/kernels/glm53_indexer_correction.py` and
+`check_glm53_indexer_correction.py`. Original compiled combo remains first;
+one-warp correction uses actual BF16 output/bias at fixed2^-12, recomputes only
+flagged rows in FP64 through affine, and stores only flagged indexer elements.
+Guarded selection flags expose actual detector coverage. No serving hook/default.
+
+CPU95 tests pass/5.13s (initial5.15s), including actual source preparation, GPU-inert imports,
+ABI/layout/stream order, unchanged oracle and independent detector/neighbor gates.
+GPU numerical/replay/guard/timing validation is still pending, not implied by CPU.
+
+NEXT after commit: one preparation, one sequential all-rank GPU process, one
+terminal audit as prescribed in `perf/glm53-indexer-correction-protocol.md`.
+120 cases/two input phases; only after all pass, rank0 fixed3-repeat graph
+timings for rows1/16/640/7616. CPU8GiB/GPU16GiB, swap0. Freeze sources from
+preparation through audit; no retry/replacement or model launch. Original GPU
+oracle remains historically failed; full model quality remains a separate gate.
+
+### Previous checkpoint (2026-09-10): cancellation detector CPU screen complete
 
 The three thresholds prescribed before this CPU screen (2^-16, 2^-12, 2^-8)
 all detect the 12 original and 14 split retained GPU failing scalars, plus all
