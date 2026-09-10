@@ -171,6 +171,9 @@ if TYPE_CHECKING:
     VLLM_DP_RANK: int = 0
     VLLM_DP_RANK_LOCAL: int = -1
     VLLM_DP_SIZE: int = 1
+    VLLM_DP_PREFIX_AFFINITY: bool = True
+    VLLM_DP_PREFIX_AFFINITY_LOAD_TOKENS: int = 2048
+    VLLM_DP_PREFIX_AFFINITY_BLOCKS: int = 262144
     VLLM_USE_STANDALONE_COMPILE: bool = True
     VLLM_ENABLE_PREGRAD_PASSES: bool = True
     VLLM_USE_BREAKABLE_CUDAGRAPH: bool = False
@@ -1401,6 +1404,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # In some system, find_loaded_library() may not work. So we allow users to
     # specify the path through environment variable VLLM_CUDART_SO_PATH.
     "VLLM_CUDART_SO_PATH": lambda: os.getenv("VLLM_CUDART_SO_PATH", None),
+    # DP load balancer: route a request to the replica that already holds
+    # its prompt prefix (approximate per-replica block memory), charging
+    # LOAD_TOKENS of prefill per unit of the replica's load score;
+    # BLOCKS bounds the per-replica memory.
+    "VLLM_DP_PREFIX_AFFINITY": lambda: bool(
+        int(os.getenv("VLLM_DP_PREFIX_AFFINITY", "1"))
+    ),
+    "VLLM_DP_PREFIX_AFFINITY_LOAD_TOKENS": lambda: int(
+        os.getenv("VLLM_DP_PREFIX_AFFINITY_LOAD_TOKENS", "2048")
+    ),
+    "VLLM_DP_PREFIX_AFFINITY_BLOCKS": lambda: int(
+        os.getenv("VLLM_DP_PREFIX_AFFINITY_BLOCKS", "262144")
+    ),
     # Rank of the process in the data parallel setting
     "VLLM_DP_RANK": lambda: int(os.getenv("VLLM_DP_RANK", "0")),
     # Rank of the process in the data parallel setting.
