@@ -26475,7 +26475,8 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - Audit:30 sources,24 benchmark receipts,7 native libraries,5172 original files,
   36 post-capture graphs/132 bindings/68 reductions and cubin bytes verify.
   Existing bindings/reductions unchanged across capture; one pointwise-only graph
-  per rank added.16 norm bindings of widths512/2048 need additional qualification.
+  per rank added.16 norm bindings of actual widths512/1536 need additional qualification.
+  Correction2026-09-10:2048 is the rounded compiler hint, not the logical Q width.
 - Checker corrections: expected env omitted vLLM import defaults COMPILE_THREADS1/
   CACHE_AUTOTUNING1; prescribed audit failure retained. Supplemental initially
   assumed whole snapshots identical, then incorrectly inferred Triton from source
@@ -26484,7 +26485,7 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   auditor now takes an explicit bounded root and includes the environment defaults.
   No numerical gates changed, no GPU reruns to repair audit tooling.
 - Decision: isolate new score-vector difference before further serving. Qualify
-  exact512/2048 shapes; compare all reduction choices, disabled combo fusion and
+  exact512/1536 shapes; compare all reduction choices, disabled combo fusion and
   fresh KDA autotuning separately. Their causal roles are unproven. Existing old/
   native four-RMSNorm sufficiency does not explain this new difference by itself.
   No next GPU job prescribed, no default or TC change, no policy promotion.
@@ -26494,3 +26495,34 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   Original failed audit and three supplemental audit logs/scripts preserved.
 - Final audit-only regression suite:129pass19.05s, lint/diff checks pass; raw
   `runtime-control/no-combo-audit-corrections-cpu.log`. No serving restart.
+
+## 2026-09-10 - Correct attention norm extents and isolate combo/split arithmetic
+
+- Status: source inventory complete; fixed GPU kernel comparison prescribed.
+- Scope: selected GLM53 recipe/SM120; no serving code/default/native changes.
+- Baseline: historical control's combo source and failed fresh no-combo graph
+  sources, with recorded selected configs. Historical combo callbacks are NOT
+  complete graph-held coverage. The full-model failed series remains terminal.
+- Correction: Q width1536, not its rounded2048 hint; KV512 and indexer LayerNorm128
+  share input stride2336 at offsets0/1536/2048. Indexer output stride256 has an
+  untouched128-element gap. Both old/new norms retain FP32 intermediate math,
+  as do inspected4096 sources; a new intermediate BF16-rounding difference is
+  NOT established. Inductor's default compute upcasting explains the source.
+- Hypothesis: combo separation/launch choices may change attention norm outputs;
+  compare directly before another model start. Broader4096 geometry changes and
+  fresh KDA autotuning remain distinct unproven model-score confounders.
+- Change: isolated source-exact probe, real layer11 weights,120 prescribed pairs
+  across4 ranks/5 row counts/2 seeds/3 magnitudes. Original/changed-input eager
+  and graph replay, guard/mutation checks, FP64 <=1 BF16 ULP gates for all3 norms.
+  No timed tuning, no source substitution, actual cubin bytes required for both
+  arms. Protocol tail contains final prepare and ONE GPU command after commit.
+- CPU inventory:16 target sources and5172 original files verify. Identical4096
+  body hashes also occur with differing launch configs; matches are many-to-many
+  and do not supply runtime-site correspondence. No GPU or throughput result yet.
+- Raw: `perf/results/2026-09-10/runtime-control/attention-norm-discovery-manifest.json`,
+  SHA512ce4252c6c25ce3d762539a995e2846b012c118640966df42066e3ceec0bf7;
+  `attention-norm-discovery.log`, `attention-norm-regression.log`.
+- Final CPU regression:194 passed16.95s (14 existing Torch deprecation warnings),
+  lint/diff checks pass. Includes audit rejection tests for incomplete matrices,
+  incorrect extents/verdicts and inconsistent output hashes. Log:
+  `runtime-control/attention-norm-final-regression.log`. GPU probe still pending.

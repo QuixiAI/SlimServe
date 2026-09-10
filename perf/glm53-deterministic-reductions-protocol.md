@@ -408,14 +408,16 @@ also corrected without changing the running model or its results:
   Supplemental audit checks exact keys/metadata/cubin bytes at the recorded
   private root. Its failed sibling-assumption script/log are preserved. Tracked
   checker now requires an explicit Triton root, with no search/fallback.
-- Model graph inventory has512- and2048-wide norms as well as4096. Sixteen
+- Model graph inventory has512- and1536-wide norms as well as4096. Sixteen
   bindings need additional shape qualification. Do not force the4096 launch
   geometry on them or silently clear their oracle gate.
 
 Supplemental audit verifies30 sources,24 benchmark receipts,7 native libraries,
 5172 original files,36 post-capture graphs/132 bindings/68 reductions. Raw actual
 source filenames, configurations and cubin digests are recorded, including512
-persistent XBLOCK2/one warp and2048 XBLOCK2/RBLOCK1024/eight warps (one stage).
+persistent XBLOCK2/one warp and1536 XBLOCK2/RBLOCK1024/eight warps (one stage).
+Correction2026-09-10:the2048 value in the original inventory was a rounded
+compiler size hint. The Q norm's logical extent and output stride are1536.
 The numerical acceptance failure is independently established and does not
 depend on accepting these smaller norms as qualified.
 
@@ -433,3 +435,74 @@ not established explanations. The completed four-RMSNorm old/native causal resul
 does not attribute THIS fresh-policy difference. Do not widen the quality gate,
 restart into a good score, promote the policy, or exonerate TC. Subsequent GPU
 work needs a newly recorded bounded protocol; existing series remain stopped.
+
+## Source-exact attention combo/split comparison (2026-09-10)
+
+No serving starts prescribed. Both stopped full-model series remain terminal.
+CPU inspection establishes actual Q1536/KV512 and indexer LayerNorm128 shapes.
+The original combo and new split sources both keep intermediate arithmetic FP32
+until final BF16 stores, including the inspected4096 RMSNorm bodies. Native IR
+includes a weight-dtype cast, but default Inductor compute-type upcasting elides
+it; do not impose eager BF16 intermediate rounding on this compiled oracle.
+Do not flip emulate_precision_casts or any serving numerical setting here.
+
+ONE new kernel process, no restarts or tuning. Four rank-matched SM120 devices,
+serialized work. Exactly120 combo/split pairs:4 ranks x rows1/3/16/640/7616 x
+seeds530901/530902 x magnitudes0.125/1/8. Changed seed=seed+100. Four real BF16
+layer11 weights:kv_a_layernorm, q_a_layernorm, indexer.k_norm weight/bias.
+Packed input stride2336; offsets1536/0/2048 for512/1536/128, output strides
+512/1536/256. Preserve the LayerNorm output gap and all surrounding guards.
+
+Use all16 exact source files and the saved configurations. Compile those configs
+only via the existing source-exact probe mechanism, no autotune/benchmark calls.
+Require original cache keys AND actual cubin-byte hashes for BOTH arms. This is
+not another test of automatic deterministic-policy selection or frontend codegen.
+Historical combo evidence is static-future callbacks, not complete graph-held
+coverage; synthetic inputs do not establish model-causality or cross-start safety.
+
+Gates: exact eager repeat and original/changed-input graph replay, immutable
+packed input and weight vectors, intact output row/gap guards. Each norm output
+must be within1 BF16 ULP of the independently computed FP64 reference with one
+final BF16 rounding. LayerNorm uses centered population variance+1e-6; RMSNorm
+uses mean square+1e-5. Record all1440 oracle-output comparisons and720 pairwise
+output comparisons. Pairwise exactness is an observation, not a prerequisite.
+Finish the predetermined matrix on numerical mismatches and exit failed with
+all output hashes/metrics preserved; stop immediately on launch/guard/receipt failures.
+Never widen gates or rerun this output to turn a failed probe into a pass.
+
+CPU discovery (working tree, no GPU) already verifies the inputs at
+`runtime-control/attention-norm-discovery-manifest.json`, SHA
+512ce4252c6c25ce3d762539a995e2846b012c118640966df42066e3ceec0bf7.
+It also inventories identical4096 source bodies with differing configurations;
+these matches are many-to-many, not runtime-site mapping or causal attribution.
+
+After commit, prepare the final manifest in an8GiB/no-swap scope:
+
+```bash
+systemd-run --user --scope --unit=glm53-attention-norm-prepare \
+  -p MemoryMax=8G -p MemorySwapMax=0 \
+  env PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 .venv/bin/python \
+  -m benchmarks.kernels.check_glm53_attention_norms --prepare \
+  --manifest perf/results/2026-09-10/runtime-control/attention-norm-manifest.json
+```
+
+Then exactly once:
+
+```bash
+systemd-run --user --scope --unit=glm53-attention-norm-probe \
+  -p MemoryMax=16G -p MemorySwapMax=0 \
+  env -u CUDA_LAUNCH_BLOCKING CUDA_VISIBLE_DEVICES=0,1,2,3 \
+  CUDA_HOME=/usr/local/cuda-13.0 OMP_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1 \
+  .venv/bin/python -m benchmarks.kernels.check_glm53_attention_norms \
+  --manifest perf/results/2026-09-10/runtime-control/attention-norm-manifest.json \
+  --output perf/results/2026-09-10/attention-norm-source-probe
+```
+
+Preserve scope stdout/stderr with pipefail/tee under runtime-control. Freeze
+sources/native binaries from final preparation through process exit and8GiB
+offline audit (same module/manifest/output with `--audit`, scope
+`glm53-attention-norm-audit`, MemoryMax=8G/MemorySwapMax=0).
+Audit counts, all metrics/hashes, before/after original5172-file
+inventory, compiler/helper/native source receipts, and final independent GPU
+release. Do not promote the deterministic policy, TC, or a performance baseline
+from this test. No subsequent GPU work is prescribed here.

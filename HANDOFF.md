@@ -35,7 +35,36 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): real workload completes; no-combo policy fails quality gate
+### Latest checkpoint (2026-09-10): source-exact attention comparison prepared
+
+The full-model no-combo series below remains STOPPED. New work is an isolated
+kernel diagnostic, not another serving start. Logical Q/KV widths are1536/512;
+the earlier2048 label confused a rounded compiler hint with the Q extent.
+Both historical combo and new split kernels retain FP32 arithmetic until final
+BF16 stores. The inspected4096 bodies do too; no new intermediate-rounding
+regression is established. This is consistent with Inductor's default
+codegen_upcast_to_fp32 and emulate_precision_casts=False.
+
+Historical attention combo includes KV512, Q1536, AND indexer LayerNorm128,
+all reading packed stride2336 at offsets1536/0/2048. The LayerNorm output has
+stride256 with a128-element gap. Old combo uses XBLOCK2/RBLOCK1024/eight warps;
+split KV uses XBLOCK2/one warp, Q2/1024/eight, LayerNorm8/two. All one stage.
+Old coverage is static-future callback evidence, NOT a complete graph inventory
+for these combo bindings. New split sources have actual graph-held receipts.
+
+`benchmarks/kernels/check_glm53_attention_norms.py` preserves exact source bytes
+and selected configs/cubin bytes, uses real layer11 weights, and tests one fixed
+120-pair matrix across all four ranks. CPU discovery verifies16 target sources,
+5172 original files, and the reference receipts. Also finds identical4096 bodies
+with different old/new launch configs (many-to-many body matches, NOT one-to-one
+model-site correspondence); broader4096 choices remain a separate confounder.
+
+NEXT: after commit, final manifest preparation then ONE16GiB/no-swap probe and
+8GiB audit, commands/gates at protocol tail. Freeze sources/native through audit.
+No model job, performance claim, default change, or retry prescribed. The CPU
+discovery manifest is not the final frozen manifest. Goal ongoing.
+
+### Previous checkpoint (2026-09-10): real workload completes; no-combo policy fails quality gate
 
 The no-combo series is now TERMINAL after its ONE fresh-a on59ae0c88f. Do NOT
 launch fresh-b/cached-a. Unlike the prior compiler failure, this profile reaches
@@ -61,9 +90,10 @@ Supplemental audit on frozen sources verifies30 source receipts,24 benchmark
 receipts,7 native libraries,5172 original files,36 graph modules/132 bindings/
 68 reductions and actual metadata/cubin bytes. Reductions unchanged across
 capture; one additional pointwise-only graph per rank appears during capture.
-16 norm bindings have widths512/2048, outside the original4096 geometry probe.
+16 norm bindings have actual widths512/1536, outside the original4096 geometry probe.
+Correction2026-09-10:2048 was the rounded size hint, NOT the Q norm width.
 512: persistent XBLOCK2/one warp/one stage, cache keyATT5PLJ...;
-2048: XBLOCK2/RBLOCK1024/eight warps/one stage, keyULYNKQF....
+1536 (hint2048): XBLOCK2/RBLOCK1024/eight warps/one stage, keyULYNKQF....
 Their exact source paths/configs/binaries are in the supplemental audit.
 
 Original prescribed audit failed first on an ENVIRONMENT CHECKER BUG: new
@@ -83,7 +113,7 @@ SHAeb333fb93c2ac28218d46ca7799d95ce2378f73ebc0ccfe5d49138b6e2530c87.
 The original failed audit remains at `deterministic-no-combo-serving/fresh-a-analysis.json`.
 
 NEXT: isolate the score change before new serving starts. Inspect the exact512/
-2048 norm sources/configs and other emitted reductions against actual historical
+1536 norm sources/configs and other emitted reductions against actual historical
 graph bindings; qualify newly covered shapes with the existing oracle contract.
 Separately assess disabled combo fusion and fresh-cache KDA autotune choices as
 confounders. Their causal roles are UNPROVEN. The older four-RMSNorm sufficiency
