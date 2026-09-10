@@ -35,7 +35,34 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10 00:07 UTC): fresh compilation exposes timed-combo conflict
+### Latest checkpoint (2026-09-10): no-combo frontend passes; NEW serving series prescribed
+
+Corrected-policy frontend on532c62674 completes12/12, including independent
+unequal-size pointwise branches. Original eight cases (outputs AND oracle metrics)
+exactly match the first frontend.6 graphs/9 bindings/6 reductions, identical
+before/after capture, qualified1/1024/eight-warps/one-stage choices, cubin bytes
+verified, FP64 maximum1 BF16 ULP.10 sources/7 native libraries/5172 original
+files unchanged; GPU-free. Not a TP4/model-forward result.
+`perf/results/2026-09-10/runtime-control/no-combo-frontend-analysis.json`,
+SHA6facb3efedd788e3dc527fd3687d09ddefd61096a528d8cc876c8b55e313a6f9.
+
+Serving auditor now targets NEW
+`perf/results/2026-09-10/deterministic-no-combo-serving/`, three explicit compiler
+options (deterministic=True/combo_kernels=False/benchmark_combo_kernel=False).
+Source-bound binary lookup handles vLLM's AOT indirection: compiler_interface
+overrides the launch TRITON_CACHE_DIR with a sibling triton_cache of the actual
+inductor_cache. No unrelated-cache search or file substitution. CPU127pass and
+real-artifact replay pass. No serving numerical or native changes in this step.
+
+NEXT: prepare once, then fresh-a/fresh-b/cached-a, exactly one start each, using
+the NEW root and no-combo scope names. Per-arm8GiB preflight/audit,150GiB serving,
+swap0. Full cold1000/300 c1/c8/c16x3, text/image, qualityx3,32K/128K prefill.
+Freeze through ALL starts/audits, no retries/edits/builds/commits; stop on failure.
+Commands and unchanged quality gates are at the protocol tail. None of this NEW
+series launched at this checkpoint. OLD series remains terminal after compile
+failure; never launch its unused arms. No default, TC or speed promotion.
+
+### Previous checkpoint (2026-09-10 00:07 UTC): fresh compilation exposes timed-combo conflict
 
 The first full-model deterministic series on7d43c93af is TERMINAL after fresh-a
 fails BEFORE health/capture/requests. Do not launch its fresh-b/cached-a arms.

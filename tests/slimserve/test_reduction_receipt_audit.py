@@ -8,6 +8,7 @@ import pytest
 
 from benchmarks.analyze_glm53_reduction_receipts import (
     audit_receipt,
+    binary_cache_directory,
     declared_symbols,
     reduction_metadata,
 )
@@ -22,7 +23,8 @@ def receipt(tmp_path):
         f"{name} = async_compile.triton('kernel', 'source')\n"
         f"def call(args):\n    {name}.run(*args)\n"
     )
-    source = tmp_path / "kernel.py"
+    source = tmp_path / "inductor/aa/kernel.py"
+    source.parent.mkdir(parents=True)
     metadata = dict(
         kernel_name=name,
         num_reduction=1,
@@ -158,3 +160,13 @@ def test_metadata_does_not_execute_generated_source():
             "@decorator(inductor_meta={'deterministic': forbidden()})\n"
             "def kernel(): pass"
         )
+
+
+def test_vllm_redirected_cache_is_resolved_from_actual_source(tmp_path):
+    namespace = tmp_path / "torch_compile_cache/torch_aot_compile/key"
+    source = namespace / "inductor_cache/aa/kernel.py"
+    assert binary_cache_directory(source, tmp_path) == namespace / "triton_cache"
+    with pytest.raises(ValueError, match="unrecognized"):
+        binary_cache_directory(tmp_path / "unknown/kernel.py", tmp_path)
+    with pytest.raises(ValueError, match="outside"):
+        binary_cache_directory(tmp_path.parent / "inductor/aa/kernel.py", tmp_path)

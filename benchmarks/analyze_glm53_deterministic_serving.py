@@ -27,7 +27,7 @@ from benchmarks.benchmark_glm53_prefill import summarize_response
 
 ROOT = Path(__file__).resolve().parents[1]
 BASE = ROOT / "perf/results/2026-09-09"
-SERIES = BASE / "deterministic-reduction-serving"
+SERIES = ROOT / "perf/results/2026-09-10/deterministic-no-combo-serving"
 ARMS = ("fresh-a", "fresh-b", "cached-a")
 PROMPT = Path("/home/tiny/.local/scratch/slimserve-glm53/prompt-source.txt")
 
@@ -54,10 +54,10 @@ def prepare():
     require(not SERIES.exists(), "new series directory required")
     require(not git("status", "--short"), "clean source required")
     original = read(BASE / "native-order-quality/summary.json")
-    frontend = BASE / "runtime-control/deterministic-reduction-frontend-analysis.json"
+    frontend = SERIES.parent / "runtime-control/no-combo-frontend-analysis.json"
     require(
         sha(frontend)
-        == "48830fce4a1fec6868f23609dd6cd8510f164e32d263f5996d5de72f2b9b815b",
+        == "6facb3efedd788e3dc527fd3687d09ddefd61096a528d8cc876c8b55e313a6f9",
         "frontend qualification changed",
     )
     sources = set(original["benchmark_implementation_sha256"]) | {
@@ -67,6 +67,8 @@ def prepare():
         "slimserve/rmsnorm_diagnostic.py",
         "benchmarks/kernels/check_glm53_cached_rmsnorm.py",
         "vllm/v1/worker/gpu_model_runner.py",
+        "vllm/config/compilation.py",
+        "vllm/compilation/compiler_interface.py",
         "benchmarks/analyze_glm53_deterministic_serving.py",
         "benchmarks/analyze_glm53_reduction_receipts.py",
         "benchmarks/analyze_glm53_quality_pair.py",
@@ -94,8 +96,16 @@ def prepare():
         original_manifest=str(cache_manifest),
         original_manifest_sha256=sha(cache_manifest),
         heuristic_sha256=read(
-            read(BASE / "deterministic-reduction-frontend/summary.json")["receipt"]
+            read(
+                SERIES.parent / "deterministic-reduction-no-combo-frontend/summary.json"
+            )["receipt"]
         )["heuristic_source_sha256"],
+        compiler_options={
+            "deterministic": True,
+            "combo_kernels": False,
+            "benchmark_combo_kernel": False,
+        },
+        frontend_audit_sha256=sha(frontend),
         caches={name: snapshot(SERIES / name) for name in ("cache-a", "cache-b")},
         arms=list(ARMS),
     )
@@ -396,9 +406,9 @@ def audit(arm, result):
         summary["source_sha256"] == manifest["source_sha256"], "wrong prompt source"
     )
     plan = copy.deepcopy(original["plan"])
-    plan["engine"]["compilation_config"]["inductor_compile_config"] = {
-        "deterministic": True
-    }
+    plan["engine"]["compilation_config"]["inductor_compile_config"] = manifest[
+        "compiler_options"
+    ]
     require(summary["plan"] == plan, "recipe/plan changed")
     cache = SERIES / ("cache-b" if arm == "fresh-b" else "cache-a")
     env = {
@@ -467,6 +477,14 @@ def audit(arm, result):
     graphs, receipts, ranks = [], [], set()
     for path in sorted(paths):
         document = read(path)
+        require(
+            document["compiler_options"]
+            == {
+                **manifest["compiler_options"],
+                "enable_auto_functionalized_v2": False,
+            },
+            "live compiler options changed",
+        )
         rank = document["rank"]
         require(rank in range(4) and rank not in ranks, "duplicate/wrong TP rank")
         ranks.add(rank)

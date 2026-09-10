@@ -64,6 +64,23 @@ def reduction_metadata(source):
     return found[0]
 
 
+def binary_cache_directory(filename, cache_root):
+    # vLLM's InductorAdaptor.initialize_cache redirects both compiler caches
+    # beneath an AOT namespace, overriding the launch environment. Resolve the
+    # sibling cache from this binding's actual emitted source, not a guessed
+    # process-global TRITON_CACHE_DIR or an unrelated cache with the same key.
+    root = Path(cache_root).resolve()
+    source = Path(filename).resolve()
+    require(source.is_relative_to(root), "source outside private cache")
+    names = {"inductor": "triton", "inductor_cache": "triton_cache"}
+    for parent in source.parents:
+        if parent == root:
+            break
+        if parent.name in names:
+            return parent.parent / names[parent.name]
+    raise ValueError("unrecognized emitted-source cache layout")
+
+
 def audit_receipt(document, *, cache_root, rank, source_sha256, heuristic_sha256):
     root = Path(cache_root).resolve()
     require(document["status"] == "complete", "incomplete graph capture")
@@ -158,7 +175,7 @@ def audit_receipt(document, *, cache_root, rank, source_sha256, heuristic_sha256
                     (config["num_warps"], config["num_stages"]) == (8, 1),
                     "unqualified RMSNorm launch",
                 )
-            folder = root / "triton" / selected["hash"]
+            folder = binary_cache_directory(row["filename"], root) / selected["hash"]
             require(
                 folder.resolve().is_relative_to(root), "binary outside private cache"
             )

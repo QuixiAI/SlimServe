@@ -296,3 +296,77 @@ completed/failed outputs. After this probe passes, adapt the serving auditor to
 the three-option policy and prescribe a NEW fresh-cache series/namespace. The
 older first-series commands above are archived, not authorization to continue
 its unused arms. No corrected-policy full-model series is prescribed yet.
+
+## No-combo frontend passes; corrected full-model series prescribed (2026-09-10)
+
+One prescribed frontend process on532c62674:12/12 cases pass. The original eight
+cases' output hashes and oracle metrics exactly match the first frontend.6 actual
+graphs/9 bindings/6 reductions, unchanged before/after capture, all norm launches
+1/1024/eight warps/one stage. FP64 maximum1 BF16 ULP; extra branches' exact CPU/
+eager/graph checks pass.10 source receipts,7 native libraries,5172 original files
+unchanged; exit0/GPU-free. Audit
+`perf/results/2026-09-10/runtime-control/no-combo-frontend-analysis.json`,
+SHA6facb3efedd788e3dc527fd3687d09ddefd61096a528d8cc876c8b55e313a6f9.
+Do not rerun this completed probe. It is still not a full-model/TP4 qualification.
+
+Auditor adapted to the explicit three-option no-combo plan and a NEW series root.
+Code inspection found InductorAdaptor.initialize_cache redirects the worker's
+Inductor/Triton directories into its AOT namespace. Binary audit now resolves
+triton_cache from the actual emitted source's sibling inductor_cache (and keeps
+the simple frontend inductor/triton layout), with private-root bounds and exact
+key/metadata/cubin checks. Never scan an unrelated cache to make a receipt pass.
+127 CPU tests pass16.04s; real frontend/timing/quality/prefill artifact replay passes.
+No serving numerical or native changes in this auditor update.
+
+Prescribe NEW series `perf/results/2026-09-10/deterministic-no-combo-serving/`:
+exactly fresh-a, fresh-b, cached-a, one start each with the same complete workload
+and unchanged per-window0.01-nat/positive-needle/exact-score/graph/source/native/
+cache/teardown gates specified above. The older series remains failed/terminal.
+The tracked auditor's default SERIES now points to this new root. Preparation
+requires the hash-bound corrected frontend audit; cached return preserves A's
+original receipt files. All failed/partial historical caches remain untouched.
+
+After committing, prepare in one8GiB/no-swap scope:
+
+```bash
+systemd-run --user --scope --unit=glm53-no-combo-prepare \
+  -p MemoryMax=8G -p MemorySwapMax=0 \
+  env PYTHONDONTWRITEBYTECODE=1 .venv/bin/python \
+  -m benchmarks.analyze_glm53_deterministic_serving prepare
+```
+
+For EACH arm, preflight in a separate8GiB/no-swap scope with:
+`.venv/bin/python -m benchmarks.analyze_glm53_deterministic_serving fresh-a --preflight`
+(substitute the arm; use scope glm53-no-combo-preflight-<arm>). It verifies source
+freeze, empty/private cached-return state, previous audit success and GPU idleness.
+Then launch fresh-a below, preserving stdout/stderr and pipefail through tee:
+
+```bash
+GLM53_SERIES_ROOT=/home/tiny/Lazarus/SlimServe/perf/results/2026-09-10/deterministic-no-combo-serving
+systemd-run --user --scope --unit=glm53-no-combo-fresh-a \
+  -p MemoryMax=150G -p MemorySwapMax=0 \
+  env -u NCCL_P2P_DISABLE -u CUDA_LAUNCH_BLOCKING \
+  CUDA_VISIBLE_DEVICES=0,1,2,3 CUDA_HOME=/usr/local/cuda-13.0 \
+  OMP_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1 SLIMSERVE_CACHE=/raid/weights \
+  VLLM_GLM5_MHC_BF16_FN=1 VLLM_GLM5_MHC_PREFILL_TC=0 \
+  SLIMSERVE_GLM53_NATIVE_ORDER=1 \
+  VLLM_CACHE_ROOT="$GLM53_SERIES_ROOT/cache-a" \
+  TORCHINDUCTOR_CACHE_DIR="$GLM53_SERIES_ROOT/cache-a/inductor" \
+  TRITON_CACHE_DIR="$GLM53_SERIES_ROOT/cache-a/triton" \
+  .venv/bin/python benchmarks/benchmark_glm53_campaign.py \
+  --source /home/tiny/.local/scratch/slimserve-glm53/prompt-source.txt \
+  --output "$GLM53_SERIES_ROOT/fresh-a" \
+  --boots 1 --repeats 3 --concurrency 1 8 16 \
+  --input-tokens 1000 --output-tokens 300 --cold-prefix \
+  --quality --quality-repeats 3 --prefill --deterministic-reductions
+```
+
+After exit/GPU release run an8GiB/no-swap audit scope, command:
+`.venv/bin/python -m benchmarks.analyze_glm53_deterministic_serving fresh-a`.
+Only if complete, proceed to fresh-b with its own output/scope and cache-b paths;
+then cached-a with its own output/scope and the EXISTING cache-a paths. Use the
+same workload/flags. No forced AOT loading and no seeded caches. Native-order
+remains diagnostic/defaultOFF; TC0. Keep sources/native frozen through all three
+jobs and audits; no intervening edits/commits/builds or other GPU work. Stop on
+any failed gate; retain every failed/slow start and all warnings, no replacements.
+No performance or default promotion from these diagnostics alone.

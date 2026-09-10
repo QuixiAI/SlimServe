@@ -26422,3 +26422,30 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   SHA67602718eeb3c8019bac83056b1b5c97f6a2e9b174b966f66d20064e4039456f.
   Corrected-policy CPU log `runtime-control/deterministic-no-combo-cpu.log` there;
   prescribed probe `perf/results/2026-09-10/deterministic-reduction-no-combo-frontend/`.
+
+## 2026-09-10 - No-combo frontend qualified; new full-model series frozen
+
+- Status: corrected frontend qualified; NEW full-model series prescribed, pending.
+- Baseline: original deterministic-only model start fails at timed combo fusion.
+  Corrected candidate532c62674 explicitly sets deterministicTrue/comboFalse/
+  benchmark_comboFalse; registered profile/native binaries/quant/TC unchanged.
+- Results: ONE fresh16GiB/no-swap frontend process12/12 pass (three graphs x
+  rows1/16/640/7616). Original8 cases' outputs/oracle metrics exactly match the
+  completed first frontend. Independent pointwise branches pass exact CPU/eager/
+  changed-input replay checks; norm oracle maximum1 BF16 ULP. No TP4/model claim.
+- Audit:6 graphs/9 bindings/6 reductions identical before/after capture, qualified
+  norm config, actual cubin byte digests.10 source receipts,7 native libraries,
+  5172 original files unchanged, exit0/GPU-free. No retry or speed measurement.
+- Change: offline auditor uses a NEW series root/three-option plan; binary lookup
+  follows vLLM's actual AOT inductor_cache/triton_cache siblings instead of the
+  frontend-only cache layout. CPU127pass16.04s, lint/diff pass; replay4 frontend
+  bindings/12 timing files/3 quality passes/24 cold-prefill requests passes.
+- Decision: prescribe exactly fresh-a/fresh-b/cached-a under NEW
+  `perf/results/2026-09-10/deterministic-no-combo-serving/`.150GiB serving/8GiB
+  preflight-audit/swap0, full cold/qualityx3/32K/128K workload and unchanged gates.
+  No edits/commits/builds through series/audits; stop on failed gate, no retries.
+  Old series remains terminal with unused arms never launched. No promotion.
+- Raw: `deterministic-reduction-no-combo-frontend/`; audit
+  `runtime-control/no-combo-frontend-analysis.json`,
+  SHA6facb3efedd788e3dc527fd3687d09ddefd61096a528d8cc876c8b55e313a6f9.
+  `runtime-control/no-combo-serving-{cpu,audit-replay}.log`, all under2026-09-10.
