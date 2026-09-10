@@ -552,6 +552,11 @@ def test_prepare_three_independent_caches_and_manifest_validation(
         artifact_roots={},
         expected_graphs={},
     )
+    dependency = tmp_path / "runtime.py"
+    dependency.write_text("# CPU-only dependency fixture\n")
+    alias = tmp_path / "venv-runtime.py"
+    alias.symlink_to(dependency)
+    old["sources"] = {str(p): sha(p) for p in (dependency, alias)}
     for rank in range(4):
         store, graphs, _ = serialized_fixture(original, count=7, rank=rank)
         old["expected_graphs"][str(rank)] = graphs
@@ -604,3 +609,85 @@ def test_prepare_three_independent_caches_and_manifest_validation(
         policy.read_manifest()
     with pytest.raises(ValueError, match="new serving series"):
         preparation.prepare(tmp_path / "pair.json", tmp_path / "closure.json", output)
+
+
+def test_source_aliases_keep_identical_receipts_but_reject_conflicts(tmp_path):
+    dependency = tmp_path / "runtime.py"
+    dependency.write_text("# fixture\n")
+    alias = tmp_path / "alias.py"
+    alias.symlink_to(dependency)
+    receipts = {str(p): sha(p) for p in (dependency, alias)}
+    assert policy.canonical_sources(receipts) == {str(dependency): sha(dependency)}
+    receipts[str(alias)] = "different"
+    with pytest.raises(ValueError, match="conflicting qualified source aliases"):
+        policy.canonical_sources(receipts)
+
+
+def test_real_prepared_manifest_roundtrip_with_current_source_freeze(
+    tmp_path, monkeypatch
+):
+    """Actual v1 metadata/qualified receipts; no cache copies, GPU or model load.
+
+    A fresh CPU fixture refreshes only the current implementation hashes and local
+    case paths. It must not rewrite or reuse the terminal v1 manifest/attempt.
+    """
+    import subprocess
+
+    from benchmarks.kernels.prepare_glm53_geometry_serving import CASES, ROOT
+
+    original = (
+        ROOT
+        / "perf/results/2026-09-10/rmsnorm-geometry-serving-v1/control/manifest.json"
+    )
+    if not original.exists():
+        pytest.skip("local completed campaign receipts are not distributed")
+    base = json.loads(original.read_text())
+    base["sources"] = {name: sha(name) for name in base["sources"]}
+    base["git_commit"] = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], text=True
+    ).strip()
+    runs = []
+    for label, mode in CASES:
+        folder = tmp_path / label
+        folder.mkdir()
+        cache = folder / "cache"
+        data = dict(
+            base,
+            label=label,
+            mode=mode,
+            cache_root=str(cache),
+            private_namespace=str(
+                cache / "torch_compile_cache/torch_aot_compile" / base["namespace"]
+            ),
+            receipts=str(folder / "receipts"),
+            worker_receipts=str(folder / "worker-receipts"),
+        )
+        path = folder / "manifest.json"
+        path.write_text(json.dumps(data))
+        runs.append(
+            dict(label=label, mode=mode, manifest=str(path), manifest_sha256=sha(path))
+        )
+    (tmp_path / "preparation.json").write_text(
+        json.dumps(
+            dict(
+                status="prepared",
+                sources=base["sources"],
+                git_commit=base["git_commit"],
+                runs=runs,
+            )
+        )
+    )
+    monkeypatch.setenv(glm53_ordering.FLAG, "1")
+    monkeypatch.setenv("VLLM_FORCE_AOT_LOAD", "1")
+    for row in runs:
+        path = Path(row["manifest"])
+        data = json.loads(path.read_text())
+        monkeypatch.setenv(policy.FLAG, row["mode"])
+        monkeypatch.setenv(policy.MANIFEST, str(path))
+        monkeypatch.setenv("VLLM_CACHE_ROOT", data["cache_root"])
+        monkeypatch.setenv(
+            "TORCHINDUCTOR_CACHE_DIR",
+            str(Path(data["private_namespace"]) / "inductor_cache"),
+        )
+        actual, checked = policy.read_manifest()
+        assert actual == data and checked == path

@@ -9,8 +9,8 @@ rank0 artifacts but stopped at the auditor's export parser. v4 stopped at the
 inventory's graph/helper classification; v5 stops at post-compile call identity.
 No-weights AOT v6 now PASSES all eight loads/audits and final comparison; its
 commands are historical. The opt-in serving integration and workload controller
-are CPU-tested. A NEW full-model v1 series is prescribed at the tail; it has not
-yet been prepared or launched at this checkpoint.
+are CPU-tested. Full-model v1 stopped during CPU preflight with zero model starts;
+the source-alias fix and NEW v2 prescription are at the tail.
 
 ## Question and fixed factors
 
@@ -679,7 +679,7 @@ confirm `/raid/weights` profile resolution, then commit the bounded full-model
 protocol before any preparation or launch. All existing quality floors and terminal
 failed series remain intact. This checkpoint does not prescribe a model/GPU job.
 
-## Full-model causal series v1 (prescribed before preparation or launch)
+## Full-model causal series v1 (historical; terminal before any model start)
 
 Root: `perf/results/2026-09-10/rmsnorm-geometry-serving-v1/`.
 Commit implementation and this protocol, then freeze all sources through closure.
@@ -776,3 +776,59 @@ Whole reference response hashes match their historical audits. Raw reports under
 `runtime-control/geometry-{full-workload,workload-final,workload-replay,workload-replay-fixed,workload-pinned}-cpu.xml`.
 This series answers a bounded causal question, not broader indexer correctness or
 the optimization campaign's remaining performance objective.
+
+## V1 terminal CPU preflight; canonical source aliases; NEW v2
+
+On8074c504f v1 prepares three copies, then the first control preflight rejects nine
+qualified source keys that the preparer canonicalized: seven virtualenv files and
+two symlinked model metadata files. No serve/audit child, model start, forward or
+GPU load. The prescribed closure hits the same validator guard and remains failed.
+Independent closure verifies actual target/root metadata, all206 qualified source
+receipts by resolved path,359 current receipts,5172 original files, and all three
+private copies unchanged. Unused cases unlaunched, GPUs free. Raw
+`runtime-control/geometry-serving-v1-preflight-closure.json`, SHA
+c27e14186c71626478a923c9daa225cb0d4f53073f447acf5d02e5d26a2ecdba.
+V1 is TERMINAL; all files retained, freeze ended. Do not reuse its markers/caches.
+
+Validator now canonicalizes the old receipt keys consistently and rejects alias
+collisions with different digests. No source/binary verification is relaxed. CPU174
+pass35.65s includes all-mode real prepared-metadata round-trips against completed
+AOT evidence, using only new CPU fixture paths (no cache copies/model/GPU). Raw
+`runtime-control/geometry-source-alias-cpu.xml`; prior CPU/closure failures retained.
+
+After committing this correction/protocol, freeze and prepare NEW v2 ONCE:
+
+```bash
+systemd-run --user --scope --unit=glm53-geometry-serving-v2-prepare -p MemoryMax=8G -p MemorySwapMax=0 \
+  env CUDA_VISIBLE_DEVICES= PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 .venv/bin/python \
+  -m benchmarks.kernels.prepare_glm53_geometry_serving \
+  --qualification perf/results/2026-09-10/rmsnorm-geometry-aot-qualification-v6/pair-analysis.json \
+  --closure perf/results/2026-09-10/rmsnorm-geometry-aot-qualification-v6/closure.json \
+  --output perf/results/2026-09-10/rmsnorm-geometry-serving-v2
+```
+
+Same exact prescribed workload and diagnostic/quality distinction as v1 above.
+ONCE per LABEL, control then geometry then return-control, conditional on all prior
+audits/source/cache/release gates:
+
+```bash
+systemd-run --user --scope --unit=glm53-geometry-serving-v2-LABEL-launch -p MemoryMax=8G -p MemorySwapMax=0 \
+  env PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 .venv/bin/python \
+  -m benchmarks.kernels.run_glm53_geometry_serving launch \
+  perf/results/2026-09-10/rmsnorm-geometry-serving-v2/LABEL/manifest.json
+```
+
+Serving150GiB, controller/audits8GiB, swap0; one GPU workload, no builds/edits through
+closure. Stop on any structural/control/repetition/workload/needle/release failure;
+preserve geometry window failures as diagnostic observations, not quality passes.
+After completion or first terminal failure, close ONCE before source edits:
+
+```bash
+systemd-run --user --scope --unit=glm53-geometry-serving-v2-close -p MemoryMax=8G -p MemorySwapMax=0 \
+  env CUDA_VISIBLE_DEVICES= PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 .venv/bin/python \
+  -m benchmarks.kernels.run_glm53_geometry_serving close \
+  perf/results/2026-09-10/rmsnorm-geometry-serving-v2
+```
+
+No retries, replacement starts, threshold changes or production promotion. V1 and
+all prior failed sequences stay terminal. Completed no-weights v6 stays completed.

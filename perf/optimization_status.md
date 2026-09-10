@@ -27082,3 +27082,25 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - Raw: `perf/results/2026-09-10/runtime-control/geometry-{full-workload,workload-final,
   workload-replay,workload-replay-fixed,workload-pinned}-cpu.xml`; exact commands and
   failure policy at the tail of `perf/glm53-rmsnorm-geometry-protocol.md`.
+
+## 2026-09-10 - Geometry v1 catches source-alias mismatch before model launch
+
+- Status: v1 terminal, source freeze released; canonical-path fix CPU-tested.
+- Baseline/hypothesis: prepared serving manifests must preserve the completed
+  qualification's exact sources, including symlinked virtualenv/model metadata.
+- Result on8074c504f: preparation completes; first control fails CPU preflight.
+  Preparer canonicalized paths but validator compared old path spellings. Nine
+  aliases rejected; no server child, model start, forward/capture or GPU load.
+  Prescribed closure repeats the reader failure and remains retained as failed.
+- Independent closure:359 current receipts,206 qualified receipts by canonical
+  path,5172 original files and all three private copies unchanged; actual targets/
+  roots exact, unused cases unlaunched, GPUs free. No native/quant/default change.
+- Fix: canonicalize qualified keys consistently; reject conflicting alias digests.
+  CPU174 pass35.65s includes all three modes with real v1 metadata and completed
+  AOT evidence in fresh CPU fixture paths. No actual cache copy or GPU/model load.
+- Decision: retain v1 failure and all caches. Commit then NEW v2 same fixed
+  three-case causal protocol/new copies, frozen through closure. No quality-gate
+  relaxation or throughput claim; this was a preflight path-identity bug.
+- Raw: `perf/results/2026-09-10/runtime-control/geometry-serving-v1-preflight-closure.json`,
+  SHA c27e14186c71626478a923c9daa225cb0d4f53073f447acf5d02e5d26a2ecdba;
+  `geometry-source-alias-cpu.xml`; original failed `rmsnorm-geometry-serving-v1/closure.json`.

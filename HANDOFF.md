@@ -35,7 +35,32 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): full-model geometry controller ready; v1 prescribed
+### Latest checkpoint (2026-09-10): v1 preflight terminal; source aliases fixed; v2 prescribed
+
+On `8074c504f`, v1 prepared all three copies but the first control stopped in CPU
+preflight. No server command, model start, forward, capture or GPU load occurred.
+The preparer resolved symlinks; the validator compared unresolved qualified keys.
+Nine paths differed only in spelling (seven virtualenv sources, two model metadata
+aliases). The prescribed closure hit the same reader guard and is retained failed.
+
+Independent closure verifies all 359 current receipts, all 206 qualified receipts
+by resolved path, 5,172 original files and all three private copies unchanged;
+unused cases unlaunched and GPUs free. Raw
+`runtime-control/geometry-serving-v1-preflight-closure.json`, SHA
+c27e14186c71626478a923c9daa225cb0d4f53073f447acf5d02e5d26a2ecdba.
+V1 is terminal, all copies/markers/failed closure retained, source freeze ended.
+
+Validator now matches the preparer's canonical paths while rejecting conflicting
+alias digests. CPU174 pass35.65s, including a real v1-metadata round-trip for all
+three case modes against actual completed AOT receipts (new CPU fixture paths,
+no private cache copies/model/GPU load). Report `runtime-control/geometry-source-alias-cpu.xml`.
+No loader/compiler/kernel math/native/quant/quality/default change.
+
+NEXT after commit: NEW v2, same fixed three-case workload/failure policy at protocol
+tail, new copies under `rmsnorm-geometry-serving-v2/`. Freeze from preparation through
+closure; do not retry v1 or launch its unused cases. V2 not prepared/launched yet.
+
+### Previous checkpoint (2026-09-10): full-model geometry controller ready; v1 prescribed
 
 Integration committed as `71cb900aa` (Auroter author/committer). The new workload
 auditor reuses existing exact-token, cold-prefill and unchanged 32-window quality

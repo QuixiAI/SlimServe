@@ -40,6 +40,16 @@ def validate_environment():
             raise ValueError(f"geometry forbids conflicting compiler flag: {name}")
 
 
+def canonical_sources(sources):
+    """Match the preparer's resolved paths without losing conflicting receipts."""
+    result = {}
+    for name, digest in sources.items():
+        path = str(Path(name).resolve())
+        if result.setdefault(path, digest) != digest:
+            raise ValueError(f"conflicting qualified source aliases: {path}")
+    return result
+
+
 def read_manifest():
     from benchmarks.kernels.check_glm53_attention_norms import require, verify
     from benchmarks.kernels.glm53_rmsnorm_geometry import SCHEMA
@@ -120,13 +130,14 @@ def read_manifest():
     qualified, graphs, reference, _ = completed_evidence(
         Path(data["aot_pair_path"]), Path(data["aot_closure_path"])
     )
+    sources = canonical_sources(qualified["sources"])
     require(
         data["qualified_manifest"] == reference
         and data["qualified_graphs"] == graphs
-        and set(qualified["sources"]) <= set(data["sources"])
+        and set(sources) <= set(data["sources"])
         and all(
             data["sources"][name] == digest
-            for name, digest in qualified["sources"].items()
+            for name, digest in sources.items()
             if Path(name).resolve() not in INTEGRATION_SITES
         )
         and all(
