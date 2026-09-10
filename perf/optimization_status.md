@@ -27808,3 +27808,24 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - Raw: `perf/results/2026-09-10/indexer-serving-v1/closure.json`, SHA
   0d1302e05d6f2350d1bcf60be4d04691f489d6c3040f1bbca37fd890d139fa8b.
   Full commands/results/limits: `perf/glm53-indexer-serving-protocol.md`.
+
+## 2026-09-10 - Bound prompt-score scratch without changing sampler arithmetic
+
+- Status: isolated CUDA-qualified; not installed in serving or promoted.
+- Baseline/hypothesis: repeated recovered4.7GB allocation warnings in the fixed
+  recipe v1/TP4 indexer-serving series. Full BF16 prompt logits are converted to
+  FP32 and normalized over the complete vocabulary. Bound independent row work
+  to1024, leaving the projection/TP gather and sampler arithmetic untouched.
+- Change: standalone helper and prescribed real-Sampler CUDA probe; no quant,
+  profile, native library, default, lm_head or quality-floor changes.
+- Correctness: CPU184 pass/5.98s; one GPU0 process,60 cases/480 outputs exact,
+  actual compiled ranks/top-k, ties, guards, offset/padded views, three dtypes.
+- Results:7616x154880 BF16/k0 incremental peak9,437,184,000 ->1,270,996,480 bytes
+  (-86.5%); isolated CUDA median20.122 ->19.597ms. Separate traces identify both
+  FP32 conversion and log_softmax allocations; not a live OOM stack or serving TPS.
+  Small just-over-boundary shapes pay extra launches; planned small path unchanged.
+- Decision: proceed to runner integration and fixed-profile score/warning/timing
+  qualification. GPU released, hardware unchanged, no retries; freeze ended.
+- Raw: `perf/results/2026-09-10/prompt-scores-gpu-v1/result.json`, SHA
+  68b82a83a8a7bc0ba8cc9b4ae349e6de6a0882f280e51edfec41aa99993cc271.
+  Full protocol and ranges: `perf/glm53-prompt-score-protocol.md`.

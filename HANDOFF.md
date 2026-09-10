@@ -35,7 +35,23 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): selective indexer correction passes model quality
+### Latest checkpoint (2026-09-10): prompt-score scratch bounded, CUDA-qualified
+
+Uninstalled helper `vllm/v1/sample/prompt_logprobs.py` chunks only post-projection
+scoring into1024 rows with the existing sampler operations. CPU184 pass; exactly
+one GPU process/60 cases/480 checked outputs all exact, including actual compiled
+inclusive ranks, top-k ties, BF16/FP16/FP32, guards and noncontiguous head views.
+At7616x154880 BF16/k0, incremental peak9.44GB ->1.27GB (86.5% less), isolated
+CUDA median20.122 ->19.597ms. No model/quant/native/profile/default change.
+Actual isolated allocation stacks identify both FP32 conversion and log_softmax;
+the previous live-server warnings are not yet stack-attributed or eliminated.
+GPU released, freeze ended. Raw `prompt-scores-gpu-v1/result.json` under2026-09-10,
+SHA68b82a83a8a7bc0ba8cc9b4ae349e6de6a0882f280e51edfec41aa99993cc271.
+NEXT: runner integration preserving the complete lm_head/TP gather and<=1024-row
+score-journal path, then a prescribed fixed-profile quality/warning/timing series.
+Full commands and limits: `perf/glm53-prompt-score-protocol.md`.
+
+### Previous checkpoint (2026-09-10): selective indexer correction passes model quality
 
 The full prescribed series on `7b8f93afb` is complete: exactly one control,
 correction and return-control start, three repeats each, all audits/closure pass.
