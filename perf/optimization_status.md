@@ -24136,3 +24136,10 @@ restart is the operator's call.
   c64 is ~1080-1090, not the 931.9 of 09-06. RECORD: glm53f-nvfp4-8 goes
   speculative by default with this schedule. Raw: glm53f-dflash2/
   sched16-0-cap256/.
+- RECORD FLIPPED (e6c876c9e): glm53f-nvfp4-8 speculative by default -
+  DFlash2, [[1,16,3],[17,64,0]], capture 256. Through `slimserve --serve`,
+  three warmed repeats, medians: c1 153.6 / c8 495.0 / c16 687.3 / c32
+  879.5 / c64 1074.5 (acceptance 2.0-2.3 at c1-c16; 1.5-1.7 at c32/c64
+  ramp/drain); canaries pass; pool 3,082,532 tokens; no V1 fallback.
+  Forced-eviction tier acceptance, WildChat leg and the 1M-context leg
+  run next on this record. Raw: perf/results/2026-09-10/glm53f-final-spec/.
