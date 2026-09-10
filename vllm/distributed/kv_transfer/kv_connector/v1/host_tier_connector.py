@@ -69,6 +69,7 @@ from vllm.v1.core.kv_tier_index import HostKVTierIndex
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     MambaSpec,
+    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 
@@ -108,6 +109,11 @@ class HostTierMeta(KVConnectorMetadata):
     # (the ring block, whose framework zeroing was skipped for the
     # async-load range but which the tier deliberately does not restore).
     zeros: dict[str, list[tuple[int, int]]] = field(default_factory=dict)  # (block, group)
+    # req_id -> [gpu_block_id, ...] promised restores the scheduler side
+    # could not stage (no target block); the worker reports the request
+    # received and the blocks invalid so the scheduler recomputes them
+    # instead of deferring the request forever (2026-09-10).
+    failed: dict[str, list[int]] = field(default_factory=dict)
     # batch_seq -> [(host_slot, disk_slot), ...] write-through of confirmed
     # host rows to the NVMe tier.
     disk_writes: dict[int, list[tuple[int, int, int]]] = field(default_factory=dict)
@@ -283,6 +289,23 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
             for gid, g in enumerate(groups)
             if not isinstance(g.kv_cache_spec, (CircularBufferSpec, MambaSpec))
         ]
+        # Sliding-window groups beside mamba state groups are window-only KV
+        # (the DFlash2 drafter's five SWA layers on GLM-5.3-Flash): their
+        # block tables carry null blocks outside the window, so they can be
+        # neither staged as a deep prefix nor restored position by position.
+        # They leave the attention set and are zeroed on resume like the QSA
+        # ring: the drafter then rebuilds its window from the taps as it
+        # goes (only acceptance is affected, never output content, since
+        # every draft is verified). Attention-only models keep the existing
+        # write-only rule for windows (DSV4's windows are target state).
+        has_state = any(isinstance(g.kv_cache_spec, MambaSpec) for g in groups)
+        self.window_groups = [
+            gid
+            for gid in self.attn_groups
+            if has_state and isinstance(groups[gid].kv_cache_spec, SlidingWindowSpec)
+        ]
+        if self.window_groups:
+            self.attn_groups = [g for g in self.attn_groups if g not in self.window_groups]
         # Per-request state groups saved once at finish and restored on
         # resume: the mamba align-state groups only. In align mode the
         # engine freezes each boundary state in the pool's prefix cache
@@ -428,6 +451,13 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
                     self._attn_ratio,
                     self._resume_align,
                 )
+            if self.window_groups:
+                logger.info(
+                    "host-tier: window-only groups %s are not tier-managed "
+                    "(zeroed on resume)",
+                    self.window_groups,
+                )
+            self._failed_restores: dict[str, list[int]] = {}
             if self.num_disk_slots:
                 logger.info(
                     "host-tier: NVMe tier %d slots x %d bytes per rank",
@@ -461,6 +491,7 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
         else:
             self._dma: KVTierDMA | None = None
             self._pending_restore_reqs: dict[int, str] = {}
+            self._failed_recv: set[str] = set()
             # Scheduler offloads/write-throughs are positive. Worker restores
             # count down from zero, so long-lived engines cannot overlap the
             # namespaces (a finite positive offset eventually collides).
@@ -657,13 +688,13 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
                 if gidx >= len(gb) or gb[gidx] < 0:
                     logger.warning(
                         "host-tier: no target block for %s attn g%d pos %d "
-                        "(group table lens: %s)",
+                        "(group table lens: %s); failing the restore closed",
                         request.request_id[-8:],
                         gid,
                         logical,
                         [len(g) for g in track.group_blocks],
                     )
-                    track.planned_blocks = 0
+                    self._fail_restore(request, track)
                     return
                 ops.append(
                     (track.planned_attn_slots[logical][gid], gb[gidx], gid)
@@ -694,20 +725,21 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
                 if state_pos >= len(gb) or gb[state_pos] < 0:
                     logger.warning(
                         "host-tier: no state target for %s group %d pos %d "
-                        "(group blocks: %d, last real: %s)",
+                        "(group blocks: %d, last real: %s); failing the "
+                        "restore closed",
                         request.request_id[-8:],
                         gid,
                         state_pos,
                         len(gb),
                         max((b for b in gb if b >= 0), default=None),
                     )
-                    track.planned_blocks = 0
+                    self._fail_restore(request, track)
                     return
                 ops.append((slot, gb[state_pos], gid))
             # Zero the ring defensively (see __init__: internal hits run
             # on a stale-claimed, never-zeroed ring; zero is the same or
             # strictly cleaner).
-            for gid in self.ring_groups:
+            for gid in self.ring_groups + self.window_groups:
                 # (block, group): under the multi-pool packed slab the ring
                 # lives in its own pool, and a bare block id would zero the
                 # ATTENTION block of that id (2026-09-08: a resumed request's
@@ -735,6 +767,20 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
             )
         if covered == track.planned_blocks:
             track.planned_blocks = 0  # restore fully staged
+
+    def _fail_restore(self, request: "Request", track: _ReqTrack) -> None:
+        """A promised restore cannot be staged: hand the scheduler every GPU
+        block of the promised span as a failed load. The worker reports the
+        request received and those blocks invalid, so the engine recomputes
+        them instead of parking the request in WAITING_FOR_REMOTE_KVS."""
+        blocks: list[int] = []
+        for gid in self.attn_groups + self.state_groups:
+            gb = track.group_blocks[gid] if gid < len(track.group_blocks) else []
+            blocks.extend(b for b in gb if b > 0)
+        self._failed_restores[request.request_id] = blocks
+        track.planned_blocks = 0
+        track.planned_attn_slots = []
+        track.planned_state_slots = {}
 
     # Offload staging ---------------------------------------------------
 
@@ -906,6 +952,7 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
             restores=self._staged_restores,
             offloads=self._staged_offloads,
             zeros=self._staged_zeros,
+            failed=self._failed_restores,
             disk_writes=self._staged_disk_writes,
             disk_reads=self._staged_disk_reads,
             main_homes=self._staged_main_homes,
@@ -916,6 +963,7 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
         self._staged_restores = {}
         self._staged_offloads = {}
         self._staged_zeros = {}
+        self._failed_restores = {}
         self._staged_disk_writes = {}
         self._staged_disk_reads = {}
         self._staged_main_homes = {}
@@ -1239,6 +1287,15 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
             self._dma.issue(
                 TierOpBatch(seq=seq, offload=[], restore=[], disk_writes=dops)
             )
+        for req_id, blocks in getattr(meta, "failed", {}).items():
+            logger.warning(
+                "host-tier: restore for %s failed closed: %d blocks reported "
+                "invalid, request released to recompute",
+                req_id[-8:],
+                len(blocks),
+            )
+            self._dma.mark_invalid(blocks)
+            self._failed_recv.add(req_id)
         for req_id, ops in meta.restores.items():
             self._seq -= 1
             self._pending_restore_reqs[self._seq] = req_id
@@ -1300,6 +1357,9 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
         if self._dma is None:
             return None, None
         done_recving: set[str] = set()
+        if self._failed_recv:
+            done_recving.update(self._failed_recv)
+            self._failed_recv.clear()
         for seq in self._dma.poll_done():
             req_id = self._pending_restore_reqs.pop(seq, None)
             if req_id is not None:

@@ -334,6 +334,11 @@ class KVTierDMA:
         done, self._disk_done = self._disk_done, []
         return done
 
+    def mark_invalid(self, blocks) -> None:
+        """Report GPU blocks whose promised restore never happened (the
+        scheduler side failed the plan closed); the scheduler recomputes them."""
+        self._invalid_blocks.update(int(b) for b in blocks)
+
     def take_invalid_blocks(self) -> set[int]:
         inv, self._invalid_blocks = self._invalid_blocks, set()
         return inv
