@@ -1406,6 +1406,68 @@ is ignored in this build and it will loop emitting prompts.
 
 ---
 
+# HANDOFF — GLM-5.3-Flash on 8x A100 (`glm53f-nvfp4-4` / `glm53f-nvfp4-8`), updated 2026-09-10 (supersedes the 2026-09-08 state below)
+
+## 2026-09-10 checkpoint - V2 runner, DFlash2 speculative record
+
+- **Operator directives (2026-09-10):** (1) "Proceed" on TP scaling, MTP
+  and the 1M qualification; (2) **V2 model runner only - V1 is
+  deprecated** (banner in `vllm/v1/worker/gpu_model_runner.py`, warning at
+  the selection point in `gpu_worker.py`; new architectures go in
+  `DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES` and V2 gets fixed, never V1);
+  (3) try `incoai/GLM-5.3-Flash-DFlash2`; (4) MTP at 3-4 tokens rather
+  than 2 (superseded by DFlash2 winning).
+- **State:** `glm53f-nvfp4-8` runs on V2 (both GLM architectures are
+  default-V2 now; V2 non-spec matches V1: c1 109.6 / c8 490.3) and is
+  **speculative by default with DFlash2**: k=3 for 1-16 running requests,
+  0 above (`num_speculative_tokens_per_batch_size [[1,16,3],[17,64,0]]`),
+  `max_cudagraph_capture_size 256`. Through `slimserve glm53f-nvfp4-8
+  --serve`, three warmed repeats: **c1 153.6 / c8 495.0 / c16 687.3 /
+  c32 879.5 / c64 1074.5** vs non-spec 109.9 / 494.6 / 676.0 / 929.9 /
+  ~1085 on the same tree. Canaries pass. Pool 3,082,532 tokens (the
+  drafter costs ~1.2M tokens of pool). `--no-spec` is the non-spec path.
+  Committed e6c876c9e. Forced-eviction tier acceptance, WildChat leg and
+  the 1M-context leg on this record were launched right after (results
+  in `perf/optimization_status.md`, 2026-09-10 entries; raw under
+  `perf/results/2026-09-10/glm53f-final-spec/`, `glm53f-leg-spec/`,
+  `glm53f-1m-leg/`).
+- **How DFlash2 is wired (all committed):** `glm5_next` implements the
+  EAGLE-3 aux-hidden-state interface (`_Glm5NextAuxTaps` mixin, listed
+  BEFORE `SupportsEagle3` in the bases because the protocol ships concrete
+  defaults); a tap at layer k is `glm5_mhc_post(mlp_out, residual,
+  post_mix, res_mix).mean(dim=1)` - the mean over the four mHC streams of
+  the layer's completed output (SGLang PR 36708 `hc_contract`). Taps
+  (6, 15, 25, 34, 43) in the +1 convention. The drafter shares the
+  target's embed_tokens/lm_head via `get_language_model()`. Source
+  speculator on `glm53f-nvfp4` (revision bf582e4e); the V1-only
+  checkpoint-MTP adapter is no longer registered (its code remains).
+- **DFlash contract traps:** the V2 DFlash speculator drafts a FIXED
+  block: per-batch schedules may pair k with 0 only (runner skips
+  drafting); any partial k asserts. The compact indexer cache caps
+  speculation at 5 tokens (8-row raw ring), so block-8's k=7 needs a
+  ring-geometry change; k=5 gave +1.6% c1 over k=3 for -8% c8.
+  c1 throughput is acceptance-luck at temperature 1.0 (per run 1.5-3.2);
+  compare STEP RATES (tok/s / acceptance length): ~72 steps/s
+  speculative vs ~110 plain in every arm, independent of capture size or
+  schedule.
+- **MTP (checkpoint head) findings, V1-only, for the record:** under
+  FULL_DECODE_ONLY the drafter got NO graphs (proposer keys off the mixed
+  mode) and ran eager; under FULL_AND_PIECEWISE k=3 gave +6.5% c1 and lost
+  c8+; a speculative step still carried a fixed ~7 ms. Superseded.
+- **TP scaling:** c1 is latency-bound (97% GPU util at 181 W; async
+  scheduling on; ~1,500 kernels/token, ~850 on the main stream): the
+  TP-invariant residue is the per-kernel latency floor, so the 1.5x
+  TP8/TP4 ratio gate at c1 is a kernel-count problem, not a collective
+  one; MTP/DFlash2 (verify batching) is what lifted c1. No ownership
+  work was started. TP4 (`glm53f-nvfp4-4`) has not been re-measured on
+  today's tree and still carries an unbooted tier config.
+- **Scratch tooling (`~/.local/scratch/glm53/`):** `launch_profile.py`
+  (registered argv + `--spec --k --schedule --additional --cudagraph-mode
+  --capture` overrides), `dflash_arm.sh` / `mtp_arm.sh` (boot + validate +
+  acceptance), `sweep_summary.py`, `final_gates.sh` (record flip + all
+  gates), `leg_1m.sh` (two sessions to 1,040,000 tokens with
+  `--require-target`, tiers + verify on), `census_launch.sh`.
+
 # HANDOFF — GLM-5.3-Flash on 8x A100 (`glm53f-nvfp4-4` / `glm53f-nvfp4-8`), updated 2026-09-08
 
 ## One-paragraph state
