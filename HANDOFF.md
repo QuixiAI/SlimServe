@@ -35,7 +35,41 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): selective indexer correction passes GPU probe
+### Latest checkpoint (2026-09-10): indexer loader foundation CPU-tested
+
+The opt-in `glm53_indexer_correction_loader.py` policy reuses the existing
+extra-launch lifecycle and observed static CUDA loader. A strict bridge compiles
+the unchanged qualified JIT and checks its key/signature/options and in-memory/
+disk cubin before adapting to Torch's static launcher. It does not inject a saved
+binary. KV remains the default policy; source/mode/adapter/event naming is now
+explicitly extensible. New correction events and hook marker remain separate.
+
+`BoundIndexerCorrection` supplies fixed guarded uint8 storage per target binding,
+8192-row diagnostic envelope (~1 MiB/binding), then invokes the already-tested
+adapter with a correctly strided view. No CUDA allocation or compilation in run.
+The independent graph inspector checks actual direct dispatch, appended static
+runner/image and arena geometry/device. No serving hook or profile default yet.
+
+CPU358 tests pass/20.50s,14 upstream Torch warnings; initial131 pass/7.72s.
+Legacy KV/geometry loader and serving tests pass after the shared refactor.
+Native driver/allocation are simulated in CPU tests; this does NOT qualify the
+new static dispatch on GPU. The prior kernel source/cubin stays unchanged.
+CPU inspection joins all eight archived target graph uses, seven AOT roots and
+46 entries per rank,269 receipts and all5,172 original files. Raw
+`runtime-control/indexer-loader-inspection-v1.json` under2026-09-10, SHA
+`89f90eb95530b179f4150a5c2dbd37b87f5839f5e3ce62f4c5d169ee79fc240b`.
+
+NEXT: add runnable AOT series preparation/controller/auditor using this base
+builder and the shared AOT lifecycle. Validate the real static-launcher ABI with
+synthetic leaf calls through each actual graph-held binding, not merely loading
+modules; preserve original and qualified corrected output hashes/replay/guards.
+Then run a separately prescribed all-rank control/correction series before any
+model integration. Serving must check actual scheduler/padding limits against
+the arena; no silent truncation, growth during capture or assumed reentrancy.
+No GPU/model job or source freeze is active/prescribed. Details:
+`perf/glm53-indexer-loader-protocol.md`.
+
+### Previous checkpoint (2026-09-10): selective indexer correction passes GPU probe
 
 On `f5ad4f884`, the one prescribed GPU process completes all120 rank-matched
 cases and both input phases. Corrected indexer max1 BF16 ULP meets the unchanged

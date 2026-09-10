@@ -44,10 +44,40 @@ def check_launcher(compiled, launcher, saved, observer):
 
 
 class KVIntervention:
+    """Shared extra-launch lifecycle; KV supplies the default adapter policy."""
+
+    schema = SCHEMA
+    candidate_mode = "kv"
+    extra_key = "kv"
+    event_prefix = "kv"
+
+    def extra(self, target):
+        return target[self.extra_key]
+
+    def make_adapter(self, launcher, pair):
+        adapter = KVOnlyOverwrite(launcher, pair[1])
+        return adapter, adapter.run
+
+    def verify_adapter(self, binding):
+        adapter = binding["adapter"]
+        require(
+            type(adapter) is KVOnlyOverwrite
+            and adapter.combo is binding["launcher"]
+            and adapter.split_kv is binding["appended"][1]
+            and binding["run"].__self__ is adapter
+            and binding["run"].__func__ is KVOnlyOverwrite.run,
+            "KV adapter launch sequence changed",
+        )
+
+    def graph_inventory(self, modules):
+        from benchmarks.kernels.audit_glm53_kv_graphs import inventory
+
+        return inventory(modules, self.manifest, self.rank, self.mode, self.observer)
+
     def __init__(self, rank, manifest, mode, observer, *, emit=None):
         require(
-            manifest["schema"] == SCHEMA
-            and mode in ("control", "kv")
+            manifest["schema"] == self.schema
+            and mode in ("control", self.candidate_mode)
             and type(rank) is int
             and rank in range(4),
             "separate KV manifest, valid rank and control/kv arm required",
@@ -79,7 +109,7 @@ class KVIntervention:
                 "invalid or duplicate KV target source",
             )
             check_source(target, self.private)
-            check_source(target["kv"], self.private)
+            check_source(self.extra(target), self.private)
             self.targets[relative.name] = target
         require(self.targets, "empty KV target set")
         self.lock = threading.RLock()
@@ -114,7 +144,7 @@ class KVIntervention:
         tuner, target = binding["tuner"], binding["target"]
         self.target(tuner)
         check_source(target, self.private)
-        check_source(target["kv"], self.private)
+        check_source(self.extra(target), self.private)
         require(
             len(tuner.compile_results) == len(tuner.launchers) == 1
             and tuner.compile_results[0] is binding["compiled"]
@@ -125,18 +155,10 @@ class KVIntervention:
             "KV direct dispatch or original binding changed",
         )
         check_launcher(binding["compiled"], binding["launcher"], target, self.observer)
-        if self.mode == "kv":
+        if self.mode == self.candidate_mode:
             compiled, launcher = binding["appended"]
-            adapter = binding["adapter"]
-            require(
-                type(adapter) is KVOnlyOverwrite
-                and adapter.combo is binding["launcher"]
-                and adapter.split_kv is launcher
-                and binding["run"].__self__ is adapter
-                and binding["run"].__func__ is KVOnlyOverwrite.run,
-                "KV adapter launch sequence changed",
-            )
-            check_launcher(compiled, launcher, target["kv"], self.observer)
+            self.verify_adapter(binding)
+            check_launcher(compiled, launcher, self.extra(target), self.observer)
 
     def replace(self, tuner, compile_replacement, resolved_by="direct"):
         with self.lock:
@@ -149,7 +171,7 @@ class KVIntervention:
                 return tuner
             require(not self.sealed, "new KV target binding after seal")
             check_source(target, self.private)
-            check_source(target["kv"], self.private)
+            check_source(self.extra(target), self.private)
             Intervention.relocate(self, tuner)
             require(
                 len(tuner.compile_results) == len(tuner.launchers) == 1
@@ -165,20 +187,20 @@ class KVIntervention:
                 tuner=tuner, target=target, compiled=compiled, launcher=launcher
             )
             run = launcher
-            if self.mode == "kv":
+            if self.mode == self.candidate_mode:
                 pair = self.appended.get(target["relative"])
                 if pair is None:
-                    extra = compile_replacement(target["kv"])
+                    extra = compile_replacement(self.extra(target))
                     require(
-                        self.observer.digest(extra) == target["kv"]["cubin_sha256"],
+                        self.observer.digest(extra)
+                        == self.extra(target)["cubin_sha256"],
                         "KV appended cubin differs before load",
                     )
                     pair = extra, extra.make_launcher()
-                    check_launcher(*pair, target["kv"], self.observer)
+                    check_launcher(*pair, self.extra(target), self.observer)
                     self.appended[target["relative"]] = pair
-                adapter = KVOnlyOverwrite(launcher, pair[1])
+                adapter, run = self.make_adapter(launcher, pair)
                 binding.update(appended=pair, adapter=adapter)
-                run = adapter.run
             tuner._cached_launcher = None
             tuner.save_cache_hook = None
             tuner.run = binding["run"] = run
@@ -186,7 +208,7 @@ class KVIntervention:
             self.verify(binding)
             self.emit(
                 dict(
-                    event="kv_binding",
+                    event=f"{self.event_prefix}_binding",
                     rank=self.rank,
                     mode=self.mode,
                     source=target["relative"],
@@ -258,7 +280,7 @@ class KVIntervention:
                 self.graph_bindings[key] = module, tuner
                 self.emit(
                     dict(
-                        event="kv_graph_binding",
+                        event=f"{self.event_prefix}_graph_binding",
                         rank=self.rank,
                         graph=getattr(module, "__file__", None),
                         symbol=symbol,
@@ -268,8 +290,6 @@ class KVIntervention:
                 )
 
     def verify_graphs(self, modules):
-        from benchmarks.kernels.audit_glm53_kv_graphs import inventory
-
         with self.lock:
             modules = tuple(modules)
             for (module_id, symbol), (module, tuner) in self.graph_bindings.items():
@@ -285,9 +305,7 @@ class KVIntervention:
             )
             for binding in self.owners.values():
                 self.verify(binding)
-            return inventory(
-                modules, self.manifest, self.rank, self.mode, self.observer
-            )
+            return self.graph_inventory(modules)
 
     def seal(self, modules):
         with self.lock:
@@ -295,7 +313,7 @@ class KVIntervention:
             if not self.sealed:
                 self.emit(
                     dict(
-                        event="kv_sealed",
+                        event=f"{self.event_prefix}_sealed",
                         rank=self.rank,
                         targets=len(self.owners),
                         graph_bindings=len(self.graph_bindings),
@@ -307,6 +325,8 @@ class KVIntervention:
 
 class KVLoader(ScopedKernelLoader):
     hook_marker = "_glm53_kv_loader"
+    controller_class = KVIntervention
+    source_file = __file__
 
     def __init__(self, rank, manifest, manifest_path, mode, *, emit=None):
         self.rank, self.manifest_path = rank, Path(manifest_path)
@@ -314,22 +334,24 @@ class KVLoader(ScopedKernelLoader):
         self.cache = self.private / "inductor_cache"
         images = {}
         for target in manifest["targets"][str(rank)]:
-            for record in (target, target["kv"]):
+            for record in (target, target[self.controller_class.extra_key]):
                 images.setdefault(
                     (record["selected"]["hash"], record["kernel"]), set()
                 ).add(record["cubin_sha256"])
         self.observer = StaticCudaBinaryObserver(
             rank, [self.cache / "triton" / str(rank)], expected_images=images, emit=emit
         )
-        self.controller = KVIntervention(rank, manifest, mode, self.observer, emit=emit)
+        self.controller = self.controller_class(
+            rank, manifest, mode, self.observer, emit=emit
+        )
         self.installed, self.templates = False, {}
         self.controller.emit(
             dict(
-                event="kv_begin",
+                event=f"{self.controller.event_prefix}_begin",
                 rank=rank,
                 mode=mode,
                 manifest_sha256=sha(self.manifest_path),
-                source_sha256=sha(__file__),
+                source_sha256=sha(self.source_file),
             )
         )
 

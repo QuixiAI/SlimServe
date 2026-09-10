@@ -27671,3 +27671,29 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - Raw: `indexer-correction-v1/analysis.json` under2026-09-10, SHA
   c6ac3d0399af92be467ef47831f512c4edee60ff08fe0772afb399c59a18cc65.
   Full commands/ranges/receipt hashes: `perf/glm53-indexer-correction-protocol.md`.
+
+## 2026-09-10 - Indexer correction static-loader foundation CPU-tested
+
+- Status: implementation/CPU evidence complete; GPU AOT/dispatch and model gates pending.
+- Baseline/hypothesis: use the qualified selective correction binary unchanged
+  through Torch's actual static CUDA launcher, preserving original AOT dispatch
+  and observing the appended driver load independently.
+- Change: explicit adapter policy points in the existing extra-launch lifecycle;
+  KV remains the default. Separate correction schema/events, strict JIT-to-static
+  image/signature/config bridge, fixed per-binding guarded uint8 arena and actual
+  graph-dispatch inspector. No serving/default/profile/kernel change.
+- Correctness: 358 CPU tests pass/20.50s,14 upstream warnings; initial131/7.72s
+  retained. Actual Torch APIs with simulated driver/allocation; legacy KV/geometry
+  loader/serving regressions pass. No GPU correctness claim from these tests.
+- Evidence: CPU base builder verifies269 source/receipt hashes and5,172 original
+  files, eight archived target graph uses, seven AOT roots/46 entries per rank.
+  Qualified kernel/cubin unchanged. No runnable per-arm series, GPU/model job,
+  native build, TPS, quality-floor change or stable-baseline promotion yet.
+- Decision: implement actual AOT series/independent auditor and bound-leaf
+  numerical/replay/guard checks before model integration. Serving must validate
+  scheduler/padding limits and lifecycle against the8192-row arena envelope.
+  No implicit growing allocation during capture or cross-stream safety claim.
+- Raw: `runtime-control/indexer-loader-inspection-v1.json`, SHA
+  89f90eb95530b179f4150a5c2dbd37b87f5839f5e3ce62f4c5d169ee79fc240b;
+  `indexer-loader-cpu-{v1,final}.xml`, under2026-09-10. CPU8GiB/swap0.
+  Commands/next gate: `perf/glm53-indexer-loader-protocol.md`.

@@ -50,6 +50,7 @@ class ScopedKernelLoader:
             "_glm53_geometry_loader",
             "_glm53_rmsnorm_diagnostic",
             "_glm53_kv_loader",
+            "_glm53_indexer_correction_loader",
         )
         require(
             self.hook_marker in markers
