@@ -35,7 +35,39 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): both source-exact geometry processes and audits PASS
+### Latest checkpoint (2026-09-10): static load observer integrated and CPU-tested
+
+`benchmarks/kernels/glm53_binary_observer.py` observes the exact private cubin
+path passed to the CUDA driver BEFORE load, compares retained raw bytes when
+present, and retains strong object/metadata/module/function provenance after
+Torch consumes them. Each static graph launcher's runner must reference that
+same observed kernel. Wrong paths/keys/images/ranks, unobserved loaded objects,
+changed handles, closed objects, and mismatched launcher bindings fail closed.
+
+MultiIntervention now accepts this observer for loaded-static binary checks;
+historical single-source controller unchanged. CPU tests use installed
+StaticTritonCompileResult.make_launcher and StaticallyLaunchedCudaKernel.load_kernel,
+with only driver calls mocked. Include generated-launcher execution, concurrent
+aliases (one driver load), three-source control-to-geometry graph replacement,
+seal/reuse, failed-load cleanup and preserving a changed foreign hook. Final
+related suite254 passed5.75s, lint/diff pass. No actual AOT/GPU/model validation
+of the new observer yet; nothing installed in serving.
+
+Read-only check confirms ALL13 qualified candidate images already exist at their
+exact original rank-local keys with identical whole bytes. No binary seeding or
+debug normalization needed. `runtime-control/rmsnorm-geometry-candidate-cache-check.json`,
+SHA017120c13bc5fc5b8261903cf8a4dd3ba782b67c00ccfe53a9f58cfcd40a7102.
+CPU reports `rmsnorm-binary-observer-{cpu,final-cpu}.xml` under the same directory.
+
+NEXT: prepare source-bound private manifests using the completed pair's actual
+control/geometry keys and bytes; implement the observer/controller's actual AOT
+loader qualification, reusing `check_glm53_aot_loader.py` (seven artifacts/46
+submodule entries per rank, no weights/forward). Independently enumerate all
+actual graph globals;35 static source/graph uses are NOT already live proof.
+Record a bounded protocol before GPU work. No next GPU/model job prescribed.
+Default/profile/quant/native/quality gates unchanged; goal ongoing.
+
+### Previous checkpoint (2026-09-10): both source-exact geometry processes and audits PASS
 
 Prescribed A and B on4b0fa3701 each complete312 pairs and exit0. All26 source/
 config binaries verify before numerics in each process; every control reproduces

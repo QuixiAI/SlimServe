@@ -46,7 +46,9 @@ def binary_sha(compiled):
 
 
 class MultiIntervention:
-    def __init__(self, rank, manifest, manifest_path, selected_mode):
+    def __init__(
+        self, rank, manifest, manifest_path, selected_mode, *, binary_observer=None
+    ):
         if manifest["schema"] != SCHEMA or selected_mode not in ("control", "geometry"):
             raise ValueError(
                 "separate geometry manifest and control/geometry arm required"
@@ -56,6 +58,10 @@ class MultiIntervention:
         self.manifest = copy.deepcopy(manifest)
         self.rank = rank
         self.mode = selected_mode
+        self.binary_observer = binary_observer
+        self.binary_digest = (
+            binary_observer.digest if binary_observer is not None else binary_sha
+        )
         self.lock = threading.RLock()
         self.sealed = False
         self.owners = {}
@@ -166,21 +172,32 @@ class MultiIntervention:
                 len(allowed) != 1
                 or not compiled
                 or len(compiled) != 1
-                or binary_sha(compiled[0]) != allowed[0]["cubin_sha256"]
+                or self.binary_digest(compiled[0]) != allowed[0]["cubin_sha256"]
             ):
                 raise ValueError("geometry bound cubin/config differs")
+            if self.binary_observer is not None:
+                self.binary_observer.verify_launcher(
+                    compiled[0], autotuner.launchers[0]
+                )
 
             def checked_compile(saved):
                 result = compile_replacement(controller.target, saved)
-                if binary_sha(result) != saved["cubin_sha256"]:
+                if self.binary_digest(result) != saved["cubin_sha256"]:
                     raise ValueError("geometry replacement cubin differs")
                 return result
 
             cached = controller.compiled_replacement
             selected = controller.target["configs"][int(self.mode == "control")]
-            if cached is not None and binary_sha(cached) != selected["cubin_sha256"]:
+            if (
+                cached is not None
+                and self.binary_digest(cached) != selected["cubin_sha256"]
+            ):
                 raise ValueError("geometry cached replacement cubin changed")
             controller.replace(autotuner, checked_compile, resolved_by)
+            if self.binary_observer is not None:
+                self.binary_observer.verify_launcher(
+                    autotuner.compile_results[0], autotuner.launchers[0]
+                )
             self.owners[id(autotuner)] = (autotuner, controller)
             return autotuner
 
@@ -241,8 +258,12 @@ class MultiIntervention:
                     self.owner(autotuner)
                     (compiled,) = autotuner.compile_results
                     selected = controller.target["configs"][int(self.mode == "control")]
-                    if binary_sha(compiled) != selected["cubin_sha256"]:
+                    if self.binary_digest(compiled) != selected["cubin_sha256"]:
                         raise ValueError("geometry graph cubin changed")
+                    if self.binary_observer is not None:
+                        self.binary_observer.verify_launcher(
+                            compiled, autotuner.launchers[0]
+                        )
                 controller.verify_graphs(modules)
 
     def seal(self, modules):

@@ -26779,3 +26779,34 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   No next GPU/model job prescribed.
 - Raw: `perf/results/2026-09-10/rmsnorm-geometry-preload-qualification/`;
   pair-analysis SHA3b5bcff2c1d23b4b8a2ffa7c648267d5ee74003f67f6ce6495528d1c69516f69.
+
+## 2026-09-10 - Observe actual static CUDA load inputs and bind graph launchers
+
+- Status: diagnostic observer/controller integration CPU-tested; not installed
+  in serving, not yet qualified with the real GPU/AOT loader or model.
+- Baseline: completed source-exact pair proves both geometries and exact binary
+  reproducibility. Static CUDA launchers discard raw bytes after driver load, so
+  the multi-source controller cannot inspect asm/cubin_raw after resolution.
+- Hypothesis/change: observe the actual private driver-load path BEFORE loading,
+  compare raw bytes when retained, then preserve strong object/metadata/handle
+  provenance. Require each generated static launcher's runner to reference that
+  observed kernel. Wire this into MultiIntervention's existing source/config/
+  graph checks; keep historical single-target implementation unchanged.
+- Correctness: initial related138 CPU tests pass2.25s; final254 pass5.75s in
+  8GiB/swap0 scope, lint/diff pass. Tests exercise installed make_launcher/load_kernel
+  and generated launcher code, only driver calls mocked. Cover consumed bytes,
+  serialized raw-less objects, bad paths/images/ranks, unobserved/closed/changed
+  objects, mismatched launchers, concurrent aliases (one load), seal/reuse,
+  failed-driver cleanup, foreign-hook preservation and three-source graph replacement.
+- Additional evidence: all13 qualified geometry images already exist at their
+  exact original rank-local cache keys with IDENTICAL whole bytes. Checked against
+  both probe outputs and the frozen original file manifest; no debug stripping,
+  binary seeding or new source substitution. This is a known-key binary join,
+  not a replay of old helper hashes after their source freeze was released.
+- Decision: retain CPU-tested diagnostic; next implement private manifests and
+  actual AOT qualification with independent graph-global coverage. Global observer
+  sealing is distinct from target sealing and needs an explicit lifetime in that
+  adapter. No next GPU/model job, throughput result, default or quality promotion.
+- Raw: `perf/results/2026-09-10/runtime-control/rmsnorm-binary-observer-{cpu,final-cpu}.xml`;
+  `rmsnorm-geometry-candidate-cache-check.json`, SHA
+  017120c13bc5fc5b8261903cf8a4dd3ba782b67c00ccfe53a9f58cfcd40a7102.

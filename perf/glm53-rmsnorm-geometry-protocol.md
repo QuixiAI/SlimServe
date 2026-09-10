@@ -235,3 +235,41 @@ consumed, retain object/handle provenance, and tie each graph-held launch callab
 to its observed kernel. Then qualify the multi-target hook against the real AOT
 loader. No additional GPU process is prescribed until that implementation and its
 bounded qualification protocol are ready.
+
+## CPU observer integration checkpoint
+
+The pre-load observer now lives in `benchmarks/kernels/glm53_binary_observer.py`.
+It records the exact private file passed to the real static CUDA load method,
+checks any available raw image against it, and retains strong identity plus the
+resulting module/function handles. Post-load checks require this prior observation;
+they do not guess a disk image. Generated launchers must bind their runner to the
+observed kernel and agree on hash, warps and shared memory. Unobserved loaded
+objects, closed/changed handles, bad paths/images/ranks and late loads after an
+explicit observer seal fail. Hook cleanup preserves prior inherited/local APIs
+and refuses to overwrite a foreign change made while active.
+
+MultiIntervention accepts the observer for binary reads and launcher checks,
+including cached replacements and graph verification. Its own target sealing
+remains separate from the observer's global load seal: do not accidentally forbid
+legitimate non-target graph compilation during future model capture. The actual
+AOT/serving adapter must choose and qualify its hook lifetime explicitly.
+
+CPU tests use the installed StaticTritonCompileResult.make_launcher, generated
+launcher code and StaticallyLaunchedCudaKernel.load_kernel; only the driver is
+mocked. They cover retained/consumed bytes, serialized objects without raw bytes,
+one load under concurrent aliases, changed handles/images/launchers, cleanup,
+and a three-target controller graph substitution followed by sealing/reuse.
+Final related suite254 passed5.75s. This is NOT real GPU/AOT or model qualification.
+No further GPU job is prescribed at this checkpoint.
+
+The known-key cache join also verifies all13 qualified candidate images against
+their exact original rank-local files and both completed probe outputs. Report
+`runtime-control/rmsnorm-geometry-candidate-cache-check.json`, SHA
+`017120c13bc5fc5b8261903cf8a4dd3ba782b67c00ccfe53a9f58cfcd40a7102`.
+It uses completed qualification receipts after their source freeze ended; it
+does not pretend the subsequently edited helper files still match old hashes.
+
+Next implement private manifest preparation and actual AOT-loader adapters/auditor,
+then prescribe the bounded all-rank/control+geometry qualification. Use the proven
+seven-artifact loader path and independently verify actual graph globals. Do not
+substitute static graph references, source probes or callback counts for coverage.
