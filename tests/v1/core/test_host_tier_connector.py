@@ -403,3 +403,34 @@ def test_unstageable_restore_fails_closed():
     assert "r2" not in meta.restores
     assert {300, 301} <= set(meta.failed["r2"])
     assert conn._tracks["r2"].planned_blocks == 0
+
+
+def test_worker_reports_failed_restore_as_invalid_blocks_and_received():
+    """Worker side of fail-closed: the failed span is marked invalid on the
+    DMA (surfacing as invalid_block_ids for the scheduler's recompute policy)
+    and the request is reported received so it leaves WAITING_FOR_REMOTE_KVS."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.host_tier_connector import (
+        HostTierMeta,
+    )
+
+    conn = make_connector()
+    marked: list[int] = []
+    fake_dma = SimpleNamespace(
+        pump=lambda: None,
+        fence_restores=lambda: None,
+        mark_invalid=lambda blocks: marked.extend(blocks),
+        poll_done=lambda: [],
+        issue=lambda batch: None,
+    )
+    conn._dma = fake_dma
+    conn._main_kv_tiered = False
+    conn._failed_recv = set()
+    conn._pending_restore_reqs = {}
+    conn._seq = 0
+    conn._connector_metadata = HostTierMeta(failed={"r9": [5, 6]})
+    conn.start_load_kv(SimpleNamespace())
+    assert marked == [5, 6]
+    _, done = conn.get_finished(set())
+    assert done == {"r9"}
+    _, done_again = conn.get_finished(set())
+    assert done_again is None
