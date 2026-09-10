@@ -26607,3 +26607,33 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - Final CPU200 passed16.62s,14 existing Torch deprecation warnings; lint/diff
   pass. Initial test fixture used a non-hex cache key; corrected to the actual
   API contract, prior failed log retained. Raw `runtime-control/attention-rank-private-{regression,final-regression}.log`.
+
+## 2026-09-10 - Full source-exact attention matrix: RMS512/1536 pass, LayerNorm128 fails
+
+- Status: completed diagnostic; RMS shapes qualified on this matrix, whole
+  matrix NOT accepted. All prescribed kernel attempts/model series terminal.
+- Baseline: ONE7c5a8c603 process,16GiB/swap0,120 predeclared pairs, real layer11
+  weights, packed stride2336 and output gap guards. All16 original source/config/
+  whole-cubin images verify before numerics. No source/default/native/quant change.
+- Correctness: every eager/replay/guard/mutation gate passes. All4 ranks' output
+  hashes/metrics/scalar evidence agree exactly; all30 previous rank0 records
+  exactly reproduced.135 frozen receipts/5172 original files verify, GPUs free.
+- RMS: KV512/Q1536 each <=1 BF16 ULP vs FP64 in both arms. Q1536 bit-exact
+  combo/split over610,172,928 paired elements; KV512 has556/203,390,976 changes.
+  Synthetic source qualification, not model activations or fresh-start proof.
+- LayerNorm:20/120 pairs fail the unchanged1-ULP gate, same five7616-row cases
+  per rank in BOTH arms. Oracle max5 ULP combo/28 split;456/50,847,744 pairwise
+  changes. Probe exits1 as required; audit completes with numerical_pass=False.
+- Local explanation: worst point's0.5742191482235658 weighted term cancels
+  bias-0.57421875. FP64 result3.982235657895572e-7, split4.507601261138916e-7,
+  absolute error5.25365603243344e-8; conditioning ratio2,883,902.4. Confirmed
+  cancellation, not a full-model causal explanation or reason to clear a gate.
+- Decision: no numerical/performance/default promotion. Next CPU work maps
+  broader4096 old/new graph roles/configs, separating those from attention combo,
+  indexer rounding and fresh KDA tuning before a new controlled model experiment.
+  No next GPU job prescribed, no model throughput measured, TC remains0.
+- Raw: `perf/results/2026-09-10/attention-norm-rank-private-probe/summary.json`, SHA
+  64c60102d391baffa7a4391257a9b742ed6932e6aea63cdb8cae77a478880c78;
+  `analysis.json`, SHA0da742b0b8d7eb08651be0b32fff0b7c874aaa87781d01d47ce2ca3877e06bdb;
+  `runtime-control/attention-rank-private-supplement.json`, SHA
+  ca1f301a402d655b0e42db598437615864444b927ac723df4cb7db3f5d283f85.

@@ -35,7 +35,47 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): rank0 numerical result; rank-private probe prepared
+### Latest checkpoint (2026-09-10): full attention matrix audited; RMS shapes pass, LayerNorm does not
+
+ONE rank-private probe on7c5a8c603 completes ALL120 predetermined pairs, after
+all16 exact source/config/cubin images verify. All4 ranks' outputs/metrics agree
+exactly, as do all30 prior rank0 records. All eager/replay/guard/mutation checks
+pass; source/native/compiler135 receipts and5172 original files unchanged.
+GPUs are free. This completes the prescribed probe/audits; NEVER rerun any of
+the four historical attempts or the stopped model series. No next GPU job is
+prescribed. Goal remains ongoing, production/default/TC/quant unchanged.
+
+Synthetic qualification on real layer11 weights:
+
+- KV512 and Q1536 both meet the <=1 BF16 ULP FP64 gate, both arms/all ranks.
+- Q1536 combo/split bit-exact over610,172,928 paired elements. KV512 differs in
+  556/203,390,976 elements, all within the oracle gate.
+- Indexer LayerNorm128 differs in456/50,847,744 paired elements and FAILS its
+  unchanged gate: max5 ULP historical combo/28 split.20/120 pairs fail, the same
+  five large-row input cases per rank, in BOTH arms. Whole matrix NOT qualified.
+
+Worst scalar has confirmed near-zero cancellation: weighted term
+0.5742191482235658 plus bias-0.57421875 gives FP64 3.982235657895572e-7.
+Split emits4.507601261138916e-7, absolute FP64 error5.25365603243344e-8.
+This explains the large ULP count locally, NOT the full-model score-vector
+change; do not widen a tolerance or silently clear the indexer gate.
+
+Raw `perf/results/2026-09-10/attention-norm-rank-private-probe/`;
+summary SHA64c60102d391baffa7a4391257a9b742ed6932e6aea63cdb8cae77a478880c78,
+tracked auditor's analysis SHA0da742b0b8d7eb08651be0b32fff0b7c874aaa87781d01d47ce2ca3877e06bdb.
+Supplement `runtime-control/attention-rank-private-supplement.json`, SHA
+ca1f301a402d655b0e42db598437615864444b927ac723df4cb7db3f5d283f85,
+verifies prior-rank0/cross-rank equality, scalar cancellation, and GPU release.
+
+NEXT: use the recorded4096 body/config inventory to map actual old/new graph
+roles, then isolate those broader reduction choices separately from attention
+combo separation/indexer rounding and fresh KDA autotuning. Numerical sensitivity
+does not establish causality. Q1536 equality here is synthetic, not a blanket
+exoneration on model activations. Existing old/native four-RMSNorm sufficiency
+still applies only to that historical pair. Before any new GPU/model job,
+record a bounded protocol; preserve quality windows, TC0, and selected recipe.
+
+### Previous checkpoint (2026-09-10): rank0 numerical result; rank-private probe prepared
 
 ONE4eb7b664a process completes30 rank0 pairs before stopping at rank1's combo
 byte gate. Rank0 RMS512/1536 both <=1 BF16 ULP vs FP64; Q1536 combo/split exactly

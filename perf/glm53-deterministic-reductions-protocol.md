@@ -630,3 +630,43 @@ After tests/commit, prescribe ONE NEW process, same120 pairs and existing gates:
 Freeze through audit, preserve logs and every failed/partial run. Expected
 LayerNorm failures stay failures; do not clear them to make the matrix pass.
 No subsequent GPU/model job prescribed, no policy/default/performance promotion.
+
+## Full rank-private attention matrix completed (2026-09-10; all attempts terminal)
+
+ONE7c5a8c603 process completes all120 fixed pairs. All16 original source/config/
+whole-cubin images verify BEFORE numerics. All repeated eager/changed-input graph/
+guard/mutation checks pass. Four ranks exactly agree on every output hash,
+oracle/pair metric and scalar evidence, and the earlier30 rank0 records exactly
+repeat.135 source/compiler/native receipts and5172 original cache files verify;
+final independent GPU query empty. No serving run, benchmark, or speed claim.
+
+KV512/Q1536 are source-exact qualified on this synthetic matrix/real layer11
+weights: both arms max1 BF16 ULP vs FP64. Q1536 matches bit-for-bit over610,172,928
+paired elements; KV512 has556 changes over203,390,976. This does not qualify all
+model activations, frontend policies, or cross-start serving behavior.
+
+LayerNorm128 does NOT qualify:20/120 pairs fail, identical five7616-row cases per
+rank, in both arms. Oracle max5 ULP combo/28 split;456 pairwise element changes
+over50,847,744. The matrix exits1 as prescribed for numerical failures, and its
+audit completes with numerical_pass=False. Do not replace failed cases or widen
+the gate. This is not a new regression introduced by the probe cache fix.
+
+Worst split point (seed530901+100, magnitude0.125, row4225/column60) is verified
+on CPU from the frozen packed input/real weights: weighted term0.5742191482235658
+plus bias-0.57421875 gives FP64 3.982235657895572e-7, BF16 oracle
+3.986060619354248e-7, actual4.507601261138916e-7. Absolute FP64 error
+5.25365603243344e-8; cancellation ratio2,883,902.4. This establishes local
+near-zero sensitivity, NOT the cause of the full-model score-window failures.
+
+Raw `attention-norm-rank-private-probe/summary.json`, SHA
+64c60102d391baffa7a4391257a9b742ed6932e6aea63cdb8cae77a478880c78;
+`analysis.json`, SHA0da742b0b8d7eb08651be0b32fff0b7c874aaa87781d01d47ce2ca3877e06bdb.
+Supplement `runtime-control/attention-rank-private-supplement.json`, SHA
+ca1f301a402d655b0e42db598437615864444b927ac723df4cb7db3f5d283f85,
+checks all prior-rank0/cross-rank records, conditioning and GPU release.
+
+All four kernel attempts are now TERMINAL; none may be silently retried. Both
+full-model deterministic series also remain stopped. No next GPU/model job is
+prescribed. Next work is CPU graph-role mapping of broader4096 launch changes
+and a separate causal design for indexer/attention fusion/KDA confounders. No
+default, TC, quant, quality-window or performance-baseline change follows here.
