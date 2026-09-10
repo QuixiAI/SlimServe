@@ -35,7 +35,22 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): full-model v3 complete; geometry candidate rejected
+### Latest checkpoint (2026-09-10): remaining KDA choice inventory complete
+
+Geometry rejection recorded in e427bd85b (Auroter author/committer). CPU inventory
+now verifies72 retained KDA tuning files against24 original rank-private files.
+Failed fresh shared cache differs in19/24 rank/kernel choices across five kernels.
+Earliest is gate/cumsum: BS32/stages3 fixed, eight -> two warps on every rank.
+Shared disk winners are NOT historical per-rank launch receipts; do not infer
+model causality or call these timings serving TPS. CPU16pass0.09s, no GPU run.
+
+NEXT: prepare isolated gate/cumsum comparison before further model execution.
+Actual CUDA path re-exports kimi_k3/amd/ops/third_party/kda; generic FLA kda.py
+is not the serving implementation. Protocol/evidence boundaries and raw receipt
+are in perf/glm53-kda-choice-protocol.md. No next GPU command prescribed yet.
+Quant/default/native libraries unchanged; every failed quality gate remains failed.
+
+### Previous checkpoint (2026-09-10): full-model v3 complete; geometry candidate rejected
 
 On `ce6df61aa`, exactly the prescribed control -> geometry -> return-control
 starts completed, each followed by successful independent worker/workload audits

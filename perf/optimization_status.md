@@ -27165,3 +27165,24 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   each case's `workload-analysis.json`, `worker-analysis.json`, `launch.json` and
   referenced raw/cache files. Consume completed receipts; do not rerun old frozen
   readers after later commits. Detailed protocol/table at geometry notebook tail.
+
+## 2026-09-10 - Inventory remaining KDA disk choices after geometry rejection
+
+- Status: CPU diagnostic complete; no serving/kernel/default changes.
+- Baseline: completed geometry v3 versus failed no-combo fresh shared cache.
+- Result: all72 series tuning files exactly match24 original rank-private files.
+  Six tuning keys/ordered candidate sets agree;19/24 rank/kernel winners differ
+  across five kernels. Gate/cumsum is the earliest: eight -> two warps, BS32,
+  three stages fixed. Intra/recompute/state/output also differ; inter solve does not.
+- Evidence limit: series files are closure-pinned; failed shared tuning files
+  are hashed now and do not establish per-rank live winners. Disk/cache presence
+  is not a launch receipt. No full-model cause or speed/quality result inferred.
+- Correctness: CPU16pass0.09s; installed Triton selection semantics, hash/path
+  checks, complete matrices, duplicates and incompatible domains tested.
+- Decision: prepare isolated gate/cumsum arithmetic test before another model
+  start. Actual CUDA import re-exports the kimi_k3 AMD-organized pure Triton tree.
+  No GPU job yet prescribed; geometry/indexer/no-combo gates remain failed.
+- Raw: runtime-control/kda-{choices-cpu.xml,disk-choice-analysis.json} under
+  perf/results/2026-09-10; analysis SHA
+  744500910b0930425294a1cf425cc05bf51a7a59a5f31d59639c2515f525984b.
+  Details: perf/glm53-kda-choice-protocol.md.
