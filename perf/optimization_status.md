@@ -27829,3 +27829,25 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - Raw: `perf/results/2026-09-10/prompt-scores-gpu-v1/result.json`, SHA
   68b82a83a8a7bc0ba8cc9b4ae349e6de6a0882f280e51edfec41aa99993cc271.
   Full protocol and ranges: `perf/glm53-prompt-score-protocol.md`.
+
+## 2026-09-10 - Integrate bounded prompt scoring with unchanged model kernels
+
+- Status: CPU-qualified opt-in; prescribed real-profile series pending.
+- Baseline/hypothesis: fixed recipe v1/SM120 TP4, unchanged original AOT kernels.
+  The isolated 86.5% score-scratch reduction should eliminate common recovered
+  allocation warnings while preserving every quality score and serving timing.
+- Change: runtime-only GLM53 flag selects1024-row helper after full projection;
+  no small-request/journal/TP-gather/quant/native/compiler/default changes. New
+  serving schema reuses the qualified no-op loader and independent capture audit
+  in all three arms. Quality wall time recorded separately, including failures.
+- Correctness: final521 CPU tests pass/24.24s,14 upstream warnings; runner request
+  lifecycle, preparation/flag admission, source-bound caches, existing controller
+  and kernel lifecycle regressions. Earlier two fixture failures retained/fixed.
+  Inspection verifies1,042 receipts and5,172 original files; no cache/GPU job.
+- Decision: commit then exactly control/chunked/return, one private cache/start,
+  three workload repeats. Full per-token historical equality mandatory in EVERY
+  arm; all unchanged quality, text/image, cold32K/128K and timing gates. No retries.
+  CPU8GiB/serve150GiB/swap0; source freeze from preparation through closure.
+- Raw: `runtime-control/prompt-score-serving-cpu-v3.xml`, inspection SHA
+  834a1d92415f21eb491b3602918cc894778e4e57d02e2397cfb382ef3aaf44d9 under2026-09-10.
+  Full commands and CPU history: `perf/glm53-prompt-score-protocol.md`.

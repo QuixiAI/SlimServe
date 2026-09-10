@@ -144,13 +144,17 @@ def audit_worker(path, manifest, rank):
         if manifest.get("serving_schema") in (
             "glm53-kv-serving-v1",
             "glm53-indexer-correction-serving-v1",
+            "glm53-prompt-score-serving-v1",
         ):
             from benchmarks.kernels.audit_glm53_kv_loader import (
                 check_graph_records as graph_checker,
             )
 
             target_events = read(folder / "loader-events.jsonl", True)
-            if manifest["serving_schema"] == "glm53-indexer-correction-serving-v1":
+            if manifest["serving_schema"] in (
+                "glm53-indexer-correction-serving-v1",
+                "glm53-prompt-score-serving-v1",
+            ):
                 from benchmarks.kernels import audit_glm53_indexer_correction_loader
                 from benchmarks.kernels.glm53_indexer_correction_serving import (
                     check_runtime_records,

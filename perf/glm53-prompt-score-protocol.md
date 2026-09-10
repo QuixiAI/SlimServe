@@ -1,7 +1,7 @@
 # GLM53 bounded prompt-score qualification
 
-Status: CPU and isolated CUDA exactness/memory gates pass; source freeze ended.
-The helper is not installed in serving. No quant, profile or native changes.
+Status: isolated CUDA and final521-test CPU integration gates pass; real serving
+series prescribed below. No quant, profile, production-default or native changes.
 
 ## Hypothesis and scope
 
@@ -49,7 +49,7 @@ runner with small-request/journal semantics intact. Then prescribe a real fixed
 `glm53-nvfp4-4`/`rtx6000`, recipe v1 control/candidate/return comparison with
 unchanged quality gates, exact per-token score comparison, text/image canaries,
 cold exact-token throughput and allocation-warning census. No serving promotion
-based on the isolated probe. No serving process is prescribed by this document yet.
+based on the isolated probe. The concrete serving prescription is below.
 
 ## CPU result
 
@@ -79,3 +79,66 @@ The chunked trace instead contains16 score allocations, maximum634,388,480 bytes
 explains the4,718,592,000-byte control blocks. This establishes isolated operation
 attribution, not an actual live-server OOM stack. Serving integration and warning
 elimination remain pending; profile/default/baseline are unchanged.
+
+## Opt-in runner integration
+
+`SLIMSERVE_GLM53_PROMPT_SCORE_CHUNKS=1` selects the qualified1024-row helper only
+for GLM53 prompt-score chunks larger than1024. Absent/0 is the existing path.
+The entire vocabulary projection, TP gather, small-request operations, bounded
+score journal and asynchronous CPU transfers remain unchanged. No dtype change.
+The knob is outside the compiled model/AOT cache key. An initially explored
+generic vLLM environment setting was removed before GPU/serving use to preserve
+the existing compiled-model environment and source identity.
+
+The distinct `SLIMSERVE_GLM53_PROMPT_SCORE_DIAGNOSTIC=control` schema reuses the
+qualified no-op indexer loader, private-cache relocation, scheduler/capture checks
+and independent graph audit in EVERY arm. It does not activate indexer correction
+or allocate selection arenas. Completed AOT evidence and the isolated scoring
+receipt are pinned inputs; old frozen validators are not rerun. Chunked is held
+to the same exact historical token-score requirement as both controls.
+
+## Prescribed serving series v1
+
+After the complete CPU gate and commit: exactly control -> chunked -> return-control,
+one private copied original-AOT namespace/start each, chunk flags0/1/0. All model
+kernels must remain at their qualified original bindings. No fresh-compilation,
+arithmetic replacement, retry, replacement start, cache deletion or quality waiver.
+Stop on any failure and close/audit the partial series before source edits.
+
+Fixed profile `glm53-nvfp4-4`/`rtx6000`, recipe v1, TP4 Marlin, no EP/speculation,
+BF16 activation/KV/lm_head, native-order1/BF16fn1/TC0 diagnostic reference. Registry
+discovery must still identify the exact compatible profile. Three repeats each of
+exact1000/300 cold-prefix c1/c8/c16; three4096-token text/168-token needle quality
+passes, text/image canaries, and three cold32K/128K requests. All per-token quality
+vectors must equal the historical original exactly. Census every allocation warning
+per arm; report quality-scoring timing separately from decode/prefill timing.
+
+CPU prepare/controller/audits8GiB, serving150GiB, swap0. No native builds or other
+GPU jobs. Freeze all source/docs/commits from preparation through successful closure
+or audited terminal failure. Private copies and all failed artifacts are retained.
+
+```bash
+systemd-run --user --scope --unit=glm53-prompt-score-serving-v1-prepare -p MemoryMax=8G -p MemorySwapMax=0 env CUDA_VISIBLE_DEVICES= PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 .venv/bin/python -m benchmarks.kernels.prepare_glm53_prompt_score_serving --output perf/results/2026-09-10/prompt-score-serving-v1
+
+systemd-run --user --scope --unit=glm53-prompt-score-serving-v1-controller -p MemoryMax=8G -p MemorySwapMax=0 env CUDA_VISIBLE_DEVICES= PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 bash -c 'for prompt_score_case in control chunked return-control; do .venv/bin/python -m benchmarks.kernels.run_glm53_geometry_serving launch "perf/results/2026-09-10/prompt-score-serving-v1/${prompt_score_case}/manifest.json" || exit "$?"; done'
+
+systemd-run --user --scope --unit=glm53-prompt-score-serving-v1-close -p MemoryMax=8G -p MemorySwapMax=0 env CUDA_VISIBLE_DEVICES= PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 .venv/bin/python -m benchmarks.kernels.run_glm53_geometry_serving close perf/results/2026-09-10/prompt-score-serving-v1
+```
+
+CPU history: runner-v1 252 pass/8.93s; runtime-only runner-v2 plus campaign323
+pass/14.65s. First serving CPU gate387 pass/two fixture failures: missing required
+native-order env in the conflict test and an accidentally matching empty inventory
+in the predecessor test; corrected in tests. Raw XMLs remain under
+`perf/results/2026-09-10/runtime-control/prompt-score-*.xml`.
+
+Final521 CPU tests pass/24.24s,14 upstream Torch deprecation warnings (v3 XML).
+Previous expanded v2 gate519 pass/24.28s. The extra final tests cover diagnostic
+classification and single installation of the unchanged loader; per-quality-pass
+wall timing is recorded for successful and failed passes. Ruff/diff pass.
+Inspection joins1,042 source/evidence receipts and5,172 original cache files,
+without preparing a cache or launching a server. Inspection SHA
+834a1d92415f21eb491b3602918cc894778e4e57d02e2397cfb382ef3aaf44d9, raw
+`runtime-control/prompt-score-serving-inspect-v1.json` under2026-09-10.
+This inspection precedes the final timing/test edits; preparation pins committed
+current bytes. Original helper/Sampler/rank implementation hashes must match the
+completed isolated GPU receipt before any serving arm is admitted.

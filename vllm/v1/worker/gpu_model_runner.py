@@ -1021,6 +1021,11 @@ class GPUModelRunner(
         )
 
         install_indexer_correction(self)
+        from slimserve.prompt_score_diagnostic import (
+            install as install_prompt_score_diagnostic,
+        )
+
+        install_prompt_score_diagnostic(self)
         from slimserve.kv_diagnostic import install as install_kv_diagnostic
 
         install_kv_diagnostic(self)
@@ -5904,6 +5909,21 @@ class GPUModelRunner(
         if not num_prompt_logprobs_dict:
             return {}
 
+        # Runtime-only scoring policy, outside the compiled model/AOT key.
+        chunk_flag = os.getenv("SLIMSERVE_GLM53_PROMPT_SCORE_CHUNKS", "0")
+        if chunk_flag not in ("0", "1"):
+            raise ValueError("SLIMSERVE_GLM53_PROMPT_SCORE_CHUNKS must be 0 or 1")
+        chunk_rows = 0
+        if chunk_flag == "1":
+            from vllm.v1.sample.prompt_logprobs import CHUNK_ROWS
+
+            if getattr(self.model_config.hf_config, "model_type", None) not in (
+                "glm5_next",
+                "glm5_next_text",
+            ):
+                raise ValueError("prompt-score chunks are qualified for GLM53 only")
+            chunk_rows = CHUNK_ROWS
+
         if not hasattr(self, "_slimserve_score_journal"):
             from slimserve.score_journal import ScoreJournal
 
@@ -5999,16 +6019,33 @@ class GPUModelRunner(
             # Compute prompt scores respecting logprobs_mode.
             # NOTE: prompt tokens skip sampling processors, so
             # processed_* and raw_* yield the same scores here.
-            if self.model_config.logprobs_mode in ("raw_logits", "processed_logits"):
-                scores = logits.to(torch.float32)
+            if chunk_rows and num_logits > chunk_rows and trace_match is None:
+                from vllm.v1.sample.prompt_logprobs import gather_prompt_logprobs
+
+                token_ids, logprobs, ranks, _ = gather_prompt_logprobs(
+                    logits,
+                    tgt_token_ids,
+                    num_prompt_logprobs,
+                    self.model_config.logprobs_mode,
+                    sampler=self.sampler,
+                    chunk_rows=chunk_rows,
+                )
             else:
-                scores = self.sampler.compute_logprobs(logits)
-            if trace_match is not None:
-                score_journal.record(trace_match, "scores", scores)
-                score_journal.record(trace_match, "target_token_ids", tgt_token_ids)
-            token_ids, logprobs, ranks, _ = self.sampler.gather_logprobs(
-                scores, num_prompt_logprobs, tgt_token_ids
-            )
+                # Small requests and the bounded 639-row diagnostic journal keep
+                # the original operations and score-stage fingerprints.
+                if self.model_config.logprobs_mode in (
+                    "raw_logits",
+                    "processed_logits",
+                ):
+                    scores = logits.to(torch.float32)
+                else:
+                    scores = self.sampler.compute_logprobs(logits)
+                if trace_match is not None:
+                    score_journal.record(trace_match, "scores", scores)
+                    score_journal.record(trace_match, "target_token_ids", tgt_token_ids)
+                token_ids, logprobs, ranks, _ = self.sampler.gather_logprobs(
+                    scores, num_prompt_logprobs, tgt_token_ids
+                )
             if trace_match is not None:
                 score_journal.record(trace_match, "selected_logprobs", logprobs)
                 score_journal.finish(trace_match)

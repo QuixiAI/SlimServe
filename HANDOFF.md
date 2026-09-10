@@ -35,7 +35,22 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): prompt-score scratch bounded, CUDA-qualified
+### Latest checkpoint (2026-09-10): prompt-score serving integration CPU-qualified
+
+Opt-in `SLIMSERVE_GLM53_PROMPT_SCORE_CHUNKS=1` wires the qualified helper into
+GLM53 requests>1024 rows; complete projection/TP gather, small requests, journal
+and async transfers unchanged. Defaults remain off; no quant/native/compiler
+change. Distinct prompt-score diagnostic uses the exact qualified no-op indexer
+loader and independent graph/lifecycle audits in every arm, not correction.
+Final521 CPU tests pass/24.24s; inspection joins1,042 receipts/5,172 original files.
+No serving process has launched yet. NEXT after commit: prepare, then exactly
+control/chunked/return-control, one private original-AOT cache/start each. Every
+arm must match historical full token-score vectors exactly. Three repeats of
+exact1000/300 c1/c8/c16, text/image, quality and cold32K/128K; census allocation
+warnings and record quality-pass wall timing. Full commands/resource limits and
+failure history: `perf/glm53-prompt-score-protocol.md`. Freeze through closure.
+
+### Previous checkpoint (2026-09-10): prompt-score scratch bounded, CUDA-qualified
 
 Uninstalled helper `vllm/v1/sample/prompt_logprobs.py` chunks only post-projection
 scoring into1024 rows with the existing sampler operations. CPU184 pass; exactly

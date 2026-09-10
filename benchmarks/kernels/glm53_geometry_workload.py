@@ -185,6 +185,11 @@ def expected_environment(path, manifest):
         "TRITON_CACHE_AUTOTUNING": "1",
         policy.FLAG: manifest["mode"],
         policy.MANIFEST: str(path),
+        **(
+            {policy.CHUNKS: "1" if manifest["label"] == "chunked" else "0"}
+            if hasattr(policy, "CHUNKS")
+            else {}
+        ),
     }
 
 
@@ -284,7 +289,8 @@ def check_summary(path, manifest, summary):
 
 def check_scores(label, documents, scores, reference_docs, reference_scores):
     require(
-        label in ("control", "return-control", "geometry", "kv", "correction"),
+        label
+        in ("control", "return-control", "geometry", "kv", "correction", "chunked"),
         "unknown causal arm",
     )
     identity = input_identity(reference_docs["control"][0])
@@ -304,7 +310,7 @@ def check_scores(label, documents, scores, reference_docs, reference_scores):
             text=delta_summary(rows[0]["text"], scores[0]["text"]),
             needles=delta_summary(rows[0]["needles"], scores[0]["needles"]),
         )
-    control = label in ("control", "return-control")
+    control = label in ("control", "return-control", "chunked")
     # A candidate quality regression is retained as a diagnostic observation. The
     # existing floors are evaluated unchanged and never labelled a quality pass.
     passed = repeated and (
