@@ -24106,3 +24106,9 @@ restart is the operator's call.
   overflow the 64-token capture set). k=3 is the small-batch choice; a
   per-batch schedule arm (k=3 to 8 requests, k=1 above, capture 128,
   c1..c64) decides the drop point. Raw: glm53f-dflash2/d5/.
+- Per-batch schedule: the V2 DFlash speculator drafts a FIXED block and
+  asserts on any partial k ("DFlash drafts a fixed block of 3; the
+  scheduler asked for num_steps=1"), so [[1,8,3],[9,64,1]] died at c16
+  (c1 156.8 / c8 482.6 before the death). Its own contract: schedules pair
+  k with 0 only (the runner skips drafting above the range). Rerunning
+  as [[1,8,3],[9,64,0]] through c64. Raw: glm53f-dflash2/sched3-1/.
