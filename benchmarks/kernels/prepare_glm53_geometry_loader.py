@@ -41,6 +41,7 @@ def loader_source_files():
         "torch._inductor.triton_bundler",
         "torch._inductor.runtime.cache_dir_utils",
         "torch._inductor.output_code",
+        "torch._inductor.utils",
         "torch._dynamo.aot_compile_types",
         "torch._functorch._aot_autograd.aot_autograd_result",
     )

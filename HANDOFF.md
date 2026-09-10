@@ -35,7 +35,34 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): artifact-root provenance CPU gate passed; NEW v5 prescribed
+### Latest checkpoint (2026-09-10): v5 terminal; exact writeback closure supported; NEW v6 prescribed
+
+v5 on838689c68 stops after ONE control-rank0. Seven artifact/root bindings verify
+during deserialization; all7 artifacts/46 entries load,26 CUDA images and17 imported
+module sources match originals. Post-load exact-call identity gate fails.205 frozen
+sources/5172 original files verify, GPUs released, other seven never launched.
+Closure `rmsnorm-geometry-aot-qualification-v5/closure.json`, SHA
+45c52321b9d81db6b151344f67a9a4d17c429be404daef8cb14c277c9541b09a.
+v1-v5 terminal; all32 private caches from v2-v5 retained; freeze ended.
+
+CPU replay of actual Torch post_compile on ALL28 serialized graphs, with inert
+sentinel calls/no GPU, creates20 alignment/writeback wrappers and keeps8 direct
+calls. Each wrapper closes over the original call and exact mutated input[4].
+`runtime-control/geometry-post-compile-cpu.json`, SHA
+5f358d74cf27baa047a585cfff440af2543f8142e2aee1680a29624f0f264fa6.
+This explains a legitimate identity transition, but v5 did not retain the final
+call's closure, so the next live gate must prove that exact transition.
+
+Observer now records post-load state BEFORE rejection and accepts ONLY the
+installed writeback code/globals/source plus exact original call, mutation object,
+indices and serialized alignment plan. Direct-call roots still require identity;
+unknown/nested/mutated wrappers reject. Related CPU324 pass7.23s,14 new negative
+closure/receipt tests; `runtime-control/geometry-writeback-cpu.xml`. No kernel math,
+serving default, quant or quality changes. NEXT after commit: NEW v6 same eight
+conditional no-weights loads at protocol tail, fresh copies, frozen through closure,
+16GiB GPU/8GiB CPU/swap0. Stop on failure; no model series or performance claim.
+
+### Previous checkpoint (2026-09-10): artifact-root provenance CPU gate passed; v5 prescribed (now stopped)
 
 All28 serialized model roots (seven/rank) have exact original source bytes/keys;
 each rank's46 submodule entries map to its seven roots. CPU inspection only, no

@@ -13,6 +13,7 @@ import threading
 from contextlib import contextmanager
 from functools import wraps
 from pathlib import Path
+from types import CodeType
 
 from benchmarks.kernels.audit_glm53_geometry_graphs import verify_call_export
 from benchmarks.kernels.check_glm53_attention_norms import require
@@ -21,6 +22,89 @@ from slimserve.rmsnorm_diagnostic import sha
 
 def digest_bytes(data):
     return hashlib.sha256(data).hexdigest()
+
+
+def alignment_plan(graph):
+    return dict(
+        inputs_to_check=list(graph.inputs_to_check),
+        mutated_input_idxs=list(graph.mutated_input_idxs),
+        defers_input_alignment=graph._defers_input_alignment,
+        wrap_compiled_regions=graph._wrap_compiled_regions,
+    )
+
+
+def post_compile_state(graph, original_call):
+    """Record the specific upstream writeback wrapper without invoking it."""
+    import torch._inductor.utils as utils
+
+    call = graph.current_callable
+    code = getattr(call, "__code__", None)
+    wrapper_codes = [
+        c
+        for c in utils.align_inputs_from_check_idxs.__code__.co_consts
+        if isinstance(c, CodeType) and c.co_name == "run"
+    ]
+    closure = dict(
+        zip(
+            getattr(code, "co_freevars", ()),
+            (c.cell_contents for c in getattr(call, "__closure__", None) or ()),
+        )
+    )
+    known = len(wrapper_codes) == 1 and code is wrapper_codes[0]
+    return dict(
+        alignment=alignment_plan(graph),
+        direct=call is original_call,
+        exact_writeback_code=known,
+        exact_writeback_globals=getattr(call, "__globals__", None) is vars(utils),
+        closure_names=list(closure),
+        closure_model_is_original=closure.get("model") is original_call,
+        closure_mutations_are_graph=closure.get("mutated_input_idxs")
+        is graph.mutated_input_idxs,
+        closure_inputs_to_check=list(closure["inputs_to_check"]) if known else None,
+        closure_mutated_input_idxs=list(closure["mutated_input_idxs"])
+        if known
+        else None,
+        callable_filename=getattr(code, "co_filename", None),
+        callable_line=getattr(code, "co_firstlineno", None),
+        wrapper_source_sha256=sha(utils.__file__) if known else None,
+    )
+
+
+def check_post_compile_state(expected, state):
+    require(state["alignment"] == expected, "live alignment plan changed")
+    require(
+        not expected["wrap_compiled_regions"], "unqualified compiled-region wrapper"
+    )
+    indices = expected["inputs_to_check"]
+    if expected["defers_input_alignment"]:
+        indices = [i for i in indices if i in expected["mutated_input_idxs"]]
+    if not indices:
+        require(state["direct"], "unexpected post-compile callable wrapper")
+        return
+    import torch._inductor.utils as utils
+
+    (code,) = [
+        c
+        for c in utils.align_inputs_from_check_idxs.__code__.co_consts
+        if isinstance(c, CodeType) and c.co_name == "run"
+    ]
+    require(
+        not state["direct"]
+        and state["exact_writeback_code"]
+        and state["exact_writeback_globals"]
+        and state["closure_names"] == ["inputs_to_check", "model", "mutated_input_idxs"]
+        and state["closure_model_is_original"]
+        and state["closure_mutations_are_graph"]
+        and state["closure_inputs_to_check"] == indices
+        and state["closure_mutated_input_idxs"] == expected["mutated_input_idxs"],
+        "post-compile callable is not the exact original-root writeback wrapper",
+    )
+    require(
+        state["callable_filename"] == code.co_filename
+        and state["callable_line"] == code.co_firstlineno
+        and state["wrapper_source_sha256"] == sha(utils.__file__),
+        "writeback wrapper source receipt changed",
+    )
 
 
 def read_store(model):
@@ -84,6 +168,7 @@ def discover(store, namespace, expected_graphs):
                 cache_key=key,
                 graph=relative,
                 graph_sha256=source_hash,
+                alignment=alignment_plan(graph),
                 submodules=sorted(
                     k for k, v in store.submodule_bytes.items() if v == artifact
                 ),
@@ -130,6 +215,7 @@ class ArtifactRootObserver:
         self.local = threading.local()
         self.lock = threading.RLock()
         self.started, self.completed, self.bindings = set(), {}, {}
+        self.post_states = {}
 
     def bind(self, graph, path, modules):
         row = getattr(self.local, "artifact", None)
@@ -253,12 +339,36 @@ class ArtifactRootObserver:
         roots = []
         for artifact in sorted(expected):
             graph, module, call = self.bindings[artifact]
-            require(
-                store.loaded_submodule_store[artifact] is self.completed[artifact]
-                and any(module is m for m in modules)
-                and graph.current_callable is call is module.call
-                and graph.compiled_fn_runner is getattr(module, "runner", None),
-                "completed artifact/root callable binding changed",
+            row = next(r for r in self.expected.values() if r["artifact"] == artifact)
+            state = dict(
+                returned_artifact_is_original=store.loaded_submodule_store[artifact]
+                is self.completed[artifact],
+                module_in_cache=any(module is m for m in modules),
+                module_export_is_original=module.call is call,
+                runner_is_original=graph.compiled_fn_runner
+                is getattr(module, "runner", None),
+                **post_compile_state(graph, call),
             )
+            if artifact not in self.post_states:
+                # Preserve detailed state BEFORE rejecting any post-load change.
+                self.emit(dict(event="artifact_post_compile_state", state=state, **row))
+                self.post_states[artifact] = state
+            require(
+                state == self.post_states[artifact],
+                "post-compile binding changed during audit",
+            )
+            require(
+                all(
+                    state[k]
+                    for k in (
+                        "returned_artifact_is_original",
+                        "module_in_cache",
+                        "module_export_is_original",
+                        "runner_is_original",
+                    )
+                ),
+                f"completed artifact/root binding changed: {artifact}",
+            )
+            check_post_compile_state(row["alignment"], state)
             roots.append(module)
         return roots

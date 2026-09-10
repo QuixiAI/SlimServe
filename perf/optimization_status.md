@@ -26972,3 +26972,29 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - Raw: `runtime-control/geometry-artifact-roots-all-ranks.json`, SHA
   33db464e59736405d7893e3c45ffb152403c2be16599b5db55ca56b4ae8ba10a;
   `geometry-artifact-root-{binding,binding-final,real-store}-cpu.xml`; protocol tail.
+
+## 2026-09-10 - v5 root binding gate encounters Torch's normal writeback wrapper
+
+- Status: v5 terminal; wrapper-aware CPU gates pass; NEW v6 prescribed.
+- Baseline/hypothesis: observed original artifact root calls need a verified path
+  through post_compile, which can legitimately wrap the callable for writeback.
+- Result: ONE control-rank0 on838689c68 verifies7 deserialize root bindings and
+  loads7 artifacts/46 entries,26 original-exact CUDA images and17 original-exact
+  module sources. Post-load call identity gate fails; no final closure captured.
+  Load/audit exit1, remaining seven cases unlaunched.205 sources/5172 original
+  files unchanged, GPUs free;32 private caches from v2-v5 retained. Freeze ended.
+- CPU diagnosis: actual post_compile on28 serialized graphs with inert sentinel
+  calls produces20 writeback wrappers (five/rank) and8 direct calls. Exact sentinel
+  retained in each closure; mutated input[4]. No GPU or graph calls. This is a
+  supported mechanism, not proof of the unrecorded final v5 callable's identity.
+- Fix: record final-state details before validation; accept only actual upstream
+  writeback code/globals/source, original model closure, mutation object/indices,
+  and frozen serialized alignment plan. Reject arbitrary/nested/changed wrappers.
+  Related CPU324 pass7.23s, including14 new negative closure/receipt checks; lint
+  and diff pass. No serving/kernel math/native/quant/default/quality change.
+- Decision: commit, freeze, NEW v6 identical eight-case matrix on new private
+  copies. Stop on any failure; old series remain terminal; no model/TPS claim.
+- Raw: v5 closure SHA45c52321b9d81db6b151344f67a9a4d17c429be404daef8cb14c277c9541b09a;
+  `runtime-control/geometry-post-compile-cpu.json`, SHA
+  5f358d74cf27baa047a585cfff440af2543f8142e2aee1680a29624f0f264fa6;
+  `runtime-control/geometry-writeback-cpu.xml`.

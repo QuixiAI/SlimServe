@@ -235,7 +235,7 @@ def test_real_torch_loader_module_resolution_and_full_private_preparation(
     from tests.slimserve.test_artifact_roots import serialized_fixture
 
     paths = loader_source_files()
-    assert len(paths) == 8 and all(p.is_file() for p in paths)
+    assert len(paths) == 9 and all(p.is_file() for p in paths)
     assert "standalone_compile.py" in {p.name for p in paths}
     old, binaries = qualified_fixture(tmp_path)
     targets = qualified_targets(old, binaries)

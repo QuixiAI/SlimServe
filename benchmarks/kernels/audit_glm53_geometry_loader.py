@@ -20,6 +20,7 @@ from benchmarks.kernels.check_glm53_geometry_loader import (
     read_manifest,
 )
 from benchmarks.kernels.check_glm53_rmsnorm_geometry import write_new
+from benchmarks.kernels.glm53_artifact_roots import check_post_compile_state
 from slimserve.rmsnorm_diagnostic import expected_receipt, sha
 
 
@@ -87,6 +88,21 @@ def check_root_records(manifest, graphs, modules, events):
                 "artifact root does not join actual loaded module",
             )
             bound[key] = event["module_index"]
+        if event["event"] == "artifact_post_compile_state":
+            state = event["state"]
+            check_post_compile_state(by_artifact[key]["alignment"], state)
+            require(
+                all(
+                    state[k]
+                    for k in (
+                        "returned_artifact_is_original",
+                        "module_in_cache",
+                        "module_export_is_original",
+                        "runner_is_original",
+                    )
+                ),
+                "completed artifact binding differs from its observed root",
+            )
     require(
         all(
             p
@@ -94,6 +110,7 @@ def check_root_records(manifest, graphs, modules, events):
                 "artifact_deserialize_begin",
                 "artifact_root_bound",
                 "artifact_deserialize_complete",
+                "artifact_post_compile_state",
             ]
             for p in phases.values()
         )

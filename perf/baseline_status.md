@@ -1920,9 +1920,11 @@ graph capture for the hybrid GDN+MTP decode, Gemma-aware fused norm+quant.
 ## GLM-5.3-Flash NVFP4 (glm53-nvfp4-4 / glm53-nvfp4-8, A100; glm53-nvfp4-4 rtx6000)
 
 2026-09-10 diagnostic status: broader RMSNorm source qualification is complete.
-Actual no-weights AOT qualification v4 loads seven rank0 artifacts, but fails its
-independent inventory's graph/helper classification. It is terminal, not a passed
-graph-coverage or full-model causal result. No new TPS baseline or production
+Actual no-weights AOT qualification v5 verifies seven rank0 root bindings during
+deserialization but fails its post-processing call identity gate. CPU inspection
+reproduces Torch's normal alignment/writeback wrapper; its exact live closure still
+needs qualification. v5 is terminal, not a passed full-coverage or model causal
+result. No new TPS baseline or production
 promotion follows. Selected recipe and quality gates remain unchanged; current
 diagnostic details are in HANDOFF and the geometry protocol.
 

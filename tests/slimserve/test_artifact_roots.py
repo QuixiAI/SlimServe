@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import copy
 import pickle
-from types import SimpleNamespace
+from types import FunctionType, SimpleNamespace
 
 import pytest
 from torch._functorch._aot_autograd.aot_autograd_result import (
@@ -9,8 +9,10 @@ from torch._functorch._aot_autograd.aot_autograd_result import (
     BundledCompiledForward,
 )
 from torch._inductor.codecache import PyCodeCache
-from torch._inductor.output_code import CompiledFxGraph
+from torch._inductor.output_code import CompiledFxGraph, maybe_realign_inputs
 from torch._inductor.standalone_compile import AOTCompiledArtifact
+from torch._inductor.utils import BoxedBool
+from torch.utils._ordered_set import OrderedSet
 
 from benchmarks.kernels.audit_glm53_geometry_loader import check_root_records
 from benchmarks.kernels.glm53_artifact_roots import (
@@ -46,6 +48,10 @@ def serialized_fixture(namespace, count=2, rank=0):
         graph.cache_linemap = []
         graph.current_callable = None
         graph.compiled_fn_runner = None
+        graph.inputs_to_check = [0, 4]
+        graph.mutated_input_idxs = OrderedSet([4] if index % 2 else [])
+        graph._defers_input_alignment = True
+        graph._wrap_compiled_regions = False
         forward = BundledCompiledForward.__new__(BundledCompiledForward)
         forward.result = graph
         entry = BundledAOTAutogradResult.__new__(BundledAOTAutogradResult)
@@ -128,6 +134,9 @@ def live_fixture(tmp_path, monkeypatch):
     def deserialize(data):
         graph = pickle.loads(data)[0].compiled_fw.result
         graph.after_deserialization(SimpleNamespace(unwrap=lambda g: {}))
+        maybe_realign_inputs(
+            BoxedBool(False), graph, graph.inputs_to_check, graph.mutated_input_idxs
+        )
         return SimpleNamespace(graph=graph)
 
     # Real vLLM concurrent load_all, CompiledFxGraph.after_deserialization,
@@ -292,5 +301,69 @@ def test_live_artifact_observer_rejects_drift(tmp_path, monkeypatch, change):
             ):
                 pass
             return
-        with pytest.raises(ValueError, match="binding changed"):
+        with pytest.raises(ValueError):
             observer.roots(store, PyCodeCache.modules)
+
+
+@pytest.mark.parametrize(
+    "change",
+    ["model", "indices", "mutations", "globals", "code", "direct", "nested", "plan"],
+)
+def test_only_exact_writeback_closure_is_accepted(tmp_path, monkeypatch, change):
+    store, _, _, _, observer, artifact, load_all = live_fixture(tmp_path, monkeypatch)
+    with observer.intercept(artifact_class=artifact):
+        load_all()
+        graph, module, original = next(
+            value
+            for value in observer.bindings.values()
+            if value[0].current_callable is not value[2]
+        )
+        wrapper = graph.current_callable
+        cells = dict(zip(wrapper.__code__.co_freevars, wrapper.__closure__))
+        if change == "model":
+            cells["model"].cell_contents = lambda: None
+        elif change == "indices":
+            cells["inputs_to_check"].cell_contents = [0]
+        elif change == "mutations":
+            cells["mutated_input_idxs"].cell_contents = OrderedSet([4])
+        elif change == "globals":
+            graph.current_callable = FunctionType(
+                wrapper.__code__, {}, closure=wrapper.__closure__
+            )
+        elif change == "code":
+            wrapper.__code__ = wrapper.__code__.replace(co_name="changed")
+        elif change == "direct":
+            graph.current_callable = original
+        elif change == "nested":
+            maybe_realign_inputs(
+                BoxedBool(False), graph, graph.inputs_to_check, graph.mutated_input_idxs
+            )
+        else:
+            graph.inputs_to_check.append(99)
+        with pytest.raises(ValueError):
+            observer.roots(store, PyCodeCache.modules)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "wrapper_source_sha256",
+        "callable_line",
+        "closure_model_is_original",
+        "exact_writeback_globals",
+        "closure_inputs_to_check",
+        "runner_is_original",
+    ],
+)
+def test_offline_writeback_receipts_reject_changed_provenance(
+    tmp_path, monkeypatch, field
+):
+    manifest, bindings, modules, events = live_receipts(tmp_path, monkeypatch)
+    state = next(
+        e["state"]
+        for e in events
+        if e["event"] == "artifact_post_compile_state" and not e["state"]["direct"]
+    )
+    state[field] = None
+    with pytest.raises(ValueError):
+        check_root_records(manifest, bindings, modules, events)

@@ -6,7 +6,8 @@ historical; do not rerun them. The first pair remains terminal after its observe
 API failure. AOT v1 stopped during CPU preparation before any private cache/GPU
 load. v2 stopped on its first GPU load's cache-lifecycle gate; v3 loaded all seven
 rank0 artifacts but stopped at the auditor's export parser. v4 stopped at the
-inventory's graph/helper classification. NEW no-weights AOT v5 is prescribed at the tail below;
+inventory's graph/helper classification; v5 stops at post-compile call identity.
+NEW no-weights AOT v6 is prescribed at the tail below;
 no full-model series is prescribed.
 
 ## Question and fixed factors
@@ -507,7 +508,7 @@ bindings; retain all loaded-module paths before validation, plus target/non-targ
 root launcher checks. No replacement/unused v1-v4 attempt or new GPU series is
 prescribed at this checkpoint. Model quality and indexer gates remain unchanged.
 
-## Artifact-root provenance qualification: NEW v5
+## Artifact-root provenance qualification: historical v5 (stopped)
 
 CPU-only discovery matches ALL28 serialized root source bytes/cache keys against
 the original graph files (seven/rank,46 submodule references/rank). Report
@@ -570,3 +571,37 @@ systemd-run --user --scope --unit=glm53-geometry-aot-v5-compare -p MemoryMax=8G 
 Audit final closure against original sources/cache and independent GPU query before
 releasing the freeze. v1-v4 stay terminal. This protocol does not authorize a model
 causal series or promote a production/default/performance change.
+
+## v5 closure and exact writeback-wrapper provenance; NEW v6
+
+ONE control-rank0 on838689c68 verifies7 real root bindings during deserialize,
+loads7 artifacts/46 entries and26 original-exact CUDA images. All17 imported
+module sources match originals. Post-load callable identity gate fails. Both load
+and audit exit1; other seven cases NEVER launched.205 source receipts/5172 original
+files unchanged, GPUs released. Closure `rmsnorm-geometry-aot-qualification-v5/closure.json`,
+SHA45c52321b9d81db6b151344f67a9a4d17c429be404daef8cb14c277c9541b09a.
+v5 TERMINAL, all copies/logs retained and freeze released.
+
+CPU-only actual Torch post_compile on28 serialized roots with sentinel callables
+reproduces20 writeback wrappers plus8 direct calls. Each wrapper closes over the
+exact sentinel and mutated input[4]. No callable executes or GPU loads. Report
+`runtime-control/geometry-post-compile-cpu.json`, SHA
+5f358d74cf27baa047a585cfff440af2543f8142e2aee1680a29624f0f264fa6.
+v5 did not retain its final callable closure; do not claim its exact identity is
+already proven. The observer now records detailed state before rejecting, and
+requires the installed writeback code object/globals/source and exact original
+call/mutation object/indices/serialized alignment plan. Unknown/nested wrappers
+and changed closures reject; direct roots retain exact-call identity. Offline audit
+joins those final-state receipts as well. Torch utils.py is added to the freeze.
+Related CPU324 pass7.23s; `runtime-control/geometry-writeback-cpu.xml`.
+
+NEW v6 after committing this fix/protocol: SAME fixed eight-case order and gates
+as v5 above, all new private caches. Substitute `v6` for `v5` in BOTH unit names
+and every series path in the explicit preparation, per-LABEL launch and final
+compare commands. Child scopes are v6. Root
+`perf/results/2026-09-10/rmsnorm-geometry-aot-qualification-v6/`.
+One preparation; one attempt each control0..3 then geometry0..3, conditional on
+all prior audits/source hashes/receipts/GPU release. Any failure stops the entire
+series; no unchanged retries. Sources frozen from preparation through terminal
+closure.16GiB GPU/8GiB CPU/swap0, no other GPU work/builds/edits. v1-v5 and unused
+cases stay terminal. No full-model series/default/gate/quant change authorized.
