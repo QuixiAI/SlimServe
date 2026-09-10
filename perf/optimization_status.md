@@ -24013,3 +24013,32 @@ restart is the operator's call.
   timings run. No candidate servingwiring. Hypothesis remains: skip unused
   scores below513pools; amortize longprefillkeyloads overhomogeneousqueries.
   Raw glm53f-pool-skip-geometry/ withtests/offlineoutputs/source snapshots.
+
+## 2026-09-10: campaign resumed - MTP, TP scaling, 1M qualification (operator: "Proceed")
+
+- Tree: the 09-07..09-10 sessions' uncommitted, profile-qualified work
+  is committed as the baseline (ac4cacd37); four candidate-prototype tests
+  quarantined as xfail. Fast gates: registry 65, tier 69, GLM 999 pass.
+- Baseline re-measured through the profile (validate_glm5_next.py, 1000
+  in / 300 out, two warmed repeats): c1 109.9 / c8 494.6 / c16 676.0 /
+  c32 929.9. Raw: perf/results/2026-09-10/glm53f-mtp-sweep/nospec/.
+- c1 is latency-bound, not idle-bound: GPU utilization 97% at c1 with 181 W
+  (278 W at c32); async scheduling is already on. The 09-09 decode census
+  counts ~1,490 kernels per token across four streams (847 on the main
+  stream, 4.76 ms). The TP-invariant residue is the kernel-latency floor,
+  so ownership-style collective fusion cannot reach the 1.5x gate at c1;
+  kernel-count reduction and MTP can.
+- MTP: the registered k=1 adapter loses at c1 (95.7 vs 105.2 tok/s on the
+  equal-feature baseline) despite a healthy mean acceptance length of 1.71
+  (of 2): a speculative step costs ~17.9 ms vs 9.5 ms plain. ROOT CAUSE:
+  llm_base_proposer.initialize_cudagraph_keys gives the drafter PIECEWISE
+  graphs only when the main mode's mixed_mode is PIECEWISE/FULL; the
+  record's FULL_DECODE_ONLY = (FULL, NONE) resolves the drafter to NONE,
+  so every draft pass ran eager (hundreds of Python launches). Sweep 4
+  reruns k = 1/3/5 under FULL_AND_PIECEWISE with a matching non-spec arm.
+- Two record features refuse speculation at construction (indexer row
+  sharding, sparse tensor-core decode). Both are per-row and structurally
+  fine with speculative rows; guards relaxed (tests updated: 51 pass),
+  serving validation owed once MTP earns its place. Row sharding off
+  costs nothing at 1000-token context (c16 +1.6%); TC decode off costs
+  3-4% - the sweep baseline has both off for a fair comparison.

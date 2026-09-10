@@ -73,8 +73,11 @@ def _sparse_tc_option(config, heads):
         if not (current_platform.is_cuda()
                 and current_platform.is_device_capability((8, 0))):
             raise ValueError("Sparse tensor-core decode is qualified only on SM80")
-        if heads != 8 or config.speculative_config is not None:
-            raise ValueError("Sparse tensor-core decode requires 8 heads and no speculation")
+        if heads != 8:
+            raise ValueError("Sparse tensor-core decode requires 8 heads per rank")
+        # Speculative batches are ordinary query rows to this path (each row
+        # carries its own selected-index list); _sparse_tc_split still bounds
+        # the rows per launch and falls back to the native kernel above it.
     return enabled
 
 

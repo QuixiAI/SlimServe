@@ -37,9 +37,9 @@ def test_option_rejects_unqualified_platform_heads_and_spec(monkeypatch):
     assert _sparse_tc_option(config, 8)
     with pytest.raises(ValueError, match="8 heads"):
         _sparse_tc_option(config, 16)
+    # Speculative rows are ordinary query rows to this path (2026-09-10).
     config.speculative_config = object()
-    with pytest.raises(ValueError, match="no speculation"):
-        _sparse_tc_option(config, 8)
+    assert _sparse_tc_option(config, 8)
     platform.is_device_capability.return_value = False
     with pytest.raises(ValueError, match="SM80"):
         _sparse_tc_option(config, 8)

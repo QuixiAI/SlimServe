@@ -34,8 +34,13 @@ def test_opt_in_and_config_boundary(monkeypatch):
             indexer._row_shard_option(config(additional_config={
                 "glm5_next_indexer_row_shard": invalid
             }), 32)
+    # Speculative decoding is an ordinary row layout to the sharded path
+    # (rows = requests x next_n, per-row request map): accepted since
+    # 2026-09-10 so MTP and row sharding coexist.
+    assert indexer._row_shard_option(
+        config(speculative_config=object()), 32
+    ) is True
     for bad in (
-        config(speculative_config=object()),
         config(additional_config={"glm5_next_indexer_row_shard": True}),
         config(parallel_config=SimpleNamespace(
             tensor_parallel_size=4, data_parallel_size=1, pipeline_parallel_size=1
@@ -63,7 +68,10 @@ def test_capture_stable_dispatch(rows, enabled):
         enabled and rows in (16, 32)
     )
     assert not indexer._row_shard_dispatch(enabled, rows, 1, 1)
-    assert not indexer._row_shard_dispatch(enabled, rows, 0, 2)
+    # next_n > 1 (speculative rows) shards on the same row-count rule.
+    assert indexer._row_shard_dispatch(enabled, rows, 0, 2) == (
+        enabled and rows in (16, 32)
+    )
 
 
 @pytest.mark.parametrize("rows", [1, 8, 16, 32, 64])

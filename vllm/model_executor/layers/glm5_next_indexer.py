@@ -96,12 +96,11 @@ def _row_shard_option(vllm_config, heads):
         or parallel.tensor_parallel_size != 8
         or parallel.data_parallel_size != 1
         or parallel.pipeline_parallel_size != 1
-        or vllm_config.speculative_config is not None
         or not extra.get("glm5_next_compact_indexer_cache", False)
     ):
         raise ValueError(
-            "Indexer row sharding requires SM80, TP8/DP1/PP1, 32 indexer heads, "
-            "compact cache and no speculation"
+            "Indexer row sharding requires SM80, TP8/DP1/PP1, 32 indexer heads "
+            "and the compact cache"
         )
     return True
 
@@ -109,7 +108,10 @@ def _row_shard_option(vllm_config, heads):
 def _row_shard_dispatch(enabled, rows, num_prefills, next_n):
     # Capture-stable shape policy. Do NOT inspect context length here: a
     # Python branch would be frozen at capture, not reevaluated on replay.
-    return enabled and rows in (16, 32) and num_prefills == 0 and next_n == 1
+    # Rows are independent query rows (row_req/visible are per row), so a
+    # speculative batch of reqs x next_n rows shards the same way; only the
+    # row count must be one of the qualified shapes.
+    return enabled and rows in (16, 32) and num_prefills == 0
 
 
 def _cache_row_dim(vllm_config: VllmConfig, kp: int) -> int:
