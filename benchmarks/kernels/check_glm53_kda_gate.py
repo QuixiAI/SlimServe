@@ -64,8 +64,8 @@ def load_weights():
     return a, bias.reshape(64, 128)
 
 
-def prepare(path):
-    require(not path.exists(), "manifest exists")
+def preparation():
+    """Collect fresh source/evidence receipts, without starting a probe."""
     inventory = read_pinned(INVENTORY, INVENTORY_SHA)
     gate_rows = [r for r in inventory["comparisons"] if r["kernel"] == KERNEL]
     require(len(gate_rows) == 4, "incomplete gate inventory")
@@ -142,23 +142,27 @@ def prepare(path):
             history[commit] == sha(ROOT / CHUNK), "gate source changed since serving"
         )
     weights = load_weights()
-    save_new(
-        path,
-        dict(
-            schema=1,
-            sources=receipts,
-            history=history,
-            cases=matrix(),
-            weight_sha256=[tensor_sha(w) for w in weights],
-            git_commit=subprocess.check_output(
-                ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
-            ).strip(),
-            atol=ATOL,
-            rtol=RTOL,
-            warps=list(WARPS),
-            packed_width=PACKED_WIDTH,
-        ),
+    return dict(
+        schema=1,
+        sources=receipts,
+        history=history,
+        cases=matrix(),
+        weight_sha256=[tensor_sha(w) for w in weights],
+        git_commit=subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
+        ).strip(),
+        atol=ATOL,
+        rtol=RTOL,
+        warps=list(WARPS),
+        packed_width=PACKED_WIDTH,
     )
+
+
+def prepare(path):
+    require(not path.exists(), "manifest exists")
+    manifest = preparation()
+    save_new(path, manifest)
+    receipts = manifest["sources"]
     print(f"Prepared {len(matrix())} pairs; {len(receipts)} source/evidence hashes")
 
 

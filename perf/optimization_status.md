@@ -27230,3 +27230,26 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   dbb92de6bc14f00c86ba8d19a8a680ab8d5ad82ed696906d300a3432e5d9bf70;
  168 pair receipts, summary and binaries. CPU reader/report under runtime-control:
   screen-kda-intra-stages.py, kda-intra-stage-screen.json. Protocol has full details.
+
+## 2026-09-10 - Prescribe remaining KDA recompute arithmetic isolation
+
+- Status: CPU complete; one196-pair GPU0 process prescribed, not launched yet.
+- Baseline/hypothesis: original4/fresh8-warps at stages3/BK64/BV64, same actual
+  serving recompute source. Does the earliest remaining change alter W/U/KG?
+- Evidence: CPU36-candidate/seven-TTIR-group screen confirms state/recompute/
+  output images differ; intra stage-only remains byte-identical. Cache artifacts
+  do not establish historical live launches or numerical causality.
+- Change: diagnostic only.196 pairs, seven sequence layouts/four TP4 gate shards,
+ 28 exact identity and168 conditioned signed-triangular cases. Eager/changed-input
+  graph replay, guards, source/binary receipts; FP64 reference metrics. Identity
+  must be exact; conditioned errors and cross-arm equality are observations,
+  not new model-quality thresholds. No autotuning or serving/native changes.
+- CPU:45passed4.45s; prior26passed4.50s retained. Shared comparison helper gains
+  positive chunk-size option, default128 unchanged; GPU diagnostic uses8192 with
+  identical metric regression. Reuses preparation receipts without rerunning gate.
+- Decision: commit then prescribed preparation/run/audit, GPU16GiB/CPU8GiB/swap0,
+  source freeze, stop on failure/no replacements. No full-model run prescribed.
+- Raw: runtime-control/kda-recompute-{cpu,final-cpu}.xml and
+  kda-remaining-binary-screen.json SHA
+  9c8d8a3f5d8a47a12fe0bb395ada85d448f886360473b0e595387c49830526a0,
+  all under perf/results/2026-09-10. Protocol contains exact one-shot commands.

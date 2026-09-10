@@ -67,17 +67,19 @@ def checked_config(config):
     return dict(zip(keys, values))
 
 
-def compare(a, b):
+def compare(a, b, *, chunk_rows=128):
     import torch
 
     if a.shape != b.shape or a.dtype != torch.bfloat16 or b.dtype != a.dtype:
         raise ValueError("matching BF16 tensors required")
+    if type(chunk_rows) is not int or chunk_rows <= 0:
+        raise ValueError("positive comparison chunk size required")
     if not torch.isfinite(a).all() or not torch.isfinite(b).all():
         raise ValueError("finite BF16 tensors required")
     # Chunk metrics so the largest serving shape stays comfortably bounded.
     count = numeric = affected_rows = ulp = 0
     maximum = absolute = squared = 0.0
-    for aa, bb in zip(a.split(128), b.split(128)):
+    for aa, bb in zip(a.split(chunk_rows), b.split(chunk_rows)):
         bits_a, bits_b = aa.view(torch.int16), bb.view(torch.int16)
         changed = bits_a != bits_b
         count += changed.sum().item()

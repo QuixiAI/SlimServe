@@ -141,3 +141,60 @@ NEXT: inspect remaining recompute W/U, recurrent-state and output choices. Scree
 same-signature binaries first (especially stage-only changes), then prescribe the
 smallest still-informative numerical comparison. Do not rerun the completed gate
 matrix or a full model just to retest unchanged work. No next GPU job prescribed.
+
+## Recompute v1 preparation and fixed protocol
+
+CPU screening finds genuinely different retained binaries for recompute4/8-warps
+and state-update4-warps/stages2/3. Output4/8-warps also differs; its stage-only
+choices are byte-identical within each warp count. Seven exact TTIR groups/36
+candidate images are recorded in `runtime-control/kda-remaining-binary-screen.json`
+by the preserved `screen-kda-remaining.py`. As before, cache presence does not
+establish historical live choices or numerical causality.
+
+Next numerical test isolates the earliest remaining operation: actual serving
+`recompute_w_u_fwd_kernel`, four versus eight warps, stages3/BK64/BV64/BT64 fixed,
+16 heads and K=V=128. No other KDA stage runs in this probe. The source matches
+both model-series commits. No autotuner, generated-source substitution, native
+build, model start or production change.
+
+Prepare and run once AFTER commit and final CPU tests. One GPU0 process,196 pairs:
+CPU final45passed4.45s (prior26passed4.50s), reports
+`runtime-control/kda-recompute-{cpu,final-cpu}.xml`.
+rank0..3, each of the seven gate-probe sequence layouts, then one identity case
+(seed530901/magnitude1) and six conditioned cases (seeds530901/530902 x magnitudes
+0.125/1/8). K is normalized random BF16; V is signed random BF16. A is BF16 identity
+or identity plus0.015625-scaled signed strict-lower-triangular noise per64-token
+chunk. This is a controlled stable triangular fixture, NOT captured model data.
+Conditioned FP32 gate/beta fixtures come from the float64 formula and real layer0
+FP32 repaired TP4 shard; identity fixtures use g=0/beta0.5.
+
+Two eager repetitions, original-input graph replay, then k*=0.5/v*=-0.5 on the
+same addresses and changed-input graph/eager comparison. Guard every BF16 output;
+all inputs must remain unmodified except those prescribed host-side changes.
+Record both actual compiled cubins, source/repair/compiler receipts, original and
+changed-input output hashes, pairwise BF16 errors and float64-reference errors.
+
+Identity cases MUST be exact to w=k*0.5/u=v*0.5/kg=k, before and after mutation.
+The batched float64 reference has separately tested chunk/sequence boundaries and
+BF16 operand round points. Its errors on conditioned cases are observations, NOT
+a new accuracy tolerance or a replacement for the failed indexer/model gates.
+Cross-arm equality is likewise an observation. No speed or production qualification
+from this test. Stop on first structural/finite/replay/guard/identity failure, retain
+partial records, and always audit/close. No retries, replacements or exclusions.
+
+The existing BF16 comparison helper now accepts a positive chunk size; its default
+128 is unchanged. The new GPU-only probe uses8192 rows per metrics tile to avoid
+millions of diagnostic launches. CPU tests require identical comparison metrics.
+Gate preparation receipt collection is shared; the completed gate v1 run is NOT
+repeated, and its old source-frozen validator is no longer current.
+
+Freeze from preparation through audit. GPU16GiB, CPU8GiB, all swap0. After commit,
+each command once from repository root:
+
+```bash
+systemd-run --user --scope --unit=glm53-kda-recompute-v1-prepare -p MemoryMax=8G -p MemorySwapMax=0 env CUDA_VISIBLE_DEVICES= .venv/bin/python -m benchmarks.kernels.check_glm53_kda_recompute prepare --manifest perf/results/2026-09-10/runtime-control/kda-recompute-v1-manifest.json
+systemd-run --user --scope --unit=glm53-kda-recompute-v1 -p MemoryMax=16G -p MemorySwapMax=0 env CUDA_VISIBLE_DEVICES=0 CUDA_HOME=/usr/local/cuda-13.0 .venv/bin/python -m benchmarks.kernels.check_glm53_kda_recompute run --manifest perf/results/2026-09-10/runtime-control/kda-recompute-v1-manifest.json --output perf/results/2026-09-10/kda-recompute-v1
+systemd-run --user --scope --unit=glm53-kda-recompute-v1-audit -p MemoryMax=8G -p MemorySwapMax=0 env CUDA_VISIBLE_DEVICES= .venv/bin/python -m benchmarks.kernels.check_glm53_kda_recompute audit --manifest perf/results/2026-09-10/runtime-control/kda-recompute-v1-manifest.json --output perf/results/2026-09-10/kda-recompute-v1
+```
+
+Next action depends on the completed result; no full-model run prescribed.

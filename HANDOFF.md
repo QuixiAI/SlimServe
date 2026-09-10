@@ -35,7 +35,21 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): gate isolation passes; no numerical difference
+### Latest checkpoint (2026-09-10): recompute isolation ready, v1 prescribed
+
+Retained state/recompute/output candidates have different binaries; CPU screen
+records36 candidates/seven exact TTIR groups. Recompute4->8-warps is the earliest
+remaining numerical test. Probe CPU45pass4.45s, including independent ragged
+reference, real JIT import/preparation, exact identity cases and audit failures.
+Shared BF16 comparison default stays128 rows; new GPU probe uses8192-row tiles.
+
+NEXT after commit: one preparation/GPU0 run/CPU audit for196 fixed pairs at
+16GiB/8GiB/swap0. Commands, cases, evidence limits and failure policy are at
+perf/glm53-kda-choice-protocol.md tail. Freeze from preparation through closure.
+No v1 manifest/cache/GPU job created yet; no full-model job prescribed.
+All completed/failed prior runs remain terminal; defaults/native/quant unchanged.
+
+### Previous checkpoint (2026-09-10): gate isolation passes; no numerical difference
 
 On c7b4bb4d1, one prescribed GPU0 process completes168 gate/cumsum pairs; audit
 passes,74 source/evidence hashes/two actual cubins verify, GPUs released. Freeze
