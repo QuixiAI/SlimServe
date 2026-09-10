@@ -35,7 +35,29 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): state/output isolation complete and bit-exact
+### Latest checkpoint (2026-09-10): attention graph boundaries mapped
+
+CPU analyzer `benchmarks/analyze_glm53_attention_contracts.py` verifies all eight
+attention graph pairs (two per rank), with 75 pinned graph/source/evidence hashes.
+Original bundle -> three split calls preserves input/weights/bias/output/rows/
+stream, allocation/alias provenance, native call sequences and graph returns.
+The indexer norm writes half of a shared K/gate buffer; this alias is checked.
+This is static correspondence, NOT historical live coverage or model causality.
+
+CPU final 67 passed in 7.14 s; earlier 14-pass report retained. No GPU/model run,
+native build, quant/profile/default change or quality-gate change. Raw
+`perf/results/2026-09-10/runtime-control/attention-contracts.json`, SHA
+8337ae7e4ec383563ed2df0230f21e9424556feccbec3a93a61deea94caff3c8.
+
+NEXT: implement/qualify a KV512-only diagnostic adapter: run original combo,
+then overwrite only KV with the previously checked split kernel on the same
+input/weight/address/stream. Preserve Q, indexer K/gate, H4096 and KDA exactly.
+Qualify actual adapter/graph replay before prescribing original/KV/return model
+starts. This is an extra-launch causal diagnostic, not a speed implementation.
+Plan/evidence limits: `perf/glm53-attention-isolation.md`. No GPU job prescribed;
+all previous failed series and the separate LayerNorm oracle failure stay failed.
+
+### Previous checkpoint (2026-09-10): state/output isolation complete and bit-exact
 
 On `4832f4ce7`, the prescribed state process/audit then output process/audit all
 exit 0. Each completes 224 pairs (56 exact, 168 conditioned). State stages2/3

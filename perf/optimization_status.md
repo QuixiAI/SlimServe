@@ -27325,3 +27325,29 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   f28c002eacc2dbe1ab664f8c1fbded2c4745bc4604a1f4c4e805acfe644bc49c;
   output 2b5c863eb453d252b05461e6d4ed02e8f171714b4c1713b49efd4e97daab943b.
   Full protocol/results and evidence limits: `perf/glm53-kda-choice-protocol.md`.
+
+## 2026-09-10 - Map remaining attention normalization graph boundaries
+
+- Status: CPU evidence complete; no serving/performance change.
+- Baseline/hypothesis: KDA comparisons were exact; attention KV512/LayerNorm128
+  differ in the earlier source-exact matrix. Locate an isolated KV intervention
+  while retaining the original Q and independently failing indexer LayerNorm.
+- Change: CPU-only AST analyzer maps one combo to three split calls across all
+  eight attention graph pairs (two/rank), with 75 pinned receipts. Checks exact
+  input/weight/bias/output/row/stream expressions, input producer and output
+  allocation/alias provenance, native call sequence and full graph return.
+- Result: all eight mappings pass; 20 other graph pairs have no bundle. Indexer
+  K writes half of a shared 256-wide K/gate output; that alias remains identical.
+  Static agreement does not prove historical live coverage, runtime input values
+  or pointwise-fusion equivalence. No GPU execution or model-causal claim.
+- Correctness: 67 CPU passed in 7.14 s, 14 upstream Torch deprecation warnings;
+  earlier 14-pass report retained. Negative cases cover swapped weights/biases/
+  outputs, streams, aliases, consumers/returns and ambiguous definitions. Lint
+  passes. All existing model/indexer gates unchanged; no TPS measurement.
+- Decision: next implement/qualify original-combo + KV-only overwrite adapter,
+  preserving Q/indexer/H4096/KDA. It is an extra-launch diagnostic, not a speedup.
+  Require actual graph/replay coverage before prescribing control/KV/return
+  serving. No GPU/model job yet prescribed; all old failed series stay terminal.
+- Raw: `perf/results/2026-09-10/runtime-control/attention-contracts.json`, SHA
+  8337ae7e4ec383563ed2df0230f21e9424556feccbec3a93a61deea94caff3c8;
+  `attention-contracts-{cpu,final-cpu}.xml`. Design: `perf/glm53-attention-isolation.md`.
