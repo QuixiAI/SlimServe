@@ -35,7 +35,31 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): broader RMSNorm graph correspondence established
+### Latest checkpoint (2026-09-10): multi-source mechanics and exact discovery ready
+
+CPU-only multi-source diagnostic implemented under `benchmarks/kernels/`, NOT
+wired into serving. One atomic resolver covers concurrent aliases without repeated
+upstream cache rechecks; every target needs exact source/config/cubin bytes and
+actual graph coverage before sealing. No late targets/aliases or source-path
+changes allowed. Historical single-source controller and serving code unchanged.
+Final related CPU suite187 passed5.43s; lint/diff pass.
+
+Final discovery verifies13 original sources/control binaries/debug identities,
+six in-place/seven triple-output layouts,35 STATIC graph/source uses,178 receipts
+and5172 unchanged original files. `runtime-control/rmsnorm-geometry-final-discovery.json`
+SHA4294ff75ea2236c577b8104ea3a44055d65dcf68ca0449685eccf02a2c5f7ea4.
+Initial discovery and both CPU reports retained. This is NOT a qualified
+intervention manifest: candidate geometry binaries still need measurement.
+
+NEXT: implement the source-exact numerical probe/auditor described in
+`perf/glm53-rmsnorm-geometry-protocol.md`, then freeze commands before GPU work.
+Follow with real-AOT multi-target loader qualification; only then prescribe a
+full-model causal series. No next GPU job is prescribed at this checkpoint.
+No model/GPU workload launched in this turn, no new TPS/default/quality claim.
+The original-cache attention combo and KDA choices must stay fixed; indexer
+gate remains failed, prior series terminal, goal ongoing.
+
+### Previous checkpoint (2026-09-10): broader RMSNorm graph correspondence established
 
 CPU-only analysis pairs28 old/new generated graphs (seven per rank), using the
 actual AST rather than duplicated compile-time docstrings. Correspondence requires

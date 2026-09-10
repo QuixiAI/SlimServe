@@ -26664,3 +26664,36 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - Raw: `perf/results/2026-09-10/runtime-control/norm-graph-role-pairs.json`, SHA
   320a6f39c4f92cd78459f21e23653e1e900870620da29bed923f5cba5dbe315e;
   prior `norm-graph-role-inventory.json` and both analysis logs retained.
+
+## 2026-09-10 - Prepare graph-complete multi-source geometry isolation
+
+- Status: CPU mechanics/discovery complete; kernel and real-AOT qualifications
+  still pending. Diagnostic lives under benchmarks, not installed in serving.
+- Baseline: exact graph correspondence identifies13 original4096 choices that
+  can change independently of attention fusion and KDA tuning. Existing retained
+  single-target-per-rank diagnostic cannot cover this experiment unchanged.
+- Hypothesis: a single atomic dispatcher can reuse the qualified per-source
+  replacement checks without repeating upstream resolution or missing graph globals.
+- Change: separate geometry schema/control+geometry arms, strong object ownership,
+  exact original/private source paths and whole-cubin checks. All sources need
+  actual graph coverage before any seal. Concurrent aliases resolve upstream once;
+  changed binaries, missing sources/modules and late targets/bindings fail closed.
+  Historical diagnostic code, serving defaults, quant and native libraries unchanged.
+- Correctness: initial mechanics67 CPU tests pass; expanded185 pass5.42s. Final
+  strengthened source-path/post-seal checks187 pass5.43s,8GiB/swap0. Lint/diff pass.
+  These tests use CPU fixtures, NOT real GPU/AOT-loader or model qualification.
+- Discovery: all13 exact original source/control-config/cubin/PTX/metadata images
+  verify; own-source debug identities for all13. Six in-place/seven triple-output
+  layouts and35 static graph/source uses.178 source receipts/5172 original files
+  unchanged. Candidate source-specific binary receipts deliberately absent until
+  the dedicated probe runs; discovery cannot be used as a qualified manifest.
+- Decision: retain preparation; implement source-exact numerical probe/auditor,
+  then qualify the actual multi-target graph loader before any model experiment.
+  Pending matrix and gates in `perf/glm53-rmsnorm-geometry-protocol.md`; no GPU
+  job prescribed/launched, throughput measured, gate widened or default promoted.
+- Raw: `perf/results/2026-09-10/runtime-control/rmsnorm-geometry-final-discovery.json`,
+  SHA4294ff75ea2236c577b8104ea3a44055d65dcf68ca0449685eccf02a2c5f7ea4;
+  `rmsnorm-geometry-final-cpu.xml`. Initial discovery SHA
+  71a570836980643a2f537635402167e16ec8fb16db64699377ce6f040d423d55
+  and `rmsnorm-geometry-cpu.xml` retained; final discovery differs only by its
+  controller source receipt after the two additional negative gates.
