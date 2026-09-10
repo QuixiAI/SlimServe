@@ -8,8 +8,9 @@ load. v2 stopped on its first GPU load's cache-lifecycle gate; v3 loaded all sev
 rank0 artifacts but stopped at the auditor's export parser. v4 stopped at the
 inventory's graph/helper classification; v5 stops at post-compile call identity.
 No-weights AOT v6 now PASSES all eight loads/audits and final comparison; its
-commands are historical. The opt-in serving integration is now CPU-tested (see
-tail); no next GPU or full-model series is prescribed.
+commands are historical. The opt-in serving integration and workload controller
+are CPU-tested. A NEW full-model v1 series is prescribed at the tail; it has not
+yet been prepared or launched at this checkpoint.
 
 ## Question and fixed factors
 
@@ -677,3 +678,101 @@ Next implement/test workload/causal auditing and the predecessor/release control
 confirm `/raid/weights` profile resolution, then commit the bounded full-model
 protocol before any preparation or launch. All existing quality floors and terminal
 failed series remain intact. This checkpoint does not prescribe a model/GPU job.
+
+## Full-model causal series v1 (prescribed before preparation or launch)
+
+Root: `perf/results/2026-09-10/rmsnorm-geometry-serving-v1/`.
+Commit implementation and this protocol, then freeze all sources through closure.
+Exactly three fresh per-start private namespaces and one attempt per case, in order:
+`control`, `geometry`, `return-control`. Each has all four rank-local caches.
+All v1-v5 no-weights failures and the no-combo model series remain terminal;
+completed no-weights v6 is consumed as pinned evidence, not rerun.
+
+Fixed model: registered `glm53-nvfp4-4` / `rtx6000`, recipe v1, TP4, Marlin,
+BF16 activation/KV/lm_head, native-order1, BF16fn1, TC0, no EP/speculation/journals/
+profiler. Preserve original compiler and attention-combo/KDA choices. Only the
+thirteen qualified norm geometries differ. The controller installs the frozen
+environment, including `SLIMSERVE_CACHE=/raid/weights`, CUDA13.0 and OMP1; inherited
+NCCL overrides are cleared and the registry supplies P2P0/SYS. The actual model
+directory must be `/raid/weights/GLM-5.3-Flash-NVFP4-FP8-KDA-TP4`.
+No driver, clock, power, memory-policy or native-binary change.
+
+Per start, through `benchmark_glm53_campaign.py` and the actual SlimServe profile:
+
+- Reach health once (existing 1,200-second startup bound), then text/image canaries.
+- Concurrencies 1/8/16, exact 1,000 input and 300 output tokens. One full warmup
+  per concurrency, then three complete repetitions in repeat-major order. Sampling
+  temperature1/top_p0.95/top_k20, seed42+request-index. Every request has unique
+  cache salt and cached_tokens=0. Retain all 25 warmup and 75 measured requests.
+- Three within-start quality passes, each 32 fixed 512+128-token windows (4,096
+  scored continuation tokens) and six four-way needle contrasts (168 scores).
+  Retain every response; require identical prompt IDs, finite scores, cold cache,
+  correct needle ranking and exact text/needle score repetition.
+- Cold prefill at 32,768 and 131,072 input tokens, eight outputs each; one warmup
+  plus three measured requests per length. Retain client and engine TTFT separately,
+  cached_tokens=0, fixed sampling, and identical prompt IDs within/across starts.
+- No performance-based retries, exclusions or stopping. All TPS is diagnostic,
+  not a new stable baseline or production promotion.
+
+Quality versus diagnostic continuation is deliberately explicit. Both controls
+must pass the unchanged per-window/aggregate floors AND exactly match the pinned
+original score vectors. Every geometry repetition is evaluated against those same
+floors with tolerance0.01 nat/token; any failure is recorded as `quality_passed=false`.
+The causal question explicitly includes reproduction of a known quality failure,
+so a complete, repeatable, finite, needle-correct geometry workload can proceed to
+the return control even when its window floors fail. This does NOT clear the failed
+quality gate or qualify a serving policy. Report exact/delta comparisons to both
+original controls and the failed no-combo vector; final return tests reversibility.
+Unknown score differences are observations, not grounds to change thresholds.
+Any load/capture binding, source, canary, token/cache, needle, repetition, control
+score, process/audit or GPU-release failure terminates v1; never launch unused cases.
+
+`run_glm53_geometry_serving.py` records one exclusive attempt marker before preflight,
+preserves stdout/stderr/exit codes and complete case inventories, checks every prior
+successful diagnostic audit and release, and uses independently bounded scopes.
+Audit failed/partial work too. On interruption stop only the case's unique owned
+scope; an unsuccessful driver query is never GPU-release proof. All source and
+original-cache hashes must stay unchanged. One GPU workload at a time, no builds.
+
+Preparation ONCE, after the clean implementation/protocol commit:
+
+```bash
+systemd-run --user --scope --unit=glm53-geometry-serving-v1-prepare -p MemoryMax=8G -p MemorySwapMax=0 \
+  env CUDA_VISIBLE_DEVICES= PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 .venv/bin/python \
+  -m benchmarks.kernels.prepare_glm53_geometry_serving \
+  --qualification perf/results/2026-09-10/rmsnorm-geometry-aot-qualification-v6/pair-analysis.json \
+  --closure perf/results/2026-09-10/rmsnorm-geometry-aot-qualification-v6/closure.json \
+  --output perf/results/2026-09-10/rmsnorm-geometry-serving-v1
+```
+
+For each LABEL in the exact order above, ONCE and only if all predecessors qualify:
+
+```bash
+systemd-run --user --scope --unit=glm53-geometry-serving-v1-LABEL-launch -p MemoryMax=8G -p MemorySwapMax=0 \
+  env PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 .venv/bin/python \
+  -m benchmarks.kernels.run_glm53_geometry_serving launch \
+  perf/results/2026-09-10/rmsnorm-geometry-serving-v1/LABEL/manifest.json
+```
+
+Serving child150GiB/swap0, audit child8GiB/swap0/GPUs hidden. Each worker independently
+checks actual artifact/live-root bindings before forward and around capture; offline
+audit joins all four ranks to completed v6 qualification, with all65 non-target
+bindings exact. Global binary observation remains active; no token-loop checks.
+
+After all three complete OR the first terminal failure, close once before any edits:
+
+```bash
+systemd-run --user --scope --unit=glm53-geometry-serving-v1-close -p MemoryMax=8G -p MemorySwapMax=0 \
+  env CUDA_VISIBLE_DEVICES= PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 .venv/bin/python \
+  -m benchmarks.kernels.run_glm53_geometry_serving close \
+  perf/results/2026-09-10/rmsnorm-geometry-serving-v1
+```
+
+CPU preparation: combined586 pass44.24s; final serving/workload/launcher108 pass30.98s.
+Real-response replay uses copied historical responses with only wrapper metadata/
+paths adapted; no model/graph/CUDA execution. The initial seed-check failure is
+retained, and the corrected auditor preserves the historical failed quality result.
+Whole reference response hashes match their historical audits. Raw reports under
+`runtime-control/geometry-{full-workload,workload-final,workload-replay,workload-replay-fixed,workload-pinned}-cpu.xml`.
+This series answers a bounded causal question, not broader indexer correctness or
+the optimization campaign's remaining performance objective.

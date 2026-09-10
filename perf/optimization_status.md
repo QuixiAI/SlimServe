@@ -27052,3 +27052,33 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   `geometry-serving-final-evidence.json` (SHA
   8a09c4ed1a9dab521f7eac7528f5af7a4b622958ed6755cf398ba7b18a1902fd),
   `geometry-serving-default-dry-run.log`; all initial reports retained.
+
+## 2026-09-10 - Full-model geometry causal controller and workload audit
+
+- Status: CPU-tested diagnostic; new v1 protocol prescribed, not launched yet.
+- Baseline/hypothesis: original native-order controls have identical scores; the
+  terminal no-combo candidate repeats exactly but fails 12 unchanged quality-window
+  floors. Test whether only the thirteen qualified norm geometries reproduce that
+  score vector, holding original attention/KDA choices and the fixed recipe constant.
+- Change: controller prescribes control/geometry/return-control, one attempt each,
+  with fresh caches, audited predecessors, complete raw inventories and GPU release.
+  Workload auditor reuses existing exact-token/quality/cold-prefill checks, pins whole
+  historical responses, and checks source/recipe/environment/runtime identities.
+  Both controls must reproduce original scores exactly. Geometry quality failures
+  remain failures of the unchanged floors, but a structurally correct repeatable
+  diagnostic may proceed to the return control to test reversibility. No promotion.
+- CPU: combined586 pass44.24s, final focused108 pass30.98s; 8 GiB/swap0/GPUs hidden.
+  Real-response rehearsal initially57 pass/1 fail caught a new auditor assumption:
+  timing seeds are42+request-index, not all42. Corrected58-pass rehearsal preserves
+  every original token/score/timing and still records the failed12-window quality.
+  All initial reports retained; no model starts were used to debug this assumption.
+- Results: registered-profile dry-run with `SLIMSERVE_CACHE=/raid/weights` selects
+  the intended derived quant. Read-only GPU query empty; all four600W limits and
+  driver580.173.02 unchanged. No native build/download or new inference/TPS yet.
+- Decision: commit and freeze the explicit v1 protocol, prepare once, then conditional
+  one-control/one-geometry/one-return starts. Serving150GiB, controller/audits8GiB,
+  swap0; stop on structural/control/repetition/workload/release failure. Source/cache
+  closure before edits. Production defaults and separate failed indexer gate unchanged.
+- Raw: `perf/results/2026-09-10/runtime-control/geometry-{full-workload,workload-final,
+  workload-replay,workload-replay-fixed,workload-pinned}-cpu.xml`; exact commands and
+  failure policy at the tail of `perf/glm53-rmsnorm-geometry-protocol.md`.

@@ -569,6 +569,9 @@ def test_prepare_three_independent_caches_and_manifest_validation(
         lambda *a: (old, graphs, reference, {str(ref): sha(ref)}),
     )
     output = tmp_path / "serving"
+    from benchmarks.kernels import glm53_geometry_workload as workload
+
+    monkeypatch.setattr(workload, "reference_evidence", lambda: ({}, {}, {}, {}))
     preparation.prepare(tmp_path / "pair.json", tmp_path / "closure.json", output)
     from slimserve.campaign_sources import snapshot
 

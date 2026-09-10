@@ -35,7 +35,39 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): opt-in geometry serving integration CPU-tested
+### Latest checkpoint (2026-09-10): full-model geometry controller ready; v1 prescribed
+
+Integration committed as `71cb900aa` (Auroter author/committer). The new workload
+auditor reuses existing exact-token, cold-prefill and unchanged 32-window quality
+checks. Whole historical response documents are pinned, not only summary means.
+Controls must exactly reproduce original text/needle scores; all arms must repeat
+exactly within start. Geometry quality failure remains a recorded failure of the
+unchanged floors, but may proceed to the prescribed return control to test
+reversibility. That is a diagnostic continuation, never production qualification.
+Any structural/workload/needle/repetition/control/release failure stops the series.
+
+Controller checks every prior audit and complete retained file inventory, source
+freeze, fresh private cache, exact environment and established model path. Serving
+uses 150 GiB/swap0; controller/audits use 8 GiB/swap0. No retries or replacement
+starts. Final closure checks actual non-target bindings, return-control kernels,
+quality vectors and cold-prefill input identities. No production/default changes.
+
+CPU: combined 586 passed (44.24 s); final serving/workload/launcher 108 passed
+(30.98 s). Real-response CPU rehearsal first caught an incorrect seed check;
+the benchmark uses seed42+request-index, not seed42 for every request. Fixed
+rehearsal passes and retains the historical 12-window failure. All reports retained
+under `perf/results/2026-09-10/runtime-control/geometry-*cpu.xml`.
+Registered-profile dry-run explicitly selects `/raid/weights/GLM-5.3-Flash-NVFP4-FP8-KDA-TP4`
+with `SLIMSERVE_CACHE=/raid/weights`. GPUs free, driver580.173.02/600W unchanged.
+
+NEXT after committing: freeze sources and execute the NEW v1 protocol at the tail
+of `perf/glm53-rmsnorm-geometry-protocol.md`: one preparation, then one control,
+one geometry, one return-control, conditional on all predecessor diagnostic gates.
+No caches or model starts have yet occurred for v1. Close/audit even a terminal
+failure before releasing the freeze. All old failed series stay terminal; v6
+no-weights qualification stays complete. No new TPS or model-quality claim yet.
+
+### Previous checkpoint (2026-09-10): opt-in geometry serving integration CPU-tested
 
 The qualified thirteen-source intervention now has a separate, default-off serving
 hook (`SLIMSERVE_GLM53_RMSNORM_GEOMETRY=control|geometry`) and manifest schema.

@@ -130,6 +130,13 @@ def serving_sources(previous):
             Path(audit_glm53_geometry_serving.__file__),
             *sorted(INTEGRATION_SITES),
             *(ROOT / p for p in PATHS),
+            ROOT / "benchmarks/kernels/glm53_geometry_workload.py",
+            ROOT / "benchmarks/kernels/run_glm53_geometry_serving.py",
+            ROOT / "benchmarks/analyze_glm53_deterministic_serving.py",
+            ROOT / "benchmarks/analyze_glm53_quality_pair.py",
+            ROOT / "slimserve/registry.py",
+            ROOT / "slimserve/hardware.py",
+            ROOT / "perf/glm53-rmsnorm-geometry-protocol.md",
         ],
     )
 
@@ -139,8 +146,12 @@ def prepare(pair_path, closure_path, output):
         not output.exists(), "new serving series required; preserve earlier attempts"
     )
     old, graphs, reference, receipts = completed_evidence(pair_path, closure_path)
+    from benchmarks.kernels.glm53_geometry_workload import reference_evidence
+
+    workload, workload_sources, _, _ = reference_evidence()
     sources, changes = serving_sources(old["sources"])
     sources.update(receipts)
+    sources.update(workload_sources)
     original, output = Path(old["original_namespace"]), output.resolve()
     require(
         not output.is_relative_to(original) and not original.is_relative_to(output),
@@ -157,6 +168,7 @@ def prepare(pair_path, closure_path, output):
         qualified_graphs=graphs,
         sources=sources,
         integration_changes=changes,
+        workload=workload,
         git_commit=subprocess.check_output(
             ["git", "rev-parse", "HEAD"], text=True
         ).strip(),
