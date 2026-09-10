@@ -24112,3 +24112,19 @@ restart is the operator's call.
   (c1 156.8 / c8 482.6 before the death). Its own contract: schedules pair
   k with 0 only (the runner skips drafting above the range). Rerunning
   as [[1,8,3],[9,64,0]] through c64. Raw: glm53f-dflash2/sched3-1/.
+- DFlash2 arms through c64 (two warmed repeats; c1 medians hide a wide
+  spread because acceptance is sampled-text dependent at temperature 1.0):
+  | arm                                   | c1    | c8    | c16   | c32   | c64    |
+  | static k=3, capture 64 (d3)           | 153.3 | 514.8 | 677.8 | -     | -      |
+  | static k=3, capture 256 (d3-cap256)   | 183.2 | 509.0 | 687.9 | 818.7 | 965.5  |
+  | [[1,8,3],[9,64,0]], capture 64        | 125.8 | 472.7 | 662.1 | 899.1 | 1089.7 |
+  | non-spec record                       | 109.9 | 494.6 | 676.0 | 929.9 | (931.9 09-06) |
+  Per-run c1 throughput tracks the run's acceptance length exactly
+  (213.6 tok/s at 3.20, 116.8 at 1.55); the STEP RATE is 71-75 steps/s in
+  every arm (14 ms per speculative step vs 9.1 ms plain, ~2.2 tokens per
+  step), so neither the capture set nor the dynamic-schedule path costs
+  anything at c1, and the c1 gain is (mean acceptance) x 9.1/14 =
+  +40..45% at the measured 2.2 acceptance. k=3 through c16 (level or
+  better), 0 above (c32 loses 12% with k=3; c64 with drafting skipped
+  reaches 1089.7). Final schedule arm [[1,16,3],[17,64,0]] with capture
+  256 running before the record flips.
