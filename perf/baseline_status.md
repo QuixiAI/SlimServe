@@ -2004,6 +2004,15 @@ historical failure. Raw `indexer-serving-v1/closure.json` under2026-09-10, SHA
 
 ### RTX6000 paired lossless mHC storage retained - 2026-09-08
 
+Later prompt-score memory qualification (2026-09-10,414829029) does not change
+these stable baselines: opt-in1024-row post-projection scoring gives exact full-model
+score parity and recovered4.7GB allocation warnings8 ->0 ->8 in prescribed
+control/chunked/return starts. E2E medians157.397/578.121/779.971,
+156.983/579.758/778.748,156.878/579.686/781.038 tok/s; effectively neutral,
+not a speed win. The series uses native-order1; production-policy/default rollout
+remains pending. GPUs released; `prompt-score-serving-v1/closure.json` under
+2026-09-10, SHA27c35be7e4a7bbd5de6b2b2a0d48b8af1a306c38e450590e0ff85e516eb8529b.
+
 Selected recipe v1, BF16 KV/activations/lm_head and spill-free indexer unchanged.
 Enable `VLLM_GLM5_MHC_BF16_FN=1` on RTX6000 only: checkpoint fn values are
 preserved exactly, FP32 arithmetic/base/scale remain unchanged, and native

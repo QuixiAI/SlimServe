@@ -35,7 +35,33 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): prompt-score serving integration CPU-qualified
+### Latest checkpoint (2026-09-10): prompt scoring eliminates recovered OOM warnings
+
+Series on414829029 CLOSED/PASS: exactly control/chunked/return, all27 timing rounds,
+nine quality passes, text/image and cold32K/128K pass. Every4096 text/168 needle
+score equals the historical original exactly. All original AOT kernel bindings
+remain exact; no correction/selection arenas. Recovered4.7GB allocator warnings
+are8 ->0 ->8 (two/rank in each control, zero candidate). No restart/replacement.
+
+E2E median c1/c8/c16: control157.397/578.121/779.971, chunked156.983/579.758/
+778.748, return156.878/579.686/781.038 tok/s. Quality-pass medians89.758/89.581/
+89.614s; cold32K/128K effectively neutral. This is a memory/reliability win, not a
+speed claim. Isolated score scratch9.44GB ->1.27GB; live full-stack peak not measured.
+
+Retain `SLIMSERVE_GLM53_PROMPT_SCORE_CHUNKS=1` as opt-in. No profile/default/quant/
+native change: production ordering remains off, while the qualified series used
+native-order1. NEXT: qualify this memory fix under the production ordering policy
+before default rollout; then resume measured decode/prefill optimization. Do not
+enable arithmetic diagnostics or change quant to seek a benchmark win.
+
+Closure1,042 receipts/5,172 original files verifies; GPUs released, freeze ended.
+Each arm still has one resource-tracker shared-memory warning/transient zombie.
+Raw `prompt-score-serving-v1/closure.json` under2026-09-10, SHA
+27c35be7e4a7bbd5de6b2b2a0d48b8af1a306c38e450590e0ff85e516eb8529b.
+Full protocol/ranges/limits: `perf/glm53-prompt-score-protocol.md`. No next GPU job
+prescribed. Use completed receipts after source edits, not expired validators.
+
+### Previous checkpoint (2026-09-10): prompt-score serving integration CPU-qualified
 
 Opt-in `SLIMSERVE_GLM53_PROMPT_SCORE_CHUNKS=1` wires the qualified helper into
 GLM53 requests>1024 rows; complete projection/TP gather, small requests, journal

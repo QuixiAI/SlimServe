@@ -1,7 +1,8 @@
 # GLM53 bounded prompt-score qualification
 
-Status: isolated CUDA and final521-test CPU integration gates pass; real serving
-series prescribed below. No quant, profile, production-default or native changes.
+Status: full serving series on414829029 and final closure PASS. Source freeze
+ended. Retain the memory fix as a qualified opt-in; no production-policy/default
+or speed promotion. Commands below are historical, not restart instructions.
 
 ## Hypothesis and scope
 
@@ -142,3 +143,65 @@ without preparing a cache or launching a server. Inspection SHA
 This inspection precedes the final timing/test edits; preparation pins committed
 current bytes. Original helper/Sampler/rank implementation hashes must match the
 completed isolated GPU receipt before any serving arm is admitted.
+
+## Completed serving result
+
+Exactly control/chunked/return-control, one private namespace/start each. All27
+exact1000/300 timing rounds (225 measured requests), nine complete quality passes,
+text/image canaries and cold32K/128K checks pass. Every4096 text and168 needle-token
+score equals the historical original EXACTLY in every pass. Every arm is internally
+repeatable; all unchanged quality windows pass. No quant/arithmetic/native changes.
+
+All four workers in every arm pass before-forward/capture provenance checks:
+seven AOT roots/46 entries,25 original launchers/two original target bindings,
+original-policy8192-row scheduler envelope. No correction kernel/selection arena
+is activated. All92 non-target bindings and the original target bindings are exact
+to the qualified control, including return. No fresh-compilation claim follows.
+
+Recovered4,718,592,000-byte allocation warnings: **8 -> 0 -> 8**. Both controls
+have two warnings per rank, all during the first quality pass; candidate has zero
+allocation-failure warnings over its complete workload. The bounded post-projection
+scoring intervention therefore eliminates the observed recoverable allocation
+failures in this serving series. Isolated stacks identify conversion/log_softmax;
+no live OOM allocation stack was collected. Do not claim every serving allocation
+or full-vocabulary requested-output allocation is bounded by the helper.
+
+Diagnostic E2E tok/s, median [min,max], three repeats:
+
+| Arm | c1 | c8 | c16 |
+| --- | ---: | ---: | ---: |
+| Control | 157.397 [157.032,157.517] | 578.121 [577.651,579.114] | 779.971 [777.735,780.952] |
+| Chunked | 156.983 [156.879,157.144] | 579.758 [578.265,581.819] | 778.748 [778.438,779.963] |
+| Return | 156.878 [156.844,157.158] | 579.686 [577.869,580.137] | 781.038 [780.347,782.019] |
+
+Cold engine scheduled-to-first-token ms, median [min,max], all cached_tokens=0:
+
+| Arm | 32K | 128K |
+| --- | ---: | ---: |
+| Control | 2580.002 [2577.780,2583.408] | 10891.981 [10846.741,10920.297] |
+| Chunked | 2589.036 [2586.287,2590.958] | 10897.479 [10857.942,10930.248] |
+| Return | 2586.528 [2584.310,2588.467] | 10924.595 [10880.917,10957.556] |
+
+Complete quality-pass wall seconds in order: control89.689/89.928/89.758,
+chunked89.581/89.902/88.667, return89.751/89.614/88.776. Medians89.758/89.581/
+89.614s are effectively neutral; client serialization and full-model work remain.
+Neither these timings nor the decode/prefill differences establish a speed win.
+The retained value is lower score scratch and removal of recovered allocator failures.
+
+Startup160.078/160.112/158.082s; GPU release0.407/0.141/0.138s. One transient
+teardown zombie and one shared-memory resource-tracker warning recorded in EACH
+arm. Do not describe allocation success as clean teardown. All process/audit exits0,
+GPUs released, driver/UUID/600W unchanged. No retries, replacements or exclusions.
+
+Closure verifies1,042 source/evidence receipts and5,172 original files, raw
+`perf/results/2026-09-10/prompt-score-serving-v1/closure.json`, SHA
+27c35be7e4a7bbd5de6b2b2a0d48b8af1a306c38e450590e0ff85e516eb8529b.
+All private caches, logs, manifests and failed CPU reports retained. Freeze ended
+before these result edits. Consume the completed receipts; do not rerun this closed
+series or its expired frozen validators.
+
+Decision: retain `SLIMSERVE_GLM53_PROMPT_SCORE_CHUNKS=1` as an opt-in memory fix.
+The default profile remains unchanged because this series used the native-order1
+diagnostic reference. Next qualify rollout under the production ordering policy,
+then return to measured decode/prefill bottlenecks. No further GPU job is prescribed
+yet; do not silently enable native ordering or change the selected recipe.

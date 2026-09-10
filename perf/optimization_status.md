@@ -27851,3 +27851,33 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - Raw: `runtime-control/prompt-score-serving-cpu-v3.xml`, inspection SHA
   834a1d92415f21eb491b3602918cc894778e4e57d02e2397cfb382ef3aaf44d9 under2026-09-10.
   Full commands and CPU history: `perf/glm53-prompt-score-protocol.md`.
+
+## 2026-09-10 - Exact model parity with recovered allocation failures eliminated
+
+- Status: serving-qualified opt-in memory fix; production-policy rollout pending.
+- Baseline/workload:414829029, fixed recipe v1/SM120 TP4, native-order1 diagnostic
+  reference. Exactly control/chunked/return, one original-AOT private cache each,
+  three repeats. All27 exact1000/300 c1/c8/c16 rounds, nine quality passes, text/image
+  canaries and cold32K/128K pass. No quant/native/compiler/default changes.
+- Hypothesis/result: bound post-projection score rows to1024 without replacing
+  sampler math. Recovered4,718,592,000-byte allocator warnings8 ->0 ->8. Every
+  control has two/rank during first quality pass; candidate has zero over its
+  complete workload. Isolated scratch reduction86.5%; no live full-stack peak or
+  actual live OOM stack collected. Large requested outputs remain unavoidable.
+- Correctness: every4096 text and168 needle-token score is exactly historical
+  original in all nine passes; unchanged quality windows pass. All original model
+  bindings exact, including92 non-targets; no correction/selection arena active.
+- Timing: E2E medians control157.397/578.121/779.971, candidate156.983/579.758/
+  778.748, return156.878/579.686/781.038 tok/s. Cold32K/128K medians2580.002/
+  10891.981,2589.036/10897.479,2586.528/10924.595ms. Quality-pass wall medians
+  89.758/89.581/89.614s. Effectively neutral, not a speed win or new stable baseline.
+- Closure: all exits/audits0,1,042 receipts/5,172 original files verify; GPUs
+  released, hardware unchanged, no retries/replacements/exclusions. Each arm retains
+  one transient teardown zombie/shared-memory warning; teardown internals not clean.
+  Source freeze ended before results documentation. Final CPU521 pass/24.24s.
+- Decision: retain opt-in memory fix. Qualify production-ordering rollout before
+  enabling profile default, then resume actual decode/prefill bottlenecks. No next
+  GPU process prescribed. Do not rerun expired frozen readers after result edits.
+- Raw: `perf/results/2026-09-10/prompt-score-serving-v1/closure.json`, SHA
+  27c35be7e4a7bbd5de6b2b2a0d48b8af1a306c38e450590e0ff85e516eb8529b.
+  Commands, spread and retained failure history: `perf/glm53-prompt-score-protocol.md`.
