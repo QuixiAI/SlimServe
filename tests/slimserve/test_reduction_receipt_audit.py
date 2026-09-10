@@ -8,7 +8,6 @@ import pytest
 
 from benchmarks.analyze_glm53_reduction_receipts import (
     audit_receipt,
-    binary_cache_directory,
     declared_symbols,
     reduction_metadata,
 )
@@ -77,6 +76,7 @@ def receipt(tmp_path):
     )
     return document, dict(
         cache_root=tmp_path,
+        triton_cache_root=tmp_path / "triton",
         rank=0,
         source_sha256="recorder",
         heuristic_sha256="compiler",
@@ -162,11 +162,32 @@ def test_metadata_does_not_execute_generated_source():
         )
 
 
-def test_vllm_redirected_cache_is_resolved_from_actual_source(tmp_path):
-    namespace = tmp_path / "torch_compile_cache/torch_aot_compile/key"
-    source = namespace / "inductor_cache/aa/kernel.py"
-    assert binary_cache_directory(source, tmp_path) == namespace / "triton_cache"
-    with pytest.raises(ValueError, match="unrecognized"):
-        binary_cache_directory(tmp_path / "unknown/kernel.py", tmp_path)
+def test_binary_cache_must_be_explicit_and_private(receipt):
+    document, args = receipt
+    args["triton_cache_root"] = args["cache_root"].parent / "unrelated"
     with pytest.raises(ValueError, match="outside"):
-        binary_cache_directory(tmp_path.parent / "inductor/aa/kernel.py", tmp_path)
+        audit_receipt(document, **args)
+
+
+def test_wrong_binary_cache_does_not_fall_back_to_a_search(receipt):
+    document, args = receipt
+    args["triton_cache_root"] = args["cache_root"] / "wrong"
+    with pytest.raises(FileNotFoundError):
+        audit_receipt(document, **args)
+
+
+def test_recorded_environment_includes_vllm_import_defaults(tmp_path):
+    from benchmarks.analyze_glm53_deterministic_serving import expected_environment
+
+    reference = {"SLIMSERVE_GLM53_NATIVE_ORDER": "1", "OMP_NUM_THREADS": "1"}
+    before = dict(reference)
+    result = expected_environment(reference, tmp_path)
+    assert reference == before
+    assert result == {
+        **reference,
+        "VLLM_CACHE_ROOT": str(tmp_path),
+        "TORCHINDUCTOR_CACHE_DIR": str(tmp_path / "inductor"),
+        "TRITON_CACHE_DIR": str(tmp_path / "triton"),
+        "TORCHINDUCTOR_COMPILE_THREADS": "1",
+        "TRITON_CACHE_AUTOTUNING": "1",
+    }

@@ -370,3 +370,66 @@ remains diagnostic/defaultOFF; TC0. Keep sources/native frozen through all three
 jobs and audits; no intervening edits/commits/builds or other GPU work. Stop on
 any failed gate; retain every failed/slow start and all warnings, no replacements.
 No performance or default promotion from these diagnostics alone.
+
+## No-combo full workload completes but fails quality acceptance (series STOPPED)
+
+One fresh-a on59ae0c88f completes the real profile and full prescribed workload,
+with sources/native binaries frozen through all audits. All three quality passes'
+individual text AND needle-token scores are exactly equal. Mean-2.7264740343091405,
+all needle rankings positive. Nevertheless12/32 windows fail the unchanged
+0.01-nat floor against fixed native controls:3/4/8/9/10/15/20/23/26/27/28/30.
+Worst window28 is0.098160 beyond the permitted floor,0.108160 below the control.
+All36 historical score comparisons differ. Improved aggregate score does not
+override failed windows. Candidate NOT promoted; series TERMINAL. NEVER launch
+its unused fresh-b/cached-a arms. Independent-start equality remains untested.
+
+Measured diagnostics only: c1/c8/c16 E2E medians155.740252/574.244902/777.768328,
+ranges[155.535387,155.742531]/[573.977641,575.604638]/[776.030609,777.828204].
+Cold engine TTFT32K2.584496[2.582000,2.587168]s and128K10.875915
+[10.840217,10.908407]s. Startup184.083560s, first text canary48.898762s due to
+cold JIT work, image0.567689s.25 warmup/75 timed exact1000/300 requests,
+text4/imageRed,168 quality requests/12288 text+504 needle scores, two prefill
+warmups/six timed requests all complete.6 recovered4,718,592,000-byte allocation
+warnings,2 zombies at teardown retained; controller/server exit0 and GPU release
+0.559451s. Final independent compute query empty. No new speed baseline.
+
+The prescribed audit initially fails on an expected-environment omission:
+vllm/env_override.py sets TORCHINDUCTOR_COMPILE_THREADS=1 and
+TRITON_CACHE_AUTOTUNING=1; new receipts expose these previously unrecorded keys.
+Supplemental evidence verifies them explicitly. Further checker assumptions were
+also corrected without changing the running model or its results:
+
+- Before/after entire snapshots need not be identical: capture adds one
+  pointwise-only graph per rank. Every pre-existing binding and every reduction
+  remain unchanged. The initial supplemental script/log are preserved.
+- The earlier sibling-cache claim is WITHDRAWN for this actual AOT path.
+  decorators.py redirects only Inductor; Triton remains at the recorded launch
+  root. InductorAdaptor's paired-directory behavior describes a different path.
+  Supplemental audit checks exact keys/metadata/cubin bytes at the recorded
+  private root. Its failed sibling-assumption script/log are preserved. Tracked
+  checker now requires an explicit Triton root, with no search/fallback.
+- Model graph inventory has512- and2048-wide norms as well as4096. Sixteen
+  bindings need additional shape qualification. Do not force the4096 launch
+  geometry on them or silently clear their oracle gate.
+
+Supplemental audit verifies30 sources,24 benchmark receipts,7 native libraries,
+5172 original files,36 post-capture graphs/132 bindings/68 reductions. Raw actual
+source filenames, configurations and cubin digests are recorded, including512
+persistent XBLOCK2/one warp and2048 XBLOCK2/RBLOCK1024/eight warps (one stage).
+The numerical acceptance failure is independently established and does not
+depend on accepting these smaller norms as qualified.
+
+Authoritative evidence:
+`perf/results/2026-09-10/runtime-control/no-combo-first-workload-analysis.json`,
+SHAeb333fb93c2ac28218d46ca7799d95ce2378f73ebc0ccfe5d49138b6e2530c87.
+Its three supplemental audit logs and preserved failed script versions are under
+the same runtime-control directory. Original failed audit stays in the series.
+
+NEXT, no GPU job prescribed yet: inspect exact smaller-norm sources and actual
+historical bindings, extend source/shape oracle coverage, and isolate the new
+score-vector change. Disabled combo fusion, broader deterministic reduction
+choices and independently fresh KDA autotuning are distinct candidate causes,
+not established explanations. The completed four-RMSNorm old/native causal result
+does not attribute THIS fresh-policy difference. Do not widen the quality gate,
+restart into a good score, promote the policy, or exonerate TC. Subsequent GPU
+work needs a newly recorded bounded protocol; existing series remain stopped.

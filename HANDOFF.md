@@ -35,7 +35,63 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): no-combo frontend passes; NEW serving series prescribed
+### Latest checkpoint (2026-09-10): real workload completes; no-combo policy fails quality gate
+
+The no-combo series is now TERMINAL after its ONE fresh-a on59ae0c88f. Do NOT
+launch fresh-b/cached-a. Unlike the prior compiler failure, this profile reaches
+health and finishes the complete workload:25 warmup/75 timed cold1000/300
+requests, text4/imageRed,168 quality requests/12288 text+504 needle scores,
+32K/128K prefill (two warmups/six timed requests). Controller/server exit0;
+GPUs released0.559451s, final independent compute query empty.
+
+Every individual text/needle score repeats EXACTLY across all three passes.
+Mean-2.7264740343091405, all needle rankings pass. BUT12/32 windows fail the
+UNCHANGED0.01-nat floor versus fixed native controls, identically in all passes:
+3/4/8/9/10/15/20/23/26/27/28/30. Worst window28 is0.098160 beyond the allowed
+floor (0.108160 below the control). All36 comparisons to12 historical passes
+differ. Aggregate improvement is NOT acceptance. No policy/TC/default promotion,
+no independent-start reproducibility claim, no retry to seek a passing score.
+
+Diagnostic E2E medians c1/c8/c16:155.740/574.245/777.768 tok/s; cold engine TTFT
+32K2.584496s/128K10.875915s. Startup184.083560s; first text canary48.898762s
+(cold JIT work), image0.567689s.6 recovered4,718,592,000-byte allocation warnings,
+2 zombies at teardown, all logs retained. These are NOT new baselines or wins.
+
+Supplemental audit on frozen sources verifies30 source receipts,24 benchmark
+receipts,7 native libraries,5172 original files,36 graph modules/132 bindings/
+68 reductions and actual metadata/cubin bytes. Reductions unchanged across
+capture; one additional pointwise-only graph per rank appears during capture.
+16 norm bindings have widths512/2048, outside the original4096 geometry probe.
+512: persistent XBLOCK2/one warp/one stage, cache keyATT5PLJ...;
+2048: XBLOCK2/RBLOCK1024/eight warps/one stage, keyULYNKQF....
+Their exact source paths/configs/binaries are in the supplemental audit.
+
+Original prescribed audit failed first on an ENVIRONMENT CHECKER BUG: new
+receipts include vLLM's TORCHINDUCTOR_COMPILE_THREADS=1 and
+TRITON_CACHE_AUTOTUNING=1 import defaults; expected env omitted them. Also,
+the sibling-cache inference introduced before launch was WRONG for this actual
+AOT path: decorators redirect only Inductor, while Triton stays in the recorded
+launch directory. Corrected offline checker now requires an explicit private
+Triton root; no guessing/search fallback. Smaller-norm qualification remains
+closed. Initial supplemental whole-snapshot equality and sibling-cache assumptions
+also failed; both scripts/logs preserved. None invalidates the verified quality
+failure. No model reruns were used to repair audit tooling.
+
+Authoritative supplemental evidence:
+`perf/results/2026-09-10/runtime-control/no-combo-first-workload-analysis.json`,
+SHAeb333fb93c2ac28218d46ca7799d95ce2378f73ebc0ccfe5d49138b6e2530c87.
+The original failed audit remains at `deterministic-no-combo-serving/fresh-a-analysis.json`.
+
+NEXT: isolate the score change before new serving starts. Inspect the exact512/
+2048 norm sources/configs and other emitted reductions against actual historical
+graph bindings; qualify newly covered shapes with the existing oracle contract.
+Separately assess disabled combo fusion and fresh-cache KDA autotune choices as
+confounders. Their causal roles are UNPROVEN. The older four-RMSNorm sufficiency
+result applies only to the completed old/native pair, not this new score vector.
+Do not widen quality gates, clear TC, reuse stopped arms, or claim universal
+determinism. No next GPU job is prescribed yet. All GPUs free, goal ongoing.
+
+### Previous checkpoint (2026-09-10): no-combo frontend passes; NEW serving series prescribed
 
 Corrected-policy frontend on532c62674 completes12/12, including independent
 unequal-size pointwise branches. Original eight cases (outputs AND oracle metrics)

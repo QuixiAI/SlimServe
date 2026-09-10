@@ -4,6 +4,9 @@
 
 Preparation creates only fresh private caches and a frozen manifest. Audits are
 offline; no generated code is executed. Every failed gate remains in its output.
+
+The 2026-09-10 series is stopped: fresh-a completed but failed the unchanged
+window-quality gate. Do not launch its unused arms or promote this candidate.
 """
 
 import argparse
@@ -50,6 +53,19 @@ def save(path, result):
         stream.write("\n")
 
 
+def expected_environment(reference, cache):
+    # These two defaults are applied by vllm.env_override during client imports;
+    # older receipts did not include TORCHINDUCTOR_/TRITON_ keys at all.
+    return {
+        **reference,
+        "VLLM_CACHE_ROOT": str(cache),
+        "TORCHINDUCTOR_CACHE_DIR": str(cache / "inductor"),
+        "TRITON_CACHE_DIR": str(cache / "triton"),
+        "TORCHINDUCTOR_COMPILE_THREADS": "1",
+        "TRITON_CACHE_AUTOTUNING": "1",
+    }
+
+
 def prepare():
     require(not SERIES.exists(), "new series directory required")
     require(not git("status", "--short"), "clean source required")
@@ -69,6 +85,8 @@ def prepare():
         "vllm/v1/worker/gpu_model_runner.py",
         "vllm/config/compilation.py",
         "vllm/compilation/compiler_interface.py",
+        "vllm/compilation/decorators.py",
+        "vllm/env_override.py",
         "benchmarks/analyze_glm53_deterministic_serving.py",
         "benchmarks/analyze_glm53_reduction_receipts.py",
         "benchmarks/analyze_glm53_quality_pair.py",
@@ -411,12 +429,7 @@ def audit(arm, result):
     ]
     require(summary["plan"] == plan, "recipe/plan changed")
     cache = SERIES / ("cache-b" if arm == "fresh-b" else "cache-a")
-    env = {
-        **original["environment"],
-        "VLLM_CACHE_ROOT": str(cache),
-        "TORCHINDUCTOR_CACHE_DIR": str(cache / "inductor"),
-        "TRITON_CACHE_DIR": str(cache / "triton"),
-    }
+    env = expected_environment(original["environment"], cache)
     require(summary["environment"] == env, "unexpected environment")
     require(
         summary["runtime"]
@@ -492,6 +505,7 @@ def audit(arm, result):
             audit_receipt(
                 document,
                 cache_root=cache,
+                triton_cache_root=env["TRITON_CACHE_DIR"],
                 rank=rank,
                 source_sha256=manifest["sources"]["slimserve/reduction_receipts.py"],
                 heuristic_sha256=manifest["heuristic_sha256"],

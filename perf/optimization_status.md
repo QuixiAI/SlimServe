@@ -26449,3 +26449,48 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   `runtime-control/no-combo-frontend-analysis.json`,
   SHA6facb3efedd788e3dc527fd3687d09ddefd61096a528d8cc876c8b55e313a6f9.
   `runtime-control/no-combo-serving-{cpu,audit-replay}.log`, all under2026-09-10.
+
+## 2026-09-10 - Full no-combo workload is repeatable within start but fails quality windows
+
+- Status: candidate NOT promoted; fixed series stopped after ONE fresh-a.
+  Fresh-b/cached-a never launched and must not be launched into this series.
+- Baseline: fixed recipe/native-order1/BF16fn1/TC0 on59ae0c88f, empty private
+  caches,150GiB/no-swap scope. Sources/native frozen through run and all audits.
+- Results: real profile reaches health and completes25 warmup/75 timed cold
+  exact1000/300 requests, text4/imageRed,168 quality requests,12288 text+504
+  needle scores, two cold-prefill warmups/six timings at32K/128K. No exclusions.
+- Numerical: every text/needle-token score exactly repeats across3 passes;
+  mean-2.7264740343091405, all needle rankings pass. But12/32 windows fail the
+  existing0.01-nat floor against fixed native controls in EVERY pass. Windows
+  3/4/8/9/10/15/20/23/26/27/28/30; worst28 is0.098160 below allowed floor.
+  Aggregate improvement does not waive these failures. All36 historical pairs
+  differ. Cross-start reproducibility untested; policy not qualified.
+- Diagnostic E2E median[min,max] tok/s:
+  c1 155.740[155.535,155.743],c8 574.245[573.978,575.605],
+  c16 777.768[776.031,777.828]. Cold engine TTFT32K2.584496
+  [2.582000,2.587168]s/128K10.875915[10.840217,10.908407]s. Not baselines/wins.
+- Startup184.083560s; first text canary48.898762s (cold JIT), image0.567689s.
+  Retain6 recovered4,718,592,000-byte allocation warnings and2 teardown zombies.
+  Controller/server exit0; GPUs released0.559451s, final independent query empty.
+- Audit:30 sources,24 benchmark receipts,7 native libraries,5172 original files,
+  36 post-capture graphs/132 bindings/68 reductions and cubin bytes verify.
+  Existing bindings/reductions unchanged across capture; one pointwise-only graph
+  per rank added.16 norm bindings of widths512/2048 need additional qualification.
+- Checker corrections: expected env omitted vLLM import defaults COMPILE_THREADS1/
+  CACHE_AUTOTUNING1; prescribed audit failure retained. Supplemental initially
+  assumed whole snapshots identical, then incorrectly inferred Triton from source
+  cache siblings. Both failed script/log versions retained. Actual AOT path
+  redirects only Inductor; explicit launch Triton root is correct. Tracked offline
+  auditor now takes an explicit bounded root and includes the environment defaults.
+  No numerical gates changed, no GPU reruns to repair audit tooling.
+- Decision: isolate new score-vector difference before further serving. Qualify
+  exact512/2048 shapes; compare all reduction choices, disabled combo fusion and
+  fresh KDA autotuning separately. Their causal roles are unproven. Existing old/
+  native four-RMSNorm sufficiency does not explain this new difference by itself.
+  No next GPU job prescribed, no default or TC change, no policy promotion.
+- Raw: `perf/results/2026-09-10/deterministic-no-combo-serving/fresh-a/`;
+  supplemental `runtime-control/no-combo-first-workload-analysis.json`,
+  SHAeb333fb93c2ac28218d46ca7799d95ce2378f73ebc0ccfe5d49138b6e2530c87.
+  Original failed audit and three supplemental audit logs/scripts preserved.
+- Final audit-only regression suite:129pass19.05s, lint/diff checks pass; raw
+  `runtime-control/no-combo-audit-corrections-cpu.log`. No serving restart.

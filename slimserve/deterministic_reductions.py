@@ -3,6 +3,9 @@
 
 Uses a supported, cache-keyed Inductor option. No generated-source mutation,
 runtime replacement, global PyTorch determinism or production default change.
+
+Not promoted: the 2026-09-10 full-model no-combo start repeated its scores exactly
+but failed 12/32 unchanged per-window quality gates. See the performance notebook.
 """
 
 import copy
