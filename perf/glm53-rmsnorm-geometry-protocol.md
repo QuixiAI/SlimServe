@@ -10,8 +10,10 @@ inventory's graph/helper classification; v5 stops at post-compile call identity.
 No-weights AOT v6 now PASSES all eight loads/audits and final comparison; its
 commands are historical. The opt-in serving integration and workload controller
 are CPU-tested. Full-model v1 stopped during CPU preflight with zero model starts;
-v2 then stops at a client import before any model start. The direct-entrypoint fix
-and NEW v3 prescription are at the tail.
+v2 then stops at a client import before any model start. Full-model v3 now completes
+all three prescribed starts/audits and closure. Geometry is rejected under the
+unchanged quality gate and does not reproduce the failed no-combo score vector;
+the completed result is at the tail. No next GPU/model series is prescribed.
 
 ## Question and fixed factors
 
@@ -834,7 +836,7 @@ systemd-run --user --scope --unit=glm53-geometry-serving-v2-close -p MemoryMax=8
 No retries, replacement starts, threshold changes or production promotion. V1 and
 all prior failed sequences stay terminal. Completed no-weights v6 stays completed.
 
-## V2 terminal client import; direct-file entrypoint fixed; NEW v3
+## V2 terminal client import; direct-file entrypoint fixed; historical v3 (complete)
 
 On1bea1f616, preparation/preflight pass; benchmark client fails at geometry plan
 validation with `No module named benchmarks`, before creating a campaign or server.
@@ -860,3 +862,60 @@ per label conditional on all prior audits/release, and one terminal closure.
 Fresh copies, serving150GiB/controller+audit8GiB/swap0; one GPU workload and no
 source edits/builds through closure. No retries or unused v1/v2 attempts. No
 production promotion, threshold changes or performance eligibility from this test.
+
+## Full-model v3 completed: geometry shift reversible, candidate rejected
+
+Source ce6df61aa. Exactly one control, one geometry, one return-control in prescribed
+order. Every serve/audit exits0; final closure succeeds, GPUs released. No retries,
+replacements or exclusions. V1/V2 remain terminal (zero model starts); all nine
+serving cache copies remain intact.359 frozen receipts/5172 original files unchanged.
+
+All three starts reach health and pass text/image canaries. Each rank loads seven
+actual artifacts/46 entries and verifies real roots before forward and around
+capture. All thirteen targets/35 bindings per start qualify; all65 non-target
+source/config/cubin bindings match across arms. Return-control target bindings
+also exactly match the first control. No callback-only coverage or global observer
+seal substitutes for the actual live-root comparisons.
+
+All225 measured and75 warmup1000/300 requests are exact and cold. Each start's
+three quality passes repeat all4096 text/168 needle scores exactly; all needle
+contrasts pass. Both controls match the original vectors exactly and pass the
+unchanged floors. Geometry mean improves from-2.727814820100083 to-2.7232418363404096,
+but12/32 per-window floors fail in EVERY pass (zero-based windows
+1,4,8,9,10,20,22,24,26,27,28,29). Do not use the better mean to clear that gate.
+This is rejection under the predeclared criterion, not broad capability ranking.
+
+Geometry differs from failed no-combo at ALL4096 text/168 needle scores; text RMS
+delta0.4122363826850714, maximum absolute4.197688817977905. Both candidates fail12
+windows, but only eight failed-window IDs overlap. The thirteen-change intervention
+therefore does NOT reproduce the failed no-combo state on this workload. The exact
+return confirms reversibility of its own score shift. RMSNorm can contribute;
+this result does not identify the remaining attention/KDA/compiler cause.
+
+All24 prefill requests (six warmups/eighteen measured) are cold and exact, with
+identical prompt IDs across starts. Three measurements per table cell:
+
+| Case | E2E c1 / c8 / c16 tok/s | Cold32K /128K engine TTFT ms |
+| --- | --- | --- |
+| Control | 157.422 /580.938 /780.713 | 2579.726 /10876.322 |
+| Geometry | 156.682 /576.893 /775.075 | 2583.413 /10896.764 |
+| Return control | 156.959 /579.190 /777.006 | 2585.843 /10899.778 |
+
+Startup166.109/164.113/166.092s. These are diagnostic timings, not new stable or
+competitive baselines. No speed win or production/default/quant promotion; original
+H4096 choices retained. Separate indexer oracle and no-combo quality gates remain
+failed. No tolerance changed and no native build occurred.
+
+Raw `rmsnorm-geometry-serving-v3/` under2026-09-10:
+
+- Closure SHA c25674eab322b7334c694e1354f0a2ab3c8b7f3b8bb9be4e8d1e6f92091cf597.
+- Control workload audit SHA5d0f2c1489b252ced721568c65d49c9d492526727d23a14bc4be0d878ae23284.
+- Geometry workload audit SHA163e864b1091c5029da2ed7925743800515b66f7c6371389d3e721236693af02.
+- Return workload audit SHAd5e3092173b2fecc19e8d7ac3fa546d2bad73d243ee0857f457c76905b060643.
+
+Each case's worker audit, launch marker, raw responses, snapshots and complete file
+inventory are linked by closure. Freeze ended after successful closure. Consume
+pinned completed receipts with relevant source/binary checks; do not rerun historical
+HEAD/source-frozen readers after new commits. Next CPU work inventories remaining
+old/fresh attention/KDA differences before a new bounded isolation or accuracy repair.
+No next GPU/model job is prescribed; the larger optimization goal remains open.

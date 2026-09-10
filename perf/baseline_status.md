@@ -1919,14 +1919,15 @@ graph capture for the hybrid GDN+MTP decode, Gemma-aware fused norm+quant.
 
 ## GLM-5.3-Flash NVFP4 (glm53-nvfp4-4 / glm53-nvfp4-8, A100; glm53-nvfp4-4 rtx6000)
 
-2026-09-10 diagnostic status: broader RMSNorm source qualification is complete.
-Actual no-weights AOT qualification v6 PASSES all eight prescribed control/geometry
-loads and audits on62a7a3ad0: seven roots/rank, all13 targeted sources across35
-bindings/arm, with all65 non-target bindings source/config/cubin-exact versus
-control. Exact live post-compile writeback closures verify too. This is loader/
-binary/graph coverage, NOT full-model causality or a new TPS baseline. No production
-promotion follows. Model-quality and separate indexer gates remain unchanged;
-current diagnostic details and next integration work are in HANDOFF/protocol.
+2026-09-10 diagnostic status: full-model control/geometry/return-control v3 completes
+on ce6df61aa, after numerical and actual-AOT qualification. All ranks' load/capture
+and workload audits pass; all65 non-target bindings remain exact. Both controls
+reproduce original text/needle scores exactly. The thirteen-source geometry change
+repeats exactly but fails12/32 unchanged quality windows and does NOT reproduce the
+failed no-combo score vector. It is rejected, with no speed win or new TPS baseline.
+Original production defaults and the separate failed indexer oracle gate are
+unchanged. Closure/raw measurements and remaining work are in HANDOFF, the geometry
+protocol and optimization notebook; stable baseline tables below remain unchanged.
 
 ### RTX6000 paired lossless mHC storage retained - 2026-09-08
 

@@ -27125,3 +27125,43 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - Raw: `rmsnorm-geometry-serving-v2/closure.json` under2026-09-10, SHA
   2b8bae9d33bcbec77982ce723c1bafcdbfe9a481ff20116473ad4fe5e96bf070;
   `runtime-control/geometry-client-entry-cpu.xml`.
+
+## 2026-09-10 - Full-model RMSNorm geometry isolation completes; candidate rejected
+
+- Status: completed causal diagnostic; geometry rejected, no speedup retained.
+- Baseline/hypothesis: can only13 original H4096 RMSNorm launch changes reproduce
+  the failed no-combo candidate, keeping attention combos/KDA/native/quant fixed?
+- Workload: ce6df61aa, real `glm53-nvfp4-4`/rtx6000 recipe v1, TP4/Marlin/BF16 KV,
+  native-order1/BF16fn1/TC0, no EP/speculation/profiling. Exactly control/geometry/
+  return-control, independent copies,150GiB serving/8GiB audits/swap0. No retries,
+  replacements, exclusions, source edits or builds during the series.
+- Structural correctness: all starts reach health and pass text/image canaries;
+  all ranks' actual AOT/pre-forward/capture root audits pass.13 target sources/35
+  bindings per start, all65 non-target source/config/cubin bindings exact across
+  arms; return target bindings also exactly match control. All serve/audit exits0.
+- Model checks:225 measured +75 warmup exact1000/300 requests, all cold. Every
+  start's three quality passes exactly repeat4096 text+168 needle scores. All
+  needle contrasts pass; both controls exactly reproduce original vectors/floors.
+  Geometry fails12/32 unchanged window floors in every repeat despite a better
+  aggregate mean (-2.7232418363404096 vs control-2.727814820100083). No gate widened.
+- Causal result: geometry differs from failed no-combo at all4096 text/168 needle
+  scores; text RMS delta0.4122363826850714/max4.197688817977905. Twelve failed
+  windows in both candidates, but only eight IDs overlap. These13 changes are
+  insufficient to reproduce that candidate on this workload. Their own shift
+  reverses exactly; no claim RMSNorm is irrelevant or other differences are proven.
+- Diagnostic E2E c1/c8/c16 medians: control157.422/580.938/780.713,
+  geometry156.682/576.893/775.075, return156.959/579.190/777.006 tok/s. Three samples
+  per cell; ranges retained in each audit/closure. Cold32K/128K engine TTFT medians:
+  control2579.726/10876.322ms, geometry2583.413/10896.764ms, return2585.843/10899.778ms.
+  All24 prefill requests cold/exact, identical prompt IDs; eighteen measured, six
+  warmups. Startup166.109/164.113/166.092s. No stable/competitive baseline promotion.
+- Closure/decision:359 sources/receipts and5172 original files unchanged; GPUs
+  released. All nine v1-v3 serving copies retained, v1/v2 terminal with zero model
+  starts. Freeze ended. Retain original H4096 choices; keep no-combo/indexer gates
+  failed. Inventory remaining attention/KDA differences before next bounded test.
+  No next GPU job prescribed, production defaults/quant/native unchanged.
+- Raw: `perf/results/2026-09-10/rmsnorm-geometry-serving-v3/closure.json`, SHA
+  c25674eab322b7334c694e1354f0a2ab3c8b7f3b8bb9be4e8d1e6f92091cf597;
+  each case's `workload-analysis.json`, `worker-analysis.json`, `launch.json` and
+  referenced raw/cache files. Consume completed receipts; do not rerun old frozen
+  readers after later commits. Detailed protocol/table at geometry notebook tail.

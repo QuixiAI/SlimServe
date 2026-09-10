@@ -35,7 +35,47 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): v2 client import terminal; direct entrypoint fixed; v3 prescribed
+### Latest checkpoint (2026-09-10): full-model v3 complete; geometry candidate rejected
+
+On `ce6df61aa`, exactly the prescribed control -> geometry -> return-control
+starts completed, each followed by successful independent worker/workload audits
+and GPU release. Final closure passes:359 frozen receipts/5,172 original files
+unchanged; all65 non-target graph/source/config/cubin bindings match across starts,
+and return-control target bindings match control. Source freeze has ended.
+All nine serving caches from v1-v3 and all prior failed attempts remain intact.
+V1/V2 stay terminal with zero model starts; v3 has three, none replaced/excluded.
+
+All three starts reach health, pass text/image canaries, complete the exact-token
+matrix and cold32K/128K prefill, and pass actual AOT/capture checks on all four ranks.
+Every start's three quality passes repeat all4,264 text/needle scores exactly.
+Both controls match the pinned original vectors exactly and pass all quality floors.
+Geometry fails12/32 unchanged window floors in every pass despite a better aggregate
+mean. It differs from the failed no-combo vector at ALL4,096 text and168 needle
+scores (text RMS delta0.412236). Thus these thirteen geometry changes are NOT
+sufficient to reproduce that candidate's score vector on this workload. Their own
+score change is reversible. This does not show RMSNorm is irrelevant or establish
+which remaining compiler/attention/KDA difference explains the rest.
+
+Diagnostic E2E c1/c8/c16 medians: control157.422/580.938/780.713,
+geometry156.682/576.893/775.075, return156.959/579.190/777.006 tok/s.
+No speed win; no production/default/quant/quality-gate promotion. Original stable
+baselines and the separate failed indexer LayerNorm oracle gate remain unchanged.
+
+Raw `perf/results/2026-09-10/rmsnorm-geometry-serving-v3/closure.json`, SHA
+c25674eab322b7334c694e1354f0a2ab3c8b7f3b8bb9be4e8d1e6f92091cf597.
+Each case has `workload-analysis.json`, `worker-analysis.json`, `launch.json` and
+complete response/kernel/cache evidence. Consume these completed pinned receipts;
+do not rerun the HEAD/source-frozen readers after subsequent commits.
+
+NEXT: retain the original H4096 choices; do not expand or promote the rejected
+geometry/no-combo policy. Use completed graph/attention evidence to inventory the
+remaining old/fresh KDA and attention differences, then prescribe the smallest
+useful isolation or correctness repair. Indexer oracle failure is still open;
+neither this result nor matching averages clears it. No next GPU/model job is
+currently prescribed. The optimization goal remains ongoing, with no new speedup
+retained at this checkpoint.
+
+### Previous checkpoint (2026-09-10): v2 client import terminal; direct entrypoint fixed; v3 prescribed
 
 V2 on `1bea1f616` passes preflight but its benchmark client fails before creating a
 campaign or starting a server: direct-file execution exposes `benchmarks/`, not
