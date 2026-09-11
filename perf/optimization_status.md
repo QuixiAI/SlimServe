@@ -25378,3 +25378,22 @@ Raw: perf/results/2026-09-10/glm53f-dflash2/mx-*/.
   but wasted restore bandwidth). Follow-up: skip restore ops for
   attention blocks the local hit already covers. Raw: perf/results/
   2026-09-11/glm53f-leg-dp2/.
+- DP2 RECORD 1M-context leg (12:54-14:20, c2, ctx-target 1,040,000,
+  tiers + byte verify): both sessions reached target (max 1,047,243,
+  median 1,043,755), 168 turns, 0 errors, 88.1M prompt tokens, tier 130
+  hits / 164 tail saves / 520 verify batches 0 mismatched, no free-list
+  fault. Recall 25/28: the three failures are all above 900K context
+  (902,755 / 905,237 / 980,301). Six clamp events at 13:19 (a 866,304-
+  token restore where the attention groups already held 760-768 local
+  blocks) precede them; whether the misses are the model's own limit
+  near 1M or a restore/recompute seam is open, so two controls run now
+  (queue12): the same 1M leg on the TP8 layout and a DP2 repeat. Raw:
+  perf/results/2026-09-10/glm53f-1m-leg/dp2-1m/.
+- k=3 vs k=4 on the DP2 record (compile cache keyed by k, c1/c8/c16/c32/
+  c64 medians of two): k=3 static 142.5 / 551.2 / 820.7 / 1011.6 /
+  1193.2 (acceptance 2.21); k=4 static 100.0 / 556.1 / 727.3 / 893.1 /
+  1092.0 (2.27); k=4 scheduled [[1,16,4],[17,64,0]] 168.3 / 513.4 /
+  726.6 / 885.6 / 1122.6. k=4 loses c16-c64 by 8-11%: acceptance barely
+  moves (2.21 -> 2.27) while every step verifies one more draft token.
+  DECISION: the record keeps k=3. Raw: perf/results/2026-09-10/
+  glm53f-dflash2/dp2-{k3-pair,k4,sched16-0-k4}/.
