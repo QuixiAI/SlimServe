@@ -35,7 +35,22 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): historical controls fail their own quality gate
+### Latest checkpoint (2026-09-10): same-live-input prompt scoring CPU-qualified
+
+New opt-in score shadow compares existing full scoring and unchanged chunked scoring
+on SAME live logits, with complete before/after input hashes and exact output bits,
+IDs/ranks. Small<=1024-row chunks stay original and explicitly UNPAIRED. Independent
+auditor joins all chunks to every HTTP prompt score on all four ranks; requires
+realistic>=7616-row paired coverage. No copied AOT or model arithmetic intervention.
+
+CPU357 pass/29.95s. NEXT after commit: ONE fresh production-order0 start using the
+command in `perf/glm53-prompt-score-shadow-protocol.md`. Controller8GiB/serve150GiB/
+swap0. Sources frozen through terminal audit, no retries/replacements. Full real
+profile workload preserved, but timing is diagnostic-only. Historical window gates
+are reported unchanged and separately; this is not a rollout or default promotion.
+No new model-quality acceptance rule is adopted. GPUs were idle before preparation.
+
+### Previous checkpoint (2026-09-10): historical controls fail their own quality gate
 
 CPU leave-one-out audit of ALL THREE chronological BF16 production baseline starts:
 each fails against the other two at the unchanged0.01-nat window floor (6/6/10

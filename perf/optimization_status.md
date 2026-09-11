@@ -27969,3 +27969,28 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   query confirms all four expected UUIDs/driver580.173.02/600W, memory34/2/2/2MiB,
   no compute processes or surviving test scopes. No reset or GPU mutation.
   Explanation and proposed separation: `perf/glm53-control-quality-diagnosis.md`.
+
+## 2026-09-10 - Qualify same-live-logit prompt scorer diagnostic on CPU
+
+- Status: CPU-qualified, one fresh real-profile diagnostic prescribed; GPU pending.
+- Baseline: opt-in bounded scoring has isolated exact CUDA parity and fixed-cache
+  serving memory evidence; fresh production control failed historical text windows.
+  Those windows bypass the chunked scorer and historical controls also fail them.
+- Hypothesis: compare both scorers on identical REAL logits to isolate scoring from
+  model ordering/compiler variability. This is not a relaxed quality/default gate.
+- Change: optional shadow hook outside compiled forward, full projection/gather once,
+  original full reference then unchanged chunk helper for>1024 rows. Complete input
+  hashes before/after each scorer (32MiB host staging), finite/exact-bit score/ID/rank
+  checks, per-rank chunk receipts. Small chunks remain original, explicitly unpaired.
+  Model/profile/quant/native/defaults unchanged, other diagnostics rejected.
+- Correctness:325 CPU tests then357 pass/29.95s, including actual runner dispatch,
+  all56 synthetic request/rank HTTP joins, damaged outputs/inputs/offsets/coverage/
+  journals, one-shot controller failures, and existing scoring/rollout regressions.
+- Decision: commit then exactly one empty-cache native-order0 production-profile
+  start, full canaries/exact-token/quality/cold-prefill workload. All timings excluded
+  from baselines; shadow runs the unbounded reference too. Report unchanged historical
+  quality separately even if it fails; no promotion or prior-verdict reclassification.
+  Source freeze through terminal audit, CPU8GiB/serve150GiB/swap0, no retries/builds.
+- Raw: `runtime-control/prompt-shadow-cpu-v{1,2}.xml` under2026-09-10. Next result
+  `perf/results/2026-09-10/prompt-score-shadow-v1/`. Exact command, bounds, coverage
+  and failure rules: `perf/glm53-prompt-score-shadow-protocol.md`.

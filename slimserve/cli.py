@@ -476,12 +476,14 @@ def main(argv: list[str] | None = None) -> int:
         from slimserve.prompt_score_diagnostic import (
             validate_plan as validate_prompt_score_plan,
         )
+        from slimserve.prompt_score_shadow import validate_plan as validate_shadow_plan
         from slimserve.rmsnorm_diagnostic import validate_plan as validate_rmsnorm_plan
         from slimserve.rmsnorm_geometry import validate_plan as validate_geometry_plan
 
         validate_plan(plan)
         validate_indexer_correction(plan)
         validate_prompt_score_plan(plan)
+        validate_shadow_plan(plan)
         validate_kv_plan(plan)
         validate_rmsnorm_plan(plan)
         validate_geometry_plan(plan)
@@ -491,6 +493,7 @@ def main(argv: list[str] | None = None) -> int:
             plan = diagnostic_plan(plan)
             validate_indexer_correction(plan)
             validate_prompt_score_plan(plan)
+            validate_shadow_plan(plan)
             validate_kv_plan(plan)
             validate_geometry_plan(plan)
     except ValueError as error:

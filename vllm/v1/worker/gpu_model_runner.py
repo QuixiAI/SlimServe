@@ -5932,6 +5932,12 @@ class GPUModelRunner(
             )
         score_journal = self._slimserve_score_journal
 
+        if not hasattr(self, "_slimserve_prompt_score_shadow"):
+            from slimserve.prompt_score_shadow import PromptScoreShadow
+
+            self._slimserve_prompt_score_shadow = PromptScoreShadow.from_env(self)
+        score_shadow = self._slimserve_prompt_score_shadow
+
         prompt_logprobs_dict: dict[str, LogprobsTensors | None] = {}
 
         # Since prompt logprobs are a rare feature, prioritize simple,
@@ -6019,7 +6025,20 @@ class GPUModelRunner(
             # Compute prompt scores respecting logprobs_mode.
             # NOTE: prompt tokens skip sampling processors, so
             # processed_* and raw_* yield the same scores here.
-            if chunk_rows and num_logits > chunk_rows and trace_match is None:
+            if score_shadow is not None:
+                if not chunk_rows or trace_match is not None:
+                    raise ValueError("score shadow requires chunks without journals")
+                token_ids, logprobs, ranks, _ = score_shadow.gather(
+                    logits,
+                    tgt_token_ids,
+                    num_prompt_logprobs,
+                    self.model_config.logprobs_mode,
+                    sampler=self.sampler,
+                    prompt_ids=request.prompt_token_ids,
+                    start_idx=start_idx,
+                    request_id=req_id,
+                )
+            elif chunk_rows and num_logits > chunk_rows and trace_match is None:
                 from vllm.v1.sample.prompt_logprobs import gather_prompt_logprobs
 
                 token_ids, logprobs, ranks, _ = gather_prompt_logprobs(

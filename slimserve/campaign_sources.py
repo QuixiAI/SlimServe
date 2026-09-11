@@ -31,6 +31,7 @@ PATHS = (
     "slimserve/kv_diagnostic.py",
     "slimserve/indexer_correction_diagnostic.py",
     "slimserve/prompt_score_diagnostic.py",
+    "slimserve/prompt_score_shadow.py",
     "benchmarks/kernels/glm53_indexer_correction_serving.py",
     "slimserve/glm53_serving_diagnostic.py",
     "benchmarks/kernels/glm53_kv_serving.py",

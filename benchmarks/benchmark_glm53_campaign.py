@@ -61,6 +61,7 @@ def diagnostic_only(args):
         or os.environ.get("SLIMSERVE_GLM53_KV_DIAGNOSTIC")
         or os.environ.get("SLIMSERVE_GLM53_INDEXER_CORRECTION")
         or os.environ.get("SLIMSERVE_GLM53_PROMPT_SCORE_DIAGNOSTIC")
+        or os.environ.get("SLIMSERVE_GLM53_PROMPT_SCORE_SHADOW")
         or any(
             os.environ.get(key) == "1"
             for key in (
@@ -605,6 +606,9 @@ def main():
     )
 
     validate_prompt_score_plan(plan)
+    from slimserve.prompt_score_shadow import validate_plan as validate_shadow_plan
+
+    validate_shadow_plan(plan)
     from slimserve.kv_diagnostic import validate_plan as validate_kv_plan
 
     validate_kv_plan(plan)
@@ -620,6 +624,7 @@ def main():
         plan = diagnostic_plan(plan)
         validate_indexer_correction(plan)
         validate_prompt_score_plan(plan)
+        validate_shadow_plan(plan)
         validate_kv_plan(plan)
         validate_geometry_plan(plan)
     if args.prefill or args.cold_prefix:
