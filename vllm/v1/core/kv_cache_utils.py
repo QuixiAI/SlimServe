@@ -187,6 +187,21 @@ class KVCacheBlockCopy(NamedTuple):
 
 
 
+def _assert_new_to_list(
+    linked: set[int], block: "KVCacheBlock", where: str, pool_id: int
+) -> None:
+    """A block id may be linked once: a second object carrying an id that is
+    already in the list (a block built outside the pool, or another pool's
+    block with a colliding id) advances num_free_blocks without lengthening
+    the list, and the divergence surfaces later in popleft_n."""
+    if block.block_id in linked:
+        raise RuntimeError(
+            f"{where} (pool {pool_id}): block id {block.block_id} "
+            f"(object pool_id={block.pool_id}, ref_cnt={block.ref_cnt}, "
+            f"null={block.is_null}) is already linked in the free list"
+        )
+
+
 def _assert_unlinked(block: "KVCacheBlock", where: str) -> None:
     """A block entering the free list must not already be in it: a second
     append silently splices a cycle into the list and the corruption only
@@ -383,6 +398,7 @@ class FreeKVCacheBlockQueue:
         last_block: KVCacheBlock = self.fake_free_list_tail.prev_free_block
         self._check("append")
         _assert_unlinked(block, "FreeKVCacheBlockQueue.append")
+        _assert_new_to_list(self._linked, block, "FreeKVCacheBlockQueue.append", self.pool_id)
         self._linked.add(block.block_id)
 
         # Connect the new block after the last block.
@@ -409,6 +425,9 @@ class FreeKVCacheBlockQueue:
         prev_block = self.fake_free_list_head
         for block in blocks:
             _assert_unlinked(block, "FreeKVCacheBlockQueue.prepend_n")
+            _assert_new_to_list(
+                self._linked, block, "FreeKVCacheBlockQueue.prepend_n", self.pool_id
+            )
             self._linked.add(block.block_id)
             block.prev_free_block = prev_block
             prev_block.next_free_block = block
@@ -436,6 +455,9 @@ class FreeKVCacheBlockQueue:
         # Add inter-connections between consecutive blocks
         for block in blocks:
             _assert_unlinked(block, "FreeKVCacheBlockQueue.append_n")
+            _assert_new_to_list(
+                self._linked, block, "FreeKVCacheBlockQueue.append_n", self.pool_id
+            )
             self._linked.add(block.block_id)
             block.prev_free_block = last_block
             last_block.next_free_block = block
