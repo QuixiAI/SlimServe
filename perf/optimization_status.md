@@ -28501,3 +28501,53 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   ONE corrected candidate is prescribed in `indexer-shard-serving-candidate-fixed/`,
   same command/flags/workload as failed candidate. Do not repeat the control or
   omit this failed start from the report. Opt-in remains off in registry.
+
+### Phase 4.5 retained: 6.09% lower cold128K TTFT
+
+- Corrected candidate d020ccc54 completes. Control8f8592d20 and corrected
+  candidate have identical native hashes, package versions, CPU affinity,
+  registry plan and prompt source. Only environment difference is the sharding
+  flag; only benchmark-source difference is the documented metadata-gate fix.
+  No timing from the failed candidate is discarded (none was produced).
+- Three repeats each, exact1000/300, all150 measured requests retained.
+  E2E c1/c8/c16 medians156.928/579.047/779.811 ->156.935/580.174/781.001tok/s
+  (+0.004/+0.195/+0.153%): effectively neutral, not decode gains.
+- Cold-prefix32K engine TTFT2527.319 ->2532.335ms (+0.20%); actual hybrid
+  chunk/tail sizes bypass the new path at32K. Cold128K10658.466 ->10009.430ms
+  (-6.09%), effective prefill12297.45 ->13094.85tok/s (+6.48%). All candidate
+  timings9986.509–10036.829ms beat every control10627.153–10694.020ms.
+  Client128K TTFT10763.258 ->10125.387ms. All timed cached_tokens0.
+- These are warmed-kernel/cold-prefix timings. Prescribed first128K warmups
+  are10589.656/10535.429ms; first-use compilation costs are retained separately.
+  Do not advertise6.09% as a zero-JIT first-request or pure-kernel speedup.
+- Correctness: both complete runs pass exact lengths, text/image and all six
+  standard retrieval contrasts. Their short-text means-2.727241/-2.732036 are
+  observations on a bypass path, not new acceptance rules or a fix for old
+  scoring variation. Standard contrasts stop at32K and do not exercise the new
+  path with these chunk sizes; this was explicitly caught before promotion.
+- Two additional generated retrieval checks at131072 prompt tokens and25%/75%
+  needle positions both return `161559407816`,16 generated tokens each, all
+  cached_tokens0. Uses existing `needle_prefix`, temperature1/top_p0.95/top_k20/
+  seed42, max_tokens64, distinct salts, no ignore_eos or prompt scoring. Serving
+  log confirms sharding active. This is two targeted checks, not broad model
+  quality certification or another throughput run.
+- Serving/control and corrected-candidate exits0, startup172.087/162.078s,
+  GPU release recorded. The separate retrieval service was stopped explicitly:
+  Result=success, ExecMainStatus0, inactive/dead, independent NVIDIA query empty.
+  Its raw directory includes exact `client.py`, result JSON and server log.
+- Decision: retain in RTX6000 profile only, flag0 restores replicated prefill.
+  Registry/recipe promotion check:78 CPU tests pass; raw
+  `indexer-shard/profile-tests.xml`. Diff/lint checks pass.
+  No installed binary, quant, activation/KV/head dtype, speculation or ordering
+  policy change. All raw runs, including failure, stay under2026-09-11:
+  `indexer-shard/`, `indexer-shard-serving-control/`,
+  `indexer-shard-serving-candidate/` (failed),
+  `indexer-shard-serving-candidate-fixed/`, `indexer-shard-128k-needle/`.
+- Reproduction: use the existing campaign command from the wide-Marlin entry
+  with wide1 in both arms and `VLLM_GLM53_INDEXER_TP_PREFILL=0/1`, new output
+  directories, boots1/repeats3. No more starts are prescribed for this item.
+- Remaining roadmap:4.1 fused expert successor,4.2 whole-layer KDA,4.3 remaining
+  structural attention, conditional4.4 persistent layer, and Phase5 are not
+  completed. Source review during serving waits confirms retained Marlin already
+  implements DP/two-tile stream-K; a successor must identify another mechanism,
+  not rename existing scheduling or repeat the rejected planar/geometry probes.

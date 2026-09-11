@@ -2002,6 +2002,42 @@ released, no retries or quant/native/default changes; original oracle remains a
 historical failure. Raw `indexer-serving-v1/closure.json` under2026-09-10, SHA
 0d1302e05d6f2350d1bcf60be4d04691f489d6c3040f1bbca37fd890d139fa8b.
 
+### RTX6000 TP row-sharded indexer retained - 2026-09-11
+
+Selected recipe v1, native libraries and existing wide-Marlin flag unchanged.
+Profile adds `VLLM_GLM53_INDEXER_TP_PREFILL=1`: disjoint prefill query rows,
+one exchange of compact pool IDs before expansion. SM120 TP4/no PCP/DCP only,
+>=2048 prefill rows and >=32768 context. Flag0 restores the replicated path.
+
+| Measurement | Control | Corrected candidate | Change |
+|---|---:|---:|---:|
+| c1 E2E tok/s | 156.928 | 156.935 | +0.004%, neutral |
+| c8 E2E tok/s | 579.047 | 580.174 | +0.195%, neutral |
+| c16 E2E tok/s | 779.811 | 781.001 | +0.153%, neutral |
+| cold32K engine TTFT ms | 2527.319 | 2532.335 | +0.20%, effectively neutral |
+| cold128K engine TTFT ms | 10658.466 | 10009.430 | -6.09% |
+
+128K effective input rate12297.45 ->13094.85tok/s (+6.48%). Candidate128K
+range9986.509–10036.829ms is below control10627.153–10694.020ms. These are
+warmed-kernel/cold-prefix timings, not zero-JIT first-request latency; initial
+128K warmups were10589.656/10535.429ms and remain recorded.32K does not activate
+this path with the actual hybrid-aligned chunk/tail sizes.
+
+One completed control8f8592d20, one candidate failing before timing on an
+upstream-only metadata field, one corrected candidate d020ccc54. Failure retained;
+no discarded timing or replacement selection. Control's disabled execution is
+unchanged by the metadata-only gate fix. Same native/package/prompt/profile
+identity; only intended environment difference is the sharding flag. This series
+does not estimate across-start variance or resolve historical scoring failures.
+
+Component selected sets/tails match on all four ranks; selector ordering is not
+bit-exact.16 focused GPU tests and a metadata regression pass. Both complete
+serving runs pass exact lengths, text/image canaries and six standard retrieval
+contrasts. Those checks stop at32K, so a separate targeted run verifies generated
+retrieval at131072 tokens,25%/75% positions: both return the correct code, zero
+cached tokens, sharding active. No separate timing matrix on that run.
+Raw `perf/results/2026-09-11/indexer-shard*`; detailed commands/decisions in notebook.
+
 ### RTX6000 wide Marlin prefill retained - 2026-09-10
 
 Current RTX6000 profile enables `VLLM_GLM53_MARLIN_PREFILL_WIDE=1`.

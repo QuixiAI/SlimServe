@@ -37,25 +37,27 @@ the old history. Upstream history is unchanged and nothing was pushed.
 
 ### Latest checkpoint (2026-09-10): kernel speed work resumed
 
-2026-09-11 UTC: active **Phase4.5 prefill indexer TP row sharding**. Actual
-serving kernels, synthetic inputs, real TP4 pool-ID exchange: complete7616-row
-32K/128K windows2.43 ->1.26ms /10.0 ->3.08ms. Exact selected sets/tails on all
-ranks, unordered legacy selector output is NOT bit-exact. Production helper
-integrated opt-in `VLLM_GLM53_INDEXER_TP_PREFILL=1`; SM120/TP4 only, >=2048
-prefill rows and >=32768 context, no decode change.16 focused GPU tests pass.
-Raw `perf/results/2026-09-11/indexer-shard/`. NEXT: exactly one flag0 control
-then one flag1 candidate through existing campaign harness, three repeats,
-cold1000/300 c1/c8/c16, quality/needles and cold32K/128K. Same recipe/library,
-wideMarlin1, native-order0. No scoring campaign, sweep or replacement starts.
-No new serving speed claim or default promotion until that pair finishes.
-Serving update: control completed at8f8592d20 (c1/c8/c16 medians156.928/579.047/
-779.811, cold32K/128K2527.319/10658.466ms). Candidate reached health but failed
-before timing because dispatch referenced upstream-only metadata field
-`max_prefill_seq_len`; this fork has per-chunk `max_seq_len`. Fixed the gate
-to use those existing host values and added a fork-metadata dispatch regression.
-Failed candidate retained. Flag-off execution is unchanged; keep the completed
-control and run ONE corrected candidate into `indexer-shard-serving-candidate-fixed/`.
-This is a recorded development failure, not a discarded slow benchmark.
+2026-09-11 UTC: **Phase4.5 prefill indexer TP row sharding RETAINED**.
+Profile now enables `VLLM_GLM53_INDEXER_TP_PREFILL=1` for SM120/TP4, >=2048
+prefill rows and >=32768 context; no decode/short-prefill change. Cold-prefix
+128K engine TTFT10.658 ->10.009s (-6.09%, effective prefill+6.48%); every
+candidate timing beats every control.32K2.527 ->2.532s effectively neutral.
+c1/c8/c16 E2E156.928/579.047/779.811 ->156.935/580.174/781.001, neutral.
+Same native libraries/recipe/packages. Component32K/128K2.43 ->1.26ms /
+10.0 ->3.08ms, exact selected sets/tails on all ranks; legacy order NOT bit-exact.
+16 GPU tests plus fork-metadata dispatch regression pass. Initial candidate
+failed before timing on an upstream-only field, fixed in d020ccc54 and retained
+in the raw record; control8f8592d20 flag-off behavior unchanged. Corrected
+candidate passes all timings/canaries/standard retrieval checks. Separate two
+cold128K generated-retrieval checks (25%/75% positions) both return the correct
+code with zero cached tokens and active sharding. No benchmark reselection.
+Raw `perf/results/2026-09-11/indexer-shard/`, `indexer-shard-serving-control/`,
+`indexer-shard-serving-candidate/` (failed), `indexer-shard-serving-candidate-fixed/`,
+`indexer-shard-128k-needle/`. No additional timing/quality runs needed here.
+Next roadmap item:4.1 source-directed review of a fused expert successor.
+Retained Marlin already has DP/two-tile stream-K; don't reinvent it or repeat
+the rejected planar prototype. Whole-layer KDA/DSA structural work and Phase5
+remain unfinished; see the existing plan tracker. No full-completion claim.
 
 2026-09-11 UTC: **Phase 4.1 cross-item pipeline implemented, tested, rejected.**
 One fixed NT16/K512/S4 candidate improves gate/up 26.28 -> 22.02 us and down

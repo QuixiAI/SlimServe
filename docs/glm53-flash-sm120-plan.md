@@ -32,12 +32,20 @@ but saves only ~20 us across 34 layers; parked without a serving campaign.
 window c1 19.36 ->19.16 us, c8 27.18 ->28.37 us, c16 34.98 ->36.52 us.
 All output/state comparisons are exact; the ~7 us/34-layer c1 budget and batched
 regressions do not merit integration. No serving run or extra variants.
-Active: **4.5 prefill indexer TP row sharding**, adapted from #54951 with pool-ID
-exchange before expansion. Complete TP4 component32K/128K windows improve
-2.43 ->1.26ms /10.0 ->3.08ms. Integrated opt-in,16 focused tests pass; one
-control/candidate serving pair is next. No serving gain/promotion claimed yet.
-No new serving gain is claimed. The broader stream-K/fused-expert successor and
-whole-layer KDA fusion are not thereby implemented or declared impossible.
+**4.5 prefill indexer TP row sharding is retained**, adapted from #54951 with
+pool-ID exchange before expansion. Cold-prefix128K engine TTFT10.658 ->10.009s
+(-6.09%, effective prefill+6.48%);32K/decode effectively neutral.16 focused GPU
+tests plus a metadata-dispatch regression pass. First candidate failed before
+timing on a metadata field; fixed candidate completes, failure preserved. Two
+additional cold128K generated-retrieval checks pass with sharding active.
+Profile enables `VLLM_GLM53_INDEXER_TP_PREFILL=1`; flag0 restores the old path.
+No claim of full roadmap completion or resolution of scoring-repeatability limits.
+The broader fused-expert successor and whole-layer KDA fusion remain unimplemented.
+Next review is **4.1**, against retained Marlin, which ALREADY uses DP plus two-tile
+stream-K (`marlin_template.h:396`). Do not treat adding stream-K itself as an
+unclaimed mechanism or repeat the closed planar prototype/launch sweeps. A
+successor needs a specific fusion/dequant/traffic saving with enough full-stack
+budget; otherwise document deferral, not a fictitious implemented result.
 
 | Existing item | State / remaining work |
 |---|---|
@@ -46,11 +54,11 @@ whole-layer KDA fusion are not thereby implemented or declared impossible.
 | 2.1–2.2 | Main transport/launch fusions retained; rejected variants stay closed |
 | 2.3 | Output-weight prefetch implemented and rejected; broader next-layer prefetch not implemented |
 | 3 | MTP port tested; off after losses on the relevant concurrent workload |
-| 4.1 | Cross-item prototype rejected against Marlin; stream-K/fused successor unimplemented |
+| 4.1 | Next source-directed review: fused successor unimplemented; retained Marlin already has DP/two-tile stream-K |
 | 4.2 | Paired K128 fg_b implemented, locally faster but parked for small full-stack value; whole-layer fusion unimplemented |
 | 4.3 | Sparse MLA/indexer improvements retained; recent local variants rejected; structural work not closed |
 | 4.4 | Persistent per-layer decode unimplemented; conditional on 4.1–4.3 evidence |
-| 4.5 | **Active:** TP row-sharded prefill indexer locally faster, opt-in integration awaiting serving pair; wide Marlin retained |
+| 4.5 | TP row-sharded prefill indexer retained (-6.09% cold128K TTFT), alongside wide Marlin; broader structural work not closed |
 | 5 | Final integration/tier qualification/port-back not completed |
 
 The 4.1 prototype is quarantined under `benchmarks/kernels/` with its binding
