@@ -190,6 +190,7 @@ async def _turn(client, model, messages, records, sid, depth, args, max_tokens,
     t0 = time.perf_counter()
     ttft = None
     chunks = []
+    reasoning_chunks = []
     usage = None
     try:
         stream = await client.chat.completions.create(
@@ -198,7 +199,10 @@ async def _turn(client, model, messages, records, sid, depth, args, max_tokens,
             max_tokens=max_tokens,
             temperature=1.0,
             top_p=0.95,
-            extra_body={"top_k": 20},
+            # Half the reply budget may be spent thinking; the server default
+            # (2000) would otherwise be clamped to max_tokens - 1 and leave the
+            # probe answer no room (the 900K+ misses of 2026-09-11).
+            extra_body={"top_k": 20, "thinking_token_budget": max(64, max_tokens // 2)},
             stream=True,
             stream_options={"include_usage": True},
             timeout=args.turn_timeout,
@@ -215,6 +219,12 @@ async def _turn(client, model, messages, records, sid, depth, args, max_tokens,
                     ttft = time.perf_counter() - t0
                 if ev.choices[0].delta.content:
                     chunks.append(ev.choices[0].delta.content)
+                else:
+                    reasoning_chunks.append(
+                        getattr(ev.choices[0].delta, "reasoning_content", None)
+                        or getattr(ev.choices[0].delta, "reasoning", None)
+                        or ""
+                    )
     except Exception as e:  # noqa: BLE001
         records.append(
             {"session": sid, "depth": depth,
@@ -244,12 +254,23 @@ async def _turn(client, model, messages, records, sid, depth, args, max_tokens,
         "t": time.time(),
     }
     if probe_marker is not None:
+        reasoning = "".join(reasoning_chunks)
         rec["probe"] = True
-        rec["recall_ok"] = probe_marker in reply
+        # The marker recalled inside the thinking text is recall too; the
+        # deep-context probes at 900K+ (2026-09-11) spent the whole budget
+        # thinking and answered nothing, which is a budget artifact, not a
+        # memory failure. Both are recorded.
+        rec["recall_in_content"] = probe_marker in reply
+        rec["recall_in_reasoning"] = probe_marker in reasoning
+        rec["recall_ok"] = rec["recall_in_content"] or rec["recall_in_reasoning"]
+        rec["budget_exhausted"] = bool(
+            usage and usage.completion_tokens >= max_tokens and not reply.strip()
+        )
         if not rec["recall_ok"]:
             # Keep enough of the miss to tell a wrong answer from garbage.
             rec["marker"] = probe_marker
             rec["reply_head"] = reply[:400]
+            rec["reasoning_head"] = reasoning[:400]
     if target_probe:
         rec["target_probe"] = True
     records.append(rec)
