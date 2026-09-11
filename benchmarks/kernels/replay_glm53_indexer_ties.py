@@ -32,16 +32,17 @@ def canonical_selection(logits, starts, ends, k=512):
 
 
 def replay_device(captured, expected, device, label, operation, canonicalize):
+    rows, columns = captured["logits"].shape
     observations, outputs = [], []
     with torch.cuda.device(device):
         logits, starts, ends = (
             captured[k].to(device) for k in ("logits", "starts", "ends")
         )
         indices = torch.empty_like(captured["indices"], device=device)
-        undefined = torch.arange(1904, device=device)[None, :] >= ends[:, None]
+        undefined = torch.arange(columns, device=device)[None, :] >= ends[:, None]
 
         def call():
-            operation(logits, starts, ends, indices, 7616, 1904, 1, 512)
+            operation(logits, starts, ends, indices, rows, columns, 1, 512)
             canonicalize(indices)
 
         def observe(mode, repeat, callback):

@@ -156,6 +156,26 @@ def measure(call, group):
     return values
 
 
+def compare_outputs(a, b, group):
+    """Collect every rank's independent pool-set, tail and ordering checks."""
+    local = {
+        "pool_sets_equal": torch.equal(
+            a[:, :2048].sort(1).values, b[:, :2048].sort(1).values
+        ),
+        "tail_equal": torch.equal(a[:, 2048:], b[:, 2048:]),
+        "order_equal": torch.equal(a, b),
+    }
+    ranks = [None] * group.world_size
+    dist.all_gather_object(ranks, local, group=group.cpu_group)
+    return {
+        "per_rank": ranks,
+        "rank0_order_equal": ranks[0]["order_equal"],
+        "sets_and_tail_exact_all_ranks": all(
+            row["pool_sets_equal"] and row["tail_equal"] for row in ranks
+        ),
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
@@ -211,19 +231,26 @@ def main():
             candidate()
             # Existing selector has unordered atomic publication; require exact
             # selected sets AND exact tail, report ordering separately.
-            torch.testing.assert_close(
-                a[:, :2048].sort(1).values, b[:, :2048].sort(1).values, rtol=0, atol=0
-            )
-            torch.testing.assert_close(a[:, 2048:], b[:, 2048:], rtol=0, atol=0)
-            ordering_equal = torch.equal(a, b)
+            row = {
+                "rows": rows,
+                "context": context,
+                "ragged": ragged,
+                **compare_outputs(a, b, group),
+                "samples": [],
+            }
+            result["cases"].append(row)
+            save()
+            assert row["sets_and_tail_exact_all_ranks"], row["per_rank"]
             if ragged:
                 data[0].mul_(0.5)
                 control()
                 candidate()
-                torch.testing.assert_close(
-                    a.sort(1).values, b.sort(1).values, rtol=0, atol=0
+                row["changed_input"] = compare_outputs(a, b, group)
+                save()
+                assert row["changed_input"]["sets_and_tail_exact_all_ranks"], (
+                    row["changed_input"]["per_rank"]
                 )
-            samples = []
+            samples = row["samples"]
             if not ragged:
                 for _ in range(3):
                     samples.append(
@@ -233,20 +260,11 @@ def main():
                             "after_ms": measure(control, group),
                         }
                     )
-            row = {
-                "rows": rows,
-                "context": context,
-                "ragged": ragged,
-                "rank0_order_equal": ordering_equal,
-                "sets_and_tail_exact_all_ranks": True,
-                "samples": samples,
-            }
             if samples:
                 row["median_slowest_rank_ms"] = {
                     name: statistics.median(max(s[name]) for s in samples)
                     for name in samples[0]
                 }
-            result["cases"].append(row)
             if rank == 0:
                 print(json.dumps(row), flush=True)
             save()

@@ -126,6 +126,15 @@ def test_analysis_rejects_failed_capture(tmp_path):
         analyze(j.path)
 
 
+def test_analysis_rejects_unknown_record_after_valid_decode(tmp_path):
+    j = journal(tmp_path)
+    j.record(**inputs())
+    j._write({"kind": "decdoe"})
+    j.close()
+    with pytest.raises(ValueError, match="unsupported schema-1.*decdoe"):
+        analyze(j.path)
+
+
 @dataclass
 class Plan:
     profile_id: str

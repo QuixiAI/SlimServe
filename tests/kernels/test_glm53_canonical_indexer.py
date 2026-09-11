@@ -62,6 +62,8 @@ def test_changed_eager_graph_inputs_padding_and_storage_bounds(rows, offset):
 
 @pytest.mark.parametrize("device", [0, 1, 2, 3])
 def test_all44_real_replay_outputs_canonicalize_without_changing_membership(device):
+    if torch.cuda.device_count() < 4:
+        pytest.skip("requires four CUDA devices")
     root = Path(__file__).resolve().parents[2]
     path = root / "perf/results/2026-09-09/indexer-saved-input-replay/summary.json"
     if not path.exists():

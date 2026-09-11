@@ -50,3 +50,15 @@ def test_duplicate_function_copies_are_retained():
     )
     assert result["identical_common_functions"] == 1
     assert result["changed_common_functions"] == [name]
+
+
+@pytest.mark.parametrize("added", ["original", "different-codegen"])
+def test_added_common_function_copy_is_reported(added):
+    before = {"selector": Counter({"original": 1})}
+    candidate = {"selector": Counter({"original": 1})}
+    candidate["selector"][added] += 1
+    result = compare(before, candidate)
+    assert result["changed_common_functions"] == ["selector"]
+    assert result["identical_common_functions"] == 1
+    assert result["before_functions"] == 1
+    assert result["candidate_functions"] == 2

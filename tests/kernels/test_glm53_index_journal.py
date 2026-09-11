@@ -3,6 +3,7 @@
 
 import hashlib
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -246,12 +247,14 @@ def test_compiled_real_indexer_journal_and_runner_chunks(
     assert len([e for e in events if e["kind"] == "tensor"]) == 2 * (11 * 4 + 4)
     for item in (e for e in events if "archive" in e):
         assert item["stage"].startswith(f"layer-{capture_layer:02d}.call-0.")
-        path = (
+        path = Path(item["archive"]["path"])
+        expected = (
             config.parent
             / "trace"
             / f"index-{events[0]['pid']}"
             / (item["archive"]["path"].split("/")[-1])
         )
+        assert path == expected
         assert (
             hashlib.sha256(path.read_bytes()).hexdigest() == item["archive"]["sha256"]
         )

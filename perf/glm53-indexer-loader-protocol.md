@@ -134,6 +134,21 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 for rank-matched processes; each operates on its
 prescribed rank. GPU identities/driver/power settings must match the isolated
 qualification before and after each process. Confirm released contexts.
 
+Disk-cost review (2026-09-11): the retained completed `indexer-aot-v1` series
+occupies2,955,108,352 allocated bytes (2.752GiB), with2,832,429,791 apparent
+bytes including all eight private caches, manifests and qualification receipts.
+The control-rank0 private namespace occupies367,742,976 allocated bytes.
+Measured with `du -s -B1` and `du -s --apparent-size -B1`; this is the completed
+series footprint, not peak preparation space or a universal model-cache bound.
+Eight independent copies are intentional: per-arm loading may update caches,
+and sharing writable artifacts would compromise the isolation contract.
+
+Preparation deliberately refuses any existing output, including a partial
+failed series. Preserve that directory as failure evidence and retry only with
+a new explicit `--output` path after fixing the cause; do not delete evidence
+or resume a partially frozen namespace. This retained diagnostic is not a
+production serving cache, and no new AOT/serving campaign is prescribed here.
+
 ```bash
 systemd-run --user --scope --unit=glm53-indexer-aot-prepare-v1 -p MemoryMax=8G -p MemorySwapMax=0 env CUDA_VISIBLE_DEVICES= PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 .venv/bin/python -m benchmarks.kernels.prepare_glm53_indexer_correction_loader --prepare-series --output perf/results/2026-09-10/indexer-aot-v1
 systemd-run --user --scope --unit=glm53-indexer-aot-controller-v1 -p MemoryMax=8G -p MemorySwapMax=0 env CUDA_VISIBLE_DEVICES=0,1,2,3 PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 bash -c 'set -e; for mode in control correction; do for rank in 0 1 2 3; do .venv/bin/python -m benchmarks.kernels.check_glm53_indexer_correction_loader launch --manifest perf/results/2026-09-10/indexer-aot-v1/$mode-rank$rank/manifest.json; done; done'

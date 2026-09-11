@@ -2,6 +2,7 @@
 import hashlib
 import inspect
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -190,7 +191,8 @@ def test_snapshot_archive_compacts_storage_and_hashes_raw_bits(journal, monkeypa
     value[0] = -0.0
     journal.snapshot("sample", value, save=True)
     row = json.loads(journal.path.read_text().splitlines()[-1])
-    path = journal.archive / "match-1-chunk-1-sample.pt"
+    path = Path(row["archive"]["path"])
+    assert path == journal.archive / "match-1-chunk-1-sample.pt"
     actual = torch.load(path, weights_only=True)
     assert actual.untyped_storage().nbytes() == value.numel() * value.element_size()
     assert (

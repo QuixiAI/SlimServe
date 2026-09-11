@@ -1,8 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
+import hashlib
+
 import pytest
 import torch
 
-from benchmarks.kernels.replay_glm53_indexer import verified_selection
+from benchmarks.kernels.replay_glm53_indexer import sha, verified_selection
+
+
+def test_shared_sha_does_not_require_python311_file_digest(tmp_path, monkeypatch):
+    from benchmarks.kernels.check_glm53_indexer_order import sha as order_sha
+
+    monkeypatch.delattr(hashlib, "file_digest", raising=False)
+    path = tmp_path / "archive"
+    data = b"indexer capture\0" * 100000
+    path.write_bytes(data)
+    assert order_sha is sha
+    assert sha(path) == hashlib.sha256(data).hexdigest()
 
 
 def fixture():

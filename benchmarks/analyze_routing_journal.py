@@ -31,6 +31,10 @@ def analyze(path, per_expert_bytes=None):
         for line in stream:
             row = json.loads(line)
             kind = row["kind"]
+            if kind not in {
+                "header", "decode", "invalid", "skip", "limit", "step_limit"
+            }:
+                raise ValueError(f"unsupported schema-1 routing record kind: {kind!r}")
             kinds[kind] += 1
             if kind == "header":
                 if header is not None or row["schema"] != 1:
