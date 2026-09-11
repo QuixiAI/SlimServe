@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from slimserve.moe_journal import instrument_moe_sum
 from vllm.logger import init_logger
 
 if TYPE_CHECKING:
@@ -60,6 +61,121 @@ class quixicore_ops:
         except ImportError as e:
             logger.debug("QuixiCore-CUDA extension unavailable: %s", e)
             return False
+
+    @staticmethod
+    @cache
+    def has_glm_route_align() -> bool:
+        return quixicore_ops.is_available() and hasattr(_qc(), "glm_route_align")
+
+    @staticmethod
+    def glm_route_align(
+        logits: torch.Tensor,
+        bias: torch.Tensor,
+        topk: int,
+        scoring: int,
+        renormalize: bool,
+        scaling: float,
+        block_size: int,
+        max_padded: int,
+        max_blocks: int,
+        *,
+        stable: bool = False,
+    ) -> list[torch.Tensor]:
+        """Fused small-M routing: scored top-k with bias-only selection plus
+        the Marlin block alignment, one launch. Returns [topk_weights,
+        topk_ids, sorted_token_ids, expert_ids, num_tokens_post_padded]."""
+        native = _qc()
+        if stable and not hasattr(native, "glm_route_align_stable"):
+            raise RuntimeError("stable GLM routing requires rebuilt native kernels")
+        call = native.glm_route_align_stable if stable else native.glm_route_align
+        return call(
+            logits, bias, topk, scoring, renormalize, scaling, block_size,
+            max_padded, max_blocks,
+        )
+
+    @staticmethod
+    @cache
+    def has_moe_sum_add() -> bool:
+        return quixicore_ops.is_available() and hasattr(_qc(), "moe_sum_add")
+
+    @staticmethod
+    def glm_stable_align(
+        ids: torch.Tensor,
+        sorted_ids: torch.Tensor,
+        experts: torch.Tensor,
+        padded: torch.Tensor,
+        offsets: torch.Tensor,
+        block: int,
+    ) -> None:
+        """Checked, scoped SM120 stable alignment; outputs must be disjoint."""
+        native = _qc()
+        if not hasattr(native, "glm_stable_align"):
+            raise RuntimeError("stable GLM alignment requires rebuilt native kernels")
+        native.glm_stable_align(ids, sorted_ids, experts, padded, offsets, block)
+
+    @staticmethod
+    @cache
+    def has_decode_gemm() -> bool:
+        return quixicore_ops.is_available() and hasattr(_qc(), "decode_gemm")
+
+    @staticmethod
+    def decode_gemm(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        fp32_out: bool = False,
+    ) -> torch.Tensor:
+        """x[M, K] @ weight[N, K]^T (+ fp32 bias) for M <= 16 on tensor cores,
+        fp32 accumulation; the decode-shaped replacement for cuBLAS on the
+        backbone projections (N in 2048..16384, K a multiple of 128 >= 512)."""
+        return _qc().decode_gemm(x, weight, bias, fp32_out)
+
+    @staticmethod
+    @cache
+    def has_decode_gemm_fp8() -> bool:
+        return quixicore_ops.is_available() and hasattr(_qc(), "decode_gemm_fp8")
+
+    @staticmethod
+    def decode_gemm_fp8(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        scale: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        fp32_out: bool = False,
+    ) -> torch.Tensor:
+        """x[M, K] (bf16) @ dequant(weight)[N, K]^T for M <= 16 on tensor cores,
+        where weight is float8_e4m3fn with fp32 128x128 block scales
+        [ceil(N/128), K/128] and dequant(w) = bf16(scale * w); fp32
+        accumulation. The FP8 swap-set's decode kernel (N in 1024..16384, N a
+        multiple of 8, K a multiple of 128 >= 512)."""
+        return _qc().decode_gemm_fp8(x, weight, scale, bias, fp32_out)
+
+    @staticmethod
+    def graph_factors() -> list[str]:
+        """Capabilities that change the traced computation graph (the MoE
+        runner and the unquantized linear pick their custom ops by them),
+        for VllmConfig.compute_hash: a compiled artifact from a build without
+        a kernel must not be reused by one with it."""
+        from slimserve.glm53_ordering import cache_factor
+        from vllm.model_executor.layers.utils import (
+            decode_gemm_enabled,
+            decode_gemm_fp8_enabled,
+        )
+
+        return [
+            f"moe_sum_add={quixicore_ops.has_moe_sum_add()}",
+            f"decode_gemm={decode_gemm_enabled()}",
+            f"decode_gemm_fp8={decode_gemm_fp8_enabled()}",
+            cache_factor(),
+        ]
+
+    @staticmethod
+    @instrument_moe_sum
+    def moe_sum_add(x: torch.Tensor, shared: torch.Tensor, out: torch.Tensor) -> None:
+        """out[t] = shared[t] + sum_k x[t, k] (bf16 in/out, fp32 accumulation):
+        the Marlin per-assignment sum, the finalize copy and the shared-expert
+        add in one launch."""
+        _qc().moe_sum_add(x, shared, out)
 
     # ------------------------------------------------------------------
     # DeepSeek-V4 multi-stream residual mixing (Ampere decode path)
@@ -159,6 +275,78 @@ class quixicore_ops:
             norm_weight,
             norm_eps,
         )
+
+    @staticmethod
+    def has_dsv4_mhc_modes() -> bool:
+        """True when the extension exposes the T == 1 mHC launch-mode switch."""
+        try:
+            return hasattr(_qc(), "set_dsv4_mhc_mode")
+        except Exception:
+            return False
+
+    @staticmethod
+    def set_dsv4_mhc_mode(mode: int) -> None:
+        """0 cooperative fused kernel, 1 last-block fused kernel, 2 split kernels."""
+        _qc().set_dsv4_mhc_mode(int(mode))
+
+    @staticmethod
+    def get_dsv4_mhc_mode() -> int:
+        return int(_qc().get_dsv4_mhc_mode())
+
+    @staticmethod
+    def has_dsv4_mhc_prefill() -> bool:
+        """True when the extension has the prefill-shaped mHC partials kernel."""
+        try:
+            return hasattr(_qc(), "set_dsv4_mhc_prefill_min_t")
+        except Exception:
+            return False
+
+    @staticmethod
+    def set_dsv4_mhc_prefill_min_t(min_t: int) -> None:
+        """Smallest T the split path hands to the prefill-shaped partials
+        kernel (0 = never; the env default is VLLM_DSV4_MHC_PREFILL_MIN_T)."""
+        _qc().set_dsv4_mhc_prefill_min_t(int(min_t))
+
+    @staticmethod
+    def get_dsv4_mhc_prefill_min_t() -> int:
+        return int(_qc().get_dsv4_mhc_prefill_min_t())
+
+    @staticmethod
+    def has_glm53_mhc_prefill_tc() -> bool:
+        try:
+            return hasattr(_qc(), "get_glm53_mhc_prefill_tc")
+        except Exception:
+            return False
+
+    @staticmethod
+    def set_glm53_mhc_prefill_tc(enabled: int) -> None:
+        """Diagnostic 0/1 switch; existing captured graphs do not change."""
+        _qc().set_glm53_mhc_prefill_tc(int(enabled))
+
+    @staticmethod
+    def get_glm53_mhc_prefill_tc() -> int:
+        return int(_qc().get_glm53_mhc_prefill_tc())
+
+    @staticmethod
+    def has_topk_sample() -> bool:
+        try:
+            return hasattr(_qc(), "topk_sample")
+        except Exception:
+            return False
+
+    @staticmethod
+    def topk_sample(
+        logits: torch.Tensor,
+        top_k: torch.Tensor,
+        top_p: torch.Tensor | None,
+        noise: torch.Tensor,
+    ) -> torch.Tensor:
+        """Top-k (<=32, all ties kept), stable-order top-p, and sampling.
+
+        Caller noise is fp32/fp64 [B, V], indexed by vocabulary ID. Top-p
+        sorts ascending by (logit, ID). Returns int64 token IDs [B].
+        """
+        return _qc().topk_sample(logits, top_k, top_p, noise)
 
     @staticmethod
     def dsv4_mhc_post(
@@ -1595,6 +1783,23 @@ class quixicore_ops:
             block_size,
             scale,
             partition_size,
+            page_stride_bytes,
+        )
+
+    @staticmethod
+    def mla_prefill_bf16_sparse_nope_sm120(
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        block_table: torch.Tensor,
+        indices: torch.Tensor,
+        topk_length: torch.Tensor,
+        block_size: int,
+        scale: float,
+        page_stride_bytes: int = 0,
+    ) -> torch.Tensor:
+        """SM120 H16 prefill; BF16 Q/KV and FP16 P/V, no cache conversion."""
+        return _qc().mla_prefill_bf16_sparse_nope_sm120(
+            q, kv, block_table, indices, topk_length, block_size, scale,
             page_stride_bytes,
         )
 

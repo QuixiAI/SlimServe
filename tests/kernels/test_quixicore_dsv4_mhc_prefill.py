@@ -1,0 +1,213 @@
+"""The prefill-shaped mHC partials kernel agrees with the decode-shaped one.
+
+Both serve the split path (mode 2 here, so every T takes it). The prefill
+kernel stages a 512-flat split of a 32-token tile in shared memory and runs
+whole dot products per lane; it writes the same [T][32][25] partial layout
+over a different flat-to-split assignment, so the mix sums differ only in
+fp32 summation order (tolerance), while the fused post-mix residual is the
+same expression in the same order (bit-exact). T = 33 and 1000 exercise the
+tile tail; the threshold setter selects the kernel per call.
+"""
+
+import pytest
+import torch
+
+from vllm.quixicore.ops import quixicore_ops
+
+pytestmark = pytest.mark.skipif(
+    not (torch.cuda.is_available() and quixicore_ops.has_dsv4_mhc_prefill()),
+    reason="needs CUDA and the QuixiCore dsv4 mHC prefill kernel",
+)
+DEV = "cuda"
+HC, H, MIXES = 4, 4096, 24
+DEFAULT_MIN_T = 64  # the launcher's default; each test restores it
+EPS = dict(
+    rms_eps=1e-6,
+    pre_eps=1e-2,
+    sinkhorn_eps=1e-6,
+    post_multiplier=0.5,
+    sinkhorn_repeat=3,
+)
+
+
+def _inputs(seed, T, fn_dtype):
+    g = torch.Generator(device=DEV).manual_seed(seed)
+    residual = torch.randn(T, HC, H, device=DEV, generator=g).to(torch.bfloat16)
+    fn = (torch.randn(MIXES, HC * H, device=DEV, generator=g) * 0.02).to(fn_dtype)
+    hc_scale = torch.tensor([0.3, 0.2, 0.1], device=DEV)
+    hc_base = torch.randn(MIXES, device=DEV, generator=g) * 0.1
+    x = torch.randn(T, H, device=DEV, generator=g).to(torch.bfloat16)
+    post = torch.rand(T, HC, device=DEV, generator=g)
+    comb = torch.rand(T, HC, HC, device=DEV, generator=g)
+    norm_weight = (1 + 0.1 * torch.randn(H, device=DEV, generator=g)).to(torch.bfloat16)
+    return residual, fn, hc_scale, hc_base, x, post, comb, norm_weight
+
+
+def _pre(min_t, residual, fn, hc_scale, hc_base, nw):
+    quixicore_ops.set_dsv4_mhc_prefill_min_t(min_t)
+    assert quixicore_ops.get_dsv4_mhc_prefill_min_t() == min_t
+    out = quixicore_ops.dsv4_mhc_pre(
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        EPS["rms_eps"],
+        EPS["pre_eps"],
+        EPS["sinkhorn_eps"],
+        EPS["post_multiplier"],
+        EPS["sinkhorn_repeat"],
+        nw,
+        1e-6 if nw is not None else 0.0,
+    )
+    torch.cuda.synchronize()
+    return [t.clone() for t in out]
+
+
+def _fused(min_t, x, residual, post, comb, fn, hc_scale, hc_base, nw):
+    quixicore_ops.set_dsv4_mhc_prefill_min_t(min_t)
+    out = quixicore_ops.dsv4_mhc_fused_post_pre(
+        x,
+        residual,
+        post,
+        comb,
+        fn,
+        hc_scale,
+        hc_base,
+        EPS["rms_eps"],
+        EPS["pre_eps"],
+        EPS["sinkhorn_eps"],
+        EPS["post_multiplier"],
+        EPS["sinkhorn_repeat"],
+        nw,
+        1e-6 if nw is not None else 0.0,
+    )
+    torch.cuda.synchronize()
+    return [t.clone() for t in out]
+
+
+def _close(a, b):
+    assert a.shape == b.shape and a.dtype == b.dtype
+    torch.testing.assert_close(a.float(), b.float(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices")
+@pytest.mark.parametrize("fn_dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("fused", [False, True])
+def test_prefill_shared_memory_setup_follows_device_switches(fn_dtype, fused):
+    mode = quixicore_ops.get_dsv4_mhc_mode()
+    minimum = quixicore_ops.get_dsv4_mhc_prefill_min_t()
+    constants = (1e-5, 1e-6, 1e-6, 2.0, 20, None, 0.0)
+    reference = None
+    try:
+        quixicore_ops.set_dsv4_mhc_mode(2)
+        quixicore_ops.set_dsv4_mhc_prefill_min_t(64)
+        for device in (0, 1, 0):
+            with torch.cuda.device(device):
+                residual, fn, scale, base, x, post, comb, _ = _inputs(51, 65, fn_dtype)
+                if fused:
+                    output = quixicore_ops.dsv4_mhc_fused_post_pre(
+                        x, residual, post, comb, fn, scale, base, *constants
+                    )
+                else:
+                    output = quixicore_ops.dsv4_mhc_pre(
+                        residual, fn, scale, base, *constants
+                    )
+                torch.cuda.synchronize()
+                host = [tensor.cpu() for tensor in output]
+                assert all(torch.isfinite(tensor).all() for tensor in host)
+                if reference is None:
+                    reference = host
+                for actual, expected in zip(host, reference):
+                    torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-6)
+    finally:
+        quixicore_ops.set_dsv4_mhc_mode(mode)
+        quixicore_ops.set_dsv4_mhc_prefill_min_t(minimum)
+
+
+@pytest.mark.parametrize("T", [65, 129])
+@pytest.mark.parametrize("fused", [False, True])
+def test_bf16_prefill_preserves_unaligned_contiguous_fn(T, fused):
+    residual, fn, scale, base, x, post, comb, _ = _inputs(41, T, torch.bfloat16)
+    storage = torch.empty(fn.numel() + 1, device=fn.device, dtype=fn.dtype)
+    odd = storage[1:].view_as(fn)
+    odd.copy_(fn)
+    assert odd.is_contiguous() and odd.data_ptr() % 4 == 2
+    assert fn.data_ptr() % 4 == 0
+    mode = quixicore_ops.get_dsv4_mhc_mode()
+    minimum = quixicore_ops.get_dsv4_mhc_prefill_min_t()
+    try:
+        quixicore_ops.set_dsv4_mhc_mode(2)
+        if fused:
+            aligned = _fused(1, x, residual, post, comb, fn, scale, base, None)
+            unaligned = _fused(1, x, residual, post, comb, odd, scale, base, None)
+        else:
+            aligned = _pre(1, residual, fn, scale, base, None)
+            unaligned = _pre(1, residual, odd, scale, base, None)
+        for a, b in zip(aligned, unaligned):
+            assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+    finally:
+        quixicore_ops.set_dsv4_mhc_mode(mode)
+        quixicore_ops.set_dsv4_mhc_prefill_min_t(minimum)
+
+
+@pytest.mark.parametrize("T", [33, 256, 1000])
+@pytest.mark.parametrize("fn_dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("with_norm", [False, True])
+def test_pre_prefill_kernel_agrees(T, fn_dtype, with_norm):
+    residual, fn, hc_scale, hc_base, _, _, _, norm_weight = _inputs(1, T, fn_dtype)
+    nw = norm_weight if with_norm else None
+    saved_mode = quixicore_ops.get_dsv4_mhc_mode()
+    try:
+        quixicore_ops.set_dsv4_mhc_mode(2)
+        ref = _pre(0, residual, fn, hc_scale, hc_base, nw)
+        new = _pre(1, residual, fn, hc_scale, hc_base, nw)
+    finally:
+        quixicore_ops.set_dsv4_mhc_mode(saved_mode)
+        quixicore_ops.set_dsv4_mhc_prefill_min_t(DEFAULT_MIN_T)
+    for a, b in zip(new, ref):
+        _close(a, b)
+    # mix sums of 16384 products of order 1e-2: fp32 order noise is far below 1e-4
+    torch.testing.assert_close(new[0], ref[0], atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(new[1], ref[1], atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize("T", [33, 256, 1000])
+@pytest.mark.parametrize("fn_dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("with_norm", [False, True])
+def test_fused_prefill_kernel_agrees_and_residual_is_bit_exact(T, fn_dtype, with_norm):
+    residual, fn, hc_scale, hc_base, x, post, comb, norm_weight = _inputs(
+        2, T, fn_dtype
+    )
+    nw = norm_weight if with_norm else None
+    saved_mode = quixicore_ops.get_dsv4_mhc_mode()
+    try:
+        quixicore_ops.set_dsv4_mhc_mode(2)
+        ref = _fused(0, x, residual, post, comb, fn, hc_scale, hc_base, nw)
+        new = _fused(1, x, residual, post, comb, fn, hc_scale, hc_base, nw)
+    finally:
+        quixicore_ops.set_dsv4_mhc_mode(saved_mode)
+        quixicore_ops.set_dsv4_mhc_prefill_min_t(DEFAULT_MIN_T)
+    assert torch.equal(new[0], ref[0]), "fused post-mix residual must be bit-exact"
+    torch.testing.assert_close(new[1], ref[1], atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(new[2], ref[2], atol=1e-4, rtol=1e-4)
+    _close(new[3], ref[3])
+
+
+def test_threshold_gates_the_kernel():
+    residual, fn, hc_scale, hc_base, _, _, _, _ = _inputs(3, 64, torch.float32)
+    saved_mode = quixicore_ops.get_dsv4_mhc_mode()
+    try:
+        quixicore_ops.set_dsv4_mhc_mode(2)
+        below = _pre(
+            65, residual, fn, hc_scale, hc_base, None
+        )  # T < min_t: decode-shaped kernel
+        at = _pre(
+            64, residual, fn, hc_scale, hc_base, None
+        )  # T == min_t: prefill kernel
+        off = _pre(0, residual, fn, hc_scale, hc_base, None)
+    finally:
+        quixicore_ops.set_dsv4_mhc_mode(saved_mode)
+        quixicore_ops.set_dsv4_mhc_prefill_min_t(DEFAULT_MIN_T)
+    for a, b in zip(below, off):
+        assert torch.equal(a, b)
+    torch.testing.assert_close(at[0], off[0], atol=1e-4, rtol=1e-4)

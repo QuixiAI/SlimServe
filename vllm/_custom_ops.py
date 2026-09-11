@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Literal
 import torch
 
 import vllm.envs as envs
+from slimserve.moe_journal import instrument_marlin_gemm
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.scalar_type import ScalarType
@@ -2653,6 +2654,7 @@ def grouped_topk(
     )
 
 
+@instrument_marlin_gemm
 def moe_wna16_marlin_gemm(
     input: torch.Tensor,
     output: torch.Tensor | None,
@@ -3112,6 +3114,52 @@ def top_k_per_row_prefill(
     topk_tokens: int,
 ) -> None:
     torch.ops._C.top_k_per_row_prefill(
+        logits,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        raw_topk_indices,
+        num_rows,
+        stride0,
+        stride1,
+        topk_tokens,
+    )
+
+
+def glm53_top_k_per_row_prefill(
+    logits: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    raw_topk_indices: torch.Tensor,
+    num_rows: int,
+    stride0: int,
+    stride1: int,
+    topk_tokens: int,
+) -> None:
+    """Opt-in GLM pool-ID tie policy; native output order remains unspecified."""
+    torch.ops._C.glm53_top_k_per_row_prefill(
+        logits,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        raw_topk_indices,
+        num_rows,
+        stride0,
+        stride1,
+        topk_tokens,
+    )
+
+
+def glm53_top_k_per_row_ordered(
+    logits: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    raw_topk_indices: torch.Tensor,
+    num_rows: int,
+    stride0: int,
+    stride1: int,
+    topk_tokens: int,
+) -> None:
+    """Opt-in diagnostic fused pool order; production defaults stay unchanged."""
+    torch.ops._C.glm53_top_k_per_row_ordered(
         logits,
         cu_seqlen_ks,
         cu_seqlen_ke,

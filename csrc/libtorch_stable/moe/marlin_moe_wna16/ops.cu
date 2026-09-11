@@ -25,6 +25,9 @@
 
 #include "kernel.h"
 
+#include <cstdlib>
+#include <cstring>
+
 #include <torch/csrc/stable/accelerator.h>
 #include <torch/csrc/stable/library.h>
 #include <torch/csrc/stable/ops.h>
@@ -44,6 +47,11 @@ namespace MARLIN_NAMESPACE_NAME {
 __global__ void MarlinDefault(MARLIN_KERNEL_PARAMS){};
 
 using MarlinFuncPtr = void (*)(MARLIN_KERNEL_PARAMS);
+
+#ifdef VLLM_BUILD_GLM53_SM120_PREFILL
+cudaError_t launch_glm53_sm120_prefill(MARLIN_KERNEL_PARAMS, int sms,
+                                      cudaStream_t stream);
+#endif
 
 // For a given "a" of size [M,K] performs a permutation of the K columns based
 // on the given "perm" indices.
@@ -460,6 +468,39 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
         "Marlin W4A8-FP8 only support SM89 or SM12x device (It is slower than "
         "Marlin W4A16 on other devices).");
   }
+
+#ifdef VLLM_BUILD_GLM53_SM120_PREFILL
+  // Opt-in until real-profile qualification. Preserve explicit schedules and
+  // every non-target dtype, shape, quantization, and reduction policy.
+  static const bool wide_glm53_prefill = [] {
+    const char* value = std::getenv("VLLM_GLM53_MARLIN_PREFILL_WIDE");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+  }();
+  const bool glm53_gate_up = prob_n == 1024 && prob_k == 4096 && top_k == 8 &&
+      !mul_topk_weights && prob_m >= 2048 && prob_m <= 8192;
+  const bool glm53_down = prob_n == 4096 && prob_k == 512 && top_k == 1 &&
+      mul_topk_weights && prob_m >= 2048 * 8 && prob_m <= 8192 * 8;
+  if (wide_glm53_prefill && major_capability == 12 && minor_capability == 0 &&
+      a_type == vllm::kBFloat16 && c_type == vllm::kBFloat16 &&
+      b_type == vllm::kFE2M1f && s_type == vllm::kFE4M3fn &&
+      group_size == 16 && num_experts == 288 && moe_block_size == 64 &&
+      !has_bias && !has_act_order && !has_zp && is_k_full && g_s != nullptr &&
+      !use_atomic_add && use_fp32_reduce && thread_k == -1 && thread_n == -1 &&
+      blocks_per_sm == -1 && max_shared_mem >= 98304 &&
+      (glm53_gate_up || glm53_down)) {
+    // Existing C_tmp capacity is >= sms*4*64*256 floats (or all output rows),
+    // sufficient for sms blocks of the wider 64*512 tile. No new weight copy.
+    auto error = launch_glm53_sm120_prefill(
+        A_ptr, B_ptr, C_ptr, C_tmp_ptr, bias_ptr, a_s_ptr, b_s_ptr, g_s_ptr,
+        zp_ptr, g_idx_ptr, sorted_token_ids_ptr, expert_ids_ptr,
+        num_tokens_past_padded_ptr, topk_weights_ptr, top_k, mul_topk_weights,
+        num_groups, prob_m, prob_n, prob_k, locks, has_bias, use_atomic_add,
+        use_fp32_reduce, sms, stream);
+    STD_TORCH_CHECK(error == cudaSuccess, "GLM53 SM120 prefill launch: ",
+                    cudaGetErrorString(error));
+    return;
+  }
+#endif
 
   // Set thread config
   exec_config_t exec_cfg;

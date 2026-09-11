@@ -480,6 +480,14 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "int stride1, int topK) -> ()");
 
   ops.def(
+      "glm53_top_k_per_row_prefill(Tensor logits, Tensor rowStarts, Tensor rowEnds, "
+      "Tensor! indices, int numRows, int stride0, int stride1, int topK) -> ()");
+
+  ops.def(
+      "glm53_top_k_per_row_ordered(Tensor logits, Tensor rowStarts, Tensor rowEnds, "
+      "Tensor! indices, int numRows, int stride0, int stride1, int topK) -> ()");
+
+  ops.def(
       "top_k_per_row_decode(Tensor logits, int next_n, "
       "Tensor seq_lens, Tensor! indices, Tensor! workspace, "
       "int numRows, int stride0, int stride1, int topK) -> ()");
@@ -835,6 +843,8 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
   ops.impl("apply_repetition_penalties_",
            TORCH_BOX(&apply_repetition_penalties_));
   ops.impl("top_k_per_row_prefill", TORCH_BOX(&top_k_per_row_prefill));
+  ops.impl("glm53_top_k_per_row_prefill", TORCH_BOX(&glm53_top_k_per_row_prefill));
+  ops.impl("glm53_top_k_per_row_ordered", TORCH_BOX(&glm53_top_k_per_row_ordered));
   ops.impl("top_k_per_row_decode", TORCH_BOX(&top_k_per_row_decode));
   ops.impl("persistent_topk", TORCH_BOX(&persistent_topk));
 #ifdef VLLM_ENABLE_COOPERATIVE_TOPK

@@ -1,3 +1,4 @@
+#include <atomic>
 // tk_cuda serving/decode bindings: torch wrappers over the validated W4/W5
 // kernels (kernels/serving/*_kernels.cuh). Registered into the _C module by
 // init_serving(m), called from tm_cuda_ext.cu's PYBIND11_MODULE.
@@ -18,8 +19,18 @@
 #include "mhc_ampere.cuh"
 #include "dsv4_router_ampere.cuh"
 #include "dsv4_projection_ampere.cuh"
+#include "glm_moe_routing.cuh"
+#include "glm_moe_stable_align.cuh"
+#include "glm_moe_combine.cuh"
+#include "bf16_decode_gemm.cuh"
+#include "fp8_decode_gemm.cuh"
+#include "glm53_mhc_prefill_tc.cuh"
+#include "topk_sample.cuh"
 #include <torch/extension.h>
+#include <ATen/MemoryOverlap.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAException.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -165,6 +176,223 @@ static torch::Tensor py_dsv4_projection_gemv(torch::Tensor x,
     return output;
 }
 
+template <bool STABLE_ALIGNMENT>
+static std::vector<torch::Tensor> py_glm_route_align(
+        torch::Tensor logits, torch::Tensor bias, int64_t topk, int64_t scoring,
+        bool renormalize, double scaling, int64_t block_size, int64_t max_padded,
+        int64_t max_blocks) {
+    CK(logits); CK(bias);
+    TORCH_CHECK(logits.scalar_type() == torch::kFloat32 && logits.dim() == 2,
+                "glm_route_align expects fp32 [M, E] router logits");
+    TORCH_CHECK(bias.scalar_type() == torch::kFloat32 && bias.dim() == 1 &&
+                    bias.numel() == logits.size(1),
+                "glm_route_align expects an fp32 [E] correction bias");
+    TORCH_CHECK(bias.device() == logits.device(),
+                "glm_route_align bias must be on the logits device");
+    const int M = int(logits.size(0)), E = int(logits.size(1));
+    TORCH_CHECK(M >= 1 && M <= glm_route::MAX_TOKENS,
+                "glm_route_align handles 1..16 tokens");
+    TORCH_CHECK(E == 288 && topk == 8,
+                "glm_route_align is instantiated for E=288, topk=8");
+    TORCH_CHECK(scoring == 0 || scoring == 1,
+                "glm_route_align expects sigmoid or sqrt-softplus scoring");
+    TORCH_CHECK(block_size == 8 || block_size == 16 || block_size == 32 ||
+                    block_size == 48 || block_size == 64,
+                "glm_route_align unsupported block size");
+    const int64_t expected_capacity = std::min(
+        M * topk * block_size, M * topk + E * (block_size - 1));
+    TORCH_CHECK(max_padded == expected_capacity &&
+                    max_blocks == (expected_capacity + block_size - 1) / block_size,
+                "glm_route_align alignment capacity mismatch");
+    const c10::cuda::CUDAGuard guard(logits.device());
+    if constexpr (STABLE_ALIGNMENT) {
+        const auto* properties = at::cuda::getDeviceProperties(logits.get_device());
+        TORCH_CHECK(properties->major == 12 && properties->minor == 0,
+                    "stable GLM routing is qualified for SM120 only");
+    }
+    auto i32 = logits.options().dtype(torch::kInt32);
+    auto topk_weights = torch::empty({M, topk}, logits.options());
+    auto topk_ids = torch::empty({M, topk}, i32);
+    auto sorted = torch::empty({max_padded}, i32);
+    auto expert_ids = torch::empty({max_blocks}, i32);
+    auto post_pad = torch::empty({1}, i32);
+    glm_route::route_align_kernel<288, 8, STABLE_ALIGNMENT>
+        <<<1, glm_route::THREADS, 0, stream()>>>(
+            fp(logits), fp(bias), fpm(topk_weights),
+            topk_ids.data_ptr<int32_t>(), sorted.data_ptr<int32_t>(),
+            expert_ids.data_ptr<int32_t>(), post_pad.data_ptr<int32_t>(), M,
+            int(scoring), float(scaling), renormalize, int(block_size),
+            int(max_padded), int(max_blocks));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return {topk_weights, topk_ids, sorted, expert_ids, post_pad};
+}
+
+// Out-variant keeps allocations in the opaque Python custom op and permits
+// full-capacity/redzone tests of the exact serving entry. Off by default.
+static void py_glm_stable_align(
+        torch::Tensor ids, torch::Tensor sorted, torch::Tensor experts,
+        torch::Tensor padded, torch::Tensor offsets, int64_t block) {
+    CK(ids);
+    TORCH_CHECK(ids.scalar_type() == torch::kInt32 && ids.dim() == 2 &&
+                    ids.size(0) >= 17 && ids.size(0) <= 8192 && ids.size(1) == 8,
+                "glm_stable_align expects int32 [17..8192,8] IDs");
+    TORCH_CHECK(block == 8 || block == 16 || block == 32 || block == 48 || block == 64,
+                "glm_stable_align unsupported block size");
+    const int numel = int(ids.numel());
+    const int capacity = int(std::min(int64_t(numel) * block,
+                                    numel + 288 * (block - 1)));
+    const int blocks = int((capacity + block - 1) / block);
+    const std::vector<torch::Tensor> outputs{sorted, experts, padded, offsets};
+    const int sizes[] = {capacity, blocks, 1, 289};
+    for (int i = 0; i < 4; ++i) {
+        const auto& value = outputs[i];
+        TORCH_CHECK(value.device() == ids.device() && value.is_contiguous() &&
+                        value.scalar_type() == torch::kInt32 && value.dim() == 1 &&
+                        value.numel() == sizes[i],
+                    "glm_stable_align output contract mismatch at ", i);
+        at::assert_no_overlap(ids, value);
+        for (int j = 0; j < i; ++j) at::assert_no_overlap(outputs[j], value);
+    }
+    const c10::cuda::CUDAGuard guard(ids.device());
+    const auto* properties = at::cuda::getDeviceProperties(ids.get_device());
+    TORCH_CHECK(properties->major == 12 && properties->minor == 0,
+                "stable GLM alignment is qualified for SM120 only");
+    const bool small = ids.size(0) <= 32;
+    auto count = small ? glm_stable_align::count_prefix<256, true>
+                       : glm_stable_align::count_prefix<1024, false>;
+    count<<<2, small ? 256 : 1024, 0, stream()>>>(
+        ids.data_ptr<int>(), sorted.data_ptr<int>(), experts.data_ptr<int>(),
+        padded.data_ptr<int>(), offsets.data_ptr<int>(), numel, int(block), capacity, blocks);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    auto scatter = small ? glm_stable_align::scatter_bitmap<256>
+                         : glm_stable_align::scatter_bitmap<512>;
+    scatter<<<288, small ? 256 : 512, 0, stream()>>>(
+        ids.data_ptr<int>(), sorted.data_ptr<int>(), offsets.data_ptr<int>(), numel);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+static void py_moe_sum_add(torch::Tensor x, torch::Tensor shared, torch::Tensor out) {
+    CK(x); CK(shared); CK(out);
+    TORCH_CHECK(x.scalar_type() == torch::kBFloat16 && shared.scalar_type() == torch::kBFloat16 &&
+                    out.scalar_type() == torch::kBFloat16,
+                "moe_sum_add: bf16 tensors");
+    TORCH_CHECK(x.dim() == 3 && shared.dim() == 2 && out.dim() == 2,
+                "moe_sum_add: x [T, topk, D], shared/out [T, D]");
+    const int64_t T = x.size(0), topk = x.size(1), d = x.size(2);
+    TORCH_CHECK(shared.size(0) == T && shared.size(1) == d && out.size(0) == T && out.size(1) == d,
+                "moe_sum_add: shape mismatch");
+    TORCH_CHECK(d % glm_moe_combine::VEC == 0, "moe_sum_add: D must be a multiple of 8");
+    glm_moe_combine::launch_moe_sum_add(bpm(out), bp(x), bp(shared), T, int(d), int(topk), stream());
+}
+
+static torch::Tensor py_decode_gemm(torch::Tensor x, torch::Tensor weight,
+                                    c10::optional<torch::Tensor> bias, bool fp32_out) {
+    CK(x); CK(weight);
+    TORCH_CHECK(x.scalar_type() == torch::kBFloat16 && weight.scalar_type() == torch::kBFloat16,
+                "decode_gemm: bf16 x and weight");
+    TORCH_CHECK(x.dim() == 2 && weight.dim() == 2 && x.size(1) == weight.size(1),
+                "decode_gemm: x [M, K], weight [N, K]");
+    const int M = int(x.size(0)), K = int(x.size(1)), N = int(weight.size(0));
+    TORCH_CHECK(decode_gemm::supports(M, N, K), "decode_gemm: unsupported shape M=", M, " N=", N, " K=", K);
+    const float* bias_ptr = nullptr;
+    if (bias.has_value()) {
+        CK((*bias));
+        TORCH_CHECK(bias->scalar_type() == torch::kFloat32 && bias->numel() == N, "decode_gemm: fp32 bias [N]");
+        bias_ptr = bias->data_ptr<float>();
+    }
+    auto out = torch::empty({M, N}, x.options().dtype(fp32_out ? torch::kFloat32 : torch::kBFloat16));
+    if (fp32_out) decode_gemm::launch_auto(bp(x), bp(weight), bias_ptr, fpm(out), M, N, K, stream());
+    else decode_gemm::launch_auto(bp(x), bp(weight), bias_ptr, bpm(out), M, N, K, stream());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+
+// Small-k sampling with all kth-value ties retained and deterministic
+// ascending (value, token ID) nucleus ordering. Caller noise is [B, V]
+// float32/float64 and indexed by vocabulary ID. Returns int64 IDs [B].
+static torch::Tensor py_topk_sample(torch::Tensor logits, torch::Tensor top_k,
+                                    c10::optional<torch::Tensor> top_p, torch::Tensor noise) {
+    using namespace tms::topk_sample;
+    CK(top_k); CK(noise);
+    TORCH_CHECK(logits.is_cuda() && logits.dim() == 2 && logits.scalar_type() == torch::kFloat32 &&
+                logits.stride(1) == 1, "topk_sample: fp32 [B, V] logits with unit inner stride");
+    const c10::cuda::CUDAGuard guard(logits.device());
+    const int B = logits.size(0), V = logits.size(1);
+    TORCH_CHECK(V >= NB * K, "topk_sample: vocabulary smaller than the candidate window");
+    TORCH_CHECK(top_k.scalar_type() == torch::kInt32 && top_k.numel() == B, "topk_sample: int32 top_k [B]");
+    TORCH_CHECK((noise.scalar_type() == torch::kFloat32 || noise.scalar_type() == torch::kFloat64) &&
+                noise.dim() == 2 && noise.size(0) == B && noise.size(1) == V,
+                "topk_sample: fp32 or fp64 noise [B, V]");
+    TORCH_CHECK(top_k.device() == logits.device() && noise.device() == logits.device(),
+                "topk_sample: tensors must be on the logits device");
+    const float* p_ptr = nullptr;
+    if (top_p.has_value()) {
+        const torch::Tensor& p_t = *top_p;
+        CK(p_t);
+        TORCH_CHECK(p_t.scalar_type() == torch::kFloat32 && p_t.numel() == B, "topk_sample: fp32 top_p [B]");
+        TORCH_CHECK(p_t.device() == logits.device(), "topk_sample: top_p device mismatch");
+        p_ptr = p_t.data_ptr<float>();
+    }
+    auto cand_val = torch::empty({B, NB * K}, logits.options());
+    auto cand_idx = torch::empty({B, NB * K}, logits.options().dtype(torch::kInt32));
+    auto thresholds = torch::empty({B, NB}, logits.options());
+    auto omitted = torch::empty({B, NB}, cand_idx.options());
+    auto prefixes = torch::empty({B, NB}, cand_idx.options());
+    auto cutoff_storage = torch::empty({B, int64_t(sizeof(RowCutoff))}, logits.options().dtype(torch::kUInt8));
+    auto* cutoffs = reinterpret_cast<RowCutoff*>(cutoff_storage.data_ptr<uint8_t>());
+    auto part_score = torch::empty({B, NB}, noise.options());
+    auto part_id = torch::empty({B, NB}, cand_idx.options());
+    auto out = torch::empty({B}, logits.options().dtype(torch::kInt64));
+    if (B == 0) return out;
+    candidates_kernel<<<dim3(NB, B), THREADS, 0, stream()>>>(
+        logits.data_ptr<float>(), logits.stride(0), V, cand_val.data_ptr<float>(), cand_idx.data_ptr<int>(),
+        thresholds.data_ptr<float>(), omitted.data_ptr<int>());
+    cutoff_kernel<<<B, MERGE_THREADS, 0, stream()>>>(
+        cand_val.data_ptr<float>(), cand_idx.data_ptr<int>(), thresholds.data_ptr<float>(),
+        omitted.data_ptr<int>(), top_k.data_ptr<int>(), p_ptr, cutoffs, prefixes.data_ptr<int>());
+    if (noise.scalar_type() == torch::kFloat64) {
+        sample_partitions_kernel<double><<<dim3(NB, B), SAMPLE_THREADS, 0, stream()>>>(
+            logits.data_ptr<float>(), logits.stride(0), V, noise.data_ptr<double>(), cutoffs,
+            prefixes.data_ptr<int>(), part_score.data_ptr<double>(), part_id.data_ptr<int>());
+        finish_kernel<double><<<B, 32, 0, stream()>>>(
+            part_score.data_ptr<double>(), part_id.data_ptr<int>(), out.data_ptr<long>());
+    } else {
+        sample_partitions_kernel<float><<<dim3(NB, B), SAMPLE_THREADS, 0, stream()>>>(
+            logits.data_ptr<float>(), logits.stride(0), V, noise.data_ptr<float>(), cutoffs,
+            prefixes.data_ptr<int>(), part_score.data_ptr<float>(), part_id.data_ptr<int>());
+        finish_kernel<float><<<B, 32, 0, stream()>>>(
+            part_score.data_ptr<float>(), part_id.data_ptr<int>(), out.data_ptr<long>());
+    }
+    return out;
+}
+
+static torch::Tensor py_decode_gemm_fp8(torch::Tensor x, torch::Tensor weight, torch::Tensor scale,
+                                        c10::optional<torch::Tensor> bias, bool fp32_out) {
+    CK(x); CK(weight); CK(scale);
+    TORCH_CHECK(x.scalar_type() == torch::kBFloat16, "decode_gemm_fp8: bf16 x");
+    TORCH_CHECK(weight.scalar_type() == torch::kFloat8_e4m3fn, "decode_gemm_fp8: float8_e4m3fn weight");
+    TORCH_CHECK(scale.scalar_type() == torch::kFloat32, "decode_gemm_fp8: fp32 block scales");
+    TORCH_CHECK(x.dim() == 2 && weight.dim() == 2 && x.size(1) == weight.size(1),
+                "decode_gemm_fp8: x [M, K], weight [N, K]");
+    const int M = int(x.size(0)), K = int(x.size(1)), N = int(weight.size(0));
+    TORCH_CHECK(decode_gemm_fp8::supports(M, N, K), "decode_gemm_fp8: unsupported shape M=", M, " N=", N, " K=", K);
+    TORCH_CHECK(scale.dim() == 2 && scale.size(0) == (N + decode_gemm_fp8::SB - 1) / decode_gemm_fp8::SB
+                    && scale.size(1) == K / decode_gemm_fp8::SB,
+                "decode_gemm_fp8: scale [ceil(N/128), K/128]");
+    const float* bias_ptr = nullptr;
+    if (bias.has_value()) {
+        CK((*bias));
+        TORCH_CHECK(bias->scalar_type() == torch::kFloat32 && bias->numel() == N, "decode_gemm_fp8: fp32 bias [N]");
+        bias_ptr = bias->data_ptr<float>();
+    }
+    auto out = torch::empty({M, N}, x.options().dtype(fp32_out ? torch::kFloat32 : torch::kBFloat16));
+    const auto* wp = reinterpret_cast<const uint8_t*>(weight.data_ptr());
+    if (fp32_out) decode_gemm_fp8::launch_auto(bp(x), wp, scale.data_ptr<float>(), bias_ptr, fpm(out), M, N, K, stream());
+    else decode_gemm_fp8::launch_auto(bp(x), wp, scale.data_ptr<float>(), bias_ptr, bpm(out), M, N, K, stream());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+
 __global__ void fill_short_context_topk_indices_kernel(
         int* __restrict__ output, const int64_t* __restrict__ positions,
         int rows, int topk, int compress_ratio) {
@@ -198,12 +426,62 @@ static void py_fill_short_context_topk_indices(
 }
 
 // ---- DeepSeek-V4 mHC, decode-specialized for Ampere ----
-static bool dsv4_mhc_cooperative_enabled() {
-    static const bool enabled = [] {
-        const char* value = std::getenv("VLLM_DSV4_MHC_COOPERATIVE");
-        return value == nullptr || value[0] != '0';
+// T == 1 pre-transition launch mode: 0 = cooperative fused kernel (grid sync),
+// 1 = last-block fused kernel (regular launch, 2026-09-07 rtx6000), 2 = the
+// three-kernel split path. VLLM_DSV4_MHC_MODE sets it; the legacy
+// VLLM_DSV4_MHC_COOPERATIVE=0 still selects the split path. Settable at
+// runtime (set_dsv4_mhc_mode) so one process can compare the modes.
+static std::atomic<int> g_dsv4_mhc_mode{-1};
+
+static int dsv4_mhc_mode() {
+    int mode = g_dsv4_mhc_mode.load(std::memory_order_relaxed);
+    if (mode >= 0) return mode;
+    mode = 0;
+    if (const char* value = std::getenv("VLLM_DSV4_MHC_MODE")) {
+        const int parsed = std::atoi(value);
+        if (parsed >= 0 && parsed <= 2) mode = parsed;
+    } else if (const char* legacy = std::getenv("VLLM_DSV4_MHC_COOPERATIVE")) {
+        if (legacy[0] == '0') mode = 2;
+    }
+    g_dsv4_mhc_mode.store(mode, std::memory_order_relaxed);
+    return mode;
+}
+
+static void py_set_dsv4_mhc_mode(int64_t mode) {
+    TORCH_CHECK(mode >= 0 && mode <= 2, "dsv4 mHC mode must be 0, 1 or 2");
+    g_dsv4_mhc_mode.store(int(mode), std::memory_order_relaxed);
+}
+
+static int64_t py_get_dsv4_mhc_mode() { return dsv4_mhc_mode(); }
+
+// Largest token count the cooperative fused kernel takes (T x NSPLITS blocks
+// co-resident, one grid barrier); larger T goes through the split path.
+// Default 8: measured 2026-09-07 on glm53-nvfp4-4/rtx6000 (notebook "mHC
+// cooperative launch for T <= 8"), c8 +1.2% like-state, c1 and c16 (split
+// path) unchanged, bit-exact. VLLM_DSV4_MHC_COOP_MAX_T overrides (1 = the
+// previous behaviour). Read once per process.
+static int dsv4_mhc_coop_max_t() {
+    static const int value = [] {
+        const char* env = std::getenv("VLLM_DSV4_MHC_COOP_MAX_T");
+        const int parsed = env ? std::atoi(env) : 8;
+        return parsed < 1 ? 1 : (parsed > 16 ? 16 : parsed);
     }();
-    return enabled;
+    return value;
+}
+
+// Persistent device counter for the last-block kernel (one launch in flight
+// per stream; the last block resets it). Allocated on first use, which is an
+// eager call - vLLM warms every shape up before it captures graphs.
+static int* dsv4_mhc_counter() {
+    static int* counter = [] {
+        int* ptr = nullptr;
+        TORCH_CHECK(cudaMalloc(&ptr, sizeof(int)) == cudaSuccess,
+                    "dsv4 mHC counter: cudaMalloc failed");
+        TORCH_CHECK(cudaMemset(ptr, 0, sizeof(int)) == cudaSuccess,
+                    "dsv4 mHC counter: cudaMemset failed");
+        return ptr;
+    }();
+    return counter;
 }
 
 static int dsv4_mhc_splits() {
@@ -250,8 +528,33 @@ static void launch_dsv4_mhc_pre_transition(
         &rms_eps, &pre_eps, &sinkhorn_eps, &post_multiplier,
         &sinkhorn_repeat, &norm_eps,
     };
+    const int T = residual.size(0);
+    if (dsv4_mhc_mode() == 1 && T == 1) {
+        dsv4_mhc::fused_pre_transition_lastblock<FUSED_POST, RMS_NORM, 4096,
+                                                 NSPLITS, FnT>
+            <<<dim3(NSPLITS, 1), dim3(dsv4_mhc::THREADS), 0, stream()>>>(
+                x_ptr, residual_ptr, post_ptr, comb_ptr, fn_ptr,
+                residual_out_ptr, partial_ptr, scale_ptr, base_ptr,
+                next_post_ptr, next_comb_ptr, layer_input_ptr, norm_ptr,
+                rms_eps, pre_eps, sinkhorn_eps, post_multiplier,
+                sinkhorn_repeat, norm_eps, dsv4_mhc_counter());
+        return;
+    }
+    // All T x NSPLITS blocks must be co-resident for the grid barrier.
+    static const int max_coresident = [&] {
+        int device = 0, sms = 0, blocks_per_sm = 0;
+        cudaGetDevice(&device);
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &blocks_per_sm, kernel, dsv4_mhc::THREADS, 0);
+        return blocks_per_sm * sms;
+    }();
+    TORCH_CHECK(T * NSPLITS <= max_coresident,
+                "DSV4 cooperative mHC: ", T * NSPLITS,
+                " blocks exceed the co-resident limit ", max_coresident,
+                "; lower VLLM_DSV4_MHC_COOP_MAX_T");
     const cudaError_t error = cudaLaunchCooperativeKernel(
-        reinterpret_cast<const void*>(kernel), dim3(NSPLITS, 1),
+        reinterpret_cast<const void*>(kernel), dim3(NSPLITS, T),
         dim3(dsv4_mhc::THREADS), args, 0, stream());
     TORCH_CHECK(error == cudaSuccess,
                 "DSV4 cooperative mHC launch failed: ",
@@ -279,6 +582,12 @@ static void launch_dsv4_mhc_pre_transition_selected(
         } else {
             LAUNCH_MHC_TYPED(half, 64);
         }
+    } else if (fn.scalar_type() == torch::kBFloat16) {
+        if (dsv4_mhc_splits() == 32) {
+            LAUNCH_MHC_TYPED(__nv_bfloat16, 32);
+        } else {
+            LAUNCH_MHC_TYPED(__nv_bfloat16, 64);
+        }
     } else if (dsv4_mhc_splits() == 32) {
         LAUNCH_MHC_TYPED(float, 32);
     } else {
@@ -287,6 +596,136 @@ static void launch_dsv4_mhc_pre_transition_selected(
 #undef LAUNCH_MHC_TYPED
 }
 
+// Prefill-shaped partials (mhc_ampere.cuh partials_prefill) for the split
+// path at T >= VLLM_DSV4_MHC_PREFILL_MIN_T (default 64: measured on
+// glm53-nvfp4-4/rtx6000, faster from T = 64 up and slower at T = 16;
+// 0 disables). Decode batches keep `partials`.
+// Runtime-settable (set_dsv4_mhc_prefill_min_t) so one process can compare
+// the two split-path partials kernels.
+static std::atomic<int> g_dsv4_mhc_prefill_min_t{-1};
+static int dsv4_mhc_prefill_min_t() {
+    int value = g_dsv4_mhc_prefill_min_t.load(std::memory_order_relaxed);
+    if (value >= 0) return value;
+    const char* env = std::getenv("VLLM_DSV4_MHC_PREFILL_MIN_T");
+    const int parsed = env ? std::atoi(env) : 64;
+    value = parsed < 0 ? 0 : parsed;
+    g_dsv4_mhc_prefill_min_t.store(value, std::memory_order_relaxed);
+    return value;
+}
+static void py_set_dsv4_mhc_prefill_min_t(int64_t min_t) {
+    TORCH_CHECK(min_t >= 0, "dsv4 mHC prefill min T must be >= 0");
+    g_dsv4_mhc_prefill_min_t.store(int(min_t), std::memory_order_relaxed);
+}
+static int64_t py_get_dsv4_mhc_prefill_min_t() {
+    return dsv4_mhc_prefill_min_t();
+}
+
+// Opt-in until fixed real-profile quality/performance qualification. This
+// changes only prefill dot summation order, never the stored model values.
+static std::atomic<int> g_glm53_mhc_prefill_tc{-1};
+static int64_t py_get_glm53_mhc_prefill_tc() {
+    int enabled = g_glm53_mhc_prefill_tc.load(std::memory_order_relaxed);
+    if (enabled >= 0) return enabled;
+    const char* value = std::getenv("VLLM_GLM5_MHC_PREFILL_TC");
+    TORCH_CHECK(value == nullptr ||
+                ((value[0] == '0' || value[0] == '1') && value[1] == '\0'),
+                "VLLM_GLM5_MHC_PREFILL_TC must be 0 or 1");
+    enabled = value != nullptr && value[0] == '1';
+    g_glm53_mhc_prefill_tc.store(enabled, std::memory_order_relaxed);
+    return enabled;
+}
+static void py_set_glm53_mhc_prefill_tc(int64_t enabled) {
+    TORCH_CHECK(enabled == 0 || enabled == 1, "mHC tensor-core switch must be 0 or 1");
+    g_glm53_mhc_prefill_tc.store(int(enabled), std::memory_order_relaxed);
+}
+template <bool FUSED_POST>
+static void launch_glm53_mhc_prefill_tc(
+        const __nv_bfloat16* x, const __nv_bfloat16* residual,
+        const float* post, const float* comb, const __nv_bfloat16* fn,
+        __nv_bfloat16* residual_out, float* partial, int T) {
+    auto kernel = glm53_mhc_prefill_tc::partials_tc<FUSED_POST>;
+    static thread_local int configured_device = -1;
+    int device = -1;
+    C10_CUDA_CHECK(cudaGetDevice(&device));
+    if (configured_device != device) {
+        C10_CUDA_CHECK(cudaFuncSetAttribute(
+            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+            glm53_mhc_prefill_tc::BYTES));
+        configured_device = device;
+    }
+    kernel<<<dim3(dsv4_mhc::SPLITS, (T + 31) / 32), 256,
+             glm53_mhc_prefill_tc::BYTES, stream()>>>(
+        x, residual, post, comb, fn, residual_out, partial, T);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+template <bool FUSED_POST, typename FnT, bool PAIRED_FN = false>
+static void launch_dsv4_mhc_partials_prefill_typed(
+        const __nv_bfloat16* x, const __nv_bfloat16* residual,
+        const float* post, const float* comb, const FnT* fn,
+        __nv_bfloat16* residual_out, float* partial, int T) {
+    auto kernel = dsv4_mhc::partials_prefill<FUSED_POST, 4096, FnT, PAIRED_FN>;
+    // This helper is module-local, but CUDA attributes also belong to the
+    // active device. A once-per-process flag leaves later devices unconfigured.
+    static thread_local int configured_device = -1;
+    int device = -1;
+    C10_CUDA_CHECK(cudaGetDevice(&device));
+    if (configured_device != device) {
+        C10_CUDA_CHECK(cudaFuncSetAttribute(
+            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+            int(dsv4_mhc::PREFILL_SMEM)));
+        configured_device = device;
+    }
+    const dim3 grid(dsv4_mhc::SPLITS,
+                    (T + dsv4_mhc::PREFILL_TILE - 1) / dsv4_mhc::PREFILL_TILE);
+    kernel<<<grid, dsv4_mhc::THREADS, dsv4_mhc::PREFILL_SMEM, stream()>>>(
+        x, residual, post, comb, fn, residual_out, partial, T);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+// Returns false when the split path must use `partials` (small T, H != 4096
+// or the kernel disabled).
+template <bool FUSED_POST>
+static bool launch_dsv4_mhc_partials_prefill(
+        const __nv_bfloat16* x, const __nv_bfloat16* residual,
+        const float* post, const float* comb, torch::Tensor fn,
+        __nv_bfloat16* residual_out, float* partial, int T, int H,
+        bool allow_tensor_core) {
+    const int min_t = dsv4_mhc_prefill_min_t();
+    if (min_t == 0 || T < min_t || H != 4096) return false;
+    if (fn.scalar_type() == torch::kHalf) {
+        launch_dsv4_mhc_partials_prefill_typed<FUSED_POST, half>(
+            x, residual, post, comb,
+            reinterpret_cast<const half*>(fn.data_ptr()), residual_out,
+            partial, T);
+    } else if (fn.scalar_type() == torch::kBFloat16) {
+        const auto* properties = at::cuda::getDeviceProperties(fn.get_device());
+        const bool sm120 = properties->major == 12 && properties->minor == 0;
+        if (allow_tensor_core && sm120 && T >= 64 && T <= 7616 &&
+                reinterpret_cast<uintptr_t>(fn.data_ptr()) % 16 == 0 &&
+                reinterpret_cast<uintptr_t>(residual) % 16 == 0 &&
+                (!FUSED_POST || (reinterpret_cast<uintptr_t>(x) % 16 == 0 &&
+                                reinterpret_cast<uintptr_t>(residual_out) % 16 == 0)) &&
+                py_get_glm53_mhc_prefill_tc()) {
+            launch_glm53_mhc_prefill_tc<FUSED_POST>(
+                x, residual, post, comb, bp(fn), residual_out, partial, T);
+            return true;
+        }
+        // Qualify this layout only on SM120. A contiguous tensor may still
+        // have an odd BF16 storage offset; preserve its valid scalar path.
+        const bool paired = sm120 &&
+                            reinterpret_cast<uintptr_t>(fn.data_ptr()) % 4 == 0;
+        if (paired) {
+            launch_dsv4_mhc_partials_prefill_typed<FUSED_POST, __nv_bfloat16, true>(
+                x, residual, post, comb, bp(fn), residual_out, partial, T);
+        } else {
+            launch_dsv4_mhc_partials_prefill_typed<FUSED_POST, __nv_bfloat16>(
+                x, residual, post, comb, bp(fn), residual_out, partial, T);
+        }
+    } else {
+        launch_dsv4_mhc_partials_prefill_typed<FUSED_POST, float>(
+            x, residual, post, comb, fp(fn), residual_out, partial, T);
+    }
+    return true;
+}
 template <int NOUT, bool FUSED_POST>
 static void launch_dsv4_mhc_partials(
         const __nv_bfloat16* x, const __nv_bfloat16* residual,
@@ -299,6 +738,11 @@ static void launch_dsv4_mhc_partials(
                 x, residual, post, comb,
                 reinterpret_cast<const half*>(fn.data_ptr()), residual_out,
                 partial, hidden_size);
+    } else if (fn.scalar_type() == torch::kBFloat16) {
+        dsv4_mhc::partials<NOUT, FUSED_POST, __nv_bfloat16>
+            <<<grid, dsv4_mhc::THREADS, 0, stream()>>>(
+                x, residual, post, comb, bp(fn), residual_out, partial,
+                hidden_size);
     } else {
         dsv4_mhc::partials<NOUT, FUSED_POST, float>
             <<<grid, dsv4_mhc::THREADS, 0, stream()>>>(
@@ -315,8 +759,9 @@ static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> py_dsv4_mhc_pre(
     CK(residual); CK(fn); CK(hc_scale); CK(hc_base);
     TORCH_CHECK(residual.scalar_type() == torch::kBFloat16, "residual must be bf16");
     TORCH_CHECK(fn.scalar_type() == torch::kFloat32 ||
-                fn.scalar_type() == torch::kFloat16,
-                "fn must be float16 or float32");
+                fn.scalar_type() == torch::kFloat16 ||
+                fn.scalar_type() == torch::kBFloat16,
+                "fn must be bfloat16, float16 or float32");
     const int T = residual.size(0), H = residual.size(2);
     TORCH_CHECK(residual.size(1) == dsv4_mhc::HC && fn.size(0) == dsv4_mhc::MIXES,
                 "DSV4 mHC expects hc_mult=4 and 24 mix rows");
@@ -325,7 +770,7 @@ static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> py_dsv4_mhc_pre(
     auto post = torch::empty({T, dsv4_mhc::HC}, float_options);
     auto comb = torch::empty({T, dsv4_mhc::HC, dsv4_mhc::HC}, float_options);
     auto layer_input = torch::empty({T, H}, residual.options());
-    if (dsv4_mhc_cooperative_enabled() && T == 1 && H == 4096) {
+    if (dsv4_mhc_mode() != 2 && T <= dsv4_mhc_coop_max_t() && H == 4096) {
         if (norm_weight) {
             launch_dsv4_mhc_pre_transition_selected<false, true>(
                 nullptr, residual, nullptr, nullptr, fn, nullptr, partial,
@@ -341,9 +786,15 @@ static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> py_dsv4_mhc_pre(
         }
         return {post, comb, layer_input};
     }
-    launch_dsv4_mhc_partials<dsv4_mhc::MIXES, false>(
-        nullptr, bp(residual), nullptr, nullptr, fn, nullptr, fpm(partial), H,
-        dim3(dsv4_mhc::SPLITS, T));
+    if (!launch_dsv4_mhc_partials_prefill<false>(
+            nullptr, bp(residual), nullptr, nullptr, fn, nullptr,
+            fpm(partial), T, H,
+            !norm_weight && rms_eps == 1e-5 && pre_eps == 1e-6 &&
+            sinkhorn_eps == 1e-6 && post_multiplier == 2.0 && sinkhorn_repeat == 20)) {
+        launch_dsv4_mhc_partials<dsv4_mhc::MIXES, false>(
+            nullptr, bp(residual), nullptr, nullptr, fn, nullptr,
+            fpm(partial), H, dim3(dsv4_mhc::SPLITS, T));
+    }
     dsv4_mhc::finalize_pre_mix<<<T, 32, 0, stream()>>>(
         fpm(partial), fp(hc_scale), fp(hc_base), fpm(post),
         fpm(comb), H, float(rms_eps), float(pre_eps),
@@ -378,10 +829,11 @@ py_dsv4_mhc_fused_post_pre(
     TORCH_CHECK(x.scalar_type() == torch::kBFloat16 &&
                 residual.scalar_type() == torch::kBFloat16, "x/residual must be bf16");
     TORCH_CHECK((fn.scalar_type() == torch::kFloat32 ||
-                 fn.scalar_type() == torch::kFloat16) &&
+                 fn.scalar_type() == torch::kFloat16 ||
+                 fn.scalar_type() == torch::kBFloat16) &&
                 post_mix.scalar_type() == torch::kFloat32 &&
                 comb_mix.scalar_type() == torch::kFloat32,
-                "mHC fn must be float16/float32 and mixes must be float32");
+                "mHC fn must be bfloat16/float16/float32 and mixes must be float32");
     const int T = residual.size(0), H = residual.size(2);
     TORCH_CHECK(residual.size(1) == dsv4_mhc::HC && fn.size(0) == dsv4_mhc::MIXES,
                 "DSV4 mHC expects hc_mult=4 and 24 mix rows");
@@ -392,7 +844,7 @@ py_dsv4_mhc_fused_post_pre(
     auto next_comb = torch::empty(
         {T, dsv4_mhc::HC, dsv4_mhc::HC}, float_options);
     auto layer_input = torch::empty({T, H}, residual.options());
-    if (dsv4_mhc_cooperative_enabled() && T == 1 && H == 4096) {
+    if (dsv4_mhc_mode() != 2 && T <= dsv4_mhc_coop_max_t() && H == 4096) {
         if (norm_weight) {
             launch_dsv4_mhc_pre_transition_selected<true, true>(
                 &x, residual, &post_mix, &comb_mix, fn, &residual_out,
@@ -409,9 +861,15 @@ py_dsv4_mhc_fused_post_pre(
         }
         return {residual_out, next_post, next_comb, layer_input};
     }
-    launch_dsv4_mhc_partials<dsv4_mhc::MIXES, true>(
-        bp(x), bp(residual), fp(post_mix), fp(comb_mix), fn,
-        bpm(residual_out), fpm(partial), H, dim3(dsv4_mhc::SPLITS, T));
+    if (!launch_dsv4_mhc_partials_prefill<true>(
+            bp(x), bp(residual), fp(post_mix), fp(comb_mix), fn,
+            bpm(residual_out), fpm(partial), T, H,
+            !norm_weight && rms_eps == 1e-5 && pre_eps == 1e-6 &&
+            sinkhorn_eps == 1e-6 && post_multiplier == 2.0 && sinkhorn_repeat == 20)) {
+        launch_dsv4_mhc_partials<dsv4_mhc::MIXES, true>(
+            bp(x), bp(residual), fp(post_mix), fp(comb_mix), fn,
+            bpm(residual_out), fpm(partial), H, dim3(dsv4_mhc::SPLITS, T));
+    }
     dsv4_mhc::finalize_pre_mix<<<T, 32, 0, stream()>>>(
         fpm(partial), fp(hc_scale), fp(hc_base), fpm(next_post),
         fpm(next_comb), H, float(rms_eps), float(pre_eps),
@@ -1412,6 +1870,36 @@ static torch::Tensor py_mla_decode_bf16_sparse_glm(torch::Tensor q, torch::Tenso
 // GLM-5.3-Flash (glm5_next) NoPE MLA, bf16 cache. There is no rope segment:
 // q and each slot are 512 bf16 latents (1024 B/slot) and the whole width both
 // scores and accumulates, i.e. the same template at QW = VW = 512.
+// Reduce form for the partitioned sparse decode (VLLM_MLA_SPARSE_REDUCE, read
+// once per process): 0 = one warp per (head, token) walking the partitions
+// serially (the original; ~0.5 us per partition on sm_120, 9.6 us at the
+// served 17 partitions and linear beyond), 1 = paged_attention_reduce_multiwarp
+// with 8 warps (3.1-5.7 us), 2 = paged_attention_reduce_channels, one thread
+// per value channel (2.4-4.2 us at 17-65 partitions; default, measured
+// 2026-09-07 on glm53-nvfp4-4/rtx6000, notebook "Sparse MLA decode: partition
+// and reduce").
+static int mla_sparse_reduce_mode() {
+    static const int value = [] {
+        const char* env = std::getenv("VLLM_MLA_SPARSE_REDUCE");
+        const int parsed = env ? std::atoi(env) : 2;
+        return parsed < 0 ? 0 : (parsed > 2 ? 2 : parsed);
+    }();
+    return value;
+}
+static void launch_sparse_reduce_512(const float* tmp, const float* ml, const float* es,
+                                     __nv_bfloat16* out, int H, int B, int P) {
+    const int mode = mla_sparse_reduce_mode();
+    if (mode == 2) {
+        paged_attention_reduce_channels<__nv_bfloat16, 512>
+            <<<dim3(H, B), 512, P * sizeof(float), stream()>>>(tmp, ml, es, out, H, P);
+    } else if (mode == 1) {
+        paged_attention_reduce_multiwarp<__nv_bfloat16, 512, 8>
+            <<<dim3(H, B), 256, P * sizeof(float), stream()>>>(tmp, ml, es, out, H, P);
+    } else {
+        paged_attention_reduce<__nv_bfloat16, 512><<<dim3(H, B), 32, 0, stream()>>>(tmp, ml, es, out, H, P);
+    }
+}
+
 static torch::Tensor py_mla_decode_bf16_sparse_nope(torch::Tensor q, torch::Tensor kv,
         torch::Tensor bt, torch::Tensor indices, torch::Tensor topk_length,
         int64_t block_size, double scale, int64_t partition_size, int64_t page_stride_bytes) {
@@ -1445,8 +1933,7 @@ static torch::Tensor py_mla_decode_bf16_sparse_nope(torch::Tensor q, torch::Tens
         topk_length.data_ptr<int>(), max_topk, nullptr,
         tmp.data_ptr<float>(), ml.data_ptr<float>(), es.data_ptr<float>(),
         int(block_size), int(bt.size(1)), float(scale), H, P, int(partition_size), 1.0f, nullptr, 0, int(page_stride_bytes));
-    paged_attention_reduce<__nv_bfloat16, 512><<<dim3(H, B), 32, 0, stream()>>>(
-        tmp.data_ptr<float>(), ml.data_ptr<float>(), es.data_ptr<float>(), bpm(out), H, P);
+    launch_sparse_reduce_512(tmp.data_ptr<float>(), ml.data_ptr<float>(), es.data_ptr<float>(), bpm(out), H, B, P);
     return out;
 }
 
@@ -2053,6 +2540,41 @@ void init_serving(py::module_& m) {
     m.def("dsv4_hash_router_debug", &py_dsv4_hash_router_debug);
     m.def("dsv4_projection_gemv", &py_dsv4_projection_gemv, py::arg("x"),
           py::arg("weight"), py::arg("bf16_output") = false);
+    m.def("glm_route_align", &py_glm_route_align<false>, py::arg("logits"),
+          py::arg("bias"), py::arg("topk"), py::arg("scoring"),
+          py::arg("renormalize"), py::arg("scaling"), py::arg("block_size"),
+          py::arg("max_padded"), py::arg("max_blocks"),
+          "fused small-M routing: scored top-k with bias selection + Marlin block alignment");
+    m.def("glm_stable_align", &py_glm_stable_align, py::arg("ids"),
+          py::arg("sorted"), py::arg("experts"), py::arg("padded"),
+          py::arg("offsets"), py::arg("block"));
+    m.def("glm_route_align_stable", &py_glm_route_align<true>, py::arg("logits"),
+          py::arg("bias"), py::arg("topk"), py::arg("scoring"),
+          py::arg("renormalize"), py::arg("scaling"), py::arg("block_size"),
+          py::arg("max_padded"), py::arg("max_blocks"),
+          "opt-in SM120 small-M routing with stable within-expert assignment order");
+    m.def("decode_gemm", &py_decode_gemm, py::arg("x"), py::arg("weight"),
+          py::arg("bias") = py::none(), py::arg("fp32_out") = false,
+          "bf16 M<=16 GEMM on tensor cores: x @ weight^T (+ bias), fp32 accumulation");
+    m.def("set_dsv4_mhc_mode", &py_set_dsv4_mhc_mode,
+          "T == 1 mHC pre-transition launch mode: 0 cooperative, 1 last-block, 2 split kernels");
+    m.def("get_dsv4_mhc_mode", &py_get_dsv4_mhc_mode);
+    m.def("set_dsv4_mhc_prefill_min_t", &py_set_dsv4_mhc_prefill_min_t,
+          "smallest T the split path hands to the prefill-shaped partials kernel (0 = never)");
+    m.def("get_dsv4_mhc_prefill_min_t", &py_get_dsv4_mhc_prefill_min_t);
+    m.def("set_glm53_mhc_prefill_tc", &py_set_glm53_mhc_prefill_tc,
+          "opt-in SM120 BF16 mHC prefill tensor cores (0/1); affects eager and future captures only");
+    m.def("get_glm53_mhc_prefill_tc", &py_get_glm53_mhc_prefill_tc);
+    m.def("topk_sample", &py_topk_sample, py::arg("logits"), py::arg("top_k"),
+          py::arg("top_p") = py::none(), py::arg("noise"),
+          "top-k (<= 32, ties kept) / top-p sampling of fp32 logits rows with caller-drawn "
+          "fp32/fp64 exponential noise [B, V]; int64 token ids");
+    m.def("decode_gemm_fp8", &py_decode_gemm_fp8, py::arg("x"), py::arg("weight"), py::arg("scale"),
+          py::arg("bias") = py::none(), py::arg("fp32_out") = false,
+          "bf16 x FP8 block-scaled weights (e4m3, 128x128 fp32 scales), M<=16, tensor cores: "
+          "x @ dequant(weight)^T (+ bias), fp32 accumulation");
+    m.def("moe_sum_add", &py_moe_sum_add, py::arg("x"), py::arg("shared"), py::arg("out"),
+          "out[t] = shared[t] + sum_k x[t, k]: Marlin per-assignment sum + shared-expert add, one launch");
     m.def("fill_short_context_topk_indices",
           &py_fill_short_context_topk_indices, py::arg("output"),
           py::arg("positions"), py::arg("topk"),

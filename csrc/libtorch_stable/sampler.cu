@@ -1,4 +1,5 @@
 #include <climits>
+#include <torch/headeronly/macros/Macros.h>
 
 #include "../cuda_compat.h"
 #include "dispatch_utils.h"
@@ -154,7 +155,8 @@ __device__ void vectorized_process(size_t thread_rank, size_t num_threads,
 }
 
 template <int step, int kNumThreadsPerBlock, int kNumBins, int kNumFinalItems,
-          bool multipleBlocksPerRow, bool mergeBlocks, typename SmemFinalType,
+          bool multipleBlocksPerRow, bool mergeBlocks, bool canonicalTies,
+          typename SmemFinalType,
           typename SmemOutputType>
 __device__ bool processHistogramStep(
     const int* indices, const float* logits, int rowEnd, uint32_t& logitPattern,
@@ -181,6 +183,10 @@ __device__ bool processHistogramStep(
   }
 
   auto distributeToBins = [&](float logit, int /* idx */ = 0) {
+    if constexpr (canonicalTies) {
+      // Signed zeros compare equal; put both in the same histogram bin.
+      logit = logit == 0.0f ? 0.0f : logit;
+    }
     if (isPartialMatch<patternShift>(logit, logitPattern)) {
       uint32_t binIdx = extractBinIdx<step>(logit);
       atomicAdd(&smemFinal.histo.data[binIdx], 1);
@@ -256,6 +262,9 @@ __device__ bool processHistogramStep(
   thresholdBinIdx = smemThresholdBinIdx[0];
 
   auto processBins = [&](float logit, int idx) {
+    if constexpr (canonicalTies) {
+      logit = logit == 0.0f ? 0.0f : logit;
+    }
     if (isPartialMatch<patternShift>(logit, logitPattern)) {
       uint32_t binIdx = extractBinIdx<step>(logit);
       // Only write elements with binIdx < thresholdBinIdx when:
@@ -292,17 +301,17 @@ __device__ bool processHistogramStep(
           }
         }
       } else {
-        if (binIdx == thresholdBinIdx) {
+        if (binIdx == thresholdBinIdx && !canonicalTies) {
           // The elements in the threshold bin share the same 32 bits at step 3
           // -- identical logits -- so which of them survive is decided by the
           // order threads win this atomic, and it differs between launches.
           // Measured on gfx942 at seq 32768 with 800 non-zero indexer logits:
           // the selected set repeated on 2 of 8 launches, Jaccard >= 0.91, and
           // every difference was among positions scoring exactly 0.0. No
-          // above-threshold token is ever dropped, so this costs bitwise
-          // reproducibility at long context, not selection quality. Making it
-          // canonical means ranking ties by index, which is a scan over the
-          // whole bin in the decode hot path.
+          // above-threshold token is dropped. This preserves the top-k SCORE
+          // set, not the downstream model output: equal indexer scores can
+          // refer to different attention values. The opt-in GLM prefill path
+          // ranks these ties by pool ID in the bounded scan below.
           int dstIdx = atomicAdd(&smemFinal.histo.data[binIdx], 1);
           if (dstIdx < topK) {
             if constexpr (mergeBlocks) {
@@ -333,17 +342,48 @@ __device__ bool processHistogramStep(
   // Make sure the elements are in shared memory.
   __syncthreads();
 
+  if constexpr (canonicalTies && step == 3) {
+    static_assert(!multipleBlocksPerRow && !mergeBlocks);
+    // The histogram already gives the output offset for the exact cutoff bin.
+    // Fill only its remaining slots, scanning pool IDs in increasing order.
+    // Reuse scan storage after all histogram/above-cutoff accesses complete.
+    int base = smemFinal.histo.data[thresholdBinIdx];
+    using Scan = cub::BlockScan<int, kNumThreadsPerBlock>;
+    for (int begin = rowStart; begin < rowEnd && base < topK;
+         begin += kNumThreadsPerBlock) {
+      const int idx = begin + threadIdx.x;
+      bool selected = false;
+      if (idx < rowEnd) {
+        float logit = logits[idx * stride1];
+        logit = logit == 0.0f ? 0.0f : logit;
+        selected = isPartialMatch<patternShift>(logit, logitPattern) &&
+                   extractBinIdx<step>(logit) == thresholdBinIdx;
+      }
+      int offset, count;
+      Scan(smemFinal.histo.scan).ExclusiveSum(int(selected), offset, count);
+      if (selected && base + offset < topK) {
+        smemOutput[base + offset] = idx - rowStart;
+      }
+      base += count;
+      __syncthreads();
+    }
+  }
+
   // Check if we should continue to next step
   return smemFinalBinSize[0] > kNumFinalItems;
 }
 
 // Follows half - 11 - 11 - 10 bit iterations
 template <int kNumThreadsPerBlock, int kNumBins, bool useRadixSort,
-          bool multipleBlocksPerRow = false, bool mergeBlocks = false>
+          bool multipleBlocksPerRow = false, bool mergeBlocks = false,
+          bool canonicalTies = false, bool canonicalOrder = false>
 static __device__ void topKPerRowJob(const int* indices, const float* logits,
                                      int rowStart, int rowEnd, int* outIndices,
                                      float* outLogits, int stride1, int topK) {
   // The number of slots for the final pass.
+  static_assert(!canonicalTies || (!useRadixSort && !multipleBlocksPerRow &&
+                                  !mergeBlocks));
+  static_assert(!canonicalOrder || (canonicalTies && kNumThreadsPerBlock == 512));
   static constexpr int kNumFinalItems = 2048;
   // The number of elements per thread for the final sort.
   static constexpr int kNumFinalItemsPerThread =
@@ -452,7 +492,7 @@ static __device__ void topKPerRowJob(const int* indices, const float* logits,
   // Step 0: Process first 11 bits of half representation
   bool continueToNextStep =
       processHistogramStep<0, kNumThreadsPerBlock, kNumBins, kNumFinalItems,
-                           multipleBlocksPerRow, mergeBlocks>(
+                           multipleBlocksPerRow, mergeBlocks, canonicalTies>(
           indices, logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput,
           smemThresholdBinIdx, smemFinalDstIdx, smemFinalBinSize,
           smemFoundTopKValues, smemFinal, stride1, rowStart, topK);
@@ -461,7 +501,7 @@ static __device__ void topKPerRowJob(const int* indices, const float* logits,
     // Step 1: Process next 11 bits
     continueToNextStep =
         processHistogramStep<1, kNumThreadsPerBlock, kNumBins, kNumFinalItems,
-                             multipleBlocksPerRow, mergeBlocks>(
+                             multipleBlocksPerRow, mergeBlocks, canonicalTies>(
             indices, logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput,
             smemThresholdBinIdx, smemFinalDstIdx, smemFinalBinSize,
             smemFoundTopKValues, smemFinal, stride1, rowStart, topK);
@@ -471,7 +511,7 @@ static __device__ void topKPerRowJob(const int* indices, const float* logits,
     // Step 2: Process next 11 bits
     continueToNextStep =
         processHistogramStep<2, kNumThreadsPerBlock, kNumBins, kNumFinalItems,
-                             multipleBlocksPerRow, mergeBlocks>(
+                             multipleBlocksPerRow, mergeBlocks, canonicalTies>(
             indices, logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput,
             smemThresholdBinIdx, smemFinalDstIdx, smemFinalBinSize,
             smemFoundTopKValues, smemFinal, stride1, rowStart, topK);
@@ -480,7 +520,7 @@ static __device__ void topKPerRowJob(const int* indices, const float* logits,
   if (continueToNextStep) {
     // Step 3: Process last 10 bits
     processHistogramStep<3, kNumThreadsPerBlock, kNumBins, kNumFinalItems,
-                         multipleBlocksPerRow, mergeBlocks>(
+                         multipleBlocksPerRow, mergeBlocks, canonicalTies>(
         indices, logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput,
         smemThresholdBinIdx, smemFinalDstIdx, smemFinalBinSize,
         smemFoundTopKValues, smemFinal, stride1, rowStart, topK);
@@ -540,9 +580,12 @@ static __device__ void topKPerRowJob(const int* indices, const float* logits,
            i += kNumThreadsPerBlock) {
         int outIndex = 0;
         auto logit = smemFinal.items.logits[i];
+        const int pool = canonicalTies ? smemFinal.items.indices[i] : 0;
         for (int j = 0; j < smemFinalDstIdx[0]; j++) {
           auto otherLogit = smemFinal.items.logits[j];
-          if (logit < otherLogit || (logit == otherLogit && i < j)) {
+          const bool tiePrecedes = canonicalTies
+              ? pool > smemFinal.items.indices[j] : i < j;
+          if (logit < otherLogit || (logit == otherLogit && tiePrecedes)) {
             outIndex++;
           }
         }
@@ -559,18 +602,49 @@ static __device__ void topKPerRowJob(const int* indices, const float* logits,
     __syncthreads();
   }
 
-  // Store to global memory.
-  for (int i = threadIdx.x; i < topK; i += kNumThreadsPerBlock) {
-    if constexpr (multipleBlocksPerRow) {
-      outIndices[i] = smemOutput[i];
-      outLogits[i] = reinterpret_cast<float*>(smemOutput + topK)[i];
-    } else {
-      if (stride1 == 1) {
-        // stride1 == 1 will use vectorized_process, which indexes already skip
-        // the rowStart.
+  if constexpr (canonicalOrder) {
+    // Selection and every read of FinalItems/Histogram have completed. Reuse
+    // their storage; this needs neither an extra launch nor a global workspace.
+    // The <=512 shortcut above is already in ascending pool-ID order.
+    int pool = smemOutput[threadIdx.x];
+    pool = pool < 0 ? INT_MAX : pool;
+    __syncthreads();
+    // One integer per thread. Warp-local exchanges stay in registers; only
+    // the ten cross-warp compare stages use shared memory. This replaces the
+    // rejected radix candidate, not an additional serving implementation.
+#pragma unroll
+    for (int size = 2; size <= 512; size *= 2) {
+#pragma unroll
+      for (int distance = size / 2; distance > 0; distance /= 2) {
+        int other;
+        if (distance < 32) {
+          other = VLLM_SHFL_XOR_SYNC_WIDTH(pool, distance, 32);
+        } else {
+          smemFinal.items.indices[threadIdx.x] = pool;
+          __syncthreads();
+          other = smemFinal.items.indices[threadIdx.x ^ distance];
+          __syncthreads();
+        }
+        const bool takeMin = ((threadIdx.x & size) == 0) ==
+                             ((threadIdx.x & distance) == 0);
+        pool = takeMin ? min(pool, other) : max(pool, other);
+      }
+    }
+    outIndices[threadIdx.x] = pool == INT_MAX ? -1 : pool;
+  } else {
+    // Store to global memory.
+    for (int i = threadIdx.x; i < topK; i += kNumThreadsPerBlock) {
+      if constexpr (multipleBlocksPerRow) {
         outIndices[i] = smemOutput[i];
+        outLogits[i] = reinterpret_cast<float*>(smemOutput + topK)[i];
       } else {
-        outIndices[i] = smemOutput[i] - rowStart;
+        if (stride1 == 1) {
+          // stride1 == 1 will use vectorized_process, which indexes already skip
+          // the rowStart.
+          outIndices[i] = smemOutput[i];
+        } else {
+          outIndices[i] = smemOutput[i] - rowStart;
+        }
       }
     }
   }
@@ -646,6 +720,29 @@ static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowDecode(
   topKPerRowJob<kNumThreadsPerBlock, kNumBins, useRadixSort,
                 multipleBlocksPerRow, mergeBlocks>(
       indices, logits, rowStart, rowEnd, outIndices, outLogits, stride1, topK);
+}
+
+// Separate entry preserves the generic prefill/decode kernels and defaults.
+// Only membership ties change; output order is still unspecified here.
+static __global__ __launch_bounds__(512) void glm53TopKPerRowPrefill(
+    const float* logits, const int* starts, const int* ends, int* indices,
+    int columns) {
+  const int row = blockIdx.x;
+  CUDA_KERNEL_ASSERT(starts[row] == 0 && ends[row] >= 0 && ends[row] <= columns);
+  topKPerRowJob<512, 2048, false, false, false, true>(
+      nullptr, logits + int64_t(row) * columns, 0, ends[row],
+      indices + int64_t(row) * 512, nullptr, 1, 512);
+}
+
+// Diagnostic fusion candidate: identical tie policy, ascending selected IDs.
+static __global__ __launch_bounds__(512) void glm53TopKPerRowOrdered(
+    const float* logits, const int* starts, const int* ends, int* indices,
+    int columns) {
+  const int row = blockIdx.x;
+  CUDA_KERNEL_ASSERT(starts[row] == 0 && ends[row] >= 0 && ends[row] <= columns);
+  topKPerRowJob<512, 2048, false, false, false, true, true>(
+      nullptr, logits + int64_t(row) * columns, 0, ends[row],
+      indices + int64_t(row) * 512, nullptr, 1, 512);
 }
 
 }  // namespace vllm
@@ -795,4 +892,63 @@ void top_k_per_row_prefill(const torch::stable::Tensor& logits,
             static_cast<int>(stride0), static_cast<int>(stride1),
             static_cast<int>(topK), kSortingAlgorithmThreshold);
   }
+}
+
+template <bool canonicalOrder>
+static void glm53_top_k_per_row_impl(
+    const torch::stable::Tensor& logits,
+    const torch::stable::Tensor& starts,
+    const torch::stable::Tensor& ends, torch::stable::Tensor& indices,
+    int64_t numRows, int64_t stride0, int64_t stride1, int64_t topK) {
+  using Scalar = torch::headeronly::ScalarType;
+  STD_TORCH_CHECK(logits.is_cuda() && logits.scalar_type() == Scalar::Float &&
+                  logits.dim() == 2 && logits.is_contiguous(),
+                  "GLM pool selector requires contiguous CUDA FP32 logits");
+  STD_TORCH_CHECK(numRows >= 1 && numRows <= 8192 &&
+                  logits.size(0) == numRows && logits.size(1) >= 1 &&
+                  logits.size(1) <= 262144 && stride0 == logits.size(1) &&
+                  stride1 == 1 && topK == 512,
+                  "GLM pool selector geometry changed");
+  const torch::stable::Tensor* buffers[] = {&starts, &ends, &indices};
+  for (const auto* value : buffers) {
+    STD_TORCH_CHECK(value->is_cuda() && value->scalar_type() == Scalar::Int &&
+                    value->is_contiguous() &&
+                    value->get_device_index() == logits.get_device_index(),
+                    "GLM pool selector requires same-device contiguous int32 buffers");
+  }
+  STD_TORCH_CHECK(starts.dim() == 1 && ends.dim() == 1 &&
+                  starts.size(0) == numRows && ends.size(0) == numRows &&
+                  indices.dim() == 2 && indices.size(0) == numRows &&
+                  indices.size(1) == 512, "GLM pool selector buffer shape changed");
+  const torch::stable::accelerator::DeviceGuard guard(logits.get_device_index());
+  if constexpr (canonicalOrder) {
+    vllm::glm53TopKPerRowOrdered<<<numRows, 512, 512 * sizeof(int32_t),
+                                  get_current_cuda_stream()>>>(
+        logits.const_data_ptr<float>(), starts.const_data_ptr<int>(),
+        ends.const_data_ptr<int>(), indices.mutable_data_ptr<int>(), int(stride0));
+  } else {
+    vllm::glm53TopKPerRowPrefill<<<numRows, 512, 512 * sizeof(int32_t),
+                               get_current_cuda_stream()>>>(
+      logits.const_data_ptr<float>(), starts.const_data_ptr<int>(),
+      ends.const_data_ptr<int>(), indices.mutable_data_ptr<int>(), int(stride0));
+  }
+  const cudaError_t error = cudaGetLastError();
+  STD_TORCH_CHECK(error == cudaSuccess, "GLM pool selector launch failed: ",
+                  cudaGetErrorString(error));
+}
+
+void glm53_top_k_per_row_prefill(
+    const torch::stable::Tensor& logits, const torch::stable::Tensor& starts,
+    const torch::stable::Tensor& ends, torch::stable::Tensor& indices,
+    int64_t numRows, int64_t stride0, int64_t stride1, int64_t topK) {
+  glm53_top_k_per_row_impl<false>(logits, starts, ends, indices, numRows,
+                                stride0, stride1, topK);
+}
+
+void glm53_top_k_per_row_ordered(
+    const torch::stable::Tensor& logits, const torch::stable::Tensor& starts,
+    const torch::stable::Tensor& ends, torch::stable::Tensor& indices,
+    int64_t numRows, int64_t stride0, int64_t stride1, int64_t topK) {
+  glm53_top_k_per_row_impl<true>(logits, starts, ends, indices, numRows,
+                               stride0, stride1, topK);
 }
