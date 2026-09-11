@@ -4014,3 +4014,22 @@ TP4 = 36 MLA + 18 indexer + 4 KDA state pages; 106 at TP8 = 68 + 34 + 4.
   (`should_fuse_dsv4_mhc` is batch-1 only), sampler/launch fusions,
   host-resident main KV for GLM. Record flips (schedule, api2, numa, fp8
   KV) only on measured wins plus the gate set.
+
+## 2026-09-11 23:40: program status
+
+- Profile of the DP2 record at 32 req/replica (notebook): MoE GEMM 39%
+  (at bandwidth), mHC partials 14%, dense GEMMs 12%, KDA 8%, allreduce 6%.
+  Landed: token-batched mHC partials (97f13c4ee, 78 -> 31 us at T=32).
+  Next kernels: KDA recurrent (0.56 TB/s effective, ~2x headroom;
+  vllm/models/kimi_k3/amd/ops/third_party/kda/fused_recurrent.py), then
+  spec at c32 once per-row costs are down.
+- Thinking budget 2000 now on both glm53f records; harness credits recall
+  in reasoning and sends probes a per-request budget.
+- OPEN: cold prefill >= ~900K produced '!' garbage in the 1M leg (both
+  layouts); a cold-prefill probe worker died silently at 200K on a
+  torch.compile cache two concurrent boots had corrupted (cache set
+  aside at ~/.cache/vllm/torch_compile_cache.corrupt-*). Rerun queued
+  (queue22, results in perf/results/2026-09-11/glm53f-coldprefill2/).
+- GPU queue: q19 NUMA arm -> q20 fp8-KV arm + FULL_AND_PIECEWISE arm ->
+  q21 same-day base on the batched-partials tree -> q22 parity test +
+  cold-prefill bisection. Logs ~/.local/scratch/glm53/queue*.log.
