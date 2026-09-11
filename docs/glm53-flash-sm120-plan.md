@@ -26,8 +26,10 @@ resume validation infrastructure or exhaust every possible configuration.
 Execution checkpoint (2026-09-11 UTC): use the original phase/item IDs below;
 this is their status, not a replacement roadmap. The **4.1 cross-item pipeline**
 is implemented and rejected: faster than its draining control, still slower
-than retained Marlin. Next active subtask is **4.2, the KDA fg_b projection**,
-adapting our existing small-M BF16 tensor-core design to the paired K128 shape.
+than retained Marlin. **4.2 paired KDA fg_b** is implemented and locally faster,
+but saves only ~20 us across 34 layers; parked without a serving campaign.
+Active next is **2.3, KDA output-weight L2 prefetch** with the full independent
+attention window included in timing, using the existing kernels unchanged.
 No new serving gain is claimed. The broader stream-K/fused-expert successor and
 whole-layer KDA fusion are not thereby implemented or declared impossible.
 
@@ -36,10 +38,10 @@ whole-layer KDA fusion are not thereby implemented or declared impossible.
 | 0 | Bring-up/profile/baseline completed |
 | 1 | Selected weight recipe implemented; FP8 KV/W4A4 are outside that recipe |
 | 2.1–2.2 | Main transport/launch fusions retained; rejected variants stay closed |
-| 2.3 | L2 prefetch unimplemented; queued, not the active item |
+| 2.3 | **In progress:** KDA output-weight L2 prefetch during independent attention work |
 | 3 | MTP port tested; off after losses on the relevant concurrent workload |
 | 4.1 | Cross-item prototype rejected against Marlin; stream-K/fused successor unimplemented |
-| 4.2 | **In progress:** paired K128 fg_b projection; existing component fusions retained; whole-layer fusion unimplemented |
+| 4.2 | Paired K128 fg_b implemented, locally faster but parked for small full-stack value; whole-layer fusion unimplemented |
 | 4.3 | Sparse MLA/indexer improvements retained; recent local variants rejected; structural work not closed |
 | 4.4 | Persistent per-layer decode unimplemented; conditional on 4.1–4.3 evidence |
 | 4.5 | Prefill improvements including wide Marlin retained; remaining structural work not closed |

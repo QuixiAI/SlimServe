@@ -44,8 +44,13 @@ All 90 actual-weight/captured-route projection checks pass; no serving run or
 promotion warranted. Kernel quarantined under `benchmarks/kernels/`, raw in
 `perf/results/2026-09-11/nvfp4-cross-item/`. Production unchanged. Broader
 stream-K/fused-expert successor remains unimplemented, not declared exhausted.
-Active next: **Phase 4.2 paired K128 fg_b projection**, adapting the retained
-small-M BF16 tensor-core design. The existing plan's phase/item tracker is current.
+Phase4.2 paired K128 fg_b projection is now implemented and locally faster:
+c1/c8/c16 2.366/2.426/2.466 -> 1.766/1.876/1.894 us. Actual weights, FP64 and
+changed-input graph checks pass. Only ~20 us/34 layers before serving effects;
+parked under `benchmarks/kernels/` without a serving campaign. Raw `kda-fg-b/`
+under2026-09-11. Active next: **Phase2.3 KDA output-weight L2 prefetch**, timing
+the whole independent attention window. No serving speed claim from either probe.
+The existing plan's phase/item tracker is current.
 
 Follow-up CLOSED: fixed-shape wide specialization (d02ebe696) gives bit-exact
 composed outputs and0.9-3.1% isolated gains, but only0.15/0.16% lower cold32K/128K

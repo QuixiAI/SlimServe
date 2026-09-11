@@ -28363,3 +28363,38 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   small-M BF16 tensor-core kernel; measure against the current strided bmm before
   any model integration. Whole-layer KDA fusion remains a separate unfinished
   part of4.2, not something this projection comparison will claim to complete.
+
+## 2026-09-11 - Phase 4.2 paired K128 projection: local win, small serving budget
+
+- Status: implemented and locally faster, parked; production unchanged. This
+  completes the focused fg_b comparison, not the roadmap's whole-layer fusion.
+- Mechanism/reference: adapt the retained `bf16_decode_gemm.cuh` staged BF16
+  tensor-core design to two K128/N2048 projections from the merged KDA input.
+  No new quant, input copy, weight layout or reduced accumulation precision;
+  output is the same `[2, M, 2048]` as the existing strided `torch.bmm`.
+  NT16/eight-warps/two-stages is fixed; no configuration search.
+- Actual layers0/22/44, rank0 TP4 BF16 f_b/g_b weights; synthetic BF16 input
+  with production6528 token stride at M8/16 (M1 view collapses to256).
+  129 copies of each weight pair yield387MiB, exceeding three128MiB L2 caches.
+  Three A/B/A rounds x ten graph replays x387 calls at M1/8/16. GPU0 SM120,
+  CUDA13.0, stock600W; build80GiB/MAX_JOBS2 and probe16GiB, swap0.
+- All nine actual-weight cases pass full-output FP64 oracle and bmm comparison
+  at rtol0.01/atol0.001; all387 changed-input graph pairs pass per batch.
+  Largest oracle NRMS0.000050974, largest bmm NRMS0.000035817. No claim of
+  bit-exactness across every value or broad model quality.
+- Median us, original -> candidate -> original: M1 2.3655 ->1.7657 ->2.3639;
+  M8 2.4264 ->1.8763 ->2.4264; M16 2.4661 ->1.8943 ->2.4624. Local latency
+  reduction ~23-25%, but only0.55-0.60us per site, ~19-20us across34 layers.
+  Historical profiled fg_b times are not the fresh isolated baseline and do
+  not justify claiming a ~0.2ms whole-model saving from this kernel.
+- Decision: preserve the working candidate in the benchmark area, not serving.
+  Its small projected value does not justify repeated server starts or another
+  qualification campaign now. May be revisited as part of substantive KDA
+  fusion, with its serving contribution still unproven. No native install.
+- Raw: `perf/results/2026-09-11/kda-fg-b/`, `screen.json`, build/probe logs,
+  exact tested source snapshots before quarantine. Reproducer:
+  `python -m benchmarks.kernels.benchmark_glm53_kda_fg_b --build-dir ...
+  --model ... --output <new.json>`, under the caps above.
+- Next existing roadmap item:2.3. Bulk-L2-prefetch the8MiB FP8 KDA o_proj
+  during existing fg_b/conv/state-update/norm work; include the entire window
+  and stream costs, not an artificially warmed GEMM or a synthetic sleep.
