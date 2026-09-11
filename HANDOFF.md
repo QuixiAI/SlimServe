@@ -3956,3 +3956,25 @@ TP4 = 36 MLA + 18 indexer + 4 KDA state pages; 106 at TP8 = 68 + 34 + 4.
 - Goalactive. Finishlongmatrix, then planunchangedcachedrestart+matched
   rowshardcontrol andGPUcandidategates duringa safe GPU-releaseinterval;
   strict1M/physicaltiers/scaling stillrequired. No queuedGPUcandidateprocess.
+
+## 2026-09-10 (late): TP4 x DP2 decision, DP root cause, block-pool crash chase
+
+- Operator decision: glm53f-nvfp4-8 serves TP4 x DP2 (prod is always c8+).
+  Root cause of the old "DP2" c1 loss: with EP off vLLM flattens the MoE TP
+  group across DP (1/8 of each expert per rank, all-gather across replicas
+  every MoE layer, lockstep dummy steps, per-step DP token sync). Fixed by
+  `--data-parallel-replicate-moe` (6629cd0d5). Prefix-affinity DP routing
+  landed in the load balancer (VLLM_DP_PREFIX_AFFINITY). Record NOT flipped
+  yet: needs the mx-tp4dp2 arm (replicated) to pass canaries + exact, then
+  the full gate set through `slimserve --serve`.
+- Block-pool crash on the speculative record under tier restores: first
+  `get_new_blocks` ref_cnt assert (leg 1), then with fail-fast invariants
+  `popleft_n` walked off the free list with num_free_blocks still positive
+  (leg 2, no double free reported). Cross-pool touch/free checks added
+  (7a453f9b3); leg 3 (`glm53f-leg-spec-instr2`) reproduces on them.
+- GPU queue (scripts in ~/.local/scratch/glm53/): queue2.sh = instrumented
+  leg -> mx-tp4dp2 (replicated) -> mx-tp4dp2-flat -> mx-tp4dp2-ep; then
+  tp4_arm_chain.sh (mx-tp4 standalone) and k4_chain.sh (DFlash2 k=4 arms
+  + paired k=3). Logs: queue2.log, matrix-chain.log, k4-chain.log. The 1M
+  leg is parked (leg_1m.sh stub; real script leg_1m.real.sh) until the
+  block-pool fault is fixed.

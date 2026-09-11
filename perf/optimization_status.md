@@ -25124,3 +25124,56 @@ restart is the operator's call.
   Log: "window-only groups [13] are not tier-managed (zeroed on
   resume)". No block-pool assert in this run (20 restores; the leg
   needed ~190). Raw: perf/results/2026-09-10/glm53f-final-spec-tier2/.
+
+## 2026-09-10: operator decision - glm53f-nvfp4-8 goes TP4 x DP2; prefix-affinity DP routing
+
+- Operator (2026-09-10): "we should use DP2 since we will always be c8+ in
+  prod", reversing the 09-03 TP8 decision. The 09-03 matrix's DP2 c1 loss
+  (67.2 vs TP8 83.0) decomposes as TP4-replica latency (standalone TP4
+  73.6, 4.1 s vs 3.6 s per 1000/300 request) plus a 10% DP overhead on
+  the active replica (4.5 s under DP2) that the operator regards as an
+  implementation bug to chase. EP stays off (loses everywhere).
+- Queue on the GPUs, in order: instrumented WildChat leg (block-pool
+  double free), matrix on today's tree with the record's full config and
+  DFlash2 (mx-tp8, mx-tp8-ep, mx-tp4dp2, mx-tp4dp2-ep at c1-c64), a
+  standalone mx-tp4 arm to isolate the DP overhead, then the DFlash2 k=4
+  arms. The record flips once mx-tp4dp2 passes canaries + exact, then the
+  full gate set (text/image canaries, exact, tier acceptance, leg) runs
+  through `slimserve --serve`.
+- Prefix-affinity routing for the DP load balancer
+  (vllm/v1/engine/dp_prefix_affinity.py, wired into DPLBAsyncMPClient):
+  each replica owns its prefix cache and KV tiers and the balancer picked
+  the least-loaded replica, so a continued conversation re-prefilled its
+  whole history on the wrong replica about half the time. The router
+  keeps a bounded per-replica memory of routed prompt block hashes
+  (chained blake2b over full blocks, cache_salt-seeded; local, so only
+  self-consistent) and charges cost = prompt_tokens - matched_prefix
+  + LOAD_TOKENS x (waiting*4 + running); with no history it is
+  least-loaded, a long cached history outweighs a moderate imbalance but
+  not a severe one. Env: VLLM_DP_PREFIX_AFFINITY (default on),
+  VLLM_DP_PREFIX_AFFINITY_LOAD_TOKENS (2048), _BLOCKS (262144 per
+  replica). 9 unit tests incl. the balancer request path. NOT yet live:
+  the DP2 validation runs measure it (multi-turn recall on the leg is the
+  check: hit rate must not halve under DP2).
+- DP OVERHEAD ROOT CAUSE (code + boot evidence): with expert parallel off,
+  vLLM's FusedMoEParallelConfig.make flattens the MoE tensor-parallel
+  group across DP (tp_size = dp x tp, rank = dp_rank x tp + tp_rank), so
+  "TP4 x DP2" holds only 1/8 of every expert per rank and every MoE layer
+  all-gathers tokens across both replicas (naive dispatch/combine on the
+  EP group), which is also why idle replicas must dummy-step in lockstep
+  and why the runner syncs token counts across DP every step. Boot logs
+  prove it: model weights 24.96 GiB/rank under TP4 x DP2 vs 44.89 GiB at
+  plain TP4 (perf/results/2026-09-02/glm53-8gpu-matrix/{tp4dp2,tp4}).
+  So the 09-03 "DP2" arm was TP4 attention over TP8 MoE in lockstep, not
+  two independent engines; its 10% c1 loss vs standalone TP4 is that
+  coupling. New `--data-parallel-replicate-moe` (ParallelConfig
+  data_parallel_replicate_moe): each replica keeps the full expert set
+  sharded over its own TP group (moe dp_size 1: no naive dispatch), the
+  forward context builds no DPMetadata, the V2 runner dispatches the
+  batch descriptor locally instead of the cross-DP all-reduce, and an
+  idle replica yields instead of dummy-stepping. Rejected with EP. Costs
+  dp x expert memory (fits: 45 GiB/rank on 80 GB). 4 unit tests
+  (tests/model_executor/test_moe_parallel_config_replicate.py). The
+  matrix now runs mx-tp4dp2 (replicated) beside mx-tp4dp2-flat (default
+  flattening) and mx-tp4 (standalone) - the replicated arm's c1 should
+  match standalone TP4 and its c8+ should beat the flattened arm.

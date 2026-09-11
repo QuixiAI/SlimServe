@@ -211,11 +211,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Data parallelism.
         self.dp_size = self.parallel_config.data_parallel_size
         self.dp_rank = self.parallel_config.data_parallel_rank
+        # Replicated-MoE DP has no per-step cross-replica collective, so the
+        # batch descriptor is dispatched locally (as with dp_size 1).
+        self.dp_sync_size = (
+            1 if self.parallel_config.data_parallel_replicate_moe else self.dp_size
+        )
 
         # Detect EP all2all peer faults to prevent emitting corrupted output.
         # Only meaningful for MoE + DP with an FT-capable all2all backend.
         self.check_ep_fault = False
-        if self.dp_size > 1 and self.model_config.is_moe:
+        if (
+            self.dp_size > 1
+            and self.model_config.is_moe
+            and not self.parallel_config.data_parallel_replicate_moe
+        ):
             self.check_ep_fault = get_ep_all2all_manager().support_fault_tolerance
 
         # Decode context parallelism.
@@ -1623,7 +1632,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_reqs,
             num_toks,
             uniform_tok_count,
-            self.dp_size,
+            self.dp_sync_size,
             self.dp_rank,
             need_eager=is_profile or skip_compiled,
             num_active_loras=num_active_loras,
