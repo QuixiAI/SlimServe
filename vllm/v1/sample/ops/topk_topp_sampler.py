@@ -142,6 +142,9 @@ class TopKTopPSampler(nn.Module):
         PyTorch-native implementation of top-k and top-p sampling.
 
         The logits tensor may be updated in-place.
+
+        Corrected tie/noise semantics and fixed-profile qualification:
+        docs/glm53-flash-sm120-review.md, "Qualification record map".
         """
         if (
             k is not None

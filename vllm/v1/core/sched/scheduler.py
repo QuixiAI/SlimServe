@@ -1657,18 +1657,18 @@ class Scheduler(SchedulerInterface):
         return GrammarOutput(structured_output_request_ids, bitmask, apply_rows)
 
     def _record_routing_journal(self, routed, req_ids, scheduled) -> None:
-        requests = [self.requests.get(rid) for rid in req_ids]
+        requests = {rid: self.requests[rid] for rid in req_ids if rid in self.requests}
         # An abort can remove a request while the model is executing. Drop the
         # whole diagnostic frame, never misalign surviving metadata with rows.
-        if any(request is None for request in requests):
+        if len(requests) != len(req_ids):
             return
         self._slimserve_routing_journal.record(
             routed.routing_data,
             routed.slot_mapping,
             req_ids,
             scheduled,
-            {rid: request.num_computed_tokens for rid, request in zip(req_ids, requests)},
-            {rid: request.num_prompt_tokens for rid, request in zip(req_ids, requests)},
+            {rid: request.num_computed_tokens for rid, request in requests.items()},
+            {rid: request.num_prompt_tokens for rid, request in requests.items()},
         )
 
     def update_from_output(

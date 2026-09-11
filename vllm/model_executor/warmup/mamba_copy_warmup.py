@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Warm the align-cache copy path without touching any model/cache storage."""
+"""Warm the align-cache copy path without touching any model/cache storage.
+
+Startup-stall fix, not a steady-state speedup. The fixed-profile workload and
+raw receipts are linked in docs/glm53-flash-sm120-review.md under
+"Qualification record map" (2026-09-08 repro-baseline/ and warmup-boundary/).
+"""
 
 import torch
 
