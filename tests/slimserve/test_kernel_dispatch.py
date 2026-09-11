@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU-only checks for optional native paths; no CUDA launch or model load."""
 
+import ctypes
 from types import SimpleNamespace
 
 import pytest
@@ -16,11 +17,13 @@ def test_cold_decode_gate_compiles_without_tracing_driver(monkeypatch, fp8, supp
     suffix = "_fp8" if fp8 else ""
     enabled = getattr(utils, f"decode_gemm{suffix}_enabled")
     calls = []
+    getpid = ctypes.CDLL(None).getpid
 
     def capability(minimum):
-        # Real capability queries call NVML ctypes functions, which cannot be
-        # traced. Fail if Dynamo tries to enter this function symbolically.
-        assert not torch.compiler.is_compiling(), "driver query entered graph"
+        # Like NVML, this actual ctypes call cannot enter a tensor graph.
+        # is_compiling() is still true during eager constant evaluation, so
+        # that flag alone does not distinguish tracing from constant folding.
+        assert getpid() > 0
         calls.append(minimum)
         return supported
 
