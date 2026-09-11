@@ -1656,6 +1656,21 @@ class Scheduler(SchedulerInterface):
         bitmask, apply_rows = result
         return GrammarOutput(structured_output_request_ids, bitmask, apply_rows)
 
+    def _record_routing_journal(self, routed, req_ids, scheduled) -> None:
+        requests = [self.requests.get(rid) for rid in req_ids]
+        # An abort can remove a request while the model is executing. Drop the
+        # whole diagnostic frame, never misalign surviving metadata with rows.
+        if any(request is None for request in requests):
+            return
+        self._slimserve_routing_journal.record(
+            routed.routing_data,
+            routed.slot_mapping,
+            req_ids,
+            scheduled,
+            {rid: request.num_computed_tokens for rid, request in zip(req_ids, requests)},
+            {rid: request.num_prompt_tokens for rid, request in zip(req_ids, requests)},
+        )
+
     def update_from_output(
         self,
         scheduler_output: SchedulerOutput,
@@ -1703,14 +1718,8 @@ class Scheduler(SchedulerInterface):
         if model_runner_output.routed_experts is not None:
             re = model_runner_output.routed_experts
             if self._slimserve_routing_journal is not None:
-                req_ids = model_runner_output.req_ids
-                self._slimserve_routing_journal.record(
-                    re.routing_data,
-                    re.slot_mapping,
-                    req_ids,
-                    num_scheduled_tokens,
-                    {rid: self.requests[rid].num_computed_tokens for rid in req_ids},
-                    {rid: self.requests[rid].num_prompt_tokens for rid in req_ids},
+                self._record_routing_journal(
+                    re, model_runner_output.req_ids, num_scheduled_tokens
                 )
             self.routed_experts_mgr.store_batch(re.routing_data, re.slot_mapping)
             routing_data = re.routing_data.astype(

@@ -1,5 +1,7 @@
 """A platform record may opt into or out of speculation on its own (glm53-nvfp4-4)."""
 
+from dataclasses import replace
+
 from slimserve import registry
 from slimserve.engine import _speculative_config
 
@@ -17,14 +19,25 @@ def test_glm53_records_serve_spec_off_by_default():
         assert _speculative_config(plan) is None
 
 
-def test_rtx6000_opt_in_keeps_the_measured_depth():
-    plan = _plan("rtx6000")
+def test_rtx6000_opt_in_keeps_the_measured_depth(tmp_path, monkeypatch):
+    monkeypatch.setenv("SLIMSERVE_CACHE", str(tmp_path))
+    # The supported --spec CLI applies this exact override to the resolved plan.
+    plan = replace(_plan("rtx6000"), speculative=True)
     assert plan.speculative_overrides == {"num_speculative_tokens": 3}
     spec = plan.speculator
     assert spec["engine"]["method"] == "mtp"
     assert spec["engine"]["moe_backend"] == "triton"
     assert spec["engine"]["attention_backend"] == "QUIXICORE_MLA_SPARSE"
     assert spec["engine"]["index_share_for_mtp_iteration"] is True
+    assert _speculative_config(plan) == {
+        "model": "RedHatAI/GLM-5.3-Flash-NVFP4",
+        "revision": "36c184c6cda000a481711306df5adde42f63321a",
+        "method": "mtp",
+        "num_speculative_tokens": 3,
+        "index_share_for_mtp_iteration": True,
+        "moe_backend": "triton",
+        "attention_backend": "QUIXICORE_MLA_SPARSE",
+    }
 
 
 def test_record_level_speculative_overrides_the_profile_flag():

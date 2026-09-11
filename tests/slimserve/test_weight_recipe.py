@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import json
+import shutil
 from dataclasses import replace
 from unittest.mock import Mock
 
@@ -18,13 +19,14 @@ def _plan(tmp_path, monkeypatch):
     plan = registry.resolve("glm53-nvfp4-4", "rtx6000", 4, None)
     plan.model_dir.mkdir()
     (plan.model_dir / "config.json").write_text("{}")
-    for name in weight_recipe.SIDECARS[:2]:
-        save_file(
-            {"w": torch.ones(2)}, str(plan.model_dir / name), metadata={"source": "old"}
-        )
-    (plan.model_dir / "fp8-swapset.json").write_text(
-        json.dumps({"source": "old", "tp_size": 4})
-    )
+    for name in weight_recipe.SIDECARS:
+        path = plan.model_dir / name
+        if path.suffix == ".safetensors":
+            save_file({"w": torch.ones(2)}, str(path), metadata={"source": "old"})
+        elif path.suffix == ".json":
+            path.write_text(json.dumps({"source": "old", "tp_size": 4}))
+        else:
+            raise AssertionError(f"unhandled sidecar format: {name}")
     recipe = {
         **plan.weight_recipe,
         "artifact_digests": {
@@ -113,6 +115,33 @@ def test_artifact_identity_ignores_only_local_provenance(tmp_path):
     assert weight_recipe.artifact_digest(a) == weight_recipe.artifact_digest(b)
     save_file({"other": torch.ones(2)}, str(b))
     assert weight_recipe.artifact_digest(a) != weight_recipe.artifact_digest(b)
+
+
+@pytest.mark.parametrize("prefix", [b"", b"1234567"])
+def test_truncated_original_sidecar_uses_the_rebuild_path(
+    tmp_path, monkeypatch, prefix
+):
+    plan = _plan(tmp_path, monkeypatch)
+    original = plan.model_dir / weight_recipe.SIDECARS[0]
+    intact = original.read_bytes()
+    original.write_bytes(prefix)
+    with pytest.raises(ValueError, match="truncated safetensors"):
+        weight_recipe.artifact_digest(original)
+
+    def rebuild(selected, staging):
+        assert selected is plan
+        for name in weight_recipe.SIDECARS:
+            if name == original.name:
+                (staging / name).write_bytes(intact)
+            else:
+                shutil.copyfile(plan.model_dir / name, staging / name)
+
+    build = Mock(side_effect=rebuild)
+    monkeypatch.setattr(weight_recipe, "_build", build)
+    weight_recipe.ensure(plan)
+    build.assert_called_once()
+    weight_recipe.validate(plan.entry_file, plan.weight_recipe)
+    assert original.read_bytes() == prefix  # never mutate the source checkpoint
 
 
 @pytest.mark.parametrize("indexed", [False, True])

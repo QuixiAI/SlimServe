@@ -19,6 +19,7 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.platforms import current_platform
 
 from .deepseek_mtp import (
     DeepSeekMTP,
@@ -155,8 +156,6 @@ class Glm5NextMTP(DeepSeekMTP):
 # The independently qualified SM120 diagnostic adapter owns a different cache
 # grouping/recurrence contract. Keep it paired with its matching proposer;
 # ordinary GLM profiles on other platforms retain the compiled adapter above.
-from vllm.platforms import current_platform
-
 if current_platform.is_cuda() and current_platform.is_device_capability((12, 0)):
     from .glm5_next_sm120_mtp import Glm5NextMTP as Glm5NextMTPModel
 else:

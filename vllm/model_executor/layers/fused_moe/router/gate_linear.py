@@ -99,7 +99,7 @@ class GateLinear(ReplicatedLinear):
             and current_platform.is_device_capability((12, 0))
             and self.weight.dtype == torch.bfloat16
             and input_size == 4096
-            and _quixicore_available()
+            and _quixicore_projection_available()
         )
         self.allow_projection_gemv = (
             self._projection_gemv_shape and out_dtype == torch.float32
@@ -306,11 +306,11 @@ direct_register_custom_op(
 )
 
 
-def _quixicore_available() -> bool:
+def _quixicore_projection_available() -> bool:
     try:
         from vllm.quixicore.ops import quixicore_ops
 
-        return bool(quixicore_ops.is_available())
+        return quixicore_ops.has("dsv4_projection_gemv")
     except Exception:  # noqa: BLE001 - any import failure means no extension
         return False
 

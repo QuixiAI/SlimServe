@@ -184,9 +184,9 @@ class TopKTopPSampler(nn.Module):
                     "per-request generators. Falling back to "
                     "PyTorch-native implementation."
                 )
-            return self.forward_native(logits, generators, k, p)
+            return self.forward_native(logits, generators, k, p, max_top_k=max_top_k)
         if self.use_fp64_gumbel:
-            return self.forward_native(logits, generators, k, p)
+            return self.forward_native(logits, generators, k, p, max_top_k=max_top_k)
         assert self.logprobs_mode not in PROCESSED_LOGPROBS_MODES, (
             "FlashInfer does not support returning logits/logprobs"
         )

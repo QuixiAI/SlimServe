@@ -173,6 +173,8 @@ def quantize_beta(w: torch.Tensor, tp_size: int) -> tuple[torch.Tensor, torch.Te
     block r of a [tp_size * BETA_ROWS, K] tensor (zeros after them), one scale
     row per rank, so the merged loader's plain row slice gives each rank its
     heads with a whole block scale of its own."""
+    if tp_size < 1:
+        raise ValueError("tp_size must be positive")
     n, k = w.shape
     if n % tp_size or n // tp_size > BETA_ROWS:
         raise ValueError(f"{n} beta rows do not shard over tp={tp_size}")
@@ -238,13 +240,15 @@ def build(
     self_quant_kda: bool = False,
     tp_size: int | None = None,
 ) -> Path:
+    if self_quant_kda and (tp_size is None or tp_size < 1):
+        raise SystemExit("--self-quant-kda requires a positive --tp-size")
     native = _headers(native_dir)
     converted = _headers(model_dir)
     names = select(native, converted, skip_layer)
     if not names:
         raise SystemExit("nothing to swap: no FP8 twins of BF16 conversion tensors")
     kda = select_kda(converted, skip_layer) if self_quant_kda else []
-    if self_quant_kda and (not kda or not tp_size):
+    if self_quant_kda and not kda:
         raise SystemExit("--self-quant-kda needs KDA BF16 tensors and --tp-size")
     group = _fp8_group_template(model_dir)
     group["targets"] = targets_for(names + kda)
