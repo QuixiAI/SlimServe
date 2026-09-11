@@ -104,7 +104,10 @@ DECODE_GEMM_MAX_TOKENS = 16
 
 
 @cache
+@torch.compiler.assume_constant_result
 def decode_gemm_enabled() -> bool:
+    # Process-fixed configuration/device: do not trace NVML/driver calls when
+    # this cache is cold during full-graph model compilation.
     if (
         os.getenv("SLIMSERVE_DECODE_GEMM", "1") == "0"
         or not current_platform.is_cuda()
@@ -172,6 +175,7 @@ def cuda_unquantized_gemm(
 # the op runs the stock CUTLASS w8a8 blockwise path (prefill numerics unchanged).
 # SLIMSERVE_DECODE_GEMM_FP8=0 keeps the stock path for every M.
 @cache
+@torch.compiler.assume_constant_result
 def decode_gemm_fp8_enabled() -> bool:
     if (
         os.getenv("SLIMSERVE_DECODE_GEMM_FP8", "1") == "0"
