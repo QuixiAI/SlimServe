@@ -1305,6 +1305,22 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     endif()
 
     set(MARLIN_MOE_OTHER_SRC "csrc/libtorch_stable/moe/marlin_moe_wna16/ops.cu")
+    if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
+      cuda_archs_loose_intersection(GLM53_MARLIN_ARCHS "12.0f" "${CUDA_ARCHS}")
+    else()
+      cuda_archs_loose_intersection(GLM53_MARLIN_ARCHS "12.0a" "${CUDA_ARCHS}")
+    endif()
+    if(GLM53_MARLIN_ARCHS)
+      set(GLM53_MARLIN_SRC
+        "csrc/libtorch_stable/moe/marlin_moe_wna16/glm53_sm120_prefill.cu")
+      set_gencode_flags_for_srcs(
+        SRCS "${GLM53_MARLIN_SRC}" CUDA_ARCHS "${GLM53_MARLIN_ARCHS}")
+      set_source_files_properties(${GLM53_MARLIN_SRC}
+        PROPERTIES COMPILE_FLAGS "-static-global-template-stub=false")
+      set_property(SOURCE ${MARLIN_MOE_OTHER_SRC} APPEND PROPERTY
+        COMPILE_DEFINITIONS VLLM_BUILD_GLM53_SM120_PREFILL=1)
+      list(APPEND VLLM_MOE_EXT_SRC ${GLM53_MARLIN_SRC})
+    endif()
     set_gencode_flags_for_srcs(
       SRCS "${MARLIN_MOE_OTHER_SRC}"
       CUDA_ARCHS "${MARLIN_MOE_OTHER_ARCHS}")

@@ -35,7 +35,32 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): same-live-input prompt scoring CPU-qualified
+### Latest checkpoint (2026-09-10): kernel speed work resumed
+
+The same-live-input scoring diagnostic is COMPLETE; do not restart or extend it.
+All four ranks pass exact paired scoring/input immutability and HTTP coverage
+(56 requests, 104 calls, 330,288 paired rows per rank). Historical window-quality
+failures remain failures. This is not a throughput result or default promotion.
+Raw: `perf/results/2026-09-10/prompt-score-shadow-v1/result.json`, exit0,
+source freeze verified, GPUs released. Sources are no longer frozen.
+
+Operator priority: optimize kernels, with focused correctness and measured speed;
+no further scoring/validation-infrastructure campaign. Current experiment screens
+large-prefill Marlin expert tiles using the existing actual-weight microbenchmark
+helpers. Target recipe/profile/quant unchanged. Record outcomes in the notebook.
+
+Wide Marlin prefill candidate is now built and installed, opt-in only:
+`VLLM_GLM53_MARLIN_PREFILL_WIDE=1`. M64/N512/K64,256 threads,three stages.
+Complete expert path improves6.75-10.03% in all18 prescribed actual-weight
+fixtures; sampled independent FP64 checks and targeted memcheck pass. Installed
+native outputs match the isolated candidate exactly at2048/2176/7616 rows.
+No serving speed claim yet. NEXT: exactly one flag0 control and one flag1
+candidate start, three repeats each, existing campaign with cold-prefix,
+quality and cold32K/128K. No further scoring diagnostic or new automation.
+Native SHA f3fb0be4831122b75c82aae71597ae21c7a5b65f63b0a05a06fb4988d616e296;
+old library preserved at `perf/results/2026-09-10/marlin-prefill/moe-before-wide.so`.
+
+### Previous checkpoint (2026-09-10): same-live-input prompt scoring CPU-qualified
 
 New opt-in score shadow compares existing full scoring and unchanged chunked scoring
 on SAME live logits, with complete before/after input hashes and exact output bits,

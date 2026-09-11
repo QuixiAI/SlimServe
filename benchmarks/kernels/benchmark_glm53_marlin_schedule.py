@@ -47,7 +47,9 @@ def footprint(cases, phase):
     return sum(map(len, experts.values())) * n * k * 9 // 16
 
 
-def prepare_case(weights, batch, record, layer_id, gemm=None):
+def prepare_case(
+    weights, batch, record, layer_id, gemm=None, block_size=8, alignment=None
+):
     from vllm import _custom_ops as ops
     from vllm.model_executor.layers.fused_moe.activation import (
         MoEActivation,
@@ -68,7 +70,9 @@ def prepare_case(weights, batch, record, layer_id, gemm=None):
     ):
         raise ValueError("invalid captured expert IDs")
     ids = torch.tensor(ids_cpu, device="cuda", dtype=torch.int32)
-    sorted_ids, expert_ids, padded = moe_align_block_size(ids, 8, 288)
+    if alignment is None:
+        alignment = moe_align_block_size(ids, block_size, 288)
+    sorted_ids, expert_ids, padded = alignment
     topk_weights = torch.full((batch, 8), 2.5 / 8, device="cuda")
     x = torch.randn(batch, 4096, device="cuda", dtype=torch.bfloat16)
     gate = torch.empty(batch * 8, 1024, device="cuda", dtype=torch.bfloat16)
@@ -98,7 +102,7 @@ def prepare_case(weights, batch, record, layer_id, gemm=None):
             expert_ids,
             padded,
             topk_weights,
-            moe_block_size=8,
+            moe_block_size=block_size,
             top_k=8 if is_gate else 1,
             mul_topk_weights=not is_gate,
             b_q_type=scalar_types.float4_e2m1f,
@@ -122,6 +126,7 @@ def prepare_case(weights, batch, record, layer_id, gemm=None):
         "call": call,
         "refs": refs,
         "input": x,
+        "alignment": alignment,
         "routing_weights": topk_weights,
         "outputs": {
             "gate_up": gate,
@@ -132,6 +137,7 @@ def prepare_case(weights, batch, record, layer_id, gemm=None):
         "identity": {
             "layer": layer_id,
             "batch": batch,
+            "block_size": block_size,
             "step": record["step"],
             "expert_ids": ids_cpu,
             "padded_rows": padded.item(),

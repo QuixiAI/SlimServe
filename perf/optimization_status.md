@@ -27994,3 +27994,77 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - Raw: `runtime-control/prompt-shadow-cpu-v{1,2}.xml` under2026-09-10. Next result
   `perf/results/2026-09-10/prompt-score-shadow-v1/`. Exact command, bounds, coverage
   and failure rules: `perf/glm53-prompt-score-shadow-protocol.md`.
+
+## 2026-09-10 - Close scoring diagnostic; resume kernel speed work
+
+- Same-live-logit shadow is complete on all four ranks: 56 requests, 104 scoring
+  calls, 56 paired calls and 330,288 paired rows per rank. Paired outputs and
+  before/after input hashes are exact; HTTP coverage passes. Historical quality
+  windows still fail. No scoring default or performance claim follows.
+- Controller/serving exit0, source freeze verified and ended, GPUs released.
+  Raw: `perf/results/2026-09-10/prompt-score-shadow-v1/result.json`.
+- Operator directs kernel optimization, not more scoring/validation infrastructure.
+  Use focused correctness and actual speed measurements for each kernel change.
+
+## 2026-09-10 - Large-prefill Marlin tile and pipeline screen
+
+- Status: isolated screening; serving/profile/native libraries unchanged.
+- Baseline: 1bc0dd939, recipe v1 NVFP4/BF16, RTX PRO6000 SM120, CUDA13.0,
+  stock clocks/power. Existing trace attributes ~122ms/full chunk to expert GEMMs.
+- Workload: actual layer3 TP4 rank0 weights; synthetic BF16 activations and fixed
+  uniform/skewed routes at7616 tokens, top8/288 experts. Installed auto uses M64,
+  K64/N256, four stages, one block/SM. Reuse existing preparation/timing helpers;
+  three A/B/A rounds, five graph replays/phase, no replacement results.
+- Screen: other existing K/N tiles regress. M32 also regresses; M48 improves down
+  only ~1.6-3.9% while hurting gate/up. Do not integrate another routing layout
+  for this marginal result. Two-stage M64 kernels regress ~10-20%.
+- Three-stage M64: N256/one block improves gate/up ~0.9-1.3%, down ~0.1-0.5%;
+  N128/two blocks improves down ~2.7-5.0% but hurts gate/up ~2-3%.
+  Four-stage isolated N256 control is bit-exact to installed auto; three-stage
+  N256 is also bit-exact. Changed geometry passes existing local rtol/atol0.01;
+  synthetic local parity is not model-quality or end-to-end throughput evidence.
+- Next kernel candidate: N512/256 threads, M64/K64/three stages. All eight warps
+  span N, removing cross-warp K reduction; 98,304 dynamic shared bytes plus1,024
+  static bytes fit SM120. Benchmark only; no production dispatch yet.
+- Raw: `perf/results/2026-09-10/marlin-prefill/{screen,rowtiles,stages4,stages3,
+  stages2}.json`, isolated native builds in `build/` and `wide-build/` there.
+  Focused helper CPU tests3 pass; Ruff/diff checks pass. Host caps16GiB/probes,
+  80GiB/builds(-j2),8GiB/CPU, swap0; GPU workloads and native builds serialized.
+
+### Wide three-stage prefill kernel wins the composed screen
+
+- M64/N512/K64,256 threads,3 stages,one block/SM: gate/up ~8.2-8.6% faster,
+  down ~15.2-16.4% faster in the first full-chunk screen. This is a new kernel
+  instantiation, not a selection among the existing generated schedules.
+- Composed gate/up + unchanged clamp/SILU + weighted down: all18 predetermined
+  cases pass local parity and win by6.75-10.03%. Actual layers3/23/44, TP4 rank0,
+  batches2048/2176/7616, uniform/skewed routes, five A/B/A rounds x five replays.
+  Full-chunk examples: layer23 uniform3181us ->2913us; skew3141us ->2857us.
+  No end-to-end throughput claim yet; routing/combination/communication excluded.
+- Independent existing planar-byte/BF16-fragment/FP64 oracle: first/middle/last
+  token of each fixture (54 tokens/432 expert assignments), gate/up, activation
+  and final expert output all pass rtol/atol0.01. Report RMS in raw JSON; this is
+  sampled numerical validation, not bit-exactness to the old reduction schedule
+  or a model-quality gate. No quant or activation precision changes.
+- Candidate uses255 registers, zero stack/local bytes,98304 dynamic +1024 static
+  shared bytes. Targeted memcheck: four composed cases,2048/7616 rows and both
+  route distributions, zero errors. Existing reference kernels are not newly
+  sanitized. Raw `wide.json`, `composed.json`, `memcheck.{json,log}` in the same
+  marlin-prefill directory. All failed/losing screen results remain available.
+- Native integration: dedicated `glm53_sm120_prefill.cu`, enabled only when built
+  for SM120 and explicitly requested by `VLLM_GLM53_MARLIN_PREFILL_WIDE=1`.
+  Auto-scheduled target NVFP4/BF16 TP4 shapes,2048..8192 input tokens only;
+  decode, smaller prefills, explicit schedules and other platforms retain their
+  existing paths. Default0 pending actual serving evidence. No new weight copy.
+- Predetermined serving check after native build/import: one flag0 control start,
+  one flag1 candidate start, same rebuilt library/profile/recipe, three repeats
+  each at exact1000/300 c1/c8/c16, cold-prefix, text/image, quality and cold32K/128K.
+  No retries or startup selection. This measures kernel serving value; it does
+  not reopen or relabel the historical noisy per-window scoring campaign.
+- Native build/import complete, CUDA13.0/sm120f,-j2/80GiB, MoE extension SHA
+  f3fb0be4831122b75c82aae71597ae21c7a5b65f63b0a05a06fb4988d616e296.
+  Prior1093b8a4 library preserved as `moe-before-wide.so`. Six installed-dispatch
+  composed cases (2048/2176/7616,both routes) match isolated wide gate/up and down
+  outputs bit-exactly; explicit old schedules serve as controls. This confirms
+  the opt-in dispatcher reaches the measured kernel. Raw `installed.json` and
+  `native-build.log`; no live serving measurement yet.
