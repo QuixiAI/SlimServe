@@ -45,18 +45,23 @@ Raw: `perf/results/2026-09-10/prompt-score-shadow-v1/result.json`, exit0,
 source freeze verified, GPUs released. Sources are no longer frozen.
 
 Operator priority: optimize kernels, with focused correctness and measured speed;
-no further scoring/validation-infrastructure campaign. Current experiment screens
-large-prefill Marlin expert tiles using the existing actual-weight microbenchmark
-helpers. Target recipe/profile/quant unchanged. Record outcomes in the notebook.
+no further scoring/validation-infrastructure campaign. Target recipe/quant unchanged.
 
-Wide Marlin prefill candidate is now built and installed, opt-in only:
+The wide Marlin prefill kernel is RETAINED in the RTX6000 profile:
 `VLLM_GLM53_MARLIN_PREFILL_WIDE=1`. M64/N512/K64,256 threads,three stages.
-Complete expert path improves6.75-10.03% in all18 prescribed actual-weight
-fixtures; sampled independent FP64 checks and targeted memcheck pass. Installed
-native outputs match the isolated candidate exactly at2048/2176/7616 rows.
-No serving speed claim yet. NEXT: exactly one flag0 control and one flag1
-candidate start, three repeats each, existing campaign with cold-prefix,
-quality and cold32K/128K. No further scoring diagnostic or new automation.
+Complete expert path improves6.75-10.03% in18 actual-weight fixtures. Independent
+sampled FP64 checks, targeted memcheck and native/probe exact parity pass.
+One fixed control/candidate pair on fb399cd89, three repeats each, finishes
+successfully with all measurements retained. Cold32K/128K engine TTFT
+2585.249/10862.210 ->2534.443/10710.859ms (-1.97/-1.39%). E2E c16
+779.195 ->784.687tok/s (+0.70%); c1/c8 remain within control spread. Every candidate
+prefill reading beats every control reading; text/image, exact tokens and all
+long-context retrieval contrasts pass. Historical scoring failures remain unchanged.
+No claim of across-start variance or broad model-quality qualification.
+Raw `marlin-wide-serving-{control,candidate}/` under2026-09-10; both exit0, GPUs free.
+NEXT: another measured kernel bottleneck, not another validation campaign. The
+wide tile is the new starting point; smaller-row/wider-column geometry and
+prefetch scheduling remain unexplored beyond the recorded rejected screen.
 Native SHA f3fb0be4831122b75c82aae71597ae21c7a5b65f63b0a05a06fb4988d616e296;
 old library preserved at `perf/results/2026-09-10/marlin-prefill/moe-before-wide.so`.
 

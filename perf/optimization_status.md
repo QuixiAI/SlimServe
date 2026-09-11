@@ -28068,3 +28068,61 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   outputs bit-exactly; explicit old schedules serve as controls. This confirms
   the opt-in dispatcher reaches the measured kernel. Raw `installed.json` and
   `native-build.log`; no live serving measurement yet.
+
+## 2026-09-10 - Retain wide Marlin prefill after real-profile speed improvement
+
+- Status: retained in `glm53-nvfp4-4` RTX6000 env. Kernel `fb399cd89`, native
+  f3fb0be4831122b75c82aae71597ae21c7a5b65f63b0a05a06fb4988d616e296.
+- Same-binary one-control/one-candidate, three repeats each, no retries or
+  replacements. Native hashes, benchmark implementation, prompt source and plans
+  match; recorded environment differs only at `VLLM_GLM53_MARLIN_PREFILL_WIDE`.
+  All18 timed rounds/150 measured exact1000/300 requests retained. Cold-prefix,
+  text/image,4096 short-text scores/six long retrieval contrasts per start,
+  cold32K/128K (one warmup +three measured requests per length), no profiler.
+- Control ->candidate E2E medians c1/c8/c16:156.997/578.757/779.195 ->
+  156.597/579.031/784.687tok/s. Changes -0.255/+0.047/+0.705%; c1/c8 are within
+  observed spread, while every c16 candidate reading exceeds every control.
+  This is a prefill improvement to full-request TPS, not a decode-kernel claim.
+- Cold engine TTFT32K:2585.249 ->2534.443ms (-1.965%);128K10862.210 ->
+  10710.859ms (-1.393%). Every candidate reading is below every control reading
+  at each length. Cached_tokens=0 throughout; no interval-logger TPS used.
+- Correctness: exact lengths and text/image canaries pass; all12 retrieval
+  contrasts positive, minimum34.13/34.57 control/candidate. Short-text means
+  -2.7306898/-2.7312957, delta-0.0006059; these <=640-token windows bypass the
+  new kernel and are non-target controls. Long retrieval prefixes and prefill
+  workloads exercise it. Numerical acceptance remains the measured actual-weight
+  local/independent oracle checks, targeted memory safety and native/probe parity;
+  this does not relabel or resolve old scoring repeatability failures.
+- Decision: enable the flag in the RTX6000 profile only. Native default remains
+  opt-in for all other callers; flag0 restores the old path. No recipe, quant,
+  activation/KV/head precision, router ordering, compiler or scoring-policy change.
+  One fixed pair plus consistent isolated wins supports this retention; it is
+  not an estimate of across-start variance or proof of physical saturation.
+- Startup182.073/148.091s; both controller/serving exits0 and owned GPU processes
+  released. Pre-existing resource-tracker teardown warning remains, not pursued
+  as a side campaign. Independent final NVIDIA query has no compute processes.
+- Raw: `perf/results/2026-09-10/marlin-wide-serving-control/summary.json` and
+  `marlin-wide-serving-candidate/summary.json`, plus all per-request JSON/logs.
+- Exact command for each arm (flag0 then1, different new output directories):
+
+  ```bash
+  systemd-run --user --scope -p MemoryMax=150G -p MemorySwapMax=0 \
+    env -u NCCL_P2P_DISABLE CUDA_VISIBLE_DEVICES=0,1,2,3 \
+    SLIMSERVE_CACHE=/raid/weights CUDA_HOME=/usr/local/cuda-13.0 \
+    VLLM_CACHE_ROOT=/home/tiny/.local/scratch/slimserve-glm53/vllm-cache \
+    OMP_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1 \
+    VLLM_GLM53_MARLIN_PREFILL_WIDE=0 SLIMSERVE_GLM53_NATIVE_ORDER=0 \
+    VLLM_GLM5_MHC_PREFILL_TC=0 .venv/bin/python benchmarks/benchmark_glm53_campaign.py \
+    --profile glm53-nvfp4-4 \
+    --source /home/tiny/.local/scratch/slimserve-glm53/prompt-source.txt \
+    --output perf/results/2026-09-10/marlin-wide-serving-control \
+    --boots 1 --repeats 3 --concurrency 1 8 16 --input-tokens 1000 \
+    --output-tokens 300 --cold-prefix --quality --prefill
+  ```
+
+  These two runs are complete; do not rerun them into the recorded directories.
+  Next work is another measured kernel optimization, not more scoring automation.
+- Registry promotion check:77 profile/recipe CPU tests pass, including the new
+  RTX6000-only flag assertion; A100 records and weight recipe remain unchanged.
+  Ruff and diff checks pass. No additional GPU campaign was needed for the
+  registry-only change to the exact flag value already measured above.

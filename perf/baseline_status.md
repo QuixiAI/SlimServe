@@ -2002,6 +2002,46 @@ released, no retries or quant/native/default changes; original oracle remains a
 historical failure. Raw `indexer-serving-v1/closure.json` under2026-09-10, SHA
 0d1302e05d6f2350d1bcf60be4d04691f489d6c3040f1bbca37fd890d139fa8b.
 
+### RTX6000 wide Marlin prefill retained - 2026-09-10
+
+Current RTX6000 profile enables `VLLM_GLM53_MARLIN_PREFILL_WIDE=1`.
+Recipe v1, NVFP4 experts, BF16 activations/KV/head, BF16 mHC storage, native
+ordering0 and mHC-TC0 are unchanged. Native kernel commit `fb399cd89`.
+
+Exactly one flag0 control and one flag1 candidate start, same native library,
+profile/recipe, benchmark implementation and source. Recorded environment differs
+ONLY in this flag. Three repeats per start, exact1000/300 c1/c8/c16, cold cache,
+text/image, quality and cold32K/128K. All measurements retained; no restart selection.
+
+| Measurement | Control median | Wide kernel median | Change |
+| --- | ---: | ---: | ---: |
+| c1 E2E tok/s | 156.997 | 156.597 | -0.26%, within observed spread |
+| c8 E2E tok/s | 578.757 | 579.031 | +0.05%, effectively neutral |
+| c16 E2E tok/s | 779.195 | 784.687 | +0.70% |
+| cold32K engine TTFT ms | 2585.249 | 2534.443 | -1.97% |
+| cold128K engine TTFT ms | 10862.210 | 10710.859 | -1.39% |
+
+Three candidate readings at each prefill length are all below all three control
+readings:32K2531.325-2536.945 vs2582.850-2586.049ms;128K10672.897-10748.248
+vs10829.170-10896.761ms. All measured cached_tokens=0. Candidate c16 range
+784.670-784.780 is above control777.412-779.197. These are full-request TPS,
+not a steady-decode kernel speedup. One pair does not estimate across-start variance.
+
+Kernel evidence: complete expert path improves6.75-10.03% on18 actual-weight
+fixtures; independent sampled FP64 oracle and targeted memcheck pass; installed
+gate/up and down match the measured probe exactly. Model text/image canaries and
+all six long-context retrieval contrasts pass in both starts. Short-text quality
+means -2.730690/-2.731296 (delta-0.000606); those short windows bypass the new
+>=2048-token kernel. This is not a resolution or reclassification of historical
+per-window scoring failures, nor broad model-quality qualification.
+
+Retain for the measured prefill/c16 gain with unchanged quant and no meaningful
+c1/c8 regression. Set the flag to0 before launch to restore the previous kernel.
+Startup182.073/148.091s; both serving/controller exits0, GPUs released. Native SHA
+f3fb0be4831122b75c82aae71597ae21c7a5b65f63b0a05a06fb4988d616e296.
+Raw: `perf/results/2026-09-10/marlin-wide-serving-{control,candidate}/`;
+isolated kernels and saved old library under `marlin-prefill/` on the same date.
+
 ### RTX6000 paired lossless mHC storage retained - 2026-09-08
 
 Quality-repeatability limitation (2026-09-10): all three retained BF16 production
