@@ -52,7 +52,9 @@ before moving or deleting diagnostics; preserve the evidence and user edits.
 Existing draft [PR #24](https://github.com/QuixiAI/SlimServe/pull/24) uses the
 upstream `glm53-flash-sm120` branch. Its published head `7619685d8` is an
 ancestor of the retained checkpoint, so publication needs only a fast-forward.
-CodeRabbit skipped the draft; no substantive review has occurred yet.
+Checkpoint `ed9859d8d` is now published there with an updated title/body and a
+passing CI guard. CodeRabbit declined the explicit full-review request because
+364 changed files exceed its 100-file limit. No substantive review has occurred.
 
 ## Remaining deep-kernel decisions
 
@@ -180,6 +182,18 @@ the worktree. Preserve the independently developed main-side improvements and
 the qualified SM120 recipe when reconciling; the existing serving numbers apply
 to the recorded source, not automatically to a future merged tree.
 
-Remaining: publish the retained checkpoint, request substantive review, address
-feedback and semantic merge conflicts, run focused checks for resulting code
-changes, and clean up. No Foundry service or external port is required here.
+Publication is complete at `ed9859d8d`. The installed GitHub CLI's PR-edit command
+failed on deprecated GraphQL projectCards; the REST API successfully updated the
+existing PR. This was not another authentication failure.
+
+The merge preview was aborted cleanly without retained runtime edits. Semantic
+conflicts include source drafter selection/profile renaming, padded FP8 KDA
+projection layout versus Ampere's gate-pair path, decode versus prefill indexer
+sharding, and independent MTP adapters. These must be reconciled, not resolved
+by deleting the other platform's implementation.
+
+Operator choice requested: split into reviewable PRs or retain one PR for a
+human reviewer. No paid-plan change, reviewer assignment or new PR stack was
+made. Remaining: substantive review, feedback and semantic merge fixes, focused
+checks for resulting code changes, and final cleanup. No Foundry service or
+external port is required here.

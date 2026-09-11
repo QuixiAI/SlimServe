@@ -28926,3 +28926,15 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   side should be discarded wholesale. Existing performance evidence remains
   tied to its measured tree. No benchmark or native build was repeated for
   this documentation/publication step.
+
+- Published ed9859d8d by non-forced fast-forward to upstream glm53-flash-sm120;
+  updated existing PR #24 title/body with recipe, evidence and scope. CI guard
+  passes. Installed gh PR-edit failed on deprecated GraphQL projectCards, not
+  authentication; REST PATCH succeeded. Explicit CodeRabbit full-review request
+  was declined: 364 changed files exceed its 100-file limit. No substantive
+  external review occurred and no review findings have been addressed yet.
+- A local uncommitted main merge confirmed semantic overlap in profile/drafter
+  selection, KDA projection layout/gate pairing, indexer sharding and MTP paths.
+  It was aborted cleanly without retaining runtime edits. Operator choice
+  requested between splitting into smaller reviewable PRs and keeping one PR
+  for human review. No paid service change or external reviewer assignment.

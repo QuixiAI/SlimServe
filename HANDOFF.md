@@ -68,10 +68,16 @@ GitHub authentication is restored as auroter. Existing draft PR #24 targets
 QuixiAI/SlimServe main from its upstream glm53-flash-sm120 branch; update that
 PR, not a new personal-fork PR. Its remote head 7619685d8 is an ancestor of this
 checkpoint. CodeRabbit previously skipped review because the PR was a draft.
+Checkpoint ed9859d8d is now pushed to PR #24, with its title/body updated and
+CI guard passing. CodeRabbit declined the explicit full-review request:
+364 changed files exceed its 100-file limit. No substantive review occurred.
+Operator choice requested: split into reviewable PRs or retain one PR for human
+review. No reviewer was assigned and no paid-plan change was made.
 Current upstream main f6c6ed429 has 17 conflicting files, including shared model
 paths and renamed profiles; resolving them requires semantic reconciliation,
-not blanket ours/theirs. Publication, review fixes and merge reconciliation
-remain open. Do not label the whole historical roadmap completed.
+not blanket ours/theirs. The local uncommitted merge preview was aborted cleanly;
+no runtime changes were retained. Review fixes and merge reconciliation remain
+open. Do not label the whole historical roadmap completed.
 
 #### Earlier development checkpoints (superseded by the H16 result above)
 
