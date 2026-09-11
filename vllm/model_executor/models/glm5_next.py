@@ -561,7 +561,7 @@ class Glm5NextDecoderLayer(nn.Module):
         return x, residual, post_mix, res_mix
 
 
-class Glm5NextMTPBlock(nn.Module):
+class Glm5NextSM120MTPBlock(nn.Module):
     """The MTP (NextN) layer's decoder block: a plain-residual DSA layer.
 
     Layer ``num_hidden_layers`` of GLM-5.3-Flash carries no mHC and no KDA:
@@ -570,7 +570,7 @@ class Glm5NextMTPBlock(nn.Module):
     the last target layer, so the block is built explicitly. The module
     prefix stays ``...layers.<idx>`` so the checkpoint's compressed-tensors
     targets for that layer (FP8 block experts) resolve; the draft loader
-    (``glm5_next_mtp.py``) rewrites checkpoint names onto the ``mtp_block``
+    (``glm5_next_sm120_mtp.py``) rewrites checkpoint names onto the ``mtp_block``
     attribute path.
     """
 
