@@ -130,12 +130,20 @@ d19a1744a passes10 CPU tests and preserves non-BF16/misaligned paths.
 Initial review-tree boot652bb8014 FAILED before timing: capability query
 entered Dynamo/NVML ctypes. Fix03382cb49 plus regression correctione35bd7976
 pass18 dispatch tests, including four cold full-graph checks. One corrected
-boot on eb8c345a9 is RUNNING, output `pr-review/serving-compile-fixed/`,
-three prescribed repeats; failed boot remains in `pr-review/serving/`.
-No performance promotion yet. All fixes are published through the stack.
+boot on eb8c345a9 PASSED, output `pr-review/serving-compile-fixed/`:
+three prescribed repeats, E2E medians156.608/578.251/783.254 tok/s and
+cold32K/128K engine TTFT2508.750/9906.629ms. Text/image and six retrieval
+contrasts pass; server exited0. Failed boot remains in `pr-review/serving/`.
+Performance preserved, not a new speedup claim. All fixes are published.
+Main advanced to0313f5228 during the run: two new conflicts are reconciled
+in72e3ed10b/8720c75e7 and merged forward as24bd601c5. RTX6000 profile unchanged;
+A100's FP8 decode binding/grouped scoring/budgets retained.120 CPU checks pass,
+eight GPU-only skips. Native rebuild for main's added binding is RUNNING;
+do not claim the completed serving result qualifies this later main merge.
 Parts1/2 now contain94/81 changed files; still below the review limit.
 CodeRabbit allows ONE included review per hour. Remaining #27/#28/#25;
-next slot about20:41 UTC on2026-09-11. Prioritize #27.
+Part1's13 threads resolved. #27 full review accepted20:42 UTC; response pending.
+Next included slot about21:42 UTC on2026-09-11, for #28 then #25.
 Do not change billing or infer that any unreviewed layer has passed review.
 Raw regression XML: perf/results/2026-09-11/pr-review/part5.xml.
 Do not label the whole historical roadmap completed.

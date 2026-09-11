@@ -27,14 +27,23 @@
   folding; corrected fixturee35bd7976 uses an actual ctypes boundary. All18
   dispatch tests now pass, including four cold full-graph cases. No native
   rebuild for this Python-only correction.
-- Decision: fixes retained for review, full serving result pending. One
-  corrected-tree boot on eb8c345a9 with three exact1000/300 cold-prefix repeats
-  atc1/c8/c16 and existing text/image/retrieval/32K/128K checks is running.
-  Original startup failure is preserved; no retries for faster timing.
+- Decision: fixes retained. One corrected-tree boot on eb8c345a9 passes three
+  exact1000/300 cold-prefix repeats atc1/c8/c16:156.608/578.251/783.254 E2E
+  tok/s. Cold32K/128K engine TTFT2508.750/9906.629ms. Text/image and all six
+  retrieval contrasts pass; exit0 and GPUs released. Performance preserved,
+  not a paired speedup. Original startup failure remains; no timing retries.
 - Raw:`perf/results/2026-09-11/pr-review/` (part1-cpu.xml, part1-gpu.xml,
   part2-combine.xml, part1-cold-compile*.xml, build log, native hashes,
-  failed `serving/`, current `serving-compile-fixed/`). Three reviews remain
-  queued under the one-included-review/hour limit; next #27 at~20:41 UTC.
+  failed `serving/`, completed `serving-compile-fixed/`). Part1's13 threads
+  resolved. #27 full review accepted20:42 UTC; #28/#25 remain queued under
+  the one-included-review/hour limit, next #28 at~21:42 UTC.
+- Concurrent main advance: nine commits through0313f5228 introduce optional
+  A100 FP8-KV decode, grouped speculative scoring, budgets and API launcher
+  changes. New binding/indexer conflicts resolved in72e3ed10b/8720c75e7 and
+  merged forward as24bd601c5. Parsed RTX6000 record is unchanged; both platform
+  paths retained.120 focused CPU checks pass/eight GPU-only skips. Rebuild
+  main's added native binding; the completed serving result above predates
+  this second main merge. Raw `main-forward-*` under the same directory.
 
 ## 2026-09-11 - Native quantized prefill GEMM on Metal; FP8-KV directive state; two walls found
 

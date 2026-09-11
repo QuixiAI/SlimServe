@@ -2150,6 +2150,31 @@ released, no retries or quant/native/default changes; original oracle remains a
 historical failure. Raw `indexer-serving-v1/closure.json` under2026-09-10, SHA
 0d1302e05d6f2350d1bcf60be4d04691f489d6c3040f1bbca37fd890d139fa8b.
 
+### RTX6000 review-fix qualification - 2026-09-11
+
+One fixed corrected-tree boot on eb8c345a9, recipe v1/TP4/no-spec, stock
+four-GPU SM120. Native QC f19b61ce, stable-libtorch unchanged. Three exact
+1000/300 cold-prefix repeats; all measurements retained:
+
+| Measurement | Median [min,max] |
+|---|---:|
+| c1 E2E tok/s | 156.608 [156.540,156.914] |
+| c8 E2E tok/s | 578.251 [576.494,580.653] |
+| c16 E2E tok/s | 783.254 [780.710,786.246] |
+| cold32K engine TTFT ms | 2508.750 [2505.050,2510.483] |
+| cold128K engine TTFT ms | 9906.629 [9883.849,9932.837] |
+
+All timed batches, text/image canaries and six retrieval contrasts pass;
+scored-text mean -2.737808 over4096 tokens. Startup174.082s, exit0, GPUs
+released. The prior boot652bb8014 failed before timing on a new capability
+query entering Dynamo/NVML; fixed by compile-time constant evaluation with
+cold-graph regressions. Failure preserved, not excluded from a timing sample.
+Consistent with retained performance, not a paired speedup or resolution of
+historical score repeatability. Raw:`perf/results/2026-09-11/pr-review/`,
+failed `serving/`, qualified `serving-compile-fixed/`.
+Main subsequently advanced to0313f5228 and was merged as24bd601c5; this
+snapshot does not qualify that later merge or its optional A100 FP8-KV path.
+
 ### RTX6000 merged-main qualification - 2026-09-11
 
 Clean725b4ba01 merges main f6c6ed429 while preserving the selected recipe v1,

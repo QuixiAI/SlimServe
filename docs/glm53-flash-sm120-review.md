@@ -240,12 +240,24 @@ traced the new capability check into NVML ctypes. Fix03382cb49 evaluates the
 process-fixed gates as compile-time constants. The initial regression wrongly
 treated is_compiling as proof of symbolic execution; e35bd7976 replaces it
 with an actual ctypes call. All18 dispatch tests now pass, including four
-cold-cache full-graph checks. A single corrected-tree boot on eb8c345a9 is
-running with three prescribed repeats; no new serving result is claimed yet.
+cold-cache full-graph checks. A single corrected-tree boot on eb8c345a9 passed
+all three prescribed repeats, text/image and six retrieval contrasts. E2E
+c1/c8/c16 medians156.608/578.251/783.254 tok/s; cold32K/128K engine TTFT
+2508.750/9906.629ms. Preserves performance, not a paired speedup claim.
 Failures and successful checks remain under `perf/results/2026-09-11/pr-review/`.
 
-Parts2–4 remain unreviewed: one included review per hour. Next slot is about
-20:41 UTC; prioritize #27, then #28 and #25. Do not enable paid overages or
+Main advanced nine commits to0313f5228 during that run. Binding and indexer
+conflicts are resolved in72e3ed10b/8720c75e7 and merged forward as24bd601c5.
+Both new A100 FP8 decode and SM120 BF16 prefill bindings are retained, as are
+grouped speculative scoring and request-grouped raw prefill. The RTX6000
+profile record is byte-equivalent as parsed JSON; upstream thinking-budget
+changes are confined to A100.120 focused CPU checks pass, eight GPU-only
+cases skipped. New main's added native binding is rebuilding; the completed
+serving result above predates this merge and is not a new-main qualification.
+
+CodeRabbit resolved all13 part1 threads. Part2 full review was accepted at
+20:42 UTC; its response and parts3/4 remain pending. One included review/hour;
+next slot about21:42 UTC for #28, then #25. Do not enable paid overages or
 repeatedly request over-quota reviews. Part5's ten threads remain resolved.
 
 Main's existing
