@@ -25397,3 +25397,15 @@ Raw: perf/results/2026-09-10/glm53f-dflash2/mx-*/.
   moves (2.21 -> 2.27) while every step verifies one more draft token.
   DECISION: the record keeps k=3. Raw: perf/results/2026-09-10/
   glm53f-dflash2/dp2-{k3-pair,k4,sched16-0-k4}/.
+- 1M-context controls (queue12): TP8 layout 26/27 recall (miss at
+  903,670; one session errored, 38 min), DP2 repeat 26/28 (misses at
+  981,382 / 983,702; both sessions to 1,046,061). Every failed probe on
+  every run has completion_tokens == 1024 (the probe cap) and an EMPTY
+  answer, while passing probes at 1,040K-1,047K used 9-779 tokens: at
+  900K+ context the model sometimes spends the whole budget thinking and
+  never answers. Not a KV/tier fault (the same marker is recalled at
+  1.045M on the same session, byte verify 0/520 mismatched) and not
+  layout-specific. Harness change: the marker found in the reasoning
+  text counts as recall (recall_in_reasoning), and budget_exhausted is
+  recorded; a closing DP2 1M run (dp2-1m-c) uses it. Raw:
+  perf/results/2026-09-10/glm53f-1m-leg/{tp8-1m,dp2-1m-b}/.
