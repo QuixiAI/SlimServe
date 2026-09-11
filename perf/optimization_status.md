@@ -25094,3 +25094,22 @@ restart is the operator's call.
   matrix now runs mx-tp4dp2 (replicated) beside mx-tp4dp2-flat (default
   flattening) and mx-tp4 (standalone) - the replicated arm's c1 should
   match standalone TP4 and its c8+ should beat the flattened arm.
+- Leg 2 (fail-fast invariants) and leg 3 (+ cross-pool checks) on the
+  speculative record both died the same way after ~35 min at c8 under
+  tier restores (154-160 hits): leg 2 `popleft_n` walked off the free
+  list with num_free_blocks still positive; leg 3 popped the fake tail
+  sentinel (block -1, ref_cnt 1) - the list is shorter than its count,
+  and no double append, negative free, or cross-pool touch/free was
+  reported. Recall stayed 68/68 and 72/72 until the death; 8 sessions
+  error at the death each time. The free list now carries a shadow
+  membership set checked at every mutating call (commit after
+  7a453f9b3); leg 4 (`glm53f-leg-spec-instr3`, queue4.sh) runs on it.
+  Raw: perf/results/2026-09-10/glm53f-leg-spec-instr{,2}/.
+- DP2 arms (queue2) all failed to boot: the record's
+  glm5_next_indexer_row_shard is TP8/DP1-only ("Indexer row sharding
+  requires SM80, TP8/DP1/PP1, 32 indexer heads and the compact cache"),
+  as did the standalone TP4 arm. Rerun (queue3.sh) with the row shard
+  off on all four arms. k=4 arms: pure k=4 died on the record's k=3
+  schedule ("DFlash drafts a fixed block of 4; the scheduler asked for
+  num_steps=3" - a static k must come with a matching schedule) and the
+  scheduled k=4 arm hit a stale output directory; both rerun in queue4.
