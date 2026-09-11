@@ -25216,3 +25216,24 @@ restart is the operator's call.
   Dispatch tests 51 pass. queue5 runs the TP4/DP2 arms with both kernels
   OFF (baseline), queue6 reruns mx-tp4dp2 and mx-tp4 with both ON; the
   record flip (flip_dp2.py) takes whichever the arms qualify.
+- Leg 4 (04:16-04:52, shadow-set check) FIRED: `FreeKVCacheBlockQueue.
+  popleft_n (pool 0): num_free_blocks=4862 but the list holds 4790
+  blocks` after 36 min at c8 (69/69 recall, 8 sessions errored at the
+  death). No code outside the queue writes list pointers and every pool
+  has its own pool_id, so a count that outruns the list can only come
+  from appending a second object that carries an already-linked block
+  id; the append now raises there with that object's pool id and
+  refcount (e4f3fe151). Leg 5 reruns on it (queue5, results
+  2026-09-11/glm53f-leg-spec-instr3). Raw of leg 4: the failure text in
+  ~/.local/scratch/glm53/queue4.log (its server.log was overwritten by
+  a concurrent chain - two queue scripts raced for the GPUs between
+  03:00 and 05:10; only queue5/queue6 remain).
+- First DP2 numbers on today's tree (flattened default MoE, DFlash2 on,
+  row shard + sparse TC off, from the raced 03:20 arm): canaries PASS;
+  c1 172.1/91.2, c8 510.6/425.6, c16 729.5/766.7, c32 959.1/992.9, c64
+  1149.8/1188.2 tok/s; weights 26.36 GiB/rank. Already +6-10% over the
+  TP8 record at c16-c64 (687.3 / 879.5 / 1074.5) without the replicated
+  MoE. The replicated arm booted with 46.28 GiB/rank (full expert set
+  per replica, as designed) but was cut off by the queue reshuffle; it
+  reruns in queue5. Raw: perf/results/2026-09-10/glm53f-dflash2/
+  mx-tp4dp2-flat-0320/.
