@@ -1141,9 +1141,15 @@ def test_quantized_main_kv_is_an_explicit_validated_choice():
         for platform, record in entry.get("variants", {}).items():
             dtype = record.get("engine", {}).get("kv_cache_dtype", "auto")
             env = record.get("env", {})
-            quantized = dtype not in {"auto", "bfloat16"} or any(
-                env.get(k) == "1"
-                for k in ("VLLM_QWEN4_EXP_TQ_MAIN_KV", "VLLM_QWEN4_EXP_FP8_MAIN_KV")
+            extra = record.get("engine", {}).get("additional_config", {}) or {}
+            quantized = (
+                dtype not in {"auto", "bfloat16"}
+                or any(
+                    env.get(k) == "1"
+                    for k in ("VLLM_QWEN4_EXP_TQ_MAIN_KV", "VLLM_QWEN4_EXP_FP8_MAIN_KV")
+                )
+                # GLM-5.3's per-layer fp8 main KV (sparse MLA layers only).
+                or bool(extra.get("glm5_next_main_kv_fp8", False))
             )
             if not quantized:
                 continue
