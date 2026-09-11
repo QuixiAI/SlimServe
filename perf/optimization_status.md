@@ -25487,3 +25487,27 @@ arm (queue17).
   (queue18: cold single requests at 200K/500K/800K/900K/1M with a
   planted marker). Also: one 400 at 1,048,065 prompt tokens - the
   harness overshoots the 1,048,576 ceiling by its 512 reply tokens.
+- STEADY DECODE STEP at 32 requests per replica (from the profile, one
+  step, 49.3 ms, 1,947 kernels): marlin MoE 19.4 ms (39%; ~170 distinct
+  experts read per step = 1.4 TB/s, i.e. at bandwidth), mHC partials
+  (CUDA `tms::dsv4_mhc::partials`, 89 launches) 7.0 ms (14%), dense bf16
+  GEMMs ~6 ms, KDA recurrent 3.9 ms (34 launches at 0.56 TB/s effective
+  - ~2x headroom), custom allreduce 2.9 ms (6%), mHC pre-mix + finalize
+  1.8 ms, sparse MLA 1.4 ms, sampler 0.7 ms. The whole-window allreduce
+  share (19%) was barrier WAITING in the eager prefill steps (1-stage
+  p50 9 us vs p90 411 us; ranks 2/3 idle 7 ms/step on the host side
+  there), so the fused mHC-allreduce is demoted; prefill-step launch
+  gaps are a separate item (FULL_AND_PIECEWISE arm queued).
+- mHC partials batched (dsv4_mhc::partials_batched<24, TT=4>): the
+  per-token kernel re-read the 1.5 MiB fn matrix per token; the batched
+  kernel reads it once per 4-token tile with the same per-element
+  arithmetic. Microbench at T=32: 31 us vs 78 us in the serving profile
+  (the whole transition op 49 us). residual_out bit-exact; fp32 mixing
+  coefficients within 2e-7 (FMA contraction), normed layer input within
+  one bf16 ulp. Expected ~4 ms of the 49 ms step (~8%). Same-day base
+  arm queued (dp2-base-mhcb) for the serving A/B.
+- Cold-prefill probe attempt 1 died silently on worker 3 during the
+  first 200K prefill (no CUDA error, no OOM); the boot had reloaded a
+  torch.compile cache that two concurrent profile boots wrote at 19:55
+  ("Cubin file saved by TritonBundler not found" warnings). The cache
+  (56 GB) was set aside; the probe reruns on a clean cache (queue22).

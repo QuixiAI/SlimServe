@@ -307,6 +307,29 @@ static void launch_dsv4_mhc_partials(
     }
 }
 
+// Decode batches (T > 1): tile TT tokens per block so fn is read once per
+// tile (see dsv4_mhc::partials_batched). Same per-token arithmetic order as
+// the per-token kernel, so the partials are bit-identical.
+template <int NOUT>
+static void launch_dsv4_mhc_partials_batched(
+        const __nv_bfloat16* x, const __nv_bfloat16* residual,
+        const float* post, const float* comb, torch::Tensor fn,
+        __nv_bfloat16* residual_out, float* partial, int hidden_size, int tokens) {
+    constexpr int TT = 4;
+    const dim3 grid(dsv4_mhc::SPLITS, (tokens + TT - 1) / TT);
+    if (fn.scalar_type() == torch::kHalf) {
+        dsv4_mhc::partials_batched<NOUT, TT, half>
+            <<<grid, dsv4_mhc::THREADS, 0, stream()>>>(
+                x, residual, post, comb,
+                reinterpret_cast<const half*>(fn.data_ptr()), residual_out,
+                partial, hidden_size, tokens);
+    } else {
+        dsv4_mhc::partials_batched<NOUT, TT, float>
+            <<<grid, dsv4_mhc::THREADS, 0, stream()>>>(
+                x, residual, post, comb, fp(fn), residual_out, partial,
+                hidden_size, tokens);
+    }
+}
 static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> py_dsv4_mhc_pre(
         torch::Tensor residual, torch::Tensor fn, torch::Tensor hc_scale,
         torch::Tensor hc_base, double rms_eps, double pre_eps,
@@ -409,9 +432,15 @@ py_dsv4_mhc_fused_post_pre(
         }
         return {residual_out, next_post, next_comb, layer_input};
     }
-    launch_dsv4_mhc_partials<dsv4_mhc::MIXES, true>(
-        bp(x), bp(residual), fp(post_mix), fp(comb_mix), fn,
-        bpm(residual_out), fpm(partial), H, dim3(dsv4_mhc::SPLITS, T));
+    if (T > 1) {
+        launch_dsv4_mhc_partials_batched<dsv4_mhc::MIXES>(
+            bp(x), bp(residual), fp(post_mix), fp(comb_mix), fn,
+            bpm(residual_out), fpm(partial), H, T);
+    } else {
+        launch_dsv4_mhc_partials<dsv4_mhc::MIXES, true>(
+            bp(x), bp(residual), fp(post_mix), fp(comb_mix), fn,
+            bpm(residual_out), fpm(partial), H, dim3(dsv4_mhc::SPLITS, T));
+    }
     dsv4_mhc::finalize_pre_mix<<<T, 32, 0, stream()>>>(
         fpm(partial), fp(hc_scale), fp(hc_base), fpm(next_post),
         fpm(next_comb), H, float(rms_eps), float(pre_eps),

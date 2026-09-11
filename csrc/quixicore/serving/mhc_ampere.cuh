@@ -116,6 +116,107 @@ __global__ void partials(
     }
 }
 
+// Batched form of `partials` for decode batches: one block owns (split,
+// tile of TT tokens) and loads each fn column once for all TT tokens. The
+// per-token kernel re-reads the whole fn matrix (NOUT x 4 x hidden fp32,
+// 1.5 MiB) for every token, which is what made it 78 us at 32 tokens on
+// the GLM-5.3 TP4 x DP2 profile (2026-09-11); with TT tokens per block the
+// fn traffic drops by TT. Same arithmetic and rounding per token, same
+// partial layout, so finalize_pre_mix is unchanged.
+template <int NOUT, int TT, typename FnT = float>
+__global__ void partials_batched(
+    const __nv_bfloat16* x,
+    const __nv_bfloat16* residual,
+    const float* post,
+    const float* comb,
+    const FnT* fn,
+    __nv_bfloat16* residual_out,
+    float* partial,
+    int hidden_size,
+    int tokens) {
+    const int split = blockIdx.x;
+    const int token0 = blockIdx.y * TT;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int total = HC * hidden_size;
+    __shared__ float mix_coeffs[TT][HC + HC * HC];
+    for (int i = tid; i < TT * (HC + HC * HC); i += THREADS) {
+        const int t = i / (HC + HC * HC);
+        const int j = i - t * (HC + HC * HC);
+        const int token = token0 + t;
+        float v = 0.0f;
+        if (token < tokens) {
+            v = (j < HC) ? post[token * HC + j] : comb[token * HC * HC + (j - HC)];
+        }
+        mix_coeffs[t][j] = v;
+    }
+    __syncthreads();
+    float accum[TT][NOUT];
+    float square_sum[TT];
+#pragma unroll
+    for (int t = 0; t < TT; ++t) {
+        square_sum[t] = 0.0f;
+#pragma unroll
+        for (int output = 0; output < NOUT; ++output) accum[t][output] = 0.0f;
+    }
+    for (int flat = split * THREADS + tid; flat < total;
+         flat += SPLITS * THREADS) {
+        const int stream = flat / hidden_size;
+        const int dim = flat - stream * hidden_size;
+        float f[NOUT];
+#pragma unroll
+        for (int output = 0; output < NOUT; ++output) {
+            f[output] = float(fn[output * total + flat]);
+        }
+#pragma unroll
+        for (int t = 0; t < TT; ++t) {
+            const int token = token0 + t;
+            if (token < tokens) {
+                float value = mix_coeffs[t][stream] * float(x[token * hidden_size + dim]);
+#pragma unroll
+                for (int input_stream = 0; input_stream < HC; ++input_stream) {
+                    value += mix_coeffs[t][HC + input_stream * HC + stream] *
+                             float(residual[(token * HC + input_stream) * hidden_size + dim]);
+                }
+                const __nv_bfloat16 rounded = __float2bfloat16_rn(value);
+                residual_out[token * total + flat] = rounded;
+                value = float(rounded);
+                square_sum[t] += value * value;
+#pragma unroll
+                for (int output = 0; output < NOUT; ++output) {
+                    accum[t][output] += value * f[output];
+                }
+            }
+        }
+    }
+    __shared__ float warp_partials[THREADS / 32][NOUT + 1];
+#pragma unroll
+    for (int t = 0; t < TT; ++t) {
+        const int token = token0 + t;
+        if (token >= tokens) break;
+#pragma unroll
+        for (int output = 0; output < NOUT; ++output) {
+            const float sum = warp_sum(accum[t][output]);
+            if (lane == 0) warp_partials[warp][output] = sum;
+        }
+        const float sum = warp_sum(square_sum[t]);
+        if (lane == 0) warp_partials[warp][NOUT] = sum;
+        __syncthreads();
+        if (warp == 0) {
+            for (int output = lane; output < NOUT + 1; output += 32) {
+                float block_sum = 0.0f;
+#pragma unroll
+                for (int source_warp = 0; source_warp < THREADS / 32; ++source_warp) {
+                    block_sum += warp_partials[source_warp][output];
+                }
+                partial[(token * SPLITS + split) * (NOUT + 1) + output] = block_sum;
+            }
+        }
+        __syncthreads();
+    }
+}
+
 template <int NSPLITS>
 __device__ __forceinline__ void finalize_pre_mix_block(
     float* partial,
