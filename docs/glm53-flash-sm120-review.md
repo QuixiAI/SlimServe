@@ -60,6 +60,33 @@ unchanged. See the baseline snapshot for spreads and raw source receipts.
 Post-run cleanup scopes raw-indexer matmul defaults to SM120 with ten focused
 dispatch tests; SM120 behavior is unchanged from the measured tree.
 
+## Qualification record map
+
+These existing notebook records supply the baseline, hypothesis, checks, timing,
+decision and raw receipts requested in the serving review. They are historical
+evidence, not a claim that old best-start rates are current baselines or that
+every optional diagnostic is enabled. Raw paths below are relative to
+`perf/results/`; the linked records preserve failed runs and caveats.
+
+| Implementation | Existing qualification | Scope and limitation |
+|---|---|---|
+| F32 repairs / offline partial reads | [2026-09-04: F32 sidecar for the RedHatAI NVFP4 conversion (router bias, KDA decay, mHC vectors) - RETAINED](../perf/optimization_status.md#2026-09-04-f32-sidecar-for-the-redhatai-nvfp4-conversion-router-bias-kda-decay-mhc-vectors---retained) | Native-value repair versus downcast values; throughput-neutral in quiet paired readings. Range reads are offline I/O hygiene, not a separately measured serving optimization. Raw `2026-09-04/glm53-nvfp4-4-rtx6000-f32ab*`. |
+| MoE output alias and combined sum | [2026-09-07: Phase 1 item 2 remainder - MoE finalize copy removed, shared-expert add fused into the Marlin sum](../perf/optimization_status.md#2026-09-07-phase-1-item-2-remainder---moe-finalize-copy-removed-shared-expert-add-fused-into-the-marlin-sum) | Baseline, separate alias/combine factors, correctness and exact-token comparisons are recorded. Raw `2026-09-07/item2-{A,B}-pass{1,2}`. Existing ROCm/AITER predicate is unchanged; no new ROCm qualification claimed. |
+| Sparse MLA partition/reducer | [2026-09-07 Sparse MLA decode: partition and reduce (DSA layers; c1 lever from the kernel sequence)](../perf/optimization_status.md#2026-09-07-sparse-mla-decode-partition-and-reduce-dsa-layers-c1-lever-from-the-kernel-sequence) | Actual H16/TP4 component comparison and serving attribution. Historical best-boot rates are superseded by the fixed cold-prefix baseline, not repeated as a current speedup. Raw `2026-09-08/dsa-A-pass{1,2}`. |
+| H16 sparse prefill dispatch | [H16 serving pair complete — retain small prefill win](../perf/optimization_status.md#h16-serving-pair-complete--retain-small-prefill-win) | Corrected active-H16 flag0/flag1 comparison; cold32K/128K TTFT -0.274/-0.517%, decode neutral. Initial H32 pair was a no-op and remains preserved. Raw `2026-09-11/sparse-swapab-h16-serving-{control,candidate}`. |
+| State-copy warmup | [2026-09-08: Startup-copy warmup passes the real three-start workload](../perf/optimization_status.md#2026-09-08-startup-copy-warmup-passes-the-real-three-start-workload) | Preceding baseline identifies the first-use157ms JIT stall; tiny private scratch compiles the production signature. Exact requests/canaries pass; steady-state throughput neutral. Raw `2026-09-08/repro-baseline` and `warmup-boundary`. |
+| Corrected small-k sampler | [2026-09-08: Corrected sampler passes the fixed three-start serving series](../perf/optimization_status.md#2026-09-08-corrected-sampler-passes-the-fixed-three-start-serving-series) | Prior entry documents corrected ties/noise and kernel/sanitizer checks. All225 measured requests pass;156.084/575.670/777.037 E2E tok/s, neutral versus the prior sampler. Raw `2026-09-08/sampler-serving`. |
+| Optional fused indexer ordering | [2026-09-09 - Fused selected-pool ordering preserves full-model results](../perf/optimization_status.md#2026-09-09---fused-selected-pool-ordering-preserves-full-model-results) | Preceding bitonic comparison replaces selector+sort with ordered selection: actual7616x1904 warm66.191->57.661us; full-model score/tensor parity passes. Instrumented107.845/457.533/645.385 tok/s is NOT a production baseline. Raw `2026-09-09/index-bitonic-timing` and `index-fused-quality-diagnostic`. |
+| Optional deterministic reductions | [2026-09-10 - Full no-combo workload is repeatable within start but fails quality windows](../perf/optimization_status.md#2026-09-10---full-no-combo-workload-is-repeatable-within-start-but-fails-quality-windows) | Not promoted: native-order diagnostic repeats scores but fails12/32 historical windows;155.740/574.245/777.768 E2E tok/s is not a win. Raw `2026-09-10/deterministic-no-combo-serving/fresh-a`. |
+| Optional GLM prompt-score chunking | [2026-09-10 - Exact model parity with recovered allocation failures eliminated](../perf/optimization_status.md#2026-09-10---exact-model-parity-with-recovered-allocation-failures-eliminated) | GLM-specific control/chunked/return, not Qwen evidence: exact4096+168 scores, allocator warnings8->0->8; candidate156.983/579.758/778.748 tok/s, timing neutral. Raw `2026-09-10/prompt-score-serving-v1`. Remains opt-in. |
+| Prompt-score default rollout limit | [2026-09-10 - Fresh production rollout stops at unchanged control quality](../perf/optimization_status.md#2026-09-10---fresh-production-rollout-stops-at-unchanged-control-quality) | Native-order0 control failed historical windows with chunking OFF; candidates/return never ran. Raw `2026-09-10/prompt-score-rollout-v1`. Not a chunking failure, no default promotion, and no instruction to restart a scoring campaign. |
+
+No separate full-load-versus-range-read timing exists for the offline F32
+builder; do not invent one. Its tensor/value identity and model-repair evidence
+are the relevant contract. Likewise, the unchanged ROCm alias branch is not
+requalified by the SM120 comparison. New performance claims still need a paired
+measurement on the selected profile.
+
 ## Remaining deep-kernel decisions
 
 ### 2.3: broader next-layer prefetch — unimplemented, deferred
@@ -199,7 +226,7 @@ The stack is published; review/merge dependency order is:
 | Part | PR | Scope | Changed files |
 |---|---|---|---:|
 | 1 | [#26](https://github.com/QuixiAI/SlimServe/pull/26) | Native kernels, bindings, focused probes/tests | 94 |
-| 2 | [#27](https://github.com/QuixiAI/SlimServe/pull/27) | Serving recipe, platform integration and regressions | 82 |
+| 2 | [#27](https://github.com/QuixiAI/SlimServe/pull/27) | Serving recipe, platform integration and regressions | 83 |
 | 3 | [#28](https://github.com/QuixiAI/SlimServe/pull/28) | Numerical diagnostics and prefill qualification | 83 |
 | 4 | [#25](https://github.com/QuixiAI/SlimServe/pull/25) | Indexer/routing diagnostics and qualification | 56 |
 | 5 | [#24](https://github.com/QuixiAI/SlimServe/pull/24) | Campaign harnesses, evidence and roadmap | 55 |
@@ -257,10 +284,21 @@ The native rebuild passes (QC61616000, stable-libtorch unchanged), followed by
 GPUs released. The completed serving result above predates this merge; defer
 the final merged-tree serving check until remaining review fixes are settled.
 
-CodeRabbit resolved all13 part1 threads. Part2 full review was accepted at
-20:42 UTC; its response and parts3/4 remain pending. One included review/hour;
-next slot about21:42 UTC for #28, then #25. Do not enable paid overages or
-repeatedly request over-quota reviews. Part5's ten threads remain resolved.
+CodeRabbit resolved all13 part1 threads. Part2 review completed21:05 UTC with
+17 findings/six nits. Fixesceafefbed/311f5accf/dbb4ab817 plus part3aa2efae02
+cover invalid TP counts, truncated sidecars, packaged case dispatch, native
+symbol fallback, folded MTP projections, aborted journal frames, sampler
+fallback metadata and stronger tests.137 CPU tests/11 GPU routing tests pass;
+final scheduler/import cleanup passes17 focused CPU tests. No native rebuild.
+The51-file source catalog is complete on the combined tip; the missing-file
+report inspected a partial review layer. The registered RTX6000 V1 override
+also makes the requested V2 port inapplicable. Keep the distinct MTP adapters;
+the SM120 block now has an unambiguous name. Decline unmeasured persistent
+pooled-key caches. Qualification links above preserve existing evidence.
+Individual review replies/resolution and parts3/4 remain pending. One included
+review/hour; next slot about21:42 UTC for #28, then #25. Do not enable paid
+overages or repeatedly request over-quota reviews. Part5's ten threads remain
+resolved. GPU routing check has exited; all GPUs are released.
 
 Local ownership review found that Marlin's per-device lock cache could alias
 overlapping layers or microbatches. Fix166d19ced uses layer/device/microbatch

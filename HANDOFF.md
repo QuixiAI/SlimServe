@@ -144,7 +144,7 @@ followed by66 merged-indexer/sparse-MLA GPU tests. GPUs released. Prior
 qualified f19b61ce binary is in `pr-review/native-before-main/`. Defer final
 merged-tree serving until remaining review fixes settle; the prior result
 does not qualify this later main merge. No server/build/probe is running.
-Parts1/2 now contain94/82 changed files; still below the review limit.
+Parts1/2 now contain94/83 changed files; still below the review limit.
 Local Marlin ownership fix166d19ced replaces the device-global lock cache with
 layer/device/microbatch scratch and invocation-local standalone fallback.
 18 focused ownership/combine tests pass on the combined tree; no native
@@ -152,7 +152,16 @@ rebuild needed. Raw `pr-review/part2-workspace-fixed.xml` (first fixture error
 retained in `part2-workspace.xml`). Include this fix in the final serving check;
 do not start a DBO qualification or claim an unmeasured speedup.
 CodeRabbit allows ONE included review per hour. Remaining #27/#28/#25;
-Part1's13 threads resolved. #27 full review accepted20:42 UTC; response pending.
+Part1's13 threads resolved. #27 review completed21:05 UTC:17 findings/six nits.
+Valid fixesceafefbed/311f5accf/dbb4ab817 (plus part3aa2efae02) cover builder
+validation/rebuilds, packaged case dispatch, optional symbols, all folded MTP
+projection shards, aborted journal frames, sampler fallback metadata and tests.
+137 CPU/11 GPU routing checks pass; final scheduler/import cleanup17 CPU pass.
+51 source-catalog files exist on the combined tip; partial-layer missing-file
+and V2-port reports do not apply. Keep the distinct MTP adapters (SM120 block
+renamed for clarity), no unmeasured persistent pooled-key cache. Existing
+qualification records are linked in the review map; no new scoring campaign.
+Individual replies/resolution pending; no server or GPU job is running.
 Next included slot about21:42 UTC on2026-09-11, for #28 then #25.
 Do not change billing or infer that any unreviewed layer has passed review.
 Raw regression XML: perf/results/2026-09-11/pr-review/part5.xml.

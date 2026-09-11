@@ -1,5 +1,34 @@
 # SlimServe Optimization Status
 
+## 2026-09-11 - Serving PR review contracts and evidence map
+
+- Scope: part2/#27 of the SM120 review stack; recipe v1/TP4/no-spec/BF16 KV
+  unchanged. Review completed21:05 UTC with17 findings and six nits.
+- Baseline: prior corrected review-tree boot156.608/578.251/783.254 E2E tok/s,
+  cold32K/128K engine TTFT2508.750/9906.629ms. Final combined serving pending;
+  no new speedup claimed from these review fixes.
+- Change:ceafefbed/311f5accf validate positive KDA shard counts, rebuild from
+  truncated original sidecars, package RMSNorm case dispatch, gate the router
+  on its actual native symbol, load all five folded MTP projection shards,
+  skip entire aborted routing-journal frames, and preserve max_top_k through
+  CUDA fallbacks. Tests compare expert/weight pairs and exact token rejection.
+  dbb4ab817 makes the SM120 MTP block name unambiguous; adapters stay separate.
+  Part3aa2efae02 imports the same packaged case definition in preparation.
+- Correctness:137 focused CPU tests pass;11 strengthened GPU routing tests pass;
+  final scheduler/import cleanup17 CPU tests pass. MTP loading is CPU contract
+  coverage, not a new MTP serving qualification. No native source/binary change.
+- Disposition:all51 catalog paths exist on the combined tip; the missing-file
+  report saw only a review layer. RTX6000 explicitly uses V1, so a V2 port is
+  not needed. No unmeasured persistent pooled-key cache is introduced. The
+  review map now links existing warmup, alias/combine, sampler, sparse MLA,
+  F32, optional ordering/reduction and GLM prompt-score records. Historical
+  failures/limits stay intact; no scoring or old permutation campaign resumed.
+- Decision: retain valid fixes; individual replies and remaining external
+  reviews precede final qualification. GPUs released after routing checks.
+- Raw:`perf/results/2026-09-11/pr-review/part2-review-cpu.xml`,
+  `part2-routing-gpu.xml`, `part2-final-cpu.xml`. Existing qualification index:
+  `docs/glm53-flash-sm120-review.md#qualification-record-map`.
+
 ## 2026-09-11 - SM120 kernel PR review fixes and compilation boundary
 
 - Scope: review stack #26 -> #27 -> #28 -> #25 -> #24; selected recipe v1,
