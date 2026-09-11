@@ -2902,6 +2902,9 @@
                 "nvme_tier_gb_per_rank": 256,
                 "enable_cross_layers_blocks": "True"
               }
+            },
+            "override_generation_config": {
+              "thinking_token_budget": 2000
             }
           },
           "env": {},
@@ -2914,7 +2917,8 @@
             "moe_backend marlin (top-level and kernel_config, since a non-auto top-level flag overwrites kernel_config): this fork defaults to aiter, which is ROCm-only; Marlin W4A16 is the NVFP4 MoE path on sm80.",
             "reasoning_parser and tool_call_parser glm47: GLM-5.3 uses the GLM-4.7-family thinking and tool-call markup; enable_auto_tool_choice and thinking are the registry serving defaults.",
             "Host KV tier ENABLED (2026-09-03): 72 GiB pinned host RAM per rank (cudaHostRegister-ed at exact size) plus a 256 GiB per-rank NVMe/disk third tier under it (per-rank O_TMPFILE in SLIMSERVE_KV_TIER_DIR - operator environment, never a profile field; on this box the tier directory sits on the 4.9 TB /dev/sda2 filesystem). The layout is the packed cross-layer slab (enable_cross_layers_blocks) over 56 layers: 4 KDA state groups + the MLA and indexer groups. Hybrid page-size unification gives the indexer group (512 B/token) 2176-token blocks beside the MLA group's 1088 (TP4; 576/1152 at TP8), so the connector runs per-group block ratios: the wider group is offloaded/restored only where its block completes and resume boundaries align to the ratios' lcm. Every kernel on this path addresses pages by block stride (no flattening of the packed view). Validation: host tier at TP4 (48 GiB/rank): 6/6 probes hit and restored at block 36 (39,168 tokens), 58 restore ops each, VLLM_KV_TIER_VERIFY 0/58 mismatched; disk tier at TP4 (8 GiB host + 64 GiB disk, restores forced from disk): promotions from NVMe, verify 0/58 mismatched, 0 disk round-trip mismatches, 6/6 recalled after a 1.9M-token churn of a 1.24M-token pool (perf/results/2026-09-03/kvtier-acceptance/glm53-tp4-{host48,disk9}/); the TP8 record validated through slimserve on 2026-09-04 (perf/results/2026-09-04/glm53f-nvfp4-8-tier/).",
-            "Reasoning effort: the GLM-5.3-Flash chat template implements the GLM-5.3 Low / High / Max levels (default Max) from the reasoning_effort chat_template_kwargs; thinking itself stays always-on (serving policy). No server flag is involved."
+            "Reasoning effort: the GLM-5.3-Flash chat template implements the GLM-5.3 Low / High / Max levels (default Max) from the reasoning_effort chat_template_kwargs; thinking itself stays always-on (serving policy). No server flag is involved.",
+            "Thinking budget (2026-09-11): override_generation_config.thinking_token_budget 2000 per request, the fleet convention (qwen38 records); the V2 runner nudges the model to wrap up at 85% of the budget and force-closes the think block at 100%, capped inside the request's max_tokens. Added after the 1M-context legs showed probes at 900K+ spending their whole 1,024-token reply budget thinking with an empty answer: this record had no budget, so nothing ever closed the block."
           ]
         },
         "rtx6000": {
@@ -3075,6 +3079,9 @@
                 "nvme_tier_gb_per_rank": 256,
                 "enable_cross_layers_blocks": "True"
               }
+            },
+            "override_generation_config": {
+              "thinking_token_budget": 2000
             }
           },
           "env": {},
@@ -3090,7 +3097,8 @@
             "Sized to the 8x A100 / 787 GB host box (2026-09-06): gpu_memory_utilization 0.95 (weights 23.6 GiB/rank, the rest of the budget is the VRAM KV pool), max_num_seqs 64 with a matching FULL_DECODE_ONLY capture size, 72 GiB pinned host tier per rank (576 GiB, leaving ~200 GB for prefill staging and page cache) and 256 GiB disk tier per rank (2 TiB on the 4.9 TB /dev/sda2). Three tiers: VRAM pool -> pinned host -> per-rank O_TMPFILE disk, all at the model-default 1,048,576 context.",
             "Reasoning effort: the GLM-5.3-Flash chat template implements the GLM-5.3 Low / High / Max levels (default Max) from the reasoning_effort chat_template_kwargs; thinking itself stays always-on (serving policy). No server flag is involved.",
             "Parallelism: TP4 x DP2 with replicated MoE (operator 2026-09-10: production is always c8+). vLLM's default DP flattens the MoE tensor-parallel group across DP (each rank holds 1/8 of every expert and every MoE layer all-gathers tokens across replicas in lockstep), which is what made the 2026-09-03 TP4xDP2 arm lose 10% at c1 to standalone TP4; data_parallel_replicate_moe keeps the full expert set on each replica sharded over its own TP4 group (44.9 GiB weights per rank), so the replicas share nothing per step. The DP load balancer routes by prefix affinity (VLLM_DP_PREFIX_AFFINITY, default on) because each replica's prefix cache and KV tiers are private. Measured 2026-09-11 through `slimserve --serve` (exact-token, DFlash2 on, three warmed repeats, medians): c1 117.8 / c8 506.8 / c16 786.5 / c32 985.8 / c64 1158.0 tok/s, text/image/tool canaries pass, forced-eviction tier acceptance 6/6 with VLLM_KV_TIER_VERIFY 96 batches / 0 mismatched (raw: perf/results/2026-09-11/glm53f-final-dp2/); the qualifying arm measured 128.8 / 559.4 / 771.2 / 1012.2 / 1174.6 (perf/results/2026-09-10/glm53f-dflash2/mx-tp4dp2-k2/); TP8 record before the flip: 153.6 / 495.0 / 687.3 / 879.5 / 1074.5. EP loses at every point and stays off.",
-            "DFlash2 speculative decoding ON by default (2026-09-10): incoai/GLM-5.3-Flash-DFlash2 (5 SWA layers, block 8, taps at target layers 6/15/25/34/43 = mean of the four mHC streams) drafts k=3 with the per-batch-size schedule [[1, 16, 3], [17, 64, 0]] per replica; rejection sampling verifies every draft, so output content is unaffected. --no-spec restores the non-speculative path."
+            "DFlash2 speculative decoding ON by default (2026-09-10): incoai/GLM-5.3-Flash-DFlash2 (5 SWA layers, block 8, taps at target layers 6/15/25/34/43 = mean of the four mHC streams) drafts k=3 with the per-batch-size schedule [[1, 16, 3], [17, 64, 0]] per replica; rejection sampling verifies every draft, so output content is unaffected. --no-spec restores the non-speculative path.",
+            "Thinking budget (2026-09-11): override_generation_config.thinking_token_budget 2000 per request, the fleet convention (qwen38 records); the V2 runner nudges the model to wrap up at 85% of the budget and force-closes the think block at 100%, capped inside the request's max_tokens. Added after the 1M-context legs showed probes at 900K+ spending their whole 1,024-token reply budget thinking with an empty answer: this record had no budget, so nothing ever closed the block."
           ],
           "speculative_overrides": {
             "num_speculative_tokens": 3,

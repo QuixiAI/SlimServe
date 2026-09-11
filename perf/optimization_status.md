@@ -35207,3 +35207,61 @@ Raw: perf/results/2026-09-10/glm53f-dflash2/mx-*/.
   moves (2.21 -> 2.27) while every step verifies one more draft token.
   DECISION: the record keeps k=3. Raw: perf/results/2026-09-10/
   glm53f-dflash2/dp2-{k3-pair,k4,sched16-0-k4}/.
+- 1M-context controls (queue12): TP8 layout 26/27 recall (miss at
+  903,670; one session errored, 38 min), DP2 repeat 26/28 (misses at
+  981,382 / 983,702; both sessions to 1,046,061). Every failed probe on
+  every run has completion_tokens == 1024 (the probe cap) and an EMPTY
+  answer, while passing probes at 1,040K-1,047K used 9-779 tokens: at
+  900K+ context the model sometimes spends the whole budget thinking and
+  never answers. Not a KV/tier fault (the same marker is recalled at
+  1.045M on the same session, byte verify 0/520 mismatched) and not
+  layout-specific. Harness change: the marker found in the reasoning
+  text counts as recall (recall_in_reasoning), and budget_exhausted is
+  recorded; a closing DP2 1M run (dp2-1m-c) uses it. Raw:
+  perf/results/2026-09-10/glm53f-1m-leg/{tp8-1m,dp2-1m-b}/.
+
+## 2026-09-11: TP4 x DP2 throughput program (operator: "implement all of your suggested improvements")
+
+Staged with a measurement gate per item; GPU order: A/B arms (queue14),
+closing 1M leg (queue15), c32-per-replica profile (queue16), fp8 main-KV
+arm (queue17).
+- Async scheduling: already active on the DP2 record (the boot log's
+  "Disabling NCCL for DP synchronization when using async scheduling");
+  no change needed.
+- Second API server: `vllm.entrypoints.openai.api_server` (what SlimServe
+  execs) only ran one frontend; it now takes the `vllm serve` multi-server
+  path when `--api-server-count > 1` (ad61a11a8). A/B arm dp2-api2.
+- NUMA binding: numactl installed; the GPUs report no NUMA affinity
+  (numa_node -1 on every PCI device: cloud topology), so the A/B arm
+  dp2-numa binds GPUs 0-3 / 4-7 to nodes 0 / 1 by assumption.
+- Indexer scoring once per request: `cached_pool_logits_grouped`
+  (glm5_next_pool_cache.py) reads each pooled-cache tile once for the k+1
+  speculative verify rows of a request (rows are request-major in decode)
+  and dots it against all G x 32 query heads; dispatched from
+  `_pooled_topk` when the decode batch is uniform in next_n (row shard
+  keeps groups intact when its local slice divides). Bit-exact against
+  the per-row kernel (7 cases incl. G=2/3/4/5/8). Cuts the deep-context
+  indexer's cache traffic by up to (k+1)x for speculative rows.
+- FP8 main KV for the 512-wide NoPE path: `mla_decode_fp8_sparse_nope`
+  (NFP8=512/SMODE=1 instantiation, 7b0323050) plus an in-kernel e4m3
+  decode in the tensor-core Triton kernel; parity 9 + 6 cases. Halves
+  the sparse-gather bytes and doubles the per-replica pool. A/B arm
+  dp2-fp8kv (canaries + exact); tier acceptance and leg follow before any
+  record flip (registry test requires the note to name format + evidence).
+- Speculation to all batch sizes: arm dp2-k3-all (schedule [[1,64,3]]);
+  the earlier dp2-k3-pair arm already measured 1012 / 1193 at c32/c64 vs
+  the record's 986 / 1158.
+- Deferred behind the profile: fused marlin MoE, mHC-in-allreduce (the
+  DSV4 fused kernel exists but its Python gate is batch-1 only:
+  `should_fuse_dsv4_mhc` requires (1, 4096) inputs - a batched variant is
+  the work), sampler/launch-count fusions, host-resident main KV.
+- THINKING BUDGET (2026-09-11, operator): the V2 runner enforces a
+  per-request thinking_token_budget (nudge to wrap up at 85%, hard
+  force-close of the think block at 100%, capped at max_tokens - 1), but
+  neither GLM-5.3 record configured one - only the qwen38 records carry
+  override_generation_config.thinking_token_budget 2000. That is why the
+  1M-leg probes at 900K+ thought through their whole 1,024-token reply
+  budget and answered nothing. Both glm53f records now set the fleet
+  convention (2000) with a registry test; the harness sends probes a
+  per-request budget of half their max_tokens so the answer keeps room.
+  The closing DP2 1M leg (queue15) validates it end to end.

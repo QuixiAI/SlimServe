@@ -6886,3 +6886,27 @@ TP4 = 36 MLA + 18 indexer + 4 KDA state pages; 106 at TP8 = 68 + 34 + 4.
   (perf/results/2026-09-11/glm53f-leg-dp2/), then the 1M leg
   (leg_1m.real.sh dp2-1m). Then queue11: k=3/k=4 arms on the record with
   the compile-hash fix. Old queue scripts are dead; only queue10/11 run.
+
+## 2026-09-11 20:00: TP4 x DP2 throughput program in flight
+
+- Landed (all on main): multi-API-server entry (ad61a11a8), grouped
+  indexer scoring for speculative rows (043effea6, bit-exact), fp8 main KV
+  for the 512-wide NoPE sparse MLA path incl. the tensor-core Triton
+  decode (7b0323050, parity passed), compile cache keyed by draft block
+  size, harness credits recall in reasoning + flags budget exhaustion.
+- 1M-context legs: both layouts reach 1.04M; every probe miss above 900K
+  was the model exhausting its 1,024-token thinking budget with an empty
+  answer, not lost recall (notebook 2026-09-11).
+- GPU queue (scripts + logs in ~/.local/scratch/glm53/): queue14 = A/B
+  arms dp2-base / dp2-api2 / dp2-numa / dp2-k3-all; queue15 = closing DP2
+  1M leg (dp2-1m-c) with the reasoning-aware harness; queue16 = c32-per-
+  replica torch profile (profile_dp2.sh; its first attempt hung on a bare
+  `wait`, fixed); queue17 = fp8 main-KV arm dp2-fp8kv. Results land in
+  perf/results/2026-09-10/glm53f-dflash2/<arm>/ and
+  perf/results/2026-09-10/glm53f-1m-leg/dp2-1m-c/.
+- Next after the profile: fused marlin MoE (launch list in
+  fused_moe/experts/marlin_moe.py: gemm1, silu_and_mul, gemm2, moe_sum per
+  layer), batched variant of the DSV4 fused mHC allreduce
+  (`should_fuse_dsv4_mhc` is batch-1 only), sampler/launch fusions,
+  host-resident main KV for GLM. Record flips (schedule, api2, numa, fp8
+  KV) only on measured wins plus the gate set.
