@@ -353,6 +353,7 @@ def _pooled_topk(
     ksel: int,
     kp: int,
     adaptive_score: bool = False,
+    group: int = 1,
 ) -> torch.Tensor:
     R, H, D = q.shape
     assert R > 0
@@ -366,6 +367,16 @@ def _pooled_topk(
             from vllm.model_executor.layers.glm5_next_pool_score import adaptive_pool_logits
 
             adaptive_pool_logits(q, weights, cache, block_table, row_req, visible, logits)
+        elif 2 <= group <= 8 and R % group == 0:
+            # Speculative verify rows of one request share their history:
+            # read each pool tile once for all `group` rows.
+            from vllm.model_executor.layers.glm5_next_pool_cache import (
+                cached_pool_logits_grouped,
+            )
+
+            cached_pool_logits_grouped(
+                q, weights, cache, block_table, row_req, visible, logits, group
+            )
         else:
             cached_pool_logits(q, weights, cache, block_table, row_req, visible, logits)
     else:
@@ -388,7 +399,7 @@ def _pooled_topk(
 def _pooled_select(
     q, weights, ape, cache, block_table, row_req, visible, logits,
     max_pools, block_size, softmax_scale, ksel, topk_out, kp,
-    adaptive_score=False, row_shard=False,
+    adaptive_score=False, row_shard=False, group=1,
 ) -> None:
     R = q.shape[0]
     if R == 0:
@@ -413,6 +424,7 @@ def _pooled_select(
             q[lo:hi], weights[lo:hi], ape, cache, block_table,
             row_req[lo:hi], visible[lo:hi], logits[:local_rows],
             max_pools, block_size, softmax_scale, ksel, kp,
+            group=group if local_rows % max(group, 1) == 0 else 1,
         )
         sel = torch.empty((R, ksel), dtype=torch.int32, device=q.device)
         # Reuse the live serving communicator on the caller stream. Creating
@@ -423,6 +435,7 @@ def _pooled_select(
         sel = _pooled_topk(
             q, weights, ape, cache, block_table, row_req, visible, logits,
             max_pools, block_size, softmax_scale, ksel, kp, adaptive_score,
+            group=group,
         )
     _expand_topk_kernel[(R,)](
         sel, visible, topk_out, sel.stride(0),
@@ -522,6 +535,9 @@ def glm5_next_pooled_indexer(
             topk_indices_buffer[:R], kp,
             adaptive_score=adaptive_score,
             row_shard=_row_shard_dispatch(row_shard_decode, R, md.num_prefills, next_n),
+            # Decode rows are request-major (row_req = arange // next_n), so a
+            # request's k+1 verify rows are contiguous.
+            group=next_n if R % max(next_n, 1) == 0 else 1,
         )
 
 

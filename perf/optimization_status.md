@@ -25409,3 +25409,39 @@ Raw: perf/results/2026-09-10/glm53f-dflash2/mx-*/.
   text counts as recall (recall_in_reasoning), and budget_exhausted is
   recorded; a closing DP2 1M run (dp2-1m-c) uses it. Raw:
   perf/results/2026-09-10/glm53f-1m-leg/{tp8-1m,dp2-1m-b}/.
+
+## 2026-09-11: TP4 x DP2 throughput program (operator: "implement all of your suggested improvements")
+
+Staged with a measurement gate per item; GPU order: A/B arms (queue14),
+closing 1M leg (queue15), c32-per-replica profile (queue16), fp8 main-KV
+arm (queue17).
+- Async scheduling: already active on the DP2 record (the boot log's
+  "Disabling NCCL for DP synchronization when using async scheduling");
+  no change needed.
+- Second API server: `vllm.entrypoints.openai.api_server` (what SlimServe
+  execs) only ran one frontend; it now takes the `vllm serve` multi-server
+  path when `--api-server-count > 1` (ad61a11a8). A/B arm dp2-api2.
+- NUMA binding: numactl installed; the GPUs report no NUMA affinity
+  (numa_node -1 on every PCI device: cloud topology), so the A/B arm
+  dp2-numa binds GPUs 0-3 / 4-7 to nodes 0 / 1 by assumption.
+- Indexer scoring once per request: `cached_pool_logits_grouped`
+  (glm5_next_pool_cache.py) reads each pooled-cache tile once for the k+1
+  speculative verify rows of a request (rows are request-major in decode)
+  and dots it against all G x 32 query heads; dispatched from
+  `_pooled_topk` when the decode batch is uniform in next_n (row shard
+  keeps groups intact when its local slice divides). Bit-exact against
+  the per-row kernel (7 cases incl. G=2/3/4/5/8). Cuts the deep-context
+  indexer's cache traffic by up to (k+1)x for speculative rows.
+- FP8 main KV for the 512-wide NoPE path: `mla_decode_fp8_sparse_nope`
+  (NFP8=512/SMODE=1 instantiation, 7b0323050) plus an in-kernel e4m3
+  decode in the tensor-core Triton kernel; parity 9 + 6 cases. Halves
+  the sparse-gather bytes and doubles the per-replica pool. A/B arm
+  dp2-fp8kv (canaries + exact); tier acceptance and leg follow before any
+  record flip (registry test requires the note to name format + evidence).
+- Speculation to all batch sizes: arm dp2-k3-all (schedule [[1,64,3]]);
+  the earlier dp2-k3-pair arm already measured 1012 / 1193 at c32/c64 vs
+  the record's 986 / 1158.
+- Deferred behind the profile: fused marlin MoE, mHC-in-allreduce (the
+  DSV4 fused kernel exists but its Python gate is batch-1 only:
+  `should_fuse_dsv4_mhc` requires (1, 4096) inputs - a batched variant is
+  the work), sampler/launch-count fusions, host-resident main KV.
