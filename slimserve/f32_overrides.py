@@ -12,6 +12,10 @@ This tool reads only the affected byte ranges from the native shards (no
 full load) and writes ``<model>/f32-overrides.safetensors``; the glm5_next
 loader substitutes those tensors when the file is present.
 
+The partial reads are offline preparation, not a claimed serving-speed gain.
+The F32 repair's model comparison and artifact record are linked in
+docs/glm53-flash-sm120-review.md, "Qualification record map".
+
     python -m slimserve.f32_overrides --native /path/to/GLM-5.3-Flash \\
         --model /path/to/GLM-5.3-Flash-NVFP4
 """

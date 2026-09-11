@@ -115,6 +115,8 @@ def _bf16_partition(q: torch.Tensor, idx: torch.Tensor) -> int:
     # per-head re-reads of the shared latent dominate and 64 is best (41.4 vs
     # 47.1 us at 1000, 75.0 vs 93.1 at 2048). The reduce is flat in the
     # partition count since the channel reducer.
+    # Full decode/prefill evidence map: docs/glm53-flash-sm120-review.md,
+    # "Qualification record map". Historical best-start rates are superseded.
     size = 32 if B <= 8 else 64
     P = (idx.shape[1] + size - 1) // size
     if B * H * P * 512 * 4 > _BF16_PARTITION_SCRATCH_CAP:

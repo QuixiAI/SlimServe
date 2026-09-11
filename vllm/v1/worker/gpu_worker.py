@@ -902,6 +902,7 @@ class Worker(WorkerBase):
 
             # Dummy forwards never cross a live request's cache-block boundary.
             # Compile the real state-copy signature before declaring readiness.
+            # Qualification: warm_mamba_copy_kernel's docstring and review map.
             warm_mamba_copy_kernel(self.device)
             bootstamp(f"worker[{self.rank}]: mamba state-copy warmup done")
 
