@@ -13,7 +13,7 @@ void run(at::Tensor q, at::Tensor cache, at::Tensor bt, at::Tensor ids,
     TORCH_CHECK(t.device() == q.device());
   TORCH_CHECK(q.is_contiguous() && out.is_contiguous() && bt.is_contiguous() &&
               ids.is_contiguous() && lengths.is_contiguous());
-  TORCH_CHECK(q.dim() == 3 && q.size(1) == 32 && q.size(2) == 512);
+  TORCH_CHECK(q.dim() == 3 && q.size(1) == slimserve::glm53_swapab::HEADS && q.size(2) == 512);
   TORCH_CHECK(cache.scalar_type() == q.scalar_type() && out.scalar_type() == q.scalar_type());
   TORCH_CHECK(out.sizes() == q.sizes() && cache.dim() == 3 && cache.size(0) > 0 &&
               cache.size(1) == block_size && cache.size(2) == 512 &&

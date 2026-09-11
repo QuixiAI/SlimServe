@@ -28762,3 +28762,65 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - Raw:`all-readers.{json,log}`,`race-all-readers.log`, all original race logs and
   `reader-barrier-build.log`. `--installed` now measures the real native binding
   and records its binary SHA; it does not rebuild or add a serving dependency.
+
+### Serving pair exposes wrong-head dispatch — no-op, not retention evidence
+
+- The prescribed flag0/flag1 pair completes, but source/config review exposes
+  a fundamental fixture error: `text_config.num_attention_heads=64`, and
+  `Glm5NextAttention` divides by TP4 before constructing the MLA wrapper.
+  The actual serving query has H16. The candidate required H32 and never
+  executed. The prior H32 component gains and 52-case H32 local sweep do not
+  establish target-profile performance; do not describe them as an exhaustive
+  study of H16. The benchmark also used scale1/sqrt512 instead of the serving
+  qk_nope_head_dim256 scale1/sqrt256.
+- Both arms have the same b4cb567e6 source, benchmark-source hashes, prompt,
+  recipe and native2592c50a binary. Exact lengths, text/image and six retrieval
+  contrasts pass. Control/candidate c1/c8/c16 E2E medians are
+  156.356/579.158/781.414 and157.011/579.762/781.025. Cold32K engine TTFT
+  2526.016 ->2527.814ms;128K9993.810 ->10009.379ms. These are two retained
+  no-op controls, NOT evidence of a faster or slower swapAB kernel.
+- Corrective work: specialize to H16 (two math warps plus one IO warp), keep
+  every math reader in the release barrier, derive benchmark heads/scale from
+  the selected checkpoint, assert actual native invocation in the dispatch
+  test, and log first native dispatch per worker. Add the missing four-byte
+  query alignment precondition for paired BF16 loads, with a safe Triton
+  fallback for unaligned query views. No profile promotion or quant change.
+- Raw: `perf/results/2026-09-11/sparse-swapab-serving-{control,candidate}/`.
+  Old library preserved in scratch `quixicore-sparse-h32-noop.so`. Corrected
+  component result will be `sparse-swapab/h16.json`; no full-model rerun is
+  justified unless the actual H16 complete kernel improves first.
+
+### Corrected H16 component comparison
+
+- Built/installed c2c4a99648315d753e8d60cb728c28476634d137bbaf6299dd817d56d81ef92d.
+  Incremental `_quixicore_C` build has two steps, -j2/80GiB, CUDA13.0; no
+  serving running. Kernel uses255 registers,72-byte stack,67,968 dynamic plus
+  1,024 compiler-static shared bytes. No spill-free claim.
+- Benchmark now reads the pinned recipe's config:64 global heads / TP4,
+  scale0.0625 from qk_nope_head_dim256. GPU0/SM120/stock600W, one16GiB/no-swap
+  workload, same three A/B/A rounds and five graph replays. Microseconds:
+
+  | Rows/context | Before | H16 native | After |
+  |---|---:|---:|---:|
+  | 2048/32768 | 1561.190 | 1495.654 | 1562.829 |
+  | 7616/32768 | 6065.971 | 5572.198 | 6065.965 |
+  | 2048/131072 | 1684.269 | 1509.587 | 1684.275 |
+  | 7616/131072 | 6251.923 | 5611.315 | 6251.520 |
+
+- Each candidate reading beats every control at its shape;4.2–10.4% kernel
+  improvement. All four normal/changed-input graph comparisons and12 sampled
+  FP64 rows pass unchanged rtol0.01/atol0.016; max normal difference0.00024414.
+  All10 installed GPU tests pass, including explicit H16 native dispatch and
+  query-alignment rejection. Full paged-graph racecheck passes0 hazards.
+- Raw:`sparse-swapab/h16.json`, `h16-tests.xml`, `h16-racecheck.log`.
+  Command is the installed benchmark documented above with
+  `--model /raid/weights/GLM-5.3-Flash-NVFP4-FP8-KDA-TP4` required.
+- Next: finish focused H16 memcheck, then ONE new flag0 control and ONE flag1
+  candidate on this same H16 library/source. Three repeats exact1000/300 at
+  c1/c8/c16, cold32K/128K, existing text/image/retrieval checks. Record under
+  `sparse-swapab-h16-serving-{control,candidate}/`. Verify all four workers
+  actually log H16 native dispatch; the previous no-op pair is not a substitute.
+
+- H16 memcheck now completes:0 errors, both paged-graph fixtures pass. Raw
+  `h16-memcheck.log`. Serving source catalog now includes the sparse-prefill
+  Python dispatcher alongside the native library receipt; no new controller.

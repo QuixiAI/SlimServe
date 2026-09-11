@@ -20,8 +20,11 @@ torch::Tensor prefill(torch::Tensor q, torch::Tensor cache, torch::Tensor bt,
   TORCH_CHECK(props->major == 12 && props->minor == 0, "requires SM120");
   for (const auto& t : {cache, bt, ids, lengths})
     TORCH_CHECK(t.device() == q.device(), "all tensors must share a device");
-  TORCH_CHECK(q.dim() == 3 && q.size(1) == 32 && q.size(2) == 512 &&
-              q.is_contiguous() && q.size(0) <= INT_MAX, "expected [B,32,512] Q");
+  TORCH_CHECK(q.dim() == 3 && q.size(1) == slimserve::glm53_swapab::HEADS &&
+              q.size(2) == 512 && q.is_contiguous() && q.size(0) <= INT_MAX,
+              "expected [B,16,512] Q");
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(q.data_ptr()) % 4 == 0,
+              "queries must be 4-byte-aligned for paired BF16 loads");
   TORCH_CHECK(block_size > 0 && block_size <= INT_MAX && std::isfinite(scale),
               "invalid block size or attention scale");
   TORCH_CHECK(cache.scalar_type() == at::kBFloat16 && cache.dim() == 3 &&

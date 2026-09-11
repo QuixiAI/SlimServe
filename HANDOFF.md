@@ -37,6 +37,21 @@ the old history. Upstream history is unchanged and nothing was pushed.
 
 ### Latest checkpoint (2026-09-10): kernel speed work resumed
 
+2026-09-11 UTC correction: **the first sparse swapAB serving pair was a no-op**.
+Checkpoint64 global attention heads / TP4 = H16; the candidate only admitted
+H32. Both complete runs are preserved; no serving gain or regression follows.
+Earlier H32 component gains and the52-case H32 sweep do NOT establish this
+profile's behavior. Native now specializes H16 (two math/one IO warps, every
+reader releases), benchmark derives heads and1/sqrt256 scale from checkpoint,
+and dispatch test asserts native invocation. First H16 component screen passes
+all12 sampled FP64 rows/graphs and improves4.2–10.4% at fixed2048/7616 rows,
+32K/128K. InstalledSHA c2c4a996; all10 H16 GPU tests pass, full paged-graph
+racecheck0 hazards and memcheck0 errors. Next new same-binary flag0/flag1 pair.
+Profile stillOFF. Original
+no-op outputs:`sparse-swapab-serving-{control,candidate}/`; H16:`sparse-swapab/h16.json`.
+Review/integration map:`docs/glm53-flash-sm120-review.md`. GitHub still401;
+host-tier allocation and QuixiCore port branch still await operator decisions.
+
 2026-09-11 UTC: **Phase4.3/4.5 native BF16 swapAB prefill is integrated OPT-IN**,
 pending a same-library flag0/flag1 serving pair. Direct Triton transpose and
 initial zero-spill CUDA design lost. Counters identified1.74B shared-load bank

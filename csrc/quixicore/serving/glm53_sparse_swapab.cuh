@@ -9,7 +9,10 @@
 // and FP16 probability/value product. No FP8 conversions or cache changes.
 namespace slimserve::glm53_swapab {
 using BF = __nv_bfloat16;
-constexpr int HEADS = 32, DIM = 512, KEYS = 32, THREADS = 160;
+// The selected checkpoint has 64 attention heads, sharded over TP4.
+constexpr int HEADS = 16, DIM = 512, KEYS = 32;
+constexpr int MATH_WARPS = HEADS / 8, MATH_THREADS = MATH_WARPS * 32;
+constexpr int THREADS = MATH_THREADS + 32;
 // A 512-element row aliases every QK row onto the same four shared banks.
 // Rotate each row by four banks, preserving the bulk copy's 16-byte alignment.
 constexpr int SHARED_DIM = DIM + 8;
@@ -17,7 +20,7 @@ constexpr int SHARED_DIM = DIM + 8;
 struct alignas(128) Shared {
   BF kv[2][KEYS][SHARED_DIM];
   int valid[2][KEYS];
-  half prob[4][KEYS][8];
+  half prob[MATH_WARPS][KEYS][8];
   alignas(8) unsigned long long ready[2], released[2];
 };
 
@@ -108,11 +111,12 @@ __global__ __launch_bounds__(THREADS, 1) void sparse_nope(
   const int tiles = (length + KEYS - 1) / KEYS;
   if (threadIdx.x == 0) {
     init_bar(&sm.ready[0], 1); init_bar(&sm.ready[1], 1);
-    init_bar(&sm.released[0], 128); init_bar(&sm.released[1], 128);
+    init_bar(&sm.released[0], MATH_THREADS);
+    init_bar(&sm.released[1], MATH_THREADS);
   }
   asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
   __syncthreads();
-  if (warp == 4) {
+  if (warp == MATH_WARPS) {
     // One IO lane owns each selected latent. Real request-local pages and
     // strides are preserved; invalid slots copy page0 but remain masked.
     for (int tile = 0; tile < tiles; tile++) {
@@ -208,7 +212,7 @@ __global__ __launch_bounds__(THREADS, 1) void sparse_nope(
       for (int i = 0; i < 4; i++) acc[m][i] = acc[m][i] * alpha[i % 2] + pv[i];
     }
     // Every shared-memory reader participates in release. Do not delegate
-    // arrival to lane0: buffer reuse must wait for all 128 math threads.
+    // arrival to lane0: buffer reuse must wait for every math thread.
     release_bar(&sm.released[buf]);
   }
 #pragma unroll

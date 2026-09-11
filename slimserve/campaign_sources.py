@@ -60,6 +60,7 @@ PATHS = (
     "vllm/model_executor/layers/fused_moe/router/glm_stable_align.py",
     "vllm/model_executor/layers/fused_moe/experts/marlin_moe.py",
     "vllm/model_executor/layers/glm5_next_indexer.py",
+    "vllm/v1/attention/backends/mla/quixicore_mla_sparse_prefill.py",
     "vllm/quixicore/ops.py",
 )
 

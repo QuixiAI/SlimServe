@@ -7,7 +7,7 @@ top-k list with one warp per (head, token): every head re-reads the same
 gathered 1 KB rows and does its dot products on CUDA cores, which is the
 right shape for a decode step of a few tokens and the wrong one for a
 7000-token prefill chunk (11 x 5.75 ms of the c8 step). Here one program
-owns one query token and all of its heads: the 32 heads are the M
+owns one query token and all of its heads: the local heads are the M
 dimension of two tensor-core products per 32-key tile (S = Q K^T, then
 O += P V with V the same gathered rows), with an online softmax per head.
 Indices are request-local token positions resolved through the token's
@@ -26,7 +26,10 @@ import os
 
 import torch
 
+from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
+
+logger = init_logger(__name__)
 
 # Kill switch for A/B runs only (read here, so not a torch-compile cache
 # factor): VLLM_MLA_SPARSE_PREFILL_TC=0 keeps prefill chunks on the decode
@@ -96,7 +99,7 @@ def _sparse_mla_prefill_kernel(
 
 def supports(q: torch.Tensor) -> bool:
     """The kernel takes the heads as a tensor-core M dimension: a power of
-    two from 16 up (TP <= 8 for GLM-5.3-Flash's 128 heads)."""
+    two from 16 up (TP <= 4 for GLM-5.3-Flash's 64 heads)."""
     H = q.shape[1]
     return q.shape[-1] == LATENT and H >= 16 and (H & (H - 1)) == 0
 
@@ -127,13 +130,15 @@ def sparse_mla_prefill_nope(
     if (
         SWAPAB_ENABLED
         and 2048 <= B <= 8192
-        and H == 32
+        and H == 16
         and q.dtype == torch.bfloat16
         and q.is_cuda
+        and q.data_ptr() % 4 == 0
         and torch.cuda.get_device_capability(q.device) == (12, 0)
     ):
         from vllm.quixicore import quixicore_ops
 
+        logger.info_once("GLM53 SM120 H16 BF16 sparse swapAB prefill active.")
         return quixicore_ops.mla_prefill_bf16_sparse_nope_sm120(
             q,
             kv_cache,

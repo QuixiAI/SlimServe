@@ -67,14 +67,23 @@ budget; otherwise document deferral, not a fictitious implemented result.
 | 0 | Bring-up/profile/baseline completed |
 | 1 | Selected weight recipe implemented; FP8 KV/W4A4 are outside that recipe |
 | 2.1–2.2 | Main transport/launch fusions retained; rejected variants stay closed |
-| 2.3 | Output-weight prefetch implemented and rejected; broader next-layer prefetch not implemented |
+| 2.3 | Output-weight prefetch implemented and rejected; broader next-layer prefetch unimplemented/deferred on overlap budget (review map) |
 | 3 | MTP port tested; off after losses on the relevant concurrent workload |
 | 4.1 | Paired-column/fused-SwiGLU successor implemented and parked: ~54us c1 step budget, batched neutral, stress comparison differences recorded; no serving promotion |
 | 4.2 | Whole-head conv/state/norm fusion implemented and rejected; paired K128 fg_b parked; projection-inclusive fusion deferred on measured value |
-| 4.3 | ACTIVE: native BF16 swapAB integrated opt-in; explicit all-reader release fixes racecheck WAR hazards and preserves7.5–10.5% component gains; same-binary serving pair pending |
-| 4.4 | Persistent per-layer decode unimplemented; conditional on 4.1–4.3 evidence |
+| 4.3 | ACTIVE: first H32 serving pair is a no-op because actual TP4 is H16; corrected H16 native component improves4.2–10.4%; GPU/serving qualification pending |
+| 4.4 | Persistent per-layer decode unimplemented/deferred; enabling fusions do not currently justify replacement (review map) |
 | 4.5 | TP row-sharded prefill indexer retained (-6.09% cold128K TTFT), alongside wide Marlin; broader structural work not closed |
 | 5 | Final integration/tier qualification/port-back not completed |
+
+The first swapAB pair exposed a fixture/dispatch error: the checkpoint has
+64 global attention heads, hence H16 at TP4, not H32. Both no-op controls stay
+recorded. The earlier H32 local sweep cannot close H16 work. Corrected native
+ownership, checkpoint-derived benchmark shape/scale and an asserted native
+dispatch are now being qualified. Detailed integration gates, research
+deferral evidence for2.3/4.4 and minimal port-back map are in
+`docs/glm53-flash-sm120-review.md`. Deferred does not mean implemented or
+exhausted; Phase5 and PR/review remain open.
 
 The 4.1 prototype is quarantined under `benchmarks/kernels/` with its binding
 and benchmark. Raw: `perf/results/2026-09-11/nvfp4-cross-item/`. Gate/up

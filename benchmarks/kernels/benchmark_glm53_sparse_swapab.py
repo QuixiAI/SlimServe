@@ -5,7 +5,6 @@
 import argparse
 import hashlib
 import json
-import math
 import statistics
 import subprocess
 from pathlib import Path
@@ -44,6 +43,12 @@ def build_native(path):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--model",
+        type=Path,
+        required=True,
+        help="selected recipe checkpoint; supplies TP4 heads and scale",
+    )
     implementation = parser.add_mutually_exclusive_group()
     implementation.add_argument("--build-dir", type=Path)
     implementation.add_argument("--installed", action="store_true")
@@ -54,6 +59,12 @@ def main():
         help="one candidate launch; no timing or correctness claim",
     )
     args = parser.parse_args()
+    config = json.loads((args.model / "config.json").read_text())
+    config = config.get("text_config", config)
+    heads = config["num_attention_heads"] // 4
+    scale = config["qk_nope_head_dim"] ** -0.5
+    if heads != 16 or config["qk_rope_head_dim"] != 0:
+        parser.error("native specialization requires the selected TP4 H16 NoPE recipe")
     if args.output.exists():
         parser.error("output must be new")
     if args.build_only and args.build_dir is None:
@@ -86,6 +97,13 @@ def main():
         ).hexdigest(),
         "cases": [],
         "native": native is not None,
+        "model": str(args.model),
+        "heads_per_rank": heads,
+        "tp_size": 4,
+        "softmax_scale": scale,
+        "config_sha256": hashlib.sha256(
+            (args.model / "config.json").read_bytes()
+        ).hexdigest(),
     }
     if native is not None:
         result["native_binary_sha256"] = hashlib.sha256(
@@ -114,7 +132,7 @@ def main():
             (2048, 131072),
             (7616, 131072),
         ):
-            q = (torch.randn(batch, 32, 512, device="cuda") * 0.2).bfloat16()
+            q = (torch.randn(batch, heads, 512, device="cuda") * 0.2).bfloat16()
             kv = (torch.randn(context // 64, 64, 512, device="cuda") * 0.5).bfloat16()
             bt = torch.arange(context // 64, device="cuda", dtype=torch.int32)[
                 None
@@ -151,13 +169,11 @@ def main():
                             indices,
                             lengths,
                             64,
-                            1 / math.sqrt(512),
+                            scale,
                             kv.stride(0) * 2,
                         )
                         return None
-                    native.run(
-                        q, kv, bt, indices, lengths, outs[arm], 64, 1 / math.sqrt(512)
-                    )
+                    native.run(q, kv, bt, indices, lengths, outs[arm], 64, scale)
                     return None
                 implementation = (pf._sparse_mla_prefill_kernel, sparse_swapab)[arm]
                 return implementation[(batch,)](
@@ -171,8 +187,8 @@ def main():
                     bt.shape[1],
                     kv.stride(0),
                     64,
-                    1 / math.sqrt(512),
-                    H=32,
+                    scale,
+                    H=heads,
                     D=512,
                     BLOCK_N=32,
                     num_warps=4,
@@ -190,7 +206,7 @@ def main():
             # values, not another implementation sharing the candidate layout.
             for row in (0, batch // 2, batch - 1):
                 selected = kv.view(context, 512)[indices[row].long()].double()
-                scores = q[row].double() @ selected.T / math.sqrt(512)
+                scores = (q[row].double() @ selected.T) * scale
                 expected = scores.softmax(-1) @ selected
                 torch.testing.assert_close(
                     outs[1][row].double(), expected, rtol=0.01, atol=0.016
