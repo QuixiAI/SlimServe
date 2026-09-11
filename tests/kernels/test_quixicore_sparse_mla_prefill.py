@@ -79,9 +79,13 @@ def test_matches_decode_walk_and_reference(heads, strided):
     assert torch.equal(out[0], torch.zeros_like(out[0]))  # tlen 0 -> 0
 
 
-def test_many_tokens_smoke():
+@pytest.mark.parametrize("swapab", [False, True])
+def test_many_tokens_smoke(swapab, monkeypatch):
     """A prefill-sized batch: every token its own program, lists of every
     length; compared to the walk."""
+    if swapab and torch.cuda.get_device_capability() != (12, 0):
+        pytest.skip("swapAB requires SM120")
+    monkeypatch.setattr(pf, "SWAPAB_ENABLED", swapab)
     torch.manual_seed(1)
     B, heads = 3000, 32
     kv = (torch.randn(N_BLOCKS, BS, 512, device=DEV) * 0.5).to(torch.bfloat16)
@@ -102,3 +106,56 @@ def test_supports():
     assert pf.supports(torch.empty(2, 16, 512, dtype=torch.bfloat16))
     assert not pf.supports(torch.empty(2, 8, 512, dtype=torch.bfloat16))
     assert not pf.supports(torch.empty(2, 32, 576, dtype=torch.bfloat16))
+
+
+@pytest.mark.parametrize("strided", [False, True])
+def test_sm120_swapab_paged_graph(strided):
+    """Native tail tiles, per-request page maps and changed graph inputs."""
+    if torch.cuda.get_device_capability() != (12, 0):
+        pytest.skip("swapAB requires SM120")
+    q, kv, bt, idx, tlen = _inputs(32, strided)
+    for row in bt:
+        row.copy_(torch.randperm(N_BLOCKS, device=DEV, dtype=torch.int32))
+
+    def call():
+        return qc.mla_prefill_bf16_sparse_nope_sm120(
+            q, kv, bt, idx, tlen, BS, SCALE, kv.stride(0) * 2
+        )
+
+    call()  # Native function-attribute setup before capture.
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        call()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        out = call()
+    for phase in range(2):
+        if phase:
+            q.mul_(8)
+            bt.copy_(bt.flip(0))
+            idx[4].fill_(-1)  # nonzero tlen with no valid cache rows
+            tlen[0] = -1
+            tlen[-1] = MAX_TOPK + 19  # clamp before reading the index array
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            out.float(), _reference(q, kv, bt, idx), atol=0.016, rtol=0.01
+        )
+        assert torch.count_nonzero(out[0]).item() == 0
+
+
+def test_sm120_swapab_rejects_invalid_metadata():
+    if torch.cuda.get_device_capability() != (12, 0):
+        pytest.skip("swapAB requires SM120")
+    q, kv, bt, idx, tlen = _inputs(32)
+    call = qc.mla_prefill_bf16_sparse_nope_sm120
+    with pytest.raises(RuntimeError, match="metadata"):
+        call(q, kv, bt.long(), idx, tlen, BS, SCALE)
+    with pytest.raises(RuntimeError, match="page stride"):
+        call(q, kv, bt, idx, tlen, BS, SCALE, kv.stride(0) * 2 + 16)
+    with pytest.raises(RuntimeError, match="block size"):
+        call(q, kv, bt, idx, tlen, 0, SCALE)
+    with pytest.raises(RuntimeError, match="share a device"):
+        call(q, kv, bt.cpu(), idx, tlen, BS, SCALE)

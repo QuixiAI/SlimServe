@@ -37,6 +37,23 @@ the old history. Upstream history is unchanged and nothing was pushed.
 
 ### Latest checkpoint (2026-09-10): kernel speed work resumed
 
+2026-09-11 UTC: **Phase4.3/4.5 native BF16 swapAB prefill is integrated OPT-IN**,
+pending a same-library flag0/flag1 serving pair. Direct Triton transpose and
+initial zero-spill CUDA design lost. Counters identified1.74B shared-load bank
+conflicts;520-BF16 shared row padding plus collective transposed value matrix
+loads produce9–13% component wins at2048/7616 rows,32K/128K cache. All local
+parity/oracle checks and10 installed GPU tests pass; paged-graph memcheck0 errors.
+Final native255 registers/72 local bytes is not spill-free. Flag
+`VLLM_GLM53_SPARSE_PREFILL_SWAPAB=1` stays off in the profile until serving
+retention; decode and other platforms unchanged. Native library SHA5f4ad989,
+prior39b302f0 saved in scratch/quixicore-before-sparse-swapab.so. Raw
+`perf/results/2026-09-11/sparse-swapab/`; no serving speed claim yet.
+Follow-up: full racecheck caught shared-buffer WAR hazards in leader-only
+release. Every one of128 math readers now arrives; the exact failing fixture
+passes0 hazards. Corrected installed SHA2592c50a preserves7.5–10.5% component
+gains, all local gates pass (`all-readers.json`). Use this binary for the
+serving pair, NOT the earlier5f4ad989 prototype, preserved in raw artifacts.
+
 2026-09-11 UTC: **Phase4.2 whole-head KDA core fusion REJECTED** after fixing
 a duplicate-reader/in-place-conv-history race. All306 graph checks pass;
 convolution and FP32 recurrent state exact. Full window c1/c8/c16

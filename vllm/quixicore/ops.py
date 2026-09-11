@@ -1772,6 +1772,23 @@ class quixicore_ops:
         )
 
     @staticmethod
+    def mla_prefill_bf16_sparse_nope_sm120(
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        block_table: torch.Tensor,
+        indices: torch.Tensor,
+        topk_length: torch.Tensor,
+        block_size: int,
+        scale: float,
+        page_stride_bytes: int = 0,
+    ) -> torch.Tensor:
+        """SM120 H32 prefill; BF16 Q/KV and FP16 P/V, no cache conversion."""
+        return _qc().mla_prefill_bf16_sparse_nope_sm120(
+            q, kv, block_table, indices, topk_length, block_size, scale,
+            page_stride_bytes,
+        )
+
+    @staticmethod
     def mla_decode_bf16_sparse_nope(
         q: torch.Tensor,
         kv: torch.Tensor,

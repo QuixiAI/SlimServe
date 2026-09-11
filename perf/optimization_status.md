@@ -28665,3 +28665,100 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   recipe v1. Adapt only candidates-on-M/heads-on-N and transposed output
   accumulation to our BF16 Q/KV and existing FP16 PV. No FlashInfer source build,
   runtime tuner, FP8 KV, or reopening of the rejected local tile/split sweep.
+
+## 2026-09-11 - Phase 4.3/4.5 BF16 sparse swapAB: native component win
+
+- Status: native integration opt-in; serving comparison pending. Source-led
+  candidates-on-M/heads-on-N ownership from merged FlashInfer#4802/#4751,
+  head ffa47d54ace70904f5c1becd5ab895a04c9393f9. Its FP8 Q/KV/probability
+  arithmetic is NOT adopted: recipe v1 keeps BF16 Q/KV and FP16 P/V. Local
+  `bf16_decode_gemm.cuh` supplies the established matrix-fragment convention.
+- Baseline:9817e787f, retained Triton H32/D512/N32 sparse prefill. GPU0/SM120,
+  CUDA13.0, stock clocks/600W, no concurrent work. Fixed2048/7616 query rows
+  at32K/128K cache rows, synthetic pooled selections, three A/B/A rounds with
+  five graph replays per arm. Component timings are NOT serving TPS.
+- Direct Triton transpose is48–57% slower;255 registers/54 spills versus
+  production255/48. Native explicit ownership instead uses four math warps,
+  one IO warp, register Q, double-buffered bulk row copies/mbarriers, warp-local
+  online softmax and transposed output MMA. Initial native has zero spills but
+  takes4.35/16.22ms at32K versus1.87/6.94ms. Zero spills alone is not a win.
+- Concrete layout diagnosis: a512-BF16 shared row aliases every QK row onto
+  the same four banks. One native launch records1,744,830,961 load bank
+  conflicts. Pad the shared row to520BF16 (16-byte-aligned; global layout
+  unchanged). Latency more than halves, but still trails production4–9%.
+  Next replace eight scalar transposed value loads with collective
+  `ldmatrix.x4.trans`, then convert BF16 pairs to the same FP16 boundary.
+  This is a dependency/layout correction, not another tile sweep.
+- Final native matrix-load medians, microseconds:
+
+  | Rows/context | Before | Candidate | After |
+  |---|---:|---:|---:|
+  | 2048/32768 | 1872.070 | 1631.027 | 1876.173 |
+  | 7616/32768 | 7051.264 | 6379.725 | 7076.250 |
+  | 2048/131072 | 2025.670 | 1773.568 | 2019.533 |
+  | 7616/131072 | 7512.883 | 6803.046 | 7558.349 |
+
+- All four cases improve9–13%; every candidate reading beats every control
+  at that shape.255 registers,72 local bytes,136-byte spill loads/stores,
+  68,992 shared bytes. This faster version is NOT spill-free. Padding and
+  matrix-load intermediate results, including regressions, remain recorded.
+- Correctness: unchanged rtol0.01/atol0.016 against retained attention;12
+  sampled independent FP64 rows; changed-input graphs, empty/short/invalid
+  selections. Maximum normal-input difference0.000244140625. Native integration
+  adds10 passing GPU tests including random3000-row dispatch, request-local
+  permuted tables, strided pages, tail tiles, length clamps, all-invalid rows,
+  changed graph queries amplified8x, and host-side metadata rejection. Targeted
+  paged-graph memcheck reports0 errors. This is local qualification, not model
+  quality certification.
+- Integration: separate SM120-family CUDA translation unit and pybind op,
+  `VLLM_GLM53_SPARSE_PREFILL_SWAPAB=1`, H32/BF16 and2048..8192 prefill rows.
+  Default0 pending serving; decode/other platforms stay unchanged. Device-local
+  checked launch setup, no JIT serving dependency or persistent cache copies.
+  Native build3 steps under80GiB/-j2, probes16GiB, swap0. Installed extension
+  SHA5f4ad989e83d62d10956cc7c84b61a1fccdc5bdf94b63f9290e95b3ded812861;
+  prior39b302f041bb846712b396f84100aefefcb332ed3fd04bd787853fa43bfdb31c
+  preserved as scratch `quixicore-before-sparse-swapab.so`.
+- Next: exactly one flag0 control and one flag1 candidate, same installed
+  libraries/recipe/client, three repeats exact1000/300 c1/c8/c16 plus cold32K/
+  128K TTFT, text/image and existing retrieval checks. No retry/fast-start
+  selection. Retain only if real-profile prefill improves without decode loss.
+- Raw:`perf/results/2026-09-11/sparse-swapab/`:screen.json, native.json,
+  padded.json, matrix.json, native-build.log, native-tests.xml,
+  memcheck-corrected.log. Benchmark module:`benchmarks.kernels.
+  benchmark_glm53_sparse_swapab`; optional --build-dir selects native, otherwise
+  the archived Triton transpose. `--profile-only` makes one launch without
+  correctness/timing claims. Counter access needed sudo; the first runuser
+  wrapper stripped injection (zero profiled kernels), direct profiling worked;
+  no driver permission/clock changes. Initial sanitizer filter used a colon
+  instead of equals and was rejected before launch; corrected memcheck passed.
+
+### Fix reader-release ordering before serving
+
+- Racecheck on the complete paged-graph fixture reports12 hazard groups despite
+  passing output comparisons. Bounded detailed output identifies WAR: math
+  thread3 reads a validity slot, producer thread128 overwrites it. Initial-copy,
+  first-reuse and individually filtered launches report clean; those reduced
+  screens do NOT supersede the failing multi-launch fixture. No serving started.
+- Replace four leader-only release arrivals with128 arrivals, one from every
+  math reader. The actual failing two-fixture/multi-launch graph test now passes
+  with0 racecheck hazards. No arithmetic, tile or precision changes. Do not
+  dismiss the original failure as a tooling issue; release ordering is explicit.
+- Installed corrected binary2592c50aa01fd3f2eade0c87acdc08becdd0805505635812dd136efcd16aa852.
+  Pre-fix binary retained in raw `before-reader-barrier.so`.255 registers,
+  72-byte stack,68,992 dynamic +1,024 compiler-static shared bytes.
+- Re-time the installed native binding, same fixed A/B/A shapes and gates:
+
+  | Rows/context | Before us | Corrected native us | After us |
+  |---|---:|---:|---:|
+  | 2048/32768 | 1871.661 | 1674.445 | 1883.539 |
+  | 7616/32768 | 7051.667 | 6519.808 | 7079.936 |
+  | 2048/131072 | 2018.714 | 1815.757 | 2010.931 |
+  | 7616/131072 | 7557.529 | 6944.973 | 7566.950 |
+
+- Corrected speedup7.5–10.5% versus before medians; every candidate reading
+  remains below every control at its shape. All four output/graph comparisons
+  and12 sampled FP64 rows pass. Normal maximum difference0.000244140625.
+  Final serving comparison uses THIS binary, not the faster unsafe prototype.
+- Raw:`all-readers.{json,log}`,`race-all-readers.log`, all original race logs and
+  `reader-barrier-build.log`. `--installed` now measures the real native binding
+  and records its binary SHA; it does not rebuild or add a serving dependency.

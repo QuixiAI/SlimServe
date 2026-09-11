@@ -32,6 +32,8 @@ from vllm.triton_utils import tl, triton
 # factor): VLLM_MLA_SPARSE_PREFILL_TC=0 keeps prefill chunks on the decode
 # walk.
 ENABLED = os.getenv("VLLM_MLA_SPARSE_PREFILL_TC", "1") != "0"
+# Opt-in until the same-binary profile comparison establishes serving value.
+SWAPAB_ENABLED = os.getenv("VLLM_GLM53_SPARSE_PREFILL_SWAPAB", "0") == "1"
 
 LATENT = 512
 _BLOCK_N = 32  # keys per tile: 64 does not fit the 100 KB shared budget
@@ -120,9 +122,29 @@ def sparse_mla_prefill_nope(
         if page_stride_bytes
         else block_size * D
     )
-    out = torch.empty_like(q)
     if B == 0:
-        return out
+        return torch.empty_like(q)
+    if (
+        SWAPAB_ENABLED
+        and 2048 <= B <= 8192
+        and H == 32
+        and q.dtype == torch.bfloat16
+        and q.is_cuda
+        and torch.cuda.get_device_capability(q.device) == (12, 0)
+    ):
+        from vllm.quixicore import quixicore_ops
+
+        return quixicore_ops.mla_prefill_bf16_sparse_nope_sm120(
+            q,
+            kv_cache,
+            block_table,
+            indices,
+            topk_length,
+            block_size,
+            scale,
+            page_stride * kv_cache.element_size(),
+        )
+    out = torch.empty_like(q)
     _sparse_mla_prefill_kernel[(B,)](
         q,
         kv_cache,

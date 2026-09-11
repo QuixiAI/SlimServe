@@ -71,7 +71,7 @@ budget; otherwise document deferral, not a fictitious implemented result.
 | 3 | MTP port tested; off after losses on the relevant concurrent workload |
 | 4.1 | Paired-column/fused-SwiGLU successor implemented and parked: ~54us c1 step budget, batched neutral, stress comparison differences recorded; no serving promotion |
 | 4.2 | Whole-head conv/state/norm fusion implemented and rejected; paired K128 fg_b parked; projection-inclusive fusion deferred on measured value |
-| 4.3 | ACTIVE: swapAB operand ownership; retained sparse MLA/indexer improvements stay; local tile/split variants remain closed |
+| 4.3 | ACTIVE: native BF16 swapAB integrated opt-in; explicit all-reader release fixes racecheck WAR hazards and preserves7.5–10.5% component gains; same-binary serving pair pending |
 | 4.4 | Persistent per-layer decode unimplemented; conditional on 4.1–4.3 evidence |
 | 4.5 | TP row-sharded prefill indexer retained (-6.09% cold128K TTFT), alongside wide Marlin; broader structural work not closed |
 | 5 | Final integration/tier qualification/port-back not completed |

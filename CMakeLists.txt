@@ -1465,6 +1465,22 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     SRCS "${VLLM_QUIXICORE_EXT_SRC}"
     CUDA_ARCHS "${QUIXICORE_ARCHS}")
 
+  # The warp-specialized GLM prefill kernel uses SM120 bulk async copies.
+  # Keep it in its own architecture-scoped translation unit.
+  if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
+    cuda_archs_loose_intersection(GLM53_SPARSE_ARCHS "12.0f" "${CUDA_ARCHS}")
+  elseif(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8)
+    cuda_archs_loose_intersection(GLM53_SPARSE_ARCHS "12.0a" "${CUDA_ARCHS}")
+  endif()
+  if(GLM53_SPARSE_ARCHS)
+    set(GLM53_SPARSE_SRC "csrc/quixicore/tm_cuda/tm_cuda_glm53_sparse.cu")
+    set_gencode_flags_for_srcs(
+      SRCS "${GLM53_SPARSE_SRC}" CUDA_ARCHS "${GLM53_SPARSE_ARCHS}")
+    set_property(SOURCE "csrc/quixicore/tm_cuda/tm_cuda_ext.cu" APPEND PROPERTY
+      COMPILE_DEFINITIONS VLLM_BUILD_GLM53_SM120_SPARSE=1)
+    list(APPEND VLLM_QUIXICORE_EXT_SRC ${GLM53_SPARSE_SRC})
+  endif()
+
   define_extension_target(
     _quixicore_C
     DESTINATION vllm
