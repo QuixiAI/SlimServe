@@ -35,8 +35,10 @@ def test_option_rejects_unqualified_platform_heads_and_spec(monkeypatch):
         additional_config={"glm5_next_sparse_tc_decode": True}, speculative_config=None
     )
     assert _sparse_tc_option(config, 8)
-    with pytest.raises(ValueError, match="8 heads"):
-        _sparse_tc_option(config, 16)
+    # 16 heads per rank (TP4) fills the kernel's 16-row tile (2026-09-11).
+    assert _sparse_tc_option(config, 16)
+    with pytest.raises(ValueError, match="8 or 16 heads"):
+        _sparse_tc_option(config, 4)
     # Speculative rows are ordinary query rows to this path (2026-09-10).
     config.speculative_config = object()
     assert _sparse_tc_option(config, 8)
@@ -72,7 +74,7 @@ def test_decode_shapes_and_prefill_fallback(rows, split):
 
 @pytest.mark.parametrize(
     "heads,width,dtype",
-    [(16, 512, torch.bfloat16), (8, 576, torch.bfloat16), (8, 512, torch.float16)],
+    [(4, 512, torch.bfloat16), (8, 576, torch.bfloat16), (8, 512, torch.float16)],
 )
 def test_other_geometries_keep_native(heads, width, dtype):
     q = torch.empty(8, heads, width, dtype=dtype)

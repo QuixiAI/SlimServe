@@ -93,14 +93,15 @@ def _row_shard_option(vllm_config, heads):
         not current_platform.is_cuda()
         or not current_platform.is_device_capability((8, 0))
         or heads != 32
-        or parallel.tensor_parallel_size != 8
-        or parallel.data_parallel_size != 1
+        or parallel.tensor_parallel_size not in (4, 8)
         or parallel.pipeline_parallel_size != 1
         or not extra.get("glm5_next_compact_indexer_cache", False)
     ):
+        # Rows are sharded over the replica's own TP group, so DP replicas
+        # are independent; TP4 shards 16/32 rows as 4/8 per rank.
         raise ValueError(
-            "Indexer row sharding requires SM80, TP8/DP1/PP1, 32 indexer heads "
-            "and the compact cache"
+            "Indexer row sharding requires SM80, TP4 or TP8 with PP1, "
+            "32 indexer heads and the compact cache"
         )
     return True
 
@@ -396,7 +397,7 @@ def _pooled_select(
         from vllm.distributed import get_tp_group
 
         group = get_tp_group()
-        assert group.world_size == 8 and 0 <= group.rank_in_group < 8
+        assert group.world_size in (4, 8) and 0 <= group.rank_in_group < group.world_size
         assert R in (16, 32) and q.shape[1:] == (32, 128)
         assert cache.shape[-1] == POOL_CACHE_HEAD_DIM and kp == 4 and ksel == 512
         assert not adaptive_score

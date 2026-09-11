@@ -25204,3 +25204,15 @@ restart is the operator's call.
   schedule ("DFlash drafts a fixed block of 4; the scheduler asked for
   num_steps=3" - a static k must come with a matching schedule) and the
   scheduled k=4 arm hit a stale output directory; both rerun in queue4.
+- TP8-only kernel guards generalized to TP4 (2026-09-11): the sparse
+  tensor-core decode Triton kernel already tiles 16 query rows per token
+  (`h = arange(16)`, masked at H=8) and compile_only covered H=16, so
+  `_sparse_tc_option`/`_sparse_tc_split` now accept 8 or 16 heads per
+  rank; the GPU parity suite (tests/glm5_next/test_sparse_tc_candidate.py,
+  48 cases incl. every heads=16 geometry) passes on one A100 slice. The
+  indexer row shard shards R in (16, 32) rows over the replica's own TP
+  group, so it accepts TP4 (4/8 rows per rank) and DP replicas; the
+  all_gather still runs on the live pynccl communicator of that TP group.
+  Dispatch tests 51 pass. queue5 runs the TP4/DP2 arms with both kernels
+  OFF (baseline), queue6 reruns mx-tp4dp2 and mx-tp4 with both ON; the
+  record flip (flip_dp2.py) takes whichever the arms qualify.
