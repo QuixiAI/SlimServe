@@ -125,9 +125,12 @@ def installed_baseline_checks(extension, batch):
                     *quixicore_ops.dsv4_mhc_pre(residual, fn, scale, base, *constants),
                 ]
             isolated = extension.run(*data, fused, with_norm, False)
-            assert all(torch.equal(a, b) for a, b in zip(reference, isolated)), (
-                "isolated baseline differs from the installed serving operator"
-            )
+            if len(reference) != len(isolated):
+                raise ValueError("isolated baseline output count differs from serving")
+            if not all(torch.equal(a, b) for a, b in zip(reference, isolated)):
+                raise ValueError(
+                    "isolated baseline differs from the installed serving operator"
+                )
             checks.append({"fused": fused, "norm": with_norm, "bit_exact": True})
     return checks
 

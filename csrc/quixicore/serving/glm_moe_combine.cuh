@@ -7,6 +7,8 @@
 // the shared-expert MLP output [T, D], out [T, D]; D is a multiple of 8 so every
 // thread moves 16-byte packs. TOPK > 0 unrolls the top-k loop, TOPK == 0 reads
 // the runtime top-k. The kernel is total: it indexes nothing beyond [T, topk, D].
+// All three base pointers must also be 16-byte aligned (checked by the binding).
+#include <algorithm>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <cstdint>

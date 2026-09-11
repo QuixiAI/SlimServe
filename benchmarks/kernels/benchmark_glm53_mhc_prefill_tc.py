@@ -294,7 +294,12 @@ def main():
             # Same six distinct weight banks in both arms. No reference FP32
             # storage conversion is timed; baseline is installed paired BF16.
             rows = timing_rows(
-                sites, narrow, batch, shared_activations=True, weight_banks=6
+                sites,
+                narrow,
+                batch,
+                shared_activations=True,
+                weight_banks=6,
+                fp32_arm=False,
             )
             fn_bytes = sum(row[1][4].numel() * row[1][4].element_size() for row in rows)
             if fn_bytes <= 3 * 128 * 2**20:

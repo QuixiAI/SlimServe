@@ -177,5 +177,8 @@ def test_install_scope_is_validated(monkeypatch, change):
         runner.parallel_config.pipeline_parallel_size = 2
     elif change == "spec":
         runner.speculative_config = object()
-    with pytest.raises(ValueError):
+    message = (
+        "bounded score journal" if change == "score_config" else "GLM53 TP4 no-spec"
+    )
+    with pytest.raises(ValueError, match=message):
         install_model_journal(runner)

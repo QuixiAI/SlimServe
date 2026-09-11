@@ -82,12 +82,18 @@ def main():
     # qualified GPU dependencies, oracle, input and gate sources stay frozen.
     changed_host = "csrc/quixicore/tm_cuda/tm_cuda_serving.cu"
     for path, digest in census["source_sha256"].items():
+        require((root / path).is_file(), f"qualified source missing: {path}")
         if path != changed_host:
             require(sha(root / path) == digest, f"qualified source changed: {path}")
     probe = root / "benchmarks/kernels/mhc_prefill_tc_probe.cu"
     header = root / "csrc/quixicore/serving/glm53_mhc_prefill_tc.cuh"
+    for path in (probe, header):
+        require(path.is_file(), f"qualified source missing: {path}")
     qualified_kernel_body(probe.read_text(), header.read_text())
     extension_path = Path(census["settings"]["extension"])
+    require(
+        extension_path.is_file(), f"qualified probe binary missing: {extension_path}"
+    )
     require(sha(extension_path) == PROBE_SHA, "qualified probe binary changed")
     active = subprocess.check_output(
         ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"], text=True
@@ -107,6 +113,8 @@ def main():
         "vllm/model_executor/layers/glm5_next_mhc_ops.py",
         "vllm/model_executor/models/glm5_next.py",
     }
+    for path in sorted(paths):
+        require((root / path).is_file(), f"qualified source missing: {path}")
     hashes = {p: sha(root / p) for p in sorted(paths)}
     plan = case_plan(BATCHES, list(range(90)))
     result = {

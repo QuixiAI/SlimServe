@@ -105,7 +105,11 @@ DECODE_GEMM_MAX_TOKENS = 16
 
 @cache
 def decode_gemm_enabled() -> bool:
-    if os.getenv("SLIMSERVE_DECODE_GEMM", "1") == "0" or not current_platform.is_cuda():
+    if (
+        os.getenv("SLIMSERVE_DECODE_GEMM", "1") == "0"
+        or not current_platform.is_cuda()
+        or not current_platform.has_device_capability(80)
+    ):
         return False
     from vllm.quixicore.ops import quixicore_ops
 
@@ -172,6 +176,7 @@ def decode_gemm_fp8_enabled() -> bool:
     if (
         os.getenv("SLIMSERVE_DECODE_GEMM_FP8", "1") == "0"
         or not current_platform.is_cuda()
+        or not current_platform.has_device_capability(80)
     ):
         return False
     from vllm.quixicore.ops import quixicore_ops

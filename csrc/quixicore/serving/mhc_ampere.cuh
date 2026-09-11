@@ -131,6 +131,9 @@ __global__ void partials(
 // the strided one above), so finalize_pre_mix / apply_pre_mix are unchanged.
 // residual_out is bit-identical to `partials` (same expression, same
 // order); the mix sums differ only in fp32 summation order.
+// Supported builds target SM80+. This tile needs ~80 KiB/block, above the
+// 48 KiB default; the launcher opts in via MaxDynamicSharedMemorySize.
+// It requires a device with at least PREFILL_SMEM opt-in shared memory.
 constexpr int PREFILL_TILE = 32;
 constexpr int PREFILL_FLATS = 2 * THREADS;
 constexpr int PREFILL_FN_STRIDE = PREFILL_FLATS;
