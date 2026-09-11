@@ -70,6 +70,14 @@
   all eight native FP8 tests pass on the rebuilt library. Applicable hooks
   pass; the existing repository-wide typos and markdownlint failures remain
   excluded as recorded in `fp8-hooks-final4.log`.
+- Main integration: implementation commit `b47509dd1` merged with upstream
+  `d39e6a9fa` as `a4e6d637e` without conflicts. All 103 focused post-merge
+  checks pass, including the incoming DP configuration/routing tests and
+  Metal tier/native/policy regressions. The merged `qwen38-nvfp4-1` profile
+  reaches health in 25.16 s and answers text (`4`) and image (`Red`) probes
+  correctly; raw `fp8-merged-vision-smoke.json` and copied engine log are in
+  the same artifact directory. Other profiles' earlier live results remain
+  scoped to their recorded pre-merge snapshot.
 - Decision: retain the required FP8 policy and vision enablement. The tested
   Metal profiles serve successfully, DSV4 has comparable measured throughput,
   and deterministic long-history eviction/reuse passes. Preserve the sampled
