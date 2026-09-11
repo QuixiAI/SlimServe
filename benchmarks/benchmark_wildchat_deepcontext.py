@@ -246,6 +246,10 @@ async def _turn(client, model, messages, records, sid, depth, args, max_tokens,
     if probe_marker is not None:
         rec["probe"] = True
         rec["recall_ok"] = probe_marker in reply
+        if not rec["recall_ok"]:
+            # Keep enough of the miss to tell a wrong answer from garbage.
+            rec["marker"] = probe_marker
+            rec["reply_head"] = reply[:400]
     if target_probe:
         rec["target_probe"] = True
     records.append(rec)
