@@ -22,6 +22,7 @@ from vllm.forward_context import (
     is_forward_context_available,
 )
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe import combine_shared
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
@@ -49,6 +50,7 @@ from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
     SharedExpertsOrder,
 )
 from vllm.platforms import current_platform
+from vllm.quixicore.ops import quixicore_ops
 from vllm.utils.torch_utils import (
     _USE_LAYERNAME,
     LayerName,
@@ -274,7 +276,7 @@ class MoERunner(MoERunnerInterface):
         self.enable_dbo = enable_dbo
         # DSV4 Ampere can carry shared/routed TP partials separately into its
         # custom all-reduce+mHC transition, avoiding a materialized local add.
-        self.defer_shared_expert_add = False
+        self._defer_shared_expert_add = False
 
         # When both gates are present and FSE is enabled, fuse their
         # weight matrices into [num_experts + num_shared, hidden] so one
@@ -294,6 +296,27 @@ class MoERunner(MoERunnerInterface):
                 mk_can_overlap_shared_experts=can_overlap,
             )
 
+        # Fold the shared-expert add into the routed experts' final sum
+        # (QuixiCore moe_sum_add through combine_shared): the op then returns
+        # the combined tensor and the separate add launch disappears. Only for
+        # the plain layer shape: no routed transforms or padding, no DP / EP /
+        # PCP / sequence parallel, no DBO, and the routed scale already applied
+        # by the router (the runner's factor is 1.0).
+        self._combine_shared_in_op = (
+            self._shared_experts is not None
+            and current_platform.is_cuda()
+            and quixicore_ops.has_moe_sum_add()
+            and routed_scaling_factor == 1.0
+            and routed_input_transform is None
+            and routed_output_transform is None
+            and not enable_dbo
+            and moe_config.dp_size == 1
+            and moe_config.pcp_size == 1
+            and not moe_config.use_ep
+            and not moe_config.is_sequence_parallel
+            and moe_config.hidden_dim == moe_config.hidden_dim_unpadded
+        )
+
         # Needed for string -> MoERunner layer lookup in custom ops.
         self.layer_name = layer_name
 
@@ -308,17 +331,31 @@ class MoERunner(MoERunnerInterface):
         return self.routed_experts.load_weights(weights)
 
     def _select_forward(self) -> Callable:
+        # One combined output unless the shared-expert output comes back
+        # separately for the Python-level add.
+        single = self._shared_experts is None or self._combine_shared_in_op
         if current_platform.is_tpu() or current_platform.is_cpu():
             # TODO: Once the OOM issue for the TPU backend is resolved, we
             # will switch to using the moe_forward custom op.
             # Note: CPU doesn't require wrapped _forward_impl.
-            return _moe_forward if self._shared_experts is None else _moe_forward_shared
+            return _moe_forward if single else _moe_forward_shared
 
         return (
-            torch.ops.vllm.moe_forward
-            if self._shared_experts is None
-            else torch.ops.vllm.moe_forward_shared
+            torch.ops.vllm.moe_forward if single else torch.ops.vllm.moe_forward_shared
         )
+
+    @property
+    def defer_shared_expert_add(self) -> bool:
+        return self._defer_shared_expert_add
+
+    @defer_shared_expert_add.setter
+    def defer_shared_expert_add(self, value: bool) -> None:
+        self._defer_shared_expert_add = value
+        # The model wants the shared and routed partials separately, which
+        # the in-kernel combine cannot provide.
+        if value and self._combine_shared_in_op:
+            self._combine_shared_in_op = False
+            self._forward_entry = self._select_forward()
 
     @property
     def shared_experts(self) -> SharedExperts | None:
@@ -609,6 +646,14 @@ class MoERunner(MoERunnerInterface):
         self._maybe_apply_shared_experts(
             shared_experts_input, SharedExpertsOrder.NO_OVERLAP, prequant_input
         )
+        if self._combine_shared_in_op:
+            # Launch the aux-stream shared experts ahead of the routed experts;
+            # SharedExperts.output joins the streams when the sum consumes it.
+            self._maybe_apply_shared_experts(
+                shared_experts_input,
+                SharedExpertsOrder.MULTI_STREAM_OVERLAPPED,
+                prequant_input,
+            )
 
         if self.routed_experts.quant_method.is_monolithic:
             # Monolithic kernels: pass router_logits to routed_experts
@@ -629,6 +674,11 @@ class MoERunner(MoERunnerInterface):
             else:
                 topk_weights, topk_ids = preselected
 
+            if (
+                self._combine_shared_in_op
+                and self._shared_experts.peek_output() is not None
+            ):
+                combine_shared.publish(topk_ids, self._shared_experts)
             fused_out = self.routed_experts.forward_modular(
                 x=hidden_states,
                 topk_weights=topk_weights,
@@ -637,6 +687,15 @@ class MoERunner(MoERunnerInterface):
                 shared_experts_input=shared_experts_input,
                 prequant_input=prequant_input,
             )
+
+        if self._combine_shared_in_op:
+            assert self._shared_experts is not None
+            if not combine_shared.retire():
+                # No kernel folded the shared output in (another experts
+                # implementation or an incompatible shape): add it here,
+                # still inside the op.
+                fused_out = fused_out + self._shared_experts.output
+            return None, fused_out
 
         self._maybe_apply_shared_experts(
             shared_experts_input,
@@ -746,6 +805,9 @@ class MoERunner(MoERunnerInterface):
             )
         )
 
+        # The in-op combine adds shared and routed outputs of one width.
+        assert not (self._combine_shared_in_op and og_hidden_dim_pre_xform is not None)
+
         result = self._forward_entry(
             hidden_states,
             router_logits,
@@ -854,7 +916,7 @@ class MoERunner(MoERunnerInterface):
         ):
             hidden_states = get_pcp_group().reduce_scatter(hidden_states, dim=0)
 
-        if self.shared_experts is not None:
+        if self.shared_experts is not None and not self._combine_shared_in_op:
             assert shared_output is not None
             return shared_output, hidden_states
         else:

@@ -30,6 +30,10 @@ class MLAModules:
     # Output gate (Kimi K3's mla_use_output_gate). Applied to the attention
     # output before o_proj; None for models without one.
     g_proj: torch.nn.Module | None = None
+    # Output widths appended to fused_qkv_a_proj for a sparse indexer's own
+    # hidden_states projections; they are split off and handed to the
+    # indexer as ``precomputed``. None keeps the indexer computing them.
+    indexer_a_sizes: tuple[int, ...] | None = None
 
 
 # --8<-- [start:multi_head_latent_attention]
@@ -88,6 +92,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         self.rotary_emb = mla_modules.rotary_emb
         self.o_proj = mla_modules.o_proj
         self.indexer = mla_modules.indexer
+        self.indexer_a_sizes = mla_modules.indexer_a_sizes
         self.indexer_rope_emb = mla_modules.indexer_rotary_emb
         self.is_sparse = mla_modules.is_sparse
         self.g_proj = mla_modules.g_proj
@@ -134,6 +139,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
     ) -> torch.Tensor:
         q_c = None
         kv_lora = None
+        indexer_inputs: tuple[torch.Tensor, ...] | None = None
 
         if self.q_lora_rank is not None:
             assert self.fused_qkv_a_proj is not None, (
@@ -147,10 +153,14 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             )
 
             qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
-            q_c, kv_lora = qkv_lora.split(
-                [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
-                dim=-1,
-            )
+            a_sizes = [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim]
+            if self.indexer_a_sizes:
+                q_c, kv_lora, *indexer_parts = qkv_lora.split(
+                    a_sizes + list(self.indexer_a_sizes), dim=-1
+                )
+                indexer_inputs = tuple(indexer_parts)
+            else:
+                q_c, kv_lora = qkv_lora.split(a_sizes, dim=-1)
             q_c = self.q_a_layernorm(q_c)
             q_proj_layer = self.q_b_proj
             q_proj_input = q_c
@@ -182,7 +192,16 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             )
 
         if self.indexer and self.is_sparse and not self.skip_topk:
-            self.indexer(hidden_states, q_c, positions, self.indexer_rope_emb)
+            if indexer_inputs is not None:
+                self.indexer(
+                    hidden_states,
+                    q_c,
+                    positions,
+                    self.indexer_rope_emb,
+                    precomputed=indexer_inputs,
+                )
+            else:
+                self.indexer(hidden_states, q_c, positions, self.indexer_rope_emb)
 
         if llama_4_scaling is not None:
             q *= llama_4_scaling

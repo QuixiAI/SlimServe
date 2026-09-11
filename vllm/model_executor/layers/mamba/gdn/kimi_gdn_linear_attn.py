@@ -58,7 +58,7 @@ def _apply_kda_output_norm(
     # CUDA kernel explicitly instead of launching casts, reductions, sigmoid
     # and multiplies separately at every KDA layer. Its output aliases a
     # contiguous input; copy_ is then a no-op (and handles noncontiguous input).
-    if current_platform.is_cuda():
+    if current_platform.is_cuda_alike():
         output.copy_(norm.forward_cuda(output, gate))
     else:
         output.copy_(norm(output, gate))
@@ -174,7 +174,7 @@ def _make_fused_conv1d_weight_loader(
 class _KimiGDNMergedColumnParallelLinear(MergedColumnParallelLinear):
     """Merged projection with selected outputs replicated across TP ranks.
 
-    The replicated shard is represented as ``size * tp_size`` so the merged
+    Each replicated shard is represented as ``size * tp_size`` so the merged
     parameter reserves ``size`` local rows on every rank. Loading that shard
     from rank zero then gives every rank the complete checkpoint weight.
     """
@@ -263,8 +263,15 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         config: KimiLinearConfig,
         vllm_config: VllmConfig,
         prefix: str = "",
+        beta_shard_rows: int | None = None,
         fuse_gate_a: bool = False,
     ) -> None:
+        """``beta_shard_rows``: rows per rank to reserve for the beta shard of
+        the merged input projection instead of ``num_heads / tp``. A
+        block-quantized projection needs every shard's local rows to be a
+        multiple of the block size, so the FP8 swap-set (slimserve.fp8_swapset)
+        stores beta per rank padded to 128 rows and asks for 128 here; the
+        padding rows are zero weights whose outputs the forward drops."""
         super().__init__(config, vllm_config, prefix)
 
         kda_config = config.linear_attn_config  # type: ignore[attr-defined]
@@ -285,6 +292,9 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.fuse_gate_a = fuse_gate_a and not self.use_full_rank_gate
 
         if self.use_full_rank_gate:
+            if beta_shard_rows is not None:
+                raise ValueError("beta_shard_rows applies to the low-rank gate only")
+            self.beta_shard_rows = self.local_num_heads
             # Keep f_a before the narrow beta shard, then pad each TP-local row
             # to select the aligned BF16 GEMM path. The padding also avoids an
             # Inductor correctness issue seen with the row-strided G view.
@@ -293,6 +303,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 self.head_dim,
                 self.num_heads,
             ]
+            replicated_shard_ids: tuple[int, ...] = (4,)
             local_output_size = (
                 4 * self.local_projection_size + self.head_dim + self.local_num_heads
             )
@@ -300,17 +311,28 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             if self.in_proj_padding:
                 in_proj_output_sizes.append(self.in_proj_padding * self.tp_size)
         else:
+            # The low-rank output gate's first stage (g_a_proj, head_dim rows
+            # of hidden_size) reads the same input as the projection, so it
+            # rides in the merged GEMM as a second replicated shard instead
+            # of a separate launch per layer at decode.
+            if beta_shard_rows is not None and beta_shard_rows < self.local_num_heads:
+                raise ValueError(
+                    f"beta_shard_rows={beta_shard_rows} < {self.local_num_heads} "
+                    "local heads"
+                )
+            self.beta_shard_rows = beta_shard_rows or self.local_num_heads
             in_proj_output_sizes = [self.projection_size] * 3 + [
-                self.num_heads,
+                self.beta_shard_rows * self.tp_size,
                 self.head_dim,
             ]
+            replicated_shard_ids = (4, 5) if self.fuse_gate_a else (4,)
             self.in_proj_padding = 0
             if self.fuse_gate_a:
                 in_proj_output_sizes.append(self.head_dim)
         self.in_proj_qkvgfab = _KimiGDNMergedColumnParallelLinear(
             self.hidden_size,
             in_proj_output_sizes,
-            replicated_shard_id=(4, 5) if self.fuse_gate_a else 4,
+            replicated_shard_id=replicated_shard_ids,
             tp_size=self.tp_size,
             bias=False,
             quant_config=self.quant_config,
@@ -394,8 +416,31 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 quant_config=self.quant_config,
                 prefix=f"{prefix}.g_b_proj",
             )
+        self.use_batched_gate_projection = (
+            self.fuse_gate_a
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability((12, 0))
+            and isinstance(self.f_b_proj.quant_method, UnquantizedLinearMethod)
+            and isinstance(self.g_b_proj.quant_method, UnquantizedLinearMethod)
+        )
+        if self.use_batched_gate_projection:
+            # f_b_proj and g_b_proj share a shape (local projection rows of
+            # head_dim) and read adjacent columns of the merged projection
+            # output, so at decode they run as one strided-batched GEMV on
+            # this buffer. The two Parameters stay as views into it, which
+            # keeps the checkpoint loaders untouched.
+            self.fg_b_weight = torch.empty(
+                2,
+                self.local_projection_size,
+                self.head_dim,
+                dtype=self.f_b_proj.weight.dtype,
+                device=self.f_b_proj.weight.device,
+            )
+            self.f_b_proj.weight.data = self.fg_b_weight[0]
+            self.g_b_proj.weight.data = self.fg_b_weight[1]
         self.use_paired_gate_projection = (
             self.fuse_gate_a
+            and not self.use_batched_gate_projection
             and current_platform.is_cuda()
             and not envs.VLLM_BATCH_INVARIANT
             and self.head_dim == 128
@@ -455,22 +500,30 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         else:
             split_sizes = [
                 3 * self.local_projection_size,
-                self.local_num_heads,
+                self.beta_shard_rows,
                 self.head_dim,
             ]
             if self.fuse_gate_a:
                 split_sizes.append(self.head_dim)
             projected = projected_qkvgfab.split(split_sizes, dim=-1)
             mixed_qkv, beta, f_a = projected[:3]
+            if self.beta_shard_rows != self.local_num_heads:
+                beta = beta[:, : self.local_num_heads]
             g_a = projected[3] if self.fuse_gate_a else self.g_a_proj(hidden_states)[0]
-            if self.use_paired_gate_projection:
+            if self.use_batched_gate_projection:
+                # Preserve the qualified SM120 strided BMM and storage layout.
+                fg_a = projected_qkvgfab[:, -2 * self.head_dim :]
+                fg_a = fg_a.view(num_tokens, 2, self.head_dim).transpose(0, 1)
+                fg_b = torch.bmm(fg_a, self.fg_b_weight.transpose(1, 2))
+                g1, g_proj_states = fg_b.unbind(0)
+            elif self.use_paired_gate_projection:
                 g1, g_proj_states = torch.ops.vllm.kda_gate_pair(
                     f_a, g_a, self.f_b_proj.weight, self.g_b_proj.weight
                 )
             else:
                 g_proj_states = self.g_b_proj(g_a)[0]
 
-        if not self.use_paired_gate_projection:
+        if not (self.use_paired_gate_projection or self.use_batched_gate_projection):
             g1 = self.f_b_proj(f_a)[0]
         beta = beta.unsqueeze(0)
         g1 = rearrange(g1, "n (h d) -> 1 n h d", d=self.head_dim)

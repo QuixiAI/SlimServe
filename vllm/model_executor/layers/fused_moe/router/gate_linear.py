@@ -19,6 +19,10 @@ class GateLinear(ReplicatedLinear):
     """MoE gate linear layer with multi-tier GEMM dispatch:
 
     1. DSV4 Ampere GEMV (SM80, M<=8, H=4096, E=256, bf16 in, fp32 out)
+    1b. QuixiCore decode projection GEMV (CUDA, M<=8, H=4096, any E,
+       bf16 in, fp32 out): one row-per-block launch that writes the fp32
+       logits directly, where the cuBLAS/F.linear tiers below either need
+       SM90+ or round through bf16 and cast.
     2. cuteDSL ll_bf16_gemm (SM90+, M<=16, bf16 in, fp32 out,
        K divisible by 8)
     3. DSV3 specialized kernel (SM90+, M<=16, H=7168 E=256/384, H=6144 E=256)
@@ -88,6 +92,17 @@ class GateLinear(ReplicatedLinear):
         )
         self.allow_dsv4_ampere_router_gemm = (
             self._dsv4_ampere_router_shape and out_dtype == torch.float32
+        )
+        self._projection_gemv_shape = (
+            not bias
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability((12, 0))
+            and self.weight.dtype == torch.bfloat16
+            and input_size == 4096
+            and _quixicore_available()
+        )
+        self.allow_projection_gemv = (
+            self._projection_gemv_shape and out_dtype == torch.float32
         )
         # GLM-5.3-Flash requires FP32 router logits. Ampere supports cuBLAS
         # BF16 inputs with FP32 output; rounding to BF16 and then casting
@@ -171,6 +186,9 @@ class GateLinear(ReplicatedLinear):
         self.allow_dsv4_ampere_router_gemm = (
             self._dsv4_ampere_router_shape and out_dtype == torch.float32
         )
+        self.allow_projection_gemv = (
+            self._projection_gemv_shape and out_dtype == torch.float32
+        )
 
         if (
             not self.allow_cublas_router_gemm
@@ -204,6 +222,11 @@ class GateLinear(ReplicatedLinear):
             and x.dtype == torch.bfloat16
         ):
             output = torch.ops.vllm.dsv4_ampere_router_gemm(x, self.weight)
+            return output, None
+
+        # Tier 1b: QuixiCore decode projection GEMV (CUDA, H=4096, M<=8).
+        if self.allow_projection_gemv and x.shape[0] <= 8 and x.dtype == torch.bfloat16:
+            output = torch.ops.vllm.router_projection_gemv(x, self.weight)
             return output, None
 
         # Tier 2: cuteDSL ll_bf16_gemm (SM90+, any dims)
@@ -280,6 +303,32 @@ direct_register_custom_op(
     op_name="dsv4_ampere_router_gemm",
     op_func=dsv4_ampere_router_gemm_impl,
     fake_impl=dsv4_ampere_router_gemm_fake,
+)
+
+
+def _quixicore_available() -> bool:
+    try:
+        from vllm.quixicore.ops import quixicore_ops
+
+        return bool(quixicore_ops.is_available())
+    except Exception:  # noqa: BLE001 - any import failure means no extension
+        return False
+
+
+def router_projection_gemv_impl(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    from vllm.quixicore.ops import quixicore_ops
+
+    return quixicore_ops.dsv4_projection_gemv(x, weight, False)
+
+
+def router_projection_gemv_fake(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    return x.new_empty((x.shape[0], weight.shape[0]), dtype=torch.float32)
+
+
+direct_register_custom_op(
+    op_name="router_projection_gemv",
+    op_func=router_projection_gemv_impl,
+    fake_impl=router_projection_gemv_fake,
 )
 
 

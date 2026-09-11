@@ -527,6 +527,14 @@ class VllmConfig:
             vllm_factors.append(self.profiler_config.compute_hash())
         else:
             vllm_factors.append("None")
+        # QuixiCore kernels that change the traced graph (the MoE runner's
+        # custom-op selection depends on which bindings the build provides).
+        from vllm.quixicore.ops import quixicore_ops
+
+        vllm_factors.append(quixicore_ops.graph_factors())
+        from slimserve.fp8_swapset import hash_factor
+
+        vllm_factors.append(hash_factor(getattr(self.model_config, "model", None)))
         vllm_factors.append(self.observability_config.compute_hash())
         if self.quant_config:
             pass  # should be captured by model_config.quantization

@@ -83,9 +83,34 @@ def _parser() -> argparse.ArgumentParser:
         "--engine-log",
         help="write the engine's own log here instead of discarding it",
     )
-    parser.add_argument(
+    profiler = parser.add_mutually_exclusive_group()
+    profiler.add_argument(
         "--torch-profile-dir",
         help="capture eight steady engine iterations after /start_profile",
+    )
+    profiler.add_argument(
+        "--cuda-profile",
+        action="store_true",
+        help="bounded CUDA profiler API ranges for an external process-tree trace",
+    )
+    parser.add_argument(
+        "--route-profile-dir",
+        help="diagnostic-only GLM53 routing capture; changes scheduling and timings",
+    )
+    parser.add_argument(
+        "--request-metrics",
+        action="store_true",
+        help="include engine request timings and cached prompt-token counts",
+    )
+    parser.add_argument(
+        "--jit-monitor-verbose",
+        action="store_true",
+        help="diagnostic: log every monitored JIT compilation and specialization",
+    )
+    parser.add_argument(
+        "--deterministic-reductions",
+        action="store_true",
+        help="diagnostic: fixed reductions for native-order GLM53 RTX6000",
     )
     parser.add_argument(
         "--enable-return-routed-experts",
@@ -117,6 +142,17 @@ def _help() -> None:
         ("--dry-run", "Print the resolved plan and stop."),
         ("--engine-log FILE", "Keep the engine's own log instead of discarding it."),
         ("--torch-profile-dir DIR", "Capture a bounded engine profile trace."),
+        ("--cuda-profile", "Enable bounded CUDA profiler API ranges for Nsight."),
+        ("--route-profile-dir DIR", "Capture actual GLM53 routing, not baseline TPS."),
+        ("--jit-monitor-verbose", "Log every monitored JIT compilation for diagnosis."),
+        (
+            "--deterministic-reductions",
+            "Qualify fixed GLM53 compiler reduction choices.",
+        ),
+        (
+            "--request-metrics",
+            "Include request timings and cached prompt-token counts.",
+        ),
         (
             "--enable-return-routed-experts",
             "Diagnostic MoE routing capture; adds overhead.",
@@ -264,14 +300,26 @@ def _show(plan: Plan) -> None:
     else:
         print(f"  platform  {registry.platform_title(plan.platform)} x{plan.gpus}")
     print(f"  model     {plan.entry_file}")
+    if plan.weight_recipe:
+        print(f"  recipe    {plan.weight_recipe['id']}")
+        print(f"  weights   {plan.weight_recipe['description']}")
     for key, value in sorted(plan.engine.items()):
         print(f"  {key:<9} {value}")
     if plan.speculative:
         spec = plan.source["speculator"]
         method = spec["engine"].get("method", "dspark")
-        print(f"  spec      {method} k={spec['engine']['num_speculative_tokens']}")
+        depth = plan.speculative_overrides.get(
+            "num_speculative_tokens", spec["engine"]["num_speculative_tokens"]
+        )
+        print(f"  spec      {method} k={depth}")
     for key, value in sorted(plan.env.items()):
-        print(f"  env       {key}={value}")
+        shadow = os.environ.get(key)
+        if shadow is not None and shadow != value:
+            # The profile's env applies with setdefault (engine.apply_env,
+            # server.start): the operator's value wins, so say so.
+            print(f"  env       {key}={value}  (shadowed: environment has {shadow})")
+        else:
+            print(f"  env       {key}={value}")
     for note in plan.notes:
         print(f"  note      {note}")
 
@@ -330,7 +378,7 @@ def main(argv: list[str] | None = None) -> int:
     if not machine.known:
         term.die(
             f"unrecognized hardware ({machine.device_name}); "
-            "slimserve runs on MI300X, A100 and Apple Silicon"
+            "slimserve runs on MI300X, A100, RTX PRO 6000 and Apple Silicon"
         )
 
     if blocked := registry.profile_blocked(profile_id, machine.platform):
@@ -408,6 +456,74 @@ def main(argv: list[str] | None = None) -> int:
                 },
             },
         )
+
+    if args.cuda_profile:
+        plan = replace(
+            plan,
+            engine={
+                **plan.engine,
+                "profiler_config": {
+                    "profiler": "cuda",
+                    "ignore_frontend": True,
+                    "max_iterations": 32,
+                },
+            },
+        )
+
+    if args.route_profile_dir:
+        from slimserve.routing_journal import diagnostic_plan
+
+        try:
+            plan = diagnostic_plan(plan, args.route_profile_dir)
+        except ValueError as error:
+            term.fail(str(error))
+            return 2
+
+    if args.request_metrics:
+        plan = replace(
+            plan,
+            engine={
+                **plan.engine,
+                "enable_prompt_tokens_details": True,
+                "enable_per_request_metrics": True,
+            },
+        )
+
+    if args.jit_monitor_verbose:
+        plan = replace(plan, engine={**plan.engine, "jit_monitor_verbose": True})
+
+    try:
+        from slimserve.glm53_ordering import validate_plan
+        from slimserve.indexer_correction_diagnostic import (
+            validate_plan as validate_indexer_correction,
+        )
+        from slimserve.kv_diagnostic import validate_plan as validate_kv_plan
+        from slimserve.prompt_score_diagnostic import (
+            validate_plan as validate_prompt_score_plan,
+        )
+        from slimserve.prompt_score_shadow import validate_plan as validate_shadow_plan
+        from slimserve.rmsnorm_diagnostic import validate_plan as validate_rmsnorm_plan
+        from slimserve.rmsnorm_geometry import validate_plan as validate_geometry_plan
+
+        validate_plan(plan)
+        validate_indexer_correction(plan)
+        validate_prompt_score_plan(plan)
+        validate_shadow_plan(plan)
+        validate_kv_plan(plan)
+        validate_rmsnorm_plan(plan)
+        validate_geometry_plan(plan)
+        if args.deterministic_reductions:
+            from slimserve.deterministic_reductions import diagnostic_plan
+
+            plan = diagnostic_plan(plan)
+            validate_indexer_correction(plan)
+            validate_prompt_score_plan(plan)
+            validate_shadow_plan(plan)
+            validate_kv_plan(plan)
+            validate_geometry_plan(plan)
+    except ValueError as error:
+        term.fail(str(error))
+        return 2
 
     if args.dry_run:
         _show(plan)

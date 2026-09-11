@@ -236,6 +236,12 @@ class FixFunctionalizationPass(VllmInductorPass):
                 self.insert_defunctionalized(graph, node)
                 self._remove(node)
 
+            elif at_target == torch.ops.vllm.moe_forward.default:
+                # The single-output MoE op: returns the layer output and
+                # declares hidden_states mutated (getitem[1]).
+                mutated_args = {1: "hidden_states"}
+                self.defunctionalize(graph, node, mutated_args=mutated_args)
+
             # only used for test_functionalization::TestFunctionWithMutatedArgsAndReturn
             elif (
                 hasattr(torch.ops.vllm, "function_with_mutated_args_and_return")

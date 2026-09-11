@@ -1,5 +1,9 @@
 {
   "schema": 1,
+  "profile_aliases": {
+    "glm53-nvfp4-4": "glm53f-nvfp4-4",
+    "glm53-nvfp4-8": "glm53f-nvfp4-8"
+  },
   "comment": "A profile is model x quant x platform x config. The id a user types carries no platform -- the CLI detects it -- so each id holds one record per platform under `variants`, and every record states its own platform. Ids follow <model>-<quant>-<gpus>. Quant tags: xxs=IQ2_XXS(-Q2_K), q4ktail=Q4K-tail, mxfp4=MXFP4, q4k=Q4_K, q2k=Q2_K, q2kxl=UD-Q2_K_XL, nvfp4=NVFP4.",
   "sources": {
     "glm52-vision": {
@@ -1172,7 +1176,8 @@
       ],
       "format": "safetensors",
       "repo": "RedHatAI/GLM-5.3-Flash-NVFP4",
-      "base_url": "https://huggingface.co/RedHatAI/GLM-5.3-Flash-NVFP4/resolve/main",
+      "revision": "36c184c6cda000a481711306df5adde42f63321a",
+      "base_url": "https://huggingface.co/RedHatAI/GLM-5.3-Flash-NVFP4/resolve/36c184c6cda000a481711306df5adde42f63321a",
       "local_dir": "GLM-5.3-Flash-NVFP4",
       "shared_note": "Safetensors checkpoint served from its directory; the vision tower, MTP head (model_mtp.safetensors), tokenizer and processor configs ship in the same repo. Requires transformers >= 5.16.1 for the native glm5_next config and processor.",
       "speculator": {
@@ -1187,11 +1192,12 @@
       },
       "quants": {
         "NVFP4": {
-          "title": "NVFP4 (group-16 FP4 experts, FP8 tail layer, BF16 backbone)",
+          "title": "NVFP4 (group-16 target experts, separate FP8 MTP head)",
           "bytes": 197881155500,
-          "summary": "RedHatAI's LLM Compressor release of the 169B GLM-5.3-Flash: 42 MoE layers in NVFP4 (group 16), the last expert layer in FP8, attention/KDA/mHC/embeddings/vision in BF16. On Ampere the experts run through the Marlin W4A16 NVFP4 kernels.",
+          "summary": "RedHatAI's LLM Compressor release of the 169B GLM-5.3-Flash: all 42 target MoE layers in NVFP4 (group 16); the separate MTP head at layer 45 has FP8 experts. The source backbone is BF16. Platform-specific recipes may restore native FP32 tensors and replace selected backbone weights with FP8; the RTX6000 record pins its complete derived recipe. Experts use Marlin W4A16 on the A100 and RTX6000 records.",
           "min_gpus": {
-            "a100": 4
+            "a100": 4,
+            "rtx6000": 4
           },
           "files": [
             {
@@ -1461,6 +1467,20 @@
       "notes": [
         "GeForce driver disables GPU peer-to-peer, so every tensor-parallel collective stages through host memory. Profiles on this platform should prefer expert parallelism and host-offloaded tables over designs that add per-step all-reduces.",
         "SM86 has no FP8 tensor cores; FP8 checkpoints serve through the Marlin W8A16 weight-only kernels."
+      ]
+    },
+    "rtx6000": {
+      "title": "NVIDIA RTX PRO 6000 Blackwell",
+      "compute_capability": [
+        12,
+        0
+      ],
+      "vram_bytes": 102642417664,
+      "gate": "gpus",
+      "status": "supported",
+      "notes": [
+        "Workstation Blackwell (GB202, sm_120): 188 SMs, 128 MiB L2, 100 KB shared memory per SM (99 KB opt-in per block), 96 GB GDDR7 at 1.79 TB/s, PCIe 5 x16 and no NVLink. On a four-card box the cards pair up under two host bridges (GPU0-GPU1, GPU2-GPU3) with the cross-pair path through the root complex; peer reads work on every pair, so tensor-parallel collectives run over PCIe and each all-reduce is a latency cost the record must budget for.",
+        "Family cubin 12.0f needs CUDA >= 13.0; older toolkits fall back to 12.0a;12.1a. The sm_120 tensor cores do NVFP4, but the stock CUTLASS and FlashInfer grouped FP4 GEMMs produced garbage on this card class in vLLM (issue #54150, cutlass #3096), so NVFP4 experts serve through Marlin W4A16 until a QuixiCore sm_120 kernel is qualified. DeepGEMM, TileLang v2 DSA schedules and the SM90/SM100 attention kernels do not run here."
       ]
     }
   },
@@ -2895,6 +2915,103 @@
             "reasoning_parser and tool_call_parser glm47: GLM-5.3 uses the GLM-4.7-family thinking and tool-call markup; enable_auto_tool_choice and thinking are the registry serving defaults.",
             "Host KV tier ENABLED (2026-09-03): 72 GiB pinned host RAM per rank (cudaHostRegister-ed at exact size) plus a 256 GiB per-rank NVMe/disk third tier under it (per-rank O_TMPFILE in SLIMSERVE_KV_TIER_DIR - operator environment, never a profile field; on this box the tier directory sits on the 4.9 TB /dev/sda2 filesystem). The layout is the packed cross-layer slab (enable_cross_layers_blocks) over 56 layers: 4 KDA state groups + the MLA and indexer groups. Hybrid page-size unification gives the indexer group (512 B/token) 2176-token blocks beside the MLA group's 1088 (TP4; 576/1152 at TP8), so the connector runs per-group block ratios: the wider group is offloaded/restored only where its block completes and resume boundaries align to the ratios' lcm. Every kernel on this path addresses pages by block stride (no flattening of the packed view). Validation: host tier at TP4 (48 GiB/rank): 6/6 probes hit and restored at block 36 (39,168 tokens), 58 restore ops each, VLLM_KV_TIER_VERIFY 0/58 mismatched; disk tier at TP4 (8 GiB host + 64 GiB disk, restores forced from disk): promotions from NVMe, verify 0/58 mismatched, 0 disk round-trip mismatches, 6/6 recalled after a 1.9M-token churn of a 1.24M-token pool (perf/results/2026-09-03/kvtier-acceptance/glm53-tp4-{host48,disk9}/); the TP8 record validated through slimserve on 2026-09-04 (perf/results/2026-09-04/glm53f-nvfp4-8-tier/).",
             "Reasoning effort: the GLM-5.3-Flash chat template implements the GLM-5.3 Low / High / Max levels (default Max) from the reasoning_effort chat_template_kwargs; thinking itself stays always-on (serving policy). No server flag is involved."
+          ]
+        },
+        "rtx6000": {
+          "platform": "rtx6000",
+          "default_quant": "NVFP4",
+          "weight_recipe": {
+            "id": "glm53-redhatai-nvfp4-fp8-kda-tp4-v1",
+            "description": "RedHatAI group-16 NVFP4 routed experts; native FP32 router/KDA/mHC repairs; native block-FP8 dense/shared/DSA weights; self-quantized block-FP8 KDA projections; BF16 KV and target vocabulary head.",
+            "local_dir": "GLM-5.3-Flash-NVFP4-FP8-KDA-TP4",
+            "target_revision": "36c184c6cda000a481711306df5adde42f63321a",
+            "native": {
+              "repo": "zai-org/GLM-5.3-Flash",
+              "revision": "3f1971b7b5f7a528c9c4ef6212c8785298a8c24a",
+              "local_dir": "GLM-5.3-Flash"
+            },
+            "tp_size": 4,
+            "artifact_digests": {
+              "f32-overrides.safetensors": "1c55137b1724151218d92c06735a16dbc9d9e3b7cdabd5c2ddfc842d8881f2e4",
+              "fp8-swapset.safetensors": "27e8aaf0e3cc3517c0e40622f176b3734924a0944bc0959c9eac3d3a6e74b327",
+              "fp8-swapset.json": "2f5fca340d60153ce80f9491db4167d7cf6fb2e8b8e32b35b3a0d2f21b29d1fb"
+            }
+          },
+          "engine": {
+            "tensor_parallel_size": 4,
+            "enable_expert_parallel": false,
+            "max_num_seqs": 16,
+            "block_size": 64,
+            "gpu_memory_utilization": 0.85,
+            "kv_cache_dtype": "auto",
+            "attention_config": {
+              "backend": "QUIXICORE_MLA_SPARSE",
+              "sparse_mla_force_mqa": true
+            },
+            "moe_backend": "marlin",
+            "linear_backend": "auto",
+            "kernel_config": {
+              "moe_backend": "marlin",
+              "linear_backend": "auto"
+            },
+            "compilation_config": {
+              "cudagraph_mode": "FULL_DECODE_ONLY",
+              "max_cudagraph_capture_size": 64
+            },
+            "limit_mm_per_prompt": {
+              "image": 2
+            },
+            "reasoning_parser": "glm47",
+            "tool_call_parser": "glm47",
+            "served_model_name": "GLM-5.3-Flash",
+            "enable_prefix_caching": true
+          },
+          "speculative": false,
+          "speculative_overrides": {
+            "num_speculative_tokens": 3
+          },
+          "speculator": {
+            "repo": "RedHatAI/GLM-5.3-Flash-NVFP4",
+            "revision": "36c184c6cda000a481711306df5adde42f63321a",
+            "local_dir": "GLM-5.3-Flash-NVFP4",
+            "engine": {
+              "method": "mtp",
+              "num_speculative_tokens": 1,
+              "index_share_for_mtp_iteration": true,
+              "moe_backend": "triton",
+              "attention_backend": "QUIXICORE_MLA_SPARSE"
+            },
+            "note": "RTX6000 diagnostic opt-in only; the retained recipe serves without speculation. Preserve its checkpoint MTP adapter and FP8 draft experts rather than inheriting the A100 DFlash2 source default."
+          },
+          "env": {
+            "VLLM_CUSTOM_AR_ALLOW_PCIE": "1",
+            "VLLM_GLM5_INDEXER_SM120_TILES": "1",
+            "VLLM_GLM5_MHC_BF16_FN": "1",
+            "VLLM_GLM53_MARLIN_PREFILL_WIDE": "1",
+            "VLLM_GLM53_INDEXER_TP_PREFILL": "1",
+            "VLLM_GLM53_SPARSE_PREFILL_SWAPAB": "1",
+            "VLLM_USE_V2_MODEL_RUNNER": "0",
+            "NCCL_P2P_DISABLE": "0",
+            "NCCL_P2P_LEVEL": "SYS"
+          },
+          "notes": [
+            "VLLM_USE_V2_MODEL_RUNNER=0 preserves the recorded SM120 recipe's V1 runner during the merge with main's A100/V2 work. A100 keeps its V2/DFlash2 defaults. Migrating this recipe to V2 requires separate graph/sampler/serving qualification and is not implied by the existing measurements.",
+            "VLLM_GLM5_INDEXER_SM120_TILES=1 (2026-09-08): RT2/PT128/four-warps pooled-indexer prefill scoring avoids the original RT8/PT64 register spills without changing quant, arithmetic, pooling, visibility or selection. Three fixed starts x three repeats plus a prescribed return-to-original control validate cold 32K/128K engine TTFT at 2.606/10.933 s versus 2.634/11.433 s in the return control; all exact-token, text/image and expanded quality checks pass. Decode is unchanged. Full selection tests, memcheck, racecheck and synccheck pass. See indexer-tile-serving/ and indexer-tile-return-control/ under perf/results/2026-09-08/. Set the environment value to 0 before launch for a controlled original-geometry comparison; other platforms retain their existing geometry.",
+            "NCCL_P2P_DISABLE=0 NCCL_P2P_LEVEL=SYS (2026-09-08): NCCL carries every TP all-reduce above the custom all-reduce's 8 MiB cap, i.e. the prefill chunks ([tokens, 4096] bf16: 57 MB at 7001 tokens, 67 MB at 8192). The four GPUs sit PHB/NODE (two per host bridge, no PCIe switch), which NCCL's default P2P level refuses, so it fell back to host-memory SHM at 15 GB/s and the reduce was 37% of a 7001-token prefill step. Over P2P: c8 prefill 811-831 -> 666-678 ms, c16 1354-1361 -> 1103-1106 ms, aggregates +4% c8 / +5-6% c16, decode untouched, gate in band (notebook 2026-09-08 'Prefill: the all-reduce arms'; the custom-AR cap at 64/128 MiB, VLLM_CUSTOM_AR_MAX_SIZE_MB, gave -14% and lost to this). Profile env applies with setdefault: a shell that exports NCCL_P2P_DISABLE=1 (tinybox's fish config does, for the CUDA 13.3 B12X container on the 13.0 driver) silently wins and the launcher prints the shadow; unset it for this record.",
+            "VLLM_CUSTOM_AR_ALLOW_PCIE=1 (2026-09-07): vLLM's custom all-reduce on the PCIe-only TP4 topology (P2P functional on every pair, BAR1 128 GiB). Replaces 91 NCCL ring-LL launches x 11.2 us with 90 x 5.1 us on the compute stream and removes their cross-stream graph gaps: exact-token c1 123.8 -> 137.4, c8 478 -> 499, c16 628 -> 657 on the swap-set tree, six gates in band (notebook 2026-09-07 'Custom all-reduce'). Off = unset the key (NCCL).",
+            "Validated cold-prefix reference (2026-09-08): recipe glm53-redhatai-nvfp4-fp8-kda-tp4-v1, repaired Marlin library and spill-free indexer geometry, three starts x three repetitions at c1/c8/c16, all 27 exact 1000/300 measurements retained with zero cached tokens. E2E medians 155.90/575.56/779.06 tok/s; cold 32K/128K engine TTFT 2.600/10.968 s. Text/image canaries, per-start 4096-token quality and six needle contrasts pass. This reference has mHC BF16 storage OFF; the subsequent paired-staging qualification below enables it. See cold-recipe-baseline/ and perf/baseline_status.md for commands, spread and limits. Unexplained historical startup throughput variation and broader quality/context qualification remain open; node-profiled gaps are not proof of unprofiled causality.",
+            "VLLM_GLM5_MHC_BF16_FN=1 (2026-09-08): losslessly store checkpoint mHC fn values in BF16 with qualified paired SM120 prefill staging; FP32 arithmetic and native FP32 base/scale stay unchanged. Same-binary one-FP32/three-BF16/one-FP32 control series passes all 45 exact-token rounds, text/image, 4096 scored tokens and six needle contrasts per start, and cold 32K/128K checks. Candidate E2E medians 156.79/578.99/779.94 tok/s versus controls 156.21/576.19/779.28 and 155.91/576.56/776.83. Retained for the small c1 gain (0.38-0.57%; all nine candidate readings above both controls); batched decode and prefill are effectively neutral. An owned-worker driver-cleanup race interrupted the chain after candidate one; only the two remaining prescribed candidates and return were resumed after a teardown-only harness fix. No discarded or replacement starts. See mhc-paired-* raw directories and the combined analysis. Set the environment value to 0 for the FP32-storage control; other platforms remain unchanged.",
+            "VLLM_GLM53_MARLIN_PREFILL_WIDE=1 (2026-09-10): M64/N512/K64, 256 threads, three-stage SM120 Marlin kernel removes cross-warp K reduction for target NVFP4/BF16 expert GEMMs at 2048..8192 input tokens. No quant/precision change; decode, smaller prefills and explicit schedules stay on existing kernels. Complete expert-path microbenchmarks improve 6.75-10.03% across 18 actual-weight fixtures, sampled independent FP64 checks pass, targeted memcheck reports zero errors, and installed outputs match the probe exactly. Same-binary one-control/one-candidate serving comparison, three repeats each, gives cold32K/128K engine TTFT 2585.249/10862.210 -> 2534.443/10710.859 ms (-1.97/-1.39%); every candidate reading is below every control reading. E2E c16 779.195 -> 784.687 tok/s (+0.70%); c1/c8 changes -0.26/+0.05% are within control spread, not decode gains. Text/image, exact tokens and all long-context retrieval contrasts pass. This is one fixed pair, not an across-start variance estimate or resolution of historical scoring-repeatability failures. Raw marlin-wide-serving-{control,candidate}/ under perf/results/2026-09-10. Set the environment flag to 0 before launch for the original kernel.",
+            "VLLM_GLM53_INDEXER_TP_PREFILL=1 (2026-09-11): shard independent long-prefill indexer query rows across TP4 and exchange 512 pool IDs before 4x token expansion, once per forward. Existing arithmetic kernels/quant unchanged. SM120 TP4 only, no PCP/DCP, at least 2048 prefill rows and 32768 context; decode and short prefills keep the original path. Completed control/corrected-candidate serving comparison gives cold-prefix 128K engine TTFT 10658.466 -> 10009.430 ms (-6.09%, effective prefill +6.48%); all three candidate timings beat all three controls. 32K TTFT +0.20% and c1/c8/c16 E2E +0.004/+0.195/+0.153% are effectively neutral, not decode wins. Component selected sets/tails match on all four ranks; legacy selector order is not bit-exact. Six standard retrieval contrasts and two additional cold128K generated-retrieval checks pass. First candidate failed before timing on an upstream-only metadata field; that failure is retained, and the corrected gate uses this fork's chunk lengths. No best-of/replacement timing selection or across-start variance claim. Initial-use JIT overhead is separate from these warmed-kernel/cold-prefix timings. Raw indexer-shard*, indexer-shard-serving-* and indexer-shard-128k-needle under perf/results/2026-09-11. Flag0 restores replicated prefill. Historical scoring-repeatability limits remain unchanged.",
+            "VLLM_GLM53_SPARSE_PREFILL_SWAPAB=1 (2026-09-11): native SM120 H16 BF16 sparse prefill uses register-resident queries, two math warps plus one IO warp, padded double-buffered KV staging and transposed value matrix loads. BF16 Q/KV and FP16 P/V boundaries are unchanged. Active for 2048..8192 rows; decode/other shapes stay on the existing route. Corrected same-binary flag0/flag1 pair on 6b2fea199 reduces cold32K/128K engine TTFT 2526.339/10001.190 -> 2519.428/9949.508 ms (-0.274/-0.517%); all three candidate readings beat all controls at each length. E2E c1/c8/c16 156.893/581.076/781.150 -> 156.663/579.222/780.644 tok/s (-0.146/-0.319/-0.065%) has overlapping ranges and is treated as neutral, not a decode improvement. Ten GPU tests, sampled FP64 comparisons, memcheck/racecheck, exact tokens, text/image and six retrieval contrasts pass. First H32 pair was a no-op: actual checkpoint64 heads / TP4 = H16. Its results are preserved and do not count as kernel evidence. Native dispatch is explicitly asserted in tests and logged on rank0 in serving. Raw sparse-swapab/h16* and sparse-swapab-h16-serving-{control,candidate}/ under perf/results/2026-09-11. This one fixed pair does not estimate across-start variance or resolve historical scoring-repeatability limits. Flag0 restores Triton prefill.",
+            "Same model facts as a100: context from config.json (1048576), ~17 KiB/token per rank of MLA + indexer KV, fixed-size KDA state; block_size 64 for the pooled-indexer cache; parsers glm47; TP4 with experts sharded (EP was 4-6% slower on a100; the PCIe all-reduce cost here is the reason to re-measure, not to assume).",
+            "moe_backend marlin: group-16 NVFP4 weights with BF16 activations, built for 12.0f. SM120 has native FP4 tensor cores, but changing this W4A16 path to W4A4 would also quantize activations and requires a separately identified recipe and quality comparison. Current kernel work preserves the selected quant and measures scheduling, layout and fusion changes against the serving baseline.",
+            "attention_config QUIXICORE_MLA_SPARSE: QuixiCore sparse NoPE MLA compiled for sm_120, covered by the kernel parity suite and fixed-start serving canaries. FlashInfer's SM120 GLM53_NOPE sparse MLA (#4802) is a reference for further measured work. Startup or local parity alone does not qualify every context length.",
+            "kv_cache_dtype auto resolves to BF16 and remains fixed in recipe v1, as does the BF16 lm_head. FP8 KV is a separate quant experiment, not an unannounced performance change to this reference.",
+            "Host and NVMe KV tiers are disabled on this record. No host/disk allocation is qualified for this 188 GB host; do not inherit A100 allocations or promise 32 GiB per rank without a complete host-memory budget and benchmark_kv_tier_eviction.py with VLLM_KV_TIER_VERIFY=1 on this machine.",
+            "Speculation: MTP (NextN) draft path ported and validated 2026-09-04 (perf/optimization_status.md, GLM-5.3-Flash MTP entries). OFF by default on this record: on the Foundry pipeline's real 8-wide fan-out (8 concurrent director commitments, ~4K-token specs, chat template with thinking, temperature 1.0 / top-p 0.95, 4096-token outputs) MTP k=3 measured 377/379 tok/s aggregate vs 453/480 spec-off (-20%, 0.82 accepted per step of 3) and 411 vs 504 greedy; single-stream 113 vs 109 (inside the 2.5% boot band). MTP wins only on short single-stream deterministic/structured cells (+17..+46% greedy: JSON triage, ctx0, code chat) and loses on the dense-prose exact-token harness at temp 1.0 (c1 95 vs 112, c8 323 vs 457). Opt-in for single-stream deterministic serving: set `speculative: true` on this record (speculative_overrides keeps num_speculative_tokens 3, the measured depth). The a100 record stays non-speculative.",
+            "Competitive target: strongest reproducible B12X result under matched workloads. The fixed three-start R28.1 cold-prefix control now completes on this box with qualified host-driver/native-FA2 adaptations, no-spec/DCP1 and its stock scheduling. Its different W4A4/FP8-KV configuration yields 132.59/466.69/589.28 E2E tok/s at c1/c8/c16, versus 155.90/575.56/779.06 here (+17.6/+23.3/+32.2%). Batched client arrivals are close during the interval when every request is generating; both reported client-decode windows include staggered prefill. This is not a kernel-only gain or a claim against every B12X configuration. Cold 32K engine TTFT is 4.2% lower here; 128K is 1.3% higher. See the two cold-prefix baselines, not published context-zero decode or old best-start ratios.",
+            "The selected recipe owns preparation and digest verification of the FP32 repair sidecar (router bias, KDA decay, mHC base/scale) and FP8 swap-set including self-quantized KDA. SlimServe prepares an isolated derived directory from pinned RedHatAI and native ZAI revisions before serving. Do not manually mutate source checkpoints or silently omit either sidecar. mHC projection fn is checkpoint BF16 upcast to FP32; only its base/scale vectors are native FP32 repairs."
           ]
         }
       }

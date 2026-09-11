@@ -9,6 +9,10 @@ import torch
 
 import vllm._custom_ops as ops
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from slimserve.canonical_moe import enabled as canonical_moe_enabled
+from slimserve.canonical_moe import stable_align_enabled
+from slimserve.glm53_ordering import enabled as native_order_enabled
+from vllm.model_executor.layers.fused_moe import combine_shared
 from vllm.config import get_current_vllm_config_or_none
 from vllm.model_executor.layers.fused_moe.activation import (
     MoEActivation,
@@ -26,6 +30,7 @@ from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
     batched_moe_align_block_size,
     moe_align_block_size,
 )
+from vllm.model_executor.layers.fused_moe.router import glm_route_align
 from vllm.model_executor.layers.fused_moe.singleton_alignment import (
     SingletonAlignment,
     make_singleton_alignment,
@@ -56,7 +61,25 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kNvfp4Static,
 )
 from vllm.platforms import current_platform
+from vllm.quixicore.ops import quixicore_ops
 from vllm.scalar_type import ScalarType, scalar_types
+
+# Marlin's lock/counter workspace only has to be zero when a kernel starts
+# and the kernel leaves it zero, which is why the dense Marlin methods
+# allocate it once per layer. Allocating (and zeroing) one per call put a
+# fill kernel in front of every MoE layer at decode; keep one per device.
+_MARLIN_MOE_WORKSPACE: dict[torch.device, torch.Tensor] = {}
+_CANONICAL_MOE_DIAGNOSTIC = canonical_moe_enabled()
+_STABLE_ALIGN_DIAGNOSTIC = stable_align_enabled()
+_NATIVE_ORDER = native_order_enabled()
+
+
+def _marlin_moe_workspace(device: torch.device) -> torch.Tensor:
+    workspace = _MARLIN_MOE_WORKSPACE.get(device)
+    if workspace is None:
+        workspace = marlin_make_workspace_new(device, 4)
+        _MARLIN_MOE_WORKSPACE[device] = workspace
+    return workspace
 
 
 def _fused_marlin_moe(
@@ -104,7 +127,7 @@ def _fused_marlin_moe(
     N = marlin_moe_intermediate_size(w1, w2)
     w13_num_shards = 2 if activation.is_gated else 1
     if workspace is None:
-        workspace = marlin_make_workspace_new(hidden_states.device, 4)
+        workspace = _marlin_moe_workspace(hidden_states.device)
 
     if intermediate_cache13 is None:
         intermediate_cache13 = torch.empty(
@@ -334,8 +357,41 @@ def fused_marlin_moe(
     if input_dtype is not None and input_dtype.itemsize == 1:
         block_size_m = max(block_size_m, 16)
 
+    if _CANONICAL_MOE_DIAGNOSTIC and (
+        hidden_states.dtype != torch.bfloat16
+        or K != 4096
+        or E != 288
+        or topk != 8
+        or quant_type != scalar_types.float4_e2m1f
+        or expert_map is not None
+        or global_num_experts != E
+    ):
+        raise ValueError("canonical alignment diagnostic requires GLM53 NVFP4 TP")
+
+    alignment = glm_route_align.consume(topk_ids)
+    canonical_alignment = False
     if (
-        hidden_states.shape[0] == 1
+        alignment is not None
+        and alignment.block_size == block_size_m
+        and expert_map is None
+    ):
+        # The fused router already aligned this very batch for this block
+        # size; skip the align / count_and_sort / fill launches.
+        sorted_token_ids = alignment.sorted_token_ids
+        expert_ids = alignment.expert_ids
+        num_tokens_post_padded = alignment.num_tokens_post_padded
+        canonical_alignment = alignment.canonical_assignment_order
+    elif _STABLE_ALIGN_DIAGNOSTIC and 17 <= hidden_states.shape[0] <= 8192:
+        from vllm.model_executor.layers.fused_moe.router.glm_stable_align import align
+
+        sorted_token_ids, expert_ids, num_tokens_post_padded = align(
+            topk_ids, block_size_m
+        )
+        canonical_alignment = True
+    elif (
+        not _NATIVE_ORDER
+        and not _STABLE_ALIGN_DIAGNOSTIC
+        and hidden_states.shape[0] == 1
         and expert_map is None
         and global_num_experts == E
         and singleton_alignment is not None
@@ -345,6 +401,10 @@ def fused_marlin_moe(
             topk_ids
         )
     else:
+        if _NATIVE_ORDER:
+            raise ValueError(
+                "native ordering requires scoped native alignment; no sorting fallback"
+            )
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
             topk_ids,
             block_size_m,
@@ -352,6 +412,20 @@ def fused_marlin_moe(
             expert_map,
             ignore_invalid_experts=True,
         )
+
+    if _CANONICAL_MOE_DIAGNOSTIC:
+        from slimserve.canonical_moe import canonicalize
+
+        if not canonical_alignment:
+            if _NATIVE_ORDER:
+                raise ValueError("native ordering received noncanonical alignment")
+            canonicalize(
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                tokens=hidden_states.shape[0],
+                block_size=block_size_m,
+            )
 
     assert activation is not None
     moe_output = _fused_marlin_moe(
@@ -971,6 +1045,17 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
     ) -> None:
         if expert_map is not None:
             ops.moe_sum(input, output, topk_ids, expert_map)
+            return
+        shared = (
+            combine_shared.consume(topk_ids, output)
+            if input.is_contiguous() and output.is_contiguous()
+            else None
+        )
+        if shared is not None:
+            # The runner published this batch's shared-expert output: fold it
+            # into the sum, one launch instead of moe_sum, the finalize copy
+            # and the add.
+            quixicore_ops.moe_sum_add(input, shared, output)
         else:
             ops.moe_sum(input, output)
 

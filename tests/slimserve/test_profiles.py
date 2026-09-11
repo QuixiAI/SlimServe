@@ -40,6 +40,82 @@ def test_every_profile_resolves_on_a_platform_it_claims():
             assert plan.engine, "a profile with no engine settings would serve nothing"
 
 
+def test_glm53_spill_free_indexer_geometry_is_rtx6000_scoped():
+    key = "VLLM_GLM5_INDEXER_SM120_TILES"
+    rtx = resolve("glm53-nvfp4-4", "rtx6000", 4, None)
+    assert rtx.env[key] == "1"
+    for profile, count in (("glm53-nvfp4-4", 4), ("glm53-nvfp4-8", 8)):
+        assert key not in resolve(profile, "a100", count, None).env
+
+
+def test_glm53_renamed_profiles_preserve_recorded_commands():
+    for platform, count in (("rtx6000", 4), ("a100", 4), ("a100", 8)):
+        old_id, new_id = f"glm53-nvfp4-{count}", f"glm53f-nvfp4-{count}"
+        old, new = (resolve(p, platform, count, None) for p in (old_id, new_id))
+        assert replace(old, profile_id=new_id) == new
+        assert old_id not in registry.profile_ids()
+        assert new_id in registry.profile_ids()
+    assert compatible_profile_ids(Machine("rtx6000", "RTX PRO 6000", 4)) == [
+        "glm53f-nvfp4-4"
+    ]
+
+
+def test_glm53_merge_keeps_drafters_and_quant_platform_scoped():
+    rtx = resolve("glm53f-nvfp4-4", "rtx6000", 4, None)
+    a100 = resolve("glm53f-nvfp4-8", "a100", 8, None)
+    assert not rtx.speculative
+    assert rtx.speculator["engine"]["method"] == "mtp"
+    assert rtx.weight_recipe["id"] == "glm53-redhatai-nvfp4-fp8-kda-tp4-v1"
+    assert rtx.engine["kv_cache_dtype"] == "auto"
+    assert rtx.env["VLLM_USE_V2_MODEL_RUNNER"] == "0"
+    assert "kv_transfer_config" not in rtx.engine
+    assert a100.speculative
+    assert a100.speculator["engine"]["method"] == "dflash"
+    assert a100.weight_recipe is None
+    assert a100.engine["data_parallel_size"] == 2
+    # A100 inherits main's V2 architecture default; only SM120 pins V1.
+    assert "VLLM_USE_V2_MODEL_RUNNER" not in a100.env
+
+
+def test_glm53_lossless_mhc_storage_is_rtx6000_scoped():
+    key = "VLLM_GLM5_MHC_BF16_FN"
+    rtx = resolve("glm53-nvfp4-4", "rtx6000", 4, None)
+    assert rtx.env[key] == "1"
+    for profile, count in (("glm53-nvfp4-4", 4), ("glm53-nvfp4-8", 8)):
+        assert key not in resolve(profile, "a100", count, None).env
+
+
+def test_glm53_wide_marlin_prefill_is_rtx6000_scoped():
+    key = "VLLM_GLM53_MARLIN_PREFILL_WIDE"
+    rtx = resolve("glm53-nvfp4-4", "rtx6000", 4, None)
+    assert rtx.env[key] == "1"
+    assert rtx.engine["moe_backend"] == "marlin"
+    assert rtx.engine["tensor_parallel_size"] == 4
+    for profile, count in (("glm53-nvfp4-4", 4), ("glm53-nvfp4-8", 8)):
+        assert key not in resolve(profile, "a100", count, None).env
+
+
+def test_glm53_indexer_tp_prefill_is_rtx6000_scoped():
+    key = "VLLM_GLM53_INDEXER_TP_PREFILL"
+    rtx = resolve("glm53-nvfp4-4", "rtx6000", 4, None)
+    assert rtx.env[key] == "1"
+    assert rtx.engine["tensor_parallel_size"] == 4
+    assert not rtx.engine["enable_expert_parallel"]
+    for profile, count in (("glm53-nvfp4-4", 4), ("glm53-nvfp4-8", 8)):
+        assert key not in resolve(profile, "a100", count, None).env
+
+
+def test_glm53_sparse_swapab_is_rtx6000_scoped():
+    key = "VLLM_GLM53_SPARSE_PREFILL_SWAPAB"
+    rtx = resolve("glm53-nvfp4-4", "rtx6000", 4, None)
+    assert rtx.env[key] == "1"
+    assert rtx.engine["tensor_parallel_size"] == 4
+    assert rtx.engine["kv_cache_dtype"] == "auto"
+    assert not rtx.speculative
+    for profile, count in (("glm53-nvfp4-4", 4), ("glm53-nvfp4-8", 8)):
+        assert key not in resolve(profile, "a100", count, None).env
+
+
 def test_every_profile_uses_registered_drafter_with_fp8_dspark():
     for profile_id in registry.profile_ids():
         entry = registry.describe(profile_id)
@@ -88,6 +164,41 @@ def test_no_spec_cli_flag_disables_the_resolved_speculator(monkeypatch):
     assert len(seen) == 1
     assert seen[0].speculative is False
     assert "speculative_config" not in engine_kwargs(seen[0])
+
+
+def test_cuda_profiler_is_explicit_bounded_and_does_not_change_recipe(monkeypatch):
+    original = resolve("glm53-nvfp4-4", "rtx6000", 4, None)
+    machine = Machine("rtx6000", "RTX PRO 6000 Blackwell", 4)
+    monkeypatch.setattr(cli.hardware, "detect", lambda: machine)
+    seen = []
+    monkeypatch.setattr(cli, "_show", seen.append)
+    assert cli.main(["glm53-nvfp4-4", "--cuda-profile", "--dry-run"]) == 0
+    configured = seen[0]
+    expected = {"profiler": "cuda", "ignore_frontend": True, "max_iterations": 32}
+    assert configured.engine["profiler_config"] == expected
+    assert replace(configured, engine=original.engine) == original
+    assert {
+        key: value
+        for key, value in configured.engine.items()
+        if key != "profiler_config"
+    } == original.engine
+    assert "profiler_config" not in original.engine
+    with pytest.raises(SystemExit):
+        cli._parser().parse_args(["--cuda-profile", "--torch-profile-dir", "unused"])
+
+
+def test_verbose_jit_cli_only_changes_observability(monkeypatch):
+    assert not cli._parser().parse_args([]).jit_monitor_verbose
+    original = resolve("glm53-nvfp4-4", "rtx6000", 4, None)
+    machine = Machine("rtx6000", "RTX PRO 6000 Blackwell", 4)
+    monkeypatch.setattr(cli.hardware, "detect", lambda: machine)
+    seen = []
+    monkeypatch.setattr(cli, "_show", seen.append)
+    assert cli.main(["glm53-nvfp4-4", "--jit-monitor-verbose", "--dry-run"]) == 0
+    configured = seen[0]
+    assert configured.engine == {**original.engine, "jit_monitor_verbose": True}
+    assert replace(configured, engine=original.engine) == original
+    assert engine_kwargs(configured)["jit_monitor_verbose"] is True
 
 
 def test_every_profile_source_names_a_blessed_dspark_download():

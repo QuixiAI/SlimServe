@@ -41,6 +41,7 @@ from vllm.v1.attention.backend import (
     MLAAttentionImpl,
     MultipleOf,
 )
+from vllm.v1.attention.backends.mla import quixicore_mla_sparse_prefill
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.kv_cache_interface import AttentionSpec
 
@@ -58,7 +59,6 @@ def _page_stride_bytes(kv_cache: torch.Tensor) -> int:
     return kv_cache.stride(0) * kv_cache.element_size()
 
 
-_BF16_PARTITION = 128
 _BF16_PARTITION_SCRATCH_CAP = 512 << 20  # bytes of fp32 partials
 
 
@@ -105,10 +105,20 @@ def _bf16_partition(q: torch.Tensor, idx: torch.Tensor) -> int:
     already B x H warps wide, so partition only while the scratch is small.
     """
     B, H = q.shape[0], q.shape[1]
-    P = (idx.shape[1] + _BF16_PARTITION - 1) // _BF16_PARTITION
+    # Decode sizes by batch, measured 2026-09-07 on glm53-nvfp4-4 / rtx6000
+    # with the channel reducer (notebook "Sparse MLA decode: partition and
+    # reduce"): one warp per (head, token, partition) walks its partition
+    # serially, so at small B the 2080-wide list wants 32-token partitions
+    # (B = 1: decode 6.6 us vs 15.8 at 128 for 1000 selected tokens, 10.8 vs
+    # 31.0 at 2048; B = 8: within 2 us of 128 either way); at B >= 16 the
+    # per-head re-reads of the shared latent dominate and 64 is best (41.4 vs
+    # 47.1 us at 1000, 75.0 vs 93.1 at 2048). The reduce is flat in the
+    # partition count since the channel reducer.
+    size = 32 if B <= 8 else 64
+    P = (idx.shape[1] + size - 1) // size
     if B * H * P * 512 * 4 > _BF16_PARTITION_SCRATCH_CAP:
         return 0
-    return _BF16_PARTITION
+    return size
 
 
 class QuixiCoreMLASparseBackend(AttentionBackend):
@@ -435,6 +445,20 @@ class QuixiCoreMLASparseImpl(MLAAttentionImpl[QuixiCoreMLASparseMetadata]):
                         self.softmax_scale, split=tc_split,
                     ), None
                 # NoPE MLA (glm5_next): no rope segment, 512-wide latents.
+                # Steps with prefill tokens take the head-batched
+                # tensor-core kernel (one program per token, the heads as
+                # the M dimension); decode steps keep the graph-captured
+                # walk below.
+                if (
+                    quixicore_mla_sparse_prefill.ENABLED
+                    and attn_metadata.num_prefills > 0
+                    and quixicore_mla_sparse_prefill.supports(q)
+                ):
+                    return quixicore_mla_sparse_prefill.sparse_mla_prefill_nope(
+                        q, kv_c_and_k_pe_cache, bt, idx, tlen,
+                        attn_metadata.block_size, self.softmax_scale,
+                        page_stride_bytes=_page_stride_bytes(kv_c_and_k_pe_cache),
+                    ), None
                 # Partitioned (128 -> 17 partitions at the 2080-wide list):
                 # the one-warp-per-(head, token) walk was 155 ms/token at
                 # TP8 with the 2048 top-k (8 warps per rank). Microbench

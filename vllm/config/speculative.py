@@ -57,6 +57,7 @@ MTPModelTypes = Literal[
     "hy_v3_mtp",
     "gemma4_mtp",
     "inkling_mtp",
+    "glm5_next_mtp",
 ]
 NgramGPUTypes = Literal["ngram_gpu"]
 DFlashModelTypes = Literal["dflash"]
@@ -1369,6 +1370,15 @@ class SpeculativeConfig:
             == "step3p5_mtp"
         )
 
+    def use_glm5_next_mtp(self) -> bool:
+        """GLM-5.3-Flash MTP: two draft cache owners (sparse MLA + indexer)."""
+        return (
+            self.method == "mtp"
+            and self.draft_model_config is not None
+            and getattr(self.draft_model_config.hf_config, "model_type", None)
+            == "glm5_next_mtp"
+        )
+
     def use_qwen4_exp_mtp(self) -> bool:
         """Return whether Qwen4Exp needs its dedicated proposer."""
         return (
@@ -1376,14 +1386,6 @@ class SpeculativeConfig:
             and self.draft_model_config is not None
             and getattr(self.draft_model_config.hf_config, "model_type", None)
             == "qwen4_exp_mtp"
-        )
-
-    def use_glm5_next_mtp(self) -> bool:
-        return (
-            self.method == "mtp"
-            and self.draft_model_config is not None
-            and getattr(self.draft_model_config.hf_config, "model_type", None)
-            == "glm5_next_mtp"
         )
 
     def use_eagle(self) -> bool:

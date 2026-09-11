@@ -212,6 +212,9 @@ from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
 from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
 from vllm.v1.spec_decode.glm5_next import Glm5NextMTPProposer
+from vllm.v1.spec_decode.glm5_next_mtp import (
+    Glm5NextMTPProposer as Glm5NextSM120MTPProposer,
+)
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.ngram_proposer_gpu import (
@@ -641,6 +644,8 @@ class GPUModelRunner(
                 | Gemma4Proposer
                 | Step3p5MTPProposer
                 | Qwen4ExpMTPProposer
+                | Glm5NextMTPProposer
+                | Glm5NextSM120MTPProposer
             )
             if self.speculative_config.method == "custom_class":
                 self.drafter = create_custom_proposer(  # type: ignore[assignment]
@@ -680,7 +685,12 @@ class GPUModelRunner(
             elif self.speculative_config.use_qwen4_exp_mtp():
                 self.drafter = Qwen4ExpMTPProposer(self.vllm_config, self.device, self)
             elif self.speculative_config.use_glm5_next_mtp():
-                self.drafter = Glm5NextMTPProposer(self.vllm_config, self.device, self)
+                glm_proposer = (
+                    Glm5NextSM120MTPProposer
+                    if current_platform.is_device_capability((12, 0))
+                    else Glm5NextMTPProposer
+                )
+                self.drafter = glm_proposer(self.vllm_config, self.device, self)
             elif self.speculative_config.use_dflash():
                 self.drafter = DFlashProposer(self.vllm_config, self.device, self)
                 self.use_aux_hidden_state_outputs = True
@@ -1015,6 +1025,35 @@ class GPUModelRunner(
                 self.max_num_reqs, dtype=torch.int32
             )
         self.layerwise_nvtx_hooks_registered = False
+
+        from slimserve.model_journal import install_model_journal
+
+        install_model_journal(self)
+        from slimserve.index_journal import install_index_journal
+
+        install_index_journal(self)
+        from slimserve.indexer_correction_diagnostic import (
+            install as install_indexer_correction,
+        )
+
+        install_indexer_correction(self)
+        from slimserve.prompt_score_diagnostic import (
+            install as install_prompt_score_diagnostic,
+        )
+
+        install_prompt_score_diagnostic(self)
+        from slimserve.kv_diagnostic import install as install_kv_diagnostic
+
+        install_kv_diagnostic(self)
+        from slimserve.rmsnorm_geometry import install as install_rmsnorm_geometry
+
+        install_rmsnorm_geometry(self)
+        from slimserve.rmsnorm_diagnostic import install as install_rmsnorm_diagnostic
+
+        install_rmsnorm_diagnostic(self)
+        from slimserve.reduction_receipts import install as install_reduction_receipts
+
+        install_reduction_receipts(self)
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
@@ -5905,6 +5944,35 @@ class GPUModelRunner(
         if not num_prompt_logprobs_dict:
             return {}
 
+        # Runtime-only scoring policy, outside the compiled model/AOT key.
+        chunk_flag = os.getenv("SLIMSERVE_GLM53_PROMPT_SCORE_CHUNKS", "0")
+        if chunk_flag not in ("0", "1"):
+            raise ValueError("SLIMSERVE_GLM53_PROMPT_SCORE_CHUNKS must be 0 or 1")
+        chunk_rows = 0
+        if chunk_flag == "1":
+            from vllm.v1.sample.prompt_logprobs import CHUNK_ROWS
+
+            if getattr(self.model_config.hf_config, "model_type", None) not in (
+                "glm5_next",
+                "glm5_next_text",
+            ):
+                raise ValueError("prompt-score chunks are qualified for GLM53 only")
+            chunk_rows = CHUNK_ROWS
+
+        if not hasattr(self, "_slimserve_score_journal"):
+            from slimserve.score_journal import ScoreJournal
+
+            self._slimserve_score_journal = ScoreJournal.from_env(
+                getattr(self.model_config.hf_config, "model_type", None)
+            )
+        score_journal = self._slimserve_score_journal
+
+        if not hasattr(self, "_slimserve_prompt_score_shadow"):
+            from slimserve.prompt_score_shadow import PromptScoreShadow
+
+            self._slimserve_prompt_score_shadow = PromptScoreShadow.from_env(self)
+        score_shadow = self._slimserve_prompt_score_shadow
+
         prompt_logprobs_dict: dict[str, LogprobsTensors | None] = {}
 
         # Since prompt logprobs are a rare feature, prioritize simple,
@@ -5965,7 +6033,24 @@ class GPUModelRunner(
             req_idx = self.input_batch.req_id_to_index[req_id]
             offset = self.query_start_loc.np[req_idx].item()
             prompt_hidden_states = hidden_states[offset : offset + num_logits]
+            trace_match = (
+                score_journal.begin(
+                    request.prompt_token_ids,
+                    start_idx,
+                    num_logits,
+                    num_prompt_logprobs,
+                    req_id,
+                )
+                if score_journal is not None
+                else None
+            )
+            if trace_match is not None:
+                score_journal.record(
+                    trace_match, "prompt_head_input", prompt_hidden_states
+                )
             logits = self.model.compute_logits(prompt_hidden_states)
+            if trace_match is not None:
+                score_journal.record(trace_match, "logits", logits)
 
             # Get the "target" tokens for each index. For prompt at index i,
             # the token at prompt index i+1 is the "sampled" token we want
@@ -5975,13 +6060,49 @@ class GPUModelRunner(
             # Compute prompt scores respecting logprobs_mode.
             # NOTE: prompt tokens skip sampling processors, so
             # processed_* and raw_* yield the same scores here.
-            if self.model_config.logprobs_mode in ("raw_logits", "processed_logits"):
-                scores = logits.to(torch.float32)
+            if score_shadow is not None:
+                if not chunk_rows or trace_match is not None:
+                    raise ValueError("score shadow requires chunks without journals")
+                token_ids, logprobs, ranks, _ = score_shadow.gather(
+                    logits,
+                    tgt_token_ids,
+                    num_prompt_logprobs,
+                    self.model_config.logprobs_mode,
+                    sampler=self.sampler,
+                    prompt_ids=request.prompt_token_ids,
+                    start_idx=start_idx,
+                    request_id=req_id,
+                )
+            elif chunk_rows and num_logits > chunk_rows and trace_match is None:
+                from vllm.v1.sample.prompt_logprobs import gather_prompt_logprobs
+
+                token_ids, logprobs, ranks, _ = gather_prompt_logprobs(
+                    logits,
+                    tgt_token_ids,
+                    num_prompt_logprobs,
+                    self.model_config.logprobs_mode,
+                    sampler=self.sampler,
+                    chunk_rows=chunk_rows,
+                )
             else:
-                scores = self.sampler.compute_logprobs(logits)
-            token_ids, logprobs, ranks, _ = self.sampler.gather_logprobs(
-                scores, num_prompt_logprobs, tgt_token_ids
-            )
+                # Small requests and the bounded 639-row diagnostic journal keep
+                # the original operations and score-stage fingerprints.
+                if self.model_config.logprobs_mode in (
+                    "raw_logits",
+                    "processed_logits",
+                ):
+                    scores = logits.to(torch.float32)
+                else:
+                    scores = self.sampler.compute_logprobs(logits)
+                if trace_match is not None:
+                    score_journal.record(trace_match, "scores", scores)
+                    score_journal.record(trace_match, "target_token_ids", tgt_token_ids)
+                token_ids, logprobs, ranks, _ = self.sampler.gather_logprobs(
+                    scores, num_prompt_logprobs, tgt_token_ids
+                )
+            if trace_match is not None:
+                score_journal.record(trace_match, "selected_logprobs", logprobs)
+                score_journal.finish(trace_match)
 
             # Transfer GPU->CPU async.
             chunk_slice = slice(start_idx, start_idx + num_logits)

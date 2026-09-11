@@ -52,6 +52,10 @@ class SharedExperts(torch.nn.Module):
         # index is always 0 and the second output list element is ignored.
         self.enable_dbo = enable_dbo
         self._output: list[torch.Tensor | None] = [None, None]
+        # Aux-stream outputs are joined (main stream waits on the aux stream)
+        # when they are consumed through `output`, not when they are launched,
+        # so the routed experts enqueued in between can overlap them.
+        self._join_pending: list[bool] = [False, False]
         self._layer = layer
         self._moe_config = moe_config
 
@@ -146,7 +150,7 @@ class SharedExperts(torch.nn.Module):
                 output = self._layer(
                     shared_experts_input, prequant_input=prequant_input
                 )
-        current_stream().wait_stream(self._stream)
+        self._join_pending[self._output_idx] = True
 
         return output
 
@@ -154,11 +158,22 @@ class SharedExperts(torch.nn.Module):
     def _output_idx(self) -> int:
         return dbo_current_ubatch_id() if self.enable_dbo else 0
 
+    def peek_output(self) -> torch.Tensor | None:
+        """The stored output, if any, without consuming or joining it."""
+        return self._output[self._output_idx]
+
     @property
     def output(self) -> torch.Tensor:
-        assert self._output[self._output_idx] is not None
-        output = self._output[self._output_idx]
-        self._output[self._output_idx] = None
+        """Consume the stored output; joins the aux stream first if it was
+        computed there."""
+        idx = self._output_idx
+        assert self._output[idx] is not None
+        if self._join_pending[idx]:
+            assert self._stream is not None
+            current_stream().wait_stream(self._stream)
+            self._join_pending[idx] = False
+        output = self._output[idx]
+        self._output[idx] = None
         return output
 
     def forward(

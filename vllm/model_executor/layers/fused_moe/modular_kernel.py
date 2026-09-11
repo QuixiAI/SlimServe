@@ -1275,6 +1275,23 @@ class FusedMoEKernelModularImpl:
 
         return a1q, a1q_scale, expert_tokens_meta, topk_ids, topk_weights
 
+    def _fused_out_is_final_output(self) -> bool:
+        """Whether the experts write their finished (weighted, reduced) result
+        into the buffer they are given, so it can be the kernel's output and
+        the finalize step's copy is skipped."""
+        if current_platform.is_rocm():
+            from vllm._aiter_ops import rocm_aiter_ops
+
+            return rocm_aiter_ops.is_fused_moe_enabled()
+        from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
+            TopKWeightAndReduceNoOP,
+        )
+
+        return isinstance(
+            self.fused_experts.finalize_weight_and_reduce_impl(),
+            TopKWeightAndReduceNoOP,
+        )
+
     def _fused_experts(
         self,
         in_dtype: torch.dtype,
@@ -1322,19 +1339,17 @@ class FusedMoEKernelModularImpl:
         # If caller's output buffer already matches fused_out shape/dtype, alias
         # to skip the redundant copy in TopKWeightAndReduceNoOP.apply downstream.
         # This eliminates ~94% of __amd_rocclr_copyBuffer events (Copy 2 of the
-        # double-copy MoE write-back path).
-        if current_platform.is_rocm():
-            from vllm._aiter_ops import rocm_aiter_ops
-
-            if (
-                rocm_aiter_ops.is_fused_moe_enabled()
-                and output_alias is not None
-                and output_alias.shape == fused_out.shape
-                and output_alias.dtype == fused_out.dtype
-                and output_alias.device == fused_out.device
-                and output_alias.is_contiguous()
-            ):
-                fused_out = output_alias
+        # double-copy MoE write-back path) on ROCm and the memcpy after every
+        # Marlin MoE layer on CUDA.
+        if (
+            output_alias is not None
+            and self._fused_out_is_final_output()
+            and output_alias.shape == fused_out.shape
+            and output_alias.dtype == fused_out.dtype
+            and output_alias.device == fused_out.device
+            and output_alias.is_contiguous()
+        ):
+            fused_out = output_alias
 
         self.fused_experts.apply(
             output=fused_out,

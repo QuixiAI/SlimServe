@@ -150,3 +150,14 @@ class Glm5NextMTP(DeepSeekMTP):
 
         loaded = super().load_weights(normalized_weights())
         return loaded | loaded_indexer
+
+
+# The independently qualified SM120 diagnostic adapter owns a different cache
+# grouping/recurrence contract. Keep it paired with its matching proposer;
+# ordinary GLM profiles on other platforms retain the compiled adapter above.
+from vllm.platforms import current_platform
+
+if current_platform.is_cuda() and current_platform.is_device_capability((12, 0)):
+    from .glm5_next_sm120_mtp import Glm5NextMTP as Glm5NextMTPModel
+else:
+    Glm5NextMTPModel = Glm5NextMTP

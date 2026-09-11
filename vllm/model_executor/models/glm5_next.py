@@ -23,6 +23,7 @@ sparse MLA kernel. The MTP head (layer 45) and video inputs are later
 phases.
 """
 
+import os
 from collections.abc import Iterable
 
 from typing import ClassVar, Literal
@@ -54,7 +55,14 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
 )
-import vllm.model_executor.layers.glm5_next_mhc_ops  # noqa: F401  (registers torch.ops.vllm.glm5_mhc_*)
+from vllm.model_executor.layers.glm5_next_indexer import (
+    Glm5NextPooledIndexer,
+)
+# Import also registers the compile-opaque torch.ops.vllm.glm5_mhc_* operators.
+from vllm.model_executor.layers.glm5_next_mhc_ops import (
+    load_lossless_mhc_fn,
+    validate_glm53_mhc_prefill_tc,
+)
 from vllm.model_executor.layers.glm5_next_mhc_project import (
     plain_bf16_projection,
     prepare_router_projection,
@@ -62,18 +70,12 @@ from vllm.model_executor.layers.glm5_next_mhc_project import (
     register_projection_stream,
     router_projection_enabled,
 )
-from vllm.model_executor.layers.glm5_next_indexer import (
-    Glm5NextPooledIndexer,
-)
 from vllm.model_executor.layers.glm5_next_indexer_workspace import (
     Glm5NextIndexerWorkspace,
 )
 from vllm.model_executor.layers.mla import (
     MLAModules,
     MultiHeadLatentAttentionWrapper,
-)
-from vllm.model_executor.layers.quantization.base_config import (
-    QuantizationConfig,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -87,16 +89,140 @@ from vllm.model_executor.models.interfaces import (
     SupportsPP,
 )
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
-    PPMissingLayer,
     is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
 )
+from vllm.model_executor.utils import set_weight_attrs
 from vllm.sequence import IntermediateTensors
 
 logger = init_logger(__name__)
+
+F32_OVERRIDES_FILE = "f32-overrides.safetensors"
+F32_OVERRIDES_ENV = "SLIMSERVE_F32_OVERRIDES"
+
+
+def _load_f32_overrides(model_path: str | None) -> dict[str, torch.Tensor]:
+    """Tensors to substitute for the checkpoint's copies, keyed by HF name.
+
+    Some NVFP4 conversions of GLM-5.3-Flash (RedHatAI's, 2026-08) saved the
+    router bias (``mlp.gate.e_score_correction_bias``), the KDA decay
+    tensors (``A_log``, ``dt_bias``) and the mHC base/scale vectors in BF16
+    although the native checkpoint keeps them in F32 and this model holds
+    them as F32 parameters. ``slimserve.f32_overrides`` rebuilds them from
+    the native checkpoint into ``<model>/f32-overrides.safetensors``; when
+    that file is present it wins over the shard copies. Set
+    ``SLIMSERVE_F32_OVERRIDES=0`` to serve the shard copies for an A/B.
+    """
+    import os
+
+    if not model_path or os.environ.get(F32_OVERRIDES_ENV, "1") == "0":
+        return {}
+    path = os.path.join(model_path, F32_OVERRIDES_FILE)
+    if not os.path.isfile(path):
+        return {}
+    from safetensors.torch import load_file
+
+    overrides = load_file(path)
+    bad = [k for k, v in overrides.items() if v.dtype != torch.float32]
+    if bad:
+        raise ValueError(
+            f"{path}: {len(bad)} override tensors are not float32, e.g. {bad[0]}"
+        )
+    logger.info("glm5_next: %d F32 override tensors from %s", len(overrides), path)
+    return overrides
+
+
+def iter_with_overrides(
+    weights: Iterable[tuple[str, torch.Tensor]],
+    overrides: dict[str, torch.Tensor],
+    extras: dict[str, torch.Tensor] | None = None,
+    strict: bool = False,
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """Yield ``weights`` with any name present in ``overrides`` replaced, then
+    the ``extras`` (tensors the checkpoint stream does not carry, such as the
+    block scales of a swapped FP8 weight). ``strict`` turns an override that
+    never appeared into an error: for the FP8 swap-set a missing substitution
+    would let the loader copy a BF16 shard into an FP8 parameter."""
+    if not overrides and not extras:
+        yield from weights
+        return
+    pending = set(overrides)
+    for name, weight in weights:
+        if name in overrides:
+            pending.discard(name)
+            yield name, overrides[name]
+        else:
+            yield name, weight
+    if pending:
+        msg = (
+            f"glm5_next: {len(pending)} override tensors never appeared in the "
+            f"checkpoint stream, e.g. {sorted(pending)[0]}"
+        )
+        if strict:
+            raise ValueError(msg)
+        logger.warning(msg)
+    if extras:
+        yield from extras.items()
+
+
+def iter_with_f32_overrides(
+    weights: Iterable[tuple[str, torch.Tensor]],
+    overrides: dict[str, torch.Tensor],
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """Yield ``weights`` with any name present in ``overrides`` replaced."""
+    return iter_with_overrides(weights, overrides)
+
+
+def _load_fp8_swapset(
+    model_path: str | None,
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    """(weights to substitute, block scales to inject) from the FP8 swap-set
+    ``slimserve.fp8_swapset`` wrote next to the checkpoint; empty when the
+    files are absent or ``SLIMSERVE_FP8_SWAPSET=0``. The quantization config
+    group that makes those modules block-FP8 is added by the model loader
+    from the same manifest, so the two cannot disagree."""
+    import json
+    import os
+
+    from slimserve.fp8_swapset import manifest_path
+
+    path = manifest_path(model_path)
+    if path is None:
+        return {}, {}
+    with open(path) as fh:
+        manifest = json.load(fh)
+    from safetensors.torch import load_file
+
+    file = os.path.join(model_path, manifest["file"])
+    tensors = load_file(file)
+    if sorted(tensors) != sorted(manifest["tensors"]):
+        raise ValueError(f"{file}: tensor names do not match the manifest {path}")
+    if manifest.get("self_quantized"):
+        tp_size = get_tensor_model_parallel_world_size()
+        if manifest.get("tp_size") != tp_size:
+            raise ValueError(
+                f"{path}: the self-quantized KDA beta layout is for tp_size="
+                f"{manifest.get('tp_size')}, serving with {tp_size}; rebuild the "
+                "swap-set with --self-quant-kda --tp-size"
+            )
+    subs = {k: v for k, v in tensors.items() if k.endswith(".weight")}
+    extras = {k: v for k, v in tensors.items() if k.endswith(".weight_scale")}
+    bad = [k for k, v in subs.items() if v.dtype != torch.float8_e4m3fn]
+    bad += [k for k, v in extras.items() if v.dtype != torch.float32]
+    if bad or len(subs) + len(extras) != len(tensors):
+        raise ValueError(
+            f"{file}: expected float8_e4m3fn weights and float32 weight_scale "
+            f"tensors only, e.g. {(bad or sorted(tensors))[0]}"
+        )
+    logger.info(
+        "glm5_next: FP8 swap-set from %s: %d weights, %d block scales",
+        file,
+        len(subs),
+        len(extras),
+    )
+    return subs, extras
 
 
 class Glm5NextMLAAttention(nn.Module):
@@ -127,9 +253,20 @@ class Glm5NextMLAAttention(nn.Module):
         self.num_local_heads = self.num_heads // tp_size
         self.scaling = self.qk_head_dim**-0.5
 
+        # The pooled indexer's three hidden_states projections (wk, the kpool
+        # compress gate, weights_proj) ride in the same replicated GEMM as
+        # extra output shards instead of three launches per DSA layer.
+        fold_indexer = current_platform.is_cuda() and current_platform.is_device_capability(
+            (12, 0)
+        )
+        self.indexer_a_sizes = (
+            (config.index_head_dim, config.index_head_dim, config.index_n_heads)
+            if fold_indexer else None
+        )
         self.fused_qkv_a_proj = MergedColumnParallelLinear(
             self.hidden_size,
-            [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+            [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim]
+            + list(self.indexer_a_sizes or ()),
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.fused_qkv_a_proj",
@@ -169,6 +306,7 @@ class Glm5NextMLAAttention(nn.Module):
             cache_config=cache_config,
             topk_indices_buffer=topk_indices_buffer,
             prefix=f"{prefix}.indexer",
+            fold_input_projections=fold_indexer,
             workspace=indexer_workspace,
         )
         mla_modules = MLAModules(
@@ -184,6 +322,7 @@ class Glm5NextMLAAttention(nn.Module):
             indexer=self.indexer,
             is_sparse=True,
             topk_indices_buffer=topk_indices_buffer,
+            indexer_a_sizes=self.indexer_a_sizes,
         )
         self.mla_attn = MultiHeadLatentAttentionWrapper(
             self.hidden_size,
@@ -243,8 +382,17 @@ class Glm5NextDecoderLayer(nn.Module):
         )
 
         if self.is_linear:
+            from slimserve.fp8_swapset import beta_shard_rows
+
             self.self_attn = KimiGatedDeltaNetAttention(
-                config, vllm_config, prefix=f"{prefix}.self_attn", fuse_gate_a=True
+                config,
+                vllm_config,
+                prefix=f"{prefix}.self_attn",
+                beta_shard_rows=beta_shard_rows(
+                    vllm_config.model_config.model,
+                    f"{prefix}.self_attn.in_proj_qkvgfab",
+                ),
+                fuse_gate_a=True,
             )
         else:
             self.self_attn = Glm5NextMLAAttention(
@@ -281,13 +429,25 @@ class Glm5NextDecoderLayer(nn.Module):
         mix_hc = (2 + self.hc_mult) * self.hc_mult
         hc_dim = self.hc_mult * self.hidden_size
 
-        def _p(*shape):
+        def _p(*shape, dtype=torch.float32):
             return nn.Parameter(
-                torch.empty(*shape, dtype=torch.float32), requires_grad=False
+                torch.empty(*shape, dtype=dtype), requires_grad=False
             )
 
-        self.hc_attn_fn = _p(mix_hc, hc_dim)
-        self.hc_ffn_fn = _p(mix_hc, hc_dim)
+        # Profile-selected lossless storage; native FP32 base/scale stay FP32.
+        bf16_fn = os.getenv("VLLM_GLM5_MHC_BF16_FN", "0") == "1"
+        if os.getenv("VLLM_GLM5_MHC_PREFILL_TC", "0") == "1":
+            validate_glm53_mhc_prefill_tc(config, bf16_fn)
+            logger.info_once(
+                "GLM53 mHC tensor-core prefill enabled: SM120, lossless BF16 fn, "
+                "64..7616 rows; registered decode batches retain their existing path"
+            )
+        fn_dtype = torch.bfloat16 if bf16_fn else torch.float32
+        self.hc_attn_fn = _p(mix_hc, hc_dim, dtype=fn_dtype)
+        self.hc_ffn_fn = _p(mix_hc, hc_dim, dtype=fn_dtype)
+        if bf16_fn:
+            for param in (self.hc_attn_fn, self.hc_ffn_fn):
+                set_weight_attrs(param, {"weight_loader": load_lossless_mhc_fn})
         self.hc_attn_base = _p(mix_hc)
         self.hc_ffn_base = _p(mix_hc)
         self.hc_attn_scale = _p(3)
@@ -390,6 +550,64 @@ class Glm5NextDecoderLayer(nn.Module):
         else:
             x = self.mlp(x, router_logits=router_logits)
         return x, residual, post_mix, res_mix
+
+
+class Glm5NextMTPBlock(nn.Module):
+    """The MTP (NextN) layer's decoder block: a plain-residual DSA layer.
+
+    Layer ``num_hidden_layers`` of GLM-5.3-Flash carries no mHC and no KDA:
+    input RMSNorm -> sparse NoPE MLA -> residual add -> post RMSNorm -> MoE
+    -> residual add. ``config.layer_types`` / ``mlp_layer_types`` stop at
+    the last target layer, so the block is built explicitly. The module
+    prefix stays ``...layers.<idx>`` so the checkpoint's compressed-tensors
+    targets for that layer (FP8 block experts) resolve; the draft loader
+    (``glm5_next_mtp.py``) rewrites checkpoint names onto the ``mtp_block``
+    attribute path.
+    """
+
+    def __init__(
+        self,
+        config,
+        vllm_config: VllmConfig,
+        prefix: str,
+        topk_indices_buffer: torch.Tensor,
+    ) -> None:
+        super().__init__()
+        quant_config = vllm_config.quant_config
+        self.hidden_size = config.hidden_size
+        self.self_attn = Glm5NextMLAAttention(
+            config, vllm_config, prefix=f"{prefix}.self_attn",
+            topk_indices_buffer=topk_indices_buffer,
+        )
+        self.mlp = DeepseekV2MoE(
+            config=config,
+            parallel_config=vllm_config.parallel_config,
+            quant_config=quant_config,
+            prefix=f"{prefix}.mlp",
+        )
+        self.input_layernorm = RMSNorm(self.hidden_size, config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(
+            self.hidden_size, config.rms_norm_eps
+        )
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        hidden_states = self.self_attn(positions, hidden_states)
+        hidden_states, residual = self.post_attention_layernorm(
+            hidden_states, residual
+        )
+        hidden_states = self.mlp(hidden_states)
+        # The caller adds the residual (pre-final-norm hidden for the logits).
+        return hidden_states, residual
 
 
 @support_torch_compile
@@ -557,6 +775,9 @@ class Glm5NextForCausalLM(
         # MLA latent projections
         ("fused_qkv_a_proj", "q_a_proj", 0),
         ("fused_qkv_a_proj", "kv_a_proj_with_mqa", 1),
+        ("fused_qkv_a_proj", "indexer.wk", 2),
+        ("fused_qkv_a_proj", "indexer.index_kpool_compress_gate", 3),
+        ("fused_qkv_a_proj", "indexer.weights_proj", 4),
         # KDA merged input projection: [q, k, v, b(beta), f_a, g_a]
         ("in_proj_qkvgfab", "q_proj", 0),
         ("in_proj_qkvgfab", "k_proj", 1),
@@ -577,6 +798,7 @@ class Glm5NextForCausalLM(
         super().__init__()
         config = vllm_config.model_config.hf_config.get_text_config()
         self.config = config
+        self._model_path = vllm_config.model_config.model
         self.model = Glm5NextTextModel(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
@@ -657,6 +879,10 @@ class Glm5NextForCausalLM(
         )
         params_dict = dict(self.named_parameters())
         loaded: set[str] = set()
+        model_path = getattr(self, "_model_path", None)
+        weights = iter_with_f32_overrides(weights, _load_f32_overrides(model_path))
+        fp8_weights, fp8_scales = _load_fp8_swapset(model_path)
+        weights = iter_with_overrides(weights, fp8_weights, fp8_scales, strict=True)
         for name, weight in weights:
             # Vision tower and MTP layer: later phases.
             if name.startswith("model.visual."):
@@ -674,12 +900,20 @@ class Glm5NextForCausalLM(
             mapped = False
             if not is_expert:
                 for target, ckpt_name, shard_id in self.stacked_params_mapping:
+                    if ckpt_name.startswith("indexer.") and name in params_dict:
+                        # Non-SM120 keeps these projections separate. Do not
+                        # load them into the two-shard Q/KV projection.
+                        continue
                     token = f".{ckpt_name}."
                     if token not in name and not name.endswith(
                         f".{ckpt_name}"
                     ):
                         continue
                     tgt = name.replace(ckpt_name, target)
+                    if tgt not in params_dict and f"{tgt}.weight" in params_dict:
+                        # A bare checkpoint parameter folded into a Linear
+                        # (the indexer's kpool compress gate) lands in .weight.
+                        tgt = f"{tgt}.weight"
                     if tgt not in params_dict:
                         continue
                     param = params_dict[tgt]

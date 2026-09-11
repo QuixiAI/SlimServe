@@ -22,12 +22,12 @@ from typing import Any
 
 import pybase64 as base64
 import regex as re
-import requests
 
 from slimserve import fetch, hardware, registry
 from slimserve.engine import engine_kwargs
 from slimserve.registry import Plan, ProfileError
 from slimserve.server import Server
+from slimserve.stream import chat_completion, visible_text
 
 _TEXT_PROMPT = "What is 2 + 2? Reply with only the number."
 _IMAGE_PROMPT = "What is the dominant color in this image? Reply with one word."
@@ -96,7 +96,10 @@ def resolve_profiles(
         raise RuntimeError(f"{registry.platform_title(machine.platform)}: {blocked}")
 
     compatible = compatible_profile_ids(machine)
-    selected = requested or compatible
+    selected = (
+        list(dict.fromkeys(registry.canonical_profile_id(p) for p in requested))
+        if requested else compatible
+    )
     if not selected:
         raise RuntimeError("no compatible profiles found")
 
@@ -173,32 +176,36 @@ def _request(
             {"type": "text", "text": prompt},
         ]
     messages = [{"role": "user", "content": content}]
+    events = []
     started = time.perf_counter()
-    body = {
-        "model": plan.engine.get("served_model_name", "model"),
-        "messages": messages,
-        "max_tokens": max_tokens,
-        # Keep the registered sampling and thinking defaults.
-        "seed": 42,
-    }
-    if plan.chat_template_kwargs:
-        body["chat_template_kwargs"] = plan.chat_template_kwargs
-    with requests.post(
-        f"{base_url}/v1/chat/completions", json=body, timeout=timeout
-    ) as response:
-        response.raise_for_status()
-        result = response.json()
-    if result.get("error"):
-        raise RuntimeError(f"chat failed: {result['error']}")
-    choice = result["choices"][0]
-    answer = choice["message"].get("content") or ""
+    raw = "".join(
+        chat_completion(
+            base_url,
+            plan.engine.get("served_model_name", "model"),
+            messages,
+            max_tokens=max_tokens,
+            # No sampling overrides: the model's shipped defaults apply.
+            # Seeded for repeatable smoke answers; greedy is never used.
+            seed=42,
+            chat_template_kwargs=plan.chat_template_kwargs or None,
+            timeout=timeout,
+            on_event=events.append,
+            include_reasoning=False,
+        )
+    )
+    answer = visible_text(raw)
     # A correct-looking number in the reasoning is not a completed answer.
-    if not answer.strip() or choice["finish_reason"] == "length":
-        raise RuntimeError(f"empty or truncated chat answer: {result}")
+    if not answer.strip() or any(
+        choice.get("finish_reason") == "length"
+        for event in events
+        for choice in event.get("choices") or []
+    ):
+        raise RuntimeError(f"empty or truncated chat answer: {events}")
     return {
         "answer": answer,
         "seconds": time.perf_counter() - started,
-        "response": result,
+        "response_events": events,
+        "answer_source": "content",
     }
 
 

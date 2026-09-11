@@ -41,6 +41,11 @@ def profile_ids() -> list[str]:
     return list(_registry()["profiles"])
 
 
+def canonical_profile_id(profile_id: str) -> str:
+    """Preserve recorded commands without listing duplicate serving profiles."""
+    return _registry().get("profile_aliases", {}).get(profile_id, profile_id)
+
+
 def platform_title(platform: str) -> str:
     entry = _registry()["platforms"].get(platform)
     return entry["title"] if entry else platform
@@ -156,6 +161,7 @@ class Plan:
     # Variant-level drafter when platforms diverge; falls back to the
     # source-level speculator.
     variant_speculator: dict[str, Any] | None = None
+    weight_recipe: dict[str, Any] | None = None
 
     @property
     def speculator(self) -> dict[str, Any] | None:
@@ -171,6 +177,8 @@ class Plan:
         if self.source.get("format") == "safetensors":
             # A safetensors checkpoint is a directory of shards plus config
             # and tokenizer files; the engine takes the directory itself.
+            if self.weight_recipe:
+                return cache_root() / self.weight_recipe["local_dir"]
             return self.model_dir
         if self.quant.assembly:
             return self.model_dir / self.quant.assembly["output"]
@@ -213,6 +221,7 @@ def describe(profile_id: str) -> dict[str, Any]:
     the platform list, and `variant()` returns the record for one platform.
     """
     profiles = _registry()["profiles"]
+    profile_id = canonical_profile_id(profile_id)
     if profile_id not in profiles:
         raise ProfileError(
             f"unknown profile {profile_id!r}; available: {', '.join(profiles)}"
@@ -267,6 +276,10 @@ def _merge_platform(profile: dict[str, Any], platform: str) -> dict[str, Any]:
         # qwen38-nvfp4-1: the MI300X variant reuses the checkpoint's MTP
         # head, the Metal variant serves the measured DFlash2 drafter).
         "speculator": record.get("speculator"),
+        # A record may enable or disable speculation for its platform alone
+        # (glm53-nvfp4-4: MTP validated on rtx6000 first, a100 stays off).
+        "speculative": record.get("speculative"),
+        "weight_recipe": copy.deepcopy(record.get("weight_recipe")),
     }
 
 
@@ -433,11 +446,16 @@ def resolve(
         quant=chosen,
         engine=merged["engine"],
         env=merged["env"],
-        speculative=bool(profile.get("speculative")),
+        speculative=bool(
+            profile.get("speculative")
+            if merged["speculative"] is None
+            else merged["speculative"]
+        ),
         speculative_overrides=merged["speculative_overrides"],
         chat_template_kwargs=dict(profile.get("chat_template_kwargs") or {}),
         notes=merged["notes"],
         variant_speculator=merged["speculator"],
+        weight_recipe=merged["weight_recipe"],
     )
     validate_cache_policy(plan.engine)
     if plan.speculator:

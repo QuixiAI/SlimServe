@@ -28,11 +28,18 @@ opaque to torch.compile and captures into decode CUDA graphs.
 
 from __future__ import annotations
 
+import os
+from functools import cache as cache_once
+
 import torch
 from torch import nn
 
+from slimserve.canonical_indexer import maybe_ordered_topk
+from slimserve.index_journal import instrument_pooled_indexer, instrument_topk
+
 from vllm import _custom_ops as ops
-from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
+from vllm.config import CacheConfig, VllmConfig
+from vllm.distributed import get_dcp_group, get_pcp_group, get_tp_group
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.glm5_next_indexer_workspace import (
@@ -60,10 +67,60 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
 logger = init_logger(__name__)
 
+# Keep the observer outside the intervention: record the actual selection order
+# passed to pool expansion. Both factories are identity functions when disabled.
+top_k_per_row_prefill = instrument_topk(maybe_ordered_topk(ops.top_k_per_row_prefill))
+
 # Row layout of the cached indexer state.
 _K_DIM = 128
 _ROW_DIM = 2 * _K_DIM  # [k | gate]
 _POOL_PROGRAMS = 128  # programs per row on the pool axis (stride loop inside)
+# Prefill path: pooled keys once per (request, pool), then a tensor-core
+# matmul of [_ROW_TILE * H, D] query rows against [_POOL_TILE, D] pooled keys.
+# Kill switch for A/B runs only (read here, so it is not a compile factor):
+# VLLM_GLM5_INDEXER_PREFILL_MATMUL=0 scores prefill rows with the decode-shaped
+# per-row kernel instead.
+def _prefill_matmul_enabled() -> bool:
+    # Keep A100's raw-cache fallback on its original per-row implementation.
+    # Its compact-cache path has an independent prefill scorer.
+    sm120 = current_platform.is_cuda() and current_platform.is_device_capability(
+        (12, 0)
+    )
+    return os.getenv("VLLM_GLM5_INDEXER_PREFILL_MATMUL", "1" if sm120 else "0") != "0"
+
+
+_PREFILL_MATMUL = _prefill_matmul_enabled()
+# Profile-selected SM120 geometry: fewer query rows and more pooled keys avoid the
+# original tile's register spills. Arithmetic and selection are unchanged.
+# Keep other profiles on their measured geometry; set before worker import.
+_SM120_TILES = os.getenv("VLLM_GLM5_INDEXER_SM120_TILES", "0") == "1"
+_ROW_TILE = 2 if _SM120_TILES else 8
+_POOL_TILE = 128 if _SM120_TILES else 64
+_TP_PREFILL_SHARD = os.getenv("VLLM_GLM53_INDEXER_TP_PREFILL", "0") == "1"
+
+
+def _prefill_row_sharding_enabled(chunks) -> bool:
+    # This fork stores host-side context lengths on each chunk, not on the
+    # enclosing prefill metadata (unlike the newer upstream implementation).
+    return bool(
+        _TP_PREFILL_SHARD and _PREFILL_MATMUL and chunks
+        and chunks[-1].token_end - chunks[0].token_start >= 2048
+        and max(c.max_seq_len for c in chunks) >= 32768
+    )
+
+
+@cache_once
+def _prefill_shard_group():
+    # Explicit SM120/TP4 opt-in. Decode, short prefills and other platforms
+    # retain the existing zero-communication path.
+    if (not _TP_PREFILL_SHARD or not torch.cuda.is_available()
+            or torch.cuda.get_device_capability() != (12, 0)):
+        return None
+    group = get_tp_group()
+    if (group.world_size != 4 or get_dcp_group().world_size != 1
+            or get_pcp_group().world_size != 1):
+        return None
+    return group
 
 
 def _compact_decode_options(vllm_config, heads):
@@ -298,9 +355,15 @@ def _expand_topk_kernel(
     tail_count = vis - n_pools * KP
     tail_start = n_pools * KP
     n_sel = tl.minimum(n_pools, KSEL)  # top-k writes valid pools first
+    # Only the selected slots are written here; the tail store and the
+    # padding loop below own the columns from n_sel * KP on. Threads of one
+    # program are not ordered against each other, so a slot written by two
+    # stores keeps whichever lands last: writing -1 over [0, KSEL * KP) here
+    # raced the tail store and dropped the tail (often the query's own
+    # token) from a fraction of rows.
     for s0 in range(0, KSEL, BLOCK_S):
         s = s0 + tl.arange(0, BLOCK_S)
-        smask = s < KSEL
+        smask = s < n_sel
         pool = tl.load(sel_ptr + r.to(tl.int64) * sel_stride + s, mask=smask, other=-1)
         ok = smask & (pool >= 0) & (pool < n_pools)
         m = tl.arange(0, KP)
@@ -322,7 +385,214 @@ def _expand_topk_kernel(
         tl.store(out_ptr + r.to(tl.int64) * OUT_W + c, tl.full((256,), -1, tl.int32), mask=cm)
 
 
+@triton.jit(do_not_specialize=["max_pools"])
+def _pool_keys_kernel(
+    ape_ptr,        # [KP, D] fp32
+    cache_ptr,      # [num_slots, ROW] bf16
+    bt_ptr,         # [num_bt_rows, bt_stride] int32
+    req_pools_ptr,  # [num_bt_rows] int32: pools to build per block-table row
+    pk_ptr,         # [num_bt_rows, max_pools, D] bf16
+    max_pools,
+    bt_stride,
+    page_stride,
+    BLOCK_SIZE: tl.constexpr,
+    D: tl.constexpr,
+    KP: tl.constexpr,
+    ROW: tl.constexpr,
+    BLOCK_P: tl.constexpr,
+):
+    """pk[req, p, :] = sum_m softmax_m(gate(t_m) + ape[m]) * k(t_m) over the
+    KP members of pool p of the request in block-table row req. The pooled
+    key depends only on the cache and APE, never on the query, so the
+    prefill path builds it once per request instead of once per query row
+    (`_pooled_logits_kernel` re-pools it for every row: rows x visible
+    softmaxes gathered through the block table). Same arithmetic and the
+    same bf16 rounding as that kernel's pool_key."""
+    req = tl.program_id(0)
+    pt = tl.program_id(1)
+    n_pools = tl.load(req_pools_ptr + req)
+    p = pt * BLOCK_P + tl.arange(0, BLOCK_P)
+    pmask = p < n_pools
+    m = tl.arange(0, KP)
+    d = tl.arange(0, D)
+    ape = tl.load(ape_ptr + m[:, None] * D + d[None, :])  # [KP, D]
+    tok = p[:, None] * KP + m[None, :]  # [P, KP]
+    blk = tl.load(
+        bt_ptr + req.to(tl.int64) * bt_stride + tok // BLOCK_SIZE,
+        mask=pmask[:, None],
+        other=0,
+    )
+    base = cache_ptr + (
+        blk.to(tl.int64) * page_stride + (tok % BLOCK_SIZE) * ROW
+    )[:, :, None]  # [P, KP, 1]
+    k = tl.load(base + d[None, None, :], mask=pmask[:, None, None], other=0.0)
+    g = tl.load(base + D + d[None, None, :], mask=pmask[:, None, None], other=0.0)
+    logits_g = g.to(tl.float32) + ape[None, :, :]  # [P, KP, D]
+    mx = tl.max(logits_g, axis=1)  # [P, D]
+    e = tl.exp(logits_g - mx[:, None, :])
+    probs = e / tl.sum(e, axis=1)[:, None, :]
+    pool_key = tl.sum(probs * k.to(tl.float32), axis=1)  # [P, D]
+    tl.store(
+        pk_ptr + (req.to(tl.int64) * max_pools + p)[:, None] * D + d[None, :],
+        pool_key.to(tl.bfloat16),
+        mask=pmask[:, None],
+    )
+
+
+@triton.jit
+def _row_tiles_kernel(
+    start_ptr,      # [num_req] int32: first query row of the request
+    count_ptr,      # [num_req] int32: query rows of the request
+    first_ptr,      # [num_req] int32: first tile slot of the request
+    row0_ptr,       # [max_tiles] int32 out
+    end_ptr,        # [max_tiles] int32 out
+    req_ptr,        # [max_tiles] int32 out
+    RT: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+):
+    """Tiles of RT consecutive query rows of one request (the last tile of a
+    request is short), written at the request's slots of the tile table.
+    Sized on the host from an upper bound, so no sync: unused slots keep
+    their (0, 0) fill and the matmul programs that draw them exit."""
+    req = tl.program_id(0)
+    start = tl.load(start_ptr + req)
+    count = tl.load(count_ptr + req)
+    first = tl.load(first_ptr + req)
+    n_tiles = (count + RT - 1) // RT
+    for t0 in range(0, n_tiles, BLOCK_T):
+        t = t0 + tl.arange(0, BLOCK_T)
+        tmask = t < n_tiles
+        row0 = start + t * RT
+        tl.store(row0_ptr + first + t, row0, mask=tmask)
+        tl.store(end_ptr + first + t, tl.minimum(row0 + RT, start + count), mask=tmask)
+        req_v = tl.full((BLOCK_T,), 0, tl.int32) + req
+        tl.store(req_ptr + first + t, req_v, mask=tmask)
+
+
+@triton.jit(do_not_specialize=["max_pools"])
+def _pooled_logits_matmul_kernel(
+    q_ptr,          # [R, H, D] bf16
+    w_ptr,          # [R, H] fp32 (already * n_heads^-0.5)
+    pk_ptr,         # [num_bt_rows, max_pools, D] bf16 pooled keys
+    row0_ptr,       # [max_tiles] int32
+    end_ptr,        # [max_tiles] int32
+    req_ptr,        # [max_tiles] int32
+    vis_ptr,        # [R] int32
+    out_ptr,        # [R, max_pools] fp32
+    max_pools,
+    softmax_scale,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    KP: tl.constexpr,
+    RT: tl.constexpr,
+    PT: tl.constexpr,
+):
+    """logits[r, p] = sum_h w[r, h] * relu(scale * <pk[req(r), p], q[r, h]>)
+    for p < vis(r) // KP. One program scores a row tile (rows [row0, end)
+    of one request) against PT pools as a [RT * H, D] x [D, PT] tensor-core
+    product; pool tiles past every row's visibility exit at once."""
+    rt = tl.program_id(0)
+    pt = tl.program_id(1)
+    r0 = tl.load(row0_ptr + rt)
+    r_end = tl.load(end_ptr + rt)
+    rows = r0 + tl.arange(0, RT)
+    rmask = rows < r_end
+    vis = tl.load(vis_ptr + rows, mask=rmask, other=0)
+    n_pools = vis // KP
+    p0 = pt * PT
+    if p0 >= tl.max(n_pools, axis=0):
+        return
+    req = tl.load(req_ptr + rt)
+    p = p0 + tl.arange(0, PT)
+    d = tl.arange(0, D)
+    pk = tl.load(
+        pk_ptr + (req.to(tl.int64) * max_pools + p)[:, None] * D + d[None, :],
+        mask=(p < max_pools)[:, None],
+        other=0.0,
+    )  # [PT, D]
+    qi = tl.arange(0, RT * H)
+    qrow = r0 + qi // H
+    qmask = qrow < r_end
+    q = tl.load(
+        q_ptr + (qrow.to(tl.int64) * H + qi % H)[:, None] * D + d[None, :],
+        mask=qmask[:, None],
+        other=0.0,
+    )  # [RT * H, D]
+    scores = tl.dot(q, tl.trans(pk))  # [RT * H, PT] fp32
+    scores = tl.maximum(scores * softmax_scale, 0.0)
+    w = tl.load(w_ptr + qrow * H + qi % H, mask=qmask, other=0.0)  # [RT * H]
+    scores = tl.reshape(scores * w[:, None], (RT, H, PT))
+    logit = tl.sum(scores, axis=1)  # [RT, PT]
+    valid = (p[None, :] < n_pools[:, None]) & rmask[:, None]
+    logit = tl.where(valid, logit, float("-inf"))
+    tl.store(
+        out_ptr + rows.to(tl.int64)[:, None] * max_pools + p[None, :],
+        logit,
+        mask=rmask[:, None] & (p[None, :] < max_pools),
+    )
+
+
 # --------------------------------------------------------------------- core op
+
+
+def _pooled_logits_by_request(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    ape: torch.Tensor,
+    cache: torch.Tensor,
+    block_table: torch.Tensor,
+    row_req: torch.Tensor,
+    n_pools: torch.Tensor,     # [R] int32: visible // kp per row
+    visible: torch.Tensor,
+    logits: torch.Tensor,
+    max_pools: int,
+    block_size: int,
+    softmax_scale: float,
+    kp: int,
+) -> None:
+    """Fill `logits` for rows grouped by request (rows of a request are
+    contiguous, requests in block-table order, as in a prefill chunk):
+    pooled keys once per request, then the tiled matmul. Every size that
+    shapes a launch is a host int, so nothing syncs."""
+    R, H, D = q.shape
+    RT, PT = _ROW_TILE, _POOL_TILE
+    n_req = block_table.shape[0]
+    dev = q.device
+    i32 = torch.int32
+    req_ids = torch.arange(n_req, device=dev, dtype=row_req.dtype)
+    start = torch.searchsorted(row_req, req_ids).to(i32)
+    end = torch.searchsorted(row_req, req_ids, right=True).to(i32)
+    count = end - start
+    req_pools = torch.zeros(n_req, dtype=i32, device=dev)
+    req_pools.scatter_reduce_(0, row_req.long(), n_pools, reduce="amax")
+    n_tiles = (count + (RT - 1)) // RT
+    tile_first = torch.cumsum(n_tiles, 0, dtype=i32) - n_tiles
+    # sum over requests of ceil(count / RT) <= ceil(R / RT) + n_req; padded
+    # to 16 slots so the three table rows stay 16-byte aligned (Triton
+    # specialises pointer args on alignment: one compile per boot, not one
+    # per tile count).
+    max_tiles = -(-(triton.cdiv(R, RT) + n_req) // 16) * 16
+    tiles = torch.zeros((3, max_tiles), dtype=i32, device=dev)
+    _row_tiles_kernel[(n_req,)](
+        start, count, tile_first, tiles[0], tiles[1], tiles[2],
+        RT=RT, BLOCK_T=256,
+    )
+    pk = torch.empty((n_req, max_pools, D), dtype=torch.bfloat16, device=dev)
+    BLOCK_P = 16
+    _pool_keys_kernel[(n_req, triton.cdiv(max_pools, BLOCK_P))](
+        ape, cache, block_table, req_pools, pk, max_pools,
+        block_table.stride(0), cache.stride(0),
+        BLOCK_SIZE=block_size, D=D, KP=kp, ROW=_ROW_DIM, BLOCK_P=BLOCK_P,
+    )
+    _pooled_logits_matmul_kernel[(max_tiles, triton.cdiv(max_pools, PT))](
+        q, weights, pk, tiles[0], tiles[1], tiles[2], visible, logits,
+        max_pools, softmax_scale, H=H, D=D, KP=kp, RT=RT, PT=PT,
+    )
+
+
+def _prefill_row_req(chunk, R: int) -> torch.Tensor:
+    """Compatibility entry point; retain actual table IDs for sliced queries."""
+    return _prefill_query_requests(chunk)[:R]
 
 
 def _prefill_query_requests(chunk) -> torch.Tensor:
@@ -352,14 +622,13 @@ def _pooled_topk(
     softmax_scale: float,
     ksel: int,
     kp: int,
+    by_request: bool = False,  # rows grouped by request: prefill chunks
     adaptive_score: bool = False,
 ) -> torch.Tensor:
     R, H, D = q.shape
-    assert R > 0
-    BLOCK_P = 16
-    # Fixed program count per row; each program strides over the row's
-    # actual pool tiles (see the kernel docstring).
-    grid = (R, min(triton.cdiv(max_pools, BLOCK_P), _POOL_PROGRAMS))
+    if R == 0:
+        return torch.empty((0, ksel), dtype=torch.int32, device=q.device)
+    n_pools = torch.div(visible, kp, rounding_mode="floor").to(torch.int32)
     if cache.shape[-1] == POOL_CACHE_HEAD_DIM:
         assert kp == 4 and D == 128 and softmax_scale == 128**-0.5
         if adaptive_score and R <= 64:
@@ -368,17 +637,27 @@ def _pooled_topk(
             adaptive_pool_logits(q, weights, cache, block_table, row_req, visible, logits)
         else:
             cached_pool_logits(q, weights, cache, block_table, row_req, visible, logits)
+    elif by_request:
+        _pooled_logits_by_request(
+            q, weights, ape, cache, block_table, row_req, n_pools, visible,
+            logits, max_pools, block_size, softmax_scale, kp,
+        )
     else:
+        BLOCK_P = 16
+        # Fixed program count per row; each program strides over the row's
+        # actual pool tiles (see the kernel docstring).
+        grid = (R, min(triton.cdiv(max_pools, BLOCK_P), _POOL_PROGRAMS))
         _pooled_logits_kernel[grid](
             q, weights, ape, cache, block_table, row_req, visible,
-            logits, max_pools, block_table.stride(0), cache.stride(0), softmax_scale,
-            BLOCK_SIZE=block_size, H=H, D=D, KP=kp, ROW=_ROW_DIM, BLOCK_P=BLOCK_P,
+            logits, max_pools, block_table.stride(0), cache.stride(0),
+            softmax_scale,
+            BLOCK_SIZE=block_size, H=H, D=D, KP=kp, ROW=_ROW_DIM,
+            BLOCK_P=BLOCK_P,
         )
     # top-k over pools: prefill-style ranges [0, n_pools) per row.
-    n_pools = torch.div(visible, kp, rounding_mode="floor").to(torch.int32)
     zeros = torch.zeros_like(n_pools)
     sel = torch.empty((R, ksel), dtype=torch.int32, device=q.device)
-    ops.top_k_per_row_prefill(
+    top_k_per_row_prefill(
         logits[:R], zeros, n_pools, sel, R, logits.stride(0), logits.stride(1),
         ksel,
     )
@@ -388,6 +667,7 @@ def _pooled_topk(
 def _pooled_select(
     q, weights, ape, cache, block_table, row_req, visible, logits,
     max_pools, block_size, softmax_scale, ksel, topk_out, kp,
+    by_request=False,
     adaptive_score=False, row_shard=False,
 ) -> None:
     R = q.shape[0]
@@ -400,7 +680,7 @@ def _pooled_select(
         assert group.world_size in (4, 8) and 0 <= group.rank_in_group < group.world_size
         assert R in (16, 32) and q.shape[1:] == (32, 128)
         assert cache.shape[-1] == POOL_CACHE_HEAD_DIM and kp == 4 and ksel == 512
-        assert not adaptive_score
+        assert not adaptive_score and not by_request
         communicator = group.device_communicator
         assert communicator is not None
         communicator.wait_for_comm_init()
@@ -422,7 +702,8 @@ def _pooled_select(
     else:
         sel = _pooled_topk(
             q, weights, ape, cache, block_table, row_req, visible, logits,
-            max_pools, block_size, softmax_scale, ksel, kp, adaptive_score,
+            max_pools, block_size, softmax_scale, ksel, kp,
+            by_request=by_request, adaptive_score=adaptive_score,
         )
     _expand_topk_kernel[(R,)](
         sel, visible, topk_out, sel.stride(0),
@@ -430,6 +711,52 @@ def _pooled_select(
     )
 
 
+def _pooled_prefill_tp_select(
+    q, weights, ape, cache, chunks, topk_out, block_size,
+    softmax_scale, ksel, kp, group,
+) -> None:
+    """Disjoint query rows; one pool-ID exchange before token expansion.
+
+    Adapted from vLLM #54951's row-ownership design. Pool IDs are 4x smaller
+    than expanded indices for GLM53. No score reduction/quantization change.
+    Chunk offsets exclude leading decode rows and trailing graph padding.
+    """
+    first, last = chunks[0].token_start, chunks[-1].token_end
+    owned = triton.cdiv(last - first, group.world_size)
+    start = first + group.rank_in_group * owned
+    stop = min(start + owned, last)
+    local = torch.full((owned, ksel), -1, dtype=torch.int32, device=q.device)
+    for chunk in chunks:
+        lo, hi = max(start, chunk.token_start), min(stop, chunk.token_end)
+        if lo >= hi:
+            continue
+        R = chunk.token_end - chunk.token_start
+        offset = slice(lo - chunk.token_start, hi - chunk.token_start)
+        visible = (chunk.cu_seqlen_ke - chunk.cu_seqlen_ks).to(torch.int32)
+        row_req = _prefill_row_req(chunk, R)
+        max_pools = max(1, chunk.max_seq_len // kp)
+        logits = torch.empty((hi - lo, max_pools), dtype=torch.float32, device=q.device)
+        local[lo - start:hi - start] = _pooled_topk(
+            q[lo:hi], weights[lo:hi], ape, cache, chunk.block_table,
+            row_req[offset], visible[offset], logits, max_pools, block_size,
+            softmax_scale, ksel, kp, by_request=True,
+        )
+    # Keep local alive until all dependent work is enqueued. Empty owners still
+    # participate with padding; every rank issues exactly one collective.
+    gathered = group.all_gather(local, dim=0)
+    for chunk in chunks:
+        R = chunk.token_end - chunk.token_start
+        if R <= 0:
+            continue
+        selected = gathered[chunk.token_start - first:chunk.token_end - first]
+        visible = (chunk.cu_seqlen_ke - chunk.cu_seqlen_ks).to(torch.int32)
+        _expand_topk_kernel[(R,)](
+            selected, visible, topk_out[chunk.token_start:chunk.token_end],
+            selected.stride(0), KP=kp, KSEL=ksel, OUT_W=topk_out.shape[1], BLOCK_S=64,
+        )
+
+
+@instrument_pooled_indexer
 def glm5_next_pooled_indexer(
     q: torch.Tensor,
     packed: torch.Tensor,
@@ -479,7 +806,19 @@ def glm5_next_pooled_indexer(
     # 2) prefill chunks.
     if md.num_prefills > 0:
         assert md.prefill is not None
-        for chunk in md.prefill.chunks:
+        chunks = md.prefill.chunks
+        group = None
+        if _prefill_row_sharding_enabled(chunks):
+            group = _prefill_shard_group()
+        if group is not None:
+            logger.info_once(
+                "GLM53 TP4 prefill indexer row sharding active (pool-ID exchange)."
+            )
+            _pooled_prefill_tp_select(
+                q, weights, ape, cache, chunks, topk_indices_buffer,
+                block_size, softmax_scale, ksel, kp, group,
+            )
+        for chunk in (() if group is not None else chunks):
             R = chunk.token_end - chunk.token_start
             if R <= 0:
                 continue
@@ -495,6 +834,7 @@ def glm5_next_pooled_indexer(
                 ape, cache, chunk.block_table, row_req, visible, logits,
                 max_pools, block_size, softmax_scale, ksel,
                 topk_indices_buffer[chunk.token_start:chunk.token_end], kp,
+                by_request=_PREFILL_MATMUL,
             )
 
     # 3) decode rows (fixed-size workspace: CUDA-graph safe).
@@ -553,9 +893,14 @@ class Glm5NextPooledIndexer(nn.Module):
         cache_config: CacheConfig | None,
         topk_indices_buffer: torch.Tensor,
         prefix: str = "",
+        fold_input_projections: bool = False,
         workspace: Glm5NextIndexerWorkspace | None = None,
     ) -> None:
         super().__init__()
+        # When the owning attention layer folds wk, the kpool compress gate
+        # and weights_proj into its fused_qkv_a_proj, forward() receives their
+        # outputs as ``precomputed`` and this module holds no such weights.
+        self.fold_input_projections = fold_input_projections
         self.n_heads = config.index_n_heads
         self.adaptive_score, self.singleton_fused_update = _compact_decode_options(
             vllm_config, self.n_heads
@@ -579,20 +924,21 @@ class Glm5NextPooledIndexer(nn.Module):
             config.q_lora_rank, self.n_heads * self.head_dim, bias=False,
             quant_config=quant_config, prefix=f"{prefix}.wq_b",
         )
-        self.wk = ReplicatedLinear(
-            config.hidden_size, self.head_dim, bias=False,
-            quant_config=quant_config, prefix=f"{prefix}.wk",
-        )
+        if not fold_input_projections:
+            self.wk = ReplicatedLinear(
+                config.hidden_size, self.head_dim, bias=False,
+                quant_config=quant_config, prefix=f"{prefix}.wk",
+            )
+            self.weights_proj = ReplicatedLinear(
+                config.hidden_size, self.n_heads, bias=False,
+                quant_config=quant_config, prefix=f"{prefix}.weights_proj",
+            )
+            self.index_kpool_compress_gate = nn.Parameter(
+                torch.zeros(self.head_dim, config.hidden_size), requires_grad=False
+            )
         self.k_norm = nn.LayerNorm(self.head_dim, eps=1e-6)
-        self.weights_proj = ReplicatedLinear(
-            config.hidden_size, self.n_heads, bias=False,
-            quant_config=quant_config, prefix=f"{prefix}.weights_proj",
-        )
         self.index_kpool_compress_ape = nn.Parameter(
             torch.zeros(self.kp, self.head_dim), requires_grad=False
-        )
-        self.index_kpool_compress_gate = nn.Parameter(
-            torch.zeros(self.head_dim, config.hidden_size), requires_grad=False
         )
         self.k_cache = Glm5NextIndexerCache(
             head_dim=_cache_row_dim(vllm_config, self.kp),
@@ -626,10 +972,19 @@ class Glm5NextPooledIndexer(nn.Module):
         qr: torch.Tensor,
         positions: torch.Tensor,
         rotary_emb=None,
+        precomputed: tuple[torch.Tensor, ...] | None = None,
     ) -> torch.Tensor:
         q, _ = self.wq_b(qr)
         q = q.view(-1, self.n_heads, self.head_dim).to(torch.bfloat16)
-        k, _ = self.wk(hidden_states)
+        if precomputed is not None:
+            k, gate, weights = precomputed
+        else:
+            k, _ = self.wk(hidden_states)
+            gate = torch.nn.functional.linear(
+                hidden_states,
+                self.index_kpool_compress_gate.to(hidden_states.dtype),
+            )
+            weights, _ = self.weights_proj(hidden_states)
         k = torch.nn.functional.layer_norm(
             k.float(),
             (self.head_dim,),
@@ -637,11 +992,7 @@ class Glm5NextPooledIndexer(nn.Module):
             self.k_norm.bias.float(),
             self.k_norm.eps,
         ).to(torch.bfloat16)
-        gate = torch.nn.functional.linear(
-            hidden_states, self.index_kpool_compress_gate.to(hidden_states.dtype)
-        ).to(torch.bfloat16)
-        packed = torch.cat([k, gate], dim=-1).contiguous()
-        weights, _ = self.weights_proj(hidden_states)
+        packed = torch.cat([k, gate.to(torch.bfloat16)], dim=-1).contiguous()
         weights = (weights.float() * self.n_head_scale).contiguous()
         if self._ape_f32 is None or self._ape_f32.device != q.device:
             self._ape_f32 = self.index_kpool_compress_ape.float().contiguous()
