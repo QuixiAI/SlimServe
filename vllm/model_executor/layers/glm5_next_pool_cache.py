@@ -199,3 +199,113 @@ def cached_pool_logits(
         16,
         num_warps=4,
     )
+
+
+@triton.jit
+def _cached_pool_logits_grouped(
+    Q,
+    W,
+    CACHE,
+    BT,
+    ROW_REQ,
+    VISIBLE,
+    OUT,
+    MAX_POOLS,
+    BT_STRIDE,
+    PAGE_STRIDE,
+    SCALE,
+    G,
+    BS: tl.constexpr,
+    H: tl.constexpr,
+    BP: tl.constexpr,
+    GP: tl.constexpr,
+):
+    """Score one request's G consecutive rows per pooled-cache read.
+
+    The per-row kernel streams every pool of the request once per row; a
+    speculative verify batch has k+1 rows per request that share the same
+    history, so this variant loads each pool tile once and dots it against
+    all G x H query heads. GP (a power of two >= G) pads the head tile;
+    padded rows are masked on load and store. Rows of a request must be
+    contiguous, which is the decode layout (row_req is checked on the host).
+    """
+    grp, block = tl.program_id(0), tl.program_id(1)
+    r0 = grp * G
+    g = tl.arange(0, GP)
+    rows = r0 + g
+    row_ok = g < G
+    counts = tl.load(VISIBLE + rows, row_ok, 0) // 4
+    count_max = tl.max(counts, axis=0)
+    tiles = tl.cdiv(count_max, BP)
+    if block >= tiles:
+        return
+    req = tl.load(ROW_REQ + r0)
+    gh = tl.arange(0, GP * H)
+    d = tl.arange(0, 128)
+    gh_row = r0 + gh // H
+    gh_ok = (gh // H) < G
+    q = tl.load(
+        Q + (gh_row.to(tl.int64) * H + gh % H)[:, None] * 128 + d[None, :],
+        gh_ok[:, None],
+        0,
+    )
+    weights = tl.load(W + gh_row * H + gh % H, gh_ok, 0.0)
+    for tile in range(block, tiles, tl.num_programs(1)):
+        p = tile * BP + tl.arange(0, BP)
+        valid = p < count_max
+        page = tl.load(BT + req.to(tl.int64) * BT_STRIDE + p * 4 // BS, valid, 0)
+        base = page.to(tl.int64) * PAGE_STRIDE + (p % (BS // 4)) * 128
+        pooled = tl.load(CACHE + base[:, None] + d[None, :], valid[:, None], 0)
+        scores = tl.maximum(tl.dot(pooled, tl.trans(q)) * SCALE, 0.0)
+        weighted = (scores * weights[None, :]).reshape(BP, GP, H)
+        logits = tl.sum(weighted, axis=2)
+        ok = (p[:, None] < counts[None, :]) & row_ok[None, :]
+        tl.store(
+            OUT + rows[None, :].to(tl.int64) * MAX_POOLS + p[:, None],
+            tl.where(ok, logits, float("-inf")),
+            (p[:, None] < MAX_POOLS) & row_ok[None, :],
+        )
+
+
+def cached_pool_logits_grouped(
+    q, weights, cache, block_table, row_req, visible, out, group, programs=64
+):
+    """Grouped scorer; requires rows in contiguous groups of `group` per
+    request (checked). Same outputs as cached_pool_logits."""
+    assert 2 <= group <= 8
+    rows = q.shape[0]
+    assert rows % group == 0 and q.shape[1:] == (32, 128)
+    assert q.dtype == cache.dtype == torch.bfloat16
+    assert weights.dtype == out.dtype == torch.float32
+    assert cache.shape[2] == POOL_CACHE_HEAD_DIM
+    assert all(t.is_contiguous() for t in (q, weights, row_req, visible, out))
+    if not rows:
+        return
+    gp = 2 if group <= 2 else 4 if group <= 4 else 8
+    _cached_pool_logits_grouped[(rows // group, programs)](
+        q,
+        weights,
+        cache,
+        block_table,
+        row_req,
+        visible,
+        out,
+        out.shape[1],
+        block_table.stride(0),
+        cache.stride(0),
+        128**-0.5,
+        group,
+        cache.shape[1],
+        q.shape[1],
+        16,
+        gp,
+        num_warps=4,
+    )
+
+
+def rows_form_request_groups(row_req: torch.Tensor, group: int) -> bool:
+    """True when every consecutive run of `group` rows shares one request."""
+    if group <= 1 or row_req.shape[0] % group:
+        return False
+    view = row_req.view(-1, group)
+    return bool((view == view[:, :1]).all().item())
