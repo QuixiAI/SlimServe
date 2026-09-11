@@ -78,7 +78,7 @@ fi
 # being generous instead OOMs at execution because the sparse-MLA and indexer
 # top-k workspaces also scale with max_model_len. Budget = free VRAM after
 # weights, minus workspace headroom. Measured cost/token: 46.6 KB target,
-# +9.2 KB for a turboquant_k8v4 draft.
+# Draft KV now uses FP8; historical pool sizing needs requalification.
 #
 # TP2 holds ~129 GiB of weights+state per GPU, leaving ~63 GiB; TP4/TP8 shard
 # the weights so far more is free (the MLA latent itself does NOT shard, so
@@ -98,30 +98,29 @@ KV_BYTES=$((KV_GIB * 1024 * 1024 * 1024))
 # Default context ceiling by GPU count. On 2 GPUs the weights leave only ~63
 # GiB per card, and a 1M ceiling needs ~52 GiB of KV *plus* GiB-scale
 # sparse-MLA/indexer workspace that also scales with max_model_len — so 1M on
-# TP2 cannot fit the required DSpark/TurboQuant path at a 1M ceiling. From 4
+# TP2 cannot fit the required DSpark/FP8 path at a 1M ceiling. From 4
 # GPUs up the weights shard and there is ample room, so 1M is the default there.
 if [[ -z "$CTX" ]]; then
     if (( TP >= 4 )); then CTX=1048576; else CTX=524288; fi
 fi
 if (( TP < 4 )) && (( CTX > 524288 )); then
     echo "error: ${CTX}-token ceiling on tp=$TP does not fit the required " \
-         "DSpark/TurboQuant path; use --ctx 524288 or --tp 4." >&2
+         "DSpark/FP8 path; use --ctx 524288 or --tp 4." >&2
     exit 2
 fi
 
 # num_speculative_tokens=3 measured best at batch scale: mean accept length
 # only grows 2.70 -> 3.07 from 3 to 7 draft tokens while verify width doubles,
-# so 7 loses ~23% throughput at batch 64. TurboQuant draft KV
-# (turboquant_k8v4) reaches fp8 acceptance parity by ~4k context and is ~22%
-# smaller per token.
+# so 7 lost ~23% throughput in the historical batch-64 experiment.
+# Draft KV uses FP8 under the current serving policy.
 SPEC_CFG=$(cat <<JSON
 {"model": "$DRAFT", "method": "dspark", "num_speculative_tokens": 3,
- "attention_backend": "TURBOQUANT", "kv_cache_dtype": "turboquant_k8v4"}
+ "kv_cache_dtype": "fp8"}
 JSON
 )
 
 echo "SlimServe: $QUANT  tp=$TP  dp=$DP  ep=$EP  gpus=${GPUS:-all}  ctx=$CTX" \
-     "kv=${KV_GIB}GiB  spec=dspark/turboquant"
+     "kv=${KV_GIB}GiB  spec=dspark/fp8"
 echo "  draft: $DRAFT"
 
 # AITER is required: the target's sparse-MLA indexer has no non-AITER ROCm path.

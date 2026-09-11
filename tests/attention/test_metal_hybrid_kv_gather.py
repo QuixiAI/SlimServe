@@ -108,6 +108,8 @@ def test_bound_draft_attention_uses_native_gather_and_exact_gpu_mask(
         head_size=dim,
         num_queries_per_kv=2,
         use_native_range_gather=True,
+        kv_cache_dtype="auto",
+        sinks=None,
         scale=dim**-0.5,
     )
     metadata = SimpleNamespace(
@@ -189,6 +191,8 @@ def test_bound_draft_attention_ignores_nonfinite_masked_cache_rows(window, dtype
         head_size=dim,
         num_queries_per_kv=1,
         use_native_range_gather=True,
+        kv_cache_dtype="auto",
+        sinks=None,
         scale=dim**-0.5,
     )
     output = torch.empty_like(query, device="mps")
@@ -271,6 +275,8 @@ def test_hybrid_kv_gather_above_signed_32bit_element_offset() -> None:
         head_size=head_size,
         num_queries_per_kv=1,
         use_native_range_gather=True,
+        kv_cache_dtype="auto",
+        sinks=None,
         scale=head_size**-0.5,
     )
     metadata = SimpleNamespace(

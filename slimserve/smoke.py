@@ -4,7 +4,7 @@
 
 Profiles are discovered from the registry instead of copied into this script.
 Each compatible profile is loaded in isolation, checked for the required
-DSpark/TurboQuant configuration, given a text request, and—when its registered
+registered drafter and FP8 policy, given a text request, and—when its registered
 modalities include images—a deterministic image request. The complete matrix
 is attempted by default so one failed profile cannot hide later omissions.
 """
@@ -125,7 +125,7 @@ def resolve_profiles(
 def validate_acceleration(plan: Plan) -> dict[str, Any]:
     """Require the resolved plan to match its registered speculator exactly.
 
-    Every profile registers a drafter (DSpark with a TurboQuant draft KV, a
+    Every profile registers a drafter (DSpark with FP8 draft KV, a
     DFlash block drafter, or a checkpoint's own MTP head); the resolved
     executable configuration must carry every registered engine setting.
     """
@@ -134,11 +134,6 @@ def validate_acceleration(plan: Plan) -> dict[str, Any]:
         raise RuntimeError("resolved plan has no speculative configuration")
     registered = plan.speculator["engine"]
     required = dict(registered)
-    if registered.get("method") == "dspark":
-        required.update(
-            attention_backend="TURBOQUANT",
-            kv_cache_dtype="turboquant_k8v4",
-        )
     # Platform variants can register a different drafter/method or verify
     # width; those are part of the profile's authoritative configuration.
     required.update(plan.speculative_overrides)

@@ -117,6 +117,7 @@ def test_benchmark_rejects_sleep_but_keeps_raw_sample(tmp_path, monkeypatch):
     probe = SimpleNamespace(
         output=tmp_path,
         tokens=lambda _: list(range(32)),
+        logprobs=10,
         draft_tokens=lambda: next(drafts),
         complete=lambda prompt, count: {
             "response": {
@@ -129,6 +130,7 @@ def test_benchmark_rejects_sleep_but_keeps_raw_sample(tmp_path, monkeypatch):
     )
     with pytest.raises(AssertionError, match="clock discontinuity or machine sleep"):
         benchmark(probe, args)
+    assert probe.logprobs is None
     sample = json.loads((tmp_path / "bench-c1-r0.json").read_text())
     assert sample["clock_gap_seconds"] == 30
     assert len(sample["responses"]) == 1
@@ -194,12 +196,9 @@ def test_smoke_uses_platform_modalities():
     from slimserve.registry import resolve
     from slimserve.smoke import profile_modalities
 
-    for profile in ("qwen38-nvfp4-1", "qwen38-nvfp4-1-tq"):
-        assert profile_modalities(resolve(profile, "metal", 1, None, 128 << 30)) == [
-            "text"
-        ]
-    vision = resolve("qwen38-q2kxl-1", "metal", 1, None, 128 << 30)
-    assert profile_modalities(vision) == ["text", "image"]
+    for profile in ("qwen38-nvfp4-1", "qwen38-q2kxl-1"):
+        vision = resolve(profile, "metal", 1, None, 128 << 30)
+        assert profile_modalities(vision) == ["text", "image"]
 
 
 def test_completion_rejects_degenerate_exact_token_output(tmp_path):
@@ -291,6 +290,32 @@ def test_chat_rejects_empty_or_truncated_answers(tmp_path, content, finish):
     with pytest.raises(AssertionError, match="empty or truncated"):
         probe.chat([], "bad")
     assert (tmp_path / "bad.json").exists()
+
+
+def test_marker_temperature_does_not_change_benchmark_sampling(tmp_path):
+    server = SimpleNamespace(plan=SimpleNamespace(engine={"served_model_name": "test"}))
+    probe = Probe(server, tmp_path, 1)
+    probe.chat_temperature = 0.0
+    requests = []
+
+    def post(path, body):
+        requests.append((path, body))
+        return {
+            "usage": {"completion_tokens": 1},
+            "choices": [
+                {
+                    "message": {"content": "opal"},
+                    "text": "opal",
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+
+    probe.post = post
+    probe.chat([], "greedy-marker")
+    probe.complete([1], 1)
+    assert requests[0][1]["temperature"] == 0.0
+    assert "temperature" not in requests[1][1]
 
 
 @pytest.mark.parametrize(

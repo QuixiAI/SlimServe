@@ -285,14 +285,9 @@ def _merge_platform(profile: dict[str, Any], platform: str) -> dict[str, Any]:
 # recommended sampling (temperature 1.0 / top_p 0.95 / top_k 20, seeded for
 # reproducibility), never temperature 0.
 #
-# Main KV precision is a per-profile, on-box-validated choice (operator
-# 2026-09-02, reversing the 2026-08-29 rtx3090 bf16 mandate): a record may
-# quantize its main KV when a note names the format and the validation.
-# qwen38fn-fp8-8/rtx3090 runs fp8 (e4m3) main KV through kv_cache_dtype;
-# TurboQuant is not used for main KV there. Draft-model KV (DSpark
-# TurboQuant) is always allowed: rejection sampling verifies drafts against
-# the target, so draft precision affects speed, never output content.
-# Enforced by test_quantized_main_kv_is_an_explicit_validated_choice.
+# FP8 is the official KV cache quantization (operator 2026-09-10).
+# TurboQuant is forbidden for both target and draft caches. Unquantized
+# auto/fp16/bf16 caches remain allowed; quantized caches must use FP8.
 #
 # "thinking" is the DeepSeek/Kimi template switch, "enable_thinking" the
 # GLM/Qwen one; templates ignore the name they do not use.
@@ -301,6 +296,45 @@ _SERVING_DEFAULTS: dict[str, Any] = {
     "default_chat_template_kwargs": {"thinking": True, "enable_thinking": True},
     "enable_prefix_caching": True,
 }
+
+
+def validate_cache_policy(config: dict[str, Any]) -> None:
+    """Reject prohibited target/draft cache settings, including overrides."""
+    for key, value in config.items():
+        if isinstance(value, dict):
+            validate_cache_policy(value)
+        elif key in ("kv_cache_dtype", "cache_dtype") and value is not None:
+            dtype = str(value).lower()
+            if dtype not in ("auto", "float16", "bfloat16") and not dtype.startswith(
+                "fp8"
+            ):
+                raise ProfileError(
+                    "FP8 is the only permitted KV cache quantization; "
+                    f"{key}={value!r} is prohibited (including draft KV)"
+                )
+        elif (
+            key in ("attention_backend", "backend")
+            and "turboquant" in str(value).lower()
+        ):
+            raise ProfileError("TurboQuant attention is prohibited on every profile")
+
+
+def validate_vision_policy(plan: Plan) -> None:
+    if "image" not in plan.source.get("modalities", []):
+        return
+    engine = plan.engine
+    limits = engine.get("limit_mm_per_prompt") or {}
+
+    def disabled(modality: str) -> bool:
+        limit = limits.get(modality)
+        return (limit.get("count") if isinstance(limit, dict) else limit) == 0
+
+    if (
+        engine.get("language_model_only")
+        or disabled("image")
+        or disabled("vision_chunk")
+    ):
+        raise ProfileError("Vision must be enabled for every vision-capable profile")
 
 
 def resolve(
@@ -388,7 +422,7 @@ def resolve(
     for key, value in _SERVING_DEFAULTS.items():
         merged["engine"].setdefault(key, copy.deepcopy(value))
 
-    return Plan(
+    plan = Plan(
         profile_id=profile_id,
         title=profile["title"],
         summary=profile["summary"],
@@ -405,6 +439,12 @@ def resolve(
         notes=merged["notes"],
         variant_speculator=merged["speculator"],
     )
+    validate_cache_policy(plan.engine)
+    if plan.speculator:
+        validate_cache_policy(plan.speculator["engine"])
+    validate_cache_policy(plan.speculative_overrides)
+    validate_vision_policy(plan)
+    return plan
 
 
 def _suggest_quant(profile_id: str, platform: str, memory_bytes: int) -> str | None:

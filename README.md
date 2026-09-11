@@ -40,7 +40,7 @@ independent TP4 instances for isolation, at roughly the 4× row each.</sub>
 ### GLM-5.2-Vision, up to 1 Million tokens of context
 
 <sub>Measured on Hot Aisle MI300X: Q2_K quant, 100k-token prompts, 2k-token
-responses, temperature 0, DSpark speculative decoding with TurboQuant draft
+responses, temperature 0, historical DSpark speculative decoding with TurboQuant draft
 KV. 1M-token context is available on 4+ GPUs. Temperature 0 was the method of
 record for these historical numbers; current benchmarking uses each model's
 shipped sampling defaults, seeded.</sub>
@@ -111,7 +111,7 @@ SlimServe is built from vLLM, so it inherits continuous batching, paged KV,
 prefix caching and a production HTTP server.
 
 It is **performance-focused, and every bleeding-edge trick is in scope.**
-Right now that means speculative decoding everywhere, TurboQuant compressed KV,
+Right now that means speculative decoding everywhere, FP8 KV quantization,
 hand-written kernels per platform, and host-memory offload for embeddings too
 large to hold in VRAM. That list is expected to turn over as better tricks
 appear — this is not a codebase that will refuse a hack because it is exotic.
@@ -119,11 +119,14 @@ appear — this is not a codebase that will refuse a hack because it is exotic.
 **Every profile speculates**, and none of them drop the drafter silently — but
 which drafter is a measured choice, not a default. GLM-5.2-Vision, DeepSeek-V4
 and Kimi K3 run DSpark against a GGUF-quantized verifier with a
-`turboquant_k8v4` draft KV cache. Qwen3.8-27B and Muse-Glimmer run DFlash 2
+`fp8` draft KV cache. Qwen3.8-27B and Muse-Glimmer run DFlash 2
 block-diffusion drafters, which share the target's KV layout and so need no
 separate draft cache. Qwen3.8-Flash-Next uses the MTP head that ships inside its
 own checkpoint. The registry names one blessed Hugging Face download per model
 family, and the test suite fails if any profile loses its registered drafter.
+Vision is enabled for every vision-capable model, including NVFP4 on Metal.
+Quantized KV must use FP8; TurboQuant is prohibited, including draft caches
+and environment overrides. Unquantized FP16/BF16 caches remain permitted.
 
 ### Hardware
 
@@ -170,7 +173,7 @@ What the specialization buys:
 - [QuixiCore-rocm](https://github.com/QuixiAI/QuixiCore-rocm) HIP/MFMA kernels
   for the routed Q2_K/Q4_K MoE and dense projections
 - DSpark speculative decoding against a GGUF-quantized verifier
-- TurboQuant compressed KV for the draft model (sliding-window support added here)
+- FP8 KV quantization for the draft model (sliding-window support added here)
 - AITER sparse-MLA (DSA) attention with a working 1M-token path
 - ~154 s cold start on a 244 GiB model (even faster load time than llama.cpp)
 - A vendored QuixiCore Metal kernel library (native MPS serving for three
@@ -218,23 +221,22 @@ checkpoint.
 
 | Profile | Model | GPUs | Runs on | Drafter |
 | --- | --- | ---: | --- | --- |
-| `glm52-q2k-2` | GLM-5.2-Vision | 2 | MI300X | DSpark + TurboQuant |
-| `glm52-q2k-4` | GLM-5.2-Vision | 4 | MI300X, A100 | DSpark + TurboQuant |
-| `glm52-q2k-8` | GLM-5.2-Vision | 8 | MI300X, A100 | DSpark + TurboQuant |
-| `glm52-xxs-1` † | GLM-5.2-Vision | 1 | Mac | DSpark + TurboQuant |
-| `dsv4-xxs-1` | DeepSeek-V4-Flash (text) | 1 | MI300X, Mac | DSpark + TurboQuant |
-| `dsv4-q4ktail-2` | DeepSeek-V4-Flash (text) | 2 | MI300X, A100 | DSpark + TurboQuant |
-| `dsv4-q4ktail-4` | DeepSeek-V4-Flash (text) | 4 | A100 | DSpark + TurboQuant |
-| `dsv4-q4ktail-8` | DeepSeek-V4-Flash (text) | 8 | A100 (TP4 x DP2) | DSpark + TurboQuant |
-| `dsv4-mxfp4-4` | DeepSeek-V4-Flash (text) | 4 | MI300X, A100 | DSpark + TurboQuant |
-| `dsv4-mxfp4-8` | DeepSeek-V4-Flash (text) | 8 | A100 | DSpark + TurboQuant |
-| `dsv4-q4k-8` | DeepSeek-V4-Flash (text) | 8 | MI300X | DSpark + TurboQuant |
-| `k3-xxs-6` | Kimi K3 | 6 | MI300X | DSpark + TurboQuant |
-| `k3-xxs-8` | Kimi K3 | 8 | MI300X | DSpark + TurboQuant |
+| `glm52-q2k-2` | GLM-5.2-Vision | 2 | MI300X | DSpark + FP8 |
+| `glm52-q2k-4` | GLM-5.2-Vision | 4 | MI300X, A100 | DSpark + FP8 |
+| `glm52-q2k-8` | GLM-5.2-Vision | 8 | MI300X, A100 | DSpark + FP8 |
+| `glm52-xxs-1` † | GLM-5.2-Vision | 1 | Mac | DSpark + FP8 |
+| `dsv4-xxs-1` | DeepSeek-V4-Flash (text) | 1 | MI300X, Mac | DSpark + FP8 |
+| `dsv4-q4ktail-2` | DeepSeek-V4-Flash (text) | 2 | MI300X, A100 | DSpark + FP8 |
+| `dsv4-q4ktail-4` | DeepSeek-V4-Flash (text) | 4 | A100 | DSpark + FP8 |
+| `dsv4-q4ktail-8` | DeepSeek-V4-Flash (text) | 8 | A100 (TP4 x DP2) | DSpark + FP8 |
+| `dsv4-mxfp4-4` | DeepSeek-V4-Flash (text) | 4 | MI300X, A100 | DSpark + FP8 |
+| `dsv4-mxfp4-8` | DeepSeek-V4-Flash (text) | 8 | A100 | DSpark + FP8 |
+| `dsv4-q4k-8` | DeepSeek-V4-Flash (text) | 8 | MI300X | DSpark + FP8 |
+| `k3-xxs-6` | Kimi K3 | 6 | MI300X | DSpark + FP8 |
+| `k3-xxs-8` | Kimi K3 | 8 | MI300X | DSpark + FP8 |
 | `muse-kdyn-1` | Muse-Glimmer-30B | 1 | Mac | DFlash |
 | `qwen38-q2kxl-1` | Qwen3.8-27B (GGUF) | 1 | MI300X, Mac | DFlash 2 |
 | `qwen38-nvfp4-1` | Qwen3.8-27B (NVFP4) | 1 | MI300X, Mac | MTP on MI300X, DFlash 2 on Mac |
-| `qwen38-nvfp4-1-tq` | Qwen3.8-27B (NVFP4) | 1 | Mac | DFlash 2 + TurboQuant draft KV |
 | `qwen38fn-fp8-8` | Qwen3.8-Flash-Next | 8 | RTX 3090 | MTP (ships with the checkpoint); native 262K context via host-resident main KV (8.05 max-length requests resident) |
 | `qwen38fn-nvfp4-4` | Qwen3.8-Flash-Next (NVFP4) | 4 | RTX 3090 | MTP (ships with the checkpoint), dynamic k by batch size; native 262K context via host-resident main KV; 32 decode slots (c16 813 / c32 758 tok/s exact bench) |
 
@@ -264,14 +266,14 @@ That file is the authority; nothing outside it can be run.
 
 The lower-level `run-glm-optimized.sh` still exists for the three exact GLM
 quants. Like the profiles, it always enables the matching DSpark draft with a
-TurboQuant cache.
+FP8 cache.
 
 ### Validate every compatible profile
 
 The live smoke runner discovers every registry profile compatible with the
 current machine; it does not keep a separate list that can silently omit a new
 TP size. Each resolved plan must use its registered DSpark drafter and
-TurboQuant KV cache. It sends text and image requests to GLM and Kimi, and a
+FP8 KV cache. It sends text and image requests to GLM and Kimi, and a
 text request to DeepSeek:
 
 ```bash
@@ -446,7 +448,7 @@ Rules of thumb:
   and the task is tolerant. Test it on your own eval before trusting it.
 - Speculative decoding costs quality **nothing** — the verifier accepts or
   rejects every draft token. All profiles use the model family's exact DSpark
-  artifact and a `turboquant_k8v4` draft cache.
+  artifact and a `fp8` draft cache.
 
 ---
 
@@ -481,7 +483,7 @@ every 0731 build, so the registry verifies sha256, not just byte counts.
 All four use the pinned 6.5 GiB [DeepSeek-V4-Flash 0731 DSpark drafter][ds4d]:
 `DeepSeek-V4-Flash-0731-DSpark-Drafter-Q2_K-Q8_0-dflash.gguf`. The drafter is
 from the same 0731 model revision as the verifier; older DeepSeek-V4-Flash
-drafters are not supported. Its sliding-window K/V is stored with TurboQuant.
+drafters are not supported. Its sliding-window K/V uses FP8.
 Context is 1048576 (yarn, 65536 base).
 
 `Layers37-42Q4KExperts` puts Q4_K on the last six expert layers and
@@ -513,15 +515,14 @@ VLLM_ROCM_USE_AITER=1 python -m vllm.entrypoints.openai.api_server \
   --compilation-config '{"cudagraph_mode": "NONE"}' \
   --speculative-config "{\"model\": \"$DRAFT\", \"method\": \"dspark\", \
     \"num_speculative_tokens\": 5, \"quantization\": \"gguf\", \
-    \"attention_backend\": \"TURBOQUANT\", \
-    \"kv_cache_dtype\": \"turboquant_k8v4\"}"
+    \"kv_cache_dtype\": \"fp8\"}"
 ```
 
 The cache and execution settings are deliberate. `--block-size 256` is what
 the DeepSeek-V4 sparse MLA backend supports; the GLM value of 64 fails at
 KV-cache setup with "no common block size". `sparse_mla_force_mqa` keeps short
 prompts off a dense ROCm path that is not implemented. The eager graph mode is
-the MI300X form of the stateful DSpark/TurboQuant path, and `max_num_seqs=64`
+the MI300X form of the stateful DSpark/FP8 path, and `max_num_seqs=64`
 bounds its startup warmup. `--reasoning-parser deepseek_v4` prevents the GLM
 default from returning every answer as reasoning with `content: null`.
 
@@ -596,7 +597,7 @@ downloader reassembles the parts and corrects that byte. The vision projector
 comes from `unsloth/Kimi-K3-GGUF`, not from the text repo.
 
 Both profiles use `Kimi-K3-DSpark-Q8_0.gguf` with a
-`turboquant_k8v4` draft cache. At TP6 the draft's 64 query heads, 16 KV heads
+`fp8` draft cache. At TP6 the draft's 64 query heads, 16 KV heads
 and 14336-wide MLP do not divide evenly, so its five-layer backbone and small
 Markov head are replicated on each rank while the target and vocabulary logits
 remain distributed. TP8 shards the same exact draft normally.
@@ -690,14 +691,16 @@ full methodology and caveats.
 
 ## Apple Silicon
 
-Three models run through the in-tree PyTorch-MPS worker and the vendored
+Three models (four profiles) run through the in-tree PyTorch-MPS worker and the vendored
 QuixiCore Metal kernels. The supported `dsv4-xxs-1` path includes the packed sparse
 MLA target cache, hybrid cache allocation, GGUF i-quant/k-quant projections,
-the matching 0731 DSpark drafter, and a `turboquant_k8v4` draft cache.
+the matching 0731 DSpark drafter, and a `fp8` draft cache.
 `muse-kdyn-1` (Muse-Glimmer-30B, 64 GiB+) and `qwen38-q2kxl-1` (Qwen3.8-27B,
 48 GiB+) serve text and vision with their DFlash block-diffusion drafters —
 Qwen3.8's hybrid GDN/attention layers share one Metal cache pool with the
-DFlash 2 path-selector drafter. GLM's separate sparse-MLA/vision path remains
+DFlash 2 path-selector drafter. `qwen38-nvfp4-1` also serves text and vision
+from its native checkpoint; the Metal dependencies include its required
+`torchvision` processor. GLM's separate sparse-MLA/vision path remains
 individually gated in the CLI.
 
 ```console
@@ -705,6 +708,7 @@ $ slimserve --list
 Profiles (Apple M5 Max, 128 GiB unified):
   ! glm52-xxs-1    GLM-5.2-Vision on one Mac — not validated on Metal
     dsv4-xxs-1     DeepSeek-V4-Flash IQ2_XXS on 1 GPU / Apple Silicon
+    qwen38-nvfp4-1 Qwen3.8-27B NVFP4 on one Mac
     muse-kdyn-1    Muse-Glimmer-30B on one Mac
     qwen38-q2kxl-1 Qwen3.8-27B on one Mac
 ```
@@ -764,7 +768,7 @@ so each card has far more room left for KV — 1M with speculative decoding stil
 on fits comfortably, and the script defaults `--ctx` to 1048576 at `--tp 4` and
 above. Nothing needs to be turned off.
 
-**On 2 GPUs, 512k is the ceiling for the required DSpark/TurboQuant path.** The
+**On 2 GPUs, 512k is the ceiling for the required DSpark/FP8 path.** The
 weights leave only ~63 GiB per card. A 1M ceiling needs ~52 GiB of KV once the
 draft cache is included, and the sparse-MLA and indexer workspaces — which also
 scale with `max_model_len` — need several GiB on top. Use 4+ GPUs when 1M
@@ -795,8 +799,9 @@ to 7 draft tokens, while verification width doubles. Spec-3 gains +12%
 throughput; spec-7 *loses* 23%. Use 7 only for single-request latency, where
 verify width is nearly free.
 
-**Draft KV uses TurboQuant** (`turboquant_k8v4`), ~22% smaller per token than
-fp8 and at acceptance parity by ~4k context.
+**Draft KV uses FP8.** TurboQuant is prohibited for both target and draft
+caches (2026-09-10 policy). Historical throughput measurements made with
+other cache formats are not FP8 validation.
 
 **`--block-size 64`** is required: the target's sparse MLA and sparse SWA groups
 only accept multiples of 64.
@@ -858,7 +863,7 @@ See [Parallelism: TP vs DP vs EP](#parallelism-tp-vs-dp-vs-ep) for why
 ### Concurrency scaling — 2×MI300X, Q2_K, 100k in / 2k out
 
 Shared 100k-token prefix (prefix-cached), unique per-request question, exactly
-2,000 output tokens each, DSpark spec-3 + TurboQuant draft KV, temperature 0
+2,000 output tokens each, historical DSpark spec-3 + TurboQuant draft KV, temperature 0
 (the historical method for this table; current runs use the model's shipped
 sampling defaults, seeded):
 

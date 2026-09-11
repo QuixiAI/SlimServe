@@ -40,7 +40,7 @@ def test_every_profile_resolves_on_a_platform_it_claims():
             assert plan.engine, "a profile with no engine settings would serve nothing"
 
 
-def test_every_profile_uses_dspark_with_turboquant():
+def test_every_profile_uses_registered_drafter_with_fp8_dspark():
     for profile_id in registry.profile_ids():
         entry = registry.describe(profile_id)
         for platform in entry["platforms"]:
@@ -55,8 +55,8 @@ def test_every_profile_uses_dspark_with_turboquant():
             registered = plan.speculator["engine"]["method"]
             assert config["method"] == registered
             if registered == "dspark":
-                assert config["attention_backend"] == "TURBOQUANT"
-                assert config["kv_cache_dtype"] == "turboquant_k8v4"
+                assert config.get("attention_backend") != "TURBOQUANT"
+                assert config["kv_cache_dtype"] == "fp8"
 
 
 def test_no_spec_cli_flag_disables_the_resolved_speculator(monkeypatch):
@@ -166,7 +166,7 @@ def test_qwen38_uses_measured_metal_speculation_settings():
 def test_metal_smoke_accepts_registered_variant_drafters():
     machine = Machine("metal", "Apple M5 Max", 1, memory_bytes=2**37)
     profiles = compatible_profile_ids(machine)
-    assert {"qwen38-nvfp4-1", "qwen38-nvfp4-1-tq"} <= set(profiles)
+    assert {"qwen38-nvfp4-1"} <= set(profiles)
     for profile in profiles:
         plan = resolve(profile, "metal", 1, None, 2**37)
         spec = validate_acceleration(plan)
@@ -202,7 +202,7 @@ def test_live_smoke_matrix_discovers_every_compatible_mi300x_profile():
     )
 
 
-def test_live_smoke_matrix_requires_dspark_and_turboquant_for_every_profile():
+def test_live_smoke_matrix_requires_registered_drafter_and_fp8_for_every_profile():
     machine = Machine("mi300x", "AMD Instinct MI300X", 8)
     for profile_id in compatible_profile_ids(machine):
         plan = resolve(profile_id, "mi300x", 8, None)
@@ -219,8 +219,8 @@ def test_live_smoke_matrix_requires_dspark_and_turboquant_for_every_profile():
             assert speculative["method"] == "dflash"
             continue
         assert speculative["method"] == "dspark"
-        assert speculative["attention_backend"] == "TURBOQUANT"
-        assert speculative["kv_cache_dtype"] == "turboquant_k8v4"
+        assert speculative.get("attention_backend") != "TURBOQUANT"
+        assert speculative["kv_cache_dtype"] == "fp8"
 
 
 def test_registry_rejects_duplicate_json_keys():
@@ -252,8 +252,8 @@ def test_deepseek_profiles_use_only_the_matching_0731_dspark_drafter():
         config = engine_kwargs(plan)["speculative_config"]
         assert config["num_speculative_tokens"] == 5
         assert config["quantization"] == "gguf"
-        assert config["attention_backend"] == "TURBOQUANT"
-        assert config["kv_cache_dtype"] == "turboquant_k8v4"
+        assert config.get("attention_backend") != "TURBOQUANT"
+        assert config["kv_cache_dtype"] == "fp8"
         assert config["model"].endswith(f"/{expected_file}")
 
 
@@ -491,8 +491,8 @@ def test_kimi_uses_the_registered_q8_dspark_gguf():
         assert speculative["method"] == "dspark"
         assert speculative["num_speculative_tokens"] == 7
         assert speculative["quantization"] == "gguf"
-        assert speculative["attention_backend"] == "TURBOQUANT"
-        assert speculative["kv_cache_dtype"] == "turboquant_k8v4"
+        assert speculative.get("attention_backend") != "TURBOQUANT"
+        assert speculative["kv_cache_dtype"] == "fp8"
         assert speculative["disable_draft_cudagraphs"] is True
         assert "draft_tensor_parallel_size" not in speculative
 
@@ -532,17 +532,8 @@ def test_qwen38_nvfp4_platforms_diverge_on_the_measured_drafter():
     assert mi300x.speculator["engine"]["method"] == "qwen3_5_mtp"
 
 
-def test_tq_profile_pins_both_drafter_turboquant_fields():
-    """The -tq drafter must pin attention_backend AND kv_cache_dtype
-    together: unset, the drafter inherits the engine-global turboquant_k8v4
-    dtype but keeps metal_attn, whose 5-dim cache shape cannot view the
-    TQ-sized page (boot reshape failure documented in the profile notes)."""
-    from slimserve.engine import _speculative_config
-
-    plan = resolve("qwen38-nvfp4-1-tq", "metal", 1, "NVFP4", 128 * GB)
-    cfg = _speculative_config(plan)
-    assert cfg["attention_backend"] == "TURBOQUANT"
-    assert cfg["kv_cache_dtype"] == "turboquant_k8v4"
+def test_turboquant_profile_is_removed():
+    assert "qwen38-nvfp4-1-tq" not in registry.profile_ids()
 
 
 def test_metal_gates_on_memory_not_on_gpu_count():
@@ -582,7 +573,7 @@ def test_deepseek_metal_is_runnable_while_glm_stays_gated():
     assert registry.platform_blocked("a100") is None
 
 
-def test_deepseek_metal_uses_measured_dspark_turboquant_settings():
+def test_deepseek_metal_uses_dspark_fp8_settings():
     plan = resolve("dsv4-xxs-1", "metal", 1, "IQ2_XXS", 128 * GB)
     # 256K metal resize (2026-08-11 Metal-side commit).
     assert plan.engine["max_model_len"] == 262144
@@ -591,8 +582,8 @@ def test_deepseek_metal_uses_measured_dspark_turboquant_settings():
     assert plan.engine["kv_cache_dtype"] == "fp8_ds_mla"
     speculative = engine_kwargs(plan)["speculative_config"]
     assert speculative["method"] == "dspark"
-    assert speculative["attention_backend"] == "TURBOQUANT"
-    assert speculative["kv_cache_dtype"] == "turboquant_k8v4"
+    assert speculative.get("attention_backend") != "TURBOQUANT"
+    assert speculative["kv_cache_dtype"] == "fp8"
     assert speculative["disable_draft_cudagraphs"] is True
 
 
@@ -1139,8 +1130,7 @@ def test_quantized_main_kv_is_an_explicit_validated_choice():
     through the engine's own kv_cache_dtype. glm52-q2k-4/a100 (fp8 at
     131072: 65.8 GiB of Q2K weights per 80 GB rank leave no room for bf16
     KV, operator-approved 2026-08-30) is covered by the same rule through
-    its note. Draft-model KV (DSpark TurboQuant) is exempt everywhere
-    because rejection sampling verifies drafts against the target.
+    its note. Draft-model KV follows the same FP8-only quantization policy.
     """
     rec = registry._registry()["profiles"]["qwen38fn-fp8-8"]["variants"]["rtx3090"]
     assert rec["engine"]["kv_cache_dtype"] == "fp8"

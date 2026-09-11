@@ -64,7 +64,7 @@ benchmark shape selection, not as endpoints.
 
 ## Canonical Serving Benchmarks
 
-Use SlimServe profiles so downloads, parser settings, DSpark/TurboQuant env,
+Use SlimServe profiles so downloads, parser settings, DSpark/FP8 env,
 KV dtype, and CUDA graph settings stay on the real path:
 
 ```bash
