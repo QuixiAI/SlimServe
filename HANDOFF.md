@@ -4,6 +4,22 @@
 > Metal. Earlier TurboQuant directives and measurements below are historical.
 > See `perf/optimization_status.md` for current validation evidence.
 
+# HANDOFF — GLM-5.3-Flash NVFP4 on 4x RTX PRO 6000 Blackwell (`glm53f-nvfp4-4` / `rtx6000`), branch `glm53f-rtx6000` (opened 2026-09-11, draft for review)
+
+The full regimen, rubric, roadmap and the post-mortem of the previous
+(deleted) sm_120 campaign are in `docs/glm53f-rtx6000-campaign.md`. Read
+that file first; this section is only the pointer and the one-paragraph state.
+
+State: branch cut from upstream/main 2b355117e; no code changes; the `.so`
+files in `vllm/` are stale (built from the deleted branch) and must be rebuilt
+for `12.0f` before any serving. Previous campaign's best on this box (no
+speculation, exact-token 1000/300): c1 162.8 / c8 534.5 / c16 691.0 tok/s
+from a 104.8 / 431.4 / 591.0 bring-up baseline; its retained pieces are
+listed in the campaign doc section 1d with a salvage recommendation awaiting
+the operator's decision. Next command: the Phase 0 native build
+(`~/.local/scratch/slimserve-glm53/rebuild.sh`), then platform + record +
+baseline.
+
 <!--
 Two active campaign handoffs live in this file. They cover different
 platforms and different hardware, and each is current for its own campaign;
