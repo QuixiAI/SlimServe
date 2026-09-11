@@ -44,7 +44,10 @@ def artifact_digest(path: Path) -> str:
         ).hexdigest()
     digest = hashlib.sha256()
     with path.open("rb") as stream:
-        size = struct.unpack("<Q", stream.read(8))[0]
+        prefix = stream.read(8)
+        if len(prefix) != 8:
+            raise ValueError(f"truncated safetensors file: {path}")
+        size = struct.unpack("<Q", prefix)[0]
         if size > 100_000_000:
             raise ValueError(f"invalid safetensors header length: {path}")
         header = json.loads(stream.read(size))
