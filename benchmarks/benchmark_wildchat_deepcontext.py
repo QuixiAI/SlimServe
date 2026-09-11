@@ -199,7 +199,10 @@ async def _turn(client, model, messages, records, sid, depth, args, max_tokens,
             max_tokens=max_tokens,
             temperature=1.0,
             top_p=0.95,
-            extra_body={"top_k": 20},
+            # Half the reply budget may be spent thinking; the server default
+            # (2000) would otherwise be clamped to max_tokens - 1 and leave the
+            # probe answer no room (the 900K+ misses of 2026-09-11).
+            extra_body={"top_k": 20, "thinking_token_budget": max(64, max_tokens // 2)},
             stream=True,
             stream_options={"include_usage": True},
             timeout=args.turn_timeout,
