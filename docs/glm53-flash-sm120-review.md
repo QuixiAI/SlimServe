@@ -49,7 +49,10 @@ The accumulated upstream diff is large (363 files and about 85K added lines
 at `b4cb567e6`), including historical notebooks and diagnostic tests. Do not
 equate that with 85K lines of retained kernels. Review runtime dependencies
 before moving or deleting diagnostics; preserve the evidence and user edits.
-No external review has occurred and no PR has been created yet.
+Existing draft [PR #24](https://github.com/QuixiAI/SlimServe/pull/24) uses the
+upstream `glm53-flash-sm120` branch. Its published head `7619685d8` is an
+ancestor of the retained checkpoint, so publication needs only a fast-forward.
+CodeRabbit skipped the draft; no substantive review has occurred yet.
 
 ## Remaining deep-kernel decisions
 
@@ -99,7 +102,12 @@ Defer the monolithic design, without calling it implemented or exhausted.
 Reopen when a concrete region has a measured traffic/dependency saving and a
 compatible resident schedule; launch-count reduction alone is insufficient.
 
-## Phase 5 integration gates
+## Deferred integration work — not SlimServe PR gates
+
+The operator explicitly excludes Foundry integration from this PR. Disabled
+host/NVMe tier qualification and the external QuixiCore port-back are follow-ups.
+Preserve the integration notes below for that later work; do not use them to
+block publishing or reviewing the retained SlimServe implementation.
 
 ### 5.1 Foundry
 
@@ -159,9 +167,19 @@ existing SlimServe measurements are provenance, not standalone port validation.
 
 ## Publication
 
-GitHub authentication returns HTTP 401. The separate Git publishing dry run
-also fails with invalid credentials, without updating remote refs. User
-reauthentication is required before pushing/opening the requested
-PR. Use Auroter <auroter@users.noreply.github.com> for author and committer.
-Keep review feedback/fixes and final cleanup as remaining work, not completed
-items merely because this review map exists.
+GitHub authentication was restored as `auroter` on 2026-09-11; the earlier
+HTTP401 failure remains in the historical notebook. Both API access and
+upstream push permission are confirmed. Update existing PR #24; do not create
+a duplicate or force-push. Use Auroter <auroter@users.noreply.github.com> for
+author and committer.
+
+The current upstream main `f6c6ed429` has 17 conflicting files against the
+retained branch, spanning profiles, shared GLM/KDA paths, CLI, runner and
+notebooks. A read-only merge-tree inspection identified these without changing
+the worktree. Preserve the independently developed main-side improvements and
+the qualified SM120 recipe when reconciling; the existing serving numbers apply
+to the recorded source, not automatically to a future merged tree.
+
+Remaining: publish the retained checkpoint, request substantive review, address
+feedback and semantic merge conflicts, run focused checks for resulting code
+changes, and clean up. No Foundry service or external port is required here.

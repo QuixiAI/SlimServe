@@ -28909,3 +28909,20 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - Profile-retention check: five focused GLM53 CPU tests pass (65 unrelated
   cases deselected), including the new RTX6000-only swapAB flag. Raw:
   `sparse-swapab/h16-profile-tests.xml`. No further GPU work or native changes.
+
+### Publication scope and authentication correction
+
+- Operator clarification: this deliverable is a SlimServe PR, review, feedback
+  fixes and cleanup. Foundry is explicitly out of scope. Disabled RTX host/NVMe
+  tier qualification and external QuixiCore port-back remain follow-ups, not
+  publication blockers. No settings or external trees were changed.
+- Authentication restored as auroter; authenticated API access and upstream push
+  permission confirmed. Existing draft PR #24 was discovered on QuixiAI/SlimServe
+  with head 7619685d8, an ancestor of retained checkpoint ba9fc7f2d. The earlier
+  statement that no PR existed was incorrect; no new PR was created by this
+  campaign pass. CodeRabbit had skipped the existing draft.
+- Non-mutating merge-tree inspection against main f6c6ed429 finds 17 conflicting
+  files. Shared model/profile changes require semantic reconciliation; neither
+  side should be discarded wholesale. Existing performance evidence remains
+  tied to its measured tree. No benchmark or native build was repeated for
+  this documentation/publication step.

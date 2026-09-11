@@ -58,13 +58,20 @@ H32 sweep are not target-profile evidence. Corrected benchmark heads/scale
 come from the checkpoint; the dispatch test asserts the native call, and
 serving logs H16 activation on rank0 before timing.
 
-Next: Phase 5 integration/publication, not another scoring or tile sweep.
+Next: SlimServe PR review/feedback/cleanup, not another scoring or tile sweep.
 Broader 2.3 next-layer prefetch and 4.4 persistent decode remain explicitly
 unimplemented/deferred, with evidence in `docs/glm53-flash-sm120-review.md`.
-Foundry has overlapping uncommitted changes and still needs its real eight-wide
-application gate. Host-tier allocation and QuixiCore port branch await operator
-choices. Both GitHub API and Git dry-run publishing fail authentication; no
-remote ref changed and no PR/review has occurred. Do not mark the roadmap done.
+The operator explicitly excludes Foundry integration from this SlimServe PR.
+Disabled host/NVMe tier qualification and external QuixiCore port-back are
+follow-ups, not publication blockers. Leave those trees and settings unchanged.
+GitHub authentication is restored as auroter. Existing draft PR #24 targets
+QuixiAI/SlimServe main from its upstream glm53-flash-sm120 branch; update that
+PR, not a new personal-fork PR. Its remote head 7619685d8 is an ancestor of this
+checkpoint. CodeRabbit previously skipped review because the PR was a draft.
+Current upstream main f6c6ed429 has 17 conflicting files, including shared model
+paths and renamed profiles; resolving them requires semantic reconciliation,
+not blanket ours/theirs. Publication, review fixes and merge reconciliation
+remain open. Do not label the whole historical roadmap completed.
 
 #### Earlier development checkpoints (superseded by the H16 result above)
 

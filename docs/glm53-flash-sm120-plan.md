@@ -74,7 +74,7 @@ budget; otherwise document deferral, not a fictitious implemented result.
 | 4.3 | H16 native BF16 swapAB retained: cold 32K/128K TTFT -0.274/-0.517%, decode neutral within pair spread; original H32 pair preserved as a no-op |
 | 4.4 | Persistent per-layer decode unimplemented/deferred; enabling fusions do not currently justify replacement (review map) |
 | 4.5 | TP row-sharded indexer, wide Marlin and H16 swapAB prefill retained; no claim that all structural possibilities are exhausted |
-| 5 | Final integration/tier qualification/port-back not completed |
+| 5 | Current deliverable: SlimServe PR #24, review, feedback fixes and cleanup. Foundry is explicitly out of scope; disabled-tier qualification and external port-back are follow-ups, not publication gates. |
 
 The first swapAB pair exposed a fixture/dispatch error: the checkpoint has
 64 global attention heads, hence H16 at TP4, not H32. Both no-op controls stay
@@ -84,7 +84,8 @@ the component and serving gates; the RTX6000 profile now enables the kernel.
 Detailed integration gates, research
 deferral evidence for2.3/4.4 and minimal port-back map are in
 `docs/glm53-flash-sm120-review.md`. Deferred does not mean implemented or
-exhausted; Phase5 and PR/review remain open.
+exhausted; SlimServe PR review and cleanup remain open. The historical Phase5
+application/tier/port tasks below are not requirements for this PR.
 
 The 4.1 prototype is quarantined under `benchmarks/kernels/` with its binding
 and benchmark. Raw: `perf/results/2026-09-11/nvfp4-cross-item/`. Gate/up
@@ -1114,6 +1115,11 @@ Exit: c1 MTP 450-550, c8 1100-1200, prefill >= 15K tok/s; every kernel has
 parity test, microbench GB/s, and an e2e entry.
 
 ### Phase 5: Foundry integration and retention
+
+Scope clarification (operator, 2026-09-11): the current deliverable is a
+SlimServe-only PR, review, feedback fixes and cleanup. The original three
+items below are future integration work, not blockers for that PR. Foundry
+must not be modified as part of this deliverable; RTX6000 tiers remain off.
 
 1. Foundry registry entry for the SlimServe backend (OpenAI-compatible,
    same port contract); pipeline runs at its real 8-wide fan-out with the
