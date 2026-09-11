@@ -44,9 +44,16 @@ def consume(topk_ids: torch.Tensor, output: torch.Tensor) -> torch.Tensor | None
     shared = pending.shared_experts.peek_output()
     if (
         shared is None
+        or output.dtype != torch.bfloat16
+        or output.ndim != 2
+        or output.shape[1] % 8 != 0
         or shared.shape != output.shape
         or shared.dtype != output.dtype
+        or shared.device != output.device
+        or not output.is_contiguous()
         or not shared.is_contiguous()
+        or output.data_ptr() % 16 != 0
+        or shared.data_ptr() % 16 != 0
     ):
         return None
     pending.consumed = True

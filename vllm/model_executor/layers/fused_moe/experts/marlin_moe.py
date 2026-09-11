@@ -1048,7 +1048,13 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
             return
         shared = (
             combine_shared.consume(topk_ids, output)
-            if input.is_contiguous() and output.is_contiguous()
+            if (
+                input.is_cuda
+                and input.dtype == torch.bfloat16
+                and input.device == output.device
+                and input.is_contiguous()
+                and input.data_ptr() % 16 == 0
+            )
             else None
         )
         if shared is not None:
