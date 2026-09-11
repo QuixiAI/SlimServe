@@ -49,7 +49,9 @@ def exact(reference, candidate):
             )
 
 
-def timing_rows(sites, narrow, batch, shared_activations=False, weight_banks=2):
+def timing_rows(
+    sites, narrow, batch, shared_activations=False, weight_banks=2, *, fp32_arm=True
+):
     """Keep every fn allocation distinct; optionally share inputs within a bank."""
     if len(sites) != len(narrow):
         raise ValueError("parameter and narrow site counts differ")
@@ -66,7 +68,11 @@ def timing_rows(sites, narrow, batch, shared_activations=False, weight_banks=2):
                 if shared is not None
                 else inputs(batch, 5001 + site + bank * len(sites))[:4]
             )
-            data = [*activations, weights[0].clone(), *weights[1:]]
+            data = [
+                *activations,
+                weights[0].clone() if fp32_arm else None,
+                *weights[1:],
+            ]
             candidate = [*activations, narrow[site].clone(), *weights[1:]]
             rows.append((data, candidate, site != 0))
     return rows

@@ -8,6 +8,8 @@ import torch
 
 from vllm.quixicore.ops import quixicore_ops
 
+pytest.importorskip("vllm._quixicore_C")
+
 pytestmark = pytest.mark.skipif(
     not (torch.cuda.is_available() and quixicore_ops.has_decode_gemm_fp8()),
     reason="needs CUDA and the QuixiCore decode_gemm_fp8 binding",

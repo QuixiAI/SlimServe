@@ -1,5 +1,9 @@
 // Archived Phase 4.1 experiment; NOT used by serving builds.
 // Marlin baseline: 6cba6fdee. Only the paired SwiGLU epilogue was added.
+// Decision: perf/optimization_status.md, 2026-09-11 "Phase 4.1 paired Marlin
+// SwiGLU: park for small serving budget". Complete expert c1 24.98 -> 23.69 us
+// (~54 us/model step), c8 neutral; seven stress comparisons fail tolerance.
+// Raw: perf/results/2026-09-11/marlin-swiglu/. No serving promotion.
 /*
  * Modified by Neural Magic
  * Copyright (C) Marlin.2024 Elias Frantar

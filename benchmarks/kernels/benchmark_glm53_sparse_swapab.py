@@ -84,7 +84,8 @@ def main():
     ).strip()
     if active:
         parser.error(f"GPUs busy: {active}")
-    assert torch.cuda.get_device_capability() == (12, 0)
+    if torch.cuda.get_device_capability() != (12, 0):
+        parser.error("SM120 required")
     torch.manual_seed(4311)
     result = {
         "status": "running",
@@ -223,7 +224,8 @@ def main():
                 graph.replay()
             torch.cuda.synchronize()
             torch.testing.assert_close(outs[1], outs[0], rtol=0.01, atol=0.016)
-            assert torch.count_nonzero(outs[1][0]).item() == 0
+            if torch.count_nonzero(outs[1][0]).item() != 0:
+                raise ValueError("empty selection must produce a zero row")
             lengths.fill_(2048)
             indices[2, :64] = indices[3, :64]
             samples = []

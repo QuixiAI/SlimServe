@@ -85,3 +85,38 @@ def test_timing_banks_reject_mismatched_site_counts():
         probe.timing_rows([[]], [], 1)
     with pytest.raises(ValueError, match="positive weight bank"):
         probe.timing_rows([], [], 1, weight_banks=0)
+
+
+def test_bf16_only_timing_does_not_clone_fp32_weights(monkeypatch):
+    monkeypatch.setattr(probe, "inputs", lambda *args: [torch.ones(1)] * 4)
+
+    class UnusedWeight:
+        def clone(self):
+            raise AssertionError("unused FP32 weight must not be allocated")
+
+    narrow = torch.ones(2, dtype=torch.bfloat16)
+    rows = probe.timing_rows(
+        [[UnusedWeight(), torch.ones(3), torch.ones(24)]],
+        [narrow],
+        1,
+        weight_banks=2,
+        fp32_arm=False,
+    )
+    assert all(row[0][4] is None for row in rows)
+    assert all(torch.equal(row[1][4], narrow) for row in rows)
+    assert len({row[1][4].data_ptr() for row in rows}) == 2
+
+
+@pytest.mark.parametrize("extra", [False, True])
+def test_installed_baseline_requires_matching_output_count(monkeypatch, extra):
+    from types import SimpleNamespace
+
+    from benchmarks.kernels import benchmark_mhc_output_parallel as comparison
+    from vllm.quixicore.ops import quixicore_ops as qc
+
+    values = [torch.ones(1) for _ in range(8)]
+    monkeypatch.setattr(comparison, "inputs", lambda *args: values)
+    monkeypatch.setattr(qc, "dsv4_mhc_pre", lambda *args: values[:3])
+    extension = SimpleNamespace(run=lambda *args: [values[0]] * (5 if extra else 3))
+    with pytest.raises(ValueError, match="output count differs"):
+        comparison.installed_baseline_checks(extension, 1)

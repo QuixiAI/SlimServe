@@ -14,6 +14,7 @@ from contextvars import ContextVar
 from functools import wraps
 
 from slimserve.glm53_ordering import enabled as native_order_enabled
+from slimserve.score_journal import private_open
 
 ACTIVE = ContextVar("slimserve_glm53_model_journal", default=None)
 OP_NAMES = ("glm5_mhc_pre", "glm5_mhc_fused_post_pre", "glm5_mhc_post")
@@ -59,7 +60,7 @@ class ModelJournal:
         self.moe_enabled = moe_enabled()
         self.moe_capture = None
         self.path = score_journal.path.with_name(f"model-{os.getpid()}.jsonl")
-        self.stream = self.path.open("x", buffering=1)
+        self.stream = private_open(self.path, buffering=1)
         self.write(
             {
                 "kind": "header",

@@ -125,16 +125,18 @@ def main():
 
     save()
     try:
+        import vllm._quixicore_C as native
         from vllm.quixicore.ops import quixicore_ops
 
         torch.set_num_threads(4)
         if torch.cuda.get_device_capability() != (12, 0):
             raise ValueError("requires the SM120 128-MiB-L2 target")
         result["gpu"] = torch.cuda.get_device_name()
-        with Path("vllm/_quixicore_C.cpython-312-x86_64-linux-gnu.so").open(
-            "rb"
-        ) as handle:
-            result["native_sha256"] = hashlib.file_digest(handle, "sha256").hexdigest()
+        native_digest = hashlib.sha256()
+        with Path(native.__file__).open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                native_digest.update(chunk)
+        result["native_sha256"] = native_digest.hexdigest()
         sidecar = args.model / "fp8-swapset.safetensors"
         for layer in args.layers:
             for kind, (cpu_q, cpu_s) in load_weights(sidecar, layer, args.rank).items():
