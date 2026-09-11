@@ -88,7 +88,8 @@ def _sparse_tc_split(enabled, q, cache, metadata):
     # Prefill and unqualified shapes retain the native bounded-scratch path.
     if (enabled and metadata.num_prefills == 0 and 0 < q.shape[0] <= 32
             and q.shape[1] in (8, 16) and q.shape[2] == 512
-            and q.dtype == cache.dtype == torch.bfloat16
+            and q.dtype == torch.bfloat16
+            and cache.dtype in (torch.bfloat16, torch.uint8, torch.float8_e4m3fn)
             and cache.shape[-1] == 512):
         return 32 if q.shape[0] < 8 else 128
     return 0
@@ -486,6 +487,30 @@ class QuixiCoreMLASparseImpl(MLAAttentionImpl[QuixiCoreMLASparseMetadata]):
             )
             return out, None
 
+        if q.shape[-1] == 512:
+            tc_split = _sparse_tc_split(
+                self._sparse_tc_decode, q, kv_c_and_k_pe_cache, attn_metadata
+            )
+            if tc_split:
+                from vllm.quixicore.sparse_mla_tc import sparse_tc_nope
+                return sparse_tc_nope(
+                    q, kv_c_and_k_pe_cache.view(torch.uint8), bt, idx, tlen,
+                    self.softmax_scale, split=tc_split, kv_scale=k_scale,
+                ), None
+            # NoPE MLA (glm5_next) over an fp8 latent: the NFP8=512
+            # instantiation of the bf16 NoPE kernel, same partition heuristic.
+            return quixicore_ops.mla_decode_fp8_sparse_nope(
+                q,
+                kv_c_and_k_pe_cache.view(torch.uint8),
+                bt,
+                idx,
+                tlen,
+                attn_metadata.block_size,
+                self.softmax_scale,
+                k_scale,
+                partition_size=_bf16_partition(q, idx),
+                page_stride_bytes=_page_stride_bytes(kv_c_and_k_pe_cache),
+            ), None
         out = quixicore_ops.mla_decode_fp8_sparse_glm(
             q,
             kv_c_and_k_pe_cache.view(torch.uint8),

@@ -1450,6 +1450,44 @@ static torch::Tensor py_mla_decode_bf16_sparse_nope(torch::Tensor q, torch::Tens
     return out;
 }
 
+// GLM-5.3-Flash (glm5_next) fp8 geometry: NoPE latent, q/cache slot are 512
+// fp8 elements (no rope tail), the value is the full 512, one per-tensor
+// kv_scale (vLLM's fp8 MLA layout, SMODE 1). The bf16 NoPE path above is the
+// NFP8=0 instantiation of the same kernel; this is the NFP8=512 one, so the
+// selected-row walk, the partition split and the reduce are shared. On sm80
+// the fp8 decode is software (no fp8 hardware), as for the 576 GLM-5.2 path.
+static torch::Tensor py_mla_decode_fp8_sparse_nope(torch::Tensor q, torch::Tensor data,
+        torch::Tensor bt, torch::Tensor indices, torch::Tensor topk_length,
+        int64_t block_size, double scale, double kv_scale,
+        int64_t partition_size, int64_t page_stride_bytes) {
+    CK(q); TORCH_CHECK(data.is_cuda() && data.stride(-1) == 1, "data must be a CUDA tensor with unit inner stride"); CK(bt); CK(indices); CK(topk_length);
+    const int B = q.size(0), H = q.size(1);
+    TORCH_CHECK(q.size(2) == 512, "NoPE MLA expects q width 512, got ", q.size(2));
+    const int max_topk = indices.size(1);
+    auto out = torch::empty({B, H, 512}, q.options());
+    if (partition_size <= 0) {
+        mla_decode_fp8_v<true, false, 512, 512, 512, 1><<<dim3(H, B), 32, 0, stream()>>>(
+            bp(q), data.data_ptr<uint8_t>(), nullptr, bt.data_ptr<int>(), nullptr,
+            indices.data_ptr<int>(), topk_length.data_ptr<int>(), max_topk, bpm(out),
+            nullptr, nullptr, nullptr, int(block_size), int(bt.size(1)), float(scale), H, 1, 0,
+            float(kv_scale), nullptr, 0, int(page_stride_bytes));
+        return out;
+    }
+    const int P = int((max_topk + partition_size - 1) / partition_size);
+    auto opts = q.options().dtype(torch::kFloat);
+    auto tmp = torch::empty({B, H, P, 512}, opts);
+    auto ml = torch::empty({B, H, P}, opts);
+    auto es = torch::empty({B, H, P}, opts);
+    mla_decode_fp8_v<true, true, 512, 512, 512, 1><<<dim3(H, B, P), 32, 0, stream()>>>(
+        bp(q), data.data_ptr<uint8_t>(), nullptr, bt.data_ptr<int>(), nullptr,
+        indices.data_ptr<int>(), topk_length.data_ptr<int>(), max_topk, nullptr,
+        tmp.data_ptr<float>(), ml.data_ptr<float>(), es.data_ptr<float>(),
+        int(block_size), int(bt.size(1)), float(scale), H, P, int(partition_size),
+        float(kv_scale), nullptr, 0, int(page_stride_bytes));
+    paged_attention_reduce<__nv_bfloat16, 512><<<dim3(H, B), 32, 0, stream()>>>(
+        tmp.data_ptr<float>(), ml.data_ptr<float>(), es.data_ptr<float>(), bpm(out), H, P);
+    return out;
+}
 // GLM-5.2-Vision geometry: q/cache slot are 576 fp8 elements, the value is the
 // leading 512, and the cache carries one per-tensor kv_scale (vLLM's fp8 MLA
 // layout) rather than per-64 e8 exponents. `indices` are request-local logical
@@ -2196,6 +2234,11 @@ void init_serving(py::module_& m) {
           py::arg("kv"), py::arg("block_table"), py::arg("indices"),
           py::arg("topk_length"), py::arg("block_size"), py::arg("scale"),
           py::arg("partition_size") = 0,
+          py::arg("page_stride_bytes") = 0);
+    m.def("mla_decode_fp8_sparse_nope", &py_mla_decode_fp8_sparse_nope, py::arg("q"),
+          py::arg("data"), py::arg("block_table"), py::arg("indices"),
+          py::arg("topk_length"), py::arg("block_size"), py::arg("scale"),
+          py::arg("kv_scale"), py::arg("partition_size") = 0,
           py::arg("page_stride_bytes") = 0);
     m.def("mla_decode_fp8_sparse_glm", &py_mla_decode_fp8_sparse_glm, py::arg("q"),
           py::arg("data"), py::arg("block_table"), py::arg("indices"),
