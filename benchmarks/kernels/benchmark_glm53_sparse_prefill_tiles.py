@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Screen existing sparse-MLA prefill tiles on SM120, not serving performance.
+"""Archived rejected SM120 sparse-prefill experiments; diagnostic only.
 
 BF16 Q/KV and the existing FP16 probability product are unchanged. Synthetic
 queries use 512 distinct pooled groups (four contiguous tokens per group) from
-a 32K/128K cache. Compare N64/one-stage candidates with the installed N32/two-
-stage kernel. The previously rejected N32/eight-warp variant is not repeated.
+a 32K/128K cache. All five experiment families completed on 2026-09-10 without
+a useful gain. Preserve this reproducer and its raw results; do not resume the
+sweep. See perf/optimization_status.md, "Close sparse-prefill local variants".
+No serving dispatcher imports the experimental kernels.
 """
 
 import argparse
@@ -39,11 +41,27 @@ def main():
     parser.add_argument("--context", type=int, nargs="+", default=[32768, 131072])
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--replays", type=int, default=5)
+    parser.add_argument("--split-heads", action="store_true")
+    parser.add_argument("--fused-accumulator", action="store_true")
+    parser.add_argument("--reload-query", action="store_true")
+    parser.add_argument("--split-values", action="store_true")
     args = parser.parse_args()
     if args.output.exists() or min(args.rounds, args.replays, *args.batch) < 1:
         parser.error("new output path and positive counts required")
     if any(c not in (32768, 131072) for c in args.context):
         parser.error("use the fixed 32K/128K cache cases")
+    if (
+        sum(
+            (
+                args.split_heads,
+                args.fused_accumulator,
+                args.reload_query,
+                args.split_values,
+            )
+        )
+        > 1
+    ):
+        parser.error("test one kernel hypothesis at a time")
     active = subprocess.check_output(
         ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"], text=True
     ).strip()
@@ -109,8 +127,11 @@ def main():
                     bt=bt,
                     indices=indices,
                     lengths=lengths,
+                    implementation=pf._sparse_mla_prefill_kernel,
+                    kernel_kwargs=None,
                 ):
-                    return pf._sparse_mla_prefill_kernel[(batch,)](
+                    value_tile = (kernel_kwargs or {}).get("VALUE_TILE", 512) or 512
+                    return implementation[(batch, 512 // value_tile)](
                         q,
                         kv,
                         bt,
@@ -127,16 +148,81 @@ def main():
                         BLOCK_N=n,
                         num_warps=warps,
                         num_stages=stages,
+                        **(kernel_kwargs or {}),
                     )
 
                 baseline_kernel = call(baseline_out, 32, 4, 2)
                 torch.testing.assert_close(baseline_out, reference, rtol=0, atol=0)
                 baseline = capture(partial(call, baseline_out, 32, 4, 2))
-                for warps in (4, 8):
+                if args.split_heads:
+                    # Each head is independent. This isolated view uses the
+                    # existing H16 kernel with duplicated request metadata;
+                    # a serving implementation would use a second grid axis.
+                    split_q = q.reshape(batch * 2, 16, 512)
+                    split_bt = bt.repeat_interleave(2, dim=0)
+                    split_indices = indices.repeat_interleave(2, dim=0)
+                    split_lengths = lengths.repeat_interleave(2, dim=0)
+
+                    def candidate_call(
+                        out,
+                        n,
+                        warps,
+                        stages,
+                        q=split_q,
+                        bt=split_bt,
+                        indices=split_indices,
+                        lengths=split_lengths,
+                        kv=kv,
+                    ):
+                        return pf._sparse_mla_prefill_kernel[(q.shape[0],)](
+                            q,
+                            kv,
+                            bt,
+                            indices,
+                            lengths,
+                            out,
+                            2048,
+                            bt.shape[1],
+                            kv.stride(0),
+                            64,
+                            1 / math.sqrt(512),
+                            H=16,
+                            D=512,
+                            BLOCK_N=n,
+                            num_warps=warps,
+                            num_stages=stages,
+                        )
+
+                    configs = [(32, 4, 2), (32, 4, 1), (64, 4, 1)]
+                elif args.fused_accumulator or args.reload_query or args.split_values:
+                    from benchmarks.kernels.glm53_sparse_prefill_fused import kernel
+
+                    candidate_call = partial(
+                        call,
+                        implementation=kernel,
+                        kernel_kwargs={
+                            "RELOAD_Q": args.reload_query,
+                            "FUSE_ACC": args.fused_accumulator,
+                            "VALUE_TILE": 256 if args.split_values else 0,
+                        },
+                    )
+                    configs = (
+                        [(32, 4, 1), (32, 4, 2)]
+                        if args.split_values
+                        else [(32, 4, 1), (32, 4, 2), (32, 4, 3)]
+                        if args.reload_query
+                        else [(32, 4, 2), (32, 8, 2), (64, 4, 1)]
+                    )
+                else:
+                    candidate_call = call
+                    configs = [(64, 4, 1), (64, 8, 1)]
+                for n, warps, stages in configs:
                     row = {
                         "batch": batch,
                         "context": context,
-                        "tile": [64, warps, 1],
+                        "tile": [n, warps, stages],
+                        "heads_per_block": 16 if args.split_heads else 32,
+                        "value_tile": 256 if args.split_values else 512,
                         "baseline_resources": {
                             "registers": baseline_kernel.n_regs,
                             "spills": baseline_kernel.n_spills,
@@ -145,7 +231,7 @@ def main():
                     }
                     result["cases"].append(row)
                     try:
-                        kernel = call(candidate_out, 64, warps, 1)
+                        kernel = candidate_call(candidate_out, n, warps, stages)
                     except torch.OutOfMemoryError:
                         raise
                     except Exception as error:
@@ -168,7 +254,9 @@ def main():
                         spills=kernel.n_spills,
                         shared=kernel.metadata.shared,
                     )
-                    candidate = capture(partial(call, candidate_out, 64, warps, 1))
+                    candidate = capture(
+                        partial(candidate_call, candidate_out, n, warps, stages)
+                    )
                     row["samples"] = [
                         {
                             name: measure(graph, 1, args.replays)

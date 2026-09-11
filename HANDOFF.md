@@ -47,9 +47,20 @@ serving workloads passed. Do not repeat its qualification or call it a speed win
 M48/S3/S4, whole-K and K32/S4/S5/S6 also rejected. Raw
 `marlin-prefill-{row48,fixed,whole,k32}/` and `marlin-fixed-serving-{control,candidate}/`
 under2026-09-10. Both servers exited0 and GPUs released. Recipe/profile unchanged.
-NEXT: focused sparse-MLA prefill N64/one-stage/four- or eight-warp screen against
-current N32/two-stage/four-warp kernel. Probe prepared, no serving path change:
-`benchmarks/kernels/benchmark_glm53_sparse_prefill_tiles.py`.
+Sparse-prefill local variants are also CLOSED: 52 synthetic case/variant
+measurements across larger key tiles, split heads, accumulator fusion, query
+reload and split values. None gives a useful gain; no serving change or further
+validation is warranted. The benchmark and experimental kernel are explicitly
+archived diagnostics under `benchmarks/kernels/`; raw results are in
+`perf/results/2026-09-10/sparse-prefill-tiles/`. Do not resume this sweep.
+
+Current operator direction: research-led optimization with practical diminishing
+returns. Start from measured bottlenecks and successful local/upstream designs;
+identify the actual mechanism and likely full-serving benefit before editing a
+kernel. Use a focused comparison to confirm the hypothesis, not permutation
+search to discover one. Spills alone do not identify the dominant bottleneck.
+NEXT: implementation-level reference review and one justified structural change,
+not another geometry sweep or scoring campaign. Recipe/profile unchanged.
 
 The same-live-input scoring diagnostic is COMPLETE; do not restart or extend it.
 All four ranks pass exact paired scoring/input immutability and HTTP coverage
@@ -73,9 +84,8 @@ prefill reading beats every control reading; text/image, exact tokens and all
 long-context retrieval contrasts pass. Historical scoring failures remain unchanged.
 No claim of across-start variance or broad model-quality qualification.
 Raw `marlin-wide-serving-{control,candidate}/` under2026-09-10; both exit0, GPUs free.
-NEXT: another measured kernel bottleneck, not another validation campaign. The
-wide tile is the new starting point; smaller-row/wider-column geometry and
-prefetch scheduling remain unexplored beyond the recorded rejected screen.
+The wide tile remains the starting point. The subsequent smaller-row, K32,
+whole-K and fixed-shape experiments above are closed, not pending work.
 Native SHA f3fb0be4831122b75c82aae71597ae21c7a5b65f63b0a05a06fb4988d616e296;
 old library preserved at `perf/results/2026-09-10/marlin-prefill/moe-before-wide.so`.
 

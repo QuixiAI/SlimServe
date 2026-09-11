@@ -12,6 +12,15 @@ Companion notebook entries go in
 `perf/optimization_status.md`; baselines in `perf/baseline_status.md`; raw
 logs under `perf/results/YYYY-MM-DD/<run-id>/`.
 
+Current operating direction (2026-09-10): prioritize research-led, practical
+kernel improvements. Use existing attribution and study relevant implementations
+before choosing a change. Each candidate needs a specific waste/dependency to
+remove, a hardware/precision-compatible precedent, and plausible end-to-end
+value. Then run a focused correctness/performance comparison; reject neutral
+results without adding permutations or repeated starts. The sparse-prefill local
+variant screen is closed. Historical phase gates below are not instructions to
+resume validation infrastructure or exhaust every possible configuration.
+
 Goal: an optimized SlimServe profile `glm53-nvfp4-4` for the platform
 `rtx6000` (4x RTX PRO 6000 Blackwell Workstation, sm_120, PCIe 5 x16, no
 NVLink, 96 GB per card) that runs GLM-5.3-Flash as close to the bandwidth

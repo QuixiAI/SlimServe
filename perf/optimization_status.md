@@ -28239,3 +28239,46 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   shared memory, and N32/eight-warps was slower. Existing attention arithmetic
   unchanged, synthetic pooled locality,32K/128K cache,2048/7616 query rows,
   three A/B/A rounds x five replays. Isolated probe only, no serving change.
+
+## 2026-09-10 - Close sparse-prefill local variants
+
+- Status: rejected; no new serving optimization retained. Production remains
+  the wide-Marlin baseline from 8f22c0d40. The sparse attention serving source,
+  selected RedHatAI NVFP4/FP8-KDA TP4 recipe and BF16 KV are unchanged.
+- Baseline: `quixicore_mla_sparse_prefill.py`, H32/D512/N32, four warps, two
+  stages. Compiled metadata: 255 registers, 48 spills, 67,840 shared bytes.
+  This resource observation did not establish the dominant performance limit.
+- Hypotheses: amortize loop overhead with larger key tiles; reduce live state
+  with split heads/values or query reload; use the existing Triton attention
+  precedent `tl.dot(p, v, acc)` to avoid a separate product accumulator.
+- Workload: synthetic Q/KV, 512 unique pooled groups of four contiguous tokens,
+  2048/7616 query rows and 32768/131072 cache rows. GPU0 on RTX PRO 6000 SM120,
+  same CUDA 13.0 environment. Three A/B/A rounds with five graph replays per
+  arm, 52 total case/variant measurements. Not actual-model activations or
+  serving performance. Every result is retained.
+- Results (paired baseline/candidate throughput ratios; >1 is faster):
+
+  | Artifact | Change | Ratio range | Decision |
+  |---|---|---:|---|
+  | `screen.json` | N64, one stage, four/eight warps | 0.543–0.821 | Reject |
+  | `split-heads.json` | H16 blocks, duplicated metadata | 0.312–0.608 | Reject |
+  | `fused-accumulator.json` | Fused PV accumulation | 0.549–1.004 | Reject; N32/W4 only +0.14–0.35% |
+  | `reload-query.json` | Shorten Q lifetime by cached reload | 0.585–0.800 | Reject; spills increased |
+  | `split-values.json` | DV256, duplicate score calculation | 0.315–0.480 | Reject despite zero spills |
+
+- Correctness: all local comparisons pass the existing rtol 0.01/atol 0.016;
+  N32 outputs bit-exact in these fixtures, N64 max absolute error
+  0.000244140625 and maximum NRMS 0.000385017. This is synthetic local parity,
+  not an independent accuracy or end-to-end qualification claim.
+- Decision: stop this line of experimentation. No serving starts, additional
+  correctness campaign, or new geometry variants are justified. Explicitly mark
+  both benchmark files as rejected diagnostic reproducers; preserve raw data.
+  No performance change to the retained baseline is claimed.
+- Method correction requested by the operator: research and attribution should
+  drive development; testing should validate a specific mechanism. Review
+  successful fusion/reuse/transport precedents and estimate practical full-stack
+  benefit before choosing another kernel. Do not equate fewer spills with a win
+  or pursue isolated sub-percent gains through repeated serving campaigns.
+- Raw: `perf/results/2026-09-10/sparse-prefill-tiles/`, five JSON files above.
+  Settings and all timings are recorded in each file; the CLI switches in
+  `benchmark_glm53_sparse_prefill_tiles.py` reproduce the respective diagnostics.
