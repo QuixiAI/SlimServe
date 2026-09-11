@@ -1304,3 +1304,17 @@ def test_glm53f_records_carry_a_thinking_budget():
         rec = registry._registry()["profiles"][profile_id]["variants"]["a100"]
         budget = rec["engine"]["override_generation_config"]["thinking_token_budget"]
         assert 500 <= budget <= 4000, (profile_id, budget)
+
+
+def test_scalar_list_engine_args_render_space_separated():
+    """vLLM's nargs list flags (numa_bind_nodes) take space-separated values;
+    a JSON-rendered list is rejected at parse time (2026-09-11 NUMA arm)."""
+    from dataclasses import replace
+    from slimserve.engine import serve_argv
+
+    plan = resolve("glm53f-nvfp4-8", "a100", 8, None)
+    plan = replace(plan, engine={**plan.engine, "numa_bind_nodes": [0, 0, 1, 1]})
+    argv = serve_argv(plan, "127.0.0.1", 8400)
+    i = argv.index("--numa-bind-nodes")
+    assert argv[i + 1 : i + 5] == ["0", "0", "1", "1"]
+    assert "[0, 0, 1, 1]" not in argv
