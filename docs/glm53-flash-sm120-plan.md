@@ -74,7 +74,7 @@ budget; otherwise document deferral, not a fictitious implemented result.
 | 4.3 | H16 native BF16 swapAB retained: cold 32K/128K TTFT -0.274/-0.517%, decode neutral within pair spread; original H32 pair preserved as a no-op |
 | 4.4 | Persistent per-layer decode unimplemented/deferred; enabling fusions do not currently justify replacement (review map) |
 | 4.5 | TP row-sharded indexer, wide Marlin and H16 swapAB prefill retained; no claim that all structural possibilities are exhausted |
-| 5 | Stack #26 -> #27 -> #28 -> #25 -> #24: parts1/5 reviewed and findings resolved; part2 review running, parts3/4 queued. Review-tree native and corrected serving checks pass; initial compile failure preserved. Main advanced again; two new conflicts resolved/propagated, focused CPU checks pass, native rebuild pending. See review map. Foundry/disabled tiers/external port-back remain out of scope. |
+| 5 | Stack #26 -> #27 -> #28 -> #25 -> #24: parts1/5 reviewed and findings resolved; part2 review running, parts3/4 queued. Main's two new conflicts resolved/propagated; native rebuild, 120 CPU and 66 GPU checks pass. Layer/microbatch-owned Marlin scratch replaces the global cache; 18 focused ownership/fallback checks pass. Final combined serving waits for remaining review fixes. See review map. Foundry/disabled tiers/external port-back remain out of scope. |
 
 The first swapAB pair exposed a fixture/dispatch error: the checkpoint has
 64 global attention heads, hence H16 at TP4, not H32. Both no-op controls stay

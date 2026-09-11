@@ -199,7 +199,7 @@ The stack is published; review/merge dependency order is:
 | Part | PR | Scope | Changed files |
 |---|---|---|---:|
 | 1 | [#26](https://github.com/QuixiAI/SlimServe/pull/26) | Native kernels, bindings, focused probes/tests | 94 |
-| 2 | [#27](https://github.com/QuixiAI/SlimServe/pull/27) | Serving recipe, platform integration and regressions | 81 |
+| 2 | [#27](https://github.com/QuixiAI/SlimServe/pull/27) | Serving recipe, platform integration and regressions | 82 |
 | 3 | [#28](https://github.com/QuixiAI/SlimServe/pull/28) | Numerical diagnostics and prefill qualification | 83 |
 | 4 | [#25](https://github.com/QuixiAI/SlimServe/pull/25) | Indexer/routing diagnostics and qualification | 56 |
 | 5 | [#24](https://github.com/QuixiAI/SlimServe/pull/24) | Campaign harnesses, evidence and roadmap | 55 |
@@ -261,6 +261,16 @@ CodeRabbit resolved all13 part1 threads. Part2 full review was accepted at
 20:42 UTC; its response and parts3/4 remain pending. One included review/hour;
 next slot about21:42 UTC for #28, then #25. Do not enable paid overages or
 repeatedly request over-quota reviews. Part5's ten threads remain resolved.
+
+Local ownership review found that Marlin's per-device lock cache could alias
+overlapping layers or microbatches. Fix166d19ced uses layer/device/microbatch
+ownership for normal, LoRA and batched expert paths; standalone calls without
+explicit scratch allocate per invocation. Steady-state serving retains reuse
+without a per-call fill. The target needs about126KiB total scratch per GPU
+across42 layers.18 focused ownership/fallback tests pass on the combined tree,
+raw `part2-workspace-fixed.xml`; the first fixture's wrong positional argument
+is preserved in `part2-workspace.xml`. No DBO serving or performance claim;
+this Python-only fix joins the final combined-profile qualification.
 
 Main's existing
 glm53f-q2-1/metal record references a missing glm53f-gguf source and lacks its

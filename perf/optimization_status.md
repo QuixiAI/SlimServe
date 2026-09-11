@@ -49,6 +49,19 @@
   final serving until remaining review fixes settle. Raw `main-forward-*`
   under the same directory.
 
+- Further local review:166d19ced removes the device-global Marlin lock cache.
+  Baseline reused one workspace across every layer; that can alias concurrent
+  work despite each completed kernel returning its locks to zero. Normal,
+  LoRA and batched expert paths now cache by layer/device/microbatch; standalone
+  calls without explicit scratch allocate per invocation. The serving path
+  keeps warm reuse/no per-call fill, about126KiB across42 layers per GPU.
+  Correctness:18 CPU ownership/fallback tests pass on the combined tree.
+  First test fixture read sorted IDs instead of the workspace positional
+  argument; explicit-scratch regression caught that error and it is corrected.
+  Raw `part2-workspace.xml` and `part2-workspace-fixed.xml` preserve both runs.
+  Decision: retain the ownership fix; no new throughput or DBO qualification
+  claimed. Final combined-profile check remains pending review completion.
+
 ## 2026-09-11 - Native quantized prefill GEMM on Metal; FP8-KV directive state; two walls found
 
 - Directive (operator): CT weights stay in native quantized form ALWAYS -

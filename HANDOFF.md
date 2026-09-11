@@ -144,7 +144,13 @@ followed by66 merged-indexer/sparse-MLA GPU tests. GPUs released. Prior
 qualified f19b61ce binary is in `pr-review/native-before-main/`. Defer final
 merged-tree serving until remaining review fixes settle; the prior result
 does not qualify this later main merge. No server/build/probe is running.
-Parts1/2 now contain94/81 changed files; still below the review limit.
+Parts1/2 now contain94/82 changed files; still below the review limit.
+Local Marlin ownership fix166d19ced replaces the device-global lock cache with
+layer/device/microbatch scratch and invocation-local standalone fallback.
+18 focused ownership/combine tests pass on the combined tree; no native
+rebuild needed. Raw `pr-review/part2-workspace-fixed.xml` (first fixture error
+retained in `part2-workspace.xml`). Include this fix in the final serving check;
+do not start a DBO qualification or claim an unmeasured speedup.
 CodeRabbit allows ONE included review per hour. Remaining #27/#28/#25;
 Part1's13 threads resolved. #27 full review accepted20:42 UTC; response pending.
 Next included slot about21:42 UTC on2026-09-11, for #28 then #25.
