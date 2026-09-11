@@ -194,8 +194,24 @@ exclude tests/diagnostics. Keep PR24 as the tip and preserve campaign commits
 with a non-rewriting history join. Combined-tree qualification above is not
 a claim that every intermediate review layer is independently serving-qualified.
 
-No substantive external review yet. Remaining: publish the stack, obtain review,
-address feedback with focused checks, and final cleanup. Main's existing
+The stack is published; review/merge dependency order is:
+
+| Part | PR | Scope | Changed files |
+|---|---|---|---:|
+| 1 | [#26](https://github.com/QuixiAI/SlimServe/pull/26) | Native kernels, bindings, focused probes/tests | 92 |
+| 2 | [#27](https://github.com/QuixiAI/SlimServe/pull/27) | Serving recipe, platform integration and regressions | 80 |
+| 3 | [#28](https://github.com/QuixiAI/SlimServe/pull/28) | Numerical diagnostics and prefill qualification | 83 |
+| 4 | [#25](https://github.com/QuixiAI/SlimServe/pull/25) | Indexer/routing diagnostics and qualification | 56 |
+| 5 | [#24](https://github.com/QuixiAI/SlimServe/pull/24) | Campaign harnesses, evidence and roadmap | 54 |
+
+History join e5d0ec096 is byte-identical to qualified-content c41148025 and
+retains every original campaign commit. No force-push or merge into main.
+Layer1 targets main; each later PR targets the preceding branch. Keep this
+dependency order when landing; retarget the next PR after its base lands.
+All remain draft pending substantive review and feedback. Initial publication
+is complete; review requests and resulting fixes are the remaining work.
+
+Main's existing
 glm53f-q2-1/metal record references a missing glm53f-gguf source and lacks its
 FP8-KV note; eight broad registry failures reproduce on main and are recorded
 separately, not hidden by invented model metadata. No Foundry service or external

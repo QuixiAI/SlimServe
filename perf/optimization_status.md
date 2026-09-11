@@ -30000,7 +30000,11 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   maximum; the365-file PR cannot receive full review as one unit. Publish a
   dependency-ordered stack with every diff below100 files, retaining all tests,
   diagnostics and original campaign history. No review-filter exclusions or
-  force-push. PR24 stays the tip; review/feedback/cleanup remain open.
+  force-push. Published stack: #26/#27/#28/#25/#24, respectively92/80/83/56/54
+  changed files. E5d0ec096 joins the cumulative branches without changing the
+  c41148025 tree or losing campaign history. Every PR targets the preceding
+  layer (first targets main); PR24 is the original tip. All drafts pending
+  review/feedback/cleanup. No new runtime work or repeated serving run.
 ## 2026-09-06: GLM-5.2 A100 tier records re-measured after the sparse-decode copy removal
 
 - Both records boot through their profiles with the host tier active

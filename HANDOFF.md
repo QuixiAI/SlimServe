@@ -107,7 +107,13 @@ even its absolute300-file maximum. The user permits splitting only when needed,
 so publish a dependency-ordered review stack under100 files per PR, retaining
 all implementation/tests/diagnostics and the original campaign history. Do not
 exclude files via review filters, force-push, or merge into main. Keep #24 as
-the stack tip. Substantive review, feedback fixes and final cleanup remain open.
+the stack tip. Published review order: #26 (kernels,92 files) -> #27
+(serving,80) -> #28 (numerics/prefill,83) -> #25 (indexer/routing,56) -> #24
+(harnesses/evidence,54). Four new upstream glm53-sm120-review-{1..4}-* branches
+are cumulative. History join e5d0ec096 has the identical tree to c41148025 and
+preserves all campaign commits; no forced push/main merge. PR24 now targets
+glm53-sm120-review-4-indexer. All remain draft. Substantive review, feedback
+fixes and final cleanup remain open; see the review map for links.
 Do not label the whole historical roadmap completed.
 
 #### Earlier development checkpoints (superseded by the H16 result above)
