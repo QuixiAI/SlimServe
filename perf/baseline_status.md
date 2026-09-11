@@ -2518,3 +2518,28 @@ graph capture for the hybrid GDN+MTP decode, Gemma-aware fused norm+quant.
 - Expected next moves: MTP speculative decoding (checkpoint ships the
   head), host tier once the packed planner handles KDA+MLA mixed block
   sizes, kernel-level tuning of the pooled-logits path.
+
+## 2026-09-11: glm53f-nvfp4-8 = TP4 x DP2, replicated MoE, DFlash2 (A100)
+
+Record flipped from TP8 (operator 2026-09-10: production is always c8+).
+Two TP4 replicas, each with the full expert set sharded over its own TP
+group (`data_parallel_replicate_moe`; weights 46.28 GiB/rank, pool
+1,653,769 tokens per replica), prefix-affinity DP routing, indexer row
+shard and sparse tensor-core decode on (both TP4-capable since 09-11),
+DFlash2 k=3 with schedule [[1,16,3],[17,64,0]] per replica.
+Exact-token 1000 in / 300 out through `slimserve --serve`, three warmed
+repeats, medians, aggregate tok/s:
+
+| record | c1 | c8 | c16 | c32 | c64 |
+|---|---|---|---|---|---|
+| glm53f-nvfp4-8 TP4xDP2 replicated (09-11) | 117.8 | 506.8 | 786.5 | 985.8 | 1158.0 |
+| glm53f-nvfp4-8 TP8 (09-10, superseded) | 153.6 | 495.0 | 687.3 | 879.5 | 1074.5 |
+
+c8 +2%, c16 +14%, c32 +12%, c64 +8%; c1 -23% (one request runs on a
+TP4 replica; c1 tracks DFlash acceptance 1.5-3.2 per run). Gates at this
+baseline: text/image/tool canaries pass; forced-eviction tier acceptance
+6/6 markers after a 2,155,789-token churn of the 1,653,769-token pool,
+24 hits, VLLM_KV_TIER_VERIFY 96 batches / 0 mismatched, 0 failed-closed.
+Owed on this record (running): WildChat deep-context leg and the 1M leg
+on the tree with the block-pool negative-allocation fix (9c24bc5ad).
+Raw: perf/results/2026-09-11/glm53f-final-dp2/.

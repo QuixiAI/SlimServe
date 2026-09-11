@@ -1276,3 +1276,15 @@ def test_no_metal_profile_uses_a_host_ram_tier():
             continue
         extra = transfer.get("kv_connector_extra_config", {})
         assert "host_tier_gb_per_rank" not in extra, profile_id
+
+
+def test_glm53f_8_is_tp4_dp2_with_replicated_moe():
+    """Operator 2026-09-10: production is always c8+, so the 8-GPU GLM-5.3
+    record runs two TP4 replicas. Each replica keeps the full expert set
+    (data_parallel_replicate_moe) - the default DP flattens the MoE across
+    all eight ranks and all-gathers every MoE layer across replicas."""
+    plan = resolve("glm53f-nvfp4-8", "a100", 8, None)
+    assert plan.engine["tensor_parallel_size"] == 4
+    assert plan.engine["data_parallel_size"] == 2
+    assert plan.engine["data_parallel_replicate_moe"] is True
+    assert plan.engine["enable_expert_parallel"] is False
