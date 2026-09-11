@@ -3978,3 +3978,15 @@ TP4 = 36 MLA + 18 indexer + 4 KDA state pages; 106 at TP8 = 68 + 34 + 4.
   + paired k=3). Logs: queue2.log, matrix-chain.log, k4-chain.log. The 1M
   leg is parked (leg_1m.sh stub; real script leg_1m.real.sh) until the
   block-pool fault is fixed.
+
+## 2026-09-11 12:00: record flipped to TP4 x DP2; block-pool fault fixed
+
+- glm53f-nvfp4-8 = TP4 x DP2 with replicated MoE (9cb3c3c30). Serve-path
+  c1 117.8 / c8 506.8 / c16 786.5 / c32 985.8 / c64 1158.0; canaries and
+  tier acceptance pass (perf/results/2026-09-11/glm53f-final-dp2/).
+- Block-pool leg deaths: negative count into get_new_blocks from
+  allocate_external_computed_blocks (fixed 9c24bc5ad; see notebook).
+- Running (queue10.sh -> queue10.log): DP2 WildChat leg
+  (perf/results/2026-09-11/glm53f-leg-dp2/), then the 1M leg
+  (leg_1m.real.sh dp2-1m). Then queue11: k=3/k=4 arms on the record with
+  the compile-hash fix. Old queue scripts are dead; only queue10/11 run.
