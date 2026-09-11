@@ -73,6 +73,35 @@ def ensure_xpu_runtime_env() -> None:
         os.environ["LD_LIBRARY_PATH"] = ":".join([lib_dir, *parts])
 
 
+def disable_ur_tracing() -> None:
+    """Turn off the Intel UR/XPTI tracing interception layer, in-process.
+
+    `ur_tracing_layer::urEventWait` sat in frame #4 of all 12 captured hang
+    stacks in the 2026-08-22 TP4 wedge RCA: it is a global-state interception
+    layer wrapping every UR call while two threads use the queue concurrently.
+    Nobody asks for it -- something in the torch XPU/PTI stack sets these after
+    exec, so a shell `export` or a systemd `Environment=` is NOT sufficient:
+    the parent's /proc/environ looks clean while the workers come up with
+
+        UR_ENABLE_LAYERS=UR_LAYER_TRACING
+        XPTI_TRACE_ENABLE=1
+        XPTI_SUBSCRIBERS=.../torch/lib/../libpti_view.so.1
+
+    (observed on this box 2026-09-10, with all three exported as off/empty).
+    It therefore has to be cleared in-process, early, in every process that
+    touches the device -- spawned workers included.
+    """
+    for var in (
+        "UR_ENABLE_LAYERS",
+        "XPTI_TRACE_ENABLE",
+        "XPTI_SUBSCRIBERS",
+        "XPTI_FRAMEWORK_DISPATCHER",
+    ):
+        if os.environ.get(var):
+            logger.info_once("XPU: clearing %s (UR tracing layer).", var)
+        os.environ[var] = "0" if var == "XPTI_TRACE_ENABLE" else ""
+
+
 def xpu_is_available() -> bool:
     try:
         return torch.xpu.is_available() and torch.xpu.device_count() > 0
@@ -94,6 +123,9 @@ class XPUPlatform(Platform):
 
     @classmethod
     def import_kernels(cls) -> None:
+        # Runs in every worker (spawned included) before any device work, which
+        # is the only place the UR tracing layer can actually be turned off.
+        disable_ur_tracing()
         # No vllm._C on XPU: the CUDA/HIP stable-ABI extension does not exist
         # here. The elementwise ops the shared layers call through
         # torch.ops._C are registered in Python (spawned workers included).
