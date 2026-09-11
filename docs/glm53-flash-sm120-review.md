@@ -198,8 +198,8 @@ The stack is published; review/merge dependency order is:
 
 | Part | PR | Scope | Changed files |
 |---|---|---|---:|
-| 1 | [#26](https://github.com/QuixiAI/SlimServe/pull/26) | Native kernels, bindings, focused probes/tests | 92 |
-| 2 | [#27](https://github.com/QuixiAI/SlimServe/pull/27) | Serving recipe, platform integration and regressions | 80 |
+| 1 | [#26](https://github.com/QuixiAI/SlimServe/pull/26) | Native kernels, bindings, focused probes/tests | 94 |
+| 2 | [#27](https://github.com/QuixiAI/SlimServe/pull/27) | Serving recipe, platform integration and regressions | 81 |
 | 3 | [#28](https://github.com/QuixiAI/SlimServe/pull/28) | Numerical diagnostics and prefill qualification | 83 |
 | 4 | [#25](https://github.com/QuixiAI/SlimServe/pull/25) | Indexer/routing diagnostics and qualification | 56 |
 | 5 | [#24](https://github.com/QuixiAI/SlimServe/pull/24) | Campaign harnesses, evidence and roadmap | 55 |
@@ -219,12 +219,34 @@ Focused CPU suite:128 passed in30.41s, raw XML
 `perf/results/2026-09-11/pr-review/part5.xml`. This is harness fault-injection
 coverage, not another serving benchmark or native-kernel qualification.
 
-Parts1–4 remain unreviewed: the service explicitly permits only one included
-review per hour. First next slot is about19:40 UTC; prioritize #26 (kernels),
-then #27 (runtime), #28 and #25. Do not enable paid overages or repeatedly
-request over-quota reviews. Fixes32a29fcc9 are published; all ten threads have
-individual evidence replies and are resolved. The remaining four external
-reviews and any resulting fixes are the outstanding publication work.
+Part1 review completed at20:00 UTC:13 inline findings and14 nits. Published
+03875b05a addresses valid contracts, optional-symbol/platform fallbacks, private
+diagnostic permissions and probe hygiene. The optional mode1 mHC completion
+counter is invocation-local, including independently captured graphs; the
+profile's cooperative default is unchanged. The bitmap-overflow report was
+already bounded by both public callers; a rejection regression now locks it.
+The proposed sampler sentinel/barrier is declined because the histogram
+invariant guarantees exactly one writer; no supported failure was identified.
+All inline findings have evidence replies and the nits have a disposition.
+
+Checks:99 focused CPU tests and172 GPU tests pass after rebuilding QuixiCore
+with80GiB/no swap/-j2. Stable-libtorch stays unchanged. Local serving review
+also found an unsupported-dtype combine handoff; d19a1744a preserves the
+unfused fallback for FP16/misaligned inputs, with10 CPU regressions passing.
+Fixes live in their owning branches and are merged forward without rewriting.
+
+The first review-tree serving boot (652bb8014) failed before timing: Dynamo
+traced the new capability check into NVML ctypes. Fix03382cb49 evaluates the
+process-fixed gates as compile-time constants. The initial regression wrongly
+treated is_compiling as proof of symbolic execution; e35bd7976 replaces it
+with an actual ctypes call. All18 dispatch tests now pass, including four
+cold-cache full-graph checks. A single corrected-tree boot on eb8c345a9 is
+running with three prescribed repeats; no new serving result is claimed yet.
+Failures and successful checks remain under `perf/results/2026-09-11/pr-review/`.
+
+Parts2–4 remain unreviewed: one included review per hour. Next slot is about
+20:41 UTC; prioritize #27, then #28 and #25. Do not enable paid overages or
+repeatedly request over-quota reviews. Part5's ten threads remain resolved.
 
 Main's existing
 glm53f-q2-1/metal record references a missing glm53f-gguf source and lacks its

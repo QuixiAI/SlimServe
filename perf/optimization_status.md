@@ -1,5 +1,41 @@
 # SlimServe Optimization Status
 
+## 2026-09-11 - SM120 kernel PR review fixes and compilation boundary
+
+- Scope: review stack #26 -> #27 -> #28 -> #25 -> #24; selected recipe v1,
+  TP4/no-spec and BF16 KV/head unchanged. Not a new optimization campaign.
+- Baseline: merged-main one-boot medians156.841/577.473/781.668 E2E tok/s,
+  cold32K/128K engine TTFT2509.907/9920.798ms. Native QC c2c4a996.
+- Review:13 inline findings/14 nits from #26. Published03875b05a adds checked
+  pack alignment/devices, optional native-symbol and SM80+ dispatch gates,
+  private diagnostic artifacts, precise probe failures and allocation cleanup.
+  Optional last-block mHC gets per-invocation counter storage to isolate eager
+  streams and independently captured graphs; default mode0 is unchanged.
+  Caller bounds already prevent the claimed bitmap overflow. Added rejection
+  coverage; did not add silent truncation. Declined an extra top-k barrier and
+  sentinel: the valid histogram invariant guarantees one writer.
+- Local serving review:d19a1744a gates the BF16-only combine handoff, keeping
+  FP16/misaligned inputs on the original fallback. Target dispatch is unchanged.
+- Checks:99 CPU tests,10 serving-fallback tests and172 GPU tests pass. Native
+  build80GiB/no swap/-j2 succeeds; new QC SHA256
+  f19b61ce4bd421bb0a33cf92a42b2db10a604ca21fdd83aceedbaf2537709025.
+  Stable-libtorch fe4a7c2a remains unchanged; prior QC binary preserved.
+- First fixed boot on652bb8014 fails before timing: cold model compilation
+  traces the new capability check into an unsupported NVML ctypes call.
+  Fix03382cb49 marks process-fixed gates for compile-time constant evaluation.
+  Initial test incorrectly asserted is_compiling=False during eager constant
+  folding; corrected fixturee35bd7976 uses an actual ctypes boundary. All18
+  dispatch tests now pass, including four cold full-graph cases. No native
+  rebuild for this Python-only correction.
+- Decision: fixes retained for review, full serving result pending. One
+  corrected-tree boot on eb8c345a9 with three exact1000/300 cold-prefix repeats
+  atc1/c8/c16 and existing text/image/retrieval/32K/128K checks is running.
+  Original startup failure is preserved; no retries for faster timing.
+- Raw:`perf/results/2026-09-11/pr-review/` (part1-cpu.xml, part1-gpu.xml,
+  part2-combine.xml, part1-cold-compile*.xml, build log, native hashes,
+  failed `serving/`, current `serving-compile-fixed/`). Three reviews remain
+  queued under the one-included-review/hour limit; next #27 at~20:41 UTC.
+
 ## 2026-09-11 - Native quantized prefill GEMM on Metal; FP8-KV directive state; two walls found
 
 - Directive (operator): CT weights stay in native quantized form ALWAYS -

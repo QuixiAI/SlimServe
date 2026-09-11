@@ -120,9 +120,22 @@ addressed,128 focused CPU tests pass. One new graph-benchmark gate test makes
 PR24's diff55 files. Serving source/recipe/native kernels unchanged; no GPU run warranted.
 The fixture-builder change belongs to #28 (476f3290e), merged forward through
 #25/#24. Fixes published in32a29fcc9; all ten threads have individual evidence
-replies and are resolved. Continue the remaining four external reviews.
-CodeRabbit allows ONE included review per hour: #26/#27/#28/#25 were quota
-blocked, first next slot about19:40 UTC on2026-09-11. Prioritize #26 then #27.
+replies and are resolved. Part1/#26 review completed20:00 UTC:13 inline
+findings/14 nits dispositioned in03875b05a, with99 CPU and172 GPU tests passing.
+CodeRabbit accepts the fixes and the already-bounded bitmap explanation.
+Native QuixiCore is now f19b61ce4bd421bb0a33cf92a42b2db10a604ca21fdd83aceedbaf2537709025;
+stable-libtorch unchanged. The old qualified binary is preserved in
+`perf/results/2026-09-11/pr-review/native-before/`. Serving fallback fix
+d19a1744a passes10 CPU tests and preserves non-BF16/misaligned paths.
+Initial review-tree boot652bb8014 FAILED before timing: capability query
+entered Dynamo/NVML ctypes. Fix03382cb49 plus regression correctione35bd7976
+pass18 dispatch tests, including four cold full-graph checks. One corrected
+boot on eb8c345a9 is RUNNING, output `pr-review/serving-compile-fixed/`,
+three prescribed repeats; failed boot remains in `pr-review/serving/`.
+No performance promotion yet. All fixes are published through the stack.
+Parts1/2 now contain94/81 changed files; still below the review limit.
+CodeRabbit allows ONE included review per hour. Remaining #27/#28/#25;
+next slot about20:41 UTC on2026-09-11. Prioritize #27.
 Do not change billing or infer that any unreviewed layer has passed review.
 Raw regression XML: perf/results/2026-09-11/pr-review/part5.xml.
 Do not label the whole historical roadmap completed.
