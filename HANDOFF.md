@@ -37,18 +37,19 @@ the old history. Upstream history is unchanged and nothing was pushed.
 
 ### Latest checkpoint (2026-09-10): kernel speed work resumed
 
-Current follow-up: fixed-shape wide Marlin specialization passes18 actual-weight
-composed fixtures with BIT-EXACT outputs to the retained wide kernel and sampled
-independent FP64 checks. Isolated paired speedups1.0093..1.0315. It fixes only
-known gate/up/down dimensions and flags at compile time; existing arithmetic,
-split-K, M64/N512/K64/three-stage geometry and quant are unchanged. Four focused
-CPU tests and lint pass. Native dispatch is opt-in behind
-`VLLM_GLM53_MARLIN_PREFILL_FIXED=1`, subordinate to PREFILL_WIDE=1.
-NEXT: native MoE build/install, installed/probe parity, then exactly one fixed0
-control and one fixed1 candidate profile start, three repetitions each. Keep all
-observations; enable only if serving improves. Current profile still has fixed
-off. Rejected M48/S3/S4, whole-K scheduling and K32/S4/S5/S6 are recorded; don't
-repeat them. Raw `marlin-prefill-{row48,fixed,whole,k32}/` under2026-09-10.
+Follow-up CLOSED: fixed-shape wide specialization (d02ebe696) gives bit-exact
+composed outputs and0.9-3.1% isolated gains, but only0.15/0.16% lower cold32K/128K
+TTFT with overlapping ranges in its one-control/one-candidate serving pair.
+E2E c1/c8/c16 changes-0.095/+0.167/-0.059% are neutral. NOT PROMOTED: specialized
+serving code removed and original f3fb0be4 library restored; d02ebe696 and raw
+candidate binary preserve the experiment. Six installed/probe cases and all
+serving workloads passed. Do not repeat its qualification or call it a speed win.
+M48/S3/S4, whole-K and K32/S4/S5/S6 also rejected. Raw
+`marlin-prefill-{row48,fixed,whole,k32}/` and `marlin-fixed-serving-{control,candidate}/`
+under2026-09-10. Both servers exited0 and GPUs released. Recipe/profile unchanged.
+NEXT: focused sparse-MLA prefill N64/one-stage/four- or eight-warp screen against
+current N32/two-stage/four-warp kernel. Probe prepared, no serving path change:
+`benchmarks/kernels/benchmark_glm53_sparse_prefill_tiles.py`.
 
 The same-live-input scoring diagnostic is COMPLETE; do not restart or extend it.
 All four ranks pass exact paired scoring/input immutability and HTTP coverage

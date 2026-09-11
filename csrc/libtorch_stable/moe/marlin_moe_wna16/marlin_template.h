@@ -246,8 +246,7 @@ template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
                              // fetch pipeline
           const int group_blocks,  // number of consecutive 16x16 blocks
                                    // with a separate quantization scale
-          const bool is_zp_float,  // is zero point of float16 type?
-          const int fixed_glm53_projection
+          const bool is_zp_float   // is zero point of float16 type?
           >
 __global__ void Marlin(
     const int4* __restrict__ A,  // fp16 input matrix of shape mxk
@@ -282,23 +281,6 @@ __global__ void Marlin(
     bool use_atomic_add,  // whether to use atomic add to reduce
     bool use_fp32_reduce  // whether to use fp32 global reduce
 ) {
-  if constexpr (fixed_glm53_projection != 0) {
-    static_assert(fixed_glm53_projection == 1 || fixed_glm53_projection == 2);
-    static_assert(a_type_id == vllm::kBFloat16.id() &&
-                  b_type_id == vllm::kFE2M1f.id() &&
-                  c_type_id == vllm::kBFloat16.id() &&
-                  s_type_id == vllm::kFE4M3fn.id() && group_blocks == 1);
-    // The caller admits only these GLM53 TP4 shapes and reduction settings.
-    // Keep routing and batch sizes dynamic, but eliminate unused generic paths.
-    prob_n = fixed_glm53_projection == 1 ? 1024 : 4096;
-    prob_k = fixed_glm53_projection == 1 ? 4096 : 512;
-    num_groups = prob_k / 16;
-    top_k = fixed_glm53_projection == 1 ? 8 : 1;
-    mul_topk_weights = fixed_glm53_projection == 2;
-    has_bias = false;
-    use_atomic_add = false;
-    use_fp32_reduce = true;
-  }
   // Each threadblock processes one "stripe" of the B matrix with (roughly) the
   // same size, which might involve multiple column "slices" (of width 16 *
   // `thread_n_blocks`). Stripes are defined as shown in the 3x3 matrix 5 SM

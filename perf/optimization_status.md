@@ -28199,3 +28199,43 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   recipe/cache/prompt source and exact1000/300 c1/c8/c16, cold32K/128K, text/image
   and existing quality requests. No retries, result exclusions or scoring detour.
   Output directories `marlin-fixed-serving-{control,candidate}/` under2026-09-10.
+
+## 2026-09-10 - Close fixed-shape Marlin: no material serving gain
+
+- Status: rejected for promotion; specialized serving code removed. Original
+  retained wide kernel/profile/recipe unchanged. Candidate source is d02ebe696.
+- Native22-object build passes; installed candidate exactly matches isolated
+  gate/up and down for six2048/2176/7616 cases. Raw `installed.json` and
+  `native-build.log` in `marlin-prefill-fixed/`. No additional validation series.
+- Exactly one fixed0 control then one fixed1 candidate, wide1 in both, three
+  repeats each, all150 exact1000/300 measured requests retained. Same registry
+  plan, prompt source, harness and native/packages; only configured environment
+  difference is `VLLM_GLM53_MARLIN_PREFILL_FIXED`. Idle temperature/power differs
+  naturally between starts and is preserved in each runtime snapshot.
+- E2E c1/c8/c16 medians156.990/580.680/783.415 ->156.840/581.648/782.955tok/s:
+  -0.095/+0.167/-0.059%, overlapping ranges, no throughput gain.
+- Cold32K engine TTFT2523.321 ->2519.520ms (-0.151%); ranges2521.167-2525.910
+  versus2515.950-2521.388ms. Cold128K10654.533 ->10637.241ms (-0.162%);
+  ranges10622.335-10690.192 versus10602.183-10672.000ms. All cached_tokens0.
+  Direction favors candidate but effect is small relative to observed spread;
+  not enough serving value to retain extra specializations or run more starts.
+- Correctness: text/image, exact lengths and all six retrieval contrasts pass
+  per arm. Short-text means-2.730707/-2.724706 bypass this>=2048-row path and
+  are not candidate coverage or a resolution of historical scoring variation.
+  Relevant numerical evidence is18 bit-exact composed fixtures plus sampled
+  independent checks and six exact installed/probe comparisons.
+- Both serving/controller exits0, GPU release confirmed independently. Existing
+  recovered allocation/teardown warnings remain unchanged and were not pursued.
+- Decision: restore serving sources/library to8f22c0d40; all candidate source is
+  retained in d02ebe696 and all raw observations stay. Current native SHA
+  f3fb0be4831122b75c82aae71597ae21c7a5b65f63b0a05a06fb4988d616e296.
+  Saved candidate `marlin-prefill-fixed/moe-fixed-candidate.so`, SHA
+  6e4465920ebf1f33f916694f67afae4cabdddcf2b3ad14781e41509382e1c132.
+- Raw serving directories `marlin-fixed-serving-{control,candidate}/` under
+  `perf/results/2026-09-10/`. Commands match the preceding wide campaign with
+  wide1 in BOTH arms and additional fixed0/fixed1 respectively; same150GiB cap.
+- Next measured bottleneck: sparse MLA prefill (~59-68ms/full chunk in prior
+  trace). Test N64/one-stage with4/8 warps; the prior N64/two-stage exceeded SM120
+  shared memory, and N32/eight-warps was slower. Existing attention arithmetic
+  unchanged, synthetic pooled locality,32K/128K cache,2048/7616 query rows,
+  three A/B/A rounds x five replays. Isolated probe only, no serving change.

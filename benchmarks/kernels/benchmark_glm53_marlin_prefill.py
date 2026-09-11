@@ -29,8 +29,8 @@ from benchmarks.kernels.profile_glm53_marlin import load_layer
 
 
 def parse_prefill_config(value):
-    if value in ("32,512,1", "64,512,1"):
-        return tuple(map(int, value.split(",")))
+    if value == "64,512,1":
+        return 64, 512, 1
     return parse_config(value)
 
 
@@ -44,14 +44,13 @@ def main():
     parser.add_argument("--replays", type=int, default=5)
     parser.add_argument("--rank", type=int, default=0)
     parser.add_argument("--block-sizes", type=int, nargs="+", default=[32, 48, 64])
-    parser.add_argument("--stages", type=int, choices=[2, 3, 4, 5, 6])
+    parser.add_argument("--stages", type=int, choices=[2, 3, 4])
     parser.add_argument("--build-dir", type=Path)
     parser.add_argument("--build-only", action="store_true")
     parser.add_argument("--pipeline", action="store_true")
     parser.add_argument("--oracle", action="store_true")
     parser.add_argument("--check-only", action="store_true")
     parser.add_argument("--installed-wide", action="store_true")
-    parser.add_argument("--fixed-shapes", action="store_true")
     parser.add_argument(
         "--configs",
         type=parse_prefill_config,
@@ -75,18 +74,6 @@ def main():
         parser.error("block sizes must be in 8/16/32/48/64")
     if args.oracle and not args.pipeline:
         parser.error("--oracle requires --pipeline")
-    if args.fixed_shapes and (
-        args.block_sizes != [64]
-        or not (
-            (args.configs == [(64, 512, 1)] and args.stages == 3)
-            or (args.configs == [(32, 512, 1)] and args.stages in (4, 5, 6))
-        )
-    ):
-        parser.error("fixed-shapes requires M64/N512, K64/S3 or K32/S4..6")
-    if not args.fixed_shapes and (
-        args.stages in (5, 6) or any(c[0] == 32 for c in args.configs)
-    ):
-        parser.error("K32 or stages5/6 requires --fixed-shapes")
     if args.installed_wide and (
         os.environ.get("VLLM_GLM53_MARLIN_PREFILL_WIDE") != "1"
         or args.stages != 3
@@ -94,22 +81,10 @@ def main():
         or args.configs != [(64, 512, 1)]
     ):
         parser.error("installed-wide requires flag1, stages3, pipeline and K64/N512/1")
-    if (
-        args.installed_wide
-        and args.fixed_shapes
-        and os.environ.get("VLLM_GLM53_MARLIN_PREFILL_FIXED") != "1"
-    ):
-        parser.error("installed fixed-shapes requires PREFILL_FIXED=1")
     extension = None
     if args.stages is not None:
-        if (
-            args.build_dir is None
-            or len(args.block_sizes) != 1
-            or args.block_sizes[0] not in (32, 48, 64)
-        ):
-            parser.error("stage experiment requires build-dir and one M32/48/64 tile")
-        if args.installed_wide and args.block_sizes != [64]:
-            parser.error("installed-wide requires M64")
+        if args.build_dir is None or args.block_sizes != [64]:
+            parser.error("stage experiment requires --build-dir and --block-sizes 64")
         from torch.utils.cpp_extension import load
 
         args.build_dir.mkdir(parents=True, exist_ok=True)
@@ -129,9 +104,6 @@ def main():
                 "-static-global-template-stub=false",
                 "-gencode=arch=compute_120f,code=sm_120f",
                 "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-                f"-DPREFILL_ROWS={args.block_sizes[0]}",
-                f"-DPREFILL_FIXED={int(args.fixed_shapes)}",
-                f"-DPREFILL_K={args.configs[0][0] if args.fixed_shapes else 64}",
             ],
             build_directory=str(args.build_dir),
             verbose=True,
@@ -154,9 +126,8 @@ def main():
             return ops.moe_wna16_marlin_gemm(*pos, **kw)
         if extension is None or kw["thread_k"] == -1:
             return ops.moe_wna16_marlin_gemm(*pos, **kw)
-        compiled_k = args.configs[0][0] if args.fixed_shapes else 64
-        if kw["thread_k"] != compiled_k or kw["moe_block_size"] != args.block_sizes[0]:
-            raise ValueError("pipeline probe requires its compiled K/M tile")
+        if kw["thread_k"] != 64 or kw["moe_block_size"] != 64:
+            raise ValueError("pipeline probe requires K64/M64 tiles")
         return extension.run(
             pos[0],
             pos[1],
@@ -185,8 +156,6 @@ def main():
     result = {
         "status": "running",
         "diagnostic_only": True,
-        "wide_baseline_enabled": os.environ.get("VLLM_GLM53_MARLIN_PREFILL_WIDE")
-        == "1",
         "git": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
         "source_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "torch": torch.__version__,
