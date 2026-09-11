@@ -195,11 +195,13 @@ def main():
 
                     configs = [(32, 4, 2), (32, 4, 1), (64, 4, 1)]
                 elif args.fused_accumulator or args.reload_query or args.split_values:
-                    from benchmarks.kernels.glm53_sparse_prefill_fused import kernel
+                    from benchmarks.kernels.glm53_sparse_prefill_fused import (
+                        kernel as fused_kernel,
+                    )
 
                     candidate_call = partial(
                         call,
-                        implementation=kernel,
+                        implementation=fused_kernel,
                         kernel_kwargs={
                             "RELOAD_Q": args.reload_query,
                             "FUSE_ACC": args.fused_accumulator,
@@ -231,7 +233,7 @@ def main():
                     }
                     result["cases"].append(row)
                     try:
-                        kernel = candidate_call(candidate_out, n, warps, stages)
+                        compiled = candidate_call(candidate_out, n, warps, stages)
                     except torch.OutOfMemoryError:
                         raise
                     except Exception as error:
@@ -250,9 +252,9 @@ def main():
                             delta.square().mean().sqrt()
                             / reference.float().square().mean().sqrt()
                         ).item(),
-                        registers=kernel.n_regs,
-                        spills=kernel.n_spills,
-                        shared=kernel.metadata.shared,
+                        registers=compiled.n_regs,
+                        spills=compiled.n_spills,
+                        shared=compiled.metadata.shared,
                     )
                     candidate = capture(
                         partial(candidate_call, candidate_out, n, warps, stages)

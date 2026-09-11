@@ -4,13 +4,15 @@ Mode 0 is the cooperative fused kernel (grid sync), mode 1 the last-block
 fused kernel (regular launch; same partials, same reduction order, so it must
 be bit-exact against mode 0), mode 2 the three-kernel split path (a
 different partial layout, so it is compared with a tolerance). Mode 1 is
-also hammered in a loop to exercise the self-resetting completion counter.
+also exercised on concurrent streams and independently captured graphs.
 """
 
 import pytest
 import torch
 
 from vllm.quixicore.ops import quixicore_ops
+
+pytest.importorskip("vllm._quixicore_C")
 
 pytestmark = pytest.mark.skipif(
     not (torch.cuda.is_available() and quixicore_ops.has_dsv4_mhc_modes()),
@@ -151,3 +153,68 @@ def test_last_block_counter_survives_a_burst():
         quixicore_ops.set_dsv4_mhc_mode(0)
     for out in outs:
         _assert_close(list(out), ref, exact=True)
+
+
+@pytest.mark.parametrize("captured", [False, True])
+@pytest.mark.parametrize("fused", [False, True])
+def test_last_block_counter_isolated_across_streams(captured, fused):
+    """Capture on one stream, replay on two: a per-stream counter is insufficient."""
+    previous = quixicore_ops.get_dsv4_mhc_mode()
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    capture_stream = torch.cuda.Stream()
+    references, calls = [], []
+    try:
+        for seed in (41, 42):
+            residual, fn, scale, base, x, norm = _inputs(seed, torch.bfloat16)
+            pre = _run_pre(0, residual, fn, scale, base, norm)
+            constants = [*EPS.values(), norm, 1e-6]
+            if fused:
+                args = (x, residual, pre[0], pre[1], fn, scale, base, *constants)
+                call = lambda args=args: quixicore_ops.dsv4_mhc_fused_post_pre(*args)
+            else:
+                args = (residual, fn, scale, base, *constants)
+                call = lambda args=args: quixicore_ops.dsv4_mhc_pre(*args)
+            references.append([value.clone() for value in call()])
+            calls.append(call)
+        torch.cuda.synchronize()
+        quixicore_ops.set_dsv4_mhc_mode(1)
+        graphs, outputs = [], []
+        if captured:
+            for call in calls:
+                with torch.cuda.stream(capture_stream):
+                    call()
+                capture_stream.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=capture_stream):
+                    outputs.append(call())
+                graphs.append(graph)
+        observed = []
+        for _ in range(32):
+            for index, stream in enumerate(streams):
+                with torch.cuda.stream(stream):
+                    if captured:
+                        graphs[index].replay()
+                        result = outputs[index]
+                    else:
+                        result = calls[index]()
+                    observed.append((index, [value.clone() for value in result]))
+        torch.cuda.synchronize()
+        for index, result in observed:
+            _assert_close(result, references[index], exact=True)
+    finally:
+        torch.cuda.synchronize()
+        quixicore_ops.set_dsv4_mhc_mode(previous)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two GPUs")
+def test_mhc_device_scoped_launch_state():
+    previous = quixicore_ops.get_dsv4_mhc_mode()
+    try:
+        for device in (0, 1, 0):
+            with torch.cuda.device(device):
+                residual, fn, scale, base, _, norm = _inputs(51, torch.bfloat16)
+                reference = _run_pre(0, residual, fn, scale, base, norm)
+                result = _run_pre(1, residual, fn, scale, base, norm)
+                _assert_close(result, reference, exact=True)
+    finally:
+        quixicore_ops.set_dsv4_mhc_mode(previous)

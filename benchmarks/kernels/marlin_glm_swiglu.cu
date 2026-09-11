@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Isolated Phase 4.1 probe. No registered op or serving dispatch.
+// Parked fusion decision and measurements: marlin_glm_swiglu_template.h header;
+// perf/optimization_status.md, 2026-09-11 "Phase 4.1 paired Marlin SwiGLU".
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
