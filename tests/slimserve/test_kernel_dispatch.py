@@ -8,6 +8,49 @@ import torch
 
 
 @pytest.mark.parametrize("fp8", [False, True])
+@pytest.mark.parametrize("supported", [False, True])
+def test_cold_decode_gate_compiles_without_tracing_driver(monkeypatch, fp8, supported):
+    from vllm.model_executor.layers import utils
+    from vllm.quixicore.ops import quixicore_ops as qc
+
+    suffix = "_fp8" if fp8 else ""
+    enabled = getattr(utils, f"decode_gemm{suffix}_enabled")
+    calls = []
+
+    def capability(minimum):
+        # Real capability queries call NVML ctypes functions, which cannot be
+        # traced. Fail if Dynamo tries to enter this function symbolically.
+        assert not torch.compiler.is_compiling(), "driver query entered graph"
+        calls.append(minimum)
+        return supported
+
+    monkeypatch.setattr(
+        utils,
+        "current_platform",
+        SimpleNamespace(
+            is_cuda=lambda: True,
+            has_device_capability=capability,
+        ),
+    )
+    monkeypatch.setenv(f"SLIMSERVE_DECODE_GEMM{suffix.upper()}", "1")
+    monkeypatch.setattr(qc, f"has_decode_gemm{suffix}", lambda: True)
+    enabled.cache_clear()
+    torch._dynamo.reset()
+    try:
+
+        def forward(x):
+            return x + (1 if enabled() else 2)
+
+        compiled = torch.compile(forward, backend="eager", fullgraph=True)
+        x = torch.ones(2)
+        torch.testing.assert_close(compiled(x), x + (1 if supported else 2))
+        assert calls == [80]
+    finally:
+        enabled.cache_clear()
+        torch._dynamo.reset()
+
+
+@pytest.mark.parametrize("fp8", [False, True])
 @pytest.mark.parametrize(
     "cuda,capability,disabled,symbol,expected",
     [
