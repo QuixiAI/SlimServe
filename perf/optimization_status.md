@@ -25284,3 +25284,20 @@ Raw: perf/results/2026-09-10/glm53f-dflash2/mx-*/.
   Queue: probe (py-spy stacks of the hang, dp2hang/) -> leg 6 with
   VLLM_FREE_LIST_TRACE=1 (queue7) -> mx-tp4dp2-k2, the replicated arm
   with the fix and both TP4 kernels on (queue8) = record candidate.
+- BLOCK-POOL FAULT ROOT CAUSE (leg 6 trace, 10:26): the last free-list
+  mutation before the divergence was `popleft_n n=0` through the slow
+  path - a NEGATIVE count. `single_type_kv_cache_manager.
+  allocate_external_computed_blocks` asks the pool for
+  `cdiv(local + external tokens, block) - len(req_blocks)`, and when the
+  local prefix hit already holds more blocks than the external (tier)
+  tokens extend to, that is negative; `get_new_blocks` only checked the
+  upper bound and `popleft_n(-k)` did `num_free_blocks -= n`, adding k to
+  the count while linking nothing. Every leg death fits: the count runs
+  ahead of the list by sums of small k (16/72/88), until an allocation
+  walks past the tail and pops a sentinel or a still-referenced block
+  (the original `assert block.ref_cnt == 0`). Fix: the pool and the queue
+  reject negative counts, and the external allocation clamps at zero with
+  a one-time warning naming the manager/group/block size and token counts
+  (tests/v1/core/test_block_pool_negative_alloc.py). The fail-fast
+  invariants and the trace ring stay (trace env-gated). The WildChat leg
+  and the 1M leg on the DP2 record rerun on this tree.
