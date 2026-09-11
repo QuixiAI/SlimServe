@@ -48,8 +48,11 @@ Phase4.2 paired K128 fg_b projection is now implemented and locally faster:
 c1/c8/c16 2.366/2.426/2.466 -> 1.766/1.876/1.894 us. Actual weights, FP64 and
 changed-input graph checks pass. Only ~20 us/34 layers before serving effects;
 parked under `benchmarks/kernels/` without a serving campaign. Raw `kda-fg-b/`
-under2026-09-11. Active next: **Phase2.3 KDA output-weight L2 prefetch**, timing
-the whole independent attention window. No serving speed claim from either probe.
+under2026-09-11. **Phase2.3 KDA output-weight L2 prefetch is now rejected**:
+complete-window c1 19.36 ->19.16us, c8 27.18 ->28.37us, c16 34.98 ->36.52us.
+All306 paired output/state checks pass exactly; no serving run or extra variants.
+Raw `perf/results/2026-09-11/kda-prefetch/`, diagnostic source in benchmarks.
+Production remains unchanged; no serving speed claim from these probes.
 The existing plan's phase/item tracker is current.
 
 Follow-up CLOSED: fixed-shape wide specialization (d02ebe696) gives bit-exact
@@ -80,8 +83,8 @@ for our state-updating decode. Queued Phase 2.3 candidate is KDA output-weight L
 prefetch during independent attention work (mechanism from
 local-inference-lab/vllm #576), adapted to our 8 MiB FP8 output projection.
 Details and stop conditions: `docs/glm53-flash-sm120-plan.md`, current research
-decision. No prefetch implementation or measured gain yet; no new GPU run during
-this review. Recipe/profile unchanged. Do not resume a geometry/scoring campaign.
+decision. This research review preceded the rejected prefetch implementation
+recorded above. Recipe/profile unchanged. Do not resume a geometry/scoring campaign.
 
 The same-live-input scoring diagnostic is COMPLETE; do not restart or extend it.
 All four ranks pass exact paired scoring/input immutability and HTTP coverage

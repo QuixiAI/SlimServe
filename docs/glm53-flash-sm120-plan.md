@@ -28,8 +28,10 @@ this is their status, not a replacement roadmap. The **4.1 cross-item pipeline**
 is implemented and rejected: faster than its draining control, still slower
 than retained Marlin. **4.2 paired KDA fg_b** is implemented and locally faster,
 but saves only ~20 us across 34 layers; parked without a serving campaign.
-Active next is **2.3, KDA output-weight L2 prefetch** with the full independent
-attention window included in timing, using the existing kernels unchanged.
+**2.3 KDA output-weight L2 prefetch** is now implemented and rejected: complete
+window c1 19.36 ->19.16 us, c8 27.18 ->28.37 us, c16 34.98 ->36.52 us.
+All output/state comparisons are exact; the ~7 us/34-layer c1 budget and batched
+regressions do not merit integration. No serving run or extra variants.
 No new serving gain is claimed. The broader stream-K/fused-expert successor and
 whole-layer KDA fusion are not thereby implemented or declared impossible.
 
@@ -38,7 +40,7 @@ whole-layer KDA fusion are not thereby implemented or declared impossible.
 | 0 | Bring-up/profile/baseline completed |
 | 1 | Selected weight recipe implemented; FP8 KV/W4A4 are outside that recipe |
 | 2.1–2.2 | Main transport/launch fusions retained; rejected variants stay closed |
-| 2.3 | **In progress:** KDA output-weight L2 prefetch during independent attention work |
+| 2.3 | Output-weight prefetch implemented and rejected; broader next-layer prefetch not implemented |
 | 3 | MTP port tested; off after losses on the relevant concurrent workload |
 | 4.1 | Cross-item prototype rejected against Marlin; stream-K/fused successor unimplemented |
 | 4.2 | Paired K128 fg_b implemented, locally faster but parked for small full-stack value; whole-layer fusion unimplemented |
@@ -67,7 +69,7 @@ and benchmark. Raw: `perf/results/2026-09-11/nvfp4-cross-item/`. Gate/up
   the expert stream regressed; joining per layer also lost the benefit. Its
   +7.1% c1 steps/s used BF16 projections and a speculative workload, so it is
   a mechanism precedent, not a prediction for this recipe.
-- Queued Phase 2.3 candidate: KDA **output-projection prefetch only**, after the
+- Tested Phase 2.3 candidate: KDA **output-projection prefetch only**, after the
   input projection while fg_b/conv/recurrent/norm execute. Our TP4 output weight
   is FP8 `[4096, 2048]` (8 MiB plus 2 KiB scales), consumed by the existing
   W8A16 QuixiCore kernel, not cuBLAS. Keep arithmetic and weights unchanged.
@@ -75,8 +77,8 @@ and benchmark. Raw: `perf/results/2026-09-11/nvfp4-cross-item/`. Gate/up
   an alternate serving backend. Any prototype must measure the complete KDA
   window including prefetch/stream costs, not just a warmed GEMM. The component
   gain must plausibly survive 34 KDA layers before a real-profile comparison;
-  reject neutral results without a budget/geometry sweep. No implementation or
-  speed result for this candidate exists yet.
+  reject neutral results without a budget/geometry sweep. Result above, raw
+  `perf/results/2026-09-11/kda-prefetch/`; source under `benchmarks/kernels/`.
 
 Goal: an optimized SlimServe profile `glm53-nvfp4-4` for the platform
 `rtx6000` (4x RTX PRO 6000 Blackwell Workstation, sm_120, PCIe 5 x16, no

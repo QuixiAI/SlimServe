@@ -28398,3 +28398,51 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - Next existing roadmap item:2.3. Bulk-L2-prefetch the8MiB FP8 KDA o_proj
   during existing fg_b/conv/state-update/norm work; include the entire window
   and stream costs, not an artificially warmed GEMM or a synthetic sleep.
+
+## 2026-09-11 - Phase 2.3 KDA output-weight prefetch: reject
+
+- Status: implemented and rejected; no serving change, library install or model
+  start. Fixed recipe/profile/TP4 unchanged. Baseline is the existing fg_b bmm,
+  convolution, packed recurrent decode, placement copy, gated RMSNorm, FP8 output
+  projection and output copy. Input projection/TP all-reduce lie outside this
+  component-window probe; these results are not serving TPS.
+- Hypothesis/reference: local-inference-lab/vllm #576 evict-last bulk-L2 hints
+  on a side stream could hide the8MiB output weight read behind independent KDA
+  work. Fixed16 CTAs x128 lanes x4KiB; one fork/window, one join/graph, no
+  per-layer joins. Compiled PTX contains the intended bulk-prefetch instruction.
+  Scales are not prefetched. No geometry/budget sweep or synthetic sleep.
+- Scope: actual rank0 layer0/22/44 FP8 output weights, BF16 fg/conv/norm and
+  repaired FP32 gate parameters; synthetic merged inputs and states. 51 distinct
+  output allocations total408MiB (>3x128MiB L2). Production SD conv layout,
+  BF16 conv state, **FP32 recurrent state**, constructor norm eps1e-5.
+- Correctness: all306 paired whole-window checks pass bit-exactly for outputs,
+  conv state and recurrent state, including changed inputs and reversed live
+  slot indices on captured graph replay. All values finite. Cache-only change
+  shares baseline arithmetic; this is not independent model-quality evidence.
+- Three fixed A/B/A rounds, ten replays plus three warmups/arm,51 windows/replay.
+  GPU0 RTX PRO6000 SM120, stock clocks, CUDA13.0;16GiB/no-swap scope. Median us:
+
+  | Batch | Original before | Prefetch | Original after |
+  |---|---:|---:|---:|
+  | 1 | 19.3616 | 19.1568 | 19.3696 |
+  | 8 | 27.1780 | 28.3726 | 27.1619 |
+  | 16 | 34.9845 | 36.5205 | 34.9765 |
+
+- Decision: reject. ~0.2us/site c1 is only~7us/34 layers; c8/c16 regress~4.4%.
+  Do not integrate, run serving qualification or try more fill budgets. Broader
+  next-layer prefetch is not thereby implemented/proven impossible. Production
+  still uses the retained wide-Marlin library/profile.
+- Raw: `perf/results/2026-09-11/kda-prefetch/screen.json`, emitted PTX and exact
+  `benchmark-tested.py`. Final benchmark only moves state-reset to a module-level
+  helper for lint; tested source retained. Probe exit0. Reproduce from repo root:
+
+  ```sh
+  systemd-run --user --scope --quiet --unit=slimserve-kda-prefetch-probe \
+    --property=MemoryMax=16G --property=MemorySwapMax=0 \
+    env CUDA_VISIBLE_DEVICES=0 OMP_NUM_THREADS=4 PYTHONUNBUFFERED=1 \
+    .venv/bin/python -m benchmarks.kernels.benchmark_glm53_kda_prefetch \
+    --model /raid/weights/GLM-5.3-Flash-NVFP4-FP8-KDA-TP4 \
+    --output perf/results/2026-09-11/kda-prefetch/screen.json
+  ```
+
+  Use a new output path; the benchmark refuses to overwrite existing results.
