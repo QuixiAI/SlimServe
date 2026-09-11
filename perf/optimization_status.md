@@ -25271,3 +25271,16 @@ Raw: perf/results/2026-09-10/glm53f-dflash2/mx-*/.
   graph is keyed without the DFlash block size, so k=3 and k=4 share a
   cache entry (the compile-cache A/B hazard). Fix owed: fold the draft
   block size into the compile hash; rerun the k arms after.
+- Replicated-DP2 hang root cause (code): the V2 speculator base
+  (`vllm/v1/worker/gpu/spec_decode/speculator.py`) keeps its own
+  `dp_size` and the DFlash proposer calls `dispatch_cg_and_sync_dp` with
+  it, so the active replica entered the drafter's cross-DP all-reduce on
+  its first speculative step while the idle replica, which no longer
+  dummy-steps in replicated mode, never joined - "RPC call to
+  sample_tokens timed out" 300 s after the canary. Fixed (db08f2fbe):
+  the speculator and the cudagraph manager use a DP sync size of 1 under
+  data_parallel_replicate_moe, matching the runner. Also keyed the
+  compile cache by draft block size for block drafters (2705757ee).
+  Queue: probe (py-spy stacks of the hang, dp2hang/) -> leg 6 with
+  VLLM_FREE_LIST_TRACE=1 (queue7) -> mx-tp4dp2-k2, the replicated arm
+  with the fix and both TP4 kernels on (queue8) = record candidate.
