@@ -80,7 +80,16 @@ _POOL_PROGRAMS = 128  # programs per row on the pool axis (stride loop inside)
 # Kill switch for A/B runs only (read here, so it is not a compile factor):
 # VLLM_GLM5_INDEXER_PREFILL_MATMUL=0 scores prefill rows with the decode-shaped
 # per-row kernel instead.
-_PREFILL_MATMUL = os.getenv("VLLM_GLM5_INDEXER_PREFILL_MATMUL", "1") != "0"
+def _prefill_matmul_enabled() -> bool:
+    # Keep A100's raw-cache fallback on its original per-row implementation.
+    # Its compact-cache path has an independent prefill scorer.
+    sm120 = current_platform.is_cuda() and current_platform.is_device_capability(
+        (12, 0)
+    )
+    return os.getenv("VLLM_GLM5_INDEXER_PREFILL_MATMUL", "1" if sm120 else "0") != "0"
+
+
+_PREFILL_MATMUL = _prefill_matmul_enabled()
 # Profile-selected SM120 geometry: fewer query rows and more pooled keys avoid the
 # original tile's register spills. Arithmetic and selection are unchanged.
 # Keep other profiles on their measured geometry; set before worker import.

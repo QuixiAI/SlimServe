@@ -2150,6 +2150,30 @@ released, no retries or quant/native/default changes; original oracle remains a
 historical failure. Raw `indexer-serving-v1/closure.json` under2026-09-10, SHA
 0d1302e05d6f2350d1bcf60be4d04691f489d6c3040f1bbca37fd890d139fa8b.
 
+### RTX6000 merged-main qualification - 2026-09-11
+
+Clean725b4ba01 merges main f6c6ed429 while preserving the selected recipe v1,
+native libraries and SM120 V1 runner. Canonical profile glm53f-nvfp4-4 accepts
+the historical glm53-nvfp4-4 alias used in this run. One fixed boot, three
+repeats exact1000/300, cold prefixes, c1/c8/c16; stock four-GPU TP4/no-spec.
+
+| Measurement | Median [min,max] |
+|---|---:|
+| c1 E2E tok/s | 156.841 [156.524,156.953] |
+| c8 E2E tok/s | 577.473 [575.299,578.584] |
+| c16 E2E tok/s | 781.668 [775.568,782.992] |
+| cold32K engine TTFT ms | 2509.907 [2507.815,2512.441] |
+| cold128K engine TTFT ms | 9920.798 [9898.006,9946.727] |
+
+No restart selection/excluded timings. Startup198.104s, zero cached prefill
+tokens. All nine timed batches, text/image canaries and six retrieval contrasts
+pass; scored-text mean -2.727000 over4096 tokens. Server exited0 and released
+all GPUs. Consistent with retained performance, not a paired speedup claim or
+qualification of other platforms, speculative execution, or disabled tiers.
+Post-run platform-only default cleanup leaves the SM120 branch unchanged;
+ten focused dispatch tests pass. Raw commands/hashes/logs and JSON:
+`perf/results/2026-09-11/merge-main/`.
+
 ### RTX6000 H16 BF16 sparse swapAB prefill retained - 2026-09-11
 
 Profile enables `VLLM_GLM53_SPARSE_PREFILL_SWAPAB=1`, SM120/H16/BF16 and

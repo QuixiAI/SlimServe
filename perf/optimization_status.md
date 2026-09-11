@@ -29980,9 +29980,27 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   objects after prior restored experiments, not changed source. Keep qualified
   native binaries (QuixiCore c2c4a996, stable-libtorch fe4a7c2a) for the merge
   qualification; do not attribute a rebuild or a new kernel speedup here.
-- Next: one fixed merged-profile serving run, exact1000/300 at c1/c8/c16,
-  three repeats, text/image, existing retrieval checks and cold32K/128K. No
-  sweep or startup selection. Prior TPS remains tied to its recorded tree.
+- Merged-tree qualification on clean 725b4ba01 is complete: one fixed boot,
+  three repeats of exact1000/300 cold-prefix c1/c8/c16; E2E tok/s medians
+  156.841/577.473/781.668, ranges156.524..156.953/575.299..578.584/
+  775.568..782.992. Cold32K/128K engine TTFT2509.907/9920.798ms,
+  ranges2507.815..2512.441/9898.006..9946.727, zero cached tokens.
+  Startup198.104s; compile/warmup recorded, no selected restarts or exclusions.
+  Text/image answers4/Red pass, all six retrieval contrasts rank first,
+  4096 scored-text tokens mean logprob -2.727000. Server exited0, owned GPUs
+  released. Decision: retained merge, performance consistent with the qualified
+  path, not a new kernel-speedup claim. Raw commands/source/recipe/runtime
+  receipts: perf/results/2026-09-11/merge-main/serving/summary.json.
+- Post-run cleanup limits the raw-indexer prefill matmul default to SM120;
+  A100 keeps main's per-row raw fallback and independent compact-cache scorer.
+  Explicit opt-in/out still works. Ten focused platform/dispatch tests pass,
+  XML in merge-main/indexer-platform-default.xml. The SM120 default/path is
+  identical to the measured tree, so no additional serving run is justified.
+- CodeRabbit confirms no supported selected-file batching and absolute300-file
+  maximum; the365-file PR cannot receive full review as one unit. Publish a
+  dependency-ordered stack with every diff below100 files, retaining all tests,
+  diagnostics and original campaign history. No review-filter exclusions or
+  force-push. PR24 stays the tip; review/feedback/cleanup remain open.
 ## 2026-09-06: GLM-5.2 A100 tier records re-measured after the sparse-decode copy removal
 
 - Both records boot through their profiles with the host tier active

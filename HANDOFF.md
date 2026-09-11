@@ -79,8 +79,8 @@ Checkpoint ed9859d8d is now pushed to PR #24, with its title/body updated and
 CI guard passing. CodeRabbit declined the explicit full-review request:
 364 changed files exceed its 100-file limit. No substantive review occurred.
 Operator confirmed: resolve main's merge conflicts first; split only if needed
-for review. All 17 conflicts against f6c6ed429 are now semantically reconciled,
-pending merged-tree serving qualification. SM120 retains padded FP8 projections,
+for review. All 17 conflicts against f6c6ed429 are now semantically reconciled
+and pushed as 725b4ba01; GitHub reports the PR mergeable. SM120 retains padded FP8 projections,
 strided KDA gate BMM, raw indexer cache, sparse prefill and explicit V1 runner;
 A100 retains compact-cache/decode row sharding, SIMT mHC, V2 and DFlash2.
 Canonical profile names follow main's glm53f-nvfp4-{4,8}; the old names remain
@@ -89,7 +89,25 @@ adapters retain their corresponding model/proposer contracts. Sliced query chunk
 now preserve actual block-table row IDs. Focused tests: 77 pass/24 SM80-only skip,
 36 prefill/profile tests pass. Broad registry checks encounter main's pre-existing
 glm53f-q2-1/metal missing-source record (8 failures, 84 pass); no model source or
-quality claim was invented to hide it. Review and final cleanup remain open.
+quality claim was invented to hide it.
+
+Merged-tree qualification on clean 725b4ba01 passed one fixed boot, three
+repeats of exact1000/300 cold-prefix c1/c8/c16: 156.841/577.473/781.668 E2E
+tok/s. Cold32K/128K engine TTFT medians2509.907/9920.798ms. Text/image answers
+and all six retrieval contrasts pass; no retry or timing exclusion. Server
+exited0 and released all GPUs. Raw: perf/results/2026-09-11/merge-main/serving/.
+This preserves the retained performance, not a new kernel-speedup claim.
+Post-run platform cleanup limits the raw-indexer matmul default to SM120,
+preserving A100's per-row fallback; explicit overrides remain available.
+Ten focused dispatch tests pass; the SM120 branch is unchanged, so no second
+serving campaign is needed for that default-only correction.
+
+CodeRabbit confirmed no supported within-PR file-batch review; 365 files exceed
+even its absolute300-file maximum. The user permits splitting only when needed,
+so publish a dependency-ordered review stack under100 files per PR, retaining
+all implementation/tests/diagnostics and the original campaign history. Do not
+exclude files via review filters, force-push, or merge into main. Keep #24 as
+the stack tip. Substantive review, feedback fixes and final cleanup remain open.
 Do not label the whole historical roadmap completed.
 
 #### Earlier development checkpoints (superseded by the H16 result above)

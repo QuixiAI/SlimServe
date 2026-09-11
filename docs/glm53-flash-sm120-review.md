@@ -45,16 +45,20 @@ limitations are recorded in the baseline snapshot.
    explicitly opt-in; no disabled heavyweight serving cache or default
    numerical policy should be introduced by cleanup.
 
-The accumulated upstream diff is large (363 files and about 85K added lines
-at `b4cb567e6`), including historical notebooks and diagnostic tests. Do not
-equate that with 85K lines of retained kernels. Review runtime dependencies
-before moving or deleting diagnostics; preserve the evidence and user edits.
+The accumulated upstream diff is large (365 files after the main merge),
+including historical notebooks and diagnostic tests. Do not equate notebook
+volume with retained kernel code. Preserve the evidence and user edits.
 Existing draft [PR #24](https://github.com/QuixiAI/SlimServe/pull/24) uses the
-upstream `glm53-flash-sm120` branch. Its published head `7619685d8` is an
-ancestor of the retained checkpoint, so publication needs only a fast-forward.
-Checkpoint `ed9859d8d` is now published there with an updated title/body and a
-passing CI guard. CodeRabbit declined the explicit full-review request because
-364 changed files exceed its 100-file limit. No substantive review has occurred.
+upstream `glm53-flash-sm120` branch. Main f6c6ed429 is merged as725b4ba01;
+all17 conflicts are resolved, and GitHub reports it mergeable.
+
+One fixed merged-tree boot passed all timed batches, text/image canaries and
+six retrieval contrasts. Exact1000/300 cold-prefix E2E medians at c1/c8/c16:
+156.841/577.473/781.668 tok/s; cold32K/128K engine TTFT2509.907/9920.798ms.
+Three repetitions, no restarts or timing exclusions; native binaries/recipe
+unchanged. See the baseline snapshot for spreads and raw source receipts.
+Post-run cleanup scopes raw-indexer matmul defaults to SM120 with ten focused
+dispatch tests; SM120 behavior is unchanged from the measured tree.
 
 ## Remaining deep-kernel decisions
 
@@ -175,25 +179,25 @@ upstream push permission are confirmed. Update existing PR #24; do not create
 a duplicate or force-push. Use Auroter <auroter@users.noreply.github.com> for
 author and committer.
 
-The current upstream main `f6c6ed429` has 17 conflicting files against the
-retained branch, spanning profiles, shared GLM/KDA paths, CLI, runner and
-notebooks. A read-only merge-tree inspection identified these without changing
-the worktree. Preserve the independently developed main-side improvements and
-the qualified SM120 recipe when reconciling; the existing serving numbers apply
-to the recorded source, not automatically to a future merged tree.
+The semantic merge preserves SM120's padded FP8 KDA projections, raw indexer
+and measured V1 runner, alongside A100's gate-pair path, compact cache/decode
+sharding and V2/DFlash2. Both platform-specific MTP adapters remain intact.
+Canonical glm53f profile names retain historical aliases. Sliced prefill query
+maps now gather actual request IDs rather than renumbering from zero.
 
-Publication is complete at `ed9859d8d`. The installed GitHub CLI's PR-edit command
-failed on deprecated GraphQL projectCards; the REST API successfully updated the
-existing PR. This was not another authentication failure.
+The user permits splitting only if necessary. CodeRabbit explicitly confirmed
+that it cannot batch selected files within one PR: incremental review only
+covers new changes, while path filters permanently exclude review scope. The
+365-file diff exceeds the current100-file limit and absolute300-file maximum.
+Therefore publish a dependency-ordered stack below100 files per PR; do not
+exclude tests/diagnostics. Keep PR24 as the tip and preserve campaign commits
+with a non-rewriting history join. Combined-tree qualification above is not
+a claim that every intermediate review layer is independently serving-qualified.
 
-The merge preview was aborted cleanly without retained runtime edits. Semantic
-conflicts include source drafter selection/profile renaming, padded FP8 KDA
-projection layout versus Ampere's gate-pair path, decode versus prefill indexer
-sharding, and independent MTP adapters. These must be reconciled, not resolved
-by deleting the other platform's implementation.
-
-Operator choice requested: split into reviewable PRs or retain one PR for a
-human reviewer. No paid-plan change, reviewer assignment or new PR stack was
-made. Remaining: substantive review, feedback and semantic merge fixes, focused
-checks for resulting code changes, and final cleanup. No Foundry service or
-external port is required here.
+No substantive external review yet. Remaining: publish the stack, obtain review,
+address feedback with focused checks, and final cleanup. Main's existing
+glm53f-q2-1/metal record references a missing glm53f-gguf source and lacks its
+FP8-KV note; eight broad registry failures reproduce on main and are recorded
+separately, not hidden by invented model metadata. No Foundry service or external
+port is required here. Use REST for PR edits: the installed gh pr edit command
+fails on deprecated GraphQL projectCards, unrelated to authentication.

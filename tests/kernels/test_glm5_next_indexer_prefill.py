@@ -202,6 +202,25 @@ def test_prefill_row_req_uses_query_rows():
     assert int(visible[500]) == 1 and int(visible[R - 1]) == 1200
 
 
+@pytest.mark.parametrize("capability", [(8, 0), (9, 0), (12, 0)])
+@pytest.mark.parametrize("override", [None, "0", "1"])
+def test_prefill_matmul_platform_default(monkeypatch, capability, override):
+    monkeypatch.setattr(
+        gi,
+        "current_platform",
+        SimpleNamespace(
+            is_cuda=lambda: True,
+            is_device_capability=lambda wanted: capability == wanted,
+        ),
+    )
+    if override is None:
+        monkeypatch.delenv("VLLM_GLM5_INDEXER_PREFILL_MATMUL", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_GLM5_INDEXER_PREFILL_MATMUL", override)
+    expected = capability == (12, 0) if override is None else override != "0"
+    assert gi._prefill_matmul_enabled() == expected
+
+
 def test_tp_shard_dispatch_uses_fork_chunk_metadata(monkeypatch):
     monkeypatch.setattr(gi, "_TP_PREFILL_SHARD", True)
     monkeypatch.setattr(gi, "_PREFILL_MATMUL", True)
