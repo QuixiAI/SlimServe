@@ -223,6 +223,8 @@ class MetalPlatform(Platform):
             return (
                 "vllm.v1.attention.backends.mla.metal_mla_sparse.MetalMLASparseBackend"
             )
+        if attn_selector_config.kv_cache_dtype in ("fp8", "fp8_e4m3"):
+            return "vllm.v1.attention.backends.metal_attn.MetalFP8AttentionBackend"
         return "vllm.v1.attention.backends.metal_attn.MetalAttentionBackend"
 
     @classmethod

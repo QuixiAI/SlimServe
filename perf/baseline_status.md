@@ -3,6 +3,34 @@
 This file holds stable baseline snapshots for comparison. Raw outputs belong in
 `perf/results/`; summarize only the numbers needed to compare future work.
 
+## DSV4 Metal FP8 draft KV - 2026-09-10
+
+- Apple M5 Max / 128 GiB, registered `dsv4-xxs-1`, TP1, target
+  `fp8_ds_mla`, DSpark draft `fp8`, NVMe tier enabled. Working-tree candidate
+  based on `d2579f88c`; source/native hashes and commands are retained below.
+- Exact 1,000 input / 2,000 output tokens, seed 42, profile/API sampling
+  defaults, no returned logprobs. One timed sample per concurrency after
+  eight-token warmups. All nine responses / 18,000 output tokens pass exact
+  counts, non-degeneracy and clock checks; registered drafter work is positive.
+
+| Concurrency | Aggregate tok/s | Wall seconds | Draft tokens |
+| --- | ---: | ---: | ---: |
+| 1 | 17.585 | 113.732 | 6,640 |
+| 8 | 21.770 | 734.959 | 47,395 |
+
+- Throughput is comparable to the historical TurboQuant-draft medians below
+  (16.455 / 21.222 tok/s), but one sample versus three historical repeats on
+  a shared host does not establish a speedup or a new variance range.
+- Separate temperature-zero cache acceptance passes all four initial phrases
+  and 12/12 concurrent recalls over three eviction rounds: 9,472 tokens
+  restored per reader, 804 block-byte checks, zero mismatches. Default-sampling
+  chat can still finish with reasoning and an empty final answer on one
+  recorded long-context prompt; cross-batch stochastic replay is not exact.
+  See the optimization notebook for the full qualification scope.
+  No CUDA/ROCm or maximum-context qualification is implied.
+- Raw: `perf/results/2026-09-10/main-integration/dsv4-fp8-final/`,
+  `qualify_fp8.py`, and `fp8-final-candidate.json` in its parent directory.
+
 ## Metal NVMe KV tier qualification - 2026-09-10
 
 - Apple M5 Max / 128 GiB, macOS 26.6.2 (25G83); candidate

@@ -35,6 +35,7 @@ class Probe:
         self.model = server.plan.engine["served_model_name"]
         self.prompt_counts = {}
         self.logprobs = None
+        self.chat_temperature = None
 
     def post(self, path, body):
         req = urllib.request.Request(
@@ -53,6 +54,8 @@ class Probe:
             "max_tokens": 4096,
             "seed": 42,
         }
+        if self.chat_temperature is not None:
+            body["temperature"] = self.chat_temperature
         start = time.perf_counter()
         response = self.post("/v1/chat/completions", body)
         result = {
@@ -384,6 +387,8 @@ def reset_prefix_cache(probe):
 
 
 def benchmark(probe, args):
+    # Replay diagnostics must not add top-k logprob work to timed samples.
+    probe.logprobs = None
     source = Path(args.source).read_text()
     tokens = probe.tokens(source)
     if len(tokens) < args.input_tokens + max(args.concurrency):
@@ -480,6 +485,11 @@ def main():
     parser.add_argument("--tier", choices=["on", "off"], default="on")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--acceptance-only", action="store_true")
+    parser.add_argument(
+        "--acceptance-temperature",
+        type=float,
+        help="Marker-chat temperature; exact-token benchmarks keep API defaults",
+    )
     parser.add_argument("--benchmark-only", action="store_true")
     parser.add_argument(
         "--acceptance-mode", choices=["marker", "replay"], default="marker"
@@ -557,6 +567,7 @@ def main():
                 server.start(str(log_path))
                 server.wait_until_ready(timeout=args.timeout)
                 probe = Probe(server, output, args.timeout)
+                probe.chat_temperature = args.acceptance_temperature
                 if tiered and not args.benchmark_only:
                     check = (
                         replay_acceptance

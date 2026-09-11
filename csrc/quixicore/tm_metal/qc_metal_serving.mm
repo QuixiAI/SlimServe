@@ -426,6 +426,76 @@ at::Tensor paged_attention_partitioned(const at::Tensor& q,
   return out;
 }
 
+std::tuple<at::Tensor, at::Tensor> kv_cache_gather_range_fp8(
+    const at::Tensor& key_cache, const at::Tensor& value_cache,
+    const at::Tensor& block_table_in, int64_t token_start, int64_t num_tokens,
+    const at::Tensor& k_scale, const at::Tensor& v_scale,
+    const at::Tensor& like) {
+  check_mps_strided(like, "like");
+  check_mps_strided(key_cache, "key_cache");
+  check_mps_strided(value_cache, "value_cache");
+  check_mps(block_table_in, "block_table");
+  TORCH_CHECK(key_cache.dim() == 4 && value_cache.sizes() == key_cache.sizes(),
+              "KV caches must both be [blocks, block_size, heads, dim]");
+  TORCH_CHECK(key_cache.scalar_type() == value_cache.scalar_type(),
+              "key/value cache dtype mismatch");
+  TORCH_CHECK(
+      key_cache.stride(1) == key_cache.size(2) * key_cache.size(3) &&
+          value_cache.stride(1) == value_cache.size(2) * value_cache.size(3),
+      "KV cache token rows must be contiguous");
+  TORCH_CHECK(key_cache.stride(0) == value_cache.stride(0),
+              "key/value cache block strides must match");
+  TORCH_CHECK(block_table_in.dim() == 1, "block_table must be one request row");
+  TORCH_CHECK(token_start >= 0 && num_tokens >= 0,
+              "token range must be non-negative");
+
+  check_mps(k_scale, "k_scale");
+  check_mps(v_scale, "v_scale");
+  TORCH_CHECK(key_cache.scalar_type() == at::kByte &&
+                  value_cache.scalar_type() == at::kByte,
+              "FP8 caches must be uint8");
+  TORCH_CHECK(k_scale.scalar_type() == at::kFloat &&
+                  v_scale.scalar_type() == at::kFloat &&
+                  k_scale.numel() == key_cache.size(2) &&
+                  v_scale.numel() == key_cache.size(2),
+              "FP8 scales must be float32 per-head");
+  const int nblocks = static_cast<int>(key_cache.size(0));
+  const int block_size = static_cast<int>(key_cache.size(1));
+  const int heads = static_cast<int>(key_cache.size(2));
+  const int head_size = static_cast<int>(key_cache.size(3));
+  const int start = static_cast<int>(token_start);
+  const int count = static_cast<int>(num_tokens);
+  TORCH_CHECK(count == 0 || (start + count + block_size - 1) / block_size <=
+                                block_table_in.numel(),
+              "token range exceeds block table");
+
+  auto block_table = block_table_in.to(at::kInt).contiguous();
+  auto key_out = at::empty({count, heads, head_size}, like.options());
+  auto value_out = at::empty_like(key_out);
+  if (count == 0) return {key_out, value_out};
+
+  const int64_t cache_block_stride = key_cache.stride(0);
+  encode([&](TorchEncoder& e) {
+    e.pipeline("kv_cache_gather_range_fp8_" + activation_type_name(like));
+    e.in(key_cache, 0);
+    e.in(value_cache, 1);
+    e.out(key_out, 2);
+    e.out(value_out, 3);
+    e.in(block_table, 4);
+    e.bytes(start, 5);
+    e.bytes(count, 6);
+    e.bytes(nblocks, 7);
+    e.bytes(block_size, 8);
+    e.bytes(heads, 9);
+    e.bytes(head_size, 10);
+    e.bytes(cache_block_stride, 11);
+    e.in(k_scale, 12);
+    e.in(v_scale, 13);
+    e.dispatch(count, 1, 1, 256, 1, 1);
+  });
+  return {key_out, value_out};
+}
+
 std::tuple<at::Tensor, at::Tensor> kv_cache_gather_range(
     const at::Tensor& key_cache, const at::Tensor& value_cache,
     const at::Tensor& block_table_in, int64_t token_start, int64_t num_tokens) {
@@ -2323,6 +2393,70 @@ void mamba_align(const std::vector<at::Tensor>& states,
       e.bytes(table_stride, 12);
       e.dispatch(static_cast<int>((copy_bytes + 4095) / 4096), n, 1, 256, 1, 1);
     }
+  });
+}
+
+void qc_kv_cache_scatter_fp8(const at::Tensor& key, const at::Tensor& value,
+                             const at::Tensor& slot_mapping,
+                             const at::Tensor& key_cache,
+                             const at::Tensor& value_cache, int64_t num_heads,
+                             int64_t head_size, int64_t block_size,
+                             const at::Tensor& k_scale,
+                             const at::Tensor& v_scale) {
+  check_mps(key, "key");
+  check_mps(value, "value");
+  check_mps(slot_mapping, "slot_mapping");
+  // Caches may be layout views (page-local dense base + one-block-shifted V
+  // alias); the kernel's flat math + block_mult is the layout contract.
+  check_mps_strided(key_cache, "key_cache");
+  check_mps_strided(value_cache, "value_cache");
+  TORCH_CHECK(key.is_contiguous() && value.is_contiguous(),
+              "kv_cache_scatter key/value must be contiguous");
+  const int64_t T = key.size(0);
+  TORCH_CHECK(value.size(0) == T, "key/value token mismatch");
+  TORCH_CHECK(key.numel() == T * num_heads * head_size &&
+                  value.numel() == T * num_heads * head_size,
+              "key/value shape mismatch");
+  TORCH_CHECK(slot_mapping.scalar_type() == at::kLong &&
+                  slot_mapping.is_contiguous() && slot_mapping.numel() >= T,
+              "slot_mapping must be contiguous int64 [tokens]");
+  TORCH_CHECK(value.scalar_type() == key.scalar_type(),
+              "FP8 store key/value dtype mismatch");
+  TORCH_CHECK(
+      key_cache.dim() == 4 && value_cache.sizes() == key_cache.sizes(),
+      "FP8 caches must have matching [blocks, block_size, heads, dim] shapes");
+  check_mps(k_scale, "k_scale");
+  check_mps(v_scale, "v_scale");
+  TORCH_CHECK(key_cache.scalar_type() == at::kByte &&
+                  value_cache.scalar_type() == at::kByte,
+              "FP8 caches must be uint8");
+  TORCH_CHECK(k_scale.scalar_type() == at::kFloat &&
+                  v_scale.scalar_type() == at::kFloat &&
+                  k_scale.numel() == key_cache.size(2) &&
+                  v_scale.numel() == key_cache.size(2),
+              "FP8 scales must be float32 per-head");
+  TORCH_CHECK(
+      key_cache.stride(0) == value_cache.stride(0) &&
+          key_cache.stride(1) == num_heads * head_size &&
+          value_cache.stride(1) == num_heads * head_size,
+      "kv_cache_scatter requires matching block strides and dense rows");
+  if (T == 0) {
+    return;
+  }
+  encode("qc_kv_cache_scatter_fp8", [&](TorchEncoder& e) {
+    e.pipeline("kv_cache_scatter_fp8_strided_" + activation_type_name(key));
+    e.in(key, 0);
+    e.in(value, 1);
+    e.in(slot_mapping, 2);
+    e.out(key_cache, 3);
+    e.out(value_cache, 4);
+    e.bytes(static_cast<int>(num_heads), 5);
+    e.bytes(static_cast<int>(head_size), 6);
+    e.bytes(static_cast<int>(block_size), 7);
+    e.bytes(static_cast<uint64_t>(key_cache.stride(0)), 8);
+    e.in(k_scale, 9);
+    e.in(v_scale, 10);
+    e.dispatch(T, 1, 1, 256, 1, 1);
   });
 }
 
@@ -5883,6 +6017,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("context_lens"), pybind11::arg("scale"),
         pybind11::arg("window") = 0, pybind11::arg("max_context") = 0);
 
+  m.def("kv_cache_gather_range_fp8", &kv_cache_gather_range_fp8);
+  m.def("qc_kv_cache_scatter_fp8", &qc_kv_cache_scatter_fp8);
   m.def("kv_cache_gather_range", &kv_cache_gather_range,
         "64-bit range gather from a strided dense/GQA paged KV cache",
         pybind11::arg("key_cache"), pybind11::arg("value_cache"),

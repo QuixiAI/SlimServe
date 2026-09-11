@@ -1,5 +1,88 @@
 # SlimServe Optimization Status
 
+## 2026-09-10 - FP8-only KV quantization and vision on NVFP4 Metal
+
+- Operator policy: remove TurboQuant from every profile, including draft KV;
+  FP8 is the official KV quantization. Preserve existing unquantized caches.
+  Enable vision on all profiles whose source supports images.
+- Changes: remove `qwen38-nvfp4-1-tq`; replace the three shared DSpark source
+  defaults with FP8; enforce the cache and vision policies at plan resolution
+  and launch, including target/draft overrides and inherited environment.
+  The NVFP4 Metal profile now loads its vision tower. Add torchvision 0.28.0
+  alongside torch 2.13.0 to the Metal requirements.
+- Metal implementation: preserve DSV4's trained SWA draft adapter while
+  replacing its cache with FP8 E4M3. The new byte-cache store and range gather
+  carry physical page strides and 64-bit addresses. SDPA uses an explicit
+  zero-value sink column to preserve the learned attention-sink denominator.
+  Padded draft pages are supported; target MLA keeps `fp8_ds_mla`.
+- Rejected bring-up: removing the draft backend alone selected the target MLA
+  context insertion and failed on the missing Metal fused insertion op.
+  The FP8 draft adapter fixes that route. Initial vision startup lacked
+  torchvision; adding the matching dependency fixes processor construction.
+- Checks so far: 167 focused tests pass, one optional large-address test skips;
+  eight native FP8 store/gather/attention tests pass on the final binary.
+  All four compatible profiles pass live smoke: DSV4 text, Muse/Qwen GGUF/
+  Qwen NVFP4 text and images. The first long-context marker leg failed before
+  any restore: plant-1 returned the correct phrase inside reasoning with no
+  answer content (29 tokens, normal stop). This is retained as a failed chat
+  quality check, not accepted as successful recall or attributed to NVMe.
+- Replay diagnosis: the first four-reader replay copied 236 slabs with zero
+  byte-verification failures, but two generated sequences differed. A second
+  run reproduced output differences between GPU-only controls with identical
+  cached layer bytes. This confirms the cross-batch stochastic replay
+  limitation already recorded below; it does not establish tier corruption.
+  A diagnostic with `VLLM_QC_MLA_PREFILL_FA_MMA=0` also captured all four
+  restored prefixes immediately before the model read them: every layer page
+  matched its GPU-cache control, across all six groups and 170 layers. The
+  12 before-forward snapshots and byte comparison are retained under
+  `cache-diag-fa0/` and `cache-diag-fa0-comparison.json`. Batching still changed
+  logits and sampled sequences with that switch, so disabling one attention
+  kernel is not a production fix. Both replay failures remain failures of
+  that exact-sequence diagnostic; no cross-batch determinism claim is made.
+- Removed the temporary worker snapshot instrumentation. The registered
+  profile with normal attention dispatch completed exact 1000/2000-token
+  samples: c1 **17.585 tok/s** (113.732 s, 6,640 draft tokens); c8
+  **21.770 aggregate tok/s** (734.959 s, 47,395 draft tokens). All nine
+  responses / 18,000 output tokens pass counts, non-degeneracy and clock
+  checks. One sample per concurrency after eight-token warmups; seed 42,
+  API sampling defaults, no returned logprobs. This is comparable throughput
+  to the historical baseline, not a demonstrated speedup. Raw benchmark
+  samples and `throughput-summary.json` remain valid even though the combined
+  run's later recall setup failed. Wrapper: `qualify_fp8.py`; raw run:
+  `dsv4-fp8-final/`.
+- Default-sampling long recall setup reproduced the same plant-1 empty final
+  answer (29 tokens) after the full benchmark, again before eviction. Retain
+  this repeatable sampled-chat quality limitation. No empty answer or phrase
+  inside reasoning is accepted as recall success. A separate deterministic
+  marker gate with explicit `--acceptance-temperature 0` PASSED all four
+  plants and **12/12 concurrent recalls across three reset/restore rounds**.
+  Each reader restored 9,472 tokens (minimum required 9,296); all 804 restored
+  block-byte checks matched. Observed request latency was 8.39-17.36 s,
+  including verification; this is not a throughput measurement. That option
+  affects only marker chat, leaving benchmark sampling unchanged. Raw:
+  `dsv4-fp8-greedy-recall/`. This qualifies deterministic cache reuse; it
+  does not erase the default-sampling chat failure or establish arbitrary
+  cross-batch sampled-sequence equality.
+- Replay top-k logprob requests are cleared before timed benchmarks so
+  diagnostics cannot silently change the TPS workload. Final CPU regression
+  suite: 188 passed, one skipped, including all SlimServe tests and the Metal
+  tier/index/IO/planner tests. Final source formatting was rebuilt successfully;
+  all eight native FP8 tests pass on the rebuilt library. Applicable hooks
+  pass; the existing repository-wide typos and markdownlint failures remain
+  excluded as recorded in `fp8-hooks-final4.log`.
+- Decision: retain the required FP8 policy and vision enablement. The tested
+  Metal profiles serve successfully, DSV4 has comparable measured throughput,
+  and deterministic long-history eviction/reuse passes. Preserve the sampled
+  chat and cross-batch replay limitations above; no universal output-quality,
+  maximum-context, crash-persistence, or other-platform qualification claim.
+- Baseline: the previous 2026-09-10 Metal qualification below used TurboQuant
+  for DSV4 draft KV (c1 16.455, c8 21.222 tok/s with tier enabled). Those
+  numbers remain historical and are not FP8 qualification. No CUDA/ROCm
+  hardware is present in this workspace; their changed draft settings require
+  on-box qualification before making performance claims.
+- Raw logs, commands, failed attempts and source/native hashes:
+  `perf/results/2026-09-10/main-integration/`.
+
 ## 2026-09-10 - Integrate qualified Metal tier into current main
 
 - Merge parents: `32ea667de` (current main) and `0212334e6` (qualified Metal).

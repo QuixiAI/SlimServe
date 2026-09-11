@@ -1,3 +1,9 @@
+> Policy update (2026-09-10): TurboQuant is prohibited in every profile,
+> including draft KV. FP8 is the only permitted KV cache quantization.
+> `qwen38-nvfp4-1-tq` is removed; `qwen38-nvfp4-1` now enables vision on
+> Metal. Earlier TurboQuant directives and measurements below are historical.
+> See `perf/optimization_status.md` for current validation evidence.
+
 <!--
 Two active campaign handoffs live in this file. They cover different
 platforms and different hardware, and each is current for its own campaign;
