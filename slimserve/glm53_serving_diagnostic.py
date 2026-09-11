@@ -22,9 +22,4 @@ def policy(manifest):
 
 
 def cases(manifest):
-    selected = policy(manifest)
-    if selected is not rmsnorm_geometry:
-        return selected.CASES
-    from benchmarks.kernels.prepare_glm53_geometry_serving import CASES
-
-    return CASES
+    return policy(manifest).CASES

@@ -2,6 +2,7 @@
 
 import json
 import os
+from types import SimpleNamespace
 
 import torch
 from safetensors.torch import save_file
@@ -83,6 +84,43 @@ def test_rewrite_spec_layer_name_targets_the_mtp_block():
     )
     assert r(45, base + "embed_tokens.weight") == "model.embed_tokens.weight"
     assert r(45, "lm_head.weight") == "lm_head.weight"
+
+
+def test_draft_loader_populates_all_folded_indexer_shards(monkeypatch):
+    from vllm.model_executor.models import glm5_next_sm120_mtp as module
+
+    target = "model.layers.45.mtp_block.self_attn.fused_qkv_a_proj.weight"
+    fused = torch.nn.Parameter(torch.full((5, 2), float("nan")), requires_grad=False)
+    fused.weight_loader = lambda param, weight, shard: param.data[shard].copy_(weight)
+    owner = SimpleNamespace(
+        config=SimpleNamespace(
+            num_hidden_layers=45, num_nextn_predict_layers=1, n_routed_experts=288
+        ),
+        model=SimpleNamespace(mtp_start_layer_idx=45, num_mtp_layers=1),
+        named_parameters=lambda: [(target, fused)],
+        strip_hf_prefix=Glm5NextMTP.strip_hf_prefix,
+        rewrite_spec_layer_name=Glm5NextMTP.rewrite_spec_layer_name,
+        stacked_params_mapping=Glm5NextMTP.stacked_params_mapping,
+    )
+    monkeypatch.setattr(
+        module, "fused_moe_make_expert_params_mapping", lambda *args, **kwargs: []
+    )
+    names = (
+        "q_a_proj",
+        "kv_a_proj_with_mqa",
+        "indexer.wk",
+        "indexer.index_kpool_compress_gate",
+        "indexer.weights_proj",
+    )
+    weights = [
+        (
+            f"model.language_model.layers.45.self_attn.{name}.weight",
+            torch.full((2,), float(i + 1)),
+        )
+        for i, name in enumerate(names)
+    ]
+    assert Glm5NextMTP.load_weights(owner, weights) == {target}
+    torch.testing.assert_close(fused, torch.arange(1, 6).float()[:, None].expand(5, 2))
 
 
 def _fake_checkpoint(tmp_path):

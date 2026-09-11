@@ -15,6 +15,11 @@ from slimserve import glm53_ordering, rmsnorm_diagnostic
 FLAG = "SLIMSERVE_GLM53_RMSNORM_GEOMETRY"
 MANIFEST = "SLIMSERVE_GLM53_GEOMETRY_MANIFEST"
 SERVING_SCHEMA = "glm53-rmsnorm-geometry-serving-v1"
+CASES = (
+    ("control", "control"),
+    ("geometry", "geometry"),
+    ("return-control", "control"),
+)
 AOT_PAIR_SHA = "46b9c695c2734759deb55d3c15ee085dc8e3bd8eea67153ab074cdd1cb4fe946"
 AOT_CLOSURE_SHA = "ff9b29e175d6d8ac2f1c787d6ca35ee522786e20541a4ac5f3ffdf6fdfd98242"
 
