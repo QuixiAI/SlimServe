@@ -1,7 +1,7 @@
 # GLM-5.3-Flash on 4x RTX PRO 6000 Blackwell (sm_120): performance plan
 
-Status: historical research plan with an active validation protocol, updated
-2026-09-08. Branch `glm53-flash-sm120`, cut from upstream/main 9247eedad.
+Status: historical research plan; current optimization direction updated
+2026-09-10. Branch `glm53-flash-sm120`, cut from upstream/main 9247eedad.
 The implementation has advanced substantially since the original plan.
 Use HANDOFF.md for current priorities and perf/baseline_status.md for current
 fixed-start results. Original target tables and bandwidth estimates below are
@@ -20,6 +20,34 @@ value. Then run a focused correctness/performance comparison; reject neutral
 results without adding permutations or repeated starts. The sparse-prefill local
 variant screen is closed. Historical phase gates below are not instructions to
 resume validation infrastructure or exhaust every possible configuration.
+
+### Current research decision (2026-09-10)
+
+- The local SGLang Kimi path (`models/kimi_linear.py`,
+  `ColumnParallelBatchedLinear` in `layers/linear.py`) merges q/k/v/beta/f_a/g_a
+  then uses a strided batched fg_b projection. SlimServe already implements
+  these mechanisms in `kimi_gdn_linear_attn.py`; this is not an unclaimed win.
+- Correction to the digest below: FlashInfer #4709's 1.5–5.9x result is
+  **frozen-state speculative verification**, T=8 on B200, not ordinary
+  state-updating decode. Our no-spec profile cannot replace its recurrent
+  state update with that output-only operation. Do not budget those speedups.
+- Inspected implementation, not just headline: local-inference-lab/vllm #576,
+  head `72c39c091f50aa4ef975793279776113e324eba2`, issues
+  `cp.async.bulk.prefetch.L2.global.L2::cache_hint` with evict-last policy on
+  a side stream during independent attention/reduction work. Fills overlapping
+  the expert stream regressed; joining per layer also lost the benefit. Its
+  +7.1% c1 steps/s used BF16 projections and a speculative workload, so it is
+  a mechanism precedent, not a prediction for this recipe.
+- Next bounded candidate: KDA **output-projection prefetch only**, after the
+  input projection while fg_b/conv/recurrent/norm execute. Our TP4 output weight
+  is FP8 `[4096, 2048]` (8 MiB plus 2 KiB scales), consumed by the existing
+  W8A16 QuixiCore kernel, not cuBLAS. Keep arithmetic and weights unchanged.
+  Do not transplant BF16 fill budgets, prefetch whole next layers, or introduce
+  an alternate serving backend. Any prototype must measure the complete KDA
+  window including prefetch/stream costs, not just a warmed GEMM. The component
+  gain must plausibly survive 34 KDA layers before a real-profile comparison;
+  reject neutral results without a budget/geometry sweep. No implementation or
+  speed result for this candidate exists yet.
 
 Goal: an optimized SlimServe profile `glm53-nvfp4-4` for the platform
 `rtx6000` (4x RTX PRO 6000 Blackwell Workstation, sm_120, PCIe 5 x16, no

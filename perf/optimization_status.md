@@ -28282,3 +28282,34 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - Raw: `perf/results/2026-09-10/sparse-prefill-tiles/`, five JSON files above.
   Settings and all timings are recorded in each file; the CLI switches in
   `benchmark_glm53_sparse_prefill_tiles.py` reproduce the respective diagnostics.
+
+## 2026-09-10 - Source-led prioritization after sparse-prefill closure
+
+- Status: research decision; no serving/kernel change and no new benchmark.
+- Reviewed successful local o_norm dispatch, merged KDA projections, pooled-key
+  reuse and head-batched sparse attention, alongside the A100 GLM52 design.
+  Borrow the demonstrated mechanisms, not the old best-start timing claims.
+- Local SGLang `python/sglang/srt/models/kimi_linear.py` and its
+  `ColumnParallelBatchedLinear` already match our merged input + strided fg_b
+  design. No new port is warranted for that optimization.
+- FlashInfer #4709 is a frozen-state speculative-verify operation, benchmarked
+  at T=8 on B200. Its advertised 1.5–5.9x gain does not apply to this no-spec,
+  state-updating KDA path. Source:
+  https://github.com/flashinfer-ai/flashinfer/pull/4709 .
+- Read all changed-file patches of the SM120 prefetch precedent at
+  https://github.com/local-inference-lab/vllm/pull/576 , head
+  `72c39c091f50aa4ef975793279776113e324eba2`. Its inline PTX bulk-prefetch/cache
+  policy and windowed side stream are relevant; its BF16 byte budgets,
+  speculative c1 result and optional broad hook framework are not our recipe.
+  It reports regressions from expert-stream contention and per-layer joins.
+- Selected next candidate: prefetch just the KDA FP8 output projection during
+  independent fg_b/conv/recurrent/norm work. Actual serving dispatch is
+  `utils.py::_quixicore_fp8_block_linear_impl` -> `decode_gemm_fp8`, not the
+  reference's cuBLAS. TP4 weight footprint is 8 MiB plus 2 KiB block scales.
+  Test the complete window and account for issue/stream overhead; a warmed
+  GEMM alone cannot justify integration. No quant, activation or KV change.
+- Stop condition: reject a neutral complete-window result without further
+  fill-budget permutations or serving starts. Only a meaningful component
+  gain with plausible 34-layer benefit merits integration and a focused
+  real-profile comparison. This remains an unimplemented hypothesis, not a
+  new speed improvement or a claim that other structural options are exhausted.

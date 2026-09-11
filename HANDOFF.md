@@ -59,8 +59,14 @@ returns. Start from measured bottlenecks and successful local/upstream designs;
 identify the actual mechanism and likely full-serving benefit before editing a
 kernel. Use a focused comparison to confirm the hypothesis, not permutation
 search to discover one. Spills alone do not identify the dominant bottleneck.
-NEXT: implementation-level reference review and one justified structural change,
-not another geometry sweep or scoring campaign. Recipe/profile unchanged.
+Reference review completed: SGLang's merged KDA projections are already present;
+FlashInfer #4709's output-only kernel is speculative verification, not a drop-in
+for our state-updating decode. Next bounded candidate is KDA output-weight L2
+prefetch during independent attention work (mechanism from
+local-inference-lab/vllm #576), adapted to our 8 MiB FP8 output projection.
+Details and stop conditions: `docs/glm53-flash-sm120-plan.md`, current research
+decision. No prefetch implementation or measured gain yet; no new GPU run during
+this review. Recipe/profile unchanged. Do not resume a geometry/scoring campaign.
 
 The same-live-input scoring diagnostic is COMPLETE; do not restart or extend it.
 All four ranks pass exact paired scoring/input immutability and HTTP coverage
