@@ -3369,6 +3369,14 @@ at::Tensor fp8ch_mul_mat_vec(const at::Tensor& w, const at::Tensor& x,
     return !(e && e[0] == '0');
   }();
   encode("qc_fp8ch_mmvq", [&](TorchEncoder& e) {
+    if (batch > 8 && x.dim() == 2 && x.is_contiguous()) {
+      // Prefill / batch-verify: planar tiled GEMM, weights stay packed
+      // (the operator directive: no bf16 materialization, ever).
+      TORCH_CHECK(K % 32 == 0,
+                  "quixicore(metal): fp8ch GEMM needs K % 32 == 0, got ", K);
+      tk::launch_qgemm_fp8ch(e, out, w, x, w_scale, N, K, batch, type_name);
+      return;
+    }
     if (use_mv4r && batch >= 3 && batch <= 8 && N % 8 == 0 && x.dim() == 2 &&
         x.is_contiguous()) {
       tk::launch_qgemv_fp8ch_mv4r(e, out, w, x, w_scale, N, K, batch,
@@ -3429,6 +3437,15 @@ at::Tensor nvfp4_mul_mat_vec(const at::Tensor& w, const at::Tensor& x,
     return !(e && e[0] == '0');
   }();
   encode("qc_nvfp4_mmvq", [&](TorchEncoder& e) {
+    if (batch > 8 && x.dim() == 2 && x.is_contiguous()) {
+      // Prefill / batch-verify: planar tiled GEMM, weights stay packed
+      // (the operator directive: no bf16 materialization, ever).
+      TORCH_CHECK(K % 32 == 0,
+                  "quixicore(metal): nvfp4 GEMM needs K % 32 == 0, got ", K);
+      tk::launch_qgemm_nvfp4_planar(e, out, w, x, w_scale, global_scale, N, K,
+                                    batch, type_name);
+      return;
+    }
     if (use_mv4r && batch >= 3 && batch <= 8 && N % 8 == 0 && x.dim() == 2 &&
         x.is_contiguous()) {
       tk::launch_qgemv_nvfp4_mv4r(e, out, w, x, w_scale, global_scale, N, K,

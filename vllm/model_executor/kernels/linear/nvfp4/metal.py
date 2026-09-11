@@ -13,11 +13,12 @@ Apply routes:
   checkpoint buffers (packed e2m1 + e4m3 group scales + fp32 global) —
   `qgemv_nvfp4_planar` at M == 1, the weight-stationary `_mb` /
   `mv_ext` batch twins for M in [2, 8]. VLLM_QC_NVFP4=0 is the kill
-  switch back to the dense matmul; VLLM_QC_NVFP4_MB=0 kills only the
-  batch twins.
-- Prefill / larger M: dense matmul against the bf16 weights materialized at
-  load (VLLM_METAL_CT_DEQUANT=once, default). =call skips materialization
-  (per-call dequant, low-memory bring-up fallback).
+  switch back to the dense matmul (requires VLLM_METAL_CT_DEQUANT=once);
+  VLLM_QC_NVFP4_MB=0 kills only the batch twins.
+- Prefill / larger M (> 8): planar tiled GEMM (qgemm_nvfp4_planar) reading
+  the packed checkpoint buffers directly - weights stay in native quantized
+  form always (operator directive 2026-09-10). VLLM_METAL_CT_DEQUANT=once
+  is a diagnostic-only escape to the old materialized-bf16 dense path.
 """
 
 import os
@@ -56,7 +57,10 @@ def _gemv_available() -> bool:
 class MetalNvFp4LinearKernel(NvFp4LinearKernel):
     def __init__(self, config: NvFp4LinearLayerConfig) -> None:
         super().__init__(config)
-        self.materialize = os.environ.get("VLLM_METAL_CT_DEQUANT", "once") != "call"
+        # Native (packed weights, no bf16 copy) is the only default;
+        # "once" is the diagnostic-only escape to the old dual-layout
+        # materialized path (kernel-bisection boots).
+        self.materialize = os.environ.get("VLLM_METAL_CT_DEQUANT", "") == "once"
         self.use_gemv = os.environ.get("VLLM_QC_NVFP4", "1") != "0"
         if self.use_gemv and not _gemv_available():
             logger.warning_once(
@@ -101,7 +105,13 @@ class MetalNvFp4LinearKernel(NvFp4LinearKernel):
         # true multiplier. weight_scale holds raw E4M3 bytes as uint8 (Metal
         # cannot allocate fp8; see the scheme's create_weights).
         n, k_half = layer.weight.shape  # type: ignore[misc]
-        if self.use_gemv and n % 4 == 0 and (k_half * 2) % 16 == 0:
+        native_ok = (
+            self.use_gemv
+            and n % 4 == 0
+            and (k_half * 2) % 16 == 0
+            and (k_half * 2) % 32 == 0
+        )
+        if native_ok:
             layer.nvfp4_weight = layer.weight.data
             layer.nvfp4_scale = layer.weight_scale.data
             layer.nvfp4_global = (
@@ -110,8 +120,32 @@ class MetalNvFp4LinearKernel(NvFp4LinearKernel):
                 .contiguous()
             )
             layer.metal_nvfp4 = True  # type: ignore[assignment]
+            if not self.materialize:
+                # Native quantized serving for EVERY M (GEMV twins <= 8,
+                # planar tiled GEMM above): the packed buffers are the only
+                # resident form. Operator directive - weights stay in
+                # native quantized form always; VLLM_METAL_CT_DEQUANT=once
+                # is a diagnostic-only escape back to the dual-layout path.
+                return
         if not self.materialize:
-            return
+            if not self.use_gemv:
+                raise RuntimeError(
+                    "quixicore(metal): NVFP4 native kernels are disabled or "
+                    "missing (VLLM_QC_NVFP4=0 or a stale vllm._quixicore_C - "
+                    "rebuild with: cmake --build "
+                    "build/temp.macosx-11.0-arm64-cpython-312 "
+                    "--target _quixicore_C), and bf16 materialization is not "
+                    "enabled. Set VLLM_METAL_CT_DEQUANT=once only as a "
+                    "diagnostic."
+                )
+            logger.warning(
+                "quixicore(metal): NVFP4 layer %s (N=%d, K=%d) misses the "
+                "native-kernel alignment (N %% 4, K %% 32); materializing "
+                "bf16 for THIS layer only.",
+                getattr(layer, "prefix", "?"),
+                n,
+                k_half * 2,
+            )
         dense = dequant_nvfp4(
             layer.weight,  # type: ignore[arg-type]
             layer.weight_scale,  # type: ignore[arg-type]
@@ -128,16 +162,15 @@ class MetalNvFp4LinearKernel(NvFp4LinearKernel):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         x_2d = x.reshape(-1, x.shape[-1])
-        m = x_2d.shape[0]
         if (
             getattr(layer, "metal_nvfp4", False)
-            and (
-                m <= _GEMV_MAX_ROWS
-                or (self.use_gemv_mb and m % 2 == 0 and m <= _GEMV_MB_MAX_ROWS)
-                or (self.use_gemv_mv and 3 <= m <= _GEMV_MB_MAX_ROWS)
-            )
+            and not getattr(layer, "metal_ct_materialized", False)
             and x.dtype in (torch.bfloat16, torch.float16)
         ):
+            # Native for EVERY M: the host op routes M <= 8 to the GEMV
+            # twins (mv_ext / column-pair / batch-1 loop, still governed
+            # by the VLLM_QC_NVFP4* knobs) and M > 8 to the planar tiled
+            # GEMM. No bf16 weight copy exists on this path.
             from vllm.quixicore import quixicore_ops
 
             out = quixicore_ops.nvfp4_mul_mat_vec(

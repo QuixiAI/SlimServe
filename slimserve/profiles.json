@@ -1747,14 +1747,16 @@
             "trust_remote_code": true,
             "reasoning_parser": "glm45",
             "tool_call_parser": "glm47",
-            "served_model_name": "GLM-5.2-Vision"
+            "served_model_name": "GLM-5.2-Vision",
+            "kv_cache_dtype": "fp8"
           },
           "notes": [
             "Not yet runnable: this model serves through sparse MLA, and the Metal sparse-MLA kernels do not exist yet. These engine settings are starting points chosen to fit the memory budget, not measured configurations -- unlike every other profile in this file.",
             "Metal has no CUDA-graph equivalent, so graph capture is disabled through compilation_config.",
             "max_num_seqs is deliberately small. Batched serving is the weakest part of every Metal engine surveyed -- ds4 still runs attention and routed experts per session -- so concurrency here is a guess, not a tested ceiling.",
             "Q2_K and Q4_K need a 512 GB Mac Studio. IQ2_XXS is the only quant a 256 GB machine can hold.",
-            "FP8 is the official KV cache quantization. DSpark draft KV uses fp8; earlier draft-cache throughput and sizing measurements require requalification after this change."
+            "FP8 is the official KV cache quantization. DSpark draft KV uses fp8; earlier draft-cache throughput and sizing measurements require requalification after this change.",
+            "kv_cache_dtype fp8 (operator 2026-09-11: FP8 default across the board). NOT yet live-validated: the profile itself is plan-time gated as not-ready on Metal (GLM-shaped sparse MLA unvalidated), so the dtype takes effect at that bring-up and must be validated with it."
           ]
         }
       }
@@ -2435,10 +2437,10 @@
           "default_quant": "NVFP4",
           "engine": {
             "tensor_parallel_size": 1,
-            "max_model_len": 32768,
+            "max_model_len": 262144,
             "max_num_seqs": 8,
             "max_num_batched_tokens": 2048,
-            "kv_cache_memory_bytes": 17179869184,
+            "kv_cache_memory_bytes": 25769803776,
             "compilation_config": {
               "cudagraph_mode": "NONE"
             },
@@ -2476,7 +2478,9 @@
             "The former qwen38-nvfp4-1-df2 twin (canonical minus muse) is retired: it differed only by VLLM_QC_MUSE, which is a kill switch, not a config. Reproduce it with VLLM_QC_MUSE=0 on this profile.",
             "Chat-template defaults: reasoning_effort low (the template ships xhigh, which spends hundreds of thinking tokens on trivial turns) and preserve_thinking explicitly true (the template treats undefined as true; pinned so a template update cannot silently flip it). Per-request values override both.",
             "enable_prefix_caching true is SlimServe policy: every profile states it explicitly; hybrid models otherwise inherit vLLM's silent hybrid default of OFF and pay full history re-prefill every chat turn. Enabled here 2026-08-30; validate on this platform (mamba 'align' cache mode is experimental upstream) at its next live validation pass.",
-            "Vision is enabled with the checkpoint's native vision tower and processor; text and image requests are required for profile validation."
+            "Vision is enabled with the checkpoint's native vision tower and processor; text and image requests are required for profile validation.",
+            "Context raised to the model default 262144 with a 24 GiB KV pool (2026-09-11). Unlocked by the native quantized prefill GEMM (qgemm_nvfp4_planar / qgemm_fp8ch): weights stay in their packed checkpoint form for EVERY batch size - the earlier dual-layout design materialized ~54 GiB of bf16 prefill weights (Model loading took 76.3 GiB) and capped the pool at 18.06 GiB, short of the 20.99 GiB one full-context request needs; the per-call-dequant escape crashed the engine mid-262k-prefill. Packed-only load is ~25 GiB incl. the vision tower. VLLM_METAL_CT_DEQUANT=once remains a diagnostic-only escape back to the materialized path. Validation: float64 kernel oracles, live parity vs the materialized route, and the 262k needle (perf/results/2026-09-11/nvfp4-native-gemm/).",
+            "fp8 main KV is BLOCKED on this record (2026-09-11): with kv_cache_dtype fp8 the model generates as if the prompt were empty on BOTH weight paths (native GEMM and CT_DEQUANT=once), while bfloat16 KV answers correctly - isolation legs in perf/results/2026-09-11/nvfp4-native-gemm/parity_*. The metal_attn SDPA prefill does call kv_cache_gather_range_fp8 with layer scales, so the fault is inside the fp8 scatter/gather or scale application at this profile's geometry (GQA 24/4, head_dim 256, partial rotary; the unit roundtrip only covers dim 64). Reverted to bfloat16 until that bring-up; the FP8-default directive (operator 2026-09-11) applies here as soon as it passes."
           ],
           "speculator": {
             "repo": "z-lab/Qwen3.8-27B-DFlash2",
@@ -2542,7 +2546,8 @@
             "tool_call_parser must be muse_glimmer: tool calls use the model's native ATEM recipient/invoke/parameter envelope, including Responses custom-tool payloads.",
             "This profile retains its qualified unquantized bf16 KV cache. The Metal FP8 backend is used by the DSV4 drafter; this profile's fused decode configuration has not been qualified with FP8 KV.",
             "Performance note (2026-08-15): DFlash speculation (always on) measures 19.9-20.1 tok/s rested on the 256-token greedy essay bench (fused verify step + tensor-ops kernels on the M5 GPU neural accelerators), ahead of plain fused decode (14.4-16.4); long-context (10k, cached decode) 11.0. Acceptance ~1.73/draft. See perf/baseline_status.md. llama.cpp reference on this box: 26.75 plain / 30.8 spec; vendor ExecuTorch 26.6/50.2.",
-            "NVMe KV tier (issue #19): 128 GiB file-backed slots behind the 12 GiB GPU pool; same unified-memory rationale as dsv4-xxs-1. enable_cross_layers_blocks forces the packed slab across the SWA+full groups; a layout mismatch fails loudly at register time. Only the 13 global layers hold deep KV (SWA layers are capped at the 2048 window), so restores are dominated by the global-layer bytes."
+            "NVMe KV tier (issue #19): 128 GiB file-backed slots behind the 12 GiB GPU pool; same unified-memory rationale as dsv4-xxs-1. enable_cross_layers_blocks forces the packed slab across the SWA+full groups; a layout mismatch fails loudly at register time. Only the 13 global layers hold deep KV (SWA layers are capped at the 2048 window), so restores are dominated by the global-layer bytes.",
+            "fp8 main KV is BLOCKED on this record: same 'unsupported dtype Byte' rejection as qwen38-q2kxl-1 from the muse fused decode path (smoke 2026-09-11). Reverted to auto until the kernels accept byte caches; the FP8-default directive then applies here too."
           ]
         }
       }
@@ -2603,7 +2608,8 @@
             "max_model_len 131072 of the model's 262144: matched to the muse profile until the hybrid KV/state manager is measured on Metal.",
             "Chat-template defaults: reasoning_effort low (the template ships xhigh, which spends hundreds of thinking tokens on trivial turns) and preserve_thinking explicitly true (the template treats undefined as true; pinned so a template update cannot silently flip it). Per-request values override both.",
             "enable_prefix_caching true is SlimServe policy: every profile states it explicitly; hybrid models otherwise inherit vLLM's silent hybrid default of OFF and pay full history re-prefill every chat turn. Enabled here 2026-08-30; validate on this platform (mamba 'align' cache mode is experimental upstream) at its next live validation pass.",
-            "NVMe KV tier (issue #19): 128 GiB file-backed slots behind the 12 GiB GPU pool; same unified-memory rationale as dsv4-xxs-1. enable_cross_layers_blocks forces the packed cross-layer slab the connector requires for the hybrid GDN+attention groups (the engine equalizes mamba and attention page sizes at boot, but the group split is not guaranteed to resolve all-uniform); a layout mismatch fails loudly at register time. GDN tail states ride the engine's frozen align-mode boundary snapshots, the contract validated on qwen38fn-fp8-8/rtx3090."
+            "NVMe KV tier (issue #19): 128 GiB file-backed slots behind the 12 GiB GPU pool; same unified-memory rationale as dsv4-xxs-1. enable_cross_layers_blocks forces the packed cross-layer slab the connector requires for the hybrid GDN+attention groups (the engine equalizes mamba and attention page sizes at boot, but the group split is not guaranteed to resolve all-uniform); a layout mismatch fails loudly at register time. GDN tail states ride the engine's frozen align-mode boundary snapshots, the contract validated on qwen38fn-fp8-8/rtx3090.",
+            "fp8 main KV is BLOCKED on this record: the first request dies with 'quixicore(metal): unsupported dtype Byte' - the fused GDN decode / hybrid KV-gather kernels read the cache as bf16 and reject byte storage (smoke 2026-09-11, perf/results/2026-09-11/nvfp4-native-gemm/smoke_qwen38-q2kxl-1.log). Reverted to auto until the QuixiCore hybrid path grows fp8-cache support; the FP8-default directive then applies here too."
           ]
         },
         "mi300x": {
@@ -2982,6 +2988,47 @@
               ]
             ]
           }
+        }
+      }
+    },
+    "glm53f-q2-1": {
+      "title": "GLM-5.3-Flash Q2 on one Mac",
+      "source": "glm53f-gguf",
+      "gpus": 1,
+      "summary": "GLM-5.3-Flash Q2 with vision and the native 1048576-token context on 128 GiB Apple Silicon.",
+      "speculative": false,
+      "variants": {
+        "metal": {
+          "platform": "metal",
+          "default_quant": "Q2",
+          "engine": {
+            "tensor_parallel_size": 1,
+            "max_num_seqs": 4,
+            "max_num_batched_tokens": 512,
+            "block_size": 64,
+            "gpu_memory_utilization": 0.9,
+            "kv_cache_dtype": "fp8",
+            "compilation_config": {
+              "cudagraph_mode": "NONE"
+            },
+            "enable_prefix_caching": true,
+            "enable_chunked_prefill": true,
+            "limit_mm_per_prompt": {
+              "image": 2
+            },
+            "reasoning_parser": "glm47",
+            "tool_call_parser": "glm47",
+            "served_model_name": "GLM-5.3-Flash"
+          },
+          "env": {
+            "VLLM_USE_V2_MODEL_RUNNER": "1"
+          },
+          "notes": [
+            "Bring-up in progress: end-to-end Metal qualification is not yet complete.",
+            "Context is read from the GGUF metadata (1048576); vision uses the exact companion GLM-5.3-Flash-Vision-Encoder.gguf.",
+            "Resident loading is the first qualification target. Expert offload is only needed if the complete runtime at native context exceeds the 128 GiB memory budget.",
+            "No speculative decoder is enabled during the initial target-model qualification."
+          ]
         }
       }
     }
