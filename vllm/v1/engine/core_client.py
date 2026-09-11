@@ -1489,6 +1489,8 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                     [w * 4 + r for w, r in current_counts],
                     self.eng_start_index,
                 )
+                if self.prefix_router.routed % 100 == 0:
+                    logger.info("dp prefix affinity: %s", self.prefix_router.stats())
             else:
                 min_score = sys.maxsize
                 eng_index = 0
