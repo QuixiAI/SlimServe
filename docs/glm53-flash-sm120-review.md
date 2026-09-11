@@ -222,8 +222,9 @@ coverage, not another serving benchmark or native-kernel qualification.
 Parts1–4 remain unreviewed: the service explicitly permits only one included
 review per hour. First next slot is about19:40 UTC; prioritize #26 (kernels),
 then #27 (runtime), #28 and #25. Do not enable paid overages or repeatedly
-request over-quota reviews. Feedback replies/resolution and the remaining
-four external reviews are the outstanding publication work.
+request over-quota reviews. Fixes32a29fcc9 are published; all ten threads have
+individual evidence replies and are resolved. The remaining four external
+reviews and any resulting fixes are the outstanding publication work.
 
 Main's existing
 glm53f-q2-1/metal record references a missing glm53f-gguf source and lacks its

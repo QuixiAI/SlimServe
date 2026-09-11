@@ -117,9 +117,10 @@ fixes and final cleanup remain open; see the review map for links.
 
 Part5 review arrived18:58 UTC: ten actionable comments/two small test cleanups
 addressed,128 focused CPU tests pass. One new graph-benchmark gate test makes
-PR24's diff55 files. Source/recipe/native kernels unchanged; no GPU run warranted.
+PR24's diff55 files. Serving source/recipe/native kernels unchanged; no GPU run warranted.
 The fixture-builder change belongs to #28 (476f3290e), merged forward through
-#25/#24. Publish/reply/resolve these findings, then continue external reviews.
+#25/#24. Fixes published in32a29fcc9; all ten threads have individual evidence
+replies and are resolved. Continue the remaining four external reviews.
 CodeRabbit allows ONE included review per hour: #26/#27/#28/#25 were quota
 blocked, first next slot about19:40 UTC on2026-09-11. Prioritize #26 then #27.
 Do not change billing or infer that any unreviewed layer has passed review.

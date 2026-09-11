@@ -30023,6 +30023,8 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - Parts1–4 remain unreviewed: explicitly one included CodeRabbit review/hour,
   next slot about19:40 UTC. Prioritize kernel #26 then runtime #27; do not
   silently enable billing or treat rate-limited requests as completed reviews.
+  Fixes32a29fcc9 are published; all ten review threads have individual evidence
+  replies and are resolved. All five PRs remain cleanly mergeable drafts.
 ## 2026-09-06: GLM-5.2 A100 tier records re-measured after the sparse-decode copy removal
 
 - Both records boot through their profiles with the host tier active
