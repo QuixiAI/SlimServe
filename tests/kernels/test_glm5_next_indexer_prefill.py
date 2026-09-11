@@ -12,7 +12,10 @@ import torch
 
 from vllm.model_executor.layers import glm5_next_indexer as gi
 from vllm.platforms import current_platform
-from vllm.v1.attention.backends.mla.indexer import build_prefill_chunk_metadata
+from vllm.v1.attention.backends.mla.indexer import (
+    DeepseekV32IndexerPrefillMetadata,
+    build_prefill_chunk_metadata,
+)
 
 H, D, KP, ROW = 32, 128, 4, gi._ROW_DIM
 BLOCK_SIZE = 1088  # the served hybrid block size (a multiple of 64)
@@ -197,6 +200,24 @@ def test_prefill_row_req_uses_query_rows():
     visible = chunk.cu_seqlen_ke - chunk.cu_seqlen_ks
     assert int(visible[0]) == 1001 and int(visible[499]) == 1500
     assert int(visible[500]) == 1 and int(visible[R - 1]) == 1200
+
+
+def test_tp_shard_dispatch_uses_fork_chunk_metadata(monkeypatch):
+    monkeypatch.setattr(gi, "_TP_PREFILL_SHARD", True)
+    monkeypatch.setattr(gi, "_PREFILL_MATMUL", True)
+    chunks = [SimpleNamespace(token_start=3, token_end=3003, max_seq_len=32768)]
+    metadata = DeepseekV32IndexerPrefillMetadata(chunks=chunks)
+    assert not hasattr(metadata, "max_prefill_seq_len")
+    assert gi._prefill_row_sharding_enabled(metadata.chunks)
+    assert not gi._prefill_row_sharding_enabled([])
+    chunks[0].token_end = 2050
+    assert not gi._prefill_row_sharding_enabled(metadata.chunks)
+    chunks[0].token_end = 3003
+    chunks[0].max_seq_len = 32767
+    assert not gi._prefill_row_sharding_enabled(metadata.chunks)
+    chunks[0].max_seq_len = 32768
+    monkeypatch.setattr(gi, "_TP_PREFILL_SHARD", False)
+    assert not gi._prefill_row_sharding_enabled(metadata.chunks)
 
 
 @pytest.mark.parametrize(

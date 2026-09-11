@@ -81,6 +81,16 @@ _POOL_TILE = 128 if _SM120_TILES else 64
 _TP_PREFILL_SHARD = os.getenv("VLLM_GLM53_INDEXER_TP_PREFILL", "0") == "1"
 
 
+def _prefill_row_sharding_enabled(chunks) -> bool:
+    # This fork stores host-side context lengths on each chunk, not on the
+    # enclosing prefill metadata (unlike the newer upstream implementation).
+    return bool(
+        _TP_PREFILL_SHARD and _PREFILL_MATMUL and chunks
+        and chunks[-1].token_end - chunks[0].token_start >= 2048
+        and max(c.max_seq_len for c in chunks) >= 32768
+    )
+
+
 @cache_once
 def _prefill_shard_group():
     # Explicit SM120/TP4 opt-in. Decode, short prefills and other platforms
@@ -664,9 +674,7 @@ def glm5_next_pooled_indexer(
         assert md.prefill is not None
         chunks = md.prefill.chunks
         group = None
-        if (_TP_PREFILL_SHARD and _PREFILL_MATMUL and chunks
-                and chunks[-1].token_end - chunks[0].token_start >= 2048
-                and md.prefill.max_prefill_seq_len >= 32768):
+        if _prefill_row_sharding_enabled(chunks):
             group = _prefill_shard_group()
         if group is not None:
             logger.info_once(

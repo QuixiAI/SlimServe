@@ -48,6 +48,14 @@ then one flag1 candidate through existing campaign harness, three repeats,
 cold1000/300 c1/c8/c16, quality/needles and cold32K/128K. Same recipe/library,
 wideMarlin1, native-order0. No scoring campaign, sweep or replacement starts.
 No new serving speed claim or default promotion until that pair finishes.
+Serving update: control completed at8f8592d20 (c1/c8/c16 medians156.928/579.047/
+779.811, cold32K/128K2527.319/10658.466ms). Candidate reached health but failed
+before timing because dispatch referenced upstream-only metadata field
+`max_prefill_seq_len`; this fork has per-chunk `max_seq_len`. Fixed the gate
+to use those existing host values and added a fork-metadata dispatch regression.
+Failed candidate retained. Flag-off execution is unchanged; keep the completed
+control and run ONE corrected candidate into `indexer-shard-serving-candidate-fixed/`.
+This is a recorded development failure, not a discarded slow benchmark.
 
 2026-09-11 UTC: **Phase 4.1 cross-item pipeline implemented, tested, rejected.**
 One fixed NT16/K512/S4 candidate improves gate/up 26.28 -> 22.02 us and down

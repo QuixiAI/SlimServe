@@ -28486,3 +28486,18 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   boots1/repeats3/cold-prefix/quality/prefill, c1/c8/c16 exact1000/300. Serving
   cap150GiB/swap0. Keep every result; no replacement or best-of starts. Only a
   meaningful measured TTFT gain without relevant regressions merits promotion.
+
+### Serving dispatch correction (same item, no new optimization)
+
+- Control8f8592d20 completes:156.928/579.047/779.811 E2E tok/s c1/c8/c16,
+  cold32K/128K engine2527.319/10658.466ms; canaries/needles pass, exit0.
+- First candidate reaches health but fails before timing, at dispatch: newer
+  upstream has `prefill.max_prefill_seq_len`, this fork only has
+  `chunk.max_seq_len`. No sharding result was produced. Both worker teardown
+  and GPU release complete; failure remains in `indexer-shard-serving-candidate/`.
+- Fix reads max of the existing host-side chunk lengths. Add regression using
+  the actual fork's `DeepseekV32IndexerPrefillMetadata`; no new kernel, geometry,
+  protocol or quality policy. Completed flag-off control's behavior is unchanged.
+  ONE corrected candidate is prescribed in `indexer-shard-serving-candidate-fixed/`,
+  same command/flags/workload as failed candidate. Do not repeat the control or
+  omit this failed start from the report. Opt-in remains off in registry.
