@@ -145,6 +145,10 @@ def sparse_tc_nope(
     assert cache.ndim == 3 and cache.shape[2] == 512
     fp8 = cache.dtype == torch.uint8
     assert q.dtype == torch.bfloat16 and (fp8 or cache.dtype == torch.bfloat16)
+    if fp8 and split > 64:
+        # The in-kernel e4m3 decode holds int32 temporaries of the [SPLIT, 512]
+        # tile; SPLIT=128 exceeds sm80's 164 KB of shared memory (278 KB asked).
+        split = 64
     assert cache.stride()[1:] == (512, 1) and cache.shape[1] > 0
     assert indices.shape[0] == block_table.shape[0] == q.shape[0]
     assert topk_length.shape == (q.shape[0],)
