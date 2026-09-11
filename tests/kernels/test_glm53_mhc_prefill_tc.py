@@ -10,6 +10,8 @@ from benchmarks.kernels.benchmark_mhc_output_parallel import inputs
 from benchmarks.kernels.mhc_fp64_oracle import accuracy_pair
 from vllm.quixicore.ops import quixicore_ops as qc
 
+pytest.importorskip("vllm._quixicore_C")
+
 pytestmark = pytest.mark.skipif(
     not (
         torch.cuda.is_available()

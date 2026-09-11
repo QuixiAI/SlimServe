@@ -9,6 +9,7 @@ from functools import wraps
 
 from slimserve.model_journal import ACTIVE
 from slimserve.model_journal import enabled as model_journal_enabled
+from slimserve.score_journal import private_directory, private_open
 
 MAX_DUMP_BYTES = 2 * 1024**3
 
@@ -30,7 +31,7 @@ class MoECapture:
         self.completed = set()
         self.saved_bytes = 0
         self.directory = journal.path.parent / f"moe-{os.getpid()}"
-        self.directory.mkdir(exist_ok=False)
+        private_directory(self.directory, exist_ok=False)
 
     def snapshot(self, stage, tensor, parameter=False):
         import torch
@@ -53,14 +54,16 @@ class MoECapture:
             raise ValueError("first-MoE worker dump byte bound exceeded")
         suffix = "parameter" if parameter else f"match-{match}"
         path = self.directory / f"{stage}-{suffix}.pt"
-        with path.open("xb") as stream:
+        with private_open(path, binary=True) as stream:
             torch.save(host, stream)
         size = path.stat().st_size
         if size > nbytes + 65536:
             raise ValueError("unexpected tensor serialization overhead")
         self.saved_bytes += size
+        digest = hashlib.sha256()
         with path.open("rb") as stream:
-            digest = hashlib.file_digest(stream, "sha256").hexdigest()
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
         self.journal.write(
             {
                 "kind": "moe_snapshot",
@@ -68,7 +71,7 @@ class MoECapture:
                 "stage": "moe3." + stage,
                 "path": str(path),
                 "file_bytes": size,
-                "file_sha256": digest,
+                "file_sha256": digest.hexdigest(),
                 "parameter": parameter,
                 "worker_saved_bytes": self.saved_bytes,
             }

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 import hashlib
 import inspect
+import os
+import stat
 from types import SimpleNamespace
 
 import pytest
@@ -79,6 +81,19 @@ def test_snapshot_values_metadata_and_parameter_dedup(journal):
     assert row["file_bytes"] == capture.saved_bytes == files[0].stat().st_size
     assert row["file_sha256"] == hashlib.sha256(files[0].read_bytes()).hexdigest()
     assert len([r for r in journal.rows if r["kind"] == "tensor"]) == 3
+
+
+def test_snapshot_permissions_ignore_permissive_umask(journal):
+    previous = os.umask(0)
+    try:
+        capture = mj.MoECapture(journal)
+        capture.snapshot("up.input", torch.ones(1))
+    finally:
+        os.umask(previous)
+    assert stat.S_IMODE(capture.directory.stat().st_mode) == 0o700
+    assert [stat.S_IMODE(p.stat().st_mode) for p in capture.directory.iterdir()] == [
+        0o600
+    ]
 
 
 def test_duplicate_stage_and_unsafe_path_fail(journal):

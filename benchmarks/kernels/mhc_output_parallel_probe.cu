@@ -3,6 +3,7 @@
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAException.h>
 #include "mhc_output_parallel.cuh"
 
 using torch::Tensor;
@@ -35,8 +36,10 @@ std::vector<Tensor> run_typed(
         ? fused_pre_transition_output_parallel<FUSED, NORM, 64>
         : fused_pre_transition<FUSED, NORM, 4096, 64, float>;
     int sms = 0, blocks = 0;
-    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, residual.get_device());
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, kernel, THREADS, 0);
+    C10_CUDA_CHECK(cudaDeviceGetAttribute(
+        &sms, cudaDevAttrMultiProcessorCount, residual.get_device()));
+    C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &blocks, kernel, THREADS, 0));
     TORCH_CHECK(T * 64 <= sms * blocks, "cooperative grid exceeds residency");
     void* args[] = {&xp, &rp, &pp, &cp, &fp, &rop, &parp, &sp, &basp,
                    &npp, &ncp, &op, &np, &rms_eps, &pre_eps, &sinkhorn_eps,

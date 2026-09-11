@@ -15,7 +15,7 @@ from vllm.triton_utils import tl, triton
 
 
 @triton.jit
-def _conv_head(x, weight, state, features, slot, X_STRIDE: tl.constexpr):
+def _conv_head(x, weight, state, features, slot):
     offsets = slot * 18432 + features
     c0 = tl.load(state + offsets)
     c1 = tl.load(state + offsets + 6144)
@@ -73,9 +73,9 @@ def _core(
         return
     x = mixed + token * MIXED_STRIDE
     features = head * 128 + k
-    q = _conv_head(x, conv_weight, conv_state, features, slot, MIXED_STRIDE)
-    key = _conv_head(x, conv_weight, conv_state, 2048 + features, slot, MIXED_STRIDE)
-    value = _conv_head(x, conv_weight, conv_state, 4096 + features, slot, MIXED_STRIDE)
+    q = _conv_head(x, conv_weight, conv_state, features, slot)
+    key = _conv_head(x, conv_weight, conv_state, 2048 + features, slot)
+    value = _conv_head(x, conv_weight, conv_state, 4096 + features, slot)
     if debug_conv is not None:
         tl.store(debug_conv + token * 6144 + features, q)
         tl.store(debug_conv + token * 6144 + 2048 + features, key)
@@ -109,10 +109,24 @@ def _core(
 
 def core(mixed, g1, g2, beta, weights, conv_state, state, indices, output, debug=None):
     batch = mixed.shape[0]
+    if weights["conv"].shape != (6144, 4) or not weights["conv"].is_contiguous():
+        raise ValueError("conv weights must be contiguous [6144, 4]")
+    if (
+        output.shape != (batch, 2048)
+        or output.dtype != torch.bfloat16
+        or not output.is_contiguous()
+    ):
+        raise ValueError("output must be contiguous BF16 [batch, 2048]")
+    if (
+        indices.shape != (batch,)
+        or indices.dtype not in (torch.int32, torch.int64)
+        or not indices.is_contiguous()
+    ):
+        raise ValueError("indices must be contiguous integer [batch]")
     assert mixed.shape == (batch, 6144) and mixed.dtype == torch.bfloat16
     assert conv_state.stride() == (18432, 1, 6144)
     assert state.dtype == torch.float32 and state.shape[1:] == (16, 128, 128)
-    assert state.is_contiguous() and output.is_contiguous()
+    assert state.is_contiguous()
     assert g1.stride() == g2.stride() == (2048, 1)
     assert weights["norm"].numel() == 128
     return _core[(batch * 16,)](

@@ -3,7 +3,7 @@
 """Phase 4.2: one full-head conv/KDA/norm fusion, complete-window comparison.
 
 Reuses the completed prefetch experiment's actual-weight windows, without any
-prefetch. 51 allocations exceed3xL2. Fixed eight-warps/full-head ownership;
+prefetch. 51 allocations exceed 3x L2. Fixed eight-warps/full-head ownership;
 no tile sweep. FP32 recurrent state, BF16 conv state, original projections.
 """
 
@@ -72,6 +72,8 @@ def main():
         "status": "running",
         "roadmap": "4.2",
         "diagnostic_only": True,
+        "method": __doc__,
+        "recipe": "glm53-redhatai-nvfp4-fp8-kda-tp4-v1",
         "git": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
         "source_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "kernel_sha256": hashlib.sha256(
