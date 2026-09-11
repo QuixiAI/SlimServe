@@ -1,0 +1,921 @@
+# GLM53 broader RMSNorm geometry isolation
+
+Status: corrected pre-load A/B pair COMPLETE and audited on4b0fa3701. Both312-pair
+matrices pass and match exactly across processes. Their commands below are
+historical; do not rerun them. The first pair remains terminal after its observer
+API failure. AOT v1 stopped during CPU preparation before any private cache/GPU
+load. v2 stopped on its first GPU load's cache-lifecycle gate; v3 loaded all seven
+rank0 artifacts but stopped at the auditor's export parser. v4 stopped at the
+inventory's graph/helper classification; v5 stops at post-compile call identity.
+No-weights AOT v6 now PASSES all eight loads/audits and final comparison; its
+commands are historical. The opt-in serving integration and workload controller
+are CPU-tested. Full-model v1 stopped during CPU preflight with zero model starts;
+v2 then stops at a client import before any model start. Full-model v3 now completes
+all three prescribed starts/audits and closure. Geometry is rejected under the
+unchanged quality gate and does not reproduce the failed no-combo score vector;
+the completed result is at the tail. No next GPU/model series is prescribed.
+
+## Question and fixed factors
+
+Can changing only the thirteen identified original-cache H4096 RMSNorm launch
+choices reproduce the failed fresh no-combo policy's score-vector change?
+
+The completed graph correspondence identifies six input-layer norms and seven
+post-attention norms, with 3/3/3/4 sources by rank. All change from
+XBLOCK1/R0_BLOCK4096/16 warps to XBLOCK1/R0_BLOCK1024/eight warps, one stage.
+Final mean+norm is not a target. The historical four-source sufficiency finding
+concerns a different old/native pair and does not answer this question.
+
+Keep the selected recipe, TP4, native libraries, original graph bodies/decorators,
+attention combo kernels, KDA cache choices, native-order1, BF16fn1 and TC0 fixed.
+Do not import fresh no-combo sources or enable its compiler policy. Do not widen
+quality tolerances or clear the separate indexer LayerNorm gate.
+
+## Completed CPU evidence
+
+- Graph mapping: `runtime-control/norm-graph-role-pairs.json`, SHA
+  `320a6f39c4f92cd78459f21e23653e1e900870620da29bed923f5cba5dbe315e`.
+  Twenty-eight graph pairs; match body, semantic consumer and exact ordered
+  call arguments, excluding duplicate compile-time docstrings.
+- Final discovery: `runtime-control/rmsnorm-geometry-final-discovery.json`, SHA
+  `4294ff75ea2236c577b8104ea3a44055d65dcf68ca0449685eccf02a2c5f7ea4`.
+  Thirteen exact sources/control configs/cubin/PTX/metadata images verified;
+  six in-place and seven triple-output layouts. All thirteen original debug
+  identities point at their own source. Thirty-five static graph/source uses.
+  All 178 source receipts and 5,172 original files verified. Discovery schema
+  deliberately cannot be passed as a qualified intervention manifest.
+- Controller: `benchmarks/kernels/glm53_rmsnorm_geometry.py`. Reuses the previous
+  single-source controller under one atomic multi-target resolver. A target
+  object reaches upstream cache resolution once, including concurrent aliases.
+  Exact paths, source/config/cubin checks, strong references, complete per-source
+  graph coverage, and no late bindings are mandatory. This is not installed in
+  SlimServe or vLLM; the historical controller/serving flags remain unchanged.
+- CPU regression: 187 passed, 5.43 seconds, 8 GiB/no-swap scope. Report
+  `runtime-control/rmsnorm-geometry-final-cpu.xml`; initial reports preserved.
+
+All raw paths above are under `perf/results/2026-09-10/`.
+Static old graph uses are discovery evidence, not proof of historical live
+coverage or of a working new hook. No throughput was measured here.
+
+## Source-exact numerical qualification
+
+The dedicated probe uses the discovered thirteen ORIGINAL sources,
+the provenance-preserving loader and rank-private Triton cache scopes from
+`check_glm53_attention_norms.py`, and the existing in-place/triple-output oracle,
+guard, eager-repeat and changed-input replay helpers from
+`check_glm53_cached_rmsnorm.py`. Keep generated metadata unchanged. Compile the
+two explicit configurations directly; do not call timed autotuning.
+
+Bounded matrix, frozen with the commands below before launch:
+
+- Two fresh, sequential processes A/B, independent empty private caches.
+  Run B only after A and its audit pass; no replacement starts or retries.
+- Each process: thirteen sources x rows 1/16/640/7616 x seeds 530901/530902 x
+  the three existing checkpoint-weight/magnitude sites in `SITES`: 312 pairs.
+  Changed input uses seed+100. Both configurations in each pair.
+- Compile all 26 source/config bindings before numerical work. Control must
+  reproduce the exact recorded key and whole cubin bytes. Geometry must use the
+  original source/decorator, not a binary borrowed from fresh no-combo graphs.
+  Record its actual key and whole binary; require exact cross-process identity.
+- Both arms: finite BF16 outputs and at most one BF16 ULP against the FP64
+  oracle; repeated eager, original/changed-input replay, guards, no read-only
+  mutation and triple-output agreement all pass. Retain the full prescribed
+  numerical matrix, including failures; a failed A terminates this pair.
+- Cross-process inputs, outputs, oracle metrics and binaries repeat exactly.
+  Cross-configuration equality is observed, not assumed or required.
+- Freeze probe/helper/serving/compiler/native sources through the pair and
+  audits. One GPU workload at a time; 16 GiB/no-swap probes, 8 GiB audits.
+  Preserve every artifact and verify all original cache files remain unchanged.
+
+Implementation: `benchmarks/kernels/check_glm53_rmsnorm_geometry.py`, with
+negative-gate tests in `tests/slimserve/test_rmsnorm_geometry_probe.py`. The
+discovery artifact lacks qualified geometry binary receipts on purpose; this
+probe establishes them. It also checks compiler metadata against each key/config,
+in-memory cubins against disk bytes, exact output/metric phase coverage, and the
+entire source freeze. B is programmatically gated on A's successful numerical
+audit, unchanged summary, and rechecked source/binary artifacts.
+
+Historical first-pair commands (STOPPED; do not rerun):
+
+```bash
+systemd-run --user --scope --unit=glm53-geometry-probe-prepare -p MemoryMax=8G -p MemorySwapMax=0 \
+  env PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 .venv/bin/python \
+  -m benchmarks.kernels.check_glm53_rmsnorm_geometry prepare \
+  --discovery perf/results/2026-09-10/runtime-control/rmsnorm-geometry-final-discovery.json \
+  --manifest perf/results/2026-09-10/runtime-control/rmsnorm-geometry-probe-manifest.json \
+  --series-root perf/results/2026-09-10/rmsnorm-geometry-source-qualification
+```
+
+Exactly one process A, then its audit. Preserve stdout/stderr and exit statuses:
+
+```bash
+systemd-run --user --scope --unit=glm53-geometry-source-a -p MemoryMax=16G -p MemorySwapMax=0 \
+  env CUDA_HOME=/usr/local/cuda-13.0 PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 \
+  .venv/bin/python -m benchmarks.kernels.check_glm53_rmsnorm_geometry run \
+  --manifest perf/results/2026-09-10/runtime-control/rmsnorm-geometry-probe-manifest.json --arm a
+systemd-run --user --scope --unit=glm53-geometry-source-a-audit -p MemoryMax=8G -p MemorySwapMax=0 \
+  env PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 .venv/bin/python \
+  -m benchmarks.kernels.check_glm53_rmsnorm_geometry audit \
+  --manifest perf/results/2026-09-10/runtime-control/rmsnorm-geometry-probe-manifest.json --arm a
+```
+
+Only after A passes and the independent GPU query is empty, exactly one B:
+
+```bash
+systemd-run --user --scope --unit=glm53-geometry-source-b -p MemoryMax=16G -p MemorySwapMax=0 \
+  env CUDA_HOME=/usr/local/cuda-13.0 PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 \
+  .venv/bin/python -m benchmarks.kernels.check_glm53_rmsnorm_geometry run \
+  --manifest perf/results/2026-09-10/runtime-control/rmsnorm-geometry-probe-manifest.json --arm b
+systemd-run --user --scope --unit=glm53-geometry-source-b-audit -p MemoryMax=8G -p MemorySwapMax=0 \
+  env PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 .venv/bin/python \
+  -m benchmarks.kernels.check_glm53_rmsnorm_geometry audit \
+  --manifest perf/results/2026-09-10/runtime-control/rmsnorm-geometry-probe-manifest.json --arm b
+systemd-run --user --scope --unit=glm53-geometry-source-pair-audit -p MemoryMax=8G -p MemorySwapMax=0 \
+  env PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 .venv/bin/python \
+  -m benchmarks.kernels.check_glm53_rmsnorm_geometry compare \
+  --manifest perf/results/2026-09-10/runtime-control/rmsnorm-geometry-probe-manifest.json
+```
+
+Any structural, binary, freeze, or numerical failure terminates this pair;
+preserve its partial/full evidence and audit before any new design. No code
+edits, builds, commits or other GPU work between preparation and final audit.
+Do not interpret these source probes as actual graph-loader or model validation.
+
+## Subsequent gates, not yet prescribed
+
+After numerical qualification, build private intervention manifests with both
+verified source-specific binaries. Qualify the real static-future and PyCodeCache
+loader hooks against all relevant original graphs, both arms/all ranks. Compare
+the controller's coverage with an independent actual-module/global inventory;
+neither static source references nor callback counts substitute for it. Reuse
+the earlier real-AOT qualification approach, not obsolete raw helper APIs.
+
+Only then wire an opt-in diagnostic into the actual profile/campaign, freeze a
+bounded control/geometry/return full-model series and its auditor, and run it in
+150 GiB/no-swap serving scopes. Preserve the existing per-window quality floors,
+exact score-vector comparisons, cold exact-token workload and all failed/slow
+starts. A diagnostic score change is not a speed win or production promotion.
+
+## First pair closure and corrected pre-load pair
+
+ONE A on28842e5c3 stops before numerical cases: the static CUDA adapter has no
+`asm` attribute. Its `cubin_raw` is consumed and cleared by `load_kernel` inside
+`make_launcher`. The original observer was wrong in both API and lifecycle.
+The first control's emitted disk key/config/whole-cubin bytes match the original;
+182 frozen receipts/5172 original files verify. A exits1, prescribed audit rejects
+the incomplete binary set, GPUs are free, B never launched. Closure:
+`runtime-control/rmsnorm-geometry-binary-api-failure-analysis.json`, SHA
+`ae19129d827af87f55352f6c7b625513c8db81ab2a0bb84e2616486ce124d07a`.
+
+Corrected probe hashes the actual in-memory image BEFORE creating the launcher,
+then compares that hash with the emitted disk binary. The helper handles Triton's
+`asm` and Torch's `cubin_raw`, rejects conflicts/missing bytes, and never falls
+back to guessing a disk image after loading. A CPU test uses the installed
+StaticallyLaunchedCudaKernel.load_kernel lifecycle with only its driver call
+mocked, proving the consumption timing.226 related tests pass5.67s. The static
+launcher implementation is added to the next frozen manifest.
+
+This fixes the SOURCE probe. The multi-target controller will separately need
+pre-load observation for graph-held static objects when implementing real-AOT
+qualification; post-load bytes are unavailable there too. Do not call the
+controller qualified or install it in serving on the strength of these CPU tests.
+
+NEW discovery `runtime-control/rmsnorm-geometry-preload-discovery.json`, SHA
+`d98fffd11b5f0f60880a3754ea6641201435aa9779bcfeb1bdb4ff95bd0d3a5f`.
+Same13 sources/configs/312-pair matrix and all gates; only the observer changes.
+NEW series, exactly A then (only after pass/audit/GPU release) B:
+
+```bash
+systemd-run --user --scope --unit=glm53-geometry-preload-prepare -p MemoryMax=8G -p MemorySwapMax=0 \
+  env PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 .venv/bin/python \
+  -m benchmarks.kernels.check_glm53_rmsnorm_geometry prepare \
+  --discovery perf/results/2026-09-10/runtime-control/rmsnorm-geometry-preload-discovery.json \
+  --manifest perf/results/2026-09-10/runtime-control/rmsnorm-geometry-preload-manifest.json \
+  --series-root perf/results/2026-09-10/rmsnorm-geometry-preload-qualification
+systemd-run --user --scope --unit=glm53-geometry-preload-a -p MemoryMax=16G -p MemorySwapMax=0 \
+  env CUDA_HOME=/usr/local/cuda-13.0 PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 \
+  .venv/bin/python -m benchmarks.kernels.check_glm53_rmsnorm_geometry run \
+  --manifest perf/results/2026-09-10/runtime-control/rmsnorm-geometry-preload-manifest.json --arm a
+systemd-run --user --scope --unit=glm53-geometry-preload-a-audit -p MemoryMax=8G -p MemorySwapMax=0 \
+  env PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 .venv/bin/python \
+  -m benchmarks.kernels.check_glm53_rmsnorm_geometry audit \
+  --manifest perf/results/2026-09-10/runtime-control/rmsnorm-geometry-preload-manifest.json --arm a
+systemd-run --user --scope --unit=glm53-geometry-preload-b -p MemoryMax=16G -p MemorySwapMax=0 \
+  env CUDA_HOME=/usr/local/cuda-13.0 PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 \
+  .venv/bin/python -m benchmarks.kernels.check_glm53_rmsnorm_geometry run \
+  --manifest perf/results/2026-09-10/runtime-control/rmsnorm-geometry-preload-manifest.json --arm b
+systemd-run --user --scope --unit=glm53-geometry-preload-b-audit -p MemoryMax=8G -p MemorySwapMax=0 \
+  env PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 .venv/bin/python \
+  -m benchmarks.kernels.check_glm53_rmsnorm_geometry audit \
+  --manifest perf/results/2026-09-10/runtime-control/rmsnorm-geometry-preload-manifest.json --arm b
+systemd-run --user --scope --unit=glm53-geometry-preload-pair-audit -p MemoryMax=8G -p MemorySwapMax=0 \
+  env PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 .venv/bin/python \
+  -m benchmarks.kernels.check_glm53_rmsnorm_geometry compare \
+  --manifest perf/results/2026-09-10/runtime-control/rmsnorm-geometry-preload-manifest.json
+```
+
+Freeze through the entire NEW pair and audits; no edits/builds/commits/other GPU
+work, no replacement attempts, no new model job. Preserve stdout/stderr/statuses.
+Stop on failure; all original first-pair paths remain immutable historical evidence.
+
+## Completed pre-load pair result
+
+Both prescribed processes exit0,312/312 pairs each; all26 source/config bindings
+verified before numerical work in each. Original control whole-cubin bytes match.
+Both geometries have maximum one BF16 ULP vs FP64; all eager/replay/guard/mutation/
+triple-output checks pass. Final audit requires and observes exact equality of all
+312 corresponding inputs, outputs, metrics and binaries across processes.
+183 source/native/compiler receipts and5172 original files remain unchanged.
+Independent GPU queries are empty after each process. Source freeze is released.
+
+Per-process geometry/control comparison:14,820 differing elements among
+5,286,248,448 paired elements. This is synthetic-input qualification on the three
+real norm weight vectors, not actual model activations, score causality or TPS.
+It does not clear the separate indexer LayerNorm gate or qualify the controller.
+
+Final `rmsnorm-geometry-preload-qualification/pair-analysis.json` SHA
+`3b5bcff2c1d23b4b8a2ffa7c648267d5ee74003f67f6ce6495528d1c69516f69`.
+A/B analysis SHAs respectively
+`9a7ea3bf24f4b811861ed373c7c10ba51a318871609ea6deecf026af3d926f6b` and
+`9bc9117e8b3417864e80e05f560b25ac2232e5fde957dd2cf16d9a11b7d67592`.
+Raw root: `perf/results/2026-09-10/`; all prior attempts and logs retained.
+
+Next CPU work: observe the actual static CUDA driver-load input before bytes are
+consumed, retain object/handle provenance, and tie each graph-held launch callable
+to its observed kernel. Then qualify the multi-target hook against the real AOT
+loader. No additional GPU process is prescribed until that implementation and its
+bounded qualification protocol are ready.
+
+## CPU observer integration checkpoint
+
+The pre-load observer now lives in `benchmarks/kernels/glm53_binary_observer.py`.
+It records the exact private file passed to the real static CUDA load method,
+checks any available raw image against it, and retains strong identity plus the
+resulting module/function handles. Post-load checks require this prior observation;
+they do not guess a disk image. Generated launchers must bind their runner to the
+observed kernel and agree on hash, warps and shared memory. Unobserved loaded
+objects, closed/changed handles, bad paths/images/ranks and late loads after an
+explicit observer seal fail. Hook cleanup preserves prior inherited/local APIs
+and refuses to overwrite a foreign change made while active.
+
+MultiIntervention accepts the observer for binary reads and launcher checks,
+including cached replacements and graph verification. Its own target sealing
+remains separate from the observer's global load seal: do not accidentally forbid
+legitimate non-target graph compilation during future model capture. The actual
+AOT/serving adapter must choose and qualify its hook lifetime explicitly.
+
+CPU tests use the installed StaticTritonCompileResult.make_launcher, generated
+launcher code and StaticallyLaunchedCudaKernel.load_kernel; only the driver is
+mocked. They cover retained/consumed bytes, serialized objects without raw bytes,
+one load under concurrent aliases, changed handles/images/launchers, cleanup,
+and a three-target controller graph substitution followed by sealing/reuse.
+Final related suite254 passed5.75s. This is NOT real GPU/AOT or model qualification.
+No further GPU job is prescribed at this checkpoint.
+
+The known-key cache join also verifies all13 qualified candidate images against
+their exact original rank-local files and both completed probe outputs. Report
+`runtime-control/rmsnorm-geometry-candidate-cache-check.json`, SHA
+`017120c13bc5fc5b8261903cf8a4dd3ba782b67c00ccfe53a9f58cfcd40a7102`.
+It uses completed qualification receipts after their source freeze ended; it
+does not pretend the subsequently edited helper files still match old hashes.
+
+Next implement private manifest preparation and actual AOT-loader adapters/auditor,
+then prescribe the bounded all-rank/control+geometry qualification. Use the proven
+seven-artifact loader path and independently verify actual graph globals. Do not
+substitute static graph references, source probes or callback counts for coverage.
+
+## Actual loader adapter CPU checkpoint
+
+Preparation, scoped loader hooks and independent live-graph inventory are now
+implemented in `prepare_glm53_geometry_loader.py`, `glm53_geometry_loader.py` and
+`audit_glm53_geometry_graphs.py` under `benchmarks/kernels/`. NOT serving hooks.
+Preparation joins the pinned completed pair to both original rank-local binaries,
+copies the full unchanged namespace separately for every rank/mode, and records
+released helper updates without silently changing native/compiler/serving receipts.
+No private copies have yet been made with this preparer.
+
+The adapter observes driver inputs before cached resolution, uses original debug
+provenance for replacements, and leaves `TRITON_CACHE_DIR` UNSET. Torch resolves
+the private Inductor cache's `triton/<rank>` directory exactly as in the original
+AOT path; do not flatten this into a shared directory or change KDA cache behavior.
+Both loader hooks remain active through inventory and target sealing. Their cleanup
+restores unchanged hooks but preserves/rejects foreign edits. Target sealing does
+not globally seal the binary observer; this is tested with a later non-target load.
+
+The independent inventory walks actual module call globals and executable `.run`
+symbols, checks source/graph hashes and selected binary/launcher-object provenance,
+and requires the mapped graphs and every target binding. It also records non-target
+Triton bindings for exact cross-arm comparison. Controller ownership/callback maps
+do not supply its coverage. This CPU implementation is NOT proof that all actual
+AOT graph globals have yet been loaded or that all are supported static launchers.
+
+Related suite232 passes2.80s (33 new tests),8GiB/swap0, including installed
+PyCodeCache/StaticAutotunerFuture/static launcher APIs and concurrent source imports.
+Driver and replacement-compiler calls are mocked; actual artifact join verifies13
+targets/7 graphs per rank/183 source receipts/5172 original files unchanged.
+`runtime-control/geometry-loader-source-check.json` SHA
+`cbe7547de5f0218caa4e5e094a1a1f74b2b17e00a0087c83a8eb5f7b78cb4d84`.
+
+Remaining before GPU work: no-weights AOT runner, separate offline receipt auditor,
+new source freeze including those tools and actual Torch loader helpers, private
+manifest preparation, and a prescribed sequential eight-process protocol with
+stop-on-failure/no retries. Then actual graph/global/binary coverage, unchanged
+non-target comparison and cache/source audit must pass before any model series.
+No next GPU/model job is prescribed at this checkpoint.
+
+## Historical real-AOT qualification v1 (stopped in CPU preparation)
+
+Runner `check_glm53_geometry_loader.py`, offline auditor
+`audit_glm53_geometry_loader.py`; both under `benchmarks/kernels/`.
+CPU gate263 passed3.13s (31 new audit/harness tests),8GiB/swap0; report
+`runtime-control/geometry-loader-protocol-cpu.xml`. Initial focused64 pass2.55s
+in `geometry-loader-audit-cpu.xml`. GPUs idle before source freeze.
+
+Exactly EIGHT processes, in this order: control-rank0, control-rank1,
+control-rank2, control-rank3, geometry-rank0, geometry-rank1, geometry-rank2,
+geometry-rank3. One fresh identical full private namespace per process. Each
+loads the original rank's seven cached artifacts/46 entries through the real
+concurrent StandaloneCompiledArtifacts.load_all path, WITHOUT outer model
+deserialization, weights, forwards, capture or timing. Never retry a process.
+
+Before each next load: preceding load exit0, offline audit exit0, original/source
+freeze unchanged, all predecessor receipts/logs unchanged, independent GPU query
+empty. ANY failure terminates the entire sequence; preserve partial/full raw logs,
+summary, binary/controller streams, audit and private caches. No edits, builds,
+commits or other GPU workloads from preparation through final closure/audit.
+
+Required per-process evidence: all seven actual graph sources and every mapped
+target binding, no static bundle fallbacks, each graph launcher tied to its
+observed exact CUDA load image, per-source selected config/cubin, independent
+graph-global inventory joined to controller and binary receipts, complete target
+and observer seals. Geometry additionally requires identical ALL non-target
+graph/source/config/binary records to the corresponding control. The observer's
+global seal occurs only after all loading/inventory/target sealing; there is no
+later capture in this gate. This lifetime is NOT automatically a serving policy.
+
+Prepare AFTER committing the implementation and this protocol:
+
+```bash
+systemd-run --user --scope --unit=glm53-geometry-aot-v1-prepare -p MemoryMax=8G -p MemorySwapMax=0 \
+  env PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 .venv/bin/python \
+  -m benchmarks.kernels.prepare_glm53_geometry_loader \
+  --pair perf/results/2026-09-10/rmsnorm-geometry-preload-qualification/pair-analysis.json \
+  --manifest perf/results/2026-09-10/runtime-control/rmsnorm-geometry-preload-manifest.json \
+  --mapping perf/results/2026-09-10/runtime-control/norm-graph-role-pairs.json \
+  --output perf/results/2026-09-10/rmsnorm-geometry-aot-qualification-v1
+```
+
+Invoke the following ONCE for each prescribed LABEL above, sequentially and only
+if all earlier labels passed. LABEL is not a tuning choice. The launcher records
+`launch.json`, native stdout/stderr in `load.log`/`audit.log`, exact commands,
+exit codes/log digests and post-load independent GPU query. It starts its GPU
+child in16GiB/swap0 and auditor in8GiB/swap0 scopes and rejects prior attempts.
+
+```bash
+systemd-run --user --scope --unit=glm53-geometry-aot-v1-launch-LABEL -p MemoryMax=8G -p MemorySwapMax=0 \
+  env CUDA_HOME=/usr/local/cuda-13.0 PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 \
+  .venv/bin/python -m benchmarks.kernels.check_glm53_geometry_loader launch \
+  --manifest perf/results/2026-09-10/rmsnorm-geometry-aot-qualification-v1/LABEL/manifest.json
+```
+
+Only after ALL eight pass and the GPUs are free:
+
+```bash
+systemd-run --user --scope --unit=glm53-geometry-aot-v1-final-audit -p MemoryMax=8G -p MemorySwapMax=0 \
+  env PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 .venv/bin/python \
+  -m benchmarks.kernels.audit_glm53_geometry_loader compare \
+  perf/results/2026-09-10/rmsnorm-geometry-aot-qualification-v1
+```
+
+This gate proves loader/graph/binary coverage, not model score causality or TPS.
+Only after it passes may the opt-in serving adapter and bounded model causal
+series be implemented/prescribed. Quant/defaults/native math/gates unchanged.
+
+## v1 preparation closure; historical v2 (stopped on first load)
+
+ONE CPU preparation on7e2b8bd0e exits1 BEFORE creating the private series or
+launching any GPU load. Dotted import of `torch._inductor.standalone_compile`
+resolves Torch's package-exported FUNCTION rather than its module, so source-file
+freezing raises AttributeError. Original5172 files and183 source receipts verify,
+GPU query empty. v1 is TERMINAL, none of its eight loads may be launched.
+Closure `runtime-control/geometry-aot-v1-preparation-failure.json`, SHA
+`1a337eb9639c4152ef2a6b02c875b97f5d512468eadd9d852dbeed36fc1f2e23`.
+
+Fixed with explicit `importlib.import_module` resolution for all five loader
+modules. New CPU test executes actual module resolution plus the WHOLE eight-copy
+preparation, frozen manifest readback and source/original verification on small
+fixtures, and rejects overwriting the output. Focused65 tests pass2.75s; related
+264 pass. No GPU/math/default/gate change. Initial evidence and tests retained.
+
+NEW v2: exactly the SAME eight rank/mode attempts, loader path, scopes, order,
+no-retry policy and gates prescribed above, at a NEW series root. Commit the fix
+then freeze through preparation/loads/audits/closure. Prepare once:
+
+```bash
+systemd-run --user --scope --unit=glm53-geometry-aot-v2-prepare -p MemoryMax=8G -p MemorySwapMax=0 \
+  env PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 .venv/bin/python \
+  -m benchmarks.kernels.prepare_glm53_geometry_loader \
+  --pair perf/results/2026-09-10/rmsnorm-geometry-preload-qualification/pair-analysis.json \
+  --manifest perf/results/2026-09-10/runtime-control/rmsnorm-geometry-preload-manifest.json \
+  --mapping perf/results/2026-09-10/runtime-control/norm-graph-role-pairs.json \
+  --output perf/results/2026-09-10/rmsnorm-geometry-aot-qualification-v2
+```
+
+Then invoke the previous `launch` command once for each prescribed LABEL in order,
+substituting `v2` for `v1` in BOTH the outer unit name and manifest series path.
+The launcher's child scope names are also v2. Only if all eight pass, invoke the
+previous final `compare` command with v2 in BOTH unit and series path. No other
+changes, replacement starts or model workload authorized by this protocol.
+
+## v2 closure and exact cache-lifecycle fix; historical v3 (stopped)
+
+ONE control-rank0 load onad6656314 exits1, followed by its prescribed failing
+audit. The remaining seven loads were NEVER launched. All seven static bundles
+load without fallback (50 entries total);15 actual CUDA loads match their original
+whole cubin images. Replacement compilation stops at the diagnostic's overly
+strict requirement that TRITON_CACHE_DIR remain absent. No graph-complete coverage,
+replacement numerical result, model forward/weights or TPS claim. All201 frozen
+source receipts/5172 original files verify, independent GPU query empty. v2 is
+TERMINAL and its eight prepared caches/receipts/logs remain intact. Closure
+`rmsnorm-geometry-aot-qualification-v2/closure.json`, SHA
+`c84e1f76dcca924103b52e660b30130e120c2f22b68a89800219024a819ae044`.
+
+Torch's actual CachingAutotuner constructor materializes an initially absent
+TRITON_CACHE_DIR as the SAME rank-private directory. CPU test executes that real
+constructor (no compilation/driver) and verifies the transition. The adapter now
+accepts absent OR exactly `<private>/inductor_cache/triton/<rank>` and checks the
+resolved canonical path before/after template creation AND compilation. It never
+unsets/rewrites the variable in callbacks. Wrong-rank/shared/empty/aliased values
+still reject. Error diagnostics now include the actual/expected cache paths; the
+failed v2 run did not itself record those environment values. Focused70 pass2.83s;
+related269 pass. The real loader must still qualify the corrected adapter.
+
+NEW v3: repeat the SAME prescribed eight-case matrix at a NEW root, not a retry
+of v2. Commit fixes/protocol, then freeze. Use the v2 preparation command above,
+substituting `v3` in BOTH unit and output path. For each LABEL in the original
+fixed order, use the launch command with `v3` in BOTH unit and manifest path;
+child scopes are also v3. Final compare uses v3 unit/path only after all eight
+loads/audits/release checks pass. Root:
+`perf/results/2026-09-10/rmsnorm-geometry-aot-qualification-v3/`.
+Same scopes/no-retry/no-edit/no-build/one-GPU-workload rules and every original
+source/binary/graph/non-target gate. Do not launch any unused v1/v2 case.
+
+## v3 closure and exported Runner.call support; historical v4 (stopped)
+
+ONE control-rank0 process on14ab95575 loads ALL7 artifacts/46 entries; its26
+observed CUDA images match original whole bytes. The independent AST inventory
+then rejects the generated module's `call = runner.call` export because it only
+recognized a top-level function. All3 sources have controller graph callbacks
+(3/4/2), but those callbacks alone do NOT qualify actual graph coverage. Load and
+prescribed audit exit1; remaining seven cases never launched. All201 sources/
+5172 original files unchanged; GPUs free. v3 is TERMINAL, all copies/logs retained.
+Closure `rmsnorm-geometry-aot-qualification-v3/closure.json`, SHA
+`352a2e15d3a2bae0bc67b1cfdfb0de4aaf6017c372ca4eaa15bbadee9f1ef6d6`.
+
+Auditor now follows the explicit exported instance/class/method AST bindings,
+or a direct call function. It checks the live method's exact instance, class,
+function, source filename/line and globals. It excludes compile-time strings and
+unexported methods. Read-only source check matches ALL28 mapped original graph
+exports and recorded kernel run symbols. Report
+`runtime-control/geometry-bound-export-source-check.json`, SHA
+`c43d449aa00bc4ffffc0f628efd291a16d199f54c69df7770c971121b457da36`.
+Focused79 tests pass2.87s; related278 pass3.47s,8GiB/swap0. Nine new CPU tests
+include actual PyCodeCache bound Runner.call imports and changed live exports.
+
+NEW v4 after commit: SAME eight cases, order, independent private copies and
+unchanged source/binary/graph/non-target/numerical gates. Use the explicit v2
+prepare command with `v4` in BOTH unit/output path; use the launch/final compare
+commands with `v4` in BOTH unit/series path. Child scopes are v4. Root:
+`perf/results/2026-09-10/rmsnorm-geometry-aot-qualification-v4/`.
+Freeze through terminal audits, one GPU workload at a time,16GiB GPU/8GiB CPU/
+swap0, stop entire series on any failure. No retries or unused v1/v2/v3 cases.
+This still does not prescribe a full-model run or change production defaults.
+
+## v4 closure: root graphs must come from actual serialized artifacts
+
+ONE control-rank0 on5213afeb5 loads7 artifacts/46 entries and27 original-exact
+CUDA images. Load/audit exit1 at `unexpected or changed graph source`; the failing
+module path was not retained. ALL private Python files equal the original snapshot.
+The validator wrongly classifies every cached module exporting callable `call` as
+a model root, although generated kernel benchmark helpers also export `call`.
+All201 sources/5172 original files unchanged, GPUs released. v4 is TERMINAL;
+remaining seven cases never launched. All copies/logs retained, freeze released.
+Closure `rmsnorm-geometry-aot-qualification-v4/closure.json`, SHA
+934fe0e8b53960e38c8270ffadf86990a77559bc642a53dc832a0ca8e559a428.
+
+CPU catalog:76 call-export sources,19/rank (eight bound Runner,11 direct).
+Only seven bound roots/rank belong to the norm mapping. Trusted rank0 pickle
+inspection, with GPUs hidden and without post-compile, recovers those same seven
+cache keys from the serialized compiled forward results. Full source-byte equality
+and all-rank discovery still need verification. Do not infer root status from
+callability, names or controller callbacks. Observe actual artifact-to-live-call
+bindings; retain all loaded-module paths before validation, plus target/non-target
+root launcher checks. No replacement/unused v1-v4 attempt or new GPU series is
+prescribed at this checkpoint. Model quality and indexer gates remain unchanged.
+
+## Artifact-root provenance qualification: historical v5 (stopped)
+
+CPU-only discovery matches ALL28 serialized root source bytes/cache keys against
+the original graph files (seven/rank,46 submodule references/rank). Report
+`runtime-control/geometry-artifact-roots-all-ranks.json`, SHA
+33db464e59736405d7893e3c45ffb152403c2be16599b5db55ca56b4ae8ba10a.
+No post-compile/forward/GPU calls in that check. The observer now scopes actual
+AOTCompiledArtifact.deserialize to its payload receipt, observes the actual live
+CompiledFxGraph.after_deserialization call/runner/module, and joins the identical
+returned artifact to vLLM's loaded store. Do not use the deep-copied serializable
+result as a substitute for the live graph. Save the complete loaded-module catalog
+before coverage checks and on failure; original-exact imported helpers are recorded
+separately. Root source/config/binary/target/non-target coverage remains mandatory.
+
+CPU gate310 pass6.94s; real vLLM concurrent load_all and Torch graph loading,
+with only the outer AOT fixture wrapper reduced. First fixture-cleanup failures
+and subsequent passes retained in `runtime-control/geometry-artifact-root-*-cpu.xml`.
+Actual GPU/AOT validation is still required. No serving code, quant, native binary,
+compiler math, quality floor or indexer gate is changed.
+
+Commit this implementation/protocol, then freeze all sources through closure.
+Exactly eight attempts, one each in this order: control-rank0, control-rank1,
+control-rank2, control-rank3, geometry-rank0, geometry-rank1, geometry-rank2,
+geometry-rank3. Same no-weights/no-forward/no-capture/no-timing workload and all
+previous source/binary/seal/coverage gates. Any failed preparation, load, audit or
+release stops the entire series; never launch remaining cases or replace an attempt.
+All predecessor audits, logs and source hashes must pass before the next case.
+Keep one GPU workload at a time; no native builds or source edits during the series.
+
+Prepare once in8GiB/swap0 with GPUs hidden (trusted local pickle discovery only):
+
+```bash
+systemd-run --user --scope --unit=glm53-geometry-aot-v5-prepare -p MemoryMax=8G -p MemorySwapMax=0 \
+  env CUDA_VISIBLE_DEVICES= PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 .venv/bin/python \
+  -m benchmarks.kernels.prepare_glm53_geometry_loader \
+  --pair perf/results/2026-09-10/rmsnorm-geometry-preload-qualification/pair-analysis.json \
+  --manifest perf/results/2026-09-10/runtime-control/rmsnorm-geometry-preload-manifest.json \
+  --mapping perf/results/2026-09-10/runtime-control/norm-graph-role-pairs.json \
+  --output perf/results/2026-09-10/rmsnorm-geometry-aot-qualification-v5
+```
+
+For each LABEL in the fixed order, ONCE, conditional on all predecessors passing:
+
+```bash
+systemd-run --user --scope --unit=glm53-geometry-aot-v5-LABEL-launch -p MemoryMax=8G -p MemorySwapMax=0 \
+  env PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 CUDA_HOME=/usr/local/cuda-13.0 .venv/bin/python \
+  -m benchmarks.kernels.check_glm53_geometry_loader launch \
+  --manifest perf/results/2026-09-10/rmsnorm-geometry-aot-qualification-v5/LABEL/manifest.json
+```
+
+Launcher retains load/audit logs and statuses, plus independent GPU-release query;
+child scopes use v5,16GiB GPU/8GiB CPU/swap0. Only if ALL eight complete successfully:
+
+```bash
+systemd-run --user --scope --unit=glm53-geometry-aot-v5-compare -p MemoryMax=8G -p MemorySwapMax=0 \
+  env CUDA_VISIBLE_DEVICES= PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 .venv/bin/python \
+  -m benchmarks.kernels.audit_glm53_geometry_loader compare \
+  perf/results/2026-09-10/rmsnorm-geometry-aot-qualification-v5
+```
+
+Audit final closure against original sources/cache and independent GPU query before
+releasing the freeze. v1-v4 stay terminal. This protocol does not authorize a model
+causal series or promote a production/default/performance change.
+
+## v5 closure and exact writeback-wrapper provenance; v6 (now complete)
+
+ONE control-rank0 on838689c68 verifies7 real root bindings during deserialize,
+loads7 artifacts/46 entries and26 original-exact CUDA images. All17 imported
+module sources match originals. Post-load callable identity gate fails. Both load
+and audit exit1; other seven cases NEVER launched.205 source receipts/5172 original
+files unchanged, GPUs released. Closure `rmsnorm-geometry-aot-qualification-v5/closure.json`,
+SHA45c52321b9d81db6b151344f67a9a4d17c429be404daef8cb14c277c9541b09a.
+v5 TERMINAL, all copies/logs retained and freeze released.
+
+CPU-only actual Torch post_compile on28 serialized roots with sentinel callables
+reproduces20 writeback wrappers plus8 direct calls. Each wrapper closes over the
+exact sentinel and mutated input[4]. No callable executes or GPU loads. Report
+`runtime-control/geometry-post-compile-cpu.json`, SHA
+5f358d74cf27baa047a585cfff440af2543f8142e2aee1680a29624f0f264fa6.
+v5 did not retain its final callable closure; do not claim its exact identity is
+already proven. The observer now records detailed state before rejecting, and
+requires the installed writeback code object/globals/source and exact original
+call/mutation object/indices/serialized alignment plan. Unknown/nested wrappers
+and changed closures reject; direct roots retain exact-call identity. Offline audit
+joins those final-state receipts as well. Torch utils.py is added to the freeze.
+Related CPU324 pass7.23s; `runtime-control/geometry-writeback-cpu.xml`.
+
+NEW v6 after committing this fix/protocol: SAME fixed eight-case order and gates
+as v5 above, all new private caches. Substitute `v6` for `v5` in BOTH unit names
+and every series path in the explicit preparation, per-LABEL launch and final
+compare commands. Child scopes are v6. Root
+`perf/results/2026-09-10/rmsnorm-geometry-aot-qualification-v6/`.
+One preparation; one attempt each control0..3 then geometry0..3, conditional on
+all prior audits/source hashes/receipts/GPU release. Any failure stops the entire
+series; no unchanged retries. Sources frozen from preparation through terminal
+closure.16GiB GPU/8GiB CPU/swap0, no other GPU work/builds/edits. v1-v5 and unused
+cases stay terminal. No full-model series/default/gate/quant change authorized.
+
+## v6 completed: live all-rank geometry intervention qualified
+
+Source62a7a3ad0, exactly8 prescribed attempts in order, all load/audit exits0.
+Final compare and source/cache/release closure also pass. All seven artifacts/
+46 submodule entries and seven graph roots qualify per process, with25 launcher
+bindings/rank. Thirteen targeted sources cover35 actual bindings/arm (9/8/8/10 by
+rank); all65 non-target graph/source/config/cubin bindings match between arms.
+The original attention combos/KDA choices remain unchanged. Every process verifies
+two direct calls and five exact post-compile writeback wrappers retaining the
+original graph call. No callback-only or helper-as-root substitution.
+
+206 frozen receipts/5172 original files unchanged, GPUs released. No retries or
+exclusions; all40 private caches across v2-v6 remain intact. Observed loaded-object
+counts vary25-27/process; the selected graph bindings remain identical, and
+coverage/config/binary comparisons pass independently of those object counts.
+
+Raw `rmsnorm-geometry-aot-qualification-v6/` under2026-09-10:
+
+- preparation SHA
+  aeae81f27510045cbbd7f548b1871ed30acb101e2263f3b8991256ea67e1cacb.
+- pair-analysis SHA46b9c695c2734759deb55d3c15ee085dc8e3bd8eea67153ab074cdd1cb4fe946.
+- closure SHAff9b29e175d6d8ac2f1c787d6ca35ee522786e20541a4ac5f3ffdf6fdfd98242.
+
+Freeze ended after closure. Consume pinned completed receipts and verify relevant
+source/binary hashes; historical read_manifest intentionally rejects later HEADs
+or helper edits. Do not rewrite or rerun the completed sequence. v1-v5 stay terminal.
+The original624-pair numerical qualification remains valid; v6 adds real-loader/
+binary/live-root coverage, not numerical execution, full-model quality or TPS.
+
+Next work: separate opt-in serving hook/manifest schema, CPU tests, fresh per-start
+private namespace with per-rank caches, and pre-forward/capture root verification.
+Target sealing must not prematurely close observation of legitimate later non-target
+compilation. Preserve original attention/KDA/recipe/defaults/quality gates, and the
+existing independent legacy diagnostic. Only after implementation/tests and a new
+explicit freeze should a control/geometry/return full-model causal series be
+prescribed. No next GPU/model job is prescribed at this checkpoint.
+
+## Opt-in serving integration checkpoint (CPU only)
+
+`slimserve/rmsnorm_geometry.py` validates the fixed recipe, BF16 activation/KV,
+native ordering, original compiler/combo policy, completed pinned AOT evidence,
+private paths and current sources. The separate flag/schema leaves the legacy
+diagnostic intact. `glm53_geometry_serving.py` verifies actual serialized/live roots
+and all target/non-target launcher bindings before forward and around capture.
+Targets seal before AOT loading returns; global binary observation intentionally
+remains active. No checks are inserted into token execution.
+
+`prepare_glm53_geometry_serving.py` can prepare three independent shared-per-start
+namespaces with rank-private Triton caches. It consumes completed v6 receipts,
+not the historical HEAD-frozen reader. The freeze now explicitly includes serving
+and client entrypoints plus all 32 shared campaign source paths. Qualified live
+loader/compiler/kernel/native files remain exact; only explicit integration sites
+and the extracted shared offline auditor may differ from the old qualification.
+`audit_glm53_geometry_serving.py` checks all-rank load/capture receipts independently
+of workload claims. Additional non-root modules must be private and receipt-exact;
+original sources and all real root bindings retain strict qualification checks.
+
+CPU gate: 511 passed, 10.03 s, 8 GiB/swap0/GPUs hidden; lint/diff pass. Tests use
+actual vLLM/Torch loading APIs with reduced outer fixtures and mocked CUDA, not
+actual serving. Source/evidence join: 340 receipts, 5,172 original files unchanged;
+default registered profile dry-run passes. Raw under `runtime-control/`:
+`geometry-serving-source-freeze-cpu.xml`, `geometry-serving-final-evidence.json`
+(SHA 8a09c4ed1a9dab521f7eac7528f5af7a4b622958ed6755cf398ba7b18a1902fd),
+`geometry-serving-default-dry-run.log`. Initial evidence/test reports retained.
+
+No new private serving copies, weights, forwards, captures or TPS were run.
+Next implement/test workload/causal auditing and the predecessor/release controller,
+confirm `/raid/weights` profile resolution, then commit the bounded full-model
+protocol before any preparation or launch. All existing quality floors and terminal
+failed series remain intact. This checkpoint does not prescribe a model/GPU job.
+
+## Full-model causal series v1 (historical; terminal before any model start)
+
+Root: `perf/results/2026-09-10/rmsnorm-geometry-serving-v1/`.
+Commit implementation and this protocol, then freeze all sources through closure.
+Exactly three fresh per-start private namespaces and one attempt per case, in order:
+`control`, `geometry`, `return-control`. Each has all four rank-local caches.
+All v1-v5 no-weights failures and the no-combo model series remain terminal;
+completed no-weights v6 is consumed as pinned evidence, not rerun.
+
+Fixed model: registered `glm53-nvfp4-4` / `rtx6000`, recipe v1, TP4, Marlin,
+BF16 activation/KV/lm_head, native-order1, BF16fn1, TC0, no EP/speculation/journals/
+profiler. Preserve original compiler and attention-combo/KDA choices. Only the
+thirteen qualified norm geometries differ. The controller installs the frozen
+environment, including `SLIMSERVE_CACHE=/raid/weights`, CUDA13.0 and OMP1; inherited
+NCCL overrides are cleared and the registry supplies P2P0/SYS. The actual model
+directory must be `/raid/weights/GLM-5.3-Flash-NVFP4-FP8-KDA-TP4`.
+No driver, clock, power, memory-policy or native-binary change.
+
+Per start, through `benchmark_glm53_campaign.py` and the actual SlimServe profile:
+
+- Reach health once (existing 1,200-second startup bound), then text/image canaries.
+- Concurrencies 1/8/16, exact 1,000 input and 300 output tokens. One full warmup
+  per concurrency, then three complete repetitions in repeat-major order. Sampling
+  temperature1/top_p0.95/top_k20, seed42+request-index. Every request has unique
+  cache salt and cached_tokens=0. Retain all 25 warmup and 75 measured requests.
+- Three within-start quality passes, each 32 fixed 512+128-token windows (4,096
+  scored continuation tokens) and six four-way needle contrasts (168 scores).
+  Retain every response; require identical prompt IDs, finite scores, cold cache,
+  correct needle ranking and exact text/needle score repetition.
+- Cold prefill at 32,768 and 131,072 input tokens, eight outputs each; one warmup
+  plus three measured requests per length. Retain client and engine TTFT separately,
+  cached_tokens=0, fixed sampling, and identical prompt IDs within/across starts.
+- No performance-based retries, exclusions or stopping. All TPS is diagnostic,
+  not a new stable baseline or production promotion.
+
+Quality versus diagnostic continuation is deliberately explicit. Both controls
+must pass the unchanged per-window/aggregate floors AND exactly match the pinned
+original score vectors. Every geometry repetition is evaluated against those same
+floors with tolerance0.01 nat/token; any failure is recorded as `quality_passed=false`.
+The causal question explicitly includes reproduction of a known quality failure,
+so a complete, repeatable, finite, needle-correct geometry workload can proceed to
+the return control even when its window floors fail. This does NOT clear the failed
+quality gate or qualify a serving policy. Report exact/delta comparisons to both
+original controls and the failed no-combo vector; final return tests reversibility.
+Unknown score differences are observations, not grounds to change thresholds.
+Any load/capture binding, source, canary, token/cache, needle, repetition, control
+score, process/audit or GPU-release failure terminates v1; never launch unused cases.
+
+`run_glm53_geometry_serving.py` records one exclusive attempt marker before preflight,
+preserves stdout/stderr/exit codes and complete case inventories, checks every prior
+successful diagnostic audit and release, and uses independently bounded scopes.
+Audit failed/partial work too. On interruption stop only the case's unique owned
+scope; an unsuccessful driver query is never GPU-release proof. All source and
+original-cache hashes must stay unchanged. One GPU workload at a time, no builds.
+
+Preparation ONCE, after the clean implementation/protocol commit:
+
+```bash
+systemd-run --user --scope --unit=glm53-geometry-serving-v1-prepare -p MemoryMax=8G -p MemorySwapMax=0 \
+  env CUDA_VISIBLE_DEVICES= PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 .venv/bin/python \
+  -m benchmarks.kernels.prepare_glm53_geometry_serving \
+  --qualification perf/results/2026-09-10/rmsnorm-geometry-aot-qualification-v6/pair-analysis.json \
+  --closure perf/results/2026-09-10/rmsnorm-geometry-aot-qualification-v6/closure.json \
+  --output perf/results/2026-09-10/rmsnorm-geometry-serving-v1
+```
+
+For each LABEL in the exact order above, ONCE and only if all predecessors qualify:
+
+```bash
+systemd-run --user --scope --unit=glm53-geometry-serving-v1-LABEL-launch -p MemoryMax=8G -p MemorySwapMax=0 \
+  env PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 .venv/bin/python \
+  -m benchmarks.kernels.run_glm53_geometry_serving launch \
+  perf/results/2026-09-10/rmsnorm-geometry-serving-v1/LABEL/manifest.json
+```
+
+Serving child150GiB/swap0, audit child8GiB/swap0/GPUs hidden. Each worker independently
+checks actual artifact/live-root bindings before forward and around capture; offline
+audit joins all four ranks to completed v6 qualification, with all65 non-target
+bindings exact. Global binary observation remains active; no token-loop checks.
+
+After all three complete OR the first terminal failure, close once before any edits:
+
+```bash
+systemd-run --user --scope --unit=glm53-geometry-serving-v1-close -p MemoryMax=8G -p MemorySwapMax=0 \
+  env CUDA_VISIBLE_DEVICES= PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 .venv/bin/python \
+  -m benchmarks.kernels.run_glm53_geometry_serving close \
+  perf/results/2026-09-10/rmsnorm-geometry-serving-v1
+```
+
+CPU preparation: combined586 pass44.24s; final serving/workload/launcher108 pass30.98s.
+Real-response replay uses copied historical responses with only wrapper metadata/
+paths adapted; no model/graph/CUDA execution. The initial seed-check failure is
+retained, and the corrected auditor preserves the historical failed quality result.
+Whole reference response hashes match their historical audits. Raw reports under
+`runtime-control/geometry-{full-workload,workload-final,workload-replay,workload-replay-fixed,workload-pinned}-cpu.xml`.
+This series answers a bounded causal question, not broader indexer correctness or
+the optimization campaign's remaining performance objective.
+
+## V1 terminal CPU preflight; canonical source aliases; historical v2 (terminal)
+
+On8074c504f v1 prepares three copies, then the first control preflight rejects nine
+qualified source keys that the preparer canonicalized: seven virtualenv files and
+two symlinked model metadata files. No serve/audit child, model start, forward or
+GPU load. The prescribed closure hits the same validator guard and remains failed.
+Independent closure verifies actual target/root metadata, all206 qualified source
+receipts by resolved path,359 current receipts,5172 original files, and all three
+private copies unchanged. Unused cases unlaunched, GPUs free. Raw
+`runtime-control/geometry-serving-v1-preflight-closure.json`, SHA
+c27e14186c71626478a923c9daa225cb0d4f53073f447acf5d02e5d26a2ecdba.
+V1 is TERMINAL; all files retained, freeze ended. Do not reuse its markers/caches.
+
+Validator now canonicalizes the old receipt keys consistently and rejects alias
+collisions with different digests. No source/binary verification is relaxed. CPU174
+pass35.65s includes all-mode real prepared-metadata round-trips against completed
+AOT evidence, using only new CPU fixture paths (no cache copies/model/GPU). Raw
+`runtime-control/geometry-source-alias-cpu.xml`; prior CPU/closure failures retained.
+
+After committing this correction/protocol, freeze and prepare NEW v2 ONCE:
+
+```bash
+systemd-run --user --scope --unit=glm53-geometry-serving-v2-prepare -p MemoryMax=8G -p MemorySwapMax=0 \
+  env CUDA_VISIBLE_DEVICES= PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 .venv/bin/python \
+  -m benchmarks.kernels.prepare_glm53_geometry_serving \
+  --qualification perf/results/2026-09-10/rmsnorm-geometry-aot-qualification-v6/pair-analysis.json \
+  --closure perf/results/2026-09-10/rmsnorm-geometry-aot-qualification-v6/closure.json \
+  --output perf/results/2026-09-10/rmsnorm-geometry-serving-v2
+```
+
+Same exact prescribed workload and diagnostic/quality distinction as v1 above.
+ONCE per LABEL, control then geometry then return-control, conditional on all prior
+audits/source/cache/release gates:
+
+```bash
+systemd-run --user --scope --unit=glm53-geometry-serving-v2-LABEL-launch -p MemoryMax=8G -p MemorySwapMax=0 \
+  env PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 .venv/bin/python \
+  -m benchmarks.kernels.run_glm53_geometry_serving launch \
+  perf/results/2026-09-10/rmsnorm-geometry-serving-v2/LABEL/manifest.json
+```
+
+Serving150GiB, controller/audits8GiB, swap0; one GPU workload, no builds/edits through
+closure. Stop on any structural/control/repetition/workload/needle/release failure;
+preserve geometry window failures as diagnostic observations, not quality passes.
+After completion or first terminal failure, close ONCE before source edits:
+
+```bash
+systemd-run --user --scope --unit=glm53-geometry-serving-v2-close -p MemoryMax=8G -p MemorySwapMax=0 \
+  env CUDA_VISIBLE_DEVICES= PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 .venv/bin/python \
+  -m benchmarks.kernels.run_glm53_geometry_serving close \
+  perf/results/2026-09-10/rmsnorm-geometry-serving-v2
+```
+
+No retries, replacement starts, threshold changes or production promotion. V1 and
+all prior failed sequences stay terminal. Completed no-weights v6 stays completed.
+
+## V2 terminal client import; direct-file entrypoint fixed; historical v3 (complete)
+
+On1bea1f616, preparation/preflight pass; benchmark client fails at geometry plan
+validation with `No module named benchmarks`, before creating a campaign or server.
+Direct-file execution includes only the benchmarks directory in sys.path, while
+the opt-in validator imports repository-qualified helpers. Serve-child/audit exit1,
+zero model starts. Closure is terminal-failure,359 sources/5172 originals unchanged,
+unused cases unlaunched, GPUs released. All six v1/v2 serving copies retained.
+Raw v2 closure SHA2b8bae9d33bcbec77982ce723c1bafcdbfe9a481ff20116473ad4fe5e96bf070.
+V1/V2 terminal; freeze released. No quality/default/native/quant/performance change.
+
+Benchmark direct-file bootstrap now adds its repository parent. CPU175 pass46.50s
+includes two separate-process entrypoint probes without inherited PYTHONPATH.
+The actual client/profile/real-manifest validation reaches the deliberate stop
+before tokenizer/server work; only hardware discovery is replaced. No weights,
+GPU loads, model starts or TPS. Raw `runtime-control/geometry-client-entry-cpu.xml`.
+
+Commit the fix/protocol, then NEW v3 with the identical v1 workload, quality versus
+diagnostic distinction, ordered control/geometry/return-control and failure policy.
+Use the v2 commands immediately above, replacing `v2` with `v3` in BOTH every unit
+name and every series path. Root is exactly
+`perf/results/2026-09-10/rmsnorm-geometry-serving-v3/`. One preparation, one attempt
+per label conditional on all prior audits/release, and one terminal closure.
+Fresh copies, serving150GiB/controller+audit8GiB/swap0; one GPU workload and no
+source edits/builds through closure. No retries or unused v1/v2 attempts. No
+production promotion, threshold changes or performance eligibility from this test.
+
+## Full-model v3 completed: geometry shift reversible, candidate rejected
+
+Source ce6df61aa. Exactly one control, one geometry, one return-control in prescribed
+order. Every serve/audit exits0; final closure succeeds, GPUs released. No retries,
+replacements or exclusions. V1/V2 remain terminal (zero model starts); all nine
+serving cache copies remain intact.359 frozen receipts/5172 original files unchanged.
+
+All three starts reach health and pass text/image canaries. Each rank loads seven
+actual artifacts/46 entries and verifies real roots before forward and around
+capture. All thirteen targets/35 bindings per start qualify; all65 non-target
+source/config/cubin bindings match across arms. Return-control target bindings
+also exactly match the first control. No callback-only coverage or global observer
+seal substitutes for the actual live-root comparisons.
+
+All225 measured and75 warmup1000/300 requests are exact and cold. Each start's
+three quality passes repeat all4096 text/168 needle scores exactly; all needle
+contrasts pass. Both controls match the original vectors exactly and pass the
+unchanged floors. Geometry mean improves from-2.727814820100083 to-2.7232418363404096,
+but12/32 per-window floors fail in EVERY pass (zero-based windows
+1,4,8,9,10,20,22,24,26,27,28,29). Do not use the better mean to clear that gate.
+This is rejection under the predeclared criterion, not broad capability ranking.
+
+Geometry differs from failed no-combo at ALL4096 text/168 needle scores; text RMS
+delta0.4122363826850714, maximum absolute4.197688817977905. Both candidates fail12
+windows, but only eight failed-window IDs overlap. The thirteen-change intervention
+therefore does NOT reproduce the failed no-combo state on this workload. The exact
+return confirms reversibility of its own score shift. RMSNorm can contribute;
+this result does not identify the remaining attention/KDA/compiler cause.
+
+All24 prefill requests (six warmups/eighteen measured) are cold and exact, with
+identical prompt IDs across starts. Three measurements per table cell:
+
+| Case | E2E c1 / c8 / c16 tok/s | Cold32K /128K engine TTFT ms |
+| --- | --- | --- |
+| Control | 157.422 /580.938 /780.713 | 2579.726 /10876.322 |
+| Geometry | 156.682 /576.893 /775.075 | 2583.413 /10896.764 |
+| Return control | 156.959 /579.190 /777.006 | 2585.843 /10899.778 |
+
+Startup166.109/164.113/166.092s. These are diagnostic timings, not new stable or
+competitive baselines. No speed win or production/default/quant promotion; original
+H4096 choices retained. Separate indexer oracle and no-combo quality gates remain
+failed. No tolerance changed and no native build occurred.
+
+Raw `rmsnorm-geometry-serving-v3/` under2026-09-10:
+
+- Closure SHA c25674eab322b7334c694e1354f0a2ab3c8b7f3b8bb9be4e8d1e6f92091cf597.
+- Control workload audit SHA5d0f2c1489b252ced721568c65d49c9d492526727d23a14bc4be0d878ae23284.
+- Geometry workload audit SHA163e864b1091c5029da2ed7925743800515b66f7c6371389d3e721236693af02.
+- Return workload audit SHAd5e3092173b2fecc19e8d7ac3fa546d2bad73d243ee0857f457c76905b060643.
+
+Each case's worker audit, launch marker, raw responses, snapshots and complete file
+inventory are linked by closure. Freeze ended after successful closure. Consume
+pinned completed receipts with relevant source/binary checks; do not rerun historical
+HEAD/source-frozen readers after new commits. Next CPU work inventories remaining
+old/fresh attention/KDA differences before a new bounded isolation or accuracy repair.
+No next GPU/model job is prescribed; the larger optimization goal remains open.
