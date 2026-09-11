@@ -41,9 +41,13 @@
   A100 FP8-KV decode, grouped speculative scoring, budgets and API launcher
   changes. New binding/indexer conflicts resolved in72e3ed10b/8720c75e7 and
   merged forward as24bd601c5. Parsed RTX6000 record is unchanged; both platform
-  paths retained.120 focused CPU checks pass/eight GPU-only skips. Rebuild
-  main's added native binding; the completed serving result above predates
-  this second main merge. Raw `main-forward-*` under the same directory.
+  paths retained.120 focused CPU checks pass/eight GPU-only skips. Native
+  rebuild passes (QC61616000, stable-libtorch unchanged), followed by66 GPU
+  tests of merged indexer/grouped-score and BF16/FP8 sparse-MLA paths. Prior
+  qualified f19b61ce binary preserved in `native-before-main/`; GPUs released.
+  The completed serving result above predates this second main merge. Defer
+  final serving until remaining review fixes settle. Raw `main-forward-*`
+  under the same directory.
 
 ## 2026-09-11 - Native quantized prefill GEMM on Metal; FP8-KV directive state; two walls found
 

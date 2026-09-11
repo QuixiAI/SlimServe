@@ -138,8 +138,12 @@ Performance preserved, not a new speedup claim. All fixes are published.
 Main advanced to0313f5228 during the run: two new conflicts are reconciled
 in72e3ed10b/8720c75e7 and merged forward as24bd601c5. RTX6000 profile unchanged;
 A100's FP8 decode binding/grouped scoring/budgets retained.120 CPU checks pass,
-eight GPU-only skips. Native rebuild for main's added binding is RUNNING;
-do not claim the completed serving result qualifies this later main merge.
+eight GPU-only skips. Native rebuild for main's added binding PASSED,
+QC61616000433f4371e23f2f4b34451cbf679194cd18f9691b105e421913aa57c4,
+followed by66 merged-indexer/sparse-MLA GPU tests. GPUs released. Prior
+qualified f19b61ce binary is in `pr-review/native-before-main/`. Defer final
+merged-tree serving until remaining review fixes settle; the prior result
+does not qualify this later main merge. No server/build/probe is running.
 Parts1/2 now contain94/81 changed files; still below the review limit.
 CodeRabbit allows ONE included review per hour. Remaining #27/#28/#25;
 Part1's13 threads resolved. #27 full review accepted20:42 UTC; response pending.

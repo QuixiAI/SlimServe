@@ -250,10 +250,12 @@ Main advanced nine commits to0313f5228 during that run. Binding and indexer
 conflicts are resolved in72e3ed10b/8720c75e7 and merged forward as24bd601c5.
 Both new A100 FP8 decode and SM120 BF16 prefill bindings are retained, as are
 grouped speculative scoring and request-grouped raw prefill. The RTX6000
-profile record is byte-equivalent as parsed JSON; upstream thinking-budget
-changes are confined to A100.120 focused CPU checks pass, eight GPU-only
-cases skipped. New main's added native binding is rebuilding; the completed
-serving result above predates this merge and is not a new-main qualification.
+profile record is identical as parsed JSON; upstream thinking-budget changes
+are confined to A100.120 focused CPU checks pass, eight GPU-only cases skipped.
+The native rebuild passes (QC61616000, stable-libtorch unchanged), followed by
+66 GPU tests for merged indexer/grouped-scoring/BF16-FP8 sparse-MLA behavior.
+GPUs released. The completed serving result above predates this merge; defer
+the final merged-tree serving check until remaining review fixes are settled.
 
 CodeRabbit resolved all13 part1 threads. Part2 full review was accepted at
 20:42 UTC; its response and parts3/4 remain pending. One included review/hour;
