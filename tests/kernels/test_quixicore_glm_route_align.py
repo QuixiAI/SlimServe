@@ -164,7 +164,7 @@ def test_glm_route_align_rejects_unsupported_shapes():
     logits = torch.zeros(17, E, device=DEV)
     bias = torch.zeros(E, device=DEV)
     max_padded, max_blocks = glm_route_align.alignment_geometry(17, K, E, 8)
-    with pytest.raises(RuntimeError, match="M must be"):
+    with pytest.raises(RuntimeError, match=r"handles 1\.\.16 tokens"):
         torch.ops.vllm.glm_route_align(
             logits, bias, K, 0, True, SCALE, 8, max_padded, max_blocks
         )

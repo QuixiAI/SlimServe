@@ -1338,9 +1338,10 @@ class FusedMoEKernelModularImpl:
 
         # If caller's output buffer already matches fused_out shape/dtype, alias
         # to skip the redundant copy in TopKWeightAndReduceNoOP.apply downstream.
-        # This eliminates ~94% of __amd_rocclr_copyBuffer events (Copy 2 of the
-        # double-copy MoE write-back path) on ROCm and the memcpy after every
-        # Marlin MoE layer on CUDA.
+        # ROCm's existing AITER predicate is preserved. CUDA alias/combine
+        # measurements: perf/optimization_status.md, 2026-09-07 "Phase 1 item 2
+        # remainder"; linked in docs/glm53-flash-sm120-review.md's qualification
+        # map. The profile's later fixed-start results supersede best-boot rates.
         if (
             output_alias is not None
             and self._fused_out_is_final_output()

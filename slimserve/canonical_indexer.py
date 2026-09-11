@@ -5,11 +5,14 @@ The disabled factory returns the original callable. Enabled only in the GLM
 pooled indexer, with model/selector observers and canonical MoE also required.
 The two-kernel control retains its extra sorting launch. CANONICAL_INDEX_FUSED
 instead emits ordered IDs inside the qualified native selector; it remains an
-opt-in diagnostic until full-model qualification, not a production default.
+qualified opt-in diagnostic, not a production default.
 CANONICAL_INDEX_TIES additionally chooses smaller pool IDs at exact equal-score
 cutoffs in the native selector. It never changes scores or higher-score choices.
 NATIVE_ORDER selects the qualified fused selector without requiring observers;
 the legacy diagnostic switches retain their original prerequisites.
+
+Selector timing and full-model parity records (not production speed claims):
+docs/glm53-flash-sm120-review.md, "Qualification record map".
 """
 
 import os
