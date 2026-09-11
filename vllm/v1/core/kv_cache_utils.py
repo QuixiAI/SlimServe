@@ -7,7 +7,7 @@ import hashlib
 import math
 import os
 from collections import defaultdict
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from functools import partial
 from typing import Any, NamedTuple, NewType, TypeAlias, cast, overload
@@ -139,6 +139,8 @@ class KVCacheBlock:
 
     # Whether the block is a null block that should never be cached.
     is_null: bool = False
+    # Block pool this block belongs to (multi-pool packed slab); frees route by it.
+    pool_id: int = 0
 
     @property
     def block_hash(self) -> BlockHashWithGroupId | None:
@@ -184,6 +186,38 @@ class KVCacheBlockCopy(NamedTuple):
     dst_block_id: int
 
 
+
+_TRACE = os.getenv("VLLM_FREE_LIST_TRACE", "0") == "1"
+
+
+def _assert_new_to_list(
+    linked: set[int], block: "KVCacheBlock", where: str, pool_id: int
+) -> None:
+    """A block id may be linked once: a second object carrying an id that is
+    already in the list (a block built outside the pool, or another pool's
+    block with a colliding id) advances num_free_blocks without lengthening
+    the list, and the divergence surfaces later in popleft_n."""
+    if block.block_id in linked:
+        raise RuntimeError(
+            f"{where} (pool {pool_id}): block id {block.block_id} "
+            f"(object pool_id={block.pool_id}, ref_cnt={block.ref_cnt}, "
+            f"null={block.is_null}) is already linked in the free list"
+        )
+
+
+def _assert_unlinked(block: "KVCacheBlock", where: str) -> None:
+    """A block entering the free list must not already be in it: a second
+    append silently splices a cycle into the list and the corruption only
+    surfaces later as ``get_new_blocks`` popping a block with ref_cnt > 0.
+    Fail here instead, at the offending free."""
+    if block.prev_free_block is not None or block.next_free_block is not None:
+        raise RuntimeError(
+            f"{where}: block {block.block_id} (ref_cnt={block.ref_cnt}, "
+            f"hash={'set' if block.block_hash is not None else 'none'}) is "
+            "already in the free list (double free)"
+        )
+
+
 class FreeKVCacheBlockQueue:
     """This class organizes a list of KVCacheBlock objects to a doubly linked
     list of free blocks. We implement this class instead of using Python
@@ -224,6 +258,16 @@ class FreeKVCacheBlockQueue:
         # in the queue has prev and next blocks.
         self.fake_free_list_head = KVCacheBlock(block_id=-1)
         self.fake_free_list_tail = KVCacheBlock(block_id=-1)
+        # Shadow membership of the linked list, kept by every link/unlink.
+        # `_check()` compares it with num_free_blocks at the start of each
+        # mutating call, so a divergence is reported at the first operation
+        # after the one that caused it (with that caller's stack), instead of
+        # much later when popleft_n walks off the end of the list.
+        self._linked: set[int] = {b.block_id for b in blocks}
+        self.pool_id = -1
+        from collections import deque
+
+        self._ring: deque = deque(maxlen=48)
         if self.num_free_blocks > 0:
             # Connect fake_head and fake_tail to the first and last block
             # respectively.
@@ -235,6 +279,39 @@ class FreeKVCacheBlockQueue:
             # For empty list, simply connect the fake head and tail.
             self.fake_free_list_head.next_free_block = self.fake_free_list_tail
             self.fake_free_list_tail.prev_free_block = self.fake_free_list_head
+
+    def _trace(self, op: str, ids) -> None:
+        """Diagnostic ring of the last mutations (VLLM_FREE_LIST_TRACE=1)."""
+        if _TRACE:
+            import traceback
+
+            self._ring.append(
+                (op, list(ids)[:8], len(ids), traceback.format_stack(limit=7)[:-1])
+            )
+
+    def _check(self, where: str) -> None:
+        if len(self._linked) != self.num_free_blocks:
+            walked = []
+            cur = self.fake_free_list_head.next_free_block
+            while cur is not None and cur is not self.fake_free_list_tail and len(walked) <= self.num_free_blocks + 8:
+                walked.append(cur.block_id)
+                cur = cur.next_free_block
+            walked_set = set(walked)
+            detail = (
+                f" walked={len(walked)} set-not-walked={sorted(self._linked - walked_set)[:16]}"
+                f" walked-not-set={sorted(walked_set - self._linked)[:16]}"
+            )
+            if _TRACE:
+                detail += "\n--- last free-list mutations (oldest first) ---\n" + "\n".join(
+                    f"{op} n={n} ids={ids}\n" + "".join(stack[-3:])
+                    for op, ids, n, stack in self._ring
+                )
+            raise RuntimeError(
+                f"FreeKVCacheBlockQueue.{where} (pool {self.pool_id}): "
+                f"num_free_blocks={self.num_free_blocks} but the list holds "
+                f"{len(self._linked)} blocks; the count and the list diverged "
+                "in an earlier operation" + detail
+            )
 
     def popleft(self) -> KVCacheBlock:
         """Pop the first free block and reduce num_free_blocks by 1.
@@ -252,7 +329,10 @@ class FreeKVCacheBlockQueue:
             )
             raise ValueError("No free blocks available")
 
+        self._check("popleft")
         first_block: KVCacheBlock = self.fake_free_list_head.next_free_block
+        self._linked.discard(first_block.block_id)
+        self._trace("popleft", [first_block.block_id])
 
         if first_block.next_free_block is None:
             # This should not happen if the block is from the free list.
@@ -284,15 +364,24 @@ class FreeKVCacheBlockQueue:
         """
         if n == 0:
             return []
+        if n < 0:
+            raise ValueError(f"popleft_n: negative count {n}")
+        self._check("popleft_n")
         assert self.num_free_blocks >= n
         self.num_free_blocks -= n
 
         curr_block = self.fake_free_list_head.next_free_block
         # Pop n blocks from the head of the list
         ret = []
-        for _ in range(n):
-            assert curr_block is not None
+        for i in range(n):
+            if curr_block is None:
+                raise RuntimeError(
+                    "FreeKVCacheBlockQueue.popleft_n: free list ended after "
+                    f"{i} blocks but num_free_blocks claimed {self.num_free_blocks + n} "
+                    f"(asked for {n}); the count and the list have diverged"
+                )
             ret.append(curr_block)
+            self._linked.discard(curr_block.block_id)
             last_block = curr_block
             curr_block = curr_block.next_free_block
             # Reset prev_free_block and next_free_block of all popped blocks
@@ -304,6 +393,7 @@ class FreeKVCacheBlockQueue:
             # the new first block.
             self.fake_free_list_head.next_free_block = curr_block
             curr_block.prev_free_block = self.fake_free_list_head
+        self._trace("popleft_n", [b.block_id for b in ret])
         return ret
 
     def remove(self, block: KVCacheBlock) -> None:
@@ -312,10 +402,13 @@ class FreeKVCacheBlockQueue:
         Args:
             block: The block to remove.
         """
+        self._check("remove")
         if block.prev_free_block is None or block.next_free_block is None:
             # This should not happen if the block is from the free list.
             # It indicates a bug in the caller's logic.
             raise RuntimeError(f"remove() called on an invalid block: {block}")
+        self._linked.discard(block.block_id)
+        self._trace("remove", [block.block_id])
 
         # Link the previous block to the next block.
         block.prev_free_block.next_free_block = block.next_free_block
@@ -338,6 +431,11 @@ class FreeKVCacheBlockQueue:
                 "prev_free_block of fake_free_list_tail should always exist"
             )
         last_block: KVCacheBlock = self.fake_free_list_tail.prev_free_block
+        self._check("append")
+        _assert_unlinked(block, "FreeKVCacheBlockQueue.append")
+        _assert_new_to_list(self._linked, block, "FreeKVCacheBlockQueue.append", self.pool_id)
+        self._linked.add(block.block_id)
+        self._trace("append", [block.block_id])
 
         # Connect the new block after the last block.
         last_block.next_free_block = block
@@ -359,8 +457,15 @@ class FreeKVCacheBlockQueue:
             "next_free_block of fake_free_list_head should always exist"
         )
 
+        self._check("prepend_n")
+        self._trace("prepend_n", [b.block_id for b in blocks])
         prev_block = self.fake_free_list_head
         for block in blocks:
+            _assert_unlinked(block, "FreeKVCacheBlockQueue.prepend_n")
+            _assert_new_to_list(
+                self._linked, block, "FreeKVCacheBlockQueue.prepend_n", self.pool_id
+            )
+            self._linked.add(block.block_id)
             block.prev_free_block = prev_block
             prev_block.next_free_block = block
             prev_block = block
@@ -383,8 +488,15 @@ class FreeKVCacheBlockQueue:
         assert last_block is not None, (
             "prev_free_block of fake_free_list_tail should always exist"
         )
+        self._check("append_n")
+        self._trace("append_n", [b.block_id for b in blocks])
         # Add inter-connections between consecutive blocks
         for block in blocks:
+            _assert_unlinked(block, "FreeKVCacheBlockQueue.append_n")
+            _assert_new_to_list(
+                self._linked, block, "FreeKVCacheBlockQueue.append_n", self.pool_id
+            )
+            self._linked.add(block.block_id)
             block.prev_free_block = last_block
             last_block.next_free_block = block
             last_block = block
@@ -935,13 +1047,25 @@ def get_max_concurrency_for_kv_cache_config(
     a representative per-layer spec (scheduler config), so both capacity
     call sites agree.
     """
-    num_blocks_per_request = sum(
+    per_group = [
         cdiv(
             group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
             group.kv_cache_spec.page_size_bytes,
         )
         for group in kv_cache_config.kv_cache_groups
-    )
+    ]
+    if kv_cache_config.pool_num_blocks:
+        # Multi-pool packed slab: each pool bounds its own groups' demand;
+        # the request fits when every pool does.
+        demand = [0] * kv_cache_config.num_pools
+        for gid, n in enumerate(per_group):
+            demand[kv_cache_config.pool_of_group(gid)] += n
+        return min(
+            kv_cache_config.blocks_in_pool(p) / d
+            for p, d in enumerate(demand)
+            if d > 0
+        )
+    num_blocks_per_request = sum(per_group)
     max_concurrency = kv_cache_config.num_blocks / num_blocks_per_request
     return max_concurrency
 
@@ -1044,6 +1168,7 @@ def _get_kv_cache_groups_uniform_type(
 
 def unify_kv_cache_spec_page_size(
     kv_cache_spec: dict[str, KVCacheSpec],
+    exclude: Collection[str] = (),
 ) -> dict[str, KVCacheSpec]:
     """
     Unify the page size of the given KVCacheSpec. If the page size of all layers
@@ -1063,7 +1188,16 @@ def unify_kv_cache_spec_page_size(
     Returns:
         The updated KVCacheSpec with the same page_size_bytes.
     """
-    page_sizes = {layer.page_size_bytes for layer in kv_cache_spec.values()}
+    # Host-resident main-KV layers (docs/host_resident_kv_design.md) do not
+    # occupy the shared slab: their pages neither set the maximum nor get
+    # unified, otherwise every mamba page would be padded to the main-KV
+    # page (measured 8x at block 12688) for rows that are never on the GPU.
+    skip = set(exclude)
+    page_sizes = {
+        layer.page_size_bytes
+        for name, layer in kv_cache_spec.items()
+        if name not in skip
+    }
     if len(page_sizes) <= 1:
         # All layers have the same page size, no need to unify.
         return kv_cache_spec
@@ -1071,7 +1205,7 @@ def unify_kv_cache_spec_page_size(
     max_page_size = max(page_sizes)
     new_kv_cache_spec = {}
     for layer_name, layer_spec in kv_cache_spec.items():
-        if layer_spec.page_size_bytes == max_page_size:
+        if layer_name in skip or layer_spec.page_size_bytes == max_page_size:
             new_kv_cache_spec[layer_name] = layer_spec
         elif isinstance(layer_spec, MambaSpec):
             # MambaSpec's page size is determined by its state shapes and does
@@ -1234,20 +1368,123 @@ def _get_kv_cache_groups_uniform_page_size(
     return create_kv_cache_group_specs(kv_cache_spec, grouped_layers)
 
 
+def _main_kv_extra_config(vllm_config: VllmConfig) -> dict[str, Any]:
+    kv_transfer_config = vllm_config.kv_transfer_config
+    if kv_transfer_config is None:
+        return {}
+    return kv_transfer_config.kv_connector_extra_config or {}
+
+
+def host_resident_kv_layers(
+    vllm_config: VllmConfig, kv_cache_groups: list[KVCacheGroupSpec]
+) -> list[str]:
+    """Layers whose main KV lives in the pinned-host arena
+    (docs/host_resident_kv_design.md), in slab order.
+
+    Opt-in per profile through ``kv_connector_extra_config.main_kv_host_resident``.
+    The candidates are the plain FullAttentionSpec layers of the uniform
+    attention groups: for Qwen4Exp these are exactly the QSA main-KV layers
+    (target and MTP drafter), which the sparse gather reads top-k rows of and
+    can fetch over PCIe; the indexer's compressed caches (MLAAttentionSpec),
+    rings and GDN states stay in the GPU slab.
+    """
+    if not _main_kv_extra_config(vllm_config).get("main_kv_host_resident"):
+        return []
+    names: list[str] = []
+    for group in kv_cache_groups:
+        spec = group.kv_cache_spec
+        if not isinstance(spec, UniformTypeKVCacheSpecs):
+            continue
+        for layer_name in group.layer_names:
+            if type(spec.kv_cache_specs[layer_name]) is FullAttentionSpec:
+                names.append(layer_name)
+    return names
+
+
+def main_kv_sub_blocks(vllm_config: VllmConfig, block_size: int) -> int:
+    """Residency rows per logical block (default 8): rows must be whole
+    multiples of 16 tokens for the kernels; fall back to 1 otherwise."""
+    want = int(_main_kv_extra_config(vllm_config).get("main_kv_sub_blocks", 8) or 8)
+    candidates = [
+        d for d in range(1, block_size + 1)
+        if block_size % d == 0 and (block_size // d) % 16 == 0
+    ]
+    # Nearest legal divisor to the request (12688 = 16 x 13 x 61 splits only
+    # at 13, 61 or 793 rows); ties prefer the finer split.
+    return min(candidates, key=lambda d: (abs(d - want), -d))
+
+
+def kv_pool_deep_requests(vllm_config: VllmConfig) -> float:
+    """Multi-pool packed slab (kv_connector_extra_config
+    ``kv_pool_deep_requests``, 0 = one pool): the attention-class pool is
+    sized to hold this many max-length requests and the remaining memory
+    goes to the other page-size classes (GDN state, ring) in proportion to
+    their chat-context demand, so a chat request no longer charges an
+    attention-sized slot per 5 MB (bf16) or 0.4 MB state page."""
+    try:
+        return float(_main_kv_extra_config(vllm_config).get("kv_pool_deep_requests", 0) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _unpadded_spec(spec: KVCacheSpec) -> KVCacheSpec:
+    """The spec with the hybrid aligner's page padding removed (pages in a
+    non-attention pool are laid out at their natural size)."""
+    if isinstance(spec, UniformTypeKVCacheSpecs):
+        inner = {n: _unpadded_spec(sp) for n, sp in spec.kv_cache_specs.items()}
+        return replace(spec, kv_cache_specs=inner)
+    if getattr(spec, "page_size_padded", None) is not None:
+        return replace(spec, page_size_padded=None)
+    return spec
+
+
+def _pool_classes(
+    kv_cache_groups: list[KVCacheGroupSpec], host_layers: list[str]
+) -> tuple[list[int], list[int]]:
+    """Group -> pool class. Pool 0 = the groups whose (packed, host-resident
+    layers excluded) block footprint is the largest; other pools by
+    distinct footprint, descending. Returns (group_pool, pool strides)."""
+    per_group: list[int] = []
+    for g in kv_cache_groups:
+        stride, _ = _get_packed_kv_cache_layout([g], exclude=host_layers)
+        per_group.append(stride)
+    strides = sorted(set(per_group), reverse=True)
+    return [strides.index(st) for st in per_group], strides
+
+
+def _chat_demand(group: KVCacheGroupSpec) -> int:
+    """Blocks a chat-context (sub-block) request holds in this group."""
+    spec = group.kv_cache_spec
+    if isinstance(spec, MambaSpec):
+        return 1 + int(spec.num_speculative_blocks)
+    return 1
+
+
+def main_kv_gpu_rows(vllm_config: VllmConfig) -> int:
+    """GPU hot-window rows for the host-resident main KV (default 16: the
+    write tails of max_num_seqs requests plus a few recently filled pages)."""
+    return int(_main_kv_extra_config(vllm_config).get("main_kv_gpu_rows", 16) or 16)
+
+
 def _get_packed_kv_cache_layout(
     kv_cache_groups: list[KVCacheGroupSpec],
+    exclude: Collection[str] = (),
 ) -> tuple[int, dict[int, list[str]]]:
     """Lay out each cache group densely in one shared block slab.
 
     A block ID is owned by one cache group at a time, so layouts from different
-    groups may overlap. Layers within a group remain disjoint.
+    groups may overlap. Layers within a group remain disjoint. ``exclude``
+    names layers laid out elsewhere (the host-resident main KV).
     """
     layers_by_offset: dict[int, list[str]] = defaultdict(list)
     block_stride = 0
+    skip = set(exclude)
     for group in kv_cache_groups:
         spec = group.kv_cache_spec
         byte_offset = 0
         for layer_name in group.layer_names:
+            if layer_name in skip:
+                continue
             if isinstance(spec, UniformTypeKVCacheSpecs):
                 page_size = spec.kv_cache_specs[layer_name].page_size_bytes
             else:
@@ -1257,6 +1494,28 @@ def _get_packed_kv_cache_layout(
         block_stride = max(block_stride, byte_offset)
     assert block_stride > 0
     return block_stride, layers_by_offset
+
+
+def _host_resident_layout(
+    kv_cache_groups: list[KVCacheGroupSpec], layers: list[str]
+) -> tuple[int, dict[str, int]]:
+    """Byte stride of one host-resident block and each layer's offset in it."""
+    per_layer: dict[str, int] = {}
+    for group in kv_cache_groups:
+        spec = group.kv_cache_spec
+        for layer_name in group.layer_names:
+            if layer_name in layers:
+                per_layer[layer_name] = (
+                    spec.kv_cache_specs[layer_name].page_size_bytes
+                    if isinstance(spec, UniformTypeKVCacheSpecs)
+                    else spec.page_size_bytes
+                )
+    offsets: dict[str, int] = {}
+    stride = 0
+    for layer_name in layers:
+        offsets[layer_name] = stride
+        stride += per_layer[layer_name]
+    return stride, offsets
 
 
 def _cross_layers_blocks_opt_in(vllm_config: VllmConfig) -> bool:
@@ -1300,20 +1559,114 @@ def _get_kv_cache_config_packed(
     """Plan a packed per-block KV cache tensor layout.
 
     Cache groups use dense, overlapping layouts within one block slab. Each
-    emitted tensor aliases the same physical backing allocation.
+    emitted tensor aliases the same physical backing allocation. Host-resident
+    main-KV layers (docs/host_resident_kv_design.md) leave the slab for their
+    own tensor whose blocks are backed by host rows plus a GPU hot window
+    reserved here.
     """
-    block_stride, layers_by_offset = _get_packed_kv_cache_layout(kv_cache_groups)
+    host_layers = host_resident_kv_layers(vllm_config, kv_cache_groups)
+    deep_requests = kv_pool_deep_requests(vllm_config)
+    multi_pool = deep_requests > 0
+    if multi_pool:
+        # Non-attention classes drop the aligner's padding: their pages are
+        # laid out at natural size in their own pool. The groups list is
+        # updated in place so the KVCacheConfig (and the worker's views)
+        # see the same specs.
+        for i, g in enumerate(kv_cache_groups):
+            kv_cache_groups[i] = replace(g, kv_cache_spec=_unpadded_spec(g.kv_cache_spec))
+        group_pool, pool_strides = _pool_classes(kv_cache_groups, host_layers)
+        # Pool 0 keeps the aligner's padded pages? No: pool 0 is the class
+        # holding the widest footprint (attention + indexer); its own
+        # padding is irrelevant because it defines the stride.
+        pool_layouts = []
+        for pool in range(len(pool_strides)):
+            groups_p = [g for g, pl in zip(kv_cache_groups, group_pool) if pl == pool]
+            pool_layouts.append(_get_packed_kv_cache_layout(groups_p, exclude=host_layers))
+        block_stride, layers_by_offset = pool_layouts[0]
+    else:
+        group_pool = [0] * len(kv_cache_groups)
+        pool_strides = []
+        pool_layouts = []
+        block_stride, layers_by_offset = _get_packed_kv_cache_layout(
+            kv_cache_groups, exclude=host_layers
+        )
     logger.info(
-        "Packed KV slab: %d groups (%s), %d layers, block_stride %d bytes",
+        "Packed KV slab: %d groups (%s), %d layers, block_stride %d bytes%s",
         len(kv_cache_groups),
         [(type(g.kv_cache_spec).__name__, len(g.layer_names)) for g in kv_cache_groups],
         sum(len(g.layer_names) for g in kv_cache_groups),
         block_stride,
+        f"; {len(pool_strides)} pools with strides {pool_strides}" if multi_pool else "",
     )
+    gpu_rows = 0
+    main_stride = 0
+    main_offsets: dict[str, int] = {}
+    sub_blocks = 1
+    if host_layers:
+        main_stride, main_offsets = _host_resident_layout(kv_cache_groups, host_layers)
+        block_size = next(
+            g.kv_cache_spec.block_size
+            for g in kv_cache_groups
+            if host_layers[0] in g.layer_names
+        )
+        sub_blocks = main_kv_sub_blocks(vllm_config, block_size)
+        gpu_rows = main_kv_gpu_rows(vllm_config)
+        reserved = gpu_rows * (main_stride // sub_blocks)
+        logger.info(
+            "Host-resident main KV: %d layers, %d bytes per %d-token block in %d "
+            "sub-rows, %d GPU hot rows (%.2f GiB reserved); the packed slab keeps "
+            "%d bytes per block",
+            len(host_layers),
+            main_stride,
+            block_size,
+            sub_blocks,
+            gpu_rows,
+            reserved / (1 << 30),
+            block_stride,
+        )
+        available_memory = max(0, available_memory - reserved)
+    pool_num_blocks: list[int] = []
+    if multi_pool:
+        # Pool 0 holds `deep_requests` max-length requests' worth of its
+        # groups' blocks (plus their chat demand headroom); every other pool
+        # gets the same chat-context concurrency C from what is left.
+        def deep_blocks(g: KVCacheGroupSpec) -> int:
+            spec = g.kv_cache_spec
+            if isinstance(spec, UniformTypeKVCacheSpecs):
+                return spec.max_memory_usage_pages(vllm_config)
+            return cdiv(spec.max_memory_usage_bytes(vllm_config), spec.page_size_bytes)
 
-    num_blocks = available_memory // block_stride
-    num_blocks = may_override_num_blocks(vllm_config, num_blocks)
-
+        deep0 = sum(deep_blocks(g) for g, pl in zip(kv_cache_groups, group_pool) if pl == 0)
+        n0 = max(2, int(deep_requests * deep0) + 2)
+        n0 = min(n0, max(2, available_memory // block_stride))
+        remaining = available_memory - n0 * block_stride
+        chat = [
+            sum(_chat_demand(g) for g, pl in zip(kv_cache_groups, group_pool) if pl == pool)
+            for pool in range(len(pool_strides))
+        ]
+        cost = sum(chat[pool] * pool_strides[pool] for pool in range(1, len(pool_strides)))
+        conc = remaining / cost if cost > 0 else 0.0
+        # +1 per pool for its null block, +1 rounding headroom.
+        pool_num_blocks = [n0] + [
+            max(2, int(conc * chat[pool]) + 2) for pool in range(1, len(pool_strides))
+        ]
+        num_blocks = may_override_num_blocks(vllm_config, n0)
+        pool_num_blocks[0] = num_blocks
+        logger.info(
+            "Multi-pool packed slab: %s blocks at strides %s = %.2f GiB; pool 0 "
+            "holds %.1f max-length requests, chat-context concurrency %.1f "
+            "(per-request blocks per pool %s; pool-0 chat demand %d)",
+            pool_num_blocks,
+            pool_strides,
+            sum(n * st for n, st in zip(pool_num_blocks, pool_strides)) / (1 << 30),
+            num_blocks / max(1, deep0),
+            conc,
+            chat,
+            chat[0],
+        )
+    else:
+        num_blocks = available_memory // block_stride
+        num_blocks = may_override_num_blocks(vllm_config, num_blocks)
     total_size = block_stride * num_blocks
 
     kv_cache_tensors: list[KVCacheTensor] = []
@@ -1326,8 +1679,32 @@ def _get_kv_cache_config_packed(
                 block_stride=block_stride,
             )
         )
-
-    return num_blocks, kv_cache_tensors
+    for pool in range(1, len(pool_num_blocks)):
+        p_stride, p_layers = pool_layouts[pool]
+        for byte_offset in sorted(p_layers):
+            kv_cache_tensors.append(
+                KVCacheTensor(
+                    size=p_stride * pool_num_blocks[pool],
+                    shared_by=p_layers[byte_offset],
+                    offset=byte_offset,
+                    block_stride=p_stride,
+                    pool=pool,
+                )
+            )
+    for layer_name in host_layers:
+        kv_cache_tensors.append(
+            KVCacheTensor(
+                size=main_stride * num_blocks,
+                shared_by=[layer_name],
+                offset=main_offsets[layer_name],
+                block_stride=main_stride,
+                host_resident=True,
+                gpu_rows=gpu_rows,
+                sub_blocks=sub_blocks,
+            )
+        )
+    pools = (pool_num_blocks, group_pool) if multi_pool else ([], [])
+    return num_blocks, kv_cache_tensors, pools
 
 
 def get_kv_cache_config_from_groups(
@@ -1359,8 +1736,9 @@ def get_kv_cache_config_from_groups(
     # CSA (compressed sparse attention) + linear case: the group layouts
     # already overlap by block ownership, which is exactly the packed slab
     # contract, so the packed planner lays the slab out directly.
+    pools: tuple[list[int], list[int]] = ([], [])
     if _get_csa_linear_tensor_layout(kv_cache_groups) is not None:
-        num_blocks, kv_cache_tensors = _get_kv_cache_config_packed(
+        num_blocks, kv_cache_tensors, pools = _get_kv_cache_config_packed(
             vllm_config, kv_cache_groups, available_memory
         )
     elif (
@@ -1388,7 +1766,7 @@ def get_kv_cache_config_from_groups(
     elif _use_packed_kv_cache_config(vllm_config, kv_cache_groups):
         # DeepSeek V4 uses the packed layout by default. Other multi-group
         # layouts can opt in with --enable-cross-layers.
-        num_blocks, kv_cache_tensors = _get_kv_cache_config_packed(
+        num_blocks, kv_cache_tensors, pools = _get_kv_cache_config_packed(
             vllm_config, kv_cache_groups, available_memory
         )
     else:
@@ -1423,6 +1801,8 @@ def get_kv_cache_config_from_groups(
         num_blocks=num_blocks,
         kv_cache_tensors=kv_cache_tensors,
         kv_cache_groups=kv_cache_groups,
+        pool_num_blocks=pools[0],
+        group_pool=pools[1],
     )
 
 
@@ -1911,7 +2291,16 @@ def _get_kv_cache_groups_csa_linear(
                 "CSA+linear pipeline stage has mamba cache owners but no "
                 "main_kv tensor slots; realign the pipeline partition."
             )
-        padded_spec = replace(representative, page_size_padded=main_kv_page)
+        # Mamba pages share the packed row with the attention pages. With the
+        # main KV host-resident (docs/host_resident_kv_design.md) the main_kv
+        # page never enters the slab, so pad to the compressed (indexer) page
+        # - the largest attention page that does - instead of 8x it.
+        pad_target = (
+            max(compressed_page, unpadded_page)
+            if _main_kv_extra_config(vllm_config).get("main_kv_host_resident")
+            else main_kv_page
+        )
+        padded_spec = replace(representative, page_size_padded=pad_target)
         grouped_names: list[list[str]] = [[] for _ in range(num_groups)]
         for index, name in enumerate(names):
             grouped_names[index % num_groups].append(name)
@@ -2234,7 +2623,14 @@ def get_kv_cache_groups(
     # Prefer preserving each layer's cache semantics. If physical pages cannot
     # be unified, try a supported allocation-only fallback before failing.
     try:
-        filtered_spec = unify_kv_cache_spec_page_size(filtered_spec)
+        filtered_spec = unify_kv_cache_spec_page_size(
+            filtered_spec,
+            exclude=(
+                {n for n, sp in filtered_spec.items() if type(sp) is FullAttentionSpec}
+                if _main_kv_extra_config(vllm_config).get("main_kv_host_resident")
+                else ()
+            ),
+        )
     except NotImplementedError:
         fallback_groups = _try_get_full_allocation_fallback_groups(kv_cache_spec)
         if fallback_groups is None:
@@ -2320,7 +2716,10 @@ def _max_memory_usage_bytes_from_groups(
         # group. Block ids are shared across groups, so each group's maximum
         # page demand consumes that common stride. This covers DeepSeek-V4's
         # MLA tuples and independent uniform draft-cache groups alike.
-        block_stride, _ = _get_packed_kv_cache_layout(kv_cache_groups)
+        block_stride, _ = _get_packed_kv_cache_layout(
+            kv_cache_groups,
+            exclude=host_resident_kv_layers(vllm_config, kv_cache_groups),
+        )
         return sum(
             cast(UniformTypeKVCacheSpecs, group.kv_cache_spec).max_memory_usage_pages(
                 vllm_config
@@ -2332,18 +2731,70 @@ def _max_memory_usage_bytes_from_groups(
         # CSA+linear packed slab: block ids come from one pool and each block
         # occupies the slab stride, so worst-case memory is the stride times
         # the summed per-group block demand (attention pages, one ring block
-        # per request, and the mamba groups' state blocks).
-        block_stride, _ = _get_packed_kv_cache_layout(kv_cache_groups)
+        # per request, and the mamba groups' state blocks). Host-resident
+        # main-KV layers are backed by host rows: they leave the stride and
+        # charge only their GPU hot window (docs/host_resident_kv_design.md).
+        host_layers = host_resident_kv_layers(vllm_config, kv_cache_groups)
+        block_stride, _ = _get_packed_kv_cache_layout(
+            kv_cache_groups, exclude=host_layers
+        )
+        # Multi-pool slab: every page-size class charges its own stride.
+        check_groups = kv_cache_groups
+        if kv_pool_deep_requests(vllm_config) > 0:
+            check_groups = [
+                replace(g, kv_cache_spec=_unpadded_spec(g.kv_cache_spec))
+                for g in kv_cache_groups
+            ]
+            group_pool, pool_strides = _pool_classes(check_groups, host_layers)
+            block_stride = pool_strides[0]
+        else:
+            group_pool, pool_strides = [0] * len(kv_cache_groups), [block_stride]
         total_blocks = 0
-        for group in kv_cache_groups:
+        needed = 0
+        for group, pool in zip(check_groups, group_pool):
             spec = group.kv_cache_spec
             if isinstance(spec, UniformTypeKVCacheSpecs):
-                total_blocks += spec.max_memory_usage_pages(vllm_config)
+                blocks = spec.max_memory_usage_pages(vllm_config)
             else:
-                total_blocks += cdiv(
+                blocks = cdiv(
                     spec.max_memory_usage_bytes(vllm_config), spec.page_size_bytes
                 )
-        return block_stride * total_blocks
+            total_blocks += blocks
+            needed += blocks * pool_strides[pool]
+        logger.info(
+            "KV memory check (packed): stride %d bytes x %d blocks = %.2f GiB; per group %s",
+            block_stride,
+            total_blocks,
+            needed / (1 << 30),
+            [
+                (
+                    type(g.kv_cache_spec).__name__,
+                    len(g.layer_names),
+                    g.kv_cache_spec.block_size,
+                    (
+                        g.kv_cache_spec.max_memory_usage_pages(vllm_config)
+                        if isinstance(g.kv_cache_spec, UniformTypeKVCacheSpecs)
+                        else cdiv(
+                            g.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+                            g.kv_cache_spec.page_size_bytes,
+                        )
+                    ),
+                    g.kv_cache_spec.page_size_bytes,
+                )
+                for g in kv_cache_groups
+            ],
+        )
+        if host_layers:
+            main_stride, _ = _host_resident_layout(kv_cache_groups, host_layers)
+            block_size = next(
+                g.kv_cache_spec.block_size
+                for g in kv_cache_groups
+                if host_layers[0] in g.layer_names
+            )
+            needed += main_kv_gpu_rows(vllm_config) * (
+                main_stride // main_kv_sub_blocks(vllm_config, block_size)
+            )
+        return needed
 
     # General case: group_size pools, each shared by one layer per group
     # Memory = group_size * page_size * blocks_for_max_len
@@ -2635,14 +3086,27 @@ def get_kv_cache_configs(
     min_num_blocks = min(
         kv_cache_config.num_blocks for kv_cache_config in kv_cache_configs
     )
+    min_pools: list[int] = []
+    if kv_cache_configs[0].pool_num_blocks:
+        min_pools = [
+            min(cfg.pool_num_blocks[p] for cfg in kv_cache_configs)
+            for p in range(len(kv_cache_configs[0].pool_num_blocks))
+        ]
     for kv_cache_config in kv_cache_configs:
         num_blocks_old = kv_cache_config.num_blocks
+        pools_old = list(kv_cache_config.pool_num_blocks)
         kv_cache_config.num_blocks = min_num_blocks
+        if pools_old:
+            kv_cache_config.pool_num_blocks = list(min_pools)
 
-        # Shrink tensor size proportionally
+        # Shrink tensor size proportionally (per pool for the multi-pool slab)
         for tensor in kv_cache_config.kv_cache_tensors:
-            assert tensor.size % num_blocks_old == 0
-            tensor.size = tensor.size // num_blocks_old * min_num_blocks
+            if pools_old and tensor.pool > 0:
+                old, new = pools_old[tensor.pool], min_pools[tensor.pool]
+            else:
+                old, new = num_blocks_old, min_num_blocks
+            assert tensor.size % old == 0
+            tensor.size = tensor.size // old * new
 
         if len(kv_cache_config.kv_cache_groups) > 0:
             max_model_len = vllm_config.model_config.max_model_len

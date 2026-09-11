@@ -166,14 +166,17 @@ class BlockPool:
         hash_block_size: int,
         enable_kv_cache_events: bool = False,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        pool_id: int = 0,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
+        # Multi-pool packed slab: blocks carry their pool so frees route back.
+        self.pool_id = pool_id
         self.enable_caching = enable_caching
         self.hash_block_size = hash_block_size
         # All kv-cache blocks.
         self.blocks: list[KVCacheBlock] = [
-            KVCacheBlock(idx) for idx in range(num_gpu_blocks)
+            KVCacheBlock(idx, pool_id=pool_id) for idx in range(num_gpu_blocks)
         ]
         # Free block queue that constructs and manipulates a doubly linked
         # list of free blocks (including eviction candidates when caching is
@@ -187,6 +190,7 @@ class BlockPool:
         # To represent a placeholder block with block_id=0.
         # The ref_cnt of null_block is not maintained, needs special care to
         # avoid freeing it.
+        self.free_block_queue.pool_id = pool_id
         self.null_block = self.free_block_queue.popleft()
         self.null_block.is_null = True
 
@@ -655,6 +659,11 @@ class BlockPool:
         Returns:
             A list of new block.
         """
+        if num_blocks < 0:
+            # popleft_n(-k) would silently add k to num_free_blocks without
+            # linking anything - the free-list count/list divergence that
+            # killed the 2026-09-10/11 WildChat legs after ~35 minutes.
+            raise ValueError(f"Cannot get a negative number of blocks ({num_blocks})")
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
@@ -664,7 +673,9 @@ class BlockPool:
         if self.enable_caching:
             for block in ret:
                 self._maybe_evict_cached_block(block)
-                assert block.ref_cnt == 0
+                assert block.ref_cnt == 0, (
+                    f"free-list block {block.block_id} has ref_cnt={block.ref_cnt}"
+                )
                 block.ref_cnt += 1
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
@@ -699,6 +710,16 @@ class BlockPool:
         self._emit_block_removed_events(evicted_hashes)
         return True
 
+    def _check_owned(self, block: KVCacheBlock, where: str) -> None:
+        """Every list/refcount operation must go through the block's own
+        pool: unlinking a block from another pool's free list leaves that
+        pool's count ahead of its list (popleft_n then walks off the end)."""
+        if block.pool_id != self.pool_id and not block.is_null:
+            raise RuntimeError(
+                f"BlockPool.{where}: block {block.block_id} belongs to pool "
+                f"{block.pool_id}, not pool {self.pool_id}"
+            )
+
     def touch(self, blocks: Sequence[KVCacheBlock]) -> None:
         """Touch a block increases its reference count by 1, and may remove
         the block from the free queue. This is used when a block is hit by
@@ -708,10 +729,16 @@ class BlockPool:
             blocks: A list of blocks to touch.
         """
         for block in blocks:
+            self._check_owned(block, "touch")
             # ref_cnt=0 means this block is in the free list (i.e. eviction
             # candidate), so remove it.
             if block.ref_cnt == 0 and not block.is_null:
                 self.free_block_queue.remove(block)
+            elif block.prev_free_block is not None and not block.is_null:
+                raise RuntimeError(
+                    f"BlockPool.touch: block {block.block_id} has "
+                    f"ref_cnt={block.ref_cnt} but sits in the free list"
+                )
             block.ref_cnt += 1
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
@@ -728,7 +755,13 @@ class BlockPool:
         blocks_with_hash = []
         blocks_without_hash = []
         for block in ordered_blocks:
+            self._check_owned(block, "free_blocks")
             block.ref_cnt -= 1
+            if block.ref_cnt < 0 and not block.is_null:
+                raise RuntimeError(
+                    f"BlockPool.free_blocks: block {block.block_id} freed "
+                    f"below zero (ref_cnt={block.ref_cnt})"
+                )
             if block.ref_cnt == 0 and not block.is_null:
                 # When caching is disabled we always append for better
                 # GPU cache locality from reusing recently used blocks

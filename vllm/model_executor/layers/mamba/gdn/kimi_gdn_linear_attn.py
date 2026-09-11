@@ -10,6 +10,8 @@ from einops import rearrange
 from torch import nn
 from torch.nn.parameter import Parameter
 
+import vllm.model_executor.layers.mamba.ops.kda_gate_projection  # noqa: F401
+from vllm import envs
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig
 from vllm.distributed import divide, get_tensor_model_parallel_rank
@@ -31,7 +33,9 @@ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from ...linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
 )
 from ..mamba_utils import (
     MambaStateDtypeCalculator,
@@ -43,6 +47,21 @@ from ..ops.gather_initial_states import gather_initial_states
 
 # Empirical lower bound for the KDA gate to avoid numerical underflow.
 _KDA_GATE_LOGBOUND_MIN = -5.0
+
+
+def _apply_kda_output_norm(
+    norm: FusedRMSNormGated, output: torch.Tensor, gate: torch.Tensor
+) -> None:
+    # This runs INSIDE the opaque kda_attention op. CustomOp's default
+    # forward_native dispatch assumes enclosing torch.compile can fuse its
+    # PyTorch operations, but that compiler cannot see this body. Use the
+    # CUDA kernel explicitly instead of launching casts, reductions, sigmoid
+    # and multiplies separately at every KDA layer. Its output aliases a
+    # contiguous input; copy_ is then a no-op (and handles noncontiguous input).
+    if current_platform.is_cuda_alike():
+        output.copy_(norm.forward_cuda(output, gate))
+    else:
+        output.copy_(norm(output, gate))
 
 
 def _materialize_kda_gate_and_beta(
@@ -153,7 +172,7 @@ def _make_fused_conv1d_weight_loader(
 
 
 class _KimiGDNMergedColumnParallelLinear(MergedColumnParallelLinear):
-    """Merged projection with some outputs replicated across TP ranks.
+    """Merged projection with selected outputs replicated across TP ranks.
 
     Each replicated shard is represented as ``size * tp_size`` so the merged
     parameter reserves ``size`` local rows on every rank. Loading that shard
@@ -164,13 +183,17 @@ class _KimiGDNMergedColumnParallelLinear(MergedColumnParallelLinear):
         self,
         input_size: int,
         output_sizes: list[int],
-        replicated_shard_ids: tuple[int, ...],
+        replicated_shard_id: int | tuple[int, ...],
         tp_size: int,
         **kwargs,
     ) -> None:
-        self.replicated_shard_ids = replicated_shard_ids
+        self.replicated_shard_ids = (
+            (replicated_shard_id,)
+            if isinstance(replicated_shard_id, int)
+            else replicated_shard_id
+        )
         output_sizes = output_sizes.copy()
-        for shard_id in replicated_shard_ids:
+        for shard_id in self.replicated_shard_ids:
             output_sizes[shard_id] *= tp_size
         super().__init__(input_size, output_sizes, **kwargs)
 
@@ -241,6 +264,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         vllm_config: VllmConfig,
         prefix: str = "",
         beta_shard_rows: int | None = None,
+        fuse_gate_a: bool = False,
     ) -> None:
         """``beta_shard_rows``: rows per rank to reserve for the beta shard of
         the merged input projection instead of ``num_heads / tp``. A
@@ -261,6 +285,11 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.local_projection_size = divide(self.projection_size, self.tp_size)
         self.conv_size = kda_config["short_conv_kernel_size"]
         self.use_full_rank_gate = kda_config.get("use_full_rank_gate", False)
+        # GLM's low-rank gate consumes the same hidden input as Q/K/V and
+        # f_a. Load its unchanged BF16 rows into the existing projection to
+        # avoid a separate narrow GEMV at every KDA layer. Other models keep
+        # their existing module/loader contract unless explicitly opted in.
+        self.fuse_gate_a = fuse_gate_a and not self.use_full_rank_gate
 
         if self.use_full_rank_gate:
             if beta_shard_rows is not None:
@@ -295,14 +324,15 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             in_proj_output_sizes = [self.projection_size] * 3 + [
                 self.beta_shard_rows * self.tp_size,
                 self.head_dim,
-                self.head_dim,
             ]
-            replicated_shard_ids = (4, 5)
+            replicated_shard_ids = (4, 5) if self.fuse_gate_a else (4,)
             self.in_proj_padding = 0
+            if self.fuse_gate_a:
+                in_proj_output_sizes.append(self.head_dim)
         self.in_proj_qkvgfab = _KimiGDNMergedColumnParallelLinear(
             self.hidden_size,
             in_proj_output_sizes,
-            replicated_shard_ids=replicated_shard_ids,
+            replicated_shard_id=replicated_shard_ids,
             tp_size=self.tp_size,
             bias=False,
             quant_config=self.quant_config,
@@ -371,6 +401,14 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             f"prefill backend, got {backend!r}."
         )
         if not self.use_full_rank_gate:
+            if not self.fuse_gate_a:
+                self.g_a_proj = ReplicatedLinear(
+                    self.hidden_size,
+                    self.head_dim,
+                    bias=False,
+                    quant_config=self.quant_config,
+                    prefix=f"{prefix}.g_a_proj",
+                )
             self.g_b_proj = ColumnParallelLinear(
                 self.head_dim,
                 self.projection_size,
@@ -378,7 +416,14 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 quant_config=self.quant_config,
                 prefix=f"{prefix}.g_b_proj",
             )
-        if not self.use_full_rank_gate:
+        self.use_batched_gate_projection = (
+            self.fuse_gate_a
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability((12, 0))
+            and isinstance(self.f_b_proj.quant_method, UnquantizedLinearMethod)
+            and isinstance(self.g_b_proj.quant_method, UnquantizedLinearMethod)
+        )
+        if self.use_batched_gate_projection:
             # f_b_proj and g_b_proj share a shape (local projection rows of
             # head_dim) and read adjacent columns of the merged projection
             # output, so at decode they run as one strided-batched GEMV on
@@ -393,6 +438,17 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
             self.f_b_proj.weight.data = self.fg_b_weight[0]
             self.g_b_proj.weight.data = self.fg_b_weight[1]
+        self.use_paired_gate_projection = (
+            self.fuse_gate_a
+            and not self.use_batched_gate_projection
+            and current_platform.is_cuda()
+            and not envs.VLLM_BATCH_INVARIANT
+            and self.head_dim == 128
+            and isinstance(self.f_b_proj.quant_method, UnquantizedLinearMethod)
+            and isinstance(self.g_b_proj.quant_method, UnquantizedLinearMethod)
+            and self.f_b_proj.weight.dtype == torch.bfloat16
+            and self.g_b_proj.weight.dtype == torch.bfloat16
+        )
         self.o_norm = FusedRMSNormGated(self.head_dim, activation="sigmoid")
         self.o_proj = RowParallelLinear(
             self.projection_size,
@@ -422,9 +478,14 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         output: torch.Tensor,
+        projected_qkvgfab: torch.Tensor | None = None,
     ) -> None:
         num_tokens = hidden_states.size(0)
-        projected_qkvgfab = self.in_proj_qkvgfab(hidden_states)[0]
+        if projected_qkvgfab is None:
+            projected_qkvgfab = self.in_proj_qkvgfab(hidden_states)[0]
+        else:
+            assert projected_qkvgfab.shape[0] == num_tokens
+            assert projected_qkvgfab.dtype == hidden_states.dtype
         if self.use_full_rank_gate:
             split_sizes = [
                 3 * self.local_projection_size,
@@ -437,22 +498,32 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             projected = projected_qkvgfab.split(split_sizes, dim=-1)
             mixed_qkv, g_proj_states, f_a, beta = projected[:4]
         else:
-            mixed_qkv, beta, fg_a = projected_qkvgfab.split(
-                [
-                    3 * self.local_projection_size,
-                    self.beta_shard_rows,
-                    2 * self.head_dim,
-                ],
-                dim=-1,
-            )
+            split_sizes = [
+                3 * self.local_projection_size,
+                self.beta_shard_rows,
+                self.head_dim,
+            ]
+            if self.fuse_gate_a:
+                split_sizes.append(self.head_dim)
+            projected = projected_qkvgfab.split(split_sizes, dim=-1)
+            mixed_qkv, beta, f_a = projected[:3]
             if self.beta_shard_rows != self.local_num_heads:
                 beta = beta[:, : self.local_num_heads]
-            # [n, 2, d] -> [2, n, d] strided view; no copy.
-            fg_a = fg_a.view(num_tokens, 2, self.head_dim).transpose(0, 1)
-            fg_b = torch.bmm(fg_a, self.fg_b_weight.transpose(1, 2))
-            g1, g_proj_states = fg_b.unbind(0)
+            g_a = projected[3] if self.fuse_gate_a else self.g_a_proj(hidden_states)[0]
+            if self.use_batched_gate_projection:
+                # Preserve the qualified SM120 strided BMM and storage layout.
+                fg_a = projected_qkvgfab[:, -2 * self.head_dim :]
+                fg_a = fg_a.view(num_tokens, 2, self.head_dim).transpose(0, 1)
+                fg_b = torch.bmm(fg_a, self.fg_b_weight.transpose(1, 2))
+                g1, g_proj_states = fg_b.unbind(0)
+            elif self.use_paired_gate_projection:
+                g1, g_proj_states = torch.ops.vllm.kda_gate_pair(
+                    f_a, g_a, self.f_b_proj.weight, self.g_b_proj.weight
+                )
+            else:
+                g_proj_states = self.g_b_proj(g_a)[0]
 
-        if self.use_full_rank_gate:
+        if not (self.use_paired_gate_projection or self.use_batched_gate_projection):
             g1 = self.f_b_proj(f_a)[0]
         beta = beta.unsqueeze(0)
         g1 = rearrange(g1, "n (h d) -> 1 n h d", d=self.head_dim)
@@ -758,16 +829,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             ]
         else:
             assert core_attn_out_spec is not None
-        # This runs inside the opaque ``vllm::kda_attention`` op, where the
-        # model-level torch.compile never sees it: the CustomOp dispatch
-        # (custom ops off under compile) lands on the decomposed
-        # forward_native and issues ~12 eager kernels per layer at decode.
-        # Take the fused Triton kernel directly; it is bit-identical to the
-        # decomposed path on the (1, n, h, d) / (n, h, d) shapes used here.
-        if current_platform.is_cuda_alike():
-            core_attn_out.copy_(self.o_norm.forward_cuda(core_attn_out, g2))
-        else:
-            core_attn_out.copy_(self.o_norm(core_attn_out, g2))
+        _apply_kda_output_norm(self.o_norm, core_attn_out, g2)
 
 
 def kda_attention(

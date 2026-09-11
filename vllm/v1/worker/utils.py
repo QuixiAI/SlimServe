@@ -158,7 +158,12 @@ class KVBlockZeroer:
             for layer_name in group.layer_names:
                 if layer_name in runner_only_attn_layers:
                     continue
-                kv = static_forward_context[layer_name].kv_cache
+                layer = static_forward_context[layer_name]
+                if getattr(layer, "kv_cache_host_resident", False):
+                    # Host-resident main KV: the GPU window is not indexed by
+                    # logical block id; the residency zeroes a row on bind.
+                    continue
+                kv = layer.kv_cache
                 if not isinstance(kv, torch.Tensor):
                     continue
                 dp = kv.data_ptr()

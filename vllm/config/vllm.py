@@ -75,6 +75,12 @@ DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES = frozenset(
         # confound in the 2026-08-12 NaN investigation. Runner choice must be
         # a property of the model, not of the speculative config.
         "DeepseekV4ForCausalLM",
+        # GLM-5.3-Flash (glm5_next, hybrid KDA + sparse MLA + mHC): served on
+        # V2 since 2026-09-10 (operator directive: V2 only, V1 deprecated).
+        # Non-spec boot validated through the registered TP8 profile; the
+        # DFlash2 speculator exists only on V2.
+        "Glm5NextForCausalLM",
+        "Glm5NextForConditionalGeneration",
         "GraniteMoeForCausalLM",
         "InklingForCausalLM",
         "InklingForConditionalGeneration",
@@ -337,8 +343,15 @@ def _v2_runner_kernels_available() -> bool:
     except Exception:
         return False
 
+# KV connectors that move KV with ordinary stream-ordered copies and never pin
+# or register GPU memory (no IB memory regions), hence compatible with
+# PyTorch's expandable_segments (VMM) allocator.
+_VMM_SAFE_KV_CONNECTORS = frozenset({"HostTierConnector"})
+
+
 
 @config(config=ConfigDict(arbitrary_types_allowed=True))
+
 class VllmConfig:
     """Dataclass which contains all vllm-related configuration. This
     simplifies passing around the distinct configurations in the codebase.
@@ -1015,6 +1028,14 @@ class VllmConfig:
         ):
             return
         if self.model_config is not None and (self.model_config.enable_cumem_allocator):
+            return
+        # Connectors that never register GPU memory with a NIC are safe: the
+        # host tier moves KV with stream-ordered copies on live tensors, whose
+        # virtual addresses stay mapped for the tensor's lifetime under VMM.
+        # expandable_segments is what keeps a 0.975-utilization rank from
+        # fragmenting into an OOM after variable-size transients
+        # (perf/optimization_status.md, 2026-09-07).
+        if self.kv_transfer_config.kv_connector in _VMM_SAFE_KV_CONNECTORS:
             return
 
         raise ValueError(

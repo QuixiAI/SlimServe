@@ -22,6 +22,8 @@ from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     FullAttentionSpec,
     MambaSpec,
+    MLAAttentionSpec,
+    SlidingWindowSpec,
 )
 
 BLOCK = 16
@@ -84,16 +86,42 @@ def make_groups():
     return [attn, ring, *mamba]
 
 
-def make_connector():
+def make_connector(indexer_ratio=None, window=False):
     vllm_config = SimpleNamespace(
         cache_config=SimpleNamespace(block_size=8),  # deliberately stale
         kv_transfer_config=SimpleNamespace(
             kv_connector_extra_config={"host_tier_gb_per_rank": 1.0}
         ),
     )
-    kv_cache_config = SimpleNamespace(
-        kv_cache_groups=make_groups(), kv_cache_tensors=[]
-    )
+    groups = make_groups()
+    if window:
+        # A drafter's sliding-window group (DFlash2 on GLM-5.3-Flash): the
+        # tier neither stages nor restores it; it is zeroed on resume.
+        groups.append(
+            SimpleNamespace(
+                kv_cache_spec=SlidingWindowSpec(
+                    block_size=BLOCK,
+                    num_kv_heads=1,
+                    head_size=8,
+                    dtype=torch.bfloat16,
+                    sliding_window=2 * BLOCK,
+                ),
+                layer_names=["draft_swa"],
+            )
+        )
+    if indexer_ratio is not None:
+        groups.append(
+            SimpleNamespace(
+                kv_cache_spec=MLAAttentionSpec(
+                    block_size=BLOCK * indexer_ratio,
+                    num_kv_heads=1,
+                    head_size=16 // indexer_ratio,
+                    dtype=torch.bfloat16,
+                ),
+                layer_names=["indexer"],
+            )
+        )
+    kv_cache_config = SimpleNamespace(kv_cache_groups=groups, kv_cache_tensors=[])
     with (
         patch(
             "vllm.distributed.kv_transfer.kv_connector.v1.host_tier_connector."
@@ -145,7 +173,11 @@ def make_connector():
 
     conn.bind_gpu_block_pool(FakePool())
     assert conn.hash_block_size == BLOCK  # from the attn spec, not config
-    assert conn.attn_groups == [0]
+    if window:
+        assert conn.attn_groups == [0] and conn.window_groups == [4]
+    else:
+        assert conn.attn_groups == ([0] if indexer_ratio is None else [0, 4])
+        assert conn.window_groups == []
     assert conn.state_groups == [2, 3]  # mamba only
     assert conn.ring_groups == [1]
     return conn
@@ -161,7 +193,7 @@ def sched_output(step_tokens, new_reqs=(), cached=None):
     )
 
 
-def alloc(n_attn, planned, base=0):
+def alloc(n_attn, planned, base=0, window=False):
     """Allocation shape mirroring the engine at external-load admission:
     attention positional; ring exactly one block; mamba groups shaped
     [null] * (planned - 1) + [real tail] (+ live compute blocks after)."""
@@ -173,6 +205,10 @@ def alloc(n_attn, planned, base=0):
         gb.append(FakeBlock(base + 95 + g))
         gb.extend(FakeBlock(base + 97 + g + i) for i in range(max(0, n_attn - planned)))
         mamba.append(gb)
+    if window:
+        # Window group: null outside the window, one live block inside.
+        swa = [FakeBlock(0, is_null=True)] * max(0, n_attn - 1) + [FakeBlock(base + 80)]
+        return FakeKVCacheBlocks(blocks=(attn, ring, *mamba, swa))
     return FakeKVCacheBlocks(blocks=(attn, ring, *mamba))
 
 
@@ -283,7 +319,7 @@ def test_resume_round_trip():
     assert {200, 201, 202, 203} <= targets  # attention span
     # Both mamba states land on the position-(k-1) tail blocks.
     assert {295, 296} <= targets
-    assert meta.zeros["r2"] == [290]  # the ring block
+    assert meta.zeros["r2"] == [(290, 1)]  # the ring block
 
 
 def test_progressive_clipped_restore():
@@ -305,7 +341,7 @@ def test_progressive_clipped_restore():
     conn.update_state_after_alloc(fresh, alloc(4, planned=4, base=300), n_ext2)
     meta2 = conn.build_connector_meta(sched_output({}))
     assert len(meta2.restores["r2"]) == 2 + 2  # final chunk carries the tail
-    assert meta2.zeros["r2"] == [390]
+    assert meta2.zeros["r2"] == [(390, 1)]
 
 
 def test_mixed_local_and_tier_resume():
@@ -326,7 +362,7 @@ def test_mixed_local_and_tier_resume():
     targets = {b for _, b, _ in ops}
     assert {402, 403} <= targets
     assert {495, 496} <= targets
-    assert meta.zeros["r5"] == [490]
+    assert meta.zeros["r5"] == [(490, 1)]
 
 
 def test_short_prompt_or_mismatch_misses():
@@ -337,3 +373,73 @@ def test_short_prompt_or_mismatch_misses():
     assert conn.get_num_new_matched_tokens(exact, 0) == (0, False)
     other = FakeRequest("r4", [h(50 + i) for i in range(6)], num_tokens=99)
     assert conn.get_num_new_matched_tokens(other, 0) == (0, False)
+
+
+def test_window_group_is_not_tier_managed_and_is_zeroed_on_resume():
+    """DFlash2 on GLM-5.3-Flash adds sliding-window drafter groups whose
+    block tables are null outside the window: excluded from staging and
+    restore, zeroed with the final restore chunk (2026-09-10)."""
+    conn = make_connector(window=True)
+    run_conversation(conn, "r1", 4)
+    fresh = FakeRequest("r2", [h(i) for i in range(4)], num_tokens=4 * BLOCK + 8)
+    conn.on_new_request(fresh)
+    n_ext, is_async = conn.get_num_new_matched_tokens(fresh, 0)
+    assert is_async and n_ext == 4 * BLOCK
+    conn.update_state_after_alloc(
+        fresh, alloc(5, planned=4, base=200, window=True), n_ext
+    )
+    meta = conn.build_connector_meta(sched_output({}))
+    ops = meta.restores["r2"]
+    assert len(ops) == 4 + 2 and all(gid != 4 for _, _, gid in ops)
+    assert (280, 4) in meta.zeros["r2"] and (290, 1) in meta.zeros["r2"]
+    assert not meta.failed
+
+
+def test_unstageable_restore_fails_closed():
+    """A promised restore whose target blocks are missing must not park the
+    request: the promised blocks are reported as failed loads (the worker
+    marks them invalid and releases the request) instead of a silent
+    planned_blocks reset (the 2026-09-10 deferred-forever hang)."""
+    conn = make_connector()
+    run_conversation(conn, "r1", 4)
+    fresh = FakeRequest("r2", [h(i) for i in range(4)], num_tokens=4 * BLOCK + 8)
+    conn.on_new_request(fresh)
+    n_ext, _ = conn.get_num_new_matched_tokens(fresh, 0)
+    short = alloc(5, planned=4, base=300)
+    short = FakeKVCacheBlocks(blocks=(short.blocks[0][:2], *short.blocks[1:]))
+    conn.update_state_after_alloc(fresh, short, n_ext)
+    meta = conn.build_connector_meta(sched_output({}))
+    assert "r2" not in meta.restores
+    assert {300, 301} <= set(meta.failed["r2"])
+    assert conn._tracks["r2"].planned_blocks == 0
+
+
+def test_worker_reports_failed_restore_as_invalid_blocks_and_received():
+    """Worker side of fail-closed: the failed span is marked invalid on the
+    DMA (surfacing as invalid_block_ids for the scheduler's recompute policy)
+    and the request is reported received so it leaves WAITING_FOR_REMOTE_KVS."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.host_tier_connector import (
+        HostTierMeta,
+    )
+
+    conn = make_connector()
+    marked: list[int] = []
+    fake_dma = SimpleNamespace(
+        pump=lambda: None,
+        fence_restores=lambda: None,
+        mark_invalid=lambda blocks: marked.extend(blocks),
+        poll_done=lambda: [],
+        issue=lambda batch: None,
+    )
+    conn._dma = fake_dma
+    conn._main_kv_tiered = False
+    conn._failed_recv = set()
+    conn._pending_restore_reqs = {}
+    conn._seq = 0
+    conn._connector_metadata = HostTierMeta(failed={"r9": [5, 6]})
+    conn.start_load_kv(SimpleNamespace())
+    assert marked == [5, 6]
+    _, done = conn.get_finished(set())
+    assert done == {"r9"}
+    _, done_again = conn.get_finished(set())
+    assert done_again is None

@@ -36,6 +36,7 @@ logger = init_logger(__name__)
 
 MTPModelTypes = Literal[
     "deepseek_mtp",
+    "glm5_next_mtp",
     "mimo_mtp",
     "glm4_moe_mtp",
     "glm4_moe_lite_mtp",
@@ -342,14 +343,37 @@ class SpeculativeConfig:
                     False,
                 )
             )
+        if self.method in ("dflash", "dspark"):
+            # Block drafters draft a fixed block of num_speculative_tokens, so
+            # the drafter's compiled graph is shaped by k: a k=4 artifact
+            # replayed at k=3 fails the inductor stride guard.
+            factors.append(self.num_speculative_tokens)
 
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
         return hash_str
 
     @staticmethod
     def hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:
-        initial_architecture = hf_config.architectures[0]
+        initial_architecture = (hf_config.architectures or [None])[0]
         text_config = getattr(hf_config, "text_config", None)
+        if hf_config.model_type == "glm5_next":
+            # Flatten the VLM for the text-only drafter without losing the
+            # root checkpoint's NVFP4 quantization metadata.
+            quantization_config = getattr(hf_config, "quantization_config", None)
+            hf_config = copy.deepcopy(text_config)
+            if quantization_config is not None:
+                hf_config.quantization_config = copy.deepcopy(quantization_config)
+        if hf_config.model_type in ("glm5_next_text", "glm5_next_mtp"):
+            hf_config.model_type = "glm5_next_mtp"
+            hf_config.update(
+                {
+                    "n_predict": hf_config.num_nextn_predict_layers,
+                    "architectures": ["Glm5NextMTPModel"],
+                    # Validate GLM's pooled-tail state before enabling the
+                    # ordinary DeepSeek cross-draft index-sharing optimization.
+                    "index_share_for_mtp_iteration": False,
+                }
+            )
         if (
             hf_config.model_type == "glm5v"
             and getattr(text_config, "model_type", None) == "glm_moe_dsa"
@@ -618,28 +642,6 @@ class SpeculativeConfig:
             n_predict = getattr(hf_config, "num_mtp_modules", 1)
             hf_config.update(
                 {"n_predict": n_predict, "architectures": ["MiniMaxM3MTP"]}
-            )
-
-        if hf_config.model_type == "glm5_next" or initial_architecture in (
-            "Glm5NextForCausalLM",
-            "Glm5NextForConditionalGeneration",
-        ):
-            # GLM-5.3-Flash: the MTP head (layer num_hidden_layers) belongs
-            # to the text model of the VL checkpoint. Promote text_config and
-            # carry the top-level quantization_config with it so the draft's
-            # FP8-block experts (layer 45 in the compressed-tensors config)
-            # resolve to their quant scheme.
-            quantization_config = getattr(hf_config, "quantization_config", None)
-            hf_config = getattr(hf_config, "text_config", hf_config)
-            if (
-                quantization_config is not None
-                and getattr(hf_config, "quantization_config", None) is None
-            ):
-                hf_config.update({"quantization_config": quantization_config})
-            hf_config.model_type = "glm5_next_mtp"
-            n_predict = getattr(hf_config, "num_nextn_predict_layers", 1)
-            hf_config.update(
-                {"n_predict": n_predict, "architectures": ["Glm5NextMTPModel"]}
             )
 
         return hf_config

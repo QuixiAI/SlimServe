@@ -48,6 +48,35 @@ def test_glm53_spill_free_indexer_geometry_is_rtx6000_scoped():
         assert key not in resolve(profile, "a100", count, None).env
 
 
+def test_glm53_renamed_profiles_preserve_recorded_commands():
+    for platform, count in (("rtx6000", 4), ("a100", 4), ("a100", 8)):
+        old_id, new_id = f"glm53-nvfp4-{count}", f"glm53f-nvfp4-{count}"
+        old, new = (resolve(p, platform, count, None) for p in (old_id, new_id))
+        assert replace(old, profile_id=new_id) == new
+        assert old_id not in registry.profile_ids()
+        assert new_id in registry.profile_ids()
+    assert compatible_profile_ids(Machine("rtx6000", "RTX PRO 6000", 4)) == [
+        "glm53f-nvfp4-4"
+    ]
+
+
+def test_glm53_merge_keeps_drafters_and_quant_platform_scoped():
+    rtx = resolve("glm53f-nvfp4-4", "rtx6000", 4, None)
+    a100 = resolve("glm53f-nvfp4-8", "a100", 8, None)
+    assert not rtx.speculative
+    assert rtx.speculator["engine"]["method"] == "mtp"
+    assert rtx.weight_recipe["id"] == "glm53-redhatai-nvfp4-fp8-kda-tp4-v1"
+    assert rtx.engine["kv_cache_dtype"] == "auto"
+    assert rtx.env["VLLM_USE_V2_MODEL_RUNNER"] == "0"
+    assert "kv_transfer_config" not in rtx.engine
+    assert a100.speculative
+    assert a100.speculator["engine"]["method"] == "dflash"
+    assert a100.weight_recipe is None
+    assert a100.engine["data_parallel_size"] == 2
+    # A100 inherits main's V2 architecture default; only SM120 pins V1.
+    assert "VLLM_USE_V2_MODEL_RUNNER" not in a100.env
+
+
 def test_glm53_lossless_mhc_storage_is_rtx6000_scoped():
     key = "VLLM_GLM5_MHC_BF16_FN"
     rtx = resolve("glm53-nvfp4-4", "rtx6000", 4, None)
@@ -87,7 +116,7 @@ def test_glm53_sparse_swapab_is_rtx6000_scoped():
         assert key not in resolve(profile, "a100", count, None).env
 
 
-def test_every_profile_uses_dspark_with_turboquant():
+def test_every_profile_uses_registered_drafter_with_fp8_dspark():
     for profile_id in registry.profile_ids():
         entry = registry.describe(profile_id)
         for platform in entry["platforms"]:
@@ -102,8 +131,8 @@ def test_every_profile_uses_dspark_with_turboquant():
             registered = plan.speculator["engine"]["method"]
             assert config["method"] == registered
             if registered == "dspark":
-                assert config["attention_backend"] == "TURBOQUANT"
-                assert config["kv_cache_dtype"] == "turboquant_k8v4"
+                assert config.get("attention_backend") != "TURBOQUANT"
+                assert config["kv_cache_dtype"] == "fp8"
 
 
 def test_no_spec_cli_flag_disables_the_resolved_speculator(monkeypatch):
@@ -181,15 +210,58 @@ def test_every_profile_source_names_a_blessed_dspark_download():
         )
 
 
+def test_spec_cli_opt_in_keeps_registered_glm_defaults(monkeypatch):
+    plan = resolve("glm53f-nvfp4-4", "a100", 4, "NVFP4")
+    assert not plan.speculative
+    monkeypatch.setattr(
+        cli.hardware,
+        "detect",
+        Mock(
+            return_value=Mock(
+                known=True,
+                platform="a100",
+                count=4,
+                memory_bytes=0,
+                device_name="A100",
+            )
+        ),
+    )
+    monkeypatch.setattr(cli.registry, "resolve", Mock(return_value=plan))
+    monkeypatch.setattr(cli.fetch, "ensure", Mock())
+    seen = []
+
+    def record_chat(resolved, *_):
+        seen.append(resolved)
+        return 0
+
+    monkeypatch.setattr(cli, "_chat", record_chat)
+    assert cli.main(["glm53f-nvfp4-4", "--quant", "NVFP4", "--spec"]) == 0
+    assert len(seen) == 1 and seen[0].speculative
+    config = engine_kwargs(seen[0])["speculative_config"]
+    # incoai/GLM-5.3-Flash-DFlash2 (block 8): up to 7 drafts per verify.
+    assert config["method"] == "dflash" and config["num_speculative_tokens"] == 7
+    # Local checkout resolves to its directory; a hub load carries the pin.
+    assert config["model"].endswith("GLM-5.3-Flash-DFlash2") or (
+        config.get("revision") == "bf582e4eacc1810f76656d1811693ff6c6737d2a"
+    )
+    assert not plan.speculative
+
+
+def test_spec_cli_flags_are_mutually_exclusive():
+    with pytest.raises(SystemExit):
+        cli._parser().parse_args(["--spec", "--no-spec"])
+
+
 def test_every_source_declares_its_live_smoke_modalities():
     sources = registry._registry()["sources"]
     assert sources["glm52-vision"]["modalities"] == ["text", "image"]
     assert sources["kimi-k3"]["modalities"] == ["text", "image"]
-    assert sources["glm53-flash-nvfp4"]["modalities"] == ["text", "image"]
+    assert sources["glm53f-nvfp4"]["modalities"] == ["text", "image"]
     assert sources["dsv4-flash"]["modalities"] == ["text"]
     assert sources["muse-glimmer"]["modalities"] == ["text", "image"]
     assert sources["qwen38-27b"]["modalities"] == ["text", "image"]
     assert sources["qwen38-27b-nvfp4"]["modalities"] == ["text", "image"]
+    assert sources["qwen38-flash-next-nvfp4"]["modalities"] == ["text", "image"]
 
 
 def test_qwen38_uses_measured_metal_speculation_settings():
@@ -200,6 +272,17 @@ def test_qwen38_uses_measured_metal_speculation_settings():
     assert speculative["num_speculative_tokens"] == 3
     assert speculative["quantization"] == "gguf"
     assert plan.env["VLLM_USE_V2_MODEL_RUNNER"] == "1"
+
+
+def test_metal_smoke_accepts_registered_variant_drafters():
+    machine = Machine("metal", "Apple M5 Max", 1, memory_bytes=2**37)
+    profiles = compatible_profile_ids(machine)
+    assert {"qwen38-nvfp4-1"} <= set(profiles)
+    for profile in profiles:
+        plan = resolve(profile, "metal", 1, None, 2**37)
+        spec = validate_acceleration(plan)
+        expected = {**plan.speculator["engine"], **plan.speculative_overrides}
+        assert all(spec[k] == v for k, v in expected.items())
 
 
 def test_qwen38_uses_measured_mi300x_speculation_settings():
@@ -230,7 +313,7 @@ def test_live_smoke_matrix_discovers_every_compatible_mi300x_profile():
     )
 
 
-def test_live_smoke_matrix_requires_dspark_and_turboquant_for_every_profile():
+def test_live_smoke_matrix_requires_registered_drafter_and_fp8_for_every_profile():
     machine = Machine("mi300x", "AMD Instinct MI300X", 8)
     for profile_id in compatible_profile_ids(machine):
         plan = resolve(profile_id, "mi300x", 8, None)
@@ -247,8 +330,8 @@ def test_live_smoke_matrix_requires_dspark_and_turboquant_for_every_profile():
             assert speculative["method"] == "dflash"
             continue
         assert speculative["method"] == "dspark"
-        assert speculative["attention_backend"] == "TURBOQUANT"
-        assert speculative["kv_cache_dtype"] == "turboquant_k8v4"
+        assert speculative.get("attention_backend") != "TURBOQUANT"
+        assert speculative["kv_cache_dtype"] == "fp8"
 
 
 def test_registry_rejects_duplicate_json_keys():
@@ -280,8 +363,8 @@ def test_deepseek_profiles_use_only_the_matching_0731_dspark_drafter():
         config = engine_kwargs(plan)["speculative_config"]
         assert config["num_speculative_tokens"] == 5
         assert config["quantization"] == "gguf"
-        assert config["attention_backend"] == "TURBOQUANT"
-        assert config["kv_cache_dtype"] == "turboquant_k8v4"
+        assert config.get("attention_backend") != "TURBOQUANT"
+        assert config["kv_cache_dtype"] == "fp8"
         assert config["model"].endswith(f"/{expected_file}")
 
 
@@ -416,7 +499,8 @@ def test_registry_contains_only_the_supported_model_artifacts():
         "qwen38-27b",
         "qwen38-27b-nvfp4",
         "qwen38-flash-next-fp8",
-        "glm53-flash-nvfp4",
+        "qwen38-flash-next-nvfp4",
+        "glm53f-nvfp4",
     }
     glm = data["sources"]["glm52-vision"]
     kimi = data["sources"]["kimi-k3"]
@@ -518,8 +602,8 @@ def test_kimi_uses_the_registered_q8_dspark_gguf():
         assert speculative["method"] == "dspark"
         assert speculative["num_speculative_tokens"] == 7
         assert speculative["quantization"] == "gguf"
-        assert speculative["attention_backend"] == "TURBOQUANT"
-        assert speculative["kv_cache_dtype"] == "turboquant_k8v4"
+        assert speculative.get("attention_backend") != "TURBOQUANT"
+        assert speculative["kv_cache_dtype"] == "fp8"
         assert speculative["disable_draft_cudagraphs"] is True
         assert "draft_tensor_parallel_size" not in speculative
 
@@ -559,17 +643,8 @@ def test_qwen38_nvfp4_platforms_diverge_on_the_measured_drafter():
     assert mi300x.speculator["engine"]["method"] == "qwen3_5_mtp"
 
 
-def test_tq_profile_pins_both_drafter_turboquant_fields():
-    """The -tq drafter must pin attention_backend AND kv_cache_dtype
-    together: unset, the drafter inherits the engine-global turboquant_k8v4
-    dtype but keeps metal_attn, whose 5-dim cache shape cannot view the
-    TQ-sized page (boot reshape failure documented in the profile notes)."""
-    from slimserve.engine import _speculative_config
-
-    plan = resolve("qwen38-nvfp4-1-tq", "metal", 1, "NVFP4", 128 * GB)
-    cfg = _speculative_config(plan)
-    assert cfg["attention_backend"] == "TURBOQUANT"
-    assert cfg["kv_cache_dtype"] == "turboquant_k8v4"
+def test_turboquant_profile_is_removed():
+    assert "qwen38-nvfp4-1-tq" not in registry.profile_ids()
 
 
 def test_metal_gates_on_memory_not_on_gpu_count():
@@ -609,7 +684,7 @@ def test_deepseek_metal_is_runnable_while_glm_stays_gated():
     assert registry.platform_blocked("a100") is None
 
 
-def test_deepseek_metal_uses_measured_dspark_turboquant_settings():
+def test_deepseek_metal_uses_dspark_fp8_settings():
     plan = resolve("dsv4-xxs-1", "metal", 1, "IQ2_XXS", 128 * GB)
     # 256K metal resize (2026-08-11 Metal-side commit).
     assert plan.engine["max_model_len"] == 262144
@@ -618,8 +693,8 @@ def test_deepseek_metal_uses_measured_dspark_turboquant_settings():
     assert plan.engine["kv_cache_dtype"] == "fp8_ds_mla"
     speculative = engine_kwargs(plan)["speculative_config"]
     assert speculative["method"] == "dspark"
-    assert speculative["attention_backend"] == "TURBOQUANT"
-    assert speculative["kv_cache_dtype"] == "turboquant_k8v4"
+    assert speculative.get("attention_backend") != "TURBOQUANT"
+    assert speculative["kv_cache_dtype"] == "fp8"
     assert speculative["disable_draft_cudagraphs"] is True
 
 
@@ -912,16 +987,19 @@ def test_a_profile_is_one_config_per_platform():
 
 def test_no_profile_carries_another_platforms_environment():
     """A ROCm switch on an a100 or Metal record is a config that leaked."""
+    # Token -> the platforms it belongs to. CUDA_ keys belong to every CUDA
+    # platform (a100 and rtx3090 both run PyTorch's CUDA allocator).
     marker = {
-        "mi300x": ("ROCM", "AITER", "HIP_"),
-        "a100": ("CUDA_",),
+        ("mi300x",): ("ROCM", "AITER", "HIP_"),
+        ("a100", "rtx3090"): ("CUDA_",),
     }
     for profile_id, entry in registry._registry()["profiles"].items():
         for platform, record in entry["variants"].items():
             for key in record.get("env") or {}:
-                for owner, tokens in marker.items():
-                    if owner == platform:
+                for owners, tokens in marker.items():
+                    if platform in owners:
                         continue
+                    owner = "/".join(owners)
                     assert not any(tok in key for tok in tokens), (
                         f"{profile_id}/{platform} sets {key}, which belongs to {owner}"
                     )
@@ -1008,7 +1086,22 @@ def test_full_decode_graphs_cover_the_largest_speculative_batch():
                 )
             else:
                 source_note = f"the pinned {capture}"
-            needed = (k + 1) * max_num_seqs
+            if schedule:
+                # Dynamic speculation: the largest decode batch is the
+                # largest (k+1) x batch over the schedule's inclusive
+                # ranges (capped at max_num_seqs), not the static k on
+                # every sequence (qwen38fn-nvfp4-4 2026-09-07: k=2 up to 8
+                # running, k=1 above -> max(3 x 8, 2 x 32) = 64).
+                needed = max(
+                    (entry[2] + 1) * min(int(entry[1]), max_num_seqs)
+                    for entry in schedule
+                )
+                static_upto = max_num_seqs
+                covered = max(int(entry[1]) for entry in schedule)
+                if covered < max_num_seqs:
+                    needed = max(needed, (k + 1) * static_upto)
+            else:
+                needed = (k + 1) * max_num_seqs
             if (profile_id, platform) in _CAPTURE_BAND_EXEMPT:
                 band, why = _CAPTURE_BAND_EXEMPT[(profile_id, platform)]
                 assert capture >= (k + 1) * band, (
@@ -1148,8 +1241,7 @@ def test_quantized_main_kv_is_an_explicit_validated_choice():
     through the engine's own kv_cache_dtype. glm52-q2k-4/a100 (fp8 at
     131072: 65.8 GiB of Q2K weights per 80 GB rank leave no room for bf16
     KV, operator-approved 2026-08-30) is covered by the same rule through
-    its note. Draft-model KV (DSpark TurboQuant) is exempt everywhere
-    because rejection sampling verifies drafts against the target.
+    its note. Draft-model KV follows the same FP8-only quantization policy.
     """
     rec = registry._registry()["profiles"]["qwen38fn-fp8-8"]["variants"]["rtx3090"]
     assert rec["engine"]["kv_cache_dtype"] == "fp8"
@@ -1181,7 +1273,7 @@ def test_every_a100_profile_carries_the_host_kv_tier():
     config, because their group specs are not verified to resolve
     all-uniform on their own.
     """
-    # Every a100 record carries the tier (the glm53 records joined on
+    # Every a100 record carries the tier (the glm53f records joined on
     # 2026-09-03 once the connector handled per-group block ratios).
     tier_pending: set[str] = set()
     seen = 0
@@ -1198,7 +1290,7 @@ def test_every_a100_profile_carries_the_host_kv_tier():
         assert transfer["kv_role"] == "kv_both", profile_id
         extra = transfer["kv_connector_extra_config"]
         assert extra["host_tier_gb_per_rank"] > 0, profile_id
-        if entry["source"] in ("glm52-vision", "glm53-flash-nvfp4"):
+        if entry["source"] in ("glm52-vision", "glm53f-nvfp4"):
             assert extra["enable_cross_layers_blocks"] == "True", profile_id
     assert seen == 9, "expected all nine A100 variants to be checked"
 
@@ -1243,3 +1335,67 @@ def test_mi300x_glm52_and_dsv4_profiles_carry_the_host_kv_tier():
         else:
             assert "enable_cross_layers_blocks" not in extra, profile_id
     assert seen == 7, "expected three GLM and four DSV4 MI300X variants"
+
+
+def test_metal_tier_profiles_carry_the_nvme_kv_tier():
+    """The issue #19 Metal records declare the NVMe-backed tier.
+
+    Unified memory makes a host-RAM tier meaningless on Metal (staging
+    bytes and KV-pool bytes are one physical pool), so these records use
+    nvme_tier_gb_per_rank, never host_tier_gb_per_rank. dsv4-xxs-1 gets
+    the packed slab via the is_dsv4 gate; the hybrid/multi-group records
+    force it with enable_cross_layers_blocks.
+    """
+    tiered = {
+        "dsv4-xxs-1": False,
+        "qwen38-q2kxl-1": True,
+        "muse-kdyn-1": True,
+    }
+    seen = 0
+    for profile_id, needs_cross_layers in tiered.items():
+        record = (
+            registry._registry()["profiles"][profile_id]
+            .get("variants", {})
+            .get("metal")
+        )
+        assert record is not None, profile_id
+        seen += 1
+        transfer = record["engine"]["kv_transfer_config"]
+        assert transfer["kv_connector"] == "HostTierConnector", profile_id
+        assert transfer["kv_role"] == "kv_both", profile_id
+        extra = transfer["kv_connector_extra_config"]
+        assert transfer["kv_connector_module_path"] == (
+            "vllm.distributed.kv_transfer.kv_connector.v1.metal_host_tier_connector"
+        ), profile_id
+        assert extra["nvme_tier_gb_per_rank"] > 0, profile_id
+        assert "host_tier_gb_per_rank" not in extra, profile_id
+        if needs_cross_layers:
+            assert extra["enable_cross_layers_blocks"] == "True", profile_id
+    assert seen == 3, "expected the three issue-#19 metal records"
+
+
+def test_no_metal_profile_uses_a_host_ram_tier():
+    """host_tier_gb_per_rank on a metal record would silently rebuild the
+    pinned-RAM tier on unified memory - the config the NVMe tier exists
+    to prevent."""
+    for profile_id, entry in registry._registry()["profiles"].items():
+        record = entry.get("variants", {}).get("metal")
+        if record is None:
+            continue
+        transfer = record["engine"].get("kv_transfer_config")
+        if transfer is None:
+            continue
+        extra = transfer.get("kv_connector_extra_config", {})
+        assert "host_tier_gb_per_rank" not in extra, profile_id
+
+
+def test_glm53f_8_is_tp4_dp2_with_replicated_moe():
+    """Operator 2026-09-10: production is always c8+, so the 8-GPU GLM-5.3
+    record runs two TP4 replicas. Each replica keeps the full expert set
+    (data_parallel_replicate_moe) - the default DP flattens the MoE across
+    all eight ranks and all-gathers every MoE layer across replicas."""
+    plan = resolve("glm53f-nvfp4-8", "a100", 8, None)
+    assert plan.engine["tensor_parallel_size"] == 4
+    assert plan.engine["data_parallel_size"] == 2
+    assert plan.engine["data_parallel_replicate_moe"] is True
+    assert plan.engine["enable_expert_parallel"] is False

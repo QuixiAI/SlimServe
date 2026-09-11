@@ -1,5 +1,1016 @@
 # SlimServe Optimization Status
 
+## 2026-09-11 - Native quantized prefill GEMM on Metal; FP8-KV directive state; two walls found
+
+- Directive (operator): CT weights stay in native quantized form ALWAYS -
+  no resident bf16 copy, no per-call dequant copies. Executes the recorded
+  follow-up from UPDATE 56 ("native quantized-GEMM prefill via qgemm_sm")
+  and backlog item #1.
+- Baseline: qwen38-nvfp4-1/metal loaded 76.3 GiB for a 21.8 GiB checkpoint
+  (bf16 materialized for M > 8), capping the KV pool at 18.06 GiB and
+  blocking the model-default 262144 context; the per-call escape
+  (CT_DEQUANT=call) crashed the engine mid-262k-prefill (2026-09-10).
+- Change: qgemm_nvfp4_planar + qgemm_fp8ch
+  (csrc/.../quantization/qgemm/qgemm_planar.metal) - llama.cpp classic
+  64x32 simdgroup-MMA geometry (moe_mm_id skeleton) with the qgemv
+  campaign's measured-winner decode bodies (select-free E2M1/E4M3 bit
+  constructs; NVFP4 group scale folded pre-MMA with the exact 2^22
+  rebias, FP8ch 256*WS[row] in the epilogue). Host ops grew a batch>8
+  branch; the Python kernel classes route EVERY M natively and the
+  materialize/per-call defaults are gone (VLLM_METAL_CT_DEQUANT=once is
+  a diagnostic-only escape; a stale .so fails loudly; a misaligned layer
+  materializes itself alone with a warning).
+- Correctness: float64 oracle 29/29 (tests/kernels/test_metal_ct_gemm.py:
+  both formats, K = 5120/17408, N/M tails, lm_head-class N, prefill width
+  M=2176, repeat-call bit-stable, GEMV band untouched). Live: registered
+  profile boots at 24.93 GiB packed-only (vision tower included), full
+  24 GiB pool granted (299,593 tokens bf16 / 576,945 fp8), and the seeded
+  "2+2" probe answers '4' through the native GEMM (bf16 KV).
+- Throughput: NOT re-pinned yet - the gate's bench legs mis-invoked the
+  harness (missing --source) and the 262k needle hit the SDPA wall below.
+  Decode expectation is neutral (decode never touched bf16); the 2500x64
+  prefill leg must be measured before comparing to the 08-27 pins.
+- Decision: RETAINED (directive). Follow-up levers: qgemm_sm-style
+  split-K twin for M in [9,32]; Metal-4 mpp::tensor_ops variant on M5.
+
+### Wall 1: dense/GQA deep-context prefill (blocks 262k on this profile)
+- metal_attn prefill is a per-request torch-SDPA loop; a 254,881-token
+  needle drove the box to memory exhaustion (compressor spiral, engine
+  wedged in MPSStream::copy_and_sync; sample in perf/results/2026-09-11/
+  nvfp4-native-gemm/). O(ctx)-shaped SDPA score tensors in ever-growing
+  shapes are the bomb - independent of KV dtype and of the GEMM work,
+  and the likely unstated reason for the old 32768 cap. max_model_len
+  stays 262144 per the default-context policy, with the profile note
+  stating the open gate: deep-context prefill needs a flash-style
+  memory-bounded attention (prefill_fa-class) wired into this backend
+  before the 262k needle can pass.
+
+### Wall 2: FP8-KV directive state on Metal (operator 2026-09-11)
+- dsv4-xxs-1: fp8_ds_mla, already compliant.
+- qwen38-nvfp4-1: fp8 REVERTED to bfloat16 with a blocker note - under
+  fp8 the model generates as if the prompt were empty on BOTH weight
+  paths while bf16 answers '4' (isolation legs in perf/results/
+  2026-09-11/nvfp4-native-gemm/parity_*). The SDPA path does call
+  kv_cache_gather_range_fp8 with layer scales, so the fault is in the
+  fp8 scatter/gather or scale application at this geometry (GQA 24/4,
+  head_dim 256, partial rotary; the unit roundtrip covers dim 64 only).
+- qwen38-q2kxl-1, muse-kdyn-1: fp8 REVERTED to auto with blocker notes -
+  first request dies with "quixicore(metal): unsupported dtype Byte"
+  (fused GDN / muse decode paths read the cache as bf16).
+- glm52-xxs-1: declared fp8 for its eventual bring-up (profile is
+  plan-time gated not-ready on Metal).
+- Cross-box follow-ups (their own boxes): mi300x/a100 records still on
+  auto (glm52-q2k-*, k3-xxs-*, dsv4-q4ktail/mxfp4 a100, qwen38 mi300x,
+  glm53f-nvfp4-*).
+- Raw artifacts: perf/results/2026-09-11/nvfp4-native-gemm/.
+
+## 2026-09-10 - FP8-only KV quantization and vision on NVFP4 Metal
+
+- Operator policy: remove TurboQuant from every profile, including draft KV;
+  FP8 is the official KV quantization. Preserve existing unquantized caches.
+  Enable vision on all profiles whose source supports images.
+- Changes: remove `qwen38-nvfp4-1-tq`; replace the three shared DSpark source
+  defaults with FP8; enforce the cache and vision policies at plan resolution
+  and launch, including target/draft overrides and inherited environment.
+  The NVFP4 Metal profile now loads its vision tower. Add torchvision 0.28.0
+  alongside torch 2.13.0 to the Metal requirements.
+- Metal implementation: preserve DSV4's trained SWA draft adapter while
+  replacing its cache with FP8 E4M3. The new byte-cache store and range gather
+  carry physical page strides and 64-bit addresses. SDPA uses an explicit
+  zero-value sink column to preserve the learned attention-sink denominator.
+  Padded draft pages are supported; target MLA keeps `fp8_ds_mla`.
+- Rejected bring-up: removing the draft backend alone selected the target MLA
+  context insertion and failed on the missing Metal fused insertion op.
+  The FP8 draft adapter fixes that route. Initial vision startup lacked
+  torchvision; adding the matching dependency fixes processor construction.
+- Checks so far: 167 focused tests pass, one optional large-address test skips;
+  eight native FP8 store/gather/attention tests pass on the final binary.
+  All four compatible profiles pass live smoke: DSV4 text, Muse/Qwen GGUF/
+  Qwen NVFP4 text and images. The first long-context marker leg failed before
+  any restore: plant-1 returned the correct phrase inside reasoning with no
+  answer content (29 tokens, normal stop). This is retained as a failed chat
+  quality check, not accepted as successful recall or attributed to NVMe.
+- Replay diagnosis: the first four-reader replay copied 236 slabs with zero
+  byte-verification failures, but two generated sequences differed. A second
+  run reproduced output differences between GPU-only controls with identical
+  cached layer bytes. This confirms the cross-batch stochastic replay
+  limitation already recorded below; it does not establish tier corruption.
+  A diagnostic with `VLLM_QC_MLA_PREFILL_FA_MMA=0` also captured all four
+  restored prefixes immediately before the model read them: every layer page
+  matched its GPU-cache control, across all six groups and 170 layers. The
+  12 before-forward snapshots and byte comparison are retained under
+  `cache-diag-fa0/` and `cache-diag-fa0-comparison.json`. Batching still changed
+  logits and sampled sequences with that switch, so disabling one attention
+  kernel is not a production fix. Both replay failures remain failures of
+  that exact-sequence diagnostic; no cross-batch determinism claim is made.
+- Removed the temporary worker snapshot instrumentation. The registered
+  profile with normal attention dispatch completed exact 1000/2000-token
+  samples: c1 **17.585 tok/s** (113.732 s, 6,640 draft tokens); c8
+  **21.770 aggregate tok/s** (734.959 s, 47,395 draft tokens). All nine
+  responses / 18,000 output tokens pass counts, non-degeneracy and clock
+  checks. One sample per concurrency after eight-token warmups; seed 42,
+  API sampling defaults, no returned logprobs. This is comparable throughput
+  to the historical baseline, not a demonstrated speedup. Raw benchmark
+  samples and `throughput-summary.json` remain valid even though the combined
+  run's later recall setup failed. Wrapper: `qualify_fp8.py`; raw run:
+  `dsv4-fp8-final/`.
+- Default-sampling long recall setup reproduced the same plant-1 empty final
+  answer (29 tokens) after the full benchmark, again before eviction. Retain
+  this repeatable sampled-chat quality limitation. No empty answer or phrase
+  inside reasoning is accepted as recall success. A separate deterministic
+  marker gate with explicit `--acceptance-temperature 0` PASSED all four
+  plants and **12/12 concurrent recalls across three reset/restore rounds**.
+  Each reader restored 9,472 tokens (minimum required 9,296); all 804 restored
+  block-byte checks matched. Observed request latency was 8.39-17.36 s,
+  including verification; this is not a throughput measurement. That option
+  affects only marker chat, leaving benchmark sampling unchanged. Raw:
+  `dsv4-fp8-greedy-recall/`. This qualifies deterministic cache reuse; it
+  does not erase the default-sampling chat failure or establish arbitrary
+  cross-batch sampled-sequence equality.
+- Replay top-k logprob requests are cleared before timed benchmarks so
+  diagnostics cannot silently change the TPS workload. Final CPU regression
+  suite: 188 passed, one skipped, including all SlimServe tests and the Metal
+  tier/index/IO/planner tests. Final source formatting was rebuilt successfully;
+  all eight native FP8 tests pass on the rebuilt library. Applicable hooks
+  pass; the existing repository-wide typos and markdownlint failures remain
+  excluded as recorded in `fp8-hooks-final4.log`.
+- Main integration: implementation commit `b47509dd1` merged with upstream
+  `d39e6a9fa` as `a4e6d637e` without conflicts. All 103 focused post-merge
+  checks pass, including the incoming DP configuration/routing tests and
+  Metal tier/native/policy regressions. The merged `qwen38-nvfp4-1` profile
+  reaches health in 25.16 s and answers text (`4`) and image (`Red`) probes
+  correctly; raw `fp8-merged-vision-smoke.json` and copied engine log are in
+  the same artifact directory. Other profiles' earlier live results remain
+  scoped to their recorded pre-merge snapshot.
+- Decision: retain the required FP8 policy and vision enablement. The tested
+  Metal profiles serve successfully, DSV4 has comparable measured throughput,
+  and deterministic long-history eviction/reuse passes. Preserve the sampled
+  chat and cross-batch replay limitations above; no universal output-quality,
+  maximum-context, crash-persistence, or other-platform qualification claim.
+- Baseline: the previous 2026-09-10 Metal qualification below used TurboQuant
+  for DSV4 draft KV (c1 16.455, c8 21.222 tok/s with tier enabled). Those
+  numbers remain historical and are not FP8 qualification. No CUDA/ROCm
+  hardware is present in this workspace; their changed draft settings require
+  on-box qualification before making performance claims.
+- Raw logs, commands, failed attempts and source/native hashes:
+  `perf/results/2026-09-10/main-integration/`.
+
+## 2026-09-10 - Integrate qualified Metal tier into current main
+
+- Merge parents: `32ea667de` (current main) and `0212334e6` (qualified Metal).
+- The independently developed tier implementations have different contracts:
+  Metal stores whole packed slabs with per-group window positions; CUDA/ROCm
+  stores group-aware rows in host RAM and optionally a third disk tier, with
+  host-resident main-KV rebindings. Keep each production implementation in its
+  platform module. Metal profiles explicitly select `metal_host_tier_connector`;
+  CUDA/ROCm continue selecting `host_tier_connector`. The Metal IO batch type
+  is separate because its zero operations address whole slabs.
+- Preserve both sets of index, connector, and IO regression tests. Linux
+  `O_DIRECT` tests skip on macOS; Metal file IO tests run here.
+- Integration validation: 188 tests pass, three platform-specific skips;
+  `qwen38-q2kxl-1` reaches health and passes text/image smoke through the
+  explicitly routed Metal tier. Commit hooks corrected existing type
+  annotations and formatting in conflicted main files; the Linux-only IO
+  symbol carries a macOS type-check suppression.
+- The prior exact-token qualification remains evidence for its recorded
+  snapshot. Integration checks and raw output are recorded under
+  `perf/results/2026-09-10/main-integration/`; no new TPS claim is made.
+
+## 2026-09-10 - Metal NVMe KV tier qualification complete
+
+- Decision: retain and ship the geometry-fixed candidate for the tested Metal
+  workloads, with the measured Muse c8 throughput tradeoff below. Correctness
+  and durability gates passed; the remaining optimization opportunity is
+  quantified, not a claim of zero tier overhead or maximum-context certification.
+- Candidate: `candidate-cache-geometry-checked` on `e6ef60edcd4309b4e4b51e96e344a2ecb29408fb`.
+  All 14 planned campaign phases finished by 2026-09-10 00:27 PDT. Independent
+  review passed against the unchanged runtime sources, harness and native
+  hashes before final documentation changes. No additional test rounds needed.
+- Platform: Apple M5 Max, 128 GiB, macOS 26.6.2 / 25G83; registered SlimServe
+  profiles and drafters. Exact completion workload: 1,000 input / 2,000 output
+  tokens, API/profile defaults and seed 42. Local ModelConfig/protocol audits
+  confirm effective temperature 1.0, top_p 1.0, top_k 0 for these three models.
+  No greedy sampling. Primary matrices use c1/c8, three repeats per tier, with
+  per-repeat warmups; Muse confirmation reverses order to off/on, three c1
+  repeats and one additional c8 batch per tier.
+- Validation: 202 targeted tests passed, two skipped; unchanged native code
+  also passed the 19-case gather/store qualification including >32-bit address
+  cases. All five machine-compatible registry profiles passed smoke with
+  positive registered-drafter activity, including text/image for Muse and GGUF
+  Qwen and text for DSV4 and the two language-only NVFP4 profiles. The original
+  Qwen failure workload and DSV4/Muse reset workloads passed 36/36 recalls.
+  Natural Qwen pressure added 12/12 correct recalls after 480,000 distinct
+  filler input tokens over three rounds. All 48 readers completed; 12,402
+  restored-block checks across the four acceptance runs had zero byte mismatches.
+- Performance: all 184 timed responses (368,000 output tokens, 44 timing
+  samples) passed exact counts, positive draft work, clock/arithmetic and
+  anti-degeneracy checks. Primary on/off medians in tok/s:
+
+  | Profile | c1 on | c1 off | c8 on | c8 off |
+  | --- | ---: | ---: | ---: | ---: |
+  | Qwen GGUF | 16.101 | 15.995 | 41.765 | 39.258 |
+  | DSV4 XXS | 16.455 | 13.200 | 21.222 | 15.958 |
+  | Muse | 8.236 | 8.757 | 13.464 | 14.475 |
+
+- Muse confirmation: c1 on 9.081 versus off 9.031 tok/s median (+0.56%), with
+  identical text and 17,872 draft tokens in all six responses. The earlier
+  c1 slowdown did not reproduce. C8 on 13.944 versus off 15.395 aggregate
+  tok/s (-9.42%); this confirms a workload-level cost consistent with the
+  primary -6.99% result. The enabled batch used 119,552 versus 110,608 draft
+  tokens (+8.09%); five of eight final texts match exactly, three differ.
+  Draft processing was 104.19 versus 106.42 draft tokens/s (-2.10%). These
+  work counts explain why identical output-token budgets need not be identical
+  inference work, but do not prove the entire TPS difference is caused by
+  sampling or exclude an I/O cost. Retain with the observed 7-9% Muse c8
+  throughput tradeoff; future tuning should measure restore/admission batching
+  and speculative acceptance before changing kernels. Do not describe this
+  candidate as performance-neutral for Muse c8.
+- Scope/limits: long-history restore tests cover approximately 9-13K input
+  tokens, not the profiles' complete 131K/262K context limits or other hardware.
+  This qualifies cache eviction/reuse within a running server, not crash or
+  power-loss persistence. The host had variable unrelated CPU/VM load; later
+  phases sampled Metal compute clients every 15 s and detected no foreign
+  compute overlap. DSV4/Qwen's favorable on/off differences are observations,
+  not causal tier speedup claims. Contended and sleep-interrupted attempts
+  remain quarantined and excluded; all retained exact-token clocks pass.
+- Raw evidence: `perf/results/2026-09-08/nvme-tier-ship/`, especially
+  `geometry-qualification-review.json`, `geometry-release-assessment.json`,
+  `muse-primary-work-audit.json`, `muse-confirmation-work-audit.json`, all
+  `geometry-*` campaign logs/responses, and `tests-geometry-fixed.txt`.
+  `qualification-geometry-campaign.py` and `geometry-extra-phases.json` retain
+  the exact commands. Final documentation and runtime are archived as
+  `candidate-ship-qualified-metal.{zip,json}`; runtime hashes are compared
+  against the tested candidate separately from the two changed notebooks.
+
+- Commit preparation: repository hooks added required copyright headers and
+  formatting. Added explicit type annotations and the required `regex` import
+  in the benchmark harness. Python runtime ASTs match the qualified snapshot
+  after excluding type annotations/checking imports and the regex import;
+  native C++ tokens and the built library hash match exactly. The 27 focused
+  tests pass; all 184 saved completion responses pass both regex engines, and
+  all four acceptance runs produce identical restore-gate results. Remaining
+  applicable pre-commit checks pass, including mypy, Ruff, clang-format,
+  secret scanning and import/license checks. The `typos` and
+  `markdownlint-cli2` hooks are skipped for this commit because they report
+  34 existing spelling tokens and 348 diagnostics in existing notebook content;
+  baseline audits and complete hook logs are retained in the same artifact
+  directory. No inference arithmetic or cache behavior changed in preparation.
+  Commit-ready archive: `candidate-ship-commit-ready.{zip,json}`.
+
+## 2026-09-08 - Metal NVMe KV tier shipping gate (history; completed above)
+
+- Scope: issue #19; `dsv4-xxs-1`, `muse-kdyn-1`, `qwen38-q2kxl-1` on
+  Apple M5 Max / 128 GiB, plus registry-discovered Metal regression profiles.
+- Baseline: uncommitted NVMe backend at parent `e6ef60edc`; 105 targeted tests
+  passed, but a single transfer larger than the 512 MiB staging budget hung
+  before enqueue. Connector shutdown only flushed, leaving its IO thread and
+  open unlinked file alive until process exit. Historical acceptance ended at
+  BOOT_UP; the separate reset cycle accepted empty answers.
+- Change: split offload/restore batches within the staging budget, acknowledge
+  only the final chunk, drain and close on connector shutdown, and reject
+  zero-progress IO. Darwin file preallocation now uses the SDK's F_PREALLOCATE
+  value (42), absent from CPython's fcntl constants; setup errors close the FD.
+  Nocache failures on Darwin are fatal rather than silently consuming cache RAM.
+- Optimization hypothesis: adjacent copy/file operations can be coalesced, and
+  the synchronous drain must yield instead of competing with the IO thread for
+  the GIL. These changes preserve FIFO slot reuse and byte identity.
+- Synthetic measurement: 128 x 64 KiB, MPS, one warmup plus three repeats,
+  sequential old/new runs. Old offload 3.075-4.320 s (median 3.665), restore
+  3.548-3.851 s (median 3.838); new offload 0.877-1.186 ms (median 0.973),
+  restore 2.124-3.488 ms (median 2.172). All roundtrips byte-identical. This
+  measures the backend's synchronous drain, heavily affected by old busy
+  polling; it is NOT SSD hardware bandwidth or an end-to-end serving speedup.
+  The earlier 512-row exploratory run overlapped tests and is excluded.
+- Correctness: 118 targeted tests passed after adding oversized mixed-batch,
+  completion-count, cleanup, partial/zero-progress IO, and acceptance-gate tests.
+- Live gate: the initial DSV4 boot stalled in the weight-residency sweep before
+  tier initialization. Sampling found MPS synchronize waiting; the host had
+  ~68 GiB compressed pages and ~16 GiB swap. Bounded the sweep reductions to
+  16 MiB input / int32 with an inner-loop fence (the former int64 reduction and
+  outer-tensor-only fence could queue large temporaries). The retry completed
+  its first sweep in 145.94 s but compression remained high; validation ongoing.
+- Acceptance harness: `benchmarks/benchmark_kv_tier_serving.py` uses registered
+  plans/drafters, saves raw responses, rejects empty/truncated answers, checks
+  marker recall across concurrent turns, requires completed tier restores, and
+  offers reset eviction or unique filler pressure. Separate `--tier off` runs
+  remove only the transfer config for an explicit diagnostic comparison.
+- Decision: code fixes and synthetic optimization retained pending live gates;
+  NOT ready to ship. No new stable serving baseline is claimed.
+- Follow-up live evidence: DSV4 reached health after 447.6 s and passed text
+  smoke with the registered DSpark/TurboQuant drafter. The sweep still did not
+  converge under host memory pressure; the weight residency set then pinned
+  93.73 GiB. Muse and GGUF Qwen failed at packed-cache reshape: the allocator
+  confused logical K/V-first shape with physical blocks-first layout. Fixed
+  page-size calculation and added a physical-page isolation test. NVFP4 smoke
+  was falsely rejected before startup because the harness compared against the
+  source drafter instead of the registered platform drafter; fixed that check.
+- Native correctness follow-up: Metal KV scatter ignored packed physical block
+  strides while attention/gather already used them. Two sentinel-page tests
+  failed against the original binary. The shader now receives a 64-bit physical
+  stride (including packed layers/padding), with both host launch sites updated.
+  Rebuilt `_quixicore_C` and the metallib; both tests pass. Combined suite:
+  133 passed, two platform/large-allocation skips. A 768 MiB MPS roundtrip also
+  passed through the 512 MiB staging budget (correctness probe; no serving TPS).
+- Raw artifacts: `perf/results/2026-09-08/nvme-tier-ship/` (saved baseline modules,
+  `io-{before,after}-controlled.json`, `tests.txt`, startup samples, smoke logs).
+- Further live failures: `smoke-native.json` rejected all four Muse/Qwen
+  profiles. Qwen GGUF reached a CUDA-only Triton Mamba alignment launch on
+  Metal; NVFP4 variants hit the DS convolution-layout guard. Added a native
+  Metal alignment planner and state copy matching the CUDA implementation,
+  supporting SD/DS convolution layouts, speculative offsets, packed page
+  strides, and in-place shifts. Eight GPU/reference checks passed, including
+  the optional >32-bit KV address check (`align-oracles.txt`). Live Qwen
+  validation remains pending; no throughput claim for this new path.
+- Muse's stricter non-streaming probe was interrupted after its initial answer
+  continued generating without completing (`muse-accept-probe/`). Inspection
+  found two more stale writes: fused target and DFlash used `muse_kv_store`,
+  which assumed contiguous K then V. Both now use the shared 64-bit strided
+  scatter; the obsolete shader is removed. Rebuild/live retest in progress.
+  Streaming API errors now propagate, and the benchmark rejects degenerate
+  exact-count output and requires positive draft-token deltas. Nine harness
+  gate tests passed (`harness-error-tests.txt`).
+- Fused Muse retest: rebuilt library passed seven GPU tests (one optional
+  large-allocation skip); `smoke-aligned` returned coherent text and image
+  responses. Its streaming smoke still concatenated reasoning and final
+  content, so this remains preliminary. Smoke now saves the complete
+  non-streaming response and requires nonempty, untruncated final content.
+  The corresponding reasoning-only false-positive regression passes.
+- Missing Mamba destination state also reproduced a silent abandoned load
+  (`state-target-before.txt`). It now uses the same failure/recompute path as
+  missing attention pages and clears any staged operations. Updated Python
+  suite: 133 passed, one skip (`tests-latest.txt`); strict harness: ten passed
+  (`harness-final-tests.txt`). Qwen live checks and exact-token comparisons
+  are still outstanding.
+- `smoke-aligned` exposed GGUF Qwen generating only `!`; the opt-in
+  `VLLM_METAL_FINITE_PROBE=1` module-output diagnostic stopped at
+  `language_model.model.layers.31.self_attn.attn` (22 x 6144 bf16).
+  `_update_hybrid_attention_mamba_layout` unconditionally collapsed the
+  packed stride after allocation. The new hybrid sentinel test failed before
+  and passes after preserving already page-local strides; nine packing tests
+  passed, one skip (`hybrid-stride-{before,after}.txt`). Strict live rerun
+  uses `smoke-strict/`, with diagnostics disabled for the real workload.
+- NVFP4 image rejection in `smoke-aligned` was a harness error: both Metal
+  variants intentionally register `language_model_only=true` (documented
+  unvalidated compressed-tensors vision path). Smoke now respects this
+  platform setting and tests text only there; Muse and GGUF Qwen still
+  require both text and image. It does not enable or claim NVFP4 vision.
+- Strict live matrix PASSED for all four smaller compatible profiles:
+  GGUF Qwen `4` / `Red`, Muse `4` / `red`, both text-only NVFP4 variants `4`.
+  Registered drafters and TurboQuant settings intact; complete API responses
+  and logs in `smoke-strict.json` / `smoke-strict/`. Combined current tests:
+  143 passed, two skips (`tests-current.txt`), Ruff and diff checks clean.
+  These are smoke results, not the eviction or performance qualification.
+  Four-session, three-round forced-eviction acceptance is now running for
+  Muse and GGUF Qwen in `acceptance-full/` with restore-byte verification on.
+- `acceptance-full` FAILED before the first reset on both models: the
+  exact one-token checkpoint reached Triton's `_bias_kernel` on Metal.
+  Implemented native Metal `v2_logit_bias` for allowed tokens, bias, and
+  minimum-token EOS suppression, keeping decisions GPU-resident. Three
+  CPU-oracle tests pass, including repeated request rows, sentinel rows,
+  padded logits, min-length boundary, and the full 1024-token allowlist
+  (`logit-bias-tests.txt`). Built native artifacts (`build-logit-bias.log`).
+  Acceptance now preflights this sampler path before session setup; the
+  full retry is `acceptance-sampler/`. Still no serving performance claim.
+- Additional capacity correctness gate: six-slot CPU reproducer proved that
+  a new offload could reclaim an already-planned restore source, then write
+  it before the read in the same worker batch. Trajectories now retain read
+  references through worker completion; concurrent readers and cancellation
+  of issued reads are covered. Pending readers also protect window pages and
+  state-tail replacement. 45 index/connector/harness tests pass
+  (`read-pin-{before,tests}.txt`).
+- `acceptance-sampler` passed the minimum-token preflight but hit a 404 on
+  local cache reset. The harness now explicitly enables the loopback dev
+  endpoint for reset acceptance and requires `success=true`, driving queued
+  snapshot releases before retrying. The new full run is `acceptance-pinned/`
+  for Muse, GGUF Qwen, and DSV4, four sessions and three eviction rounds.
+- Long-context inspection found Muse cleared only the attention kernel's
+  inherited window, leaving `Attention.sliding_window=2048` for its 13 global
+  NoPE layers. The allocator consequently advertised all 57 target/draft
+  layers as sliding-window caches. Constructor regression failed before;
+  planner and kernel now both retain global history. The tier explicitly
+  selects a FullAttentionSpec group as primary even if windows are listed
+  first. 36 constructor/index/connector tests pass (`muse-policy-after.txt`).
+- `acceptance-pinned` Muse completed all 12 recalls with byte parity, but this
+  is NOT a qualifying pass: most restores were only 48 tokens of common
+  chat framing. Partial prefix hits adopted an existing lineage whose occupied
+  suffix discarded each divergent session's new hashes. Saves now fork on a
+  partial hit or concurrent writer, retaining both branches; 36 index/connector
+  tests pass (`branch-tests.txt`). Appending to an unbranched inactive lineage
+  still reuses it. The acceptance gate now requires unique completed readers
+  and restoration of the original prompt within one primary block, minimum
+  128 tokens, rejecting the observed boilerplate-only restores. Thirteen
+  harness tests pass (`depth-gate-tests.txt`). Muse needs a new full run with
+  these fixes; the current queued Qwen/DSV4 run remains useful trial evidence.
+- Qwen's `acceptance-pinned` run passed all 12 concurrent recalls with byte
+  verification clean. Retrospective depth audit confirms 2,400-3,200 tokens
+  restored for every request, exceeding the 2,220-token minimum from the
+  original 3,020-3,080-token prompts and 800-token primary blocks. The audit
+  is `acceptance-pinned/qwen38-q2kxl-1/restore-depth-audit.json`. Latest CPU
+  regression run: 115 passed (`tests-qualification-cpu.txt`). DSV4 is loading;
+  Muse's final policy/lineage run and exact-token on/off comparisons remain.
+- DSV4 reached health in 470 s, but session setup failed before eviction:
+  plant 2 asked for `silver maple river` and returned `silver maple tree`,
+  with coherent reasoning that also substituted the phrase. This is a failed
+  correctness gate, not a restore pass. A matched tier-off control is needed
+  to distinguish model/prompt behavior from cache-layout corruption. Raw:
+  `acceptance-pinned/dsv4-xxs-1/plant-2.json`. The latest complete targeted
+  suite passed 152 tests, two skips (`tests-qualification.txt`). Muse's fresh
+  history-policy run is `acceptance-muse-history/`.
+- Muse's corrected global policy exposed a fused-decoder metadata defect:
+  all local layers shared one block table and all global layers another,
+  despite allocation across 12 independent groups. The first planted request
+  degenerated into repeated `to` tokens (`acceptance-muse-history/`). Fused
+  dispatch now receives each layer's actual group table, lengths, and slots,
+  reusing prepared views within a group. Its auxiliary-output variant also
+  distinguishes single-request verify rows from independent decode requests
+  before choosing the shared-KV attention kernel. Rebuilt native library;
+  three policy/group tests passed (`muse-group-tests.txt`). Fresh full run:
+  `acceptance-muse-groups/`.
+- The first group-metadata retry rejected stride-zero broadcast tables in a
+  newly added native validation check. Corrected that check to allow the
+  supported row stride. A two-layer native oracle now exercises distinct
+  packed cache groups at 1,200-token context, both independent requests and
+  speculative row expansion; outputs match the CPU reference and all cache
+  pages match exactly. Fused state can be explicitly released before MPS
+  teardown. Nineteen native/policy/harness tests pass
+  (`muse-native-group-oracle.txt`); final rebuilt retry is
+  `acceptance-muse-groups-final/`.
+- Muse's final rebuilt run PASSED all 12 concurrent recalls, restoring
+  2,048-4,032 tokens per request (required minimum 1,588), with no byte
+  mismatches. Round latency ranges: 19.96-24.71 s, 8.10-9.96 s, 7.07-7.91 s.
+  These are instrumented correctness timings, not serving benchmarks. Raw:
+  `acceptance-muse-groups-final/muse-kdyn-1/acceptance.json` and server log.
+  The matched DSV4 tier-off control is `dsv4-off-control/`.
+- A final reader-lifetime regression also reproduced state-slot recycling
+  when a trajectory converted through the stateless finish path while a
+  restore still held its state snapshot. That conversion now waits for the
+  readers, matching ordinary state-tail replacement. The before failure is
+  `state-conversion-before.txt`; the regression suite is
+  `state-conversion-tests.txt`. This guard does not affect Muse's stateless
+  trajectories or the normal HMA finish path exercised by Qwen.
+- Startup experiment pending: request the existing weight residency set
+  before the bounded sweep. Previously both measured DSV4 starts spent
+  roughly 380 s sweeping still-pageable weights, then pinned them. Keeping
+  earlier pages resident while touching later tensors should prevent that
+  rotation. The current tier-off control was already loaded and uses the
+  old order; the next DSV4 tier-on retry will measure this one startup change.
+  No steady-state performance win is claimed yet.
+- DSV4 tier-off control reproduced all three planted messages exactly,
+  including the 950-token reasoning and incorrect `silver maple tree`
+  answer for session 2. This excludes NVMe as the cause of that failure;
+  the unchanged phrase-copying task is not reliably followed by this model.
+  Byte-identical message audit: `dsv4-off-control/paired-output-audit.json`.
+  Added an explicit `--marker-format quoted` variant for a stricter copying
+  instruction while retaining the original plain case and its failed result.
+  Next tier-on qualification uses that variant and the pin-first startup.
+- Pin-first DSV4 reached health in 88 s versus 443 s (tier-off control) and
+  470 s (tier-on), with model loading still around 40 s. This is a measured
+  startup improvement only, pending completion of the same registered
+  profile's correctness and throughput gates. Raw:
+  `acceptance-dsv4-quoted/dsv4-xxs-1/server.log`.
+- The quoted copying task also failed before eviction (DSV4 dropped
+  `lantern` from the first phrase). Retained that failure and added a direct
+  replay oracle: prime GPU cache, record seeded 128-token completions for
+  four concurrent prompts, reset, and require byte-identical generated text
+  after each of three NVMe restore rounds, alongside restored-depth and
+  cache-byte checks. This measures cache correctness independently of the
+  model's unreliable phrase copying. Raw prompt IDs, controls, and each
+  replay are saved. Current run: `acceptance-dsv4-replay/`; candidate tests:
+  `tests-candidate-replay.txt`.
+- DSV4 replay round 0 restored all four 1,280-token prefixes with exact
+  source/destination bytes (35 pages each), but three generated sequences
+  differed from the concurrent GPU-cache controls; one matched all 128
+  tokens and another matched 621 characters before diverging. This is NOT
+  a passing replay result. The next run repeats the GPU-cache controls
+  before any eviction and records top-20 token logprobs to distinguish
+  control instability, sampling/order sensitivity, and restore-state errors.
+  Raw: `acceptance-dsv4-replay/`; diagnostic: `dsv4-replay-stability/`.
+- The logprob diagnostic crashed before its controls: speculative accepted
+  token flattening still called Triton on Metal. Added the native ragged
+  gather, preserving padded source-row strides and untouched rejected rows.
+  Full selected-token IDs, logprobs/logits, and ranks match CPU in two tests
+  (`spec-logprob-tests.txt`); rebuilt native artifacts. Retry:
+  `dsv4-replay-logprobs/`. That interrupted startup took 170 s (weight load
+  58.5 s, residency request about 95 s, sweep 3.35 s), so pin-first startup
+  has measured 88-170 s, not a fixed 88 s, versus the old 443-470 s range.
+- Seeded control diagnosis: repeated GPU-cache requests changed their first
+  generated token with identical top-20 logprobs (maximum common-logprob
+  difference 0.000002), before any restore. The verifier dump established
+  seed 42 and the same first-token position, but the runner selected ordinary
+  Gumbel sampling for an all-prefill batch and inverse-CDF rejection sampling
+  when a neighbor had draft tokens. Metal speculative profiles now always
+  use their verifier, including zero-draft batches. A native regression with
+  the original routing produced tokens 55 versus 970 for the same request
+  alone/mixed; the corrected routing agrees. Fourteen sampler/logprob tests
+  passed; the rerun is `dsv4-consistent-sampler/`. Raw diagnosis:
+  `dsv4-replay-logprobs/`, `dsv4-sampler-dump/`, `sampling-routing-before.txt`.
+- Reduction hardening: added a threadgroup barrier between reading the
+  shared maximum and reusing that scratch for sums. The sparse 129,280-token
+  vocabulary oracle (offsets 0 and +/-20,000, shuffled request states) already
+  passed the old binary; this is a code-level race prevention, not a measured
+  cause of the live failure or a performance optimization. Native rebuilt;
+  retain only with final profile correctness/performance gates.
+- The corrected sampler routing made all four 128-token GPU-cache controls
+  repeat exactly. Restore round 0 again had byte-exact 1,280-token prefixes
+  and matching first-token probabilities, but three continuations diverged.
+  Subsequent inspection found a separate probability correctness defect:
+  MPS Gumbel's `output_processed_logits[req_indices, cols].copy_(processed)`
+  wrote an advanced-indexing temporary, leaving DSpark's persistent draft
+  distributions stale. Both scalar-column and per-row-column native tests
+  failed against the original path, including padded persistent strides.
+  Indexed assignment now writes the actual destination; 14 tests pass
+  (`draft-logits-{before,after}.txt`). The old-binary marker retry was stopped
+  after this discovery (`dsv4-marker-consistent/`); it is not a qualification
+  result. Prior phrase-copy errors must be reassessed with valid draft
+  probabilities, rather than attributed solely to model quality.
+- With the draft-probability fix, the original prompt still omitted a word
+  before eviction. A persistent registered DSV4 server then passed all 12
+  explicit-question probes: four phrases with short context, four with the
+  original random background, and four with ordinary prose. Added an explicit
+  `--marker-format question-last` variant: the phrase remains before the
+  background; only the copying question is repeated at the end, without
+  repeating the phrase. Raw: `dsv4-context-probe/`, server `dsv4-live.log`.
+  GPU-only 128-token replay controls still diverged at tokens 1, 2, and 92
+  under different scheduling (the fourth matched). Exact stochastic sequence
+  replay therefore remains a diagnostic, not evidence of NVMe corruption;
+  its failures are retained. No cross-batch determinism claim is made.
+- DSV4 question-last, 700 words: PASSED all 12 concurrent recalls across
+  three reset/restore rounds. Every restored prefix was 1,536 tokens, above
+  the 1,449-token minimum; all restored bytes matched. Instrumented request
+  latency 5.79-14.52 s is not a serving throughput result. Raw:
+  `dsv4-question-last-700/`; a four-session, three-round 4,000-word follow-up
+  is running on the same registered server.
+- The first 4,000-word run failed initial phrase 3 after reusing a shorter
+  session prefix. Isolation on the same server established: fresh 9,564-token
+  prompt, GPU-repeat, and full NVMe restore all returned the same correct
+  37-token response (9,472 tokens restored byte-exactly). Reusing a shorter
+  prefix on GPU instead produced the same incorrect 942-token response as
+  reusing it from NVMe, message-exact. This is a retained partial-prefix
+  model-quality/reproducibility limitation, not a tier transfer discrepancy.
+  Raw: `dsv4-long-isolation/`, `dsv4-partial-isolation/`. No claim of perfect
+  phrase accuracy under every prefill partition or stochastic trajectory.
+- DSV4 long acceptance with fresh session histories PASSED all 12 concurrent
+  recalls over three eviction rounds: every restored prefix 9,472 tokens,
+  required minimum 9,296; byte verification clean. Requests initially had
+  9,552-9,576 prompt tokens. Instrumented recall latency 8.29-15.68 s; no TPS
+  claim. An isolated cache namespace kept the previous short diagnostic
+  histories separate while allowing all sessions/rounds within the run to
+  share normally. Raw: `dsv4-long-fresh/`, same registered `dsv4-live.log`.
+  Next: Qwen natural eviction with 160,000 filler tokens per round, Muse
+  long-context recalls, and exact-token on/off matrices.
+- Pre-matrix candidate suite: 178 passed, two skips (platform/optional large
+  allocation), `tests-pre-matrix.txt`; archived 41 changed source/artifact
+  files plus native-library hashes in `candidate-pre-matrix.{zip,json}`.
+- Qwen natural eviction, round 0: PASSED all four concurrent recalls after
+  exactly 160,000 distinct filler prompt tokens (ten 16,000-token requests,
+  up to four submitted concurrently). Each history restored 12,800 tokens,
+  above the 12,063-token minimum, with byte verification clean. Initial
+  histories were 12,863-12,904 prompt tokens. Instrumented recall latency
+  38.83-49.64 s; filler request latency 198.6-840.7 s includes scheduler
+  waiting and is not a decode throughput benchmark. Round 1 also PASSED
+  all four recalls after another 160,000 filler tokens: each restored
+  12,800 tokens byte-exactly, with 32.39-49.77 s request latency. Every
+  restore carried 77 x 16,384,000-byte pages (about 1.17 GiB), split into
+  32/32/13-page chunks through the 512 MiB staging budget. The third and
+  final pressure round also PASSED all four recalls after another 160,000
+  filler tokens (480,000 total), again restoring 12,800 tokens byte-exactly;
+  final-round latency 28.12-42.21 s. Raw: `qwen-natural-pressure/qwen38-q2kxl-1/`,
+  including exact pressure responses and checkpointed acceptance.
+- Muse long acceptance PASSED all 12 recalls across three reset/restore
+  rounds: 9,152-9,408 tokens restored, minimum 9,005, byte verification clean.
+  Instrumented recall latency 7.31-12.59 s. Raw: `muse-long/`.
+- Exact-token candidate matrices (1,000 input / 2,000 output, c1/c8, three
+  repeats, registered sampling defaults, seed 42, active registered drafter)
+  completed for DSV4 and Muse. Median aggregate tok/s, tier on versus off:
+  DSV4 c1 18.114 / 16.965, c8 21.055 / 21.669; Muse c1 8.682 / 8.606,
+  c8 13.600 / 14.515. On/off c8 differences are -2.84% and -6.30%; sequential
+  run spreads overlap, so these are observed integration costs, not isolated
+  IO overhead or statistically established regressions. Raw exact responses,
+  positive draft counts, and clean clock-gap checks in `matrix-{profile}-{on,off}/`.
+  These longer sampling workloads are not directly comparable to historical
+  short/greedy results. Final profile smoke and Qwen matrix remain required.
+- Qwen matrix tier-on c1 produced three valid exact samples at 9.115, 9.028,
+  9.061 tok/s. The first c8 request group exceeded the 1,800 s HTTP deadline
+  while the engine continued generating (four of eight requests completed
+  before shutdown). No c8 TPS is accepted. The concurrency slowdown requires
+  attribution; a shorter c8 tier-off phase-profile diagnostic is running,
+  followed by the exact workload after the cause is isolated. Raw:
+  `matrix-qwen38-q2kxl-1-on/`, `qwen-c8-phase-off/`. Shipping gate remains open.
+- Qwen c8 phase diagnosis: tier-off 1,000/256 diagnostic completed at
+  13.561 aggregate tok/s with synchronization instrumentation (not a baseline).
+  Tier-on attribution showed target costs close to off but drafter costs
+  increasing from about 40 ms/call to hundreds of ms. The tier-on diagnostic
+  was stopped after attribution; its partial interval is not a performance
+  result. Raw: `qwen-c8-phase-{on,off}/`, including profiler snapshots.
+- The remaining DFlash context-write helper used advanced indexing and wrote
+  PAD_SLOT_ID=-1 into the last cache page. Native scatter now skips padded
+  slots and honors packed strides, sliced projections, and cache dtypes.
+  Three padding regressions failed before the change; 10 store/gather tests
+  passed afterwards with one optional large-allocation skip. Isolated writes
+  were byte-exact even above 2^31 offsets; four/32-row timings were sub-ms,
+  so this is NOT the explanation of the c8 slowdown. Raw:
+  `dflash-context-store-{before,after}.txt`, `qwen-context-write-probe.{py,json}`.
+- Benchmark failure preservation: completed peer responses now survive another
+  request timing out in `failed-bench-c*-r*.json`; failed groups never receive
+  a throughput result. All 19 harness tests passed, including timeout peers
+  and the sleep-discontinuity gate. Raw: `harness-partial-batch-tests.txt`.
+- Confirmed Qwen c8 bottleneck: bound-mode DFlash SDPA retained strided
+  `index_select` even after exact-mode attention gained the 64-bit gather.
+  On a real-sized 16,384,000-byte-stride slab, gathering 1,200 tokens took
+  23.603 ms versus 0.188 ms through the native gather, byte-exact. Repeating
+  that read across eight requests and five drafter layers explains the
+  roughly 1 s drafter cost; context writes were exonerated above. Raw:
+  `qwen-bound-gather-probe.{py,json}`, `qwen-c8-pyprof-on/`.
+- Change: native range gather now also serves bound-mode draft attention.
+  It retains the prior one-page backoff and exact GPU visibility mask, so
+  sliding windows crossing an estimated page boundary keep the same tokens.
+  Four routing/oracle cases rejected the original unsafe strided gather;
+  all 15 gather/context-store tests passed after the change, including the
+  optional 5 GiB allocation and bound-mode reads beyond signed-32-bit offsets.
+  Raw: `bound-gather-{before,after,large}.txt`. This is a microbenchmark win;
+  fresh registered-profile exact-token measurements remain the shipping gate.
+- Bound-gather candidate preflight: 190 passed, two platform/optional skips,
+  14 existing torch.jit deprecation warnings in 3.00 s. Separately, all 15
+  gather/store tests passed with the 5 GiB option enabled. Ruff over all
+  modified Python files and `git diff --check` passed. Archived 44 changed
+  files plus native-library hashes in `candidate-bound-gather.{zip,json}`.
+  The final serial campaign is `qualification-final-campaign.py`, state in
+  `final-campaign-state.json`: all five profile smoke checks, then three-round
+  long restores and fresh c1/c8 1,000/2,000-token on/off matrices for Qwen,
+  Muse, and DSV4. Runtime source is frozen during these comparisons.
+- Final campaign stopped on long Qwen acceptance: all five registered profile
+  smoke checks passed (including both supported vision paths), but the second
+  reset/restore round returned three incorrect or empty answers at 12,800
+  restored tokens. Every transfer passed byte verification; the first round
+  was correct. No fresh final throughput matrix ran. Raw:
+  `final-acceptance-qwen38-q2kxl-1/`, `smoke-final.json`.
+- A reduced 700-word, four-session, three-round reset test passed all 12
+  recalls (`qwen-repeat-restore-small/`). This does not clear the long failure.
+  Hypothesis under investigation: a frozen recurrent boundary snapshot changes
+  during reuse, or long-context execution reads the wrong state. Debug-only
+  owner/boundary/physical-page and existing verification-digest logging added;
+  exact long rerun with DEBUG logging is `qwen-long-snapshot-trace/`. No
+  production fix or throughput claim yet; shipping gate remains open.
+- The DEBUG long rerun passed all 12 recalls at 12,800 restored tokens
+  (15.07-24.67 s). Every available same-owner/boundary recurrent snapshot
+  digest remained identical across rounds (`snapshot-comparison.json`);
+  the last queued save had no digest before shutdown and is not compared.
+  This passing rerun does not explain the earlier normal-logging failure.
+  A 12.8 GB packed-state probe also passed 14 bf16/fp32 read/write cases at
+  physical block IDs 1..775 (`qwen-state-view-probe.{py,json}`). The next
+  diagnostic replays the exact failed request bodies under normal logging
+  through fresh prefill, GPU reuse, and two NVMe resets, with unique cache
+  salts (`qwen-failed-body-controls/`); production numerics remain unchanged.
+- Fixed-body control: all four fresh responses were correct (415.60-513.54 s
+  concurrent wall latency). Reuse was also correct, but one request extended
+  its GPU prefix via NVMe, so it was a mixed control. First forced reset:
+  4/4 correct at 12,000-12,800 restored tokens; second reset: 3/4, with session
+  3 returning 45 reasoning tokens containing the correct phrase but no final
+  answer. All transfers were byte-exact. Thus the failure recurred with
+  unchanged request bodies and normal logging; it remains unexplained.
+  Actual SD convolution-layout slices also passed all seven large-offset
+  read/write/sentinel probes (`qwen-state-view-sd-probe.{py,json}`). Next run:
+  `qwen-long-token-trace/`, original four-session 3,000-word histories for up
+  to ten rounds, recording token IDs/logprobs and targeted snapshot logging
+  to distinguish premature generation termination from parser/state failure.
+- Token trace reproduced the second-round empty final answer. Raw output ended
+  directly after Chinese reasoning with `<|im_end|>` (ID 248046), without
+  `</think>` or final content; its target logprob was -0.725746 (~48.4%), tied
+  with newline. This rules out parser loss and an impossible sampled stop for
+  this response. All available frozen-state digests, including the failing
+  request's re-saved boundary, matched their originals. Raw:
+  `qwen-long-token-trace/{token-report,snapshot-comparison}.json`.
+- Independent deterministic bug: bound-mode draft SDPA let nonfinite bytes in
+  masked, recycled sliding-window rows contaminate attention (masking scores
+  does not make NaN arithmetic or `0 * inf` safe). All four fp16/bf16,
+  window/no-window GPU regressions failed before. Clear only invisible rows
+  of the private gathered K/V before SDPA; keep the exact visibility mask and
+  preserve visible values. 18 gather/store tests pass, one optional skip
+  (`bound-nonfinite-{before,after}.txt`). No serving speedup or explanation
+  of the observed high-probability EOS is claimed from this fix alone.
+  `qwen-eos-distribution-control/` now teacher-forces the identical failed
+  reasoning from a fresh cache, then GPU/NVMe reuse, to compare the stop-token
+  distribution independently of sampled paths.
+- Teacher-forced EOS control preserved all 13,120 input token IDs. Premature
+  EOS probabilities were 9.19% fresh, 28.29% GPU reuse (no tier hit), 45.31%
+  first NVMe restore, and 39.39% repeated restore. All chose newline under
+  seed 42; transfers were byte-exact. This demonstrates a non-negligible
+  early-stop probability without NVMe and sensitivity to the prefill/cache
+  path, not distribution identity. Raw:
+  `qwen-eos-distribution-control/comparison.json` and full per-mode responses.
+- The original normal-logging, three-round workload still failed after masked
+  row sanitization (`qwen-nonfinite-fixed-acceptance/`): first round 4/4, second
+  round 3/4, session 3 again reasoning-only. The sanitization fixes its four
+  deterministic regressions but is NOT the fix for this observed stop.
+  Next isolation is `qwen-resident-control/`: same registered packed layout,
+  same original histories, no forced eviction; record any tier hits to avoid
+  mislabeling a mixed run as GPU-only. No fresh throughput campaign has run.
+- `qwen-resident-control/` passed all 12 turns, but every turn extended its
+  resident GPU prefix via NVMe to 12,800 tokens. It is a mixed GPU/NVMe pass,
+  NOT a GPU-only control; reported resume depth is total cached-prefix depth,
+  not necessarily the number of tokens transferred from disk. No reset calls
+  occurred. Corrected control: same wrapper with `--tier off`, output
+  `qwen-resident-tier-off/`, which removes only the registered transfer config.
+  Its unpacked cache layout is an explicit difference from the tiered profile.
+- Current diagnostic command: `caffeinate -i .venv/bin/python
+  perf/results/2026-09-08/nvme-tier-ship/qwen-resident-control.py
+  --profile qwen38-q2kxl-1 --tier off --acceptance-only --context-words 3000
+  --rounds 3 --sessions 4 --marker-format question-last
+  --output perf/results/2026-09-08/nvme-tier-ship/qwen-resident-tier-off`.
+  The prepared `qualification-masked-campaign.py` requires a passed long
+  Qwen gate before starting fresh profile smoke, long restores, and exact-token
+  matrices. Preserve earlier failed directories when retrying; no commit yet.
+- Masked-row candidate archived as `candidate-masked-rows.{zip,json}` (44
+  changed files plus the native-library hash). CPU index/connector/profile/
+  harness checks passed: 133 tests, one platform skip in 7.71 s
+  (`cpu-gates-masked.txt`). The full GPU suite and current-candidate exact-token
+  comparisons remain outstanding; this archive is not a shipping approval.
+- Correct GPU-only control PASSED all 12 recalls with zero tier hits/restores
+  (`qwen-resident-tier-off/`). Round latencies were 145.15-145.78 s,
+  60.29-61.37 s, and 62.53-63.19 s. This does not clear the repeated tiered
+  failure. The failed chat's rendered prompt preserved correctly closed prior
+  reasoning sections (`qwen-failed-prompt-tail.json`), ruling out that framing
+  hypothesis for this response.
+- Current masked-row preflight: 194 passed, two skips, 14 existing warnings
+  in 4.33 s (`tests-masked-current.txt`); all 19 gather/context-store tests
+  passed with the optional 5 GiB allocation enabled in 2.76 s
+  (`tests-masked-large.txt`). Ruff on every changed Python file and diff
+  checks passed.
+- Next isolation: `qwen-eos-equal-boundary-control.py` compares one identical
+  teacher-forced target token after fresh prefill, direct GPU reuse, and NVMe
+  restore. The ignored `direct-gpu-boundary-hook/sitecustomize.py` temporarily
+  omits the conservative drafter lookup backoff during GPU prefix lookup;
+  normal allocation/retention remains intact. This deliberate diagnostic
+  deviation permits matching the target prefix boundary and is NOT generative
+  qualification or a production change. Confirm the logged GPU/NVMe depths
+  actually match before interpreting its logits. Output:
+  `qwen-eos-equal-boundary-control/`.
+- Equal-boundary next-token control PASSED: both GPU-only reuses logged
+  exactly 12,800 cached tokens and no tier hit; both reset/NVMe reuses restored
+  exactly 12,800. All four produced IDENTICAL top-10 logprob maps, including
+  EOS -0.7917404175 (45.3056%), and sampled newline. Fresh full prefill retained
+  EOS -2.3865280151 (9.1948%). Restore byte verification was clean. Thus this
+  distribution shift already exists in the GPU cache at the same prefix
+  boundary; it is not introduced by transferring that snapshot. This is one
+  teacher-forced token, not proof of arbitrary-context distribution identity
+  or a fix for the original reasoning-only response. Raw compact comparison:
+  `qwen-eos-equal-boundary-control/comparison.json`.
+- Current exact-token measurement starts independently of the still-open
+  original chat acceptance gate: `masked-matrix-qwen38-q2kxl-1-on/`, registered
+  Qwen profile, no diagnostic lookup hook, 1,000 input / 2,000 output tokens,
+  c1/c8, three repeats, profile/API sampling defaults and seed 42. Runtime
+  source remains the `candidate-masked-rows` archive. A throughput pass alone
+  does not approve shipping or erase the original chat failures.
+- First current Qwen results: c1 samples 20.758 / 16.223 / 16.113 tok/s
+  (median 16.223), identical generated text and 3,051 draft tokens in each.
+  First c8 sample PASSED all eight exact 2,000-token responses: 31.612 tok/s,
+  506.140 s, 26,670 draft tokens, 0.0035 s clock gap. Two c8 repeats and the
+  matching off run remain. The old candidate's c8 request group timed out;
+  these are current-candidate measurements, not a completed on/off comparison.
+  A separate CPU build and Disk Inventory X scan were active; host/process RSS
+  and thermal samples are retained in `resource-samples.jsonl` and
+  `host-processes-start.json`. Do not label this an idle-machine baseline.
+- Prepared follow-up diagnostics (not yet run): `qwen-eos-chunk-trace.py`
+  records the scheduler's actual prefill splits and cache geometry, using
+  `equal-boundary-chunk-hook/`; `qwen-failed-body-equal-boundary.py` replays
+  all four exact failed chat bodies across GPU/NVMe reuse with token IDs and
+  top-five logprobs. Both are isolated, ignored diagnostics. No acceptance
+  criterion, production sampling default, or registered drafter was changed.
+- CONFIRMED new blocker before completing the matrix: obtaining
+  `DFlashSpeculator.attn_vllm_config` calls `replace(VllmConfig, ...)`, whose
+  validation re-runs `MetalPlatform.check_and_update_config` on the SHARED
+  CacheConfig. A real local Qwen ModelConfig reproducer changed the target's
+  finalized block size from 800 to 16 (`draft-config-mutation-model-before.txt`).
+  The allocated Mamba/cache specs remain 800. The scheduler's 16-token split
+  sequence for the 13,120-token prompt includes 12,288, whereas proper
+  800-token alignment includes 12,000; see `expected-prefill-splits.json`.
+  This makes a mislabeled recurrent boundary a concrete hypothesis, not an
+  assumption that the observed cache sensitivity is benign model numerics.
+  Stopped the owned server during c8 repeat 2; earlier completed samples are
+  retained as diagnostic results, not a qualified candidate. Fix and live
+  scheduler/state trace required before restarting performance qualification.
+- Live pre-fix trace CONFIRMS the geometry mismatch:
+  `cache_bs=16 scheduler_bs=800 hash_bs=800 eagle=True`. The final long-prefill
+  chunks ended at 10,080, 12,096, 13,104, and 13,120. Mamba block index 15
+  receives the state after 12,096 tokens, then is cached under its nominal
+  12,800-token boundary when the state moves to block 16. GPU and NVMe reuse
+  therefore agree on the SAME mislabeled state, explaining why the earlier
+  equal-boundary logprob match did not establish correct prefix semantics.
+  Raw: `qwen-eos-chunk-trace/server.log`. A portable platform regression also
+  failed exactly for the auto-aligned 800-token case; default and explicit
+  block sizes passed (`metal-config-tests-before.txt`, 1 failed / 3 passed).
+- Fix: remove Metal's redundant reset of an automatically selected block size.
+  `CacheConfig` already resolves an unspecified size to 16; revalidation must
+  preserve the backend's finalized alignment. All four platform regressions
+  now pass (`metal-config-tests-after.txt`). Current live trace is
+  `qwen-eos-geometry-fixed.py`, using `geometry-fixed-hook/`: logging only,
+  normal GPU prefix lookup, no conservative-backoff override. Verify the
+  actual prefix semantics and rerun the original chat workload before claiming
+  this resolves the observed EOS failures. No new native build is needed.
+- Corrected live trace PASSED: cache/scheduler/hash block sizes all remain
+  800. Fresh prefill ends at 1,600-token increments, then 12,000 and 13,120;
+  every reuse starts at 12,000 and recomputes the same 1,120-token tail.
+  ALL FIVE top-10 logprob maps are now identical (fresh, two GPU reuses, two
+  NVMe resets), EOS -2.4950237274; no byte mismatch. The GPU reuses had no tier
+  hit; their depth is proven by the scheduler trace, not the absent lookup
+  wrapper lines. Real ModelConfig reproduction also preserves target/draft
+  block_size=800 (`draft-config-mutation-model-after.txt`). Compact output:
+  `qwen-eos-geometry-fixed/comparison.json`.
+- Depth gate corrected for speculative Mamba alignment: require the actual
+  cached guard boundary, `(prompt_tokens // block_size - 1) * block_size`,
+  minimum 128, while retaining the previous attention-only rule. For a
+  12,863-token prompt the valid snapshot is 12,000; the old >=12,063 check
+  incorrectly demanded a 12,800 state inside the final unsplit chunk. Four
+  regressions cover accepting that real boundary while rejecting 11,200,
+  boilerplate-only 800, and an attention-only 12,000 hit. The new positive
+  case failed before the adjustment. No marker, nonempty/final-content,
+  byte-parity, completed-reader, sampling, or exact-token gate was relaxed.
+- Corrected candidate preflight: 202 passed, two skips, 14 existing warnings
+  in 3.08 s (`tests-geometry-fixed.txt`); all changed Python files pass Ruff
+  and diff checks. Archive: `candidate-cache-geometry-checked.{zip,json}`,
+  46 changed files plus native-library hash. The earlier
+  `candidate-cache-geometry` archive precedes a formatting-only test fix.
+  Original four-session / three-reset / 3,000-word chat workload is running
+  without diagnostic hooks in `qwen-geometry-fixed-acceptance/`, with the
+  original request text, default sampling, seed 42, drafter, and byte checks.
+- Original long Qwen acceptance PASSED all 12 recalls after the geometry fix.
+  Round 0 restored 12,000 for all four sessions, 50.77-54.40 s; round 1
+  restored 12,000-12,800, 44.51-45.93 s; round 2 restored 12,000-12,800,
+  39.71-41.12 s. Every round had four completed readers and zero byte
+  mismatches. Later mixed scheduling can legitimately materialize a deeper
+  aligned snapshot. This closes the reproduced original chat failure, with
+  the corrected guard-boundary depth criterion described above.
+- Current serial campaign: `qualification-geometry-campaign.py`, state in
+  `geometry-campaign-state.json`. It checks the candidate hashes and changed
+  file set between phases; all five profile smokes, DSV4/Muse long restores
+  and exact-token on/off matrices, Qwen's original three 160,000-token pressure
+  rounds, then its exact-token on/off matrix. Earlier pre-fix Qwen/Muse live
+  successes do not qualify the corrected candidate's cache semantics. Final
+  readiness remains pending this campaign and an independent artifact review.
+- Corrected-candidate registry smoke PASSED all five compatible profiles:
+  DSV4 with registered DSpark/TurboQuant draft KV; both text-only NVFP4 Qwen
+  variants; Muse and GGUF Qwen text AND image requests. Raw:
+  `smoke-geometry.json` / `smoke-geometry/`. The campaign has advanced to
+  DSV4's four-session, three-round, 4,000-word restore workload. Independent
+  final audit is prepared in `review-geometry-qualification.py`; it checks
+  source hashes, every saved answer, restore depths, all exact-token samples,
+  and the complete 480,000-token Qwen pressure workload before review.
+- Corrected DSV4 long acceptance PASSED all 12 recalls: 9,472 restored tokens
+  per request, required >=9,296, four completed readers each round, 6.38-18.22 s
+  latency, byte verification clean (`geometry-acceptance-dsv4-xxs-1/`). Its on
+  matrix also passed every exact count and clock/drafter gate: c1
+  18.988 / 16.455 / 16.116 tok/s (median 16.455), c8
+  20.914 / 21.222 / 21.336 (median 21.222). Raw:
+  `geometry-matrix-dsv4-xxs-1-on/`. Off comparison is running; no paired
+  performance conclusion yet.
+- DSV4 sampling audit resolves the real local ModelConfig and API request:
+  generation_config=auto, no model sampling overrides, temperature=1.0,
+  top_p=1.0, top_k=0, seed=42 (`dsv4-effective-sampling.txt`). The on/off c1
+  responses have identical generated text hashes and 6,605 draft tokens each
+  (`dsv4-c1-work-equivalence.json`), despite substantial timing variation.
+  This is a shared-workstation run: resource samples record competing host
+  workloads. No macOS thermal/performance warning was reported, but GPU clocks
+  were not measured. Do not infer a precise tier speedup from that variation.
+- Corrected DSV4 on/off matrix PASSED all 54 exact 1,000-in/2,000-out
+  responses (108,000 output tokens), with positive registered DSpark activity
+  and clean clock checks. Independent raw-count/timing audit:
+  `dsv4-geometry-matrix-audit.json`. Off c1: 19.264 / 13.200 / 10.738 tok/s
+  (median 13.200); off c8: 15.958 / 18.355 / 14.682 (median 15.958).
+  On medians are 16.455 / 21.222 at c1/c8. No tier-enabled slowdown was
+  observed in this run; the apparent +24.7%/+33.0% is NOT a controlled
+  speedup claim because unrelated CPU/VM activity changed during the phases.
+  Both boots pinned 93.73 GiB of weights and selected the same 4.82 GiB KV
+  pool. Completion-endpoint sampling is independently confirmed in
+  `dsv4-completion-effective-sampling.txt`. Muse long restore validation is
+  now running; final shipping review remains pending the complete campaign.
+- Corrected Muse long acceptance PASSED all 12 recalls, four completed readers
+  per round, 9,152-9,408 restored tokens (required >=9,005), latency
+  8.08-21.92 s. All 9,822 logged block comparisons across 12 verification
+  batches matched. Raw: `geometry-acceptance-muse-kdyn-1/`. Its tier-enabled
+  exact-token matrix is running. The final artifact audit now also requires
+  positive logged byte-verification evidence for every acceptance phase.
+- Muse performance attempt INTERRUPTED for observed GPU contention, not a
+  serving correctness failure. A separate QuixiProofs training process
+  (PID 55296) consumed Metal GPU time concurrently; c1 samples were
+  8.045 / 7.228 / 4.699 tok/s. Stopped only the owned serving process tree
+  and preserved its outputs under `contended-geometry-matrix-muse-kdyn-1-on-*`.
+  These samples are diagnostic and cannot qualify performance. Raw activity:
+  `muse-on-python-gpu-clients.json`, `geometry-performance-interruption.json`.
+  The user was asked to coordinate a GPU window; no other project's process
+  was changed. Subsequent activity from a QuixiProofs evaluation process is
+  also detected by the new guard.
+- Resume orchestration: `qualification-geometry-resume.py` reuses the exact
+  original commands and candidate hash checks, preserves the five completed
+  phases, and waits for three 15-second samples without foreign Metal compute
+  activity. During each resumed phase it records active AGX client counters
+  every 15 seconds; overlap from Python/vLLM/MLX/llama/train/benchmark clients
+  interrupts and quarantines only the owned attempt before a clean retry.
+  This guard is diagnostic orchestration, not a production code change or a
+  claim of idle CPU/display load. State remains `geometry-campaign-state.json`;
+  activity evidence is in `geometry-gpu-availability.jsonl` and each resumed
+  phase's `*-gpu-activity.jsonl`. Shipping review remains pending.
+- First uncontended Muse retry was rejected by the clock gate: one sample
+  had an 881.224-second difference between wall-clock and monotonic elapsed
+  time. `geometry-sleep-evidence.txt` confirms idle/maintenance sleep and a
+  Dark Wake Thermal Emergency during that interval. Its output is preserved
+  under `clock-interrupted-geometry-matrix-muse-kdyn-1-on-*`; its reported TPS
+  is invalid. No completed qualification phase crossed these sleep intervals.
+  Resumed after a full user wake, open-lid state, and no current thermal
+  warning, using `caffeinate -is` (temporary AC system-sleep assertion scoped
+  to the driver). GPU contention and clock guards remain mandatory. The final
+  audit also rejects foreign compute activity in resumed phase logs.
+- Clean Muse tier-enabled matrix PASSED: c1 8.954 / 8.167 / 8.236 tok/s
+  (median 8.236); c8 11.815 / 13.464 / 13.719 (median 13.464). All 27
+  responses are exact 1,000-in/2,000-out, registered DFlash activity is
+  positive, and clock differences stay within 0.041 s. All three c1 outputs
+  and draft counts are identical (`muse-clean-on-c1-work-equivalence.json`).
+  The full phase has no recorded foreign compute overlap. Raw:
+  `geometry-matrix-muse-kdyn-1-on/` and its `*-gpu-activity.jsonl`.
+  The guarded tier-disabled comparison is running; no final paired Muse
+  performance conclusion yet.
+
+- Muse c1 comparison needs confirmation: enabled median 8.236 versus disabled
+  8.757 tok/s (~5.95% lower), with overlapping sample ranges. All six outputs
+  have identical text hashes and 17,872 draft tokens. The enabled samples had
+  top-12 foreign-process CPU medians of 401% / 204% / 201%, versus
+  110% / 115% / 110% when disabled (`muse-clean-c1-comparison.json`). This
+  does not establish a causal tier overhead. The first two disabled c8 samples
+  are also higher (14.475 / 14.800 tok/s versus enabled median 13.464).
+  Reverse-order off/on confirmation (same 1,000/2,000 tokens, three c1 repeats
+  and one additional full c8 batch per tier) is prepared in
+  `geometry-extra-phases.json`. `finish-geometry-campaign.py` is running under
+  `caffeinate -is`; after primary completion it invokes the resume driver
+  automatically, preserving completed phases and running the four guarded
+  confirmation phases. It stops if primary qualification fails.
+  This confirmation remains required before the shipping assessment.
+
+- Muse c8 work audit while the final disabled repeat runs: enabled draft
+  counts were 122,128 / 118,640 / 117,440 versus 110,608 in each of the
+  first two disabled repeats. Only four of eight r0 response text hashes
+  match across tiers; the two disabled repeats match each other exactly.
+  Later enabled draft-token rates were 99.83 / 100.70 per second versus
+  disabled 100.07 / 102.31. These are diagnostic work counts, not an
+  alternative serving TPS metric or proof that tier overhead is absent.
+  They identify differing speculative work as a confound in the c8 output
+  TPS comparison. Hypothesis: repeat scheduling/prefix reuse changes the
+  sampled paths and acceptance work; reverse-order confirmation remains
+  required. Raw: `muse-clean-c8-work-comparison-partial.json` plus the
+  corresponding matrix responses and resource samples. No production
+  change or shipping decision follows from this partial audit.
+
+- Muse primary matrices COMPLETE: all 54 responses have exactly 1,000 input
+  and 2,000 output tokens, positive DFlash work, and valid clocks/arithmetic.
+  Disabled c8 ended at 14.475 / 14.800 / 11.729 tok/s (median 14.475);
+  enabled median 13.464 is 6.99% lower. C1 remains 5.95% lower. Both ranges
+  overlap. The final disabled c8 repeat changed sampled work too (116,144
+  drafts versus 110,608 in each earlier repeat), while its foreign CPU
+  median rose to 335% from 115-117%. Both boots used the same 12 GiB KV
+  budget and reported 744,673-token capacity. All guarded samples have no
+  detected foreign compute overlap. Raw: `muse-primary-matrix-audit.json`,
+  `muse-primary-work-audit.json`; reproducible work audit:
+  `audit-phase-work.py geometry-matrix-muse-kdyn-1-on
+  geometry-matrix-muse-kdyn-1-off`. Decision: correctness gates pass;
+  performance confirmation remains required. Qwen's original natural
+  pressure workload is now running on the frozen geometry-fixed candidate.
+
+- Qwen natural pressure round 1 PASS: 10 distinct filler responses account
+  for exactly 160,000 input tokens; all four subsequent answers contain the
+  correct original phrases and end normally (63.62-68.50 s). Each restores
+  12,000 tokens; all four readers complete. The 12 verification chunks
+  cover 292 restored blocks with zero byte mismatches. Raw:
+  `geometry-qwen-natural-pressure/qwen38-q2kxl-1/pressure-0.json`,
+  `recall-0-*.json`, `acceptance.json`, and `server.log`. The remaining two
+  pressure rounds and both Qwen performance matrices are still required.
+
+- Qwen natural pressure round 2 PASS: another 10 distinct filler responses
+  account for exactly 160,000 input tokens. All four correct recalls end
+  normally, with one 12,800-token restore and three 12,000-token restores;
+  all four readers complete. Cumulative byte verification: 588 restored
+  block checks across 24 chunks, zero mismatches. Raw: the same run's
+  `pressure-1.json`, `recall-1-*.json`, and `acceptance.json`. The third
+  and final pressure round is running; no extra durability rounds are planned.
+
+- Qwen natural pressure COMPLETE/PASS: all three rounds exercised exactly
+  160,000 distinct filler input tokens each (480,000 total, 30 requests),
+  followed by 12/12 correct recalls with normal stops and all 12 completed
+  readers. Final-round recalls took 42.56-44.48 s. Cumulative verification
+  covered 888 restored blocks in 36 chunks, with zero byte mismatches.
+  Every restore met the 12,000-token minimum. The original repeated-reuse
+  durability gate is satisfied on the geometry-fixed candidate. Raw:
+  `geometry-qwen-natural-pressure/`. Remaining release work is performance
+  qualification: both Qwen matrices, the four planned Muse confirmation
+  phases, then the independent artifact/source audit. No additional
+  durability rounds are planned.
+
+- Qwen tier-enabled matrix COMPLETE/PASS: c1 17.818 / 15.508 / 16.101 tok/s
+  (median 16.101); c8 37.493 / 41.765 / 43.620 aggregate tok/s (median
+  41.765). All 27 responses have exactly 1,000 input and 2,000 output
+  tokens, positive DFlash work, valid clocks and throughput arithmetic.
+  No foreign compute overlap was detected by the guard. Raw:
+  `geometry-matrix-qwen38-q2kxl-1-on/`,
+  `qwen-geometry-on-matrix-audit.json`. The disabled comparison is next;
+  no paired Qwen performance conclusion yet.
+
 This is the running performance notebook. Follow `perf/perf.md`: record the
 baseline, hypothesis, controlled change, correctness result, throughput result,
 decision, and raw artifact locations.
@@ -28938,3 +29949,5183 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   It was aborted cleanly without retaining runtime edits. Operator choice
   requested between splitting into smaller reviewable PRs and keeping one PR
   for human review. No paid service change or external reviewer assignment.
+
+### Main merge reconciliation (2026-09-11)
+
+- Baseline: published 06d9e1a92; main f6c6ed429. User directs resolving the merge
+  before deciding whether CodeRabbit's file limit requires smaller review units.
+- All 17 textual conflicts reconciled with both platform contracts retained.
+  SM120 keeps its padded FP8 projection layout and strided gate BMM, folded MLA
+  input projections, raw indexer cache, BF16 sparse kernels and explicit V1
+  runner. A100 keeps unpadded gate pairing, compact cache/decode sharding,
+  SIMT mHC and V2/DFlash2. Old profile IDs alias main's glm53f names; list/smoke
+  enumeration does not duplicate profiles. Independent MTP adapters remain
+  paired with their own proposers. Historical notebooks from both sides remain.
+- Fix discovered during reconciliation: query slices must gather original
+  block-table IDs from the KV-token map at query starts, not enumerate request
+  changes from zero. Updated TP-prefill fixtures use real full-table semantics
+  and an independent expected row map, including slices beginning after req0.
+- Focused correctness: 77 passed, 24 SM80-only tests skipped on SM120 (KDA
+  projection loaders/norm, mHC dispatch, MTP/config/grouping, query maps).
+  Subsequent sparse/prefill/TP-exchange and profile gate: 36 passed. Raw XML:
+  perf/results/2026-09-11/merge-main/prefill-and-profile.xml.
+- The broad registry suite records 84 pass/8 fail: all failures are caused by
+  main's existing glm53f-q2-1/metal record referring to missing glm53f-gguf and
+  lacking the FP8-KV qualification note. Confirmed in upstream/main's JSON;
+  this is not an SM120 merge regression. No source metadata was fabricated.
+  New runner test initially assumed an explicit A100 env1; corrected to verify
+  that it inherits main's V2 default (no override). Its first XML is preserved.
+- No serving CUDA/CMake source differs from measured 6b2fea199. QuixiCore build
+  target is current; stable-libtorch's dry run finds timestamp-dirty Marlin
+  objects after prior restored experiments, not changed source. Keep qualified
+  native binaries (QuixiCore c2c4a996, stable-libtorch fe4a7c2a) for the merge
+  qualification; do not attribute a rebuild or a new kernel speedup here.
+- Next: one fixed merged-profile serving run, exact1000/300 at c1/c8/c16,
+  three repeats, text/image, existing retrieval checks and cold32K/128K. No
+  sweep or startup selection. Prior TPS remains tied to its recorded tree.
+## 2026-09-06: GLM-5.2 A100 tier records re-measured after the sparse-decode copy removal
+
+- Both records boot through their profiles with the host tier active
+  (48 GiB/rank). The merged tree needed `_quixicore_C` rebuilt first: the
+  MI300X commit changed `post_update`'s binding and the stale extension
+  died at the sampler with "incompatible function arguments" - any merge
+  that touches csrc means a rebuild before the next boot.
+- Exact-token (1000 in / 300 out, temp 1.0 / top-p 0.95 / top-k 20,
+  seed 42), aggregate tok/s, canaries (text + reasoning, image, tool)
+  passing on both:
+  | record               | c1   | c8    | c16   | previous                     |
+  | glm52-q2k-4 (TP4,fp8)| 31.7 | 93.7  | 115.6 | no exact baseline on file    |
+  | glm52-q2k-8 (TP8)    | 72.5 | 166.5 | 223.1 | 14.9 / 81.5 / 135.2 (09-03)  |
+  TP8/TP4 at c1 = 2.3x. Raw: perf/results/2026-09-06/glm52-q2k-{4,8}-
+  baseline/. Between the 09-03 TP8 numbers and these: the sparse decode
+  no longer `reshape(-1)`-copies the packed layer cache on every call
+  (page_stride_bytes on the entry points) and the merged MI300X work
+  reworked the v2 batch kernels; the split is not measured separately.
+
+## 2026-09-06: glm53f-nvfp4-8 maximized - 1M context on three KV tiers, max_num_seqs 64
+
+- Operator ask: 1M context with VRAM + pinned host + disk KV, maximize the
+  pool and max_num_seqs. Record (renamed glm53f-*: GLM-5.3-Flash is the
+  hybrid glm5_next model, not the 743B GLM-5.3 that shares GLM-5.2's
+  architecture): gpu_memory_utilization 0.85 -> 0.95, max_num_seqs 32 ->
+  64 (FULL_DECODE_ONLY capture 64), host tier 64 -> 72 GiB/rank (576 GiB
+  pinned, ~169 GB host RAM left available), disk tier 128 -> 256 GiB/rank
+  (2 TiB). glm53f-nvfp4-4 takes the same tier sizes.
+- Boot (weights 23.6 GiB/rank): VRAM KV 50.08 GiB/rank = 3,171,368 tokens
+  (3.02x one full 1,048,576-token request; was 2,696,830 at 0.85); host
+  11,915 slots/rank at the 576-token hash block; disk 42,366 slots/rank.
+  Canaries (text + reasoning, image, tool) pass.
+- Exact-token through the profile (1000 in / 300 out, temp 1.0 / top-p
+  0.95 / top-k 20, seed 42):
+  | c1   | c8    | c16   | c32   | c64   |
+  | 83.8 | 402.6 | 562.1 | 750.0 | 931.9 |
+  c1/c8/c16 match the 0.85 boot (84.4 / 413.6 / 578.8); c32 and c64 are
+  new points and still scaling. Raw: perf/results/2026-09-06/
+  glm53-nvfp4-8-max/.
+- Tier acceptance on this pool (churn 3,980,143 tokens of 3,171,368,
+  VLLM_KV_TIER_VERIFY=1): 6/6 probes hit and resumed at block 68 (39,168
+  tokens), 106 restore ops each (68 MLA + 34 indexer + 4 KDA states),
+  0/106 mismatched on every restore, one promotion from disk, 6/6
+  recalled. The WildChat deep-context leg on this final record follows.
+- Client knob, no server change: the Flash chat template implements the
+  GLM-5.3 reasoning_effort levels (Low / High / Max, default Max) via
+  chat_template_kwargs; thinking stays always-on per policy.
+- WildChat deep-context leg on the maximized glm53f-nvfp4-8 (tiers active,
+  VLLM_KV_TIER_VERIFY=1): PASS - 0 errors, 33/33 recall, max ctx 204,088 /
+  median 181,931 across the 8 sessions, 96,467 completion tokens in the
+  4,548 s wall (97,378 on the 0.85 boot of 09-03: unchanged, as decode
+  does not depend on pool size), prefix cache hit rate 92.1%. Tier: 228
+  boundary-state saves, ZERO restores - with 8 sessions at ~180K the
+  3.17M-token VRAM pool never evicts a live session, so the leg cannot
+  exercise restores (same as the GLM-5.2 TP8 leg of 2026-08-30); the
+  forced-eviction acceptance above (0/106 mismatched, promotion from
+  disk) is the restore evidence of record. Raw: perf/results/2026-09-06/
+  glm53-leg-tier/glm53-nvfp4-8/ (pre-rename path).
+
+## 2026-09-06 - qwen38fn-nvfp4-4 bring-up record: nvidia/Qwen3.8-Flash-Next-NVFP4 on 4x RTX 3090 (unbooted)
+
+- Request: a profile for nvidia/Qwen3.8-Flash-Next-NVFP4 on four 3090s.
+- Checkpoint (HF metadata + config.json): ModelOpt MIXED_PRECISION, 25
+  files, 123.6 GiB. quantized_layers: the 48 x 512 routed experts NVFP4
+  (group 16: weight U8 packed, weight_scale E4M3 [N, K/16], weight_scale_2,
+  input_scale), mtp.layers.0.mlp.experts FP8 group 128 with the official
+  FP8 release's weight_scale_inv layout, and every layer's
+  ple.ple_embedding.ngram_embedding FP8 per-tensor (47.7 GiB of tables in
+  model-fp8-mtp-ple.safetensors, same shard/scale naming as the FP8
+  release). Excluded (bf16): self_attn*, linear_attn*, hyper-connections,
+  mlp.gate, shared_expert*, embed_tokens, lm_head, visual*. On-GPU weight
+  bytes = 123.6 - 47.7 (PLE, host-pinned) = ~76 GiB -> ~19 GiB/rank at TP4.
+- Registry: source qwen38-flash-next-nvfp4 (all 25 files with LFS sha256,
+  min_gpus rtx3090 4, min_host_ram 128 GiB for the PLE table), profile
+  qwen38fn-nvfp4-4 with one rtx3090 record cloned from qwen38fn-fp8-8
+  (kv fp8 at 262144, util 0.96, seqs 32 / capture 96, prefix caching,
+  MTP k=2 + index share, PLE host, triton GDN, admission 96) with
+  tensor_parallel_size 4, moe_backend marlin (top-level + kernel_config,
+  the glm53f-nvfp4 precedent), host tier 176 + NVMe 896 GiB/rank (the
+  8-rank record's 704 GiB / 3.5 TiB totals over 4 ranks). Every note is
+  labelled as inherited until the first boot decides.
+- Code (three seams the mixed release needs; all unit-covered in
+  tests/models/qwen4_exp/test_weight_loading.py, 33 green):
+  1. PLE tables: _get_ple_embedding_quant_method accepted only Fp8Config;
+     it now also maps a modelopt_mixed config whose quantized_layers names
+     the table as FP8 onto Qwen4ExpPLEFp8EmbeddingMethod (prefix roots
+     bridged by the config's own _resolve_quant_algo candidates).
+  2. QSA: without_modelopt_fp4 also strips modelopt_mixed (the projections
+     are bf16 in the release either way).
+  3. MTP drafter: ModelOpt's FP8 MoE method only knows per-tensor scales,
+     but the drafter's experts are block-128 FP8 with weight_scale_inv.
+     _draft_quant_config_from_modelopt_mixed renumbers the mtp.layers.<i>
+     keys onto the draft model's layer indices and builds
+     Qwen4ExpDraftBlockFp8Config (an Fp8Config that quantizes exactly those
+     RoutedExperts through Fp8MoEMethod - the FP8 record's validated Marlin
+     W8A16 block-FP8 path - and leaves every other draft module bf16).
+- enable_expert_parallel is again a correctness requirement, now because
+  of the drafter: block-128 scales cannot split intermediate 640 four ways
+  (160/rank). NVFP4 group 16 would split, so a TP-experts A/B needs a
+  per-layer parallelism split first.
+- KV arithmetic to watch at boot: 2 KV heads, so each rank holds one head
+  at TP4 exactly as at TP8 -> the same 7,488 B/token/rank; 262144 needs
+  ~1.9 GiB/rank of pool plus GDN state, against a budget of 22.62 - ~19
+  (weights) - ~1.2 (non-torch) - 0.9 (activation) - 0.47 (graphs) GiB.
+  If the pool comes up short the record caps max_model_len at the largest
+  length that fits and states the arithmetic (policy: default context
+  unless genuinely impossible on the platform).
+- Status: download in progress (~19 of 124 GiB at 20:xx UTC); nothing
+  booted. Validation needs the four GPUs, which production holds - boot on
+  port 8001 after the operator stops prod: health, GPU KV size, exact bench
+  c1/c8, tier eviction-restore recall, multi-turn tracking, image request.
+
+## 2026-09-06 - Three-tier redesign, milestone 1: pointer-table QSA gather (host-resident main KV)
+
+- Trigger: qwen38fn-nvfp4-4 cannot hold one 262,144-token request in GPU
+  KV (weights 20.59 GiB of 24 per rank; pool 0.77 GiB vs 2.02 needed,
+  ceiling ~46-60K tokens). The tiers as built store finished/evicted
+  conversations; an ACTIVE request still has to fit in VRAM. Operator:
+  "then redesign the tiers", "we own the whole stack all the way down to
+  the kernels" - design in docs/host_resident_kv_design.md.
+- Key fact: QSA reads only the indexer's top-2048 tokens per query, and
+  the main QSA KV is 82% of the per-token slab (6,144 of 7,488 B/rank).
+  With main KV in the pinned host arena and gathered over PCIe (the PLE
+  table's mechanism), a 262K request needs ~0.35 GiB of GPU KV.
+- Milestone 1: `qsa_sparse_paged_attention(..., page_offsets=)` - a
+  per-request int64 table (same shape as the block table) of each logical
+  page's element offset from the slab pointer, PTR_SENTINEL for nulls,
+  built once per step by `page_offsets_from_table(block_table, page_base,
+  k_cache)`; pages may be GPU rows or MAPPED host rows. Three iterations
+  measured on the way: per-page int-to-pointer cast 1.6x slower on GPU
+  pages (lost vectorization); a second dependent table load 1.35x; the
+  per-request table + `tl.multiple_of(.., 16)` alignment hint 1.2x.
+- Results (GPU 4, TP4 geometry, x12 layers/step, bit-exact parity in all
+  configurations; bench_ptrtable_gather_v4.log):
+  | rows | slab | table GPU | all host | 50% host |
+  | 3    | 1.45 | 1.51      |  1.83    |  1.49    | ms/step
+  | 24   | 1.73 | 2.13      | 12.05    |  6.18    |
+  | 48   | 3.21 | 4.20      | 23.9     | 12.2     |
+  | 96   | 5.74 | 7.09      | 47.5     | 24.1     |
+  Host gather = ~25 GB/s effective (PCIe 4.0 x16 saturated; the design's
+  12 GB/s estimate was pessimistic). c1 cost is negligible (+0.3 ms/step
+  all-host); c8 all-host +10 ms/step, so the hot window and real
+  selection locality decide the batch regime.
+- Test: tests/models/qwen4_exp/test_qsa_fp8_kv.py::
+  test_qsa_pointer_table_pages_match_slab_indexing (GPU, host, mixed,
+  null-page masking).
+- Also today: the merged tree's `_quixicore_C` is stale (post_update
+  binding changed upstream; the sampler dies "incompatible function
+  arguments" - the notebook's 2026-09-06 GLM entry hit the same). First
+  rebuild attempt failed at cmake configure (Makefiles vs the Ninja-built
+  FetchContent cache: ninja was not on PATH); retrying with .venv/bin and
+  CUDA on PATH. Production cannot restart on this tree until it lands.
+- Next: milestone 2 (pointer-table cache store), 3 (residency manager +
+  split main-KV slab + pool = GPU rows + active host rows), 4 (tier
+  rebind = zero-copy restore), 5 (serving gates).
+
+## 2026-09-06 - Three-tier redesign, milestones 2-3: host-resident main KV boots at the native 262,144 context on 4x RTX 3090
+
+- Design: docs/host_resident_kv_design.md. The 13 QSA main-KV layers
+  (target + MTP drafter) leave the packed slab for their own tensor:
+  logical blocks live in pinned host rows (cudaHostRegister PORTABLE |
+  MAPPED, read by the gather over PCIe), a small window of GPU rows holds
+  the blocks being written, and one per-request offset table (built once
+  per step, kernel-page granularity) addresses both.
+- The obstacle was not the main KV itself but what every block id costs
+  in the packed slab. Measured on the way (boot 5-13 logs):
+  1. Excluding the main KV from the slab left the stride at 78 MB: the 12
+     GDN state pages per row were padded to the main-KV page (block 12688
+     x 512 B = 6.5 MB each) by the CSA+linear grouping.
+  2. Sizing the attention block from the indexer page (64 B/token, so
+     the block grows from 1600 to 12688 tokens and a max-length request
+     charges 21 attention blocks, not 164) needed the aligner override to
+     be sticky on cache_config: a later config view without the transfer
+     config re-ran the aligner with 512 B/token.
+  3. The residency sub-row count must divide the block into 16-token
+     rows: 12688 = 16 x 13 x 61 splits at 13 (976-token rows), not 8.
+  Result: slab stride 10,556,416 B (the ring group: 13 rings padded to
+  the indexer page), a 262,144-token request needs 0.37 GiB of GPU KV
+  (21 attention + 1 ring + 16 mamba blocks), and the check passes against
+  the 0.78 GiB pool: "GPU KV cache size: 441,505 tokens, maximum
+  concurrency for 262,144 tokens per request: 1.68x". Main KV: 832
+  logical rows x 6.5 MB, 24 GPU hot rows (0.15 GiB), 5.03 GiB pinned host
+  rows per rank. CUDA graphs capture (0.28 GiB).
+- Per-step bookkeeping (vllm/v1/worker/gpu/kv_residency.py,
+  model_runner._prepare_main_kv_residency): written rows come from the
+  CPU block-table mirror + computed/scheduled token counts (no device
+  sync); the row holding the last computed token and the next is
+  protected; demotion copies the coldest unprotected GPU row to its host
+  row on the compute stream and rewrites its offset; a bound row is
+  zeroed before its first write; dummy/capture runs resolve every page to
+  scratch row 0. Unit tests: tests/v1/worker/test_kv_residency.py (bind,
+  demote, protect, and a bit-exact gather from a demoted host row).
+- Not yet: serving correctness (smoke at 6K/16K in flight after the
+  warmup indexing fix), tier integration (M4: the trajectory tier
+  currently saves only the slab rows; main-KV rows are the residency's
+  own host pool), the drafter's block-size interplay, and throughput.
+
+## 2026-09-06 - qwen38fn-nvfp4-4 with host-resident main KV: first validated numbers at the native 262,144 context
+
+- Boot 14 (serve_boot14_hostkv_8001.log): health, 441,505-token GPU pool,
+  1.68x one max-length request, main KV 832 rows x 6.5 MB per rank (24
+  GPU hot rows, 5.03 GiB host rows), graphs captured.
+- Correctness (port 8001, 4x RTX 3090, sampled at temp 1.0 / top_p 0.95 /
+  top_k 20):
+  | gate                                  | result                              |
+  | marker recall 54K / 144K / 243K tokens| PASS / PASS / PASS (follow-up 9.7 / 12.0 / 12.7 s; prefill 20 / 58 / 118 s) |
+  | multi-turn state tracking, 3 seeds    | 3/3 PASS                            |
+  | image canary (red circle)             | PASS ("A red circle is drawn")      |
+  | server errors                         | 0                                   |
+  At 243K tokens the request holds 249 main-KV rows against a 24-row
+  window: the follow-up's gathers read ~90% of their pages from pinned
+  host rows over PCIe and still answer in 12.7 s.
+- Throughput (exact 1000/2000, seed 42): c1 119.8 / c8 336.5 / c16 335.1
+  tok/s; draft acceptance 51.6% / 59.3% / 57.9%. For scale, the 8-GPU FP8
+  record does 136 / 594 / ~850 with GPU-resident KV, so 4 cards of NVFP4
+  through Marlin land at 88% of its c1 and 57% of its c8. c16 == c8 is the
+  window: 16 requests x 3-4 rows exceed 24, so decode gathers run at PCIe
+  speed (48 queries x 12 MiB per step = ~23 ms, matching the milestone-1
+  microbench). Lever: main_kv_gpu_rows - A/B at 64 rows in flight.
+- Raw: perf/results/2026-09-06/qwen38fn-nvfp4-4/ (deep_recall_250k.log,
+  multiturn_hostkv.log, image_canary.log, bench_hostkv_c{1,8,16}.log,
+  smoke_hostkv_boot14.log, run_validation_hostkv.out).
+
+## 2026-09-06 - qwen38fn-nvfp4-4: the hot-window A/B says the limiter is per-request slab rows, not the gather
+
+- Hypothesis: c16 == c8 (335 vs 337) because 16 requests' rows spill the
+  24-row window and decode gathers run at PCIe speed. Test: main_kv_gpu_rows
+  24 -> 64 (boots 15/17; the 24-row baseline re-measured on boot 16).
+  | window | GPU pool (tokens) | c8 (s42 / s43)  | c16 (s42 / s43) | Running (interval log) | residency counters |
+  | 24     | 441,505           | 349.0 / 330.9   | 339.1 / 329.2   | 4 max                  | 178 binds, 155 demotions |
+  | 64     | 269,042           | 227.5 / 211.2   | 217.2 / 225.1   | 2 max                  | 16 binds, 0 demotions    |
+  REJECTED - the larger window is 35% slower, and the counters show why:
+  the scheduler never had more than 2 requests running at 64 rows and 4
+  at 24. Every running request charges the packed slab a fixed ~18 rows
+  x 10.56 MB = 190 MB regardless of context: 1 attention block, 1 ring
+  block, and (2 + num_spec) = 4 GDN state blocks in each of the 4 mamba
+  groups (fp32 SSM state, 812 KB per layer at TP4). The 0.78 GiB pool
+  therefore admits 4 requests; each extra hot row (6.5 MB) comes out of
+  that pool. The "c8" and "c16" numbers are effectively c4.
+- Bookkeeping cost measured: 0.4 ms of CPU per step (residency stats log).
+- Consequence for this platform: a 4x 3090 NVFP4 instance serves ~4-5
+  concurrent requests at any context up to 262K, gathering deep history
+  over PCIe; the 8-GPU FP8 record serves 32 at 1.89x max-length capacity.
+  Two 4-GPU instances = ~8-10 sessions with full context across the box.
+- Levers left (in flight: boot 18): gpu_memory_utilization 0.97 -> 0.975,
+  hot rows 24 -> 16, max_num_seqs 6 with capture 24 (smaller graph
+  reserve). Not taken: dropping the ring padding to the indexer page
+  (-8% stride); GDN state precision (fp32 -> bf16 would halve 12 of the
+  18 rows but is a numerics change needing its own qualification).
+
+## 2026-09-06 - qwen38fn-nvfp4-4 final record: util 0.975, 24 hot rows, 8 seqs, capture 24
+
+- Pool tuning (boots 18/19): 16 rows + 6 seqs gave the largest pool
+  (565,679 tokens, 2.16x) but c6 fell to 295 - five requests' 20 active
+  rows no longer fit a 16-row window, so every decode gather went to host.
+  24 rows + 8 seqs + capture 24 at util 0.975: pool 531,186 tokens (2.03x
+  one max-length request), 5 running, c8 361.7 / c1 120.1 tok/s, 0 errors;
+  residency 41 binds / 18 demotions over the c8+c1 legs, 0.42 ms CPU per
+  step. RETAINED as the profile.
+- Free memory on device after the boot: 23.0/23.56 GiB usable, 21.08
+  weights+non-torch, 0.98 activation, 0.19 graphs - the 0.975 utilization
+  leaves ~0.3 GiB true headroom, the same band the FP8 record runs at.
+- Standing next steps: (1) M4 tier rebind - the trajectory tier still
+  saves slab rows only, so a resumed conversation re-prefills its main KV
+  until the residency's host rows become the trajectory's slots; (2) ring
+  padding to the indexer page (8% of the stride); (3) the same design on
+  the 8-GPU FP8 record, where the 1.89x pool would become many x at no
+  weight cost; (4) two co-resident instances (GPUs 0-3 / 4-7) as the
+  operator asked - the profile is sized for it (88 GiB host + 448 GiB
+  NVMe per rank, ~6 GiB host rows per rank).
+- Raw: perf/results/2026-09-06/qwen38fn-nvfp4-4/ (serve_boot19_final_8001
+  .log, bench_final_c{8,1}.log, run_final.out; the A/B legs
+  bench_window{24,64,64b}_*.log, bench_tuned_c{1,6}.log).
+
+## 2026-09-06 - Production switched to qwen38fn-nvfp4-4 on GPUs 0-3
+
+- Operator: "put the new nvfp4 tp4 on production" and "I only want 4 GPUs
+  in production, the other 4 should be free." The systemd unit
+  (operator-side, not in the repo) now runs
+  `slimserve.cli qwen38fn-nvfp4-4 --serve --port 8000` with
+  CUDA_VISIBLE_DEVICES=0,1,2,3; the FP8 8-GPU unit file is backed up in
+  ~/.local/scratch. No second instance: GPUs 4-7 stay free.
+
+## 2026-09-06 - Milestone 4: tier rebind for the host-resident main KV - validated
+
+- Hazard closed first: with the main KV host-resident, a tier restore
+  brought back indexer pages and GDN tails but not main-KV rows (a
+  resumed conversation would attend over stale rows). Restores were gated
+  off (d04f69abe, production restarted on it) until this landed.
+- Design (docs/host_resident_kv_design.md, milestone 4): second pinned
+  arena of main-KV tier slots (84,451,328 B = one 12,688-token block of 13
+  sub-rows), reserved at block allocation (main_homes), flushed at fill
+  (main_flush, confirmed next build), rebound on restore (main_rebinds:
+  offset-table update, zero copy, pinned until the request ends), released
+  when a reserved block never fills (main_release). Index: per-position
+  main slot, main-aware resumability, pins block reclaim; trajectories
+  carrying main slots are deleted rather than demoted to disk (4b owed).
+- Live (port 8001 on GPUs 4-7 beside production, slab 4 + main 20 GiB per
+  rank, 12 x 55K churn after 8K/24K/42K conversations): hits fired
+  ("resume at block 3 (38064 tokens)"), recall correct on all three
+  rebound conversations, 0 errors. Restore vs cold: 8K 3.5 vs 2.6 s, 24K
+  7.5 vs 6.3 s, 42K 4.6 vs 11.3 s - the 12,688-token block is the resume
+  granularity, so conversations shorter than ~2 blocks re-prefill most of
+  themselves; deep ones gain the full win.
+- Tests: index (reserve/confirm/release/pin), connector (homes at alloc,
+  flush at fill, rebinds + pins on resume, release at finish), residency
+  (home demotion, flush, rebind, gather from the tier slot): 118 CPU + 5
+  GPU green.
+- Profile: host_tier 12 GiB + main_kv_tier 76 GiB per rank (352 GiB
+  pinned total, as validated); production restarted on it.
+
+## 2026-09-06 - qwen38fn-nvfp4-4 capacity levers: what bounds the 2.03x resident concurrency
+
+- Operator: "the 531k tokens, 2.03 max length requests is unacceptable -
+  the entire purpose of kv cache cpu offload and kv cache nvme offload is
+  to maximize that and transcend the limitation of gpu vram."
+- What the number is: the main QSA KV is already off the GPU (host rows,
+  76 GiB tier per rank). The 2.03x counts the GPU-RESIDENT residue per
+  max-length request: 38 packed slab blocks x 10,556,416 B = 0.37 GiB,
+  made of 21 indexer-key blocks (13 layers x 12,688 tokens x 64 B, bf16,
+  dense-scanned every step), 16 GDN state blocks (12 layers x 812,032 B:
+  fp32 temporal state 12 heads x 128 x 128 + conv tail) and 1 ring block.
+  The pool that holds them is 0.44 GiB out of 0.91 GiB "available KV"
+  after the 24 hot rows and the drafter's share. Everything else on the
+  card is 20.8-21.1 GiB of weights + non-torch, 1 GiB peak activation,
+  0.19 GiB graphs.
+- Lever 1, max_num_batched_tokens 1024 (test on GPUs 4-7, port 8001,
+  serve_boot21_batch1024_8001.log): available KV 0.91 -> 1.06 GiB, pool
+  531,186 -> 634,664 tokens (2.03x -> 2.42x). Peak activation did NOT
+  drop (0.98 -> 1.08 GiB); the gain came from a smaller non-torch share.
+  Cost: c8 361.7 -> 310.6 tok/s (-14%), c1 120.1 -> 128.9 (+7%).
+  REJECTED: the batched-token cap is not what sets the activation peak,
+  and it taxes the concurrent case the profile exists for.
+- Finding: the activation peak is the vision encoder's profiling image -
+  the encoder cache is profiled with one image of the maximum feature
+  size (16,384 encoder tokens = 65,536 patches through the 27-layer,
+  1152-wide ViT), not the LLM's batched tokens. Lever 2 is bounding the
+  image side (mm_processor_kwargs max_pixels, which the Qwen3-VL
+  processing info maps onto size.longest_edge, so it bounds both the
+  profile and real requests by downscaling larger images); measured next.
+- Lever 2, mm_processor_kwargs max_pixels 4194304 (encoder budget 16,384 ->
+  4,096 tokens; serve_boot22/23_maxpix_*_8001.log): at util 0.975 the
+  profiler handed the pool 1.62 GiB (1,034,778 tokens, 3.95x) and CUDA
+  graph capture died OOM (free 2.4 MB on ranks 1-2). At util 0.96 the
+  pool was 1.27 GiB (786,432 tokens, 3.00x), boot and capture passed,
+  idle free 620 MiB per card (production idles at 1,040), and the c8
+  exact bench crashed the workers with torch.OutOfMemoryError (126 MiB
+  request, 46 MiB free) inside execute_model. REJECTED as configured.
+  What it taught: the vision profile's oversized activation peak was
+  never waste - it was the only thing reserving the ~0.5 GiB that graph
+  capture and the c8 prefill transient actually need. Without it the
+  profiler over-commits, and vLLM has no accounting for those transients.
+  Bounding images could still buy ~0.1-0.3 GiB with an explicit
+  kv_cache_memory_bytes chosen from a loaded measurement, not from the
+  profiler; that is at most +0.3x and was not pursued.
+- Conclusion: the resident-concurrency bound at this checkpoint is
+  structural, not a tuning knob. Per max-length request the GPU still
+  carries 218 MB of bf16 indexer keys (dense-scanned every step) and
+  156 MB of GDN state, packed at a uniform 10.56 MB stride. Ways to move
+  it, sized from the layout: (1) fp8 indexer keys with a per-group
+  (non-uniform) slab stride: 401 -> 272 MB per max-length request
+  (+47%); (2) bf16 GDN temporal state on top: -> 195 MB (+106%; needs
+  a deep-recall requalification, fp32 state was chosen for long-sequence
+  drift); (3) host-resident indexer keys (milestone 5): the scan reads
+  every compressed key each step, so at 262K x 8 requests that is
+  1.7 GB/step over PCIe (~70-90 ms) - concurrency unbounded by VRAM at a
+  measurable deep-context decode cost. None of these was started;
+  decision owed to the operator (see the 2026-09-06 report).
+- Housekeeping: profiles.json restored to the committed record (util
+  0.975, no batched-token cap, no image bound); GPUs 4-7 released;
+  production untouched throughout.
+
+## 2026-09-06 - qwen38fn-fp8-8: the host-resident main KV ported to the 8-GPU FP8 record
+
+- Operator: "do the 8-gpu FP8 port. stop production when you are ready to
+  test it." Production (qwen38fn-nvfp4-4 on GPUs 0-3) was stopped for the
+  test window and restarted after it.
+- Baseline (perf/baseline_status.md, 2026-09-02/03 record): GPU pool
+  496,174 tokens = 1.89 max-length requests at 1,056-token blocks; c1
+  130.9-136.2, c8 547-585, c16 838, c32 880-882 tok/s (exact 1000/2000).
+- Port: the FP8 record's kv_connector_extra_config gains
+  main_kv_host_resident / main_kv_gpu_rows 104 (32 seqs x up to 3 write
+  rows + scratch) / main_kv_sub_blocks 8 / main_kv_tier_gb_per_rank 48,
+  with host_tier_gb_per_rank 88 -> 12 (the slab tier now holds 12,688-token
+  blocks: 1,220 = 15.5M tokens) and nvme 448 unchanged.
+- Boot 1 (serve_boot1_hostkv_8001.log) failed the planner: at TP8 the GDN
+  state page halves (406 KB), so the aligner's natural attention block
+  became 6,352 tokens = 16 x 397, which splits into no sub-row near 8 -
+  main_kv_sub_blocks resolved to 1, every hot row became a whole 19.5 MB
+  block, and the one-request check wanted 4.39 GiB of 3.64. Fix
+  (vllm/platforms/interface.py): the host-resident aligner holds the block
+  at main_kv_block_tokens (default 12,688, the validated 13 x 976 geometry)
+  and pads the GDN page to match; tests/v1/core/
+  test_main_kv_planner_helpers.py pins the arithmetic. The main KV is one
+  KV head replicated per rank, so blocks stay 84,451,328 B at TP8 and the
+  hot window is 0.63 GiB.
+- Boot 2 (16 + 64 GiB tiers) came up but left 64 GiB MemAvailable on the
+  995 GiB box (24 GiB of residency rows per rank on top of the tiers and
+  the 48 GiB PLE segment); boot 3 = the record as committed (12 + 48):
+  MemAvailable 221 GiB at idle.
+- Boot 3 (serve_boot3_final_8001.log): available KV 3.65 GiB, GPU pool
+  2,110,949 tokens = 8.05 max-length requests (1.89x before; 2.03x on the
+  4-GPU NVFP4 record), weights + non-torch 18.07 GiB, peak activation 0.9,
+  graphs 0.47.
+- Exact bench (bench_hostkv_c{1,8,16,32}.log): c1 116.2 (-12%), c8 549.4
+  (in band), c16 631.3 (-25%), c32 787.5 (-11%). Two causes, both
+  measured: (1) the residency's per-step host bookkeeping, 10.6 ms/step at
+  c1 falling to 4.1 ms/step amortized at c32 (a dozen small device ops and
+  pageable H2D copies per step in MainKVResidency.prepare_step) - the c1
+  and c16 loss; (2) capacity at chat context: c32 ran 21 requests (KV
+  96.4%, 11 waiting) because every chat request charges 14 packed blocks -
+  1 attention + 1 ring + 12 GDN snapshots that each occupy a 10.56 MB slot
+  for 812 KB of state - while the interval generation rate at that plateau
+  was 900-1,019 tok/s (baseline-equivalent per running request).
+- Image canary PASS ('A red circle is drawn in the image.'); tier
+  acceptance (48-request churn of 55K tokens against the 306-block pool)
+  PASS: hits fired (resume at block 3 = 38,064 tokens), marker recall on
+  all three restored conversations, 8K 2.3 s / 24K 7.4 s / 42K 4.2 s vs
+  cold 1.9 / 5.7 / 10.1 s; 0 errors over the whole run.
+- Decision: ADOPTED on the record - 4.3x the resident deep-context
+  capacity at the native 262,144 context for -11% at c32 and flat c8.
+  Owed next, in order: (a) vectorize prepare_step (keep the device tables
+  incremental, pinned staging) - recovers most of c1/c16; (b) per-group
+  slab strides so a GDN snapshot stops paying an attention-sized slot -
+  chat concurrency 21 -> the full 32 and max-length residency ~8x -> ~13x
+  in the same pool; (c) fp8 indexer keys on top of (b).
+- Raw: perf/results/2026-09-06/qwen38fn-fp8-8_hostkv/.
+- Deep-recall follow-up (after the entry above): the first smoke run's
+  raw-prompt cold turns return an immediate end-of-turn token (raw text
+  ending in a period; 68% EOS probability at 8K) - a model behaviour, not
+  a KV fault - so recall was re-measured with the question inside one
+  fresh request: PASS at 1.8K, 2.1K, 6.3K, 24K, 50K, 51K, 54K, 72K, 99K
+  and 198K tokens. Controlled tier restores (restore_depth_probe.py: fresh
+  conversation, 44 x 55K churn, follow-up) PASS at 3, 4 and 5 full
+  blocks (5.2 / 3.3 / 8.1 s vs 10.4 / 12.7 / 18.1 s cold); a 198K
+  conversation (203 rows against the 104-row window) recalled across a
+  follow-up under two concurrent 50K prefills and a quiet one after
+  (oversub_probe.py); the exact smoke flow rerun on the same 54K prompt
+  and a fresh variant PASS.
+- OPEN: between 22:44 and 22:48 UTC three follow-ups (54K, 144K, 198K)
+  returned empty answers - the 54K/144K ones were tier restores of
+  trajectories written at boot by the aborted first smoke, the 198K one a
+  fresh conversation whose follow-up ran beside 43-51K sweeps. Nothing in
+  the log (no warnings, disk_reads 0, restores staged for the full span),
+  and none of the probes above reproduces it. Suspected mechanism, real by
+  inspection whether or not it fired here: KVTierIndex._delete (reclaim
+  under a full main-KV tier) frees main slots without telling the
+  residency, so a block still alive in the GPU prefix cache whose demoted
+  rows point into a reclaimed slot reads another trajectory's bytes. Fix
+  owed (design doc, 8-GPU section, item c). Production keeps the TP4
+  record, which carries the same code path.
+- Production restarted on qwen38fn-nvfp4-4 (GPUs 0-3) at 23:45 UTC; the
+  FP8 record's new configuration is committed but not deployed (operator:
+  one instance on GPUs 0-3, GPUs 4-7 free).
+
+## 2026-09-07 - qwen38fn-nvfp4-4: optimization brainstorm and the host-reality microbenchmarks
+
+- Status: in progress (plan). Scope: qwen38fn-nvfp4-4/rtx3090 decode path.
+- Deliverable: perf/qwen38fn_nvfp4_4_optimization_plan.md (inventory, bytes
+  per step, c1 budget, ranked experiments E0-E8, do-not-redo list),
+  written per the QuixiCore CUDA handbook with the Metal/ROCm findings
+  cross-checked.
+- Measured 2026-09-07 on idle GPUs 4-7 (raw in perf/results/2026-09-07/qwen38fn-nvfp4-4-plan/, tables in
+  the plan): DRAM copy 844 GB/s; NCCL all-reduce TP4 bf16 [t,2560] ~40-48
+  us flat for t<=24 (77 us at t=64); vLLM custom all-reduce over PCIe at
+  TP4 (car_parity.py, VLLM_CUSTOM_AR_ALLOW_PCIE=1) 24.0/25.1 us at t=1/3
+  vs NCCL 40.2 - the TP8 rejection of 2026-08-27 does not transfer to TP4
+  - and 50/53/174/649 us at t=8/16/64/256 (NCCL 40/41/48/127); cuBLAS
+  bf16 decode GEMMs at M=3: 703 GB/s on 2560->4096 but 80-125 GB/s on the
+  2560->320/512 shared-expert and router shapes and 318-474 on the
+  1536->2560 and hyper-connection mixer shapes, with a 16-21 us floor per
+  call independent of M (1..24).
+- Finding: the checkpoint quantizes only the routed experts; GDN
+  projections (3.89 GiB), the replicated hyper-connection mixers (1.19
+  GiB), QSA projections, lm_head and shared experts are bf16, so a rank
+  streams ~3.9 GB per c1 step (4.6 ms at roofline) through ~11 cuBLAS
+  calls per layer that run latency-shaped. With 96 all-reduces at ~42 us,
+  the dense chain and the collectives are about two thirds of the 15.9 ms
+  c1 step. c8 remains pool-bound (5 running).
+- Next: E0 nsys census + E1 custom AR at TP4 (config + payload cutover),
+  then the skinny-GEMM family (E2) and hyper-connection fusion (E3).
+
+## 2026-09-07 - qwen38fn-nvfp4-4 optimization campaign: same-instance baseline (loop start)
+
+- Status: in progress. Scope: qwen38fn-nvfp4-4/rtx3090, test instance on
+  GPUs 4-7 (port 8001), production untouched on GPUs 0-3.
+- Baseline (record as committed, exact 1000/2000 seeded, c1/c8/c32):
+  **129.5 / 361.1 / 384.7 tok/s**, pool 531,186 tokens, 0 errors
+  (perf/results/2026-09-07/qwen38fn-nvfp4-4-opt/bench_baseline_c{1,8,32}.log).
+  c1 is above the 120.1 recorded on 2026-09-06 (same config; that run was
+  taken beside a busy production box), so today's numbers are the A/B
+  reference; c32 == pool-bound c8 (max_num_seqs 8, 5 running).
+- E1 change under test: VLLM_CUSTOM_AR_PCIE_MAX_BYTES (new env; PCIe
+  opt-in custom all-reduce only for payloads <= the cap, NCCL above), run
+  with VLLM_CUSTOM_AR_ALLOW_PCIE=1 and a 16 KiB cap so MTP verify steps
+  (3 x 2560 bf16 = 15,360 B) take the 24 us one-shot and c8+ steps stay on
+  NCCL. tests/distributed/test_custom_ar_pcie_cap.py (3) green.
+- E1 result (serve_e1_car2_8001.log, bench_e1_car2_c{1,8,32}.log): c1
+  **101.9 (-21%)**, c8 353.3 (-2%), c32 391.5 (+2%). REJECTED. The
+  standalone parity harness (24 vs 40 us at t<=3) does not transfer to the
+  decode graph: inside the FULL decode graph the registered one-shot
+  kernel spins on peer flags, so every all-reduce waits for the slowest
+  rank's position in its own graph, and with 96 of them per step the rank
+  skew that NCCL's LL protocol absorbs becomes serial waiting (the
+  microbench synchronized all ranks before each timed call). c8/c32
+  payloads exceed the cap and stayed on NCCL, hence unchanged. The env
+  knobs (VLLM_CUSTOM_AR_PCIE_MAX_BYTES + cap-sized IPC buffers) stay
+  opt-in and off; the buffer sizing is a real fix for the existing
+  VLLM_CUSTOM_AR_ALLOW_PCIE path (an 8 MiB buffer tipped the startup
+  free-memory check at gpu_memory_utilization 0.975, which leaves only
+  ~30 MB of slack on this record - worth remembering for any change that
+  allocates before the check). Lesson for the plan: collective latency is
+  a floor at TP4 on PCIe; the lever is fewer collectives or more tokens
+  per step, not a faster all-reduce kernel.
+- E2 gate microbench (skinny_gemm_proto.py, CUDA-graph replay timing, GPU 4
+  idle; skinny_gemm_graph.out): the wall-clock table in the plan was
+  launch-bound (Triton flat at 29-38 us per call, cuBLAS 16-21 us floor).
+  In-graph GPU time per call at M=3: cuBLAS 5.1 / 7.4 / 13.1 / 13.0 /
+  11.4 / 7.4 / 17.4 / 28.3 us on shared-expert 2560->320 / router 2560->512
+  / GDN out 1536->2560 / QSA o / hyper down 10240->320 / hyper up
+  320->10240 / QSA qkv 2560->2048 / GDN in 2560->4096 (320-887 GB/s), so
+  the dense chain is ~100 us per layer = ~4.8 ms of the c1 step, not the
+  8-10 ms the wall-clock numbers implied. A weight-stationary split-K
+  Triton kernel (BN 16-64, BK 64-256, SK 1-8, fp32 accumulate, 2e-2
+  parity) beats cuBLAS by 1.01-1.27x at M=3 and 1.12-1.78x at M=24 (cuBLAS
+  drops to 417-474 GB/s on the 1536->2560 and 2560->2048 shapes at M=24
+  where the kernel holds 726-743). Revised E2 expectation: c1 -0.8 ms
+  (~+5%), c8 -2 ms of a ~26 ms step (~+8%); larger with the E3 epilogue
+  fusions. Decision: proceed after the E0 census confirms the chain's
+  share.
+- E0 nsys census (census_c1c8.nsys-rep -> sqlite; census_report.txt,
+  census_gaps.txt; `--cuda-graph-trace=node`, c1 112.7 / c8 362.4 tok/s
+  under the profiler). Per decode step on rank 0:
+
+  | item | c1 (18.7 ms/step) | c8, 5 running (29 ms/step) |
+  |---|---:|---:|
+  | cuBLAS small-M cutlass WMMA "Kernel2" (441/step at c1) | 5.8 ms | 6.2 ms |
+  | cuBLAS ampere_bf16 s16816 GEMMs + splitKreduce (220/step) | 2.0 ms | 2.5 ms |
+  | cuBLAS dot_kernel/reduce_1Block (router/gate GEMVs) | 0.2 ms | 0.9 ms |
+  | NCCL all-reduce RING_LL (103/step) + all-gather | 2.3 ms | 4.5 ms |
+  | Marlin NVFP4 experts (100/step) | 1.7 ms | 3.8 ms |
+  | QSA gather splitk + merge + indexer scoring | 0.6 ms | 1.9 ms |
+  | GDN delta-rule update + conv | 0.4 ms | 1.1 ms |
+  | MoE glue (topkGating, align, sum, silu, act) | 1.1 ms | 1.4 ms |
+  | elementwise + vectorized_elementwise (~350/step) | 0.9 ms | 1.8 ms |
+  | hyper-connection glue (_hc_*) | 0.4 ms | 0.6 ms |
+  | sampler _topk_topp (1/step, 248K vocab) | 0.36 ms | 0.44 ms |
+  | host gaps (GPU idle) | 2.3 ms (12%) | 2.5 ms (9%) |
+
+  "Kernel2" is cutlass_80_wmma_tensorop_bf16_s161616gemm 16x16/32x32 tiles
+  with split-K (grids 8x80, 8x3x40, 8x10, ...), i.e. cuBLAS's small-M
+  heuristic for the hyper-connection mixers, router, shared expert, GDN
+  B/A projection and output projections: 9 per layer plus the
+  splitKreduce follow-ups. The dense bf16 chain is therefore ~7.7 ms of
+  the c1 step (37%) and ~9.3 ms at c8 (32%): the plan's ranking of E2
+  stands, and the graph microbench (5-28 us per call) under-counted the
+  number of calls, not their cost. In-graph NCCL LL is 13-21 us per call
+  at 3 rows (2.1 ms/step), 37 us at 15 rows. Idle gaps cluster after the
+  input-prep index/elementwise kernels and after the sampler: the host
+  floor (E7) is 2.3-2.5 ms/step. Marlin holds ~550 GB/s effective on the
+  expert stream at c1 (E4 demoted). Sampler at 0.36-0.44 ms/step is a
+  cheap follow-up (Metal "lm_head_sample" precedent).
+- E2 leg 1 (vllm/models/qwen4_exp/nvidia/skinny_gemm_sm86.py, env
+  VLLM_QWEN4_EXP_SKINNY_GEMM=1, one config per (N, K); 397 linears / 8
+  shapes routed; tests/models/qwen4_exp/test_skinny_gemm_sm86.py 64
+  green): c1 **138.8 (+7.2%)**, c8 355.9 (-1.4%), c32 386.8 (+0.5%), 0
+  errors. Per-M sweep (skinny_sweep_m.out) explains c8: the single config
+  loses to cuBLAS on (320,2560) at M<=16 (4.5 vs 5.5 us), (512,2560)
+  (needs bn16/bk256/sk1: 5.8 vs 6.5) and (336,10240) at M>=24 (21 vs 18
+  us), while the wide shapes hold 1.1-1.7x at every M. Leg 2 = per-M
+  bucketed plan (cuBLAS for the shared-expert shape below M=24), under
+  test as e2b.
+- METHOD CORRECTION (2026-09-07): c1 tok/s on this record is dominated by
+  the drafter's acceptance draw, which varies with any numeric change
+  (custom AR reduction order, Triton vs cuBLAS accumulation) and between
+  repeats: the same E2b instance measured 126.3 / 120.5 / 123.1 / 154.1
+  tok/s on four c1 runs at 55.9 / 51.1 / 53.4 / 80.1% acceptance, while
+  its decode step time was 16.78-16.90 ms every time. The exact bench
+  reports spec_decode_drafts (= verify steps) and wall_seconds, so
+  ms/step = wall / drafts is the paired c1 metric from here on, and c8/c32
+  are read as verify-steps/s = tok/s / (1 + accepted/drafts). bench.sh
+  prints both. Re-read with that metric: baseline 16.81 ms/step; E1 17.00
+  (+1.1%, rejected on step time too, and its 36.6% acceptance was the
+  lottery, not a defect); E2 leg 1 16.93 and E2b 16.78-16.90: the skinny
+  route has NOT moved the c1 step despite the kernel-level 1.1-1.27x,
+  which needs the census with the route on (running) before E2 is judged.
+- E2b census (census_e2b.nsys-rep, 15 s c1 window, 809 steps, GPU busy
+  93%): `_skinny_gemm_kernel` ran only 60 times per step (0.45 ms) while
+  cuBLAS "Kernel2" still ran 394/step (5.5 ms) and ampere GEMMs 53/step:
+  the route reached only the QSA attention projections. Cause: the decode
+  model came from cached torch.compile artifacts ("reconstructed
+  serializable fn from standalone compile artifacts, num_submods=50"),
+  compiled before the route existed; the switch was read from the raw
+  environment and so was not in the compile hash. Fix: register
+  VLLM_QWEN4_EXP_SKINNY_GEMM in vllm/envs.py (every registered env var is a
+  compile factor). Leg e2c = fresh compile with the per-M plan.
+- E2c (fresh compile, per-M plan, 8 shapes / 397 linears; e2c logs): c1
+  **16.36 / 16.44 ms/step vs 16.81 (-2.4%)**, c8 167.5 vs 166.8
+  verify-steps/s (flat), c32 184.4 vs 180.8 (+2.0%). Real but small. The
+  checkpoint enumeration (safetensors headers) shows the plan was still
+  missing four per-rank shapes; graph-replay sweep (skinny_sweep_extra.out):
+  GDN fused B/A (24,2560) cuBLAS 15.6 -> 5.1 us (3x, 36/step), MTP
+  fc (2560,2560) 21 -> 17, shared-expert down (2560,160) 3.4 -> 2.5,
+  lm_head (62080,2560) 416 -> 361 us (1/step). Added (13 shapes; parity
+  86 green); census e2d with the full route at c1 and c8 in flight.
+- E2d census (census_e2d.nsys-rep, 13-shape route): `_skinny_gemm_kernel`
+  now runs 444/step (Kernel2 down to 63/step), averaging 14.1 us in-graph
+  (6.3 ms/step) against the 7.5 ms the cuBLAS chain took, so GPU time per
+  step fell ~1.2 ms while the measured step fell 0.45 ms: the remainder
+  is absorbed by host gaps (E7 becomes binding at c1). NCCL all-reduce
+  durations in the same census are 39-80 us per call (8.2 ms/step in the
+  c8-style window), well above the 13-21 us standalone figure: in-graph
+  the kernel duration includes waiting for the slowest rank, so
+  collectives are both the rank-skew sink and, at 15-24 rows (77-123 KB),
+  a bandwidth item on NCCL's LL protocol (~1.5-2.7 GB/s). Next: E2d
+  serving verdict (running), then an NCCL env sweep (protocol/algorithm/
+  buffer sizes) at decode payloads on the P2P fabric, then E7.
+- **E2 RETAINED (e2d, 13-shape per-M plan, 483 linears / 12 shapes routed):
+  c1 15.81 / 15.87 ms/step vs 16.81 (-5.8%), c8 168.3 vs 166.8
+  verify-steps/s (+0.9%), c32 187.1 vs 180.8 (+3.5%), 0 errors; tok/s at
+  the drawn acceptances 143.1 / 354.9 / 401.5.** Kept behind
+  VLLM_QWEN4_EXP_SKINNY_GEMM (registered env, compile-hash factor); the
+  record's env turns it on once the correctness gates (deep recall to
+  144K, image canary, tier restore at 3-5 blocks) pass on the same
+  instance. Lesson recorded twice now: a kernel A/B is not a serving A/B
+  until the census shows the kernel in the graph, and the c1 metric is
+  ms/step.
+- NCCL env sweep (nccl_env_sweep.sh, torchrun world 4 on GPUs 4-7, bf16
+  [t,2560] all-reduce): default 41-47 us from t=1 to t=64 (isolated
+  60-75 us outliers at single sizes are timer noise, not a trend);
+  NCCL_PROTO=Simple 48-81 (worse), LL128 = default, NCCL_ALGO=Tree
+  worse above t=8 (87-123 us), BUFFSIZE / LL_BUFFSIZE / NTHREADS /
+  P2P_USE_CUDA_MEMCPY all within noise of default. REJECTED: NCCL's LL
+  ring is already at its latency floor on this fabric; the 39-80 us
+  in-graph durations at c8 are rank-skew waits, which the host-floor work
+  (E7) addresses, not a protocol knob.
+- E7 host floor, py-spy (pyspy_worker0_e7.txt / pyspy_core_e7.txt, 250 Hz
+  x 20 s during c1, route on): worker 0 self-time is 45% on
+  `short_conv_attn.py:348` (`non_spec_req_idx_cpu.to(device)`, a pageable
+  host-to-device copy that blocks behind the previous step's kernels) and
+  45% on `sync_completion_event`; the engine core sits in
+  shm_broadcast waits (it is ahead of the workers). The pageable copy is
+  a per-step drain: the host cannot run the next step's metadata build
+  and graph launch while the GPU still works, which is the 2.3 ms of
+  GPU idle the census showed. E7a: the five pageable `.to(device)` sites
+  in the short-conv builder -> `async_tensor_h2d` (pinned, non_blocking),
+  and pinned staging for the residency's per-step index copies. Under
+  test (e7a).
+- **E7a RETAINED (drain kill): c1 15.38 / 15.34 ms/step (vs 15.81 with E2
+  alone, 16.81 baseline: -8.7% cumulative), c8 176.0 verify-steps/s
+  (+5.5% vs baseline), c32 189.7 (+4.9%); tok/s at the drawn acceptances
+  140.4 / 384.9 / 407.8; 0 errors.** py-spy after the fix: worker 0 54%
+  in sync_completion_event (GPU wait) and ~30% in shm_broadcast waits
+  (waiting for the engine core's next step), the core mostly waiting for
+  worker output - the residual host gap is the per-step scheduler/worker
+  handshake, not a blocking copy. Change: five pageable `.to(device)` in
+  vllm/v1/attention/backends/short_conv_attn.py -> async_tensor_h2d, and
+  pinned staging in MainKVResidency.prepare_step. Not gated (the code is
+  correct either way); the residency tests (5) pass.
+- E5a (num_speculative_tokens 3, max_cudagraph_capture_size 32; e5a logs):
+  c1 16.83 ms/step at 37.3% per-draft acceptance = 2.12 tok/step
+  (~126 tok/s vs ~140 at k=2), c8 271.1 tok/s / 117.1 verify-steps/s
+  (vs 384.9 / 176.0). REJECTED: the third draft token is accepted too
+  rarely to pay for the fourth verify row, and align-mode GDN needs
+  k+2 snapshot slots per group per request, so c8 loses running
+  requests on top. Record reverted to k=2 / capture 24.
+- E5b two-pool packed slab (in flight): the scheduler had one BlockPool, so
+  a GDN snapshot block occupied a full attention-sized slot (10.56 MB for
+  812 KB of state) and a 1,000-token request charged ~8 of the 42 slots
+  (18.4% KV usage per request -> 5 running at c8/c32). Change: mamba/GDN
+  groups draw block ids from a second pool at their own stride
+  (kv_connector_extra_config mamba_pool_blocks_per_attn_block = GDN blocks
+  per attention-class block; 0 = old single pool). Touch points: planner
+  (_get_kv_cache_config_packed splits layouts and memory, KVCacheConfig
+  pool_num_blocks/group_pool, KVCacheTensor.pool, packed memory check and
+  cross-rank unify per pool), BlockPool(pool_id) + KVCacheBlock.pool_id,
+  coordinator (one pool per class, per-pool allocation counts, cache-hit
+  lookups on the group's pool), KVCacheManager (per-pool capacity checks
+  with watermark/reservation, free_blocks routing by pool, usage = max),
+  scheduler frees via the manager and bind_gpu_block_pools, worker
+  (one backing per pool), tier connector (per-pool strides, state-group
+  pool for tail pins, DMA views per pool), warmup (min pool bound).
+  Tests: tests/v1/core/test_two_pool_packed_planner.py + the core, tier
+  DMA, residency and registry suites (136 green).
+- E5b RESULT: REJECTED and reverted. Boot e5b_pools (serve_e5b_pools_8001.log):
+  the mamba-class stride came out at 9,744,384 bytes - a GDN group block is
+  12 layers x 812 KB of real fp32 state, not a small page padded to the
+  attention stride - so the split only moved memory (20 attention-class +
+  60 mamba-class blocks, 0.53x max-length) and the tier rejected the
+  backing size. The per-request slab charge at chat context is real state
+  bytes (~2 x 10.56 MB attention/ring + ~6 x 9.7 MB GDN = ~80 MB), not
+  slot padding; the c8/c32 concurrency lever is the GDN state size (fp32
+  SSM state, spec/boundary copies), not the pool layout. The two-pool code
+  is removed (no model here can benefit); the design note stays above.
+- E-GDN (mamba_ssm_cache_dtype bfloat16; egdn logs): GDN page 812,032 ->
+  418,816 B; c1 15.16 ms/step (-1.2% vs 15.34), c8 175.4 verify-steps/s
+  (flat), c32 192.4 (+1.4%); recall PASS at 18K/54K/144K, canary PASS,
+  0 errors. Alone it changes nothing structural because the aligner pads
+  the GDN page back to the attention page inside the single pool.
+- Per-request accounting corrected: the pool is 76 blocks (0.81 GiB /
+  10.56 MB; 531,186 tokens = 2.03 x 38 blocks, not 42), and a chat
+  request holds 14: 1 attention + 1 ring + 3 per GDN group (running
+  state + num_speculative_blocks=2 rollback slots) x 4 groups. Twelve of
+  the fourteen are GDN pages (5.0 MB bf16 / 0.42 MB for the 1-layer
+  group) in 10.56 MB slots.
+- E5b (multi-pool, second attempt): one BlockPool per page-size class at
+  the class's natural (unpadded) page size; extras kv_pool_deep_requests
+  sizes the attention-class pool for that many max-length requests and
+  gives the rest to the other classes at equal chat-context concurrency.
+  Same plumbing as before (perf/results/.../apply_pools_plumbing.py,
+  apply_pools_planner.py); tests/v1/core/test_multi_pool_packed_planner.py;
+  136 tests green. Leg e5b_pools2 = bf16 state + kv_pool_deep_requests 2.0.
+- E5b leg 4 (e5b_pools4; bf16 GDN state + kv_pool_deep_requests 2.0):
+  pools [43, 72, 24, 8] blocks at strides [10.56 MB, 5.03 MB, 225 KB,
+  29 KB] = 0.77 GiB (attention/indexer, 12-layer GDN x3 groups, 1-layer
+  GDN, ring), 2.05 max-length requests kept; **c8 424.1 tok/s / 190.8
+  verify-steps/s (+8.4% vs E7a, +14% vs baseline), c32 487.1 / 227.7
+  (+20% vs E7a, +26% vs baseline), c1 15.25 ms/step (unchanged)**; recall
+  PASS 18K/54K/144K, canary PASS, 0 errors. Two defects found by the
+  gates: the ring pool got 8 blocks including its null block so c32 ran 7
+  (fixed: +1 null allowance per pool), and no tail state was ever saved
+  because the boundary lookup asked one pool for all four state groups
+  while the 1-layer GDN group lives in another (fixed: per-group pools
+  for the lookup, pins and pin releases). Three boots were lost to the
+  connector's slab selection (most-layers storage is now the GDN pool;
+  the residency window ties pool 0's layer count) - both fixed by
+  selecting the pool-0 storage explicitly and excluding host-resident
+  layers. Leg 5 re-checks c32/c8, restores (hit counts) and recall.
+- Capacity reality behind E5b: at 8 running, the GDN rollback slots alone
+  (8 x 4 groups x 2 x 5 MB = 320 MB) are 40% of the 0.81 GiB pool, so
+  c32 cannot reach 16 running while keeping 2 max-length requests; the
+  next structural lever there is the spec-slot count (k+1 per-position
+  states), not the layout.
+- **E5b RETAINED (leg 5, e5b_pools5; record now carries
+  mamba_ssm_cache_dtype bfloat16 + kv_pool_deep_requests 2.0): pools
+  [44, 71, 25, 9], deep 2.1x; c32 507.8 tok/s / 230.2 verify-steps/s
+  (+27% vs baseline 180.8), c8 430.5 / 194.6 (+17% vs 166.8), c1 15.25
+  ms/step (unchanged vs E7a); restores 3/3 (42K 4.7 s, 54K 3.3 s, 76K
+  8.0 s vs 12.0/15.9/24.9 fresh; 50 tail saves), recall PASS, 0 errors.**
+  Cumulative vs the 2026-09-07 baseline: c1 16.81 -> 15.25 ms/step
+  (-9.3%), c8 166.8 -> 194.6 verify-steps/s (+17%), c32 180.8 -> 230.2
+  (+27%); tok/s at the drawn acceptances 140.9 / 430.5 / 507.8 vs 129.5 /
+  361.1 / 384.7.
+- Kernel-count census (E2d sqlite, c1 window): 2,655 launches per decode
+  step (~55 per layer), 15.6 ms GPU/step under nsys. By count: skinny
+  GEMM 437, vectorized_elementwise 437 (the split-K path's accumulator
+  zero-fill and fp32->bf16 convert: 2 extra launches per split-K call,
+  ~270/step), elementwise 177, NCCL 103, hc gate_mix/silu/combine_norm
+  ~300, Marlin 100, MoE glue (topkGating, align, count_and_sort, dot,
+  reduce, silu, act_and_mul, sum) ~450, GDN conv+update 72, QSA chain
+  ~100. Inside CUDA graphs each launch still costs a 1-5 us GPU floor, so
+  the count itself is a c1 lever (Metal precedent: fused eager chains
+  498 -> 302 ms). Next: E2e single-launch split-K (last-CTA reduce, no
+  zero-fill/convert), then E3 hyper-connection epilogue fusion (SiLU into
+  the mixer GEMM, gate-mix into the up-projection), then MoE glue.
+- NVTX census (census_nvtx2): no module attribution is possible inside
+  the FULL decode graph (only NCCL's own ranges and scheduler scopes
+  appear); recorded so it is not retried.
+- E-max10 (max_num_seqs 10, capture 32, kv_pool_deep_requests 1.5; pools
+  [33, 94, 32, 12], 1.57x deep): c32 146.3 tok/s / 67.6 verify-steps/s -
+  a 3.4x collapse from thrash at 100% pool usage (10 running x 9 GDN
+  blocks against 94). REJECTED; record back to 8 / 24 / 2.0. The
+  chat-concurrency sizing needs headroom above max_num_seqs, and the
+  GDN-state bytes cap running requests near 8 on 24 GB regardless.
+
+### 2026-09-07 E2e + E3: single-launch split-K and fused hyper-connection ops (qwen38fn-nvfp4-4, port 8001, GPUs 4-7)
+
+- Baseline: the retained E5b instance (c1 15.25 ms/step, c8 194.6, c32 230.2
+  verify-steps/s; perf/results/2026-09-07/qwen38fn-nvfp4-4-opt/bench_e5b_*).
+- Hypothesis: the kernel-count census (2,655 launches/step) attributed ~270
+  launches to the split-K zero-fill/convert pair and ~300 to hyper-connection
+  glue (hc_silu, gate GEMV, hc_gate_mix). E2e folds split-K into one launch
+  (partials to a persistent workspace, last-CTA reduce via an acq_rel counter,
+  SiLU epilogue); E3 fuses mixer-down + silu(x/HC) and up-projection +
+  sigmoid gate-mix into two Triton ops (`qwen4_exp_hc_down_silu`,
+  `qwen4_exp_hc_up_gate_mix`).
+- Correctness: tests/models/qwen4_exp/test_skinny_gemm_sm86.py 105 passed
+  (split-K re-entrancy, fp32-reference parity for both fused ops). The op
+  path and the direct call differ by one bf16 ulp; the test compares each to
+  the fp32 reference. First boot failed inside Dynamo: the route gate called
+  `is_device_capability` (lru_cache wrapper) in the compiled region; fixed by
+  deciding the route at enable time (`HyperConnection.sm86_hc_fused`).
+- Result (serve_e3_hcfuse_8001.log, bench_e3_hcfuse_c*.log): c1 14.92 /
+  14.95 ms/step (-2.1%), c8 193.6 verify-steps/s (-0.5%), c32 230.2 (0%).
+  Gates: recall 18K/54K/144K PASS, canary PASS.
+- Reading: ~570 fewer launches bought 0.3 ms/step, far below the ~2 us per
+  in-graph launch that the census model assumed. The decode step at c1 is
+  not launch-bound to that degree; the remaining time sits in the collectives
+  (NCCL skew) and the big kernels.
+- Decision: below the keep rule for complexity-adding changes (>=8-10%).
+  Attribution leg (HC_FUSED=False, E2e alone) recorded below before the
+  revert decision.
+- Attribution leg (HC fusion off, E2e alone; serve_e2e_only_8001.log,
+  bench_e2e_only_c*.log): c1 14.97 / 15.02 ms/step (-1.7% vs 15.25), c8
+  194.0 verify-steps/s (-0.3%), c32 231.1 (+0.4%). The E2e+E3 leg was
+  14.92 / 14.95: the hyper-connection fusion contributed nothing
+  measurable on top of the single-launch split-K.
+- **E3 REJECTED and removed** (hyperconnection.py restored, the fused
+  ops and their test deleted). **E2e below the keep rule on its own
+  (-1.7%)**; it stays as the kernel base for E8 (int8 weight-only, same
+  kernel, next entry) and is judged with it: if E8 does not clear the bar
+  the whole line reverts to the pre-E2e kernel.
+- Lesson: the kernel-count census over-weighted launch count. 570 fewer
+  in-graph launches were worth ~0.3 ms; the c1 step is dominated by the
+  bytes the dense bf16 chain streams (below).
+
+### 2026-09-07 E8: int8 weight-only storage for the skinny-routed dense linears (qwen38fn-nvfp4-4)
+
+- Baseline: E2e leg above (c1 14.97 / 15.02 ms/step, c8 194.0, c32 231.1).
+- Evidence (census_e2d.sqlite, `_skinny_gemm_kernel` grouped by grid,
+  per rank-step): lm_head (62080,2560) 3 calls x 361 us at 880 GB/s;
+  HC mixer down (336,10240) 96 x 12.3 us at 560 GB/s; HC up (10240,320)
+  97 x 9.8 us at 670 GB/s; (4096,2560) 36 x 26.2 us at 800 GB/s;
+  (2560,1536)/(2560,2560) 49 x 12.4 us; (512,2560) 48 x 7.8 us at 336 GB/s;
+  (3584,2560) 12 x 23.2 us at 790 GB/s. Total 5.7 ms/step for ~3.9 GB of
+  bf16 weights per rank-step: 4.1 ms at the 936 GB/s peak, i.e. the chain
+  is bandwidth-bound and the big shapes already sit at 85-94% of peak.
+  Only halving the bytes moves it materially.
+- Hypothesis: int8 weight-only (symmetric absmax/127 per row and per
+  group of 128/64/32 columns, fp16 scales) halves the stream: ~2 ms/step
+  at c1 (13%), and c8/c32 in proportion since M <= 24 stays weight-bound.
+  W8A16 at this granularity is the standard near-lossless setting (llama.cpp
+  Q8_0 lm_head, vLLM/AutoGPTQ int8 weight-only) but the NVIDIA NVFP4
+  checkpoint deliberately left these layers bf16, so a quality gate is
+  mandatory: prompt-logprob parity against production (logprob_parity.py:
+  PPL ratio, mean |dlogprob|, top-1 agreement on 32 fixed texts), plus
+  recall, canary and the MTP acceptance rate.
+- Implementation (skinny_gemm_sm86.py): GROUP_K constexpr path in the
+  kernel (int8 tile -> bf16 in registers, integer dot, one fp32 scale
+  multiply on the accumulator per BLOCK_K chunk since BLOCK_K divides the
+  group); quantize_w8 / dequantize_w8 (Triton); the quant method's
+  process_weights_after_loading swaps the bf16 Parameter for int8 +
+  weight_scale_sm86 when VLLM_QWEN4_EXP_SKINNY_W8=1 (registered env,
+  compile factor); custom op qwen4_exp_skinny_gemm_w8_sm86: skinny kernel
+  at M <= 32, bf16 dequant + cuBLAS above, lm_head (318 MB) chunks its rows
+  through the kernel instead of materializing the bf16 copy. Frees ~1.6 GB
+  of weights per rank, which the memory profile hands to the KV pools.
+- Correctness: test_skinny_gemm_sm86.py 185 passed (int8 vs dequantized
+  fp32 reference at every planned shape and M, large-M paths, post-load
+  quantization).
+- Sweep (skinny_sweep_w8.py -> skinny_sweep_w8.out/json): best config per
+  (shape, M) for int8 and, with the single-launch kernel, bf16 again.
+- Sweep verdict (skinny_sweep_w8.out, make_plans.out): int8 wins on the
+  seven large shapes, 0.52-0.64x of the best bf16 config at M<=8 and
+  0.80-0.93x at M=24-32 ((2048,2560), (2560,1536), (2560,2560),
+  (3584,2560), (4096,2560), (10240,320), lm_head 371 -> 202 us); the seven
+  <=7 MB shapes are latency-bound (~4-5 us in-graph floor per launch) and
+  int8 LOSES there (1.07-1.31x), so they stay bf16. Variant microbench
+  (w8_variants.out): the fp16 bit-trick dequant is no faster than the
+  int8 -> fp32 -> bf16 cast, so the cost is the tensor-core operand path,
+  not the conversion; an FMA GEMV variant wins only at M=1 and loses at
+  M=3 (the c1 verify batch), so the dot path stays.
+- bf16 re-sweep with the single-launch kernel (E2f, same run): every
+  bucket beats cuBLAS by >3% now, including (320,2560) at M<=16 (4.3 vs
+  4.3-5.3 us) which the first sweep had left on cuBLAS; new SM86_SKINNY_PLANS
+  table installed. 192 tests pass.
+- **E8 leg (int8 on the 7 shapes + E2f tables; serve_e8_w8_8001.log,
+  bench_e8_w8_c*.log): c1 13.41 / 13.44 ms/step (-10.4% vs the E2e leg
+  14.97 / 15.02; -12% vs E5b 15.25), c8 279.8 verify-steps/s (+44% vs
+  194.0), c32 258.8 (+12% vs 231.1); tok/s at the drawn acceptances
+  164.6 / 593.5 / 567.2.** Available KV memory per rank 0.91 -> 1.59 GiB
+  (the freed bf16 weights). Recall 18K/54K/144K PASS, canary PASS.
+  Quality gate pending (below).
+- INCIDENT 08:11-08:13: the first logprob-parity run used production
+  (:8000) as the bf16 reference. Its prompt-logprobs request (~800
+  tokens) OOM-killed the production worker: compute_prompt_logprobs_with_
+  chunking used a fixed 1024-token chunk, i.e. ~1 GB of fp32 full-vocab
+  logits after the TP gather, against 65 MB free at 0.975 utilization
+  (/var/log/SlimServe/serve.log 08:12:58, rank 2 "allocate 465567744
+  bytes (free: 65339392)"). The engine died, systemd's stop timed out
+  and it auto-restarted the unit at 08:13:40 on the current working
+  tree (skinny route with the new bf16 tables, drain kill, bf16 GDN
+  state, multi-pool slab; int8 off since the record does not set
+  VLLM_QWEN4_EXP_SKINNY_W8). Not an intentional bounce. Any client
+  sending echo/prompt_logprobs could have triggered it.
+  Fix (vllm/v1/worker/gpu/sample/prompt_logprob.py): the chunk is now
+  sized from device free memory + the allocator's idle reserve (first
+  chunk 8 tokens to learn the vocab width, then half the budget at
+  ~16 B/token/vocab entry, capped at 1024). The parity gate
+  (logprob_parity.py) is now dump-and-compare between two test servers
+  on :8001 and never targets production.
+- Quality gate results (logprob_parity.py dump/compare, 31 texts, 25.7K
+  prompt tokens, top-1 prompt logprobs; all on :8001):
+  | pair | PPL a / b | mean abs dlogprob | top-1 agree | max abs d |
+  |---|---|---|---|---|
+  | bf16 (e2f) vs int8 run1 | 4.679 / 4.740 | 0.173 | 92.6% | 26.2 |
+  | int8 run1 vs int8 run2 (same server) | 4.740 / 4.698 | 0.144 | 93.9% | 26.2 |
+  | int8 run2 vs run3 (same server) | 4.698 / 4.701 | 0.133 | 93.9% | 4.9 |
+  | bf16 run1 vs run2 (same server, fresh boot) | 5.230 / 5.937 | 0.271 | 92.4% | 32.7 |
+  | bf16 boot1 vs bf16 boot2 run1 | 4.679 / 5.230 | 0.243 | 92.5% | 35.6 |
+  The int8 quantization is inside the run-to-run spread of the SAME
+  server (bf16-vs-int8 0.173 vs int8-vs-int8 0.133-0.144). The
+  serving path itself, bf16 included, is NOT deterministic: identical
+  prompts re-prefilled on the same server (prompt-logprobs requests
+  skip the prefix cache) disagree by 0.13 nats per token on average
+  with 6% top-1 flips, and on top of that whole runs of consecutive
+  requests come back 0.2-0.6 nats/token worse (bf16 run2 texts 0-10,
+  bf16 boot2 texts 11-30, int8 run1 text 10) with single near-certain
+  tokens scored at -20..-35. The recall probes never saw this (a marker
+  survives spotty corruption). E8 is therefore judged on throughput
+  and on being within the same-server spread; the nondeterminism /
+  corruption is a separate correctness defect being bisected with the
+  same probe, starting from the committed HEAD (6e140ce6a) served from
+  a worktree (~/.local/scratch/ss-head, native .so files linked, the
+  prompt-logprob chunk fix copied in so the probe cannot OOM it).
+- Committed HEAD (6e140ce6a, worktree ~/.local/scratch/ss-head, record as
+  committed): 5 dumps, all clean: run-to-run mean |dlogprob| 0.131-0.134,
+  top-1 agreement 93.9-94.2%, max |d| 4.2-5.3, no per-text shift above
+  0.04. So the 0.13-nat / 6%-flip floor is pre-existing (bf16 logits and
+  discrete MoE/indexer choices; recorded as the baseline), but the
+  episodic per-text corruption (3 of 7 working-tree dumps, 2 of 4
+  servers; max |d| 20-35, whole requests 0.2-0.6 nats worse) is NOT in
+  HEAD: one of the loop's retained changes introduced it. Bisecting with
+  probe_chain.sh (boot, 3 dumps, compare vs HEAD run1; CORRUPT_TEXTS
+  counts texts shifted > 0.1 nats): leg 1 = kv_pool_deep_requests 0
+  (single pool, E5b off), then E7a, then bf16 GDN state, then the
+  skinny route.
+- Bisect leg 1 (kv_pool_deep_requests 0, single pool): run1 CORRUPT
+  texts 11-30 (every request from the 12th on, -0.2..-0.85 nats), then
+  the engine died during run2 with "RPC call to sample_tokens timed
+  out". The multi-pool slab is NOT the cause. The hang is the tell: a
+  timeout inside sample_tokens is a collective deadlock, and the only
+  collective there is the prompt-logprob logits all-gather. Root cause:
+  today's chunk fix sized the chunk from EACH RANK's free memory, so TP
+  ranks disagreed; with unequal chunk sizes the all-gather misaligns the
+  gathered rows (garbage logprobs from the second chunk on: onset at
+  token ~130-160, exactly what the per-64 profile showed), and with
+  unequal chunk counts it deadlocks. HEAD stayed clean because its
+  looser memory put every rank at the 1024 cap. Every corrupted dump was
+  on a server carrying the per-rank chunk. So the corruption is an
+  artifact of the probe's own fix, not of any retained optimization.
+  Fix: all-reduce(MIN) the chunk across the TP group before use.
+  Verification probe (chunkfix: working tree, record restored, int8
+  off): 3 dumps must show CORRUPT_TEXTS 0 and max |d| at the ~5 floor.
+- Verification (chunkfix probe: working tree, record restored, int8 off,
+  TP-consistent chunk): 3 dumps vs HEAD run1, CORRUPT_TEXTS 0 / 0 / 0,
+  mean |dlogprob| 0.134-0.137, top-1 93.7-94.0%, max |d| 4.3-6.1: the
+  same floor as HEAD-vs-HEAD. Root cause confirmed and closed. The
+  standing lesson: a prompt-logprob dump/compare (logprob_parity.py) is
+  the sensitive correctness gate for this stack - it found in one pass
+  what three recall probes, the canary and the tier restore could not -
+  and it must run against test servers only.
+- E8 final quality gate (e8_final: int8 on, TP-consistent chunk; 3 dumps vs
+  HEAD run1): CORRUPT_TEXTS 0/0/0, PPL ratio 1.0040 / 1.0032 / 1.0008,
+  mean |dlogprob| 0.157-0.159 (bf16 floor 0.131-0.137), top-1 agreement
+  93.0-93.1% (floor 93.7-94.2%), max |d| 5.5-7.4 (floor 4.2-6.1). The int8
+  signature is +0.02 nats/token of spread and -0.8 pt of top-1 agreement
+  on top of the floor, with no systematic shift: accepted for W8A16 at
+  group 32-128 (int8 stays off the seven latency-bound small shapes).
+- INCIDENT 2 (09:18): the c8 bench that followed the 93 prompt-logprob
+  requests on the same server OOM'd in the QSA indexer's scoring
+  temporary (`qsa_mqa_paged` logits, 128 MiB fp32, 108 MiB free) and the
+  engine died. The same bench passed on every earlier server that had not
+  served prompt logprobs first: the variable-size logits chunks
+  fragmented the caching allocator's reserved pool so a 128 MiB contiguous
+  block was no longer reclaimable at 0.975 utilization. Fix below.
+- Fixes for incident 2: prompt-logprob chunk capped at 64 tokens (still
+  TP-agreed) and PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True in the
+  record's env; vllm/config/vllm.py's connector guard now exempts
+  HostTierConnector (_VMM_SAFE_KV_CONNECTORS: it copies live tensors
+  stream-ordered and never registers GPU memory with a NIC, which is what
+  the guard protects). Regression test tests/v1/sample/
+  test_prompt_logprob_chunk.py.
+- **E8 RETAINED (e8_v2: int8 on the 7 large shapes, E2f bf16 tables,
+  expandable segments, chunk fix; serve_e8_v2_8001.log, bench_e8_v2*_c*.log):
+  c1 13.46 / 13.47 ms/step, c8 281.6 / 275.4 verify-steps/s (before /
+  after 93 prompt-logprob requests), c32 258.5; tok/s at the drawn
+  acceptances 151.8 / 615.1 / 554.2.** Quality 3 dumps vs HEAD:
+  CORRUPT_TEXTS 0, PPL ratio 1.001-1.004, mean |dlogprob| 0.158-0.161
+  (floor 0.13), top-1 92.9-93.2% (floor 94.0%). Recall PASS, canary PASS,
+  tier restore PASS (restore issued, hot == restored). The post-dump c8
+  bench that OOM'd before now runs. Record: VLLM_QWEN4_EXP_SKINNY_W8=1 +
+  expandable segments + two notes.
+  Cumulative vs the 2026-09-07 baseline (16.81 ms/step, 166.8, 180.8):
+  c1 -19.9% (13.46), c8 +69% (281.6), c32 +43% (258.5).
+
+### 2026-09-07 census of the retained build (census_e8.nsys-rep / .sqlite, census_e8_windows.out)
+
+Per rank-step under nsys (c1 14.07 ms, GPU busy 14.16 ms, 2345 kernels;
+c8 28.2 ms, 2353 kernels). The windows in census_rank.py's automatic split
+were mislabeled (warmup vs benches); census_e8_windows.out uses explicit
+windows (c1 t=3-28 s, c8 t=50-95 s from the first traced kernel).
+
+| item | c1 ms/step | c8 ms/step |
+|---|---:|---:|
+| _skinny_gemm_kernel (486/step) | 4.52 | 5.36 |
+| NCCL all-reduce (103) + all-gather (7) | 2.38 + 0.32 | 4.96 + 1.33 |
+| Marlin NVFP4 experts (100) | 1.66 | 6.17 |
+| QSA sparse gather (14) + indexer scoring | 0.44 | 4.28 + 0.36 |
+| MoE glue (gating, align, sum, silu, act, count/sort, router GEMV) | ~1.5 | ~1.5 |
+| bf16 BinaryFunctor elementwise, 51/step | 0.25 (4.9 us) | 0.99 (19.5 us) |
+| sampler _topk_topp (1) | 0.36 | 0.49 |
+| HC glue (combine_norm, gate_mix, silu) | 0.52 | 0.57 |
+| GDN gating-delta + conv | 0.33 | 0.68 |
+
+Reading: the int8 route holds (lm_head 189 us, (4096,2560) 16 us,
+(3584,2560) 15 us in-graph); the HC down (336,10240) is still the largest
+skinny item (96 x 12.3 us, 44 CTAs). Marlin streams ~8 experts x 3.9 MB at
+c1 and ~50 at c8 at ~800-940 GB/s: bandwidth-bound, done. Host gaps are
+gone (busy == wall). Levers left, by size: c8 collectives (skew +
+123 KB LL payloads), QSA gather at c8 (306 us per call for ~24 x 2K rows
+of 1 KB = ~160 GB/s, 2-3x headroom), a non-vectorized bf16 binary op in
+the MoE path (51/step, 19.5 us at c8), MoE glue fusion (E4), the
+single-CTA sampler (355-490 us, 2.5% c1 / 1.7% c8, below the keep bar
+alone).
+
+### 2026-09-07 E1 revisit at c8/c32 and E9 shared-expert gate fusion
+
+- E1 revisit leg (VLLM_CUSTOM_AR_PCIE_MAX_BYTES=262144 only): the worker
+  log shows "Custom allreduce is disabled ... more than two PCIe-only
+  GPUs" - the PCIe opt-in also needs VLLM_CUSTOM_AR_ALLOW_PCIE=1, so this
+  leg was a no-op and stands as the repeat baseline of the retained build:
+  c8 277.4 / 279.4 verify-steps/s, c32 258.5, c1 13.55 ms/step (e8_v2 was
+  281.6 / 275.4, 258.5, 13.46): noise ~1.5% at c8, ~0.5% at c1. The
+  corrected leg is queued after E9.
+- E9 hypothesis: the shared expert (Qwen2MoeMLP with expert_gate) ends in
+  `sigmoid(expert_gate(x)) * out`: a (1,2560) cuBLAS GEMV (dot_kernel +
+  reduce_1Block), a sigmoid and an unvectorized bf16 broadcast multiply
+  (elementwise_kernel<128,4> BinaryFunctor, 4.9 us at c1 / 19.5 us at c8)
+  = ~12 us per MoE layer at c1, ~27 us at c8, x50 layers: 0.6 ms (4.2%)
+  and 1.35 ms (4.8%). Fold the gate dot (2560 MACs per row, recomputed by
+  every program) and the sigmoid row scale into the down projection's
+  skinny kernel (ROW_GATE path); 7 launches per shared expert become 3.
+  Implementation: `_skinny_gemm_kernel` ROW_GATE/K_GATE/xg/wg, custom op
+  `qwen4_exp_skinny_gated_down_sm86(out, w_down, x, w_gate)`,
+  `Qwen4ExpSharedExpertMLP` (class-swapped onto the shared expert by
+  Qwen4ExpSparseMoeBlock; the route hook sets `sm86_gated_down` when the
+  down shape is planned and bf16). Tests: 198 passed (gated kernel vs
+  fp32 reference at split_k 1 and 4, module forward fused vs base).
+- E9 first cut (gate dot recomputed in the down kernel, leg e9_gate): c1
+  13.72 / 13.72 ms/step (+1.5% vs 13.46-13.55), c8 281.4, c32 256.5:
+  REJECTED. Microbench (e9_micro.py): the fused down took 22 us vs 8.7 us
+  for the four launches - the in-kernel gate dot walks K=2560 in BLOCK_K=32
+  chunks (80 latency-bound iterations). Quality/recall/canary all passed.
+- E9b (row scale from precomputed gate logits; e9b_micro.out): the
+  (1,2560) gate GEMV is faster on cuBLAS dot+reduce (3.0 us) than on the
+  skinny kernel (3.9 us), so it stays; the down kernel applies
+  sigmoid(g[m]) for free: 5.5 us vs 8.7 us at M<=8, and the 19.5 us
+  broadcast multiply at c8 goes away (expected +1% c1, +3.5% c8). 211
+  tests pass; leg e9b running (c1/c8/c32/c1/c8, logprob compare, recall,
+  canary).
+- E9b leg (e9b): c1 13.50 / 13.56 ms/step (flat vs 13.46-13.55), c8 274.1 /
+  267.1 verify-steps/s (-2..-4% vs 277-281), c32 261.7 (+1%); quality
+  CORRUPT 0, PPL ratio 1.0037, recall/canary PASS. No gain: either the
+  fused path is not active in the served model or the multiply it removes
+  is not the shared expert's. Checking the module tree on the meta device
+  before deciding; E1 corrected leg (VLLM_CUSTOM_AR_ALLOW_PCIE=1 + 256 KB
+  cap) runs meanwhile.
+- E1 corrected leg (VLLM_CUSTOM_AR_ALLOW_PCIE=1 + 256 KB cap, e1b): the
+  custom all-reduce enabled ("P2P must be functional") and the engine then
+  hung until "RuntimeError: cancelled" in shm_broadcast: the IPC buffer
+  registration does not work under the expandable_segments allocator the
+  record now carries. E1 was already rejected at c1; REJECTED for good and
+  not pursued further (the collectives' c8 cost is rank skew, not the LL
+  transfer).
+
+### 2026-09-07 E10: QSA sparse-gather launch shape for fp8 caches (qwen38fn-nvfp4-4)
+
+- Evidence: census_e8 c8 window - `_qsa_sparse_paged_gqa_splitk_kernel`
+  14 x 306 us = 4.3 ms of the 28 ms step (15%); microbench (qsa_micro.py,
+  fp8 KV, 6 q heads / 2 kv heads per rank, top-2048): 24 rows 258 us =
+  195 GB/s, 3 rows 39 us = 161 GB/s, i.e. a fifth of the card.
+- Hypothesis: the fp8 override (16-key tiles, 4 warps, 8 splits, 16
+  sequential gather iterations per program) is latency-bound; more bytes
+  per iteration and more programs in flight lift it.
+- Sweep (qsa_sweep.py -> qsa_sweep.out; direct split-K + merge launches,
+  parity vs the library): best block_n=64 splits=32 warps=8 stages=2 at
+  both row counts: 3 rows 39.2 -> 24.7 us (1.59x), 24 rows 227 -> 134.5 us
+  (1.69x); stages 3/4 fail to compile. Parity vs an fp32 dense reference
+  over the selected rows: 0.28-0.32% max relative error, same as the
+  library shape, with padded -1 indices.
+- Implementation: ops/qsa.py fp8 branch of qsa_sparse_paged_attention
+  (block_n 64, 8 warps, 32 splits at <= 512 base programs; prefill row
+  counts scale splits so the fp32 partial buffer stays under 64 MiB). TQ
+  keeps its shape. Test tests/models/qwen4_exp/test_qsa_fp8_gather_sm86.py
+  (rows 1/3/24/96/600, both table modes).
+- Expected: c8/c32 ~1.7 ms/step (6%), c1 ~0.16 ms (1%).
+- E10 leg (e10, with E9b still in; the boot log confirms "48 shared experts
+  with the gated down projection", so E9b IS active): c1 13.45 / 13.50
+  ms/step (flat), c8 284.3 / 274.5 verify-steps/s (flat vs 277-281; the
+  284 is the best c8 reading so far), c32 263.0 / 255.7 (flat vs 258.5);
+  quality CORRUPT 0, PPL ratio 1.0048; recall/canary PASS. A 1.6-1.7x
+  kernel gain on 15% of the c8 step should have been ~6%: measuring the
+  in-graph QSA kernel on this build with the census before judging.
+- E9b verdict: active and null (c1/c8/c32 unchanged over three legs).
+  REJECT; revert after the census.
+- E10 census (census_e10.sqlite, census_e10_windows.out): the (rows,1,32)
+  grid confirms the new shape is in the graph; the serving geometry is ONE
+  kv head per rank with a 6-head group (the sweep modelled two heads), and
+  in-graph the gather went 306 -> 275 us at c8 (-10%) and 31.6 -> 35.8 us
+  at c1 (+13%): step-level flat, as measured. Re-run at the serving
+  geometry (qsa_decode_micro.out, GPU-resident random pages over a 33 MB
+  slab): old shape 92.5 / 134 us at 3 / 24 rows, E10 shape 21.6 / 84 us,
+  so the same kernel is 1.7x (c1) to 3.3x (c8) slower in serving than on
+  the microbench's inputs; a bit-trick e4m3 decode (fp16 exponent
+  re-bias, no exp2/selects) gains only 0-12%, so the ALU decode is not the
+  limiter either. Next: reproduce the serving slowdown (address spread
+  over the 0.8 GB pool / TLB, interleaved K|V page layout, host-mapped
+  pages, index order) before touching the kernel again.
+- Spread/order/layout microbench (qsa_spread_micro.out, library path with
+  the E10 shape, serving geometry): 33 MB vs 1 GB slab, random vs sorted
+  indices, separate vs interleaved K|V pages all land at 22-26 us (3 rows)
+  and 105-121 us (24 rows). None reproduces serving's 35.8 / 275 us, so
+  the serving gather is slowed by something the microbench does not have:
+  the host-resident main KV pages read over PCIe (a minority of
+  host-mapped rows at ~25 GB/s dominates the kernel). If so the lever is
+  the GPU window (main_kv_gpu_rows), which the int8 route's freed memory
+  can now afford: E12.
+- Residency geometry (serve_e10 log): a residency row is one 16-token
+  kernel page across the attention layers = 6.5 MB; 24 GPU hot rows =
+  0.15 GiB against 572 host rows (3.46 GiB pinned); at c8 the stats show
+  537 binds / 514 demotions over 12.5K steps. Eight 1-3K-token contexts
+  need ~1500 rows (9.7 GB), so at c8 the gather is mostly PCIe reads of
+  host-mapped pages: raising main_kv_gpu_rows within the freed 0.7 GB
+  cannot change that, and the only structural lever is deduplicating the
+  three query rows' selections per request (one PCIe fetch per row) -
+  parked as a design item.
+
+### 2026-09-07 E13: decode batch 16 (qwen38fn-nvfp4-4)
+
+- Hypothesis: c32 is capped at c8's throughput (258 vs 280 verify-steps/s)
+  because max_num_seqs is 8; the weight streams (Marlin, skinny, ~12 GB
+  per step) amortize over more rows, so 16 running requests should lift
+  c32 substantially. E-max10 collapsed because its GDN pool ran at 100%
+  (thrash) and 30-row batches fell outside the captured graphs; the int8
+  route freed 0.7 GB per rank since, and capture goes to 48.
+- Leg e13: record temporarily max_num_seqs 16 / max_cudagraph_capture_size
+  48 (pools, kv_pool_deep_requests 2.0 unchanged); bench c32, c8, c1, c32;
+  preemption and residency counters; recall gate.
+- E13 leg (e13): pools [44, 195, 66, 23] (attention pool 76 -> 44 to fund
+  the GDN pool for 16 chat requests); c32 204.8 / 233.2 verify-steps/s
+  (-10..-20% vs 258-263), c8 258.1 (-7%), c1 13.48 (flat). Sixteen running
+  requests take 2.4x the step time of eight (68 vs 28 ms): the per-row
+  costs (PCIe gather, collectives, GDN state, glue) dominate, not the
+  weight streams. REJECTED; record back to 8 / 24.
+
+### 2026-09-07 E14: tensor-parallel experts instead of expert parallelism (qwen38fn-nvfp4-4)
+
+- Hypothesis: with EP4 each rank serves a different subset of the experts
+  a step routes to, so ranks finish the MoE at different times and the
+  in-graph all-reduces absorb the skew (c1: 103 x 23 us against a ~10 us
+  LL floor = ~1.4 ms/step; c8: 103 x 48 us = ~4 ms) and the 7 all-gathers
+  per step are EP dispatch. Sharding every expert across the 4 ranks
+  (enable_expert_parallel false) streams the same bytes per rank on
+  average but balances them exactly and removes the dispatch. Risk:
+  Marlin tiles on N/4-wide expert shards, and the router/glue runs on
+  every rank for all tokens.
+- Leg e14: record temporarily enable_expert_parallel false; bench c1, c8,
+  c32, c1, c8; recall gate.
+- E14 leg (e14): BOOT FAILED - OOM in process_weights_after_loading
+  (Marlin NVFP4 repack, `permute_scales`) with 22.4 GiB already allocated
+  per rank: tensor-parallel experts keep all 512 experts per rank at
+  quarter width and the Marlin tiles pad the 160-wide shards, so the
+  weights alone exceed the card. REJECTED as infeasible on 24 GB; record
+  back to enable_expert_parallel true. Config levers are exhausted
+  (E1, E12, E13, E14); the remaining items are kernels: the sampler,
+  MoE glue fusion (E4), the QSA per-request gather dedup.
+
+### 2026-09-07 E15: small-k sampler fast path (qwen38fn-nvfp4-4)
+
+- Evidence: `_topk_topp_kernel` runs once per step from ONE program per
+  row over the 248K vocabulary: 355 us at c1, 469-490 us at c8/c32 in the
+  census (2.5% / 1.7% of the step), the same at any batch.
+- Design: when the batch's largest k (known CPU-side in
+  gpu/sample/states.py, no sync) is <= 32: (1) 64 programs per row
+  extract their vocabulary slice's top round8(max_k) candidates
+  (sequential max/argmax over a 4096 tile), (2) one program per row
+  extracts the top-k of the candidates in order, applies the top-p prefix
+  rule (softmax over the survivors; keep while the mass strictly above is
+  < p, the largest always) and emits the pivot logit, (3) a masking pass
+  writes -inf below the pivot in place. Exact ties at the pivot are kept
+  (the reference's sort drops an arbitrary subset). Rows with top-k
+  disabled carry k == vocab and push the batch past the cap, so the
+  generic kernel keeps serving them.
+- Parity (tests/v1/sample/test_topk_topp_fast_path.py, 13 tests): kept
+  sets equal to apply_top_k_top_p_pytorch at batch 1/3/8/24, mixed k and
+  p, and the >32 fallback.
+- Microbench (sampler_micro.out, sampler_sweep.out): 64 splits x 4 warps
+  38 / 51 / 97 / 225 us at batch 1 / 3 / 8 / 24 vs 386-436 us generic.
+  Expected: c1 -0.3 ms (2.2%), c8/c32 -0.25 ms (0.9%): below the keep bar
+  on its own; measured on the leg before judging.
+- E15 leg (e15): c1 13.16 / 13.28 ms/step (-2.1% vs 13.46 / 13.55), c8
+  286.0 / 271.3 verify-steps/s (noise around 277-284), c32 261.7 (flat);
+  recall and canary PASS. Real and counter-backed (the sampler launch is
+  ~50 us instead of 355), but the sampler was 2.5% of the step, so the
+  gain cannot reach the handbook's 3% low-risk bar. REJECTED/DEFERRED
+  per the decide rule; source reverted, the implementation and its parity
+  test kept under perf/results/2026-09-07/qwen38fn-nvfp4-4-opt/
+  (e15_patch.py in the session scratch, test_topk_topp_fast_path.py) to
+  revive if the step shrinks enough for 0.3 ms to clear the bar.
+
+### 2026-09-07 closing assessment of the qwen38fn-nvfp4-4 loop
+
+Retained build (record + working tree, uncommitted): skinny bf16/int8 dense
+route with the re-swept tables (E2/E2e/E2f/E8), drain kill (E7a), bf16 GDN
+state (E-GDN), multi-pool packed slab (E5b), expandable-segments allocator,
+TP-consistent budgeted prompt-logprob chunks. Cumulative vs the 2026-09-07
+baseline: c1 16.81 -> 13.46 ms/step (-20%), c8 166.8 -> 282 verify-steps/s
+(+69%), c32 180.8 -> 259 (+43%); gates: recall 18K/54K/144K, image canary,
+tier restore, prompt-logprob parity (no corrupted texts, PPL +0.1-0.4%).
+
+Rejected today with measurements: E1 (custom AR, and incompatible with
+VMM), E3 (HC fusion, 0), E9/E9b (shared-expert gate fusion, 0), E10 (QSA
+gather shape, -10% kernel in serving because the gather is PCIe-bound),
+E13 (batch 16, -10..-20% c32), E14 (TP experts, OOM), E15 (sampler fast
+path, -2.1% c1: real but under the 3% bar; archived).
+
+Remaining levers, all below their keep bars on the census_e10 numbers:
+| lever | predicted | bar |
+|---|---:|---:|
+| E15 sampler fast path (archived) | c1 -2.1% | 3% low-risk |
+| E4a fused MoE prologue (router top-k + align, one launch) | c1 -3.6% | 8-10% |
+| E4b fused moe_sum + shared-expert combine | c1 -1.5% | 8-10% |
+| horizontal fusion of same-input small GEMMs (GDN B/A+QKVZ, router+shared gate_up) | c1 -2.5% | 8-10% |
+| QSA per-request gather dedup (one PCIe fetch for the 3 verify rows) | c8/c32 -6% | 8-10% |
+The step is now dominated by bandwidth-bound weight streams (skinny 4.5 ms
++ Marlin 1.6 ms at 85-94% of peak) and collective rank skew (2.7 ms at
+c1, 6.3 ms at c8), neither of which a kernel-level change on this box
+moves by 8%. Stopping the loop here; the sub-bar items are documented for
+a future pass if the bar is relaxed or the step shrinks.
+Production (:8000) runs the working tree of 08:13 (auto-restart after the
+prompt-logprob OOM): skinny bf16 route, drain kill, bf16 GDN state, pools;
+it does NOT yet have the int8 route (record env added after 08:13) - a
+restart is the operator's call.
+
+## 2026-09-07 - Main-KV tier reclaim hazard closed: slot holds that outlive the request
+
+- The hazard (recorded open in the 2026-09-06 8-GPU entry, shared by the
+  production TP4 record): a pool block whose residency rows point INTO a
+  main-KV tier slot - a rebound block, or a block that demoted into its
+  home - stays in the GPU prefix cache after its request ends, but the
+  index only pinned slots for the request's lifetime and never for
+  homes. `KVTierIndex._reclaim` could then `_delete` that trajectory,
+  hand its slots to another lineage, and a later prefix-cache hit on the
+  block read that lineage's bytes. A second, write-side variant: the
+  residency keeps `home_addr` across pool block reuse, so a fresh
+  allocation of the block id that found the tier full (`reserve_main_slot`
+  None) kept the stale home and would demote its NEW rows into the old
+  trajectory's slot.
+- Fix (kv_tier_index.py, host_tier_connector.py): block-level HOLDS.
+  `hold_main(block, slot)` when the connector stages a home or a rebind
+  (and on the fill path's late reservation); `_main_busy` treats held
+  slots like pinned ones, so reclaim skips the trajectory. Holds drop
+  when the pool reuses the block id (a fresh allocation: positions >=
+  the request's computed blocks in `_reserve_main_homes`, which now
+  takes `computed_blocks`), when a confirmed flush moved the rows into a
+  new slot (`unhold_main(block, keep=slot)` on the confirm path - the
+  prefix-cache-hit re-home case), and when an unfilled reservation is
+  released at finish. A fresh block that gets no slot is explicitly
+  un-homed (`main_release` -> `clear_home`) so it demotes into pool rows.
+  Pins stay as they were. Holds are bounded by the pool's block count
+  (42 at TP4, 306 at TP8) against 921 / 813 tier slots, so at most that
+  many trajectories are ever protected from reclaim by cache residue.
+- Tests (CPU): index - held slots block reclaim until every block lets
+  go; unhold-keep and slot-free drop holds. Connector - rebound blocks
+  hold their slots after the resumer finishes, until the pool reuses
+  every block that pointed at them (then reclaim proceeds); a fresh
+  block without a slot is un-homed while the tier is full. 112 green
+  across the tier, residency, planner and registry suites.
+- Live check: qwen38fn-nvfp4-4 on GPUs 4-7 (port 8001, the current
+  working tree) with a 2 GiB main tier (25 slots vs a 43-block pool).
+  Marker conversation (29.7K tokens, 2 full blocks), hot follow-up, then
+  10 x 29.7K churn (30 slots through a 25-slot tier), follow-up. The
+  index logged 28 reclaims with 20-23 slots held throughout - reclaim
+  proceeded only through unheld lineages - and every follow-up recalled
+  its marker: 2/2 in the acceptance (both mixed resumes: block 0 from the
+  GPU prefix cache, block 1 rebound from its tier slot, 3.6-3.9 s vs 7.7 s
+  cold) and 4/4 in the classification probe (three tier resumes at 2
+  blocks, one GPU/cold), 0 errors. One earlier miss at a 200-token
+  answer budget was the model thinking past the budget (the same flow
+  passes at 300 tokens with the codename produced), not a KV fault.
+  Raw: perf/results/2026-09-07/reclaim_hazard/ (serve_tinytier_8001.log,
+  reclaim_acceptance_v2.out, restore_probe.out, scripts).
+
+## 2026-09-07 - qwen38fn-nvfp4-4 scaling campaign: throughput vs concurrency (operator: "get throughput to grow linearly with concurrency")
+
+- Production as measured live on port 8000 after the reclaim-fix restart
+  (exact 1000/2000, temp 1.0, seed 42): c1 103.0 (another request was
+  live during the leg), c8 557.3, c32 549.4 tok/s. c32 == c8 because the
+  record admits 8 decode slots (max_num_seqs 8).
+- Baseline leg (seqs32u96: max_num_seqs 32, capture 96, util 0.96 - at
+  0.975 the 96-size graph set took 0.47 GiB against 0.19 at 24 and the
+  first c8 request OOM'd in the PLE short conv; pools [44, 121, 41, 15] =
+  1.01 GiB, chat concurrency ~13, window 24 rows): c1 143.8 (13.32
+  ms/step), c8 608.0 (273.5 verify-steps/s), c16 474.3 (221.7), c32 507.0
+  (233.2), 13 running steadily at c32, 0 preemptions, pool 97.5%.
+  Per-request step time 29 ms at 8 running -> 58 ms at 13: the per-row
+  cost doubled. The residency shows why: 24 hot rows against 39-52 rows
+  of active main KV (13 chat requests x 3-4 rows of 976 tokens), 219
+  demotions by step 6500, so most pages of every request are read over
+  PCIe each step (the M1 cost table: 48 rows at 50% host = 12 ms vs 3.2
+  ms all-GPU). Hypothesis for the next leg: the hot window, not the
+  pool, caps scaling on this box; per-request VRAM at chat context is
+  ~26 MB of hot main-KV rows + 45 MB of GDN slots (9 x 5.03 MB: the
+  running state plus k=2 rollback copies per group) + 10.6 MB indexer +
+  0.7 MB, ~83 MB, so 32 fully-hot chat requests need ~2.6 GiB against a
+  1.15-1.5 GiB KV budget.
+- Window leg (win48: 48 hot rows funded by kv_pool_deep_requests 1.0,
+  capture 48, util 0.97; pools [23, 184, 62, 22] = 1.10 GiB, chat
+  concurrency ~20). The FULL-graph guard first refused max_num_seqs 32
+  against "23 Mamba blocks": it read pool 0 (attention) under the
+  multi-pool slab; fixed to read the smallest state pool
+  (_mamba_blocks_available, unit test). Results: c1 162.9 (13.46
+  ms/step, flat), c8 593.2 (282.2 verify-steps/s), c16 580.8 (260.7) at
+  16 running with 30 demotions by step 3000 (the window mostly holds:
+  16 x 3-4 rows against 48), c32 347.9 (160.1) at 20 running - 60-80
+  rows against 48 (148 demotions) AND 20 x 3 = 60 query tokens beyond
+  the 48-size graph set, so those steps ran eager. Reading: with pages
+  hot and in-graph, 16 running still costs ~61 ms per request-step
+  against 29 at 8 - the step grows linearly with rows (3.8 ms/row) even
+  without PCIe, so the aggregate is flat from 8 to 16. The kernel census
+  at c16 (next) has to name the O(rows) term before anything else is
+  built; the window and graph sizes are necessary but not sufficient.
+- c16 kernel census on win48 (census_win48c16.sqlite, window 12-45 s,
+  3188 rank-steps, 48 query rows): busy/step 43.99 ms vs 28.80 at c8 (24
+  rows). Growth by kernel: the int8 skinny route ran 4 calls/step (486 at
+  c8) - above its row cutoff the dense projections fall back to
+  cuBLAS/cutlass bf16 GEMMs fed by a per-call int8 dequant
+  (_dequant_w8_kernel 194 calls, 3.77 ms/step) - 13.6 ms of fallback
+  against 5.4 ms of skinny at c8 (+8 ms). Collectives: all-reduce 7.92
+  ms (103 calls at 77 us; 4.91 at c8) and all-gather 2.38 (1.37), both
+  RING_LL on doubled messages (+4 ms). Marlin MoE 8.08 (5.96): the
+  expected saturation. The sparse gather is flat at 4.06 ms (grid
+  (48,1,8); 3.84 at c8): with the 48-row window the pages are hot and the
+  gather is not the scaling term. GDN update 1.20 (0.58), sampler 0.55.
+  Order of attack: (A) carry the int8 route past 24 rows (tensor-core
+  tiles or a W8A16 GEMM without the per-call dequant); (B) the NCCL
+  protocol for 100-250 KB all-reduces (LL128/Simple test next); then the
+  VRAM levers (GDN single-slot replay, window) to reach 32 running.
+- Lever B, NCCL_PROTO=LL128 (leg ll128 on the win48 config, env only):
+  c8 614.1 tok/s (288.2 verify-steps/s vs 282.2), c16 763.4 (342.9 vs
+  260.7: +31%) at 16 running, 0 errors. The RING_LL kernels the census
+  showed (77 us per all-reduce at 48 rows, 103 per step) are latency
+  protocol on 100-250 KB messages; LL128 moves them at line rate over
+  the P2P links. c1 measured next (LL128 adds ~1 us per tiny call).
+  c1 under LL128: 14.79 ms/step (13.3-13.5 baseline, +10%): the tiny
+  per-call messages pay LL128's higher latency. Caveat before any
+  record change: NCCL disables LL128 on PCIe-only topologies by default
+  (it relies on 128-byte store atomicity that PCIe does not guarantee),
+  so a forced LL128 is not production-safe on evidence alone; testing
+  NCCL_PROTO=Simple and NCCL_MIN_NCHANNELS=8 (default protocol) next.
+  NCCL_PROTO=Simple: c8 523.2 (244.0 verify-steps/s: -14%), c16 635.2
+  (307.9: +18%) - no per-size selection, so it trades c8 for c16.
+  NCCL_MIN_NCHANNELS=8: c8 609.4 (283.1, flat), c16 OOM in execute_model
+  (the extra channel buffers eat the headroom at util 0.97). Decision:
+  the collectives stay on the default LL for now; LL128 is recorded as
+  the measured ceiling (+31% at c16) pending a PCIe-atomicity argument
+  or an integrity soak, and the message count (103 all-reduces + 7
+  all-gathers per step) is the structural lever if one is built later.
+- Lever A, int8 skinny tiles past 32 rows (skinny_sweep_w8_m96.out, GPU 4,
+  graph-timed): with BLOCK_M 64/128 the int8 kernel at M=48/64 beats the
+  per-call dequant + cuBLAS fallback ~2x on every routed shape and
+  matches cuBLAS bf16 (4096x2560 @48: 32.8 us vs 86.5 fallback / 48.4
+  bf16; 3584x2560: 28.7 / 62.4 / 26.9; 2560x2560: 21.4 / 45.6 / 23.8;
+  2048x2560: 23.0 / 42.9 / 24.1; 2560x1536: 14.8 / 32.6 / 18.5). At
+  M=96 the tiles trail cuBLAS bf16 (35.7 vs 26.1 on 2048x2560) but still
+  beat the fallback (44.8). Marlin W8 (marlin_w8_microbench.out) beats
+  the fallback too but has a ~45 us floor that loses to the skinny kernel
+  at M<=32 and would need a second weight layout (+0.35 GiB/rank):
+  rejected in favour of extending the existing kernel. Installed:
+  block_m 16/32/64/128 by M, MAX_M 128, 64/128-row buckets for the five
+  swept shapes, widest-bucket reuse for shapes without one (the lm_head
+  62080x2560 and 10240x320 sweep next). Live A/B at c8/c16 queued.
+- k=1 leg (k1: num_speculative_tokens 1, capture 64, win48 config): c8
+  468.6 tok/s (266.5 verify-steps/s, 1.76 tok/step: -23% vs k=2's 2.13
+  tok/step), c16 823.3 (462.8: +42% vs 580.8) at 16 running, c32 700.2
+  (397.0) at 22 running. Reading: at k=1, 16 running is 32 query rows -
+  inside the int8 route's original cutoff, half the collective bytes,
+  Marlin below saturation - so the request-step is 35 ms instead of 61
+  and the lost draft token is repaid twice over. At 22 running (44 rows)
+  the same cliffs return plus window overflow (88 rows vs 48). The record
+  already supports num_speculative_tokens_per_batch_size (dynamic k):
+  leg dynk = k 2 up to 8 running, 1 above, queued behind the tiles A/B.
+- Tiles A/B (leg tiles: win48 config, k=2, the int8 kernel with 64/128-row
+  buckets for all seven shapes - lm_head 62080x2560 @48: 356.9 us vs
+  997.6 fallback / 391.9 bf16; 10240x320 @48: 10.7 / 25.9 / 13.0):
+  c8 620.4 tok/s (287.3 verify-steps/s, flat vs 282.2 - c8 never left the
+  route), c16 801.3 (361.4 vs 260.7: +38%) at 16 running, 0 errors,
+  192 skinny unit cases green. RETAINED: the per-call dequant is gone
+  from the batched-decode regime; the route now covers M <= 128.
+- Dynamic k (leg dynk: num_speculative_tokens_per_batch_size
+  [[1,8,2],[9,32,1]], capture 64, win48, tiles in): c1 161.6 (13.44
+  ms/step, flat), c8 572.7 (276.7 verify-steps/s, in the 277-288 band),
+  c16 887.7 (491.7: +53% vs the tiles-only 361.4, +88% vs the campaign
+  baseline's 260.7) at 16 running, c32 784.2 (436.7) at 20 running with
+  the 48-row window overflowing (20 x 4 rows), 0 errors. Curve so far:
+  c1 162 / c8 573 / c16 888 / c32 784 against the start's 144 / 608 /
+  474 / 507. Leg dynk64 (window 64 rows) running for the c32 point.
+- Window 64 with dynamic k (leg dynk64, deep 1.0): c16 902.6 (509.6
+  verify-steps/s), c32 826.9 (468.4) at 18 running (pools [23, ~150, ..]
+  admit two fewer than the 48-row leg's 20, which had 784.2 at 20 with
+  the window overflowing). The two sides of the VRAM trade are now
+  measured: rows for the gather vs GDN slots for admission. Leg deep2
+  (deep 2.0 kept, 40 rows) running for the record decision.
+- Deep 2.0 kept (leg deep2: window 40 rows, capture 64, dynamic k): c8
+  594.5 (271.8 verify-steps/s), c16 798.9 (450.3), c32 760.8 (422.5) at
+  16 running, 0 errors. Decision for the record: deep 2.0 / 40 rows /
+  dynamic k - the operator's standing complaint is that 2.03 resident
+  262K requests is too few, so the window is not funded from the deep
+  pool; c16 +43% and c32 +39% over production (557 / 549) at no deep
+  cost. The deep-1.0 / 64-row variant (903 / 827) is recorded as the
+  chat-optimised alternative; the GDN single-slot replay (design doc)
+  is what funds both at once. Gates (recall, canary, tier acceptance,
+  restore probe) running on the chosen configuration.
+- Gates on the chosen record (leg final, port 8001, gates_final.out /
+  gates2.out): recall PASS at 54K, 144K and 216K tokens in one fresh
+  request each (216K prefill 78.6 s: the part beyond the 40-row window
+  is written over PCIe; follow-up 9.3 s); image canary PASS at idle and
+  4/4 under c16 load (c16 with images 813.7 tok/s); tier acceptance PASS
+  at 3 depths (42K restored 4.1 s vs 10.7 s cold); the 60,000-repeat
+  recall depth in the old smoke is ~550K tokens and is rejected with 400
+  by design. The first image after boot logged 48 expandable-segments
+  mapping retries at util 0.97 (none under load afterwards): the vision
+  encoder's first-run transient lands on near-zero headroom, so the
+  record moves to util 0.965 and is re-verified (leg final2). The
+  restore probe's first run missed one of two follow-ups; the wrapper
+  dropped the answer text, so it is rerun with full answers (gates3).
+- Residency per-step CPU: the leg final log showed cpu_ms_per_step 50-100
+  while rows changed every step (the 216K prefill: 2 rows bound and 2
+  demoted per step), against ~1 ms in the chat benches. Cause: the
+  retained build's pinned staging allocated fresh pinned tensors per step
+  (torch.tensor(pin_memory=True), .pin_memory()), each a synchronizing
+  cudaHostAlloc. Fixed with persistent pinned staging buffers grown
+  geometrically (kv_residency._staging); 5 residency GPU tests green.
+  Perf-only: it lengthens long prefills, not answers.
+- Follow-up correctness on the 32-seq configs (leg final: restore probe
+  3/3 FAIL even on the hot follow-up, answers coherent but blind to the
+  prompt head or empty; static k=2 on the same config: every follow-up
+  empty; fresh single requests PASS to 216K; tier acceptance PASS at
+  8K/24K/42K; the same 29.7K probe PASSED 4/4 at 22:05 on the 8-seq /
+  24-row / capture-24 config). The log shows the "hot" follow-ups were
+  tier restores at block 2, so the GPU prefix cache had already dropped
+  the cold turn. Discrimination chain running: (8 seqs, 24 rows), (32
+  seqs, 24 rows), (8 seqs, 40 rows), probe_m.py on each.
+- RETRACTION of the follow-up-defect reading above: the raw-completion
+  probes (restore_probe, probe_m) are not a KV oracle for this model.
+  Production (8 seqs / 24 rows, untouched) fails them the same way -
+  follow-ups with 46-59 new tokens returned empty, a FRESH single request
+  answered "I don't know" once and the identical resend answered - while
+  the same document and question through the chat template (probe_chat:
+  enable_thinking false, three seeds) recall exactly: production fresh
+  3/3, resume 3/3 (29.8K tokens). The model's end-of-turn probability at
+  the answer position of a template-less prompt is high (the notebook's
+  2026-09-06 note: 68% at 8K), so at temperature 1.0 empty and evasive
+  answers are legitimate samples, and the earlier FP8 "empty answer"
+  episode reads the same way. The chat oracle (fresh vs resume, plus a
+  108K variant and a resume-after-churn variant for the tier path) is
+  the standing recall check from here; running it on the new record.
+- Chat oracle on the new record, first run (serve_final2_stagingrace):
+  30K fresh 1/3 ("OSPREY-5150", "OSINT", "OSINT"), resume 0/3
+  ("OSPREY", "OSWorld", "OSWorld") - the prompt head's first token
+  survives and the rest is lost, non-deterministically, on FRESH
+  requests too; production is 6/6 on the same oracle. A real defect,
+  and the code delta from production narrows it to the staging change
+  above: reusing one pinned buffer for the residency's page_delta /
+  row_of_block updates while the previous step's non_blocking H2D copy
+  from that buffer may still be in flight overwrites the copy's source
+  (the original per-step allocations were slow but race-free). Fixed:
+  a CUDA event recorded after the copies and synchronized before the
+  buffers are rewritten (and before they are grown). 5 residency GPU
+  tests green; the oracle is rerun twice (seeds 1-3, 4-6) on the record
+  before any number is trusted; the 108K, churn and post-bench oracle
+  variants follow with the final numbers.
+
+## 2026-09-08 - ROOT CAUSE of the resumed-conversation recall failures: flush skipped clean rows on a re-homed block
+
+- Found with the chat oracle plus a VLLM_KV_TIER_VERIFY digest of every
+  main-KV slot at flush and at rebind (kv_residency): every rebind
+  digest matched its flush, so slot bytes survive intact; but the rank-0
+  timeline showed slot 6fb000 - the first request's logical block 0 -
+  flushed AGAIN 13 s later with different bytes while a third request
+  was reading it. The third request was a MIXED resume: logical 1 from
+  the tier (rebind), logical 0 a GPU prefix-cache hit (the second
+  request's pool block, whose rows were clean: flushed to the second
+  lineage's slot). The connector re-homed that block into the resumed
+  lineage's slot and staged a flush; flush() skipped every clean
+  resident row on the assumption "clean == already in the home", true
+  only for the slot the row was flushed to. The new home received a
+  partial image (demoted rows moved, resident rows never copied), and
+  the resumed conversation attended over stale bytes for its prompt
+  head - hence "OSINT"/"OSWorld": the first token survives (its slot was
+  copied) and the rest does not. The same rule sat in the demotion path.
+- This is pre-existing (production has it; it needs a GPU-cache hit to
+  coincide with a tier resume of the same content, which my oracle's
+  identical back-to-back prompts produce reliably and production's
+  oracle run happened not to) and it is the mechanism behind the 8-GPU
+  port's "empty follow-up" episode (2026-09-06, recorded open).
+- Fix (kv_residency.py): a per-row `flushed_to` address (the host copy
+  that is current); flush and demotion copy when the row is dirty OR its
+  current copy is elsewhere; bind resets it; rebind sets it to the slot;
+  set_home moves demoted rows unconditionally (they are never dirty).
+  Regression test: flush to slot 2, re-home to slot 0, flush -> slot 0
+  complete; demotion into a third home copies too. 6 residency GPU
+  tests green. Exonerated by the bisect on the way: the int8 tiles
+  (restored), the pinned staging rewrite (restored, event-guarded), the
+  tier arena size, the GPUs, the environment.
+- Verification running: the chat oracle (fresh vs resume, and resume
+  after a churn that forces tier restores) on production's configuration
+  and on the new record, both with VLLM_KV_TIER_VERIFY=1.
+- Verification (leg fixA, production config, VLLM_KV_TIER_VERIFY=1): the
+  flush fix behaves as designed - the re-homed block's slot digest is now
+  identical across every re-home (cec4950e... on all four lineage
+  swaps, where before each re-home produced a different digest) and every
+  rebind digest matches its flush, slab restores 0 mismatched. It is a
+  real bug and it is fixed, but it was NOT the oracle's cause: the
+  identical-prompt oracle still fails (fresh 2/3, resume 0/3) while the
+  resume-AFTER-CHURN oracle passes 6/6 on the same instance. Reading:
+  pure tier resumes (both blocks from the tier) are correct; MIXED
+  resumes - an internal GPU prefix-cache hit on logical block 0 plus a
+  tier restore of logical 1 and the boundary state ("staged 5 restore
+  ops (blocks 1..2 of 2)") - are what fail. Every earlier passing probe
+  (reclaim test, tier acceptance) was either a full re-prefill or a pure
+  tier resume; the mixed path had never been exercised until the
+  back-to-back oracle. On paper the mixed path checks out (the scheduler
+  hands the request to the worker only after the async load with the
+  full computed count, so the GDN state column seeds at 1; the state
+  restore targets gb[1]; the attention/main-KV restore covers logical 1
+  and the cached block keeps its rows). Two experiments queued to split
+  it: (a) a verify-mode row consistency pass every 25 steps (every clean
+  GPU row vs its host copy, every demoted row vs flushed_to); (b)
+  VLLM_KV_TIER_RESTORE_FROM_ZERO=1, which restores the GPU-cached span
+  from the tier as well (identical bytes, zero-copy rebind) so the
+  main-KV/slab side matches the pure case and only the state/ring side
+  of the mixed resume remains different.
+- ROOT CAUSE (2026-09-08 00:40): the restore's defensive RING zero. The
+  connector stages the resumed request's ring block ids to be zeroed
+  with the restore, and the DMA zeroed `self.blocks[gpu_block]` - pool 0,
+  the ATTENTION slab. Under the single packed slab a block id was one
+  physical row owned by one group, so zeroing "ring block N" was
+  harmless; since the multi-pool slab (E5b, 2026-09-07, in production
+  since 08:13) the ring has its own pool and ring block id N is a
+  DIFFERENT block from attention block N, so the zero wiped attention
+  block N's indexer keys (and raw keys). A pure tier resume rewrites
+  every restored attention block right after the zero, so it never
+  showed; a MIXED resume keeps its GPU-cached leading block, and when
+  that block's id coincided with the request's ring block id (the
+  identical-prompt oracle recycles the same few ids) the prompt head's
+  indexer keys were zeroed: the top-k never selected the codename tokens
+  again - "OSINT"/"OSWorld" - while the main-KV rows and slab digests
+  all verified intact (they were, the damage was to a block the digests
+  never covered). Proven by VLLM_KV_TIER_RESTORE_FROM_ZERO (restoring the
+  cached block too rewrites it after the zero: 6/6) and by the fix: zero
+  ops now carry their KV group and the DMA zeroes `_blocks_for(gid)`.
+  Unit test: a zero on the ring pool leaves pool 0 untouched. Verification
+  legs (mixed, churn, 108K oracles, verify on) running on production's
+  configuration and on the record. Production carries this bug today.
+- Verification (chain_zerofix, VLLM_KV_TIER_VERIFY=1, no diagnostic
+  toggle): production's configuration - mixed 6/6, resume-after-churn
+  6/6, 108K 6/6, 15 tier hits, 0 divergent rows, 0 slab mismatches, 0
+  errors; the new record (32 seqs, capture 64, util 0.965, 40 rows,
+  dynamic k, with the tiles, the flushed_to fix and the event-guarded
+  persistent staging) - the same 18/18 and the same clean counters.
+- Numbers with the fixes, first attempts: (1) on the verification
+  instance (VLLM_KV_TIER_VERIFY=1 left on) c1 measured 15.62 ms/step -
+  the slot digests and the row check are not free; never bench with
+  verify on. (2) On a clean boot: c1 13.40 ms/step (in band), c8 251.5
+  verify-steps/s (-7% vs 271.8 on this configuration before the fixes),
+  c16 343.2 (-24% vs 450.3). Cause: the event-guarded staging waited on
+  the PREVIOUS step's copy before rewriting its one pinned buffer; under
+  window thrash at c16 (64 rows of demand vs 40) rows change every step,
+  so the host synchronized with the GPU every step and lost the
+  scheduling overlap. Fixed with an 8-deep ring of staging buffers (the
+  wait lands on the copy from 8 steps ago); numbers rerun on a clean boot.
+- With the staging ring (clean boot, util 0.965): c1 13.37 ms/step, c8
+  634.8 tok/s (286.7 verify-steps/s - the sync cost is gone), c16 639.2
+  (343.4) - still -24% vs 450.3, and the log says why: 13 running, not
+  16. util 0.965 shrinks the GDN slot pool from 150 to 125 blocks (the
+  0.5% is 0.12 GiB = 25 blocks = 3 chat requests at k=2 demand). Not a
+  code cost. Record decision: back to util 0.97 (799 / 761 with 16
+  running, canaries 4/4 under load, oracle 18/18); the first-image
+  allocator retries at 0.97 are recoverable and stay noted. Numbers at
+  0.97 on the final code rerun for the baseline.
+- util 0.965 data point, complete (final code, clean boot): c1 146.9
+  (13.37 ms/step), c8 634.8 (286.7 verify-steps/s), c16 639.2 (343.4)
+  at 13 running, images under c16 4/4 at 611.1 tok/s, c32 676.3 (371.1)
+  at 13 running, post-bench oracle 6/6, 0 errors, residency 0.742
+  ms/step. The first-image allocator retries (48) appear at 0.965 as
+  well, so the lower utilization never bought the headroom it was meant
+  to; 0.97 is the record.
+- FINAL numbers, util 0.97, final code, clean boot (leg rec97): c1 145.6
+  tok/s (13.40 ms/step), c8 603.3 (277.9 verify-steps/s), c16 813.1
+  (450.7) at 16 running, images under c16 4/4 at 790.0, c32 757.5
+  (424.1) at 16 running, post-bench oracle 6/6, 0 errors. Baseline
+  snapshot updated; record committed. Owed next: the GDN single-slot
+  replay (design doc) to reach 32 hot requests; the LL128 question for
+  the collectives; the residency bookkeeping vectorization.
+
+## 2026-09-08 - GLM-5.3-Flash handoff implementation (in progress)
+
+- Scope: `glm53f-nvfp4-4` / `glm53f-nvfp4-8`, A100-SXM4-80GB,
+  driver 595.45.04, starting commit `c61ccdbb92ba`.
+- Baseline: booted the registered TP4 profile, unchanged serving code,
+  `SLIMSERVE_KV_TIER_DIR=/home/ubuntu/.local/scratch/kv-tier
+  VLLM_KV_TIER_VERIFY=1 .venv/bin/slimserve glm53f-nvfp4-4 --serve -y
+  --host 127.0.0.1 --port 8400`. Confirmed 72 GiB pinned host and 256 GiB
+  disk per rank; GPU pool 1,275,022 tokens. zg's CUDA embedding daemon
+  initially occupied approximately 1 GiB on each GPU and later grew to
+  about 5 GiB despite no explicit retrieval during timed runs. Treat this
+  TP4 run as diagnostic, not a controlled GPU-idle baseline; repeat it.
+  User requested CPU-only zg: global model config and all six index
+  manifests now say CPU, and the restarted daemon has CUDA visibility
+  disabled. No embedding schema changed or full rebuild was needed.
+- Validation repair: added `benchmarks/validate_glm5_next.py`, which asserts
+  text/reasoning/image/tool results before exact-token benchmarks, saves
+  failures, refuses artifact overwrite, and never kills unrelated GPU
+  processes. The historical scratch runner only printed canary failures,
+  reused a hard-coded output directory and killed every compute PID.
+- Indexer test repair: replaced the import-time print-only smoke with
+  pytest assertions, real top-k pruning, shuffled/strided pages and a
+  mixed-request CUDA-graph replay test crossing the 128-program tile loop.
+  The original smoke selected every pool, and passed a flat cache whose
+  stride was not the physical page stride expected by the serving kernel.
+- Hypotheses: avoid query/APE loads in inactive pooled-logits programs;
+  separately investigate the already-supported mHC fused RMSNorm path.
+  Do not attribute all direct copies to `.contiguous()` without a trace:
+  contiguous inputs make those calls no-ops. These are experiments, not
+  measured serving wins yet; channel ownership and MTP remain open.
+- Correctness so far: registry tests 63/63, TP4 canaries pass. Exact-token
+  workload is 1000 input / 300 output, temperature 1, top-p .95, top-k 20,
+  seed 42; each concurrency warmed with 32 outputs, three timed repeats.
+  TP4 c1 median 74.47 (72.71-75.48), c8 median 335.57 (335.14-336.78).
+  c16 repeats 469.22 / 272.83 / 468.17 / 466.00: the slow outlier is not
+  explained, and must not be hidden by reporting only the median.
+  Forced eviction pending; startup alone is not tier acceptance.
+- Kernel gates: 27 passed (13 pooled-indexer + 14 sparse MLA); tier gates
+  60 passed. The independent FP32 pooled-score oracle needs BF16-level
+  tolerance because exp/reduction order can round a pooled key to the
+  adjacent BF16 value; exact selected-token-set tests all pass. Initial
+  microbenchmark had an input initialization race: Triton's timer uses a
+  fresh stream without waiting for default-stream random block-table
+  initialization. Added synchronization before timing; synced run passes.
+  Keep the failed artifact as a harness diagnostic, not a serving failure.
+- Candidate under `benchmarks/glm5_next_pool_candidate.py`: diagnostic
+  one-pool-per-program score kernel to distribute short contexts across
+  more SMs. Not installed in serving, not measured yet.
+- Discovery: compatible registry profiles recorded in the artifact folder.
+  This pass starts with both GLM-5.3-Flash TP sizes; other models have not
+  been live-revalidated and must be included if shared serving code changes.
+- Decision: in progress; no performance-sensitive change retained yet.
+- Raw artifacts: `perf/results/2026-09-08/glm53f-tp4-handoff-baseline/`.
+
+## 2026-09-08 - KDA opaque output normalization (in progress)
+
+- Scope: CUDA `KimiGatedDeltaNetAttention` used by GLM-5.3-Flash; ROCm
+  dispatch unchanged. No quant, model weights, profile, KV layout or native
+  extension ABI changes.
+- Baseline: TP8 real profile with `--torch-profile-dir` (capture inactive
+  during timing). After moving zg off GPUs AND restricting its CPU daemon
+  to cores 122-125 / one embedding context, c1 83.66 / 83.86 / 83.82,
+  c8 402.07 / 401.92 / 404.20. c16 after CPU isolation on the same boot:
+  556.52 / 561.86 / 561.51. Earlier c1/c8 on that boot were contaminated
+  by the CPU embedding daemon using about 64 cores, and are diagnostic only.
+- Hypothesis: `FusedRMSNormGated` follows disabled-CustomOp native dispatch
+  (`compile_native=False`) under the profile's compiler policy. Its call is
+  inside opaque `kda_attention`, so the promised enclosing compiler fusion
+  cannot happen. The native method emits FP32 casts, square/mean/rsqrt,
+  weight/gate multiplies, sigmoid, BF16 cast and copy-back at all 34 layers.
+  Historical trace adjacency places 102 of approximately 145 direct copies
+  per decode token around KDA norm arithmetic, not mHC `.contiguous()` calls.
+- Change: `_apply_kda_output_norm` explicitly calls `forward_cuda` on CUDA.
+  The existing stride-aware Triton kernel normalizes the contiguous serving
+  output buffer in-place; copy-back becomes a no-op for that allocation.
+  Keep the existing dispatch on other platforms. No private environment gate.
+- Correctness: 24 targeted cases pass against decomposed FP32 PyTorch with
+  BF16 output tolerance (8/16 local heads, 1/8/16/37/257 tokens, contiguous
+  and row-strided gates, repeated CUDA-graph replay, zero inputs, saturated
+  gates and noncontiguous output/padding preservation). Full fast gates:
+  174 passed in 8.54 s (`glm53f-kda-norm/final-gates.log`). Initial test setup failures were missing vLLM config context,
+  not kernel failures; this fork has no suggested root conftest fixture,
+  so the new test provides its own scoped config fixture.
+- Microbenchmark (GPU 7, graphs, identical input reset in both arms):
+  H8/T1 33.29 -> 4.35 us, H8/T8 33.94 -> 3.80, H8/T16 28.85 -> 3.86;
+  H16/T1 27.13 -> 3.56, H16/T8 28.14 -> 3.85, H16/T16 28.89 -> 3.93.
+  These are isolated norm timings, not serving TPS improvements.
+- TP8 candidate end-to-end: canaries pass; c1 90.30 / 90.32 / 90.10,
+  c8 424.74 / 429.02 / 423.81, c16 584.44 / 585.94 / 580.73. Medians
+  improve 7.7% / 5.6% / 4.1% versus the isolated-daemon baseline. Same
+  registered profile and profiler configuration, warmed per concurrency.
+  Boot reports 50.41 GiB KV / 3,192,799 tokens versus 50.08 GiB /
+  3,171,368 before; allocation sizing is observed, not a guaranteed capacity.
+- TP4 clean baseline: c1 74.99 / 75.59 / 75.60, c8 335.69 / 335.90 /
+  336.24, c16 470.17 / 469.68 / 467.56. Candidate: c1 80.65 / 80.88 /
+  80.79, c8 350.67 / 349.33 / 349.57, c16 483.87 / 486.06 / 483.96.
+  Medians improve 6.9% / 4.1% / 3.0%; all canaries and exact-token checks
+  pass. TP4 now boots at 20.46 GiB KV / 1,292,330 tokens, with the registered
+  72 GiB host and 256 GiB disk tiers per rank, unchanged util/max_num_seqs.
+- Decision: both TP sizes establish a serving win; forced-eviction acceptance
+  running on TP4 with the actual 1,292,330-token pool and all six markers.
+  Full 1.25-hour WildChat leg has not been rerun. TP8/TP4 remains only
+  1.118x / 1.215x / 1.208x at c1/c8/c16: the 1.5x scaling gate is NOT met.
+- Fresh TP8 trace confirms the mechanism: six decode steps now contain 204
+  fused norm launches (34/token); the main direct-copy class drops from
+  870 to 258 (145 -> 43/token). This is 102 removed copies per token,
+  plus the eliminated decomposed norm arithmetic, not a guessed mHC copy win.
+  Sampled completion hashes vary within both reference and candidate arms;
+  their cross-arm mismatch is not a deterministic numerical parity test.
+- TP4 clean A/B completed: temporarily restored the original norm callsite
+  to boot `glm53f-tp4-cpu-zg-baseline/`, then restored the fused callsite on
+  disk after that server reached health. Its loaded Python operation stays
+  the reference; the candidate then used a fresh server boot. Baseline
+  source hash is recorded in that artifact folder. No private env gate.
+  One candidate boot raced teardown of the reference workers and failed
+  hardware detection; waiting for all owned GPU processes to exit before
+  reboot resolved it (`server-hardware-race.log`). Not a model/kernel fix.
+- Environment: Python 3.12.13, torch 2.13.0+cu130, CUDA 13.0. Observed
+  SM/memory clocks 1140/1593 MHz, power limit 500 W; clocks were not changed.
+- CPU-only zg follow-through: global defaults and all six existing index
+  manifests use CPU, preserving the embedding model/dimensions and vectors.
+  Daemon starts with `CUDA_VISIBLE_DEVICES='' ZVEC_GREP_DEVICE=cpu
+  ZVEC_GREP_LLAMA_CONTEXT_PARALLELISM=1 taskset -c 122-125 zg server on`.
+  Patched the installed llama-cpp backend's CPU thread count to respect
+  `node:os.availableParallelism()` instead of auto-sizing to the full host.
+  Warm semantic query completed in 0.63 s; NVIDIA reports no zg allocation.
+  An npm upgrade can overwrite this local backend patch (not CPU config).
+  MCP transport needs a client reload after daemon replacement; CLI server
+  queries work meanwhile. GitHub issue creation returned 403, so no issue
+  was filed; report saved under
+  `/home/ubuntu/.local/scratch/zg-bug-reports/04-cpu-affinity-threads.md`.
+- Raw artifacts: `perf/results/2026-09-08/glm53f-kda-norm/`, baseline
+  `glm53f-tp8-cpu-zg-baseline/` and `glm53f-tp8-handoff-baseline/` (same date),
+  candidate `glm53f-tp8-kda-fused/`. Fresh trace captures two prefill chunks
+  plus six decode steps; exclude prefill when interpreting decode costs.
+
+### Pooled-indexer one-pool schedule - diagnostic only, not retained
+
+- Independent candidate in `benchmarks/glm5_next_pool_candidate.py`; no
+  production dispatch change. Same cached BF16 rows and pool semantics,
+  one pool/program with FP32 reductions instead of 16-pool tensor-core tiles.
+- Micro hypothesis confirmed only at c1 / 1000 tokens: score 30.12 ->
+  11.28 us, full selection 39.90 -> 18.21. At c8/c16 short context it is
+  effectively flat; at 4096 tokens it regresses (c16 score 168.11 ->
+  237.09 us). Baseline GPU 7 vs candidate GPU 6, so these are directional
+  micro results, not a controlled serving comparison.
+- Exact selected sets match the reference at the six tested short-context
+  shapes. The 32768-token matrix failed the chosen logit tolerance on
+  1/65536 scores (max discrepancy .001831); no tolerance was relaxed to
+  pass the candidate. Raw `indexer-one-pool*.{json,log}` in the norm folder.
+- Decision: reject general replacement; keep clearly quarantined as a
+  diagnostic for future short-context scheduling work. No serving TPS claim.
+
+## 2026-09-09 - TP4 tier acceptance completed; continue GLM optimization
+
+- The 72 GiB host / 256 GiB disk registered TP4 configuration passed all six
+  marker probes after forced eviction. Each request resumed at block 36
+  (39,168 tokens); all four ranks logged 0/58 mismatched restores for each
+  probe: 1,392 checked restore operations, zero mismatches. Initial churn
+  1,978,046 tokens against a 1,292,330-token pool; subsequent rechurn took
+  the cumulative workload above 6M tokens. Build/churn/probe phases took
+  109.06 / 696.69 / 1455.48 seconds. This establishes host restores, not
+  fresh disk-promotion acceptance or the separate WildChat leg.
+- Raw: `perf/results/2026-09-08/glm53f-tp4-kda-fused/tier/acceptance.json`,
+  adjacent log and `metrics-after.prom`, and the parent server log.
+- Next hypothesis: use the existing mHC fused RMSNorm contract as the DSV4
+  NVIDIA model does, removing a separate normalization at 90 GLM sites.
+  Preserve the intermediate BF16 rounding before RMSNorm. First measure
+  parity and graph latency for decode and prefill shapes, then real profiles.
+  This does not itself solve channel ownership: the current DSV4 channel-
+  owned API returns local-width inputs and Q8 artifacts for single-token
+  GGUF projections. GLM's BF16/NVFP4 projection path needs a distinct
+  integration, not blindly passing its full-width tensors to that API.
+
+### Existing mHC + RMSNorm fusion - rejected for GLM decode
+
+- GPU 7 graph microbenchmarks, actual GLM dimensions/eps/20 Sinkhorn
+  iterations, five alternating-order repeats per shape. Median separate ->
+  fused latency (us): T1 15.26 -> 15.69; T8 20.04 -> 22.72; T16 25.40 ->
+  28.24; T64 51.83 -> 53.66; T257 161.25 -> 156.49; T576 354.97 -> 348.74.
+- Numerical/graph tests passed (24 shape/zero/transition cases plus the
+  temporary opaque schema test). Small prefill gains do not justify decode
+  regressions. Removed the temporary serving-wrapper extension; retained
+  direct-native correctness tests and the diagnostic microbenchmark only.
+- Raw: `perf/results/2026-09-09/glm53f-mhc-norm/{micro.json,parity.log}`.
+
+### KDA replicated gate-input projection merge - in progress
+
+- Clean TP4 reference on the retained output-norm implementation: canaries
+  pass; c1 80.68 / 80.62 / 80.73, c8 348.80 / 348.26 / 350.62, c16 484.17 /
+  482.91 / 482.45. Same registered profile and warmed exact-token workload.
+- Hypothesis: concatenate the unchanged BF16 g_a rows into Q/K/V/beta/f_a
+  at load time. Both f_a and g_a remain fully replicated on every rank;
+  Q/K/V/beta retain their TP slices. Eliminates one narrow GEMV per KDA
+  layer without a persistent second weight copy. GLM opts in explicitly;
+  other Kimi users retain their existing constructor/loader behavior.
+- Raw reference: `perf/results/2026-09-09/glm53f-tp4-mhc-reference/` (named
+  before the rejected mHC microbench); initial projection tests alongside
+  the mHC microbench artifacts. No serving gain claimed yet.
+
+### Paired low-rank KDA gate kernel - in progress
+
+- New Triton kernel schedules f_b and g_b in one grid against their
+  existing BF16 weights and row-strided f_a/g_a inputs. No weight repack
+  or duplicate cache. T1 uses FP32 reductions; T2-64 uses BF16 tensor cores;
+  larger prefill remains on cuBLAS. Separate output allocations honor the
+  custom-op nonaliasing contract. Non-GLM, quantized and batch-invariant
+  paths retain their existing projection methods.
+- Initial GPU 7 micro: TP8 local dim 1024, separate -> paired (us): T1
+  6.94 -> 2.24, T8 6.38 -> 2.20, T16 6.03 -> 2.32; TP4 local dim 2048:
+  T1 6.46 -> 2.37, T8 6.17 -> 2.53, T16 6.31 -> 2.60. Tile selection:
+  BN16 at T1, BN32 for batched decode. Isolated latency, not serving TPS.
+- 29 kernel/graph/opcheck cases pass, covering all capture batch sizes,
+  ragged and zero batches, distinct row strides, mutable replay inputs,
+  zero inputs, nonaliasing outputs, and prefill fallback. Gate row-loader
+  and merged-GEMM tests pass; initial eight loader-test failures were an
+  incomplete mocked TP fixture, corrected without loader changes.
+- Combined fast gate: 242 pass, one host-arena test fails its machine-wide
+  MemAvailable delta (959 MiB versus expected ~1536) while serving is
+  active. Arena shape and pinning checks pass. Rerun after server teardown
+  to isolate global-memory-counter interference; do not conceal this result.
+- Current live TP4 server loaded the preceding input-merge-only code;
+  paired-kernel integration on disk requires a fresh boot for its own A/B.
+- Raw: `perf/results/2026-09-09/glm53f-mhc-norm/gate-pair*.{json,log}`,
+  `fast-gates.log`, `projection-parity-fixed.log`.
+- The arena test passed after server teardown (4.25 s,
+  `arena-isolated.log`). Combined result is 242 passes plus that isolated
+  pass; the machine-wide-memory-counter failure is retained above.
+- Input-merge-only TP4 results: c1 82.22 / 82.46 / 82.56; c8 353.96 /
+  353.48 / 353.72; c16 484.97 / 487.37 / 485.01. Medians improve 2.2% /
+  1.4% / 0.4% against the fresh reference. All real canaries pass. Paired
+  kernel is now being measured in a separate new TP4 boot.
+
+### Tensor-core mHC transition prototype - in progress, not serving
+
+- Existing cooperative FP32 mHC remains ~1.4 ms/token in the most recent
+  TP8 trace (89 fused post/pre + one pre). Prototype in `benchmarks/` uses
+  partitioned TF32x3 projections followed by a fused Sinkhorn/pre-mix
+  finalize, optionally RMSNorm. Weights stay FP32; post-update and pre-mix
+  BF16 rounding boundaries are preserved. This removes the cooperative
+  grid barrier, not yet the replicated TP ownership.
+- Compare 256/512/1024-element K tiles against the existing native kernel
+  and native + standalone RMSNorm at actual GLM eps and 20 iterations.
+  Require exact updated residuals, tight FP32 mix parity and BF16 output
+  parity before even considering serving integration.
+- Raw: `perf/results/2026-09-09/glm53f-mhc-norm/tensorcore-mhc.{json,log}`.
+- First TF32x3 tile is rejected: T1 BK256 128.0 us versus native 12.76;
+  BK512/1024 are worse. Compiler metadata identifies 1,422 spills in the
+  partial kernel (32 registers, 32 KiB shared), versus no spills in finalize.
+  T8 also failed the strict bitwise updated-residual criterion on two of
+  131,072 BF16 elements (max 1.53e-5, one BF16 step). No serving integration
+  or tolerance relaxation. A one-token-per-program SIMT variant is being
+  checked to avoid the padded tensor-core tile's live intermediates.
+- SIMT follow-through: matched the native first FMA order (post*x plus the
+  already-rounded first residual product), fixing the bitwise residual
+  mismatch without loosening the criterion. BK256, native -> SIMT (us):
+  T1 12.72 -> 9.91, T8 17.39 -> 13.64, T16 22.76 -> 17.01, T64 48.84 ->
+  36.26. Including RMSNorm, native + separate -> fused SIMT: 15.15 -> 10.97,
+  20.01 -> 14.83, 25.48 -> 18.23, 51.82 -> 37.47 respectively.
+- Clean implementation in `glm5_next_mhc_triton.py` omits the failed
+  tensor-core tile entirely. 120 tests pass: three seeds, all decode capture
+  sizes plus ragged batches, standalone pre / fused post-pre, norm on/off,
+  mutable CUDA-graph replay and zero inputs. Updated residuals are bit-exact
+  against native; FP32 mixes use 1e-5 tolerance and layer outputs BF16-level
+  tolerance. No serving dispatch change yet; TP8 paired-gate reference is
+  booting before the next A/B. Raw `simt-mhc-final.{json,log}` and
+  `simt-mhc-parity.log` in the same artifact folder.
+
+### TP4 paired-gate end-to-end result
+
+- Both projection changes, fresh registered TP4 boot: text/reasoning/image/
+  tool canaries pass. c1 83.36 / 83.63 / 83.57; c8 355.05 / 356.82 / 356.78;
+  c16 489.83 / 490.05 / 488.88. Medians vs input-merge-only: +1.3% / +0.9%
+  / +1.0%; versus the fresh output-norm-only reference: +3.6% / +2.3% / +1.4%.
+- Raw: `perf/results/2026-09-09/glm53f-tp4-paired-gate/`; TP8 validation
+  and long-context acceptance on the new projection path remain outstanding.
+- TP8 paired-gate validation completed: all canaries and exact-token checks
+  pass. c1 92.98 / 93.41 / 93.51; c8 441.09 / 433.59 / 432.21; c16 587.30 /
+  597.12 / 591.13; c32 784.97 / 783.22 / 775.43; c64 942.28 / 940.79 /
+  948.23. Medians vs previous TP8 output-norm-only: +3.4% / +2.1% / +1.1%
+  at c1/c8/c16. Report the c8/c16 spreads; do not cherry-pick fastest repeats.
+- Raw: `perf/results/2026-09-09/glm53f-tp8-paired-gate/`; profiler capture
+  inactive during timing and started only after the final c64 repeat.
+  TP8/TP4 remains 1.118x / 1.215x / 1.207x: scaling is still NOT acceptable.
+- The mHC wrapper/model callsites were changed only after this reference
+  reached health and finished compilation. Its loaded operations remain
+  the reference; the SIMT + norm candidate needs a new process. The source
+  change is explicit, not a private environment flag.
+- Fresh reference trace confirms 34 paired-gate launches per decode token.
+  Across six decode steps, the main BF16 GEMV class drops 174 -> 106 calls
+  per token and the BF16-input/FP32-output GEMV class 56 -> 22. This removes
+  102 old GEMV calls per token and adds 34 paired launches; the big merged
+  input projection consumes the extra g_a rows without a separate launch.
+- After teardown, the complete fast gate including the new mHC tests passes:
+  **367 passed in 12.27 s**, `fast-gates-simt.log`. No native ABI change or
+  extension rebuild was required for these Triton/Python implementations.
+
+### SIMT mHC live validation - in progress
+
+- Production microbench, three CUDA-graph repeats, native + separate norm ->
+  split SIMT + fused norm (median us): T1 15.222 -> 11.089, T8 20.073 ->
+  14.870, T16 25.447 -> 18.055, T64 51.960 -> 37.152. Full repeat arrays:
+  `perf/results/2026-09-09/glm53f-mhc-norm/serving-micro.json`.
+- A fresh registered TP8 boot passes text/reasoning/image/tool canaries.
+  Per-concurrency warmups absorb cold Triton prefill autotuning before the
+  exact-token measurements. Raw server log, source hashes, canaries and
+  repeat JSON: `perf/results/2026-09-09/glm53f-tp8-simt-mhc/`.
+- This is not completion of the scaling campaign. TP4 validation and the
+  full long-running workload on these latest kernels are still pending.
+- QuixiCore port review found stricter umbrella tolerance contracts than
+  the current SlimServe BF16 tests. Do not infer generic QuixiCore
+  conformance from these model-specific gates or relabel the new
+  Apache-2.0 sources under QuixiCore's MIT root license.
+- TP8 matrix completed: c1 95.87 / 97.08 / 97.76; c8 445.02 / 452.68 /
+  445.12; c16 608.26 / 614.14 / 611.13; c32 794.66 / 787.95 / 790.03;
+  c64 962.33 / 974.02 / 970.80. Medians improve 3.9% / 2.7% / 3.4% /
+  0.9% / 3.0% over the same-day paired-gate reference. c32 repeat ranges
+  overlap: that arm is inconclusive, not a confirmed gain.
+- Post-timing rank-0 trace contains six decode steps with 540 partial and
+  540 finalize launches (90 transitions per token), plus 204 paired gates
+  (34 per token). The two prefill steps use the native larger-batch mHC
+  path with 180 fused pre-mix/RMSNorm launches. Trace:
+  `glm53f-tp8-simt-mhc/trace/dp0_pp0_tp0_dcp0_ep0_rank0.1788919568016690925.pt.trace.json`.
+- Expanded coverage adds T2/T4 mHC and T4 paired-gate cases: **179 passed**,
+  `glm53f-mhc-norm/expanded-parity.log`. This adds 26 cases to the preceding
+  367-test suite; a new combined-suite total has not yet been run.
+- TP4 completed: all canaries pass; c1 84.18 / 86.94 / 86.71; c8 366.47 /
+  365.29 / 363.83; c16 501.80 / 502.32 / 500.45. Medians improve 3.8% /
+  2.4% / 2.4% against the paired-gate reference, with non-overlapping
+  repeat ranges. Raw `perf/results/2026-09-09/glm53f-tp4-simt-mhc/`.
+- Retain SIMT mHC for the measured small-batch path, subject to the pending
+  long-context acceptance. TP8/TP4 is now 1.120x / 1.219x / 1.218x at
+  c1/c8/c16: the 1.5x scaling gate still fails.
+
+### GLM checkpoint MTP adapter - opt-in, not yet serving-validated
+
+- Implement the layer-45 ordinary residual NoPE MLA + MoE adapter, retaining
+  GLM's pooled indexer and DeepSeek's MTP recurrence/expert-loading/sharing
+  infrastructure. Root VLM quantization metadata survives draft text-config
+  flattening; the adapter does not allocate BF16 replacement experts.
+- Intercept only GLM indexer weights before the generic MTP loader, which
+  otherwise assumes a fused wk/weights projection absent from GLM. Keep
+  expanded-pool/tail buffer width consistent with the target. Disable the
+  optional cross-draft index-sharing optimization pending GLM state tests.
+- `slimserve <profile> --spec` opts into its already-registered drafter;
+  `--spec` and `--no-spec` are mutually exclusive. Both GLM profiles remain
+  non-speculative by default. Start with the existing registered k=1, not
+  an unmeasured promotion to k=5.
+- The [upstream recipe](https://recipes.vllm.ai/zai-org/GLM-5.3-Flash)
+  (checked September 9) documents k=5 MTP on newer NVIDIA hardware; this
+  is motivation, not evidence of speed or correctness on this A100 stack.
+- CPU contracts cover config/quant preservation, MLA classification, separate
+  indexer loading and rejection of unknown indexer tensors. Initial combined
+  run: 68 pass, one test-fixture failure (missing resolve quant argument),
+  corrected before the next gate. No MTP serving result claimed yet.
+- Corrected combined CPU gate: **69 passed**. Further checkpoint inspection
+  confirms that layer 45 is **block-128 FP8**, while main experts use NVFP4;
+  retaining both compressed-tensors config groups is necessary. The adapter
+  must not classify all checkpoint experts as NVFP4.
+- First MTP startup was stopped during initialization after review found a
+  missing architecture-converter registration: draft layer count must be
+  one, not the main config's 45. Added the registry entry and a contract
+  assertion. This cancelled boot is inconclusive, not a benchmark or a
+  serving failure. Preserve `glm53f-tp4-mtp1/server.log`; next boot uses
+  `glm53f-tp4-mtp1/attempt02/`.
+- Attempt02 failed before draft weight loading: the shared proposer passes
+  the **target** VllmConfig into the draft constructor, even though the
+  loader separately selects the draft model class. Accessing its root
+  Glm5NextConfig as a text config raises missing `num_hidden_layers`.
+  Adapter constructors now explicitly read speculative_config's draft
+  config; a regression test distinguishes target and draft objects.
+- The registered opt-in drafter now explicitly selects
+  `QUIXICORE_MLA_SPARSE`: the proposer intentionally discards the target's
+  attention backend unless a draft backend is specified. Keep the default
+  non-speculative profiles unchanged. Attempt03 is the next fresh boot;
+  no MTP timing or acceptance result exists yet.
+- Attempt03 successfully loaded the draft, including its
+  `CompressedTensorsW8A8Fp8MoEMethod` and ten unquantized linear modules,
+  then failed in the generic proposer: its multimodal dispatch assumed
+  `image_token_index`, whereas GLM exposes `image_token_id`. Added GLM to
+  the existing token-id dispatch and a CPU load/sharing regression test.
+  This is an owned integration failure, not a kernel or throughput result.
+- Attempt04 passed loading/sharing and model compilation, then stopped at
+  the generic proposer's single-KV-group assertion. GLM has independently
+  allocated MLA/indexer groups with different block sizes. A dedicated
+  proposer now follows the existing Qwen multi-owner design, with **separate
+  persistent slot buffers as well as block tables**. Secondary slots are
+  computed from that group's block size/physical IDs, current draft positions
+  and the primary rejection mask. The assertion is not simply bypassed.
+- The dedicated proposer also explicitly declares the inherited MTP's
+  `(logits_hidden, recycle_hidden)` return contract; the generic method only
+  recognized the DeepSeek architecture name. Tests cover reversed group order,
+  different page sizes/physical IDs, rejected slots, compacted query rows,
+  max-context padding, missing owners/tables, and stable per-group buffers.
+
+### MTP capacity gate and FP32 router correction - follow-up required
+
+- Attempt05 passes draft loading/sharing, compilation and graph profiling,
+  then fails full-context KV capacity: 18.12 GiB required versus 17.38 GiB
+  available at TP4 utilization 0.85. No health or request acceptance. Raw:
+  `perf/results/2026-09-09/glm53f-tp4-mtp1/attempt05/server.log`.
+  Combined MTP/config/CLI CPU contracts: 80 passed (`cpu-contract.log`).
+- Raise registered TP4 utilization to 0.90, preserving the full 1,048,576
+  context and max_num_seqs 16. The new budget and MTP require live validation;
+  the old non-spec benchmark cannot substitute for it.
+- Independently isolate an inherited router precision issue: the HF GLM
+  reference uses FP32 linear logits, but GateLinear on SM80 with H4096/E288
+  previously ran BF16-output F.linear and only then cast to FP32. Seed-91
+  synthetic M1/8/16 max errors against FP32 linear were 0.003726/0.004812/
+  0.005939; direct cuBLAS BF16-input/FP32-output errors were 0/7.15e-7/8.34e-7.
+- Enable the existing FP32-output cuBLAS tier for this exact no-bias SM80
+  shape, including deferred set_out_dtype. Preserve other dispatch paths.
+  This is a precision correction, not yet an end-to-end speed claim. It may
+  also remove 42 cast copies per decode step; that trace claim is unverified.
+- Targeted GPU gate: **24 passed in 6.75 s**, direct/deferred dtype, batches
+  1/2/4/8/16/32/64/257/2048, changing-input graph replay and narrow-dispatch
+  guards. FP32 oracle tolerance atol 2e-5/rtol 1e-5. Raw:
+  `perf/results/2026-09-09/glm53f-fp32-router/parity.log`.
+- Take a fresh corrected non-spec TP4 reference before MTP comparison.
+  Previous SIMT/projection numbers remain historical measurements with the
+  BF16-rounded router, not a quality-equivalent reference for this change.
+- Corrected TP4 non-spec reference completes at utilization 0.90. Real
+  profile reaches health with 1,545,459-token pool; all text/reasoning/image/
+  tool canaries pass, plus exact 1000-in/300-out checks. Three warmed repeats:
+  c1 86.78/87.69/87.40, c8 366.64/368.44/370.83,
+  c16 502.91/502.14/504.19 tok/s (medians 87.40/368.44/502.91).
+  Raw: `perf/results/2026-09-09/glm53f-tp4-fp32-router-reference/`.
+  Command: `CUDA_VISIBLE_DEVICES=0,1,2,3 VLLM_KV_TIER_VERIFY=1
+  .venv/bin/slimserve glm53f-nvfp4-4 --serve -y --host 127.0.0.1
+  --port 8400 --torch-profile-dir <absolute-run-dir>/trace`.
+- Post-timing rank-0 trace contains seven small-batch decode steps. The
+  direct-copy float-output cast kernel occurs once per step, consistent
+  with removal of the 42 router casts; other integer/cast copies remain.
+  Do not claim all direct copies disappeared. Trace filename ends
+  `rank0.1788922599877880710.pt.trace.json`.
+- Preserve this as the corrected MTP comparison reference. Similar TPS to
+  the historical snapshot is not an isolated router speedup measurement:
+  both router precision and registered memory budget changed. Latest
+  long-context/eviction acceptance and corrected TP8 remain pending.
+
+### Checkpoint MTP k=1 live result - not promoted
+
+- Attempt06, same corrected router and TP4 utilization 0.90, reaches health
+  with 21.33 GiB KV and a 1,234,509-token pool at full 1,048,576 context.
+  Command is the corrected reference command plus `--spec`, without torch
+  profiling. Raw: `perf/results/2026-09-09/glm53f-tp4-mtp1/attempt06/`.
+- Text/reasoning/image/tool canaries pass. Exact-token three-repeat TPS:
+  c1 97.84/92.23/81.30; c8 358.47/357.33/357.81;
+  c16 476.08/486.43/487.38. Medians 92.23/357.81/486.43 versus corrected
+  non-spec 87.40/368.44/502.91: c1 repeat ranges overlap (inconclusive),
+  c8/c16 regress 2.9%/3.3%. **Do not enable k=1 by default.**
+- Accepted/draft counter deltas prove real speculation: c1 127/173,
+  107/192, 79/220; c8 965/1431, 945/1448, 945/1450;
+  c16 1879/2912, 1949/2840, 1934/2859. These are workload-dependent
+  acceptance figures, not a model-wide quality or throughput guarantee.
+- Additional three-repeat greedy 1000-in/300-out diagnostic produces
+  different texts and accepted/draft 83/216, 123/176, 128/172. This is a
+  repeatability concern; canaries/exact counts do not resolve it. Preserve
+  `greedy-repeatability.json` (full responses) and compare the same
+  diagnostic against a fresh non-spec boot before assigning cause to MTP.
+  Even the stochastic non-spec reference's third response hash differed;
+  stochastic hashes alone are not a correctness verdict.
+- Keep MTP explicitly experimental and opt-in; long-context acceptance and
+  repeatability investigation remain required. No MTP performance promotion.
+- Fresh non-spec boot reproduces greedy output differences, with zero
+  prefix-cache hits and zero draft counters. The same-prefix logprob probe
+  changes token preference materially (e.g. `From` versus `Tr` at token 26,
+  not merely equal-score tie breaking). Raw full responses:
+  `glm53f-tp4-corrected-acceptance/greedy-{repeatability,logprobs}.json`.
+  Do not assign this to MTP alone or run a long acceptance leg as though
+  short canaries resolved the issue. KDA recurrent state is FP32; MoE
+  Marlin already uses `use_atomic_add=False, use_fp32_reduce=True`.
+- Next controlled A/B disables only the new SIMT mHC dispatch, retaining
+  native mHC with norm and the other corrected serving code. Temporary
+  source-local `_USE_SIMT_MHC=False` is diagnostic, not a retained fallback
+  decision. Use a fresh boot/capture; no environment-only cache ambiguity.
+- Native mHC A/B also has different greedy completions and first-token
+  logprobs. Adjacent runs diverge at generated token 229 and token 26.
+  Disabling SIMT did not restore repeatability. Raw:
+  `glm53f-tp4-native-mhc-repeatability/greedy-logprobs.json`. Restore SIMT
+  and remove the temporary dispatch flag after teardown.
+- The notebook's Qwen4Exp quality investigation (2026-09-07) distinguishes
+  a pre-existing same-server numerical floor from true episodic corruption;
+  do not treat every greedy text mismatch as proof of the latter. Next
+  isolate against the **untouched starting revision c61ccdbb9**, not just
+  native mHC plus the other new changes. A detached read-only-source
+  worktree at `/home/ubuntu/.local/scratch/glm53f-start-reference` reuses the
+  unchanged native extension binaries by symlink; imports were verified to
+  resolve its own vllm and SlimServe Python sources. Its registered profile
+  uses the original utilization 0.85. This is a quality diagnostic, not a
+  throughput comparison against the new 0.90 profile.
+- Starting-revision attempts01/02 fail on missing worktree runtime
+  dependencies (FlashAttention binary extensions, then its ignored
+  `layers`/`ops` Python package), not model/kernel behavior. Link those
+  unchanged installed dependencies and preflight model/rotary imports;
+  attempt03 is the usable comparison candidate. Preserve all failed logs.
+- Current combined GLM/router/profile/sparse-MLA gate: **368 passed in
+  11.09 s**; separate host-tier/index CPU gate: **43 passed in 5.87 s**.
+  Raw `glm53f-fp32-router/{final-fast-gates,tier-cpu-gates}.log`.
+  These unit gates do not replace live long-context acceptance.
+- Starting revision attempt03 reaches health and passes all canaries, then
+  **also reproduces non-identical greedy output**. Both adjacent run pairs
+  first diverge at generated token 63 (`where`/`why`), and first-token
+  logprobs vary before any new decode kernels could be involved. Raw:
+  `glm53f-tp4-start-reference-repeatability/attempt03/greedy-logprobs.json`.
+  This establishes that non-repeatability predates this optimization pass;
+  it does not establish a root cause or prove quality equivalence of all
+  changes. Keep sensitive quality checks and the long workload outstanding.
+- The temporary SIMT-disable flag is removed. Limit new SIMT dispatch and
+  model-level RMSNorm fusion to SM80; other platforms keep explicit norm
+  calls. SM80 transition suite: **148 passed**; platform norm-once and MTP
+  contracts: **10 passed**. Raw `glm53f-fp32-router/{sm80-dispatch-gates,
+  platform-contract}.log`. A100's math is unchanged by these platform guards.
+- Current decision: retain measured non-spec kernels provisionally, keep
+  checkpoint MTP opt-in (k=1 concurrent regression), and do not describe
+  the campaign as fully optimized or long-workload qualified. Corrected
+  TP8 reference, channel-owned execution, long-context/forced-eviction
+  qualification, and a contract-compliant QuixiCore port remain open.
+
+## 2026-09-09: TP8 c1/c8/c16/c32 performance and compact indexer KV campaign
+
+- Active objective: optimize GLM-5.3-Flash TP8 performance and KV cache at
+  c1/c8/c16/c32. The preceding turn made implementation/measurement
+  progress but did not complete scaling, quality, or long-workload gates.
+- Fresh current-tree reference, 8x A100 80GB, CUDA 13, registered
+  `glm53f-nvfp4-8`, full context 1,048,576, utilization .95/max_num_seqs64,
+  corrected FP32 router and SM80 norm/SIMT guards. Standard warmed
+  1000-in/300-out exact-token protocol: c1 99.23/98.99/98.79;
+  c8 446.29/448.56/456.46; c16 607.58/620.47/606.24;
+  c32 805.71/804.05/800.11. Medians **98.99/448.56/607.58/804.05** tok/s.
+  All text/reasoning/image/tool canaries and exact checks pass.
+- 50.10 GiB KV/rank, 3,172,516-token pool, 3.03 full-context requests.
+  Raw server/canaries/repeats/source hashes/post-timing trace:
+  `perf/results/2026-09-09/glm53f-tp8-corrected-reference/`.
+  Serve command: `VLLM_KV_TIER_VERIFY=1 .venv/bin/slimserve
+  glm53f-nvfp4-8 --serve -y --host 127.0.0.1 --port 8400
+  --torch-profile-dir <absolute-run-dir>/trace`.
+- New hypothesis: cache the learned completed four-token indexer pools
+  instead of recomputing them for every query. Current scoring explicitly
+  rounds pooled keys to BF16 before its tensor-core dot, so caching that
+  same result need not introduce another precision reduction.
+- Prototype `glm5_next_pool_cache.py` is **not yet enabled in serving**.
+  A page holds BF16 pool keys plus an eight-row raw key/gate ring; logical
+  head size64 versus old256 cuts indexer bytes/token 4x. Power-of-two page
+  ratios preserve existing allocator/tier assumptions. Nominal aggregate
+  MLA+indexer KV drops ~25%, before packed padding and fixed-state effects.
+- Qwen QSA's compressed-key/ring implementation was inspected as precedent.
+  Here the ring belongs to the physical page itself, so byte-exact tier
+  restores include it. Complete pools are computed before a separate raw
+  ring-store launch to avoid races. Only each ring row's last writer stores.
+  Eight raw rows support at most five speculative tokens; integration must
+  enforce that bound, not silently accept larger speculation.
+- Tests prepared for ragged/chunked prefill, multiple page sizes/strides,
+  page boundaries, rejection of speculative suffixes, simulated page
+  restore and changing-input/slot CUDA graph replay.
+- Initial single-pool reduction: 43/45 passed; two cached keys crossed
+  BF16 midpoints relative to the scorer. Disabling FMA did not fix it;
+  nine explicit denominator/key sum-tree combinations also failed strict
+  parity. Those tuning variants were removed, not hidden behind tolerance.
+- Match the scorer's [16,4,128] tiled pooling shape instead: 45/45 pass at
+  unchanged atol/rtol 1e-6, then 69/69 with eight additional random seeds
+  across BS64/1152/4608 and 4K+ contexts. This is unit parity, not live
+  correctness or host/disk connector acceptance. Add exact pruned top-k
+  set checks before integration. Raw failure/diagnostic/pass logs under
+  `perf/results/2026-09-09/glm53f-compact-pool-cache/`.
+- Isolated CUDA-graph update+score microbenchmark is running. No serving
+  throughput/capacity gain claimed; the compact format remains unenabled.
+- Subsequent integration gate: **101 passed** (compact/raw HF oracle,
+  strict score and exact pruned pool sets, cache lifecycle, and configuration
+  bounds); 65 profile tests pass separately. Twelve microbenchmark shapes
+  (c1/8/16/32 x 1000/16384/131072 context) have **zero logit difference**
+  and identical pruned pool sets. Raw `parity-hf-config.log`, `micro.jsonl`.
+  Isolated CUDA-graph update+score, including both compact update launches:
+  c1/1K 26.83->18.87 us; c32/1K 106.90->21.84 us;
+  c1/131K 502.01->32.03 us; c32/131K 9613.69->205.61 us.
+  This excludes top-k/attention/model execution and is not serving TPS.
+- `additional_config.glm5_next_compact_indexer_cache` controls the format
+  and participates in the compiler hash. Off by default in code, rejects
+  non-SM80/kpool!=4/spec>5. Raw cache remains supported. Working TP8
+  registry flag is enabled for candidate A/B (not yet a retained decision);
+  TP4 untouched. Candidate boot/validator:
+  `perf/results/2026-09-09/glm53f-tp8-compact-pool/attempt01/`.
+  Source is frozen during model startup/capture/measurement.
+- Candidate attempt01 reaches health with **4,225,909-token KV capacity**
+  (4.03 full-context requests) at the same 50.10 GiB/rank, versus raw
+  3,172,516 (3.03): **+33.20% allocated capacity**. Text/reasoning/image/
+  tool canaries pass. Timed repeats are running; this is not yet a long
+  context, forced-eviction, disk restore, or MTP serving qualification.
+- Candidate exact-token repeats completed: c1 99.06/99.07/100.38;
+  c8 473.79/474.39/473.71; c16 660.65/667.81/658.26;
+  c32 893.77/896.24/890.92. Medians **99.07/473.79/660.65/893.77**:
+  +0.08%/+5.63%/+8.74%/+11.16% versus the fresh raw-cache reference.
+  All canaries/exact checks pass; source hashes remain unchanged throughout.
+  Decision: retain as a **provisional candidate**, with c1 effectively flat,
+  meaningful concurrent gains and +33.20% capacity. Not fully qualified.
+- Full long gate started after timings, no concurrent benchmark:
+  `.venv/bin/python benchmarks/benchmark_wildchat_deepcontext.py
+  --parquet /home/ubuntu/.local/scratch/wildchat/data/train-00000-of-00014.parquet
+  --base-url http://127.0.0.1:8400/v1 --concurrency 8 --ctx-target 1000000
+  --max-hours 1.25 --seed 42 --out <attempt01>/deepcontext_c8.json`.
+  Preserve the current server/source while it runs; later forced eviction
+  must use the new 4,225,909-token pool, not an old capacity assumption.
+- While the live gate runs, added CPU scheduler tests for raw ratio2 and
+  compact ratio8: incomplete wide pages are not saved/restored, resume
+  clamps to a complete boundary, and disk demotion/promotion preserves
+  sparse per-position group mappings. Combined connector/index host/disk
+  suite: **47 passed in 7.09 s** with CUDA hidden. Raw:
+  `glm53f-compact-pool-cache/ratio8-scheduler-disk.log`. These are metadata
+  tests, not physical page-copy or GPU restore acceptance.
+
+## 2026-09-09: mHC urgent/deferred projection prototype (GPU gate pending)
+
+- Status: diagnostic only under `benchmarks/`; not imported by serving.
+  Compact-cache long workload retains exclusive GPU use and its frozen
+  source. No throughput/quality claim for this prototype.
+- Baseline evidence: current corrected raw TP8 trace, last complete c1
+  decode region 9.229 ms. Main stream 1,417 kernels/8.798 ms cumulative;
+  separate stream 126 kernels/.714 ms overlaps and must not be added as
+  critical-path latency. All 90 mHC sites identified; their partial/final
+  kernels total 1.216 ms on main. KDA input projection example uses
+  BF16 tensor-core GEMM ~22.37 us plus split-K reduce ~2.37 us at M=1,
+  local output width3336 (3*1024 QKV +8 beta +128 f_a +128 g_a).
+- Reproducible CPU-only attribution:
+  `benchmarks/summarize_glm5_next_trace.py`; raw census/examples in
+  `perf/results/2026-09-09/glm53f-mhc-deferred/reference-decode-census.json`.
+  Includes explicit stream accounting and rejects incomplete mHC regions.
+- Hypothesis: the current finalize serializes pre-mix/RMSNorm behind the
+  20-iteration Sinkhorn, though post/comb coefficients are consumed only
+  after the following attention/MLP site. Fork deferred coefficients on a
+  side stream, compute urgent pre-mix/RMSNorm and the real projection on
+  main, join after the projection. No async outputs escape the operation.
+- Precedent inspected: DSV4 `mhc_allreduce_ampere.cuh` urgent/deferred
+  split. This is NOT another trial of September 3's rejected plain
+  allreduce+mHC fusion and does not claim channel ownership is solved.
+- Prototype: `benchmarks/glm5_next_mhc_deferred.py` with persistent test
+  buffers; timing/gates in `benchmark_glm5_next_mhc_deferred.py`. Compares
+  existing serving transition+GEMM, serial split, and overlapping split;
+  real KDA BF16 and FP32 router consumer shapes at c1/8/16/32. Prepared
+  strict normalized-input/consumer parity and changed-input graph replay.
+- Both phases **compile offline for SM80** with CUDA hidden. Raw:
+  `glm53f-mhc-deferred/offline-build.log` and `offline-cache/`. Static lint
+  passes. This is build evidence only; GPU correctness/timing is pending.
+- Next command after the live long/tier work releases GPUs:
+  `CUDA_VISIBLE_DEVICES=7 .venv/bin/python
+  benchmarks/benchmark_glm5_next_mhc_deferred.py --tokens 1 8 16 32`.
+  Only integrate if parity and complete producer+consumer timings justify
+  it; preserve the join and existing BF16 rounding boundaries. A later
+  serving integration must include the consuming projection in the opaque
+  op, not return unfinished coefficient buffers into an unaware caller.
+
+## 2026-09-09: shared pooled-indexer scratch (isolated candidate, GPU gates pending)
+
+- Status: implemented in detached worktree
+  `/home/ubuntu/.local/scratch/glm53f-next-candidate`, not in the live
+  serving source. It starts from the complete current dirty-tree snapshot;
+  the untouched starting-reference worktree was not modified.
+- Baseline: the compact-cache TP8 checkpoint above allocates independent
+  `decode_logits[64,262144]` FP32 buffers in 11 sequential DSA layers.
+  Hypothesis: one model-owned scratch buffer removes ten duplicate
+  64-MiB allocations, nominally **640 MiB/rank**. Actual GPU/KV capacity
+  and serving throughput remain unmeasured for this candidate.
+- Change: lazy `Glm5NextIndexerWorkspace` is owned by each text model/PP
+  stage, threaded through decoder and MLA constructors to indexers.
+  It shares logits only; KV caches, APE/weights and selected outputs stay
+  distinct. A stage with no indexers allocates no logits. Shape/device
+  changes are rejected. No process-global cache or cross-model sharing.
+- Gated by compiler-hashed
+  `additional_config.glm5_next_shared_indexer_scratch`; off by default
+  in code, enabled only in the isolated TP8 registry candidate. Main TP8
+  profile remains the compact-only long-gate source.
+- CPU ownership/config/constructor plus existing platform/MTP/profile
+  suite: **90 passed, 10 CUDA tests skipped in 8.82 s**. Final focused
+  ownership suite after formatting: **12 passed in 8.18 s**. Constructor
+  tests exercise eleven indexers with speculation counts0/1/5, shared
+  logits pointers and independent KV/parameter objects. Ten prepared CUDA
+  tests cover raw/compact cache, c1/8/16/32/64 and changing graph replay.
+  Skips are pending gates, not passes. No native extension changed/built.
+- Raw: `perf/results/2026-09-09/glm53f-shared-indexer-scratch/`, including
+  initial snapshot patch/archive, CPU logs, resolved plan and a checked
+  **candidate-only.patch** relative to the frozen main serving sources.
+  The latter has not been applied to main.
+- Worktree invocation hazard: its symlinked `.venv/bin/slimserve` console
+  script resolves the original editable checkout. Use
+  `.venv/bin/python -m slimserve.cli ...` from the candidate directory;
+  module import paths and the dry-run's two flags were explicitly checked.
+  Native/FA dependencies are unchanged symlinks to the installed binaries.
+- Next: finish the current live long/tier gates, then GPU replay tests and
+  a real registered TP8 A/B for scratch sharing. Keep this separate from
+  the mHC overlap prototype until each change has its own evidence.
+
+## 2026-09-09: compact TP8 long gate complete; physical restore gate running
+
+- Status: long-workload gate passed within its time cap; tier qualification
+  and overall performance goal remain in progress. Frozen compact-only
+  serving sources still match `attempt01/source-sha256.txt`.
+- Exact c8 WildChat command recorded above completed in **4564.93 s**:
+  **633 successful turns, zero errors, 100/100 recall probes**. Eight sessions
+  stopped at the wall-clock limit, none at the target/context ceiling.
+  Maximum context **530,222**, median **509,100.5** tokens. This is NOT
+  validation at the full 1,048,576-token context ceiling.
+- Raw output: 237,686 completion tokens, 159,449,115 total prompt tokens
+  including cached prefixes. Do not compare these heterogeneous long-turn
+  totals with warmed exact-token decode TPS. GPU cache reached 98.1% in
+  diagnostic interval logs; DMA totals still showed **zero restores**.
+  Good recall here is not a tier-restore pass.
+- Strengthened `benchmarks/kv_tier_acceptance.py`: filler batching now
+  counts actual response `usage.prompt_tokens`, fails closed on missing/
+  invalid usage, and continues to an explicit `--churn-factor` target.
+  JSON records each filler and actual/target totals. Twelve CPU tests pass;
+  lint passes. Actual restore counters and byte verification remain
+  independent required gates, not inferred from token counts.
+- Started the unchanged registered compact profile's forced restore test:
+  `--pool-tokens 4225909 --churn-factor 1.75 --depths
+  40000,50000,60000,70000,80000,90000 --filler-tokens 55000
+  --filler-concurrency 8`, natural WildChat plants, seed42. Target
+  **7,395,341 actual filler prompt tokens** is intended to pressure host
+  capacity as well as GPU capacity. Disk reads must be observed before
+  claiming disk qualification. `VLLM_KV_TIER_VERIFY=1` remains enabled.
+- API3316656/engine3317413 remain alive, port8400; restore harness exec
+  session25585. No source changes or competing GPU tests while it runs.
+- Raw: `perf/results/2026-09-09/glm53f-tp8-compact-pool/attempt01/`
+  `deepcontext_c8.{log,json}`, `churn-accounting-tests.log`, and in-flight
+  `tier_acceptance.{log,json}`. Shared scratch/mHC overlap GPU gates follow.
+
+## 2026-09-09: cache-neutral NVFP4 Marlin layout contract
+
+- Status: diagnostic CPU evidence; no replacement serving kernel or speedup.
+  Baseline c1 trace has 84 expert GEMMs totaling about1.260ms on main.
+- Inspected owned GPTQ repacker, NVFP4 scale conversion and Marlin MoE
+  epilogue. Derived logical `(k,n)` to packed-word/nibble and narrow-scale
+  inverse addresses, retaining current small-scale clipping and BF16
+  router/global-scale rounding boundaries. Existing packed weights are
+  the target: no persistent dequantized/repacked duplicate cache.
+- `tests/glm5_next/test_nvfp4_marlin_layout.py`: **4 CPU tests passed,
+  3 native CUDA repack tests skipped**, pending released GPUs. Enumeration
+  covers every nibble across16x64,32x128,256x512 shapes; scale inversion
+  matches the owned converter. Lint passes. CPU evidence does not establish
+  numerical equivalence of a future fused GEMM.
+- Raw: `perf/results/2026-09-09/glm53f-nvfp4-layout/cpu-contract.log`.
+
+## 2026-09-09: c1 scaling attribution and next isolated experiments
+
+- Status: diagnostic/prepared, no additional serving change or speedup yet.
+- Corrected raw-cache TP4/TP8 rank0 traces, final complete decode at
+  context1007/1006: outer10.512/9.229ms. These single traced regions have
+  slightly different context/profile budgets and are not a throughput A/B.
+  Main-stream attribution: mHC1.223/1.216ms; 84 expert GEMMs1.657/1.260ms;
+  91 custom allreduces .619/.723ms; 42 route-top-k kernels .284/.303ms;
+  42 general align kernels .260/.235ms. Side streams overlap and must not
+  be added as latency. This supports targeting replicated computation,
+  collectives and fixed per-layer work. New raw TP4 census:
+  `glm53f-mhc-deferred/tp4-reference-decode-census.json`.
+- The existing pooled scorer already limits itself to128 programs/row,
+  striding over actual visible tiles. No full-context-grid fix is needed.
+  Extended isolated pool benchmark with `--tune-score`: pool tiles
+  16/32/64/128 × programs32/64/128/256, original tight parity/top-512
+  gates and three timing repeats. Four tile shapes compile offline SM80
+  (12/16/24/40KiB shared). No GPU timings/serving change yet. Raw build:
+  `glm53f-compact-pool-cache/score-tiles-offline.log`.
+- `benchmarks/benchmark_glm5_next_singleton_align.py`: for one non-EP
+  token with distinct valid top-k experts, each expert block has one real
+  row plus padding. Keep immutable row/padding metadata and view current
+  router IDs directly, bypassing general histogram/sort alignment. No new
+  GEMM, weight duplicate, process-global cache or serving import.
+  **12 CPU mapping/shape/alias tests pass; 24 combined with churn tests**.
+  Native Marlin and graph parity remain pending: reordered blocks could
+  alter split-K partitioning/rounding and must be tested, not assumed.
+- Prepared timing includes both native NVFP4 GEMMs, SwiGLU and final sum,
+  exact comparison and16 changed-input/route/weight graph replays. Cycles
+  16 disjoint expert sets (192MiB packed weights at TP8 shapes) to avoid
+  a single L2-resident route exaggerating savings. Five alternating
+  repeats. Actual serving A/B is still required. CPU raw:
+  `glm53f-nvfp4-layout/singleton{,-churn}-cpu.log`.
+- GPU queue after the physical restore gate releases the engine: compact
+  regressions/native layout, scratch replay, mHC overlap, scorer tile
+  sweep, singleton alignment. Promote only separately gated/measured wins.
+
+## 2026-09-09: compact TP8 physical disk/host restore acceptance passed
+
+- Status: retained compact-cache checkpoint now passes the time-capped
+  long workload and actual disk→host→GPU restore gate. Full1M per-session
+  ceiling, TP scaling and further performance optimization remain open.
+- Unchanged registered compact-only server/source, exact hashes verified
+  after both live gates. Churn **113 fillers /7,405,558 actual prompt
+  tokens**, exceeding target7,395,341; eviction phase1536.3s.
+- Six GPU-hot controls all recalled. All six post-eviction initial probes
+  plus their12 repeats recalled (**18/18**). Every initial probe had real
+  external hits, spanning41472/55296/64512/73728/82944/92160 tokens.
+  Restored TTFT3.033/3.634/5.194/5.447/6.210/6.877s; these are diagnostic
+  restore latencies, not comparable warmed exact-token decode throughput.
+- Six scheduler NVMe promotions. Matched all48 worker restore-issuance
+  records to verification records by rank/sequence: **825 disk reads and
+  825 GPU restore operations per rank**,6600 aggregate; **zero reported
+  byte mismatches**, no request/server errors. Runtime verifier reports
+  mismatch counts; it does not separately report missing expected digests.
+- Raw: compact `attempt01/tier_acceptance.{json,log}`, `server.log`,
+  `tier-mechanism-summary.json`. Source-hash checks still pass.
+- API3316656 was stopped only after acceptance completed. Wait for exact
+  workers3317655..3317662 to finish CUDA/disk teardown before GPU tests.
+
+## 2026-09-09: post-tier GPU gates and scratch-only serving A/B
+
+- All prior workers exited; no competing GPU process during microbenchmarks.
+  Main `tests/glm5_next`: **412 passed in10.90s**, including the three native
+  NVFP4 repack contracts. Later singleton-dispatch integration: **430 passed
+  in10.51s**, with its profile flag still off. No native binary changed.
+- Scratch replay initially failed10/10 tests because the test demanded
+  stable top-k ordering. Inspected `sampler.cu`: histogram winners are
+  emitted through atomicAdd. Added private-vs-private controls (order
+  changed in13–16 of16 calls per shape) and per-layer logit snapshots before
+  scratch reuse. **10 GPU tests now pass** with bit-exact valid logits and
+  equal selected index sets, raw/compact × c1/8/16/32/64 ×8 changing replays.
+  Floating tolerance was not loosened. Native ordering remains unstable;
+  this is not a claim of whole-model greedy repeatability.
+- Raw scratch evidence: `glm53f-shared-indexer-scratch/gpu-replay.log`
+  (original failures), `gpu-replay-controls.log` (passing controls), and
+  checked `candidate-only-replay-controls.patch`. Patch is NOT applied to
+  main; candidate lives in its existing detached worktree.
+- Started a real **scratch-only** registered TP8 A/B from
+  `/home/ubuntu/.local/scratch/glm53f-next-candidate` using
+  `.venv/bin/python -m slimserve.cli glm53f-nvfp4-8 --serve
+  --host 127.0.0.1 --port8400 -y`, same tier directory and VERIFY=1.
+  API3377788/engine3378642, serving session3318. Canaries and warmed
+  c1/c8/c16/c32 three-repeat harness PID3377872/session21202 wait for health.
+  Actual API cwd and seven serving-source hashes verified. Freeze the
+  candidate worktree and shared native binaries while this A/B runs.
+- Raw: `perf/results/2026-09-09/glm53f-tp8-shared-scratch/attempt01/`.
+  Boot is in progress; memory/TPS/serving acceptance not yet established.
+
+## 2026-09-09: measured decode experiments; singleton integration remains opt-in
+
+- mHC overlap: all8 shapes (c1/8/16/32 × KDA/router consumer) pass strict
+  parity and16 changed-input graph replays each. Median baseline→overlap
+  microseconds: c1 KDA25.59→22.41, router17.01→13.09; c8 30.15→25.89,
+  21.63→18.11; c16 35.28→32.10,25.40→21.42; c32 45.75→42.95,
+  32.68→29.28. Serial splitting regresses. These are isolated subgraphs,
+  NOT whole-model TPS; KDA repeated weights can fit L2. Serving integration
+  must keep the consuming projection and stream join inside the opaque op.
+  Raw: `glm53f-mhc-deferred/gpu-parity-timing.{jsonl,stderr}`.
+- Singleton align: native NVFP4 two-GEMM/SwiGLU/sum pipeline passes exact
+  parity and16 changing input/route/weight graph replays. Five alternating
+  repeats over16 disjoint routes/192MiB packed weights: median
+  **41.99→35.69us**, -15.0% subgraph time. Confirmed through the integrated
+  public `fused_marlin_moe` dispatch: **41.97→35.69us**. Still no serving
+  speedup claimed. Raw `glm53f-nvfp4-layout/singleton{,-public}-gpu.*`.
+- Promoted metadata helper to owned
+  `vllm/model_executor/layers/fused_moe/singleton_alignment.py`, threaded
+  optional owner through MarlinExperts. Gated by
+  `additional_config.glm5_next_singleton_marlin_alignment`, **off in every
+  profile**. Only SM80/NVFP4/H4096/E288/non-EP/non-LoRA/W4A16 may allocate
+  it. M>1, EP maps, different global expert counts, int64/strided IDs or
+  incompatible block size use general alignment. No weight/kernel math
+  changes, no global cache. Thirty focused CPU tests and430 GLM regressions
+  pass. This main-tree opt-in code is NOT in the running scratch worktree.
+- Scorer sweep: **192/192 configurations** pass original logit/top-512
+  checks across12 shapes. BP128 vs BP16 halves c1/131K scoring16.42→7.78us
+  but slows c1/1K3.05→4.11us. BP64/programs32 improves c16/16K17.41→10.50us
+  and c32/16K32.67→22.54us. Do not pick a universal large tile; investigate
+  GPU-side context-adaptive dispatch with graph-safe fixed launch sizes.
+  Current serving scorer unchanged. Raw `glm53f-compact-pool-cache/score-tuning.*`.
+
+## 2026-09-09: shared scratch retained for measured KV capacity
+
+- Status: retained and copied from the isolated tested worktree into main.
+  Additional `glm5_next_shared_indexer_scratch` now enabled in TP8 only.
+  Profile notes updated to distinguish current compact ratio8 geometry
+  from historical raw-cache tier validation. No native binary change.
+- Same settings/protocol as compact-only: GPU KV budget **50.72GiB/rank**
+  vs50.10, **4,278,924 tokens** vs4,225,909, +53,015/+1.2545%. This matches
+  the640MiB/rank scratch saving. No change to weights or main KV precision.
+- Three-repeat medians c1/c8/c16/c32 **99.834/473.828/657.642/894.580**
+  tok/s; differences versus compact-only **+0.774%/+0.009%/-0.456%/+0.090%**.
+  Treat throughput as effectively unchanged, not a speedup. Full repeats
+  and checked exact1000/300 counts in `attempt01/comparison.json`.
+- Text/reasoning/image/tool canaries pass. Main-tree integration passes
+  **107 CPU/profile/ownership/dispatch tests** and **452 GLM tests on GPU**.
+  This includes native-layout and changing shared-scratch replay controls.
+  Shared scratch has not had a new full-ceiling/long/tier run; the preceding
+  real disk restore and76-minute long run certify compact-only sources.
+- Raw: `glm53f-tp8-shared-scratch/attempt01/` comparison, source hashes,
+  canaries, exact JSONs and `main-integration-{cpu,gpu}.log`.
+- API3377788 stopped after its A/B completed; all workers have exited.
+  Next experiment: enable singleton alignment alone relative to this
+  shared-scratch checkpoint, through the same registered TP8 profile.
+
+- Follow-on singleton **validation candidate** is now enabled in the
+  working TP8 registry, not yet accepted as a serving optimization.
+  API3397536/engine3398115 (main tree), session99280, port8400;
+  canary/exact harness3397610/session48367. Same tier/VERIFY settings.
+  Raw `glm53f-tp8-singleton-align/attempt01/`, including resolved plan and
+  seven source hashes. Freeze main serving files while this A/B runs.
+  Keep the preceding shared-scratch-only measurements as its baseline.
+
+## 2026-09-09: singleton alignment retained; opaque mHC allocation gate
+
+- Singleton A/B completed from frozen main sources; all seven hashes match.
+  Same registered TP8 settings and warmed exact 1000-in/300-out protocol as
+  shared-scratch baseline, three repeats at c1/c8/c16/c32. All request token
+  counts checked in raw JSON; text/reasoning/image/tool canaries pass.
+- Baseline medians 99.834/473.828/657.642/894.580; candidate medians
+  **101.880/475.342/660.040/896.848** tok/s. Differences
+  **+2.049%/+0.320%/+0.365%/+0.253%**. Retain for the c1 gain, consistent
+  with the exact native MoE microbenchmark; other concurrencies effectively
+  unchanged and do not use this singleton fast path. c1 range101.851–102.390,
+  c8 474.943–476.543, c16 652.415–674.762, c32 896.416–897.768.
+  KV remains4,278,924 tokens/50.72GiB per rank. No new long/tier claim.
+- Raw: `glm53f-tp8-singleton-align/attempt01/` source hashes, canaries,
+  exact JSONs and server log. Harness exited successfully; API3397536
+  stopped after completion, workers undergoing normal CUDA/disk teardown.
+- Next candidate `benchmarks/glm5_next_mhc_project.py` registers an opaque
+  fresh-allocation fused post/pre+projection operation with caller-owned
+  stream handle and an explicit join. Not imported by serving models.
+  Unlike the earlier persistent-buffer prototype, tests chain three
+  transitions, release intermediates and replay changed inputs8 times.
+  Both KDA BF16 and router FP32 consumers, M1/8/16/32/64/65 are covered.
+  Meta/schema gate8pass/12GPUskipped; GPU allocation/lifetime gate pending.
+  Raw CPU evidence: `glm53f-mhc-deferred/opaque-meta-cpu.log`.
+
+- Opaque GPU gate **20passed**, including12 allocation/chained graph cases.
+  Fresh-allocation timing preserves the earlier win. c1/8/16/32 median
+  baseline→opaque microseconds: KDA26.42→22.81,30.76→27.68,35.25→31.30,
+  45.63→42.53; router17.19→13.18,21.69→18.15,25.41→21.53,32.67→29.15.
+  Three alternating repeats, exact BF16 residual/norm/projection, FP32
+  coefficients1e-6. Still isolated subgraphs, not serving TPS.
+  Raw `opaque-gpu.log`, `opaque-timing-final.{jsonl,stderr}`; earlier timing
+  attempts exposed runner import path and [T,4] vs [T,4,1] shape-adapter
+  issues, preserved separately. Reproduce with `PYTHONPATH=.` for runner.
+- Integrated owned `vllm/model_executor/layers/glm5_next_mhc_project.py`:
+  compiler-opaque operation+fake schema, unchanged partial kernel, split
+  urgent/deferred finalization, model/PP-owned stream and explicit join.
+  GLM KDA accepts optional precomputed projection; DeepseekV2MoE accepts
+  optional router logits, rejecting SP/internal-router mismatches.
+  Guard: explicit boolean additional-config flag, SM80/H4096/HC4/BF16,
+  noLoRA, exact unquantized linear method/no bias/no output gathering.
+  First pre-only site and unsupported projection sites keep old dispatch;
+  M>64 retains original native transition with the same projection.
+- Main GLM regression gate **483passed**. Initial4 failures were constructor-
+  bypassing dispatch test doubles missing new flags, not kernel failures;
+  two new plumbing assertions assumed tensor object identity despite the
+  pre-existing zero-copy view. Fixtures corrected without changing numeric
+  tolerances. Raw `serving-integration-gpu{,-final}.log`, `plumbing-cpu.log`.
+- Next real-profile A/B enables only `glm5_next_mhc_projection_overlap`
+  relative to the retained singleton checkpoint. Flag enabled in TP8 solely
+  as a validation candidate; do not call overlap retained before live result.
+
+- Actual boot eligibility is **34 KDA layers, 0 router sites**: this model's
+  MoERunner owns the gate internally (`is_internal_router` means gate is
+  notNone), so the initial guard excludes router overlap. Current A/B is
+  consequently KDA-only, not the full two-consumer integration. API3414693,
+  engine3415383, workers3415608 onward, sessions72809/91444, raw
+  `glm53f-tp8-mhc-overlap/attempt01/`. Health and canaries pass; exact matrix
+  still in progress. KV4,280,453 tokens/50.74GiB per rank.
+- Pending `benchmarks/glm5_next_router_overlap.py` uses the existing runner
+  external-gate interface rather than bypassing its shared-expert work:
+  at model construction, remove only the identical gate alias from the
+  runner; the parent MoE retains unchanged parameter/loader ownership.
+  Reject SP, input transforms, shared gate fusion, DBO, different gate,
+  non-BF16/quantized/bias/gathered projections. CPU ownership tests check
+  unchanged canonical parameter names and rejection without mutation.
+  Not applied to serving while the current comparison runs.
+- Separate adaptive scorer prototype now lives only under `benchmarks/`.
+  GPU-visible per-row length chooses tile16/32/64/128 and active CTA count
+  under a fixed graph launch. Offline SM80 compilation passes all4 batch
+  variants but uses40KiB shared memory: short-context occupancy is a risk,
+  not a presumed win. Mixed-length changed-input graph tests and alternating
+  timing are prepared; **not GPU-tested or serving-integrated yet**.
+  Raw `glm53f-compact-pool-cache/adaptive-offline-compile.log`.
+
+- KDA-only A/B completed, all9 hashes match and every exact JSON has
+  requested1000/300 token counts. Medians c1/c8/c16/c32
+  **102.763/476.888/657.832/899.056** tok/s versus singleton
+  101.880/475.342/660.040/896.848: **+0.867%/+0.325%/-0.334%/+0.246%**.
+  Retain as the next comparison checkpoint for the small c1 gain consistent
+  with microbenchmarks; higher-concurrency differences are within run spread.
+  c1 samples102.763/102.350/103.217, c8 486.689/476.888/476.614,
+  c16 656.152/669.858/657.832, c32 899.056/904.195/894.867.
+  This does not establish TP scaling or long/1M correctness. API3414693
+  stopped only after harness exited successfully; wait for GPU teardown.
+- Pending external-router ownership/rejection tests **9passed** on CPU,
+  raw `glm53f-mhc-deferred/router-externalization-cpu.log`.
+
+- Moved the externalization helper into owned `glm5_next_mhc_project.py`
+  and removed its now-redundant benchmark copy. Independent strict boolean
+  `glm5_next_mhc_router_projection_overlap` requires the mHC overlap flag.
+  Only construction-time opt-in changes the runner alias; serving forward
+  uses its existing external-router interface without a new runner API.
+  Main ownership/config/forward test11pass, including actual
+  `MoERunner._forward_impl` with boundary doubles: supplied logits are
+  consumed without another gate call, shared-expert sync still runs.
+  Raw `router-owned-forward-cpu.log`; combined CPU guards25pass before
+  that extra forward case. Flag TRUE in TP8 only for next live candidate.
+- Adaptive scorer's original and BP64 attempts each failed4 mixed replay
+  tests, with a few FP32 differences around1.4–1.9e-6 exceeding1e-6.
+  Do not weaken the gate. Static controls: BP16/W4 passes; BP32/W4 and
+  BP64/W4 fail; BP32/W8 and BP64/W16 pass. Evidence points to head-sum
+  layout rather than stale graph lengths. Explicitly reducing two groups
+  of16 heads then combining their sums makes the BP64 adaptive candidate
+  pass all4 mixed replay tests, preserving the baseline arithmetic.
+  Restoring BP128 long-context tile is the next strict gate before timing.
+  Raw `adaptive-{gpu,bp64-gpu,numeric-controls,warp-controls,
+  head-reduction-gpu}.log` under the compact-pool-cache result directory.
+
+- BP128 still fails the strict gate even with grouped head reduction;
+  excluded from this candidate. BP64 grouped reduction passes4 mixed-length
+  replay cases (40 graph replays total, contexts0–131076 crossing branch
+  thresholds) without tolerance changes. The final timing candidate uses
+  short BP16/32/64 according to batch and BP64 for medium/long contexts.
+- Twelve-shape adaptive timing/parity sweep completed. Median baseline→
+  candidate score microseconds for contexts1K/16K/131K:
+  c1 3.047→3.102/4.495→4.194/16.289→9.958;
+  c8 3.525→3.599/10.024→9.305/51.902→50.988;
+  c16 4.329→3.944/17.504→13.062/98.238→92.518;
+  c32 5.561→4.844/32.672→24.037/187.580→174.002.
+  Three alternating repeats each, original raw scorer comparison and
+  top512-set checks pass. Short c1/c8 slightly slower, long c1~39% lower
+  score time, medium c16/c32~25–26% lower. Still benchmark-only; serving
+  integration and whole-model TPS remain pending. Raw
+  `adaptive-bp64-fixed-timing.{jsonl,stderr}`. BP128 failure preserved in
+  `adaptive-bp128-fixed-gpu.log`; no failed variant enabled in serving.
+- Additional measured c1 lead: current compact update+score at1K costs
+  18.96us while score alone costs3.05us in this isolated harness. Investigate
+  the compact pool-update launch/low-occupancy cost (including no-completed-
+  pool steps) rather than assuming scorer tuning exhausts this path.
+
+- Full-router integration passes **498 GLM GPU tests** and76 CPU/profile
+  tests. Registered next A/B is booting: API3439513/engine3440417,
+  workers3440672..3440679, server92894/harness23493, port8400, raw
+  `glm53f-tp8-mhc-router-overlap/attempt01/`. Boot confirms34 KDA layers/
+  42 router sites on every rank; nine source hashes verified. Only router
+  overlap differs from KDA-only checkpoint. No serving result yet.
+- Quarantined next c1 update prototype reuses original `_complete_pools`
+  arithmetic inside one CTA, barriers before replacing the raw ring, and
+  skips pooling on non-completion steps. No serving import/dispatch change.
+  Offline SM80compile passes BS64/4608; GPU byte-exact state and changing-
+  slot graph tests pending until the live engine releases all GPUs.
+  Raw `glm53f-compact-pool-cache/singleton-update-offline.log`.
+
+## 2026-09-09: router overlap rejected on serving evidence
+
+- Full KDA+router A/B completed: all canaries and exact1000/300 counts pass,
+  nine source hashes match, KV unchanged4,280,453 tokens/50.74GiB per rank.
+  c1/c8/c16/c32 medians **102.708/474.973/655.794/897.148** tok/s versus
+  KDA-only102.763/476.888/657.832/899.056: **-0.053%/-0.402%/-0.310%/-0.212%**.
+  No serving benefit despite the isolated router-subgraph timing win.
+- Decision: disable the separate router-overlap flag and keep KDA-only.
+  Externalization moves the runner's shared-expert stream sync after gate
+  projection, changing its overlap window; this is a plausible explanation,
+  not a profiler-proven cause. Preserve the opt-in helper as a documented
+  diagnostic only, with no extra weight or cache allocation when disabled.
+- Raw `glm53f-tp8-mhc-router-overlap/attempt01/comparison.json`, all exact
+  JSONs/canaries/server log and hashes. API3439513 stopped after successful
+  harness exit; worker/GPU teardown must finish before singleton-update GPU
+  gate. Timing runner now exists at
+  `benchmarks/benchmark_glm5_next_singleton_pool_update.py`: both page sizes,
+  all4 phases, five alternating CUDA-graph timing repeats, byte-exact cache.
+
+## 2026-09-09: fused singleton cache update and adaptive decode scorer integration
+
+- All8 focused GPU cases pass: singleton update byte-exact across both page
+  sizes, phases, ring/page boundaries, invalid slots and graph replay; adaptive
+  score replay expanded to c64 and synthetic1M context. These synthetic
+  tests do not replace a full1M serving workload. Raw
+  `glm53f-compact-pool-cache/update-and-expanded-score-gpu.log`.
+- Singleton update5-repeat graph timing on BS4608: baseline phase0/1/2/3
+  medians15.668/15.561/15.610/15.794us; fused1.585/1.611/1.576/14.509us.
+  Byte-exact state before/after timing; BS64 also passes and improves.
+  The non-completion phases avoid the expensive pool tile; completion
+  retains its exact arithmetic and saves one launch. Raw
+  `singleton-update-timing.{jsonl,stderr}`. No serving gain claimed yet.
+- Moved singleton kernel into owned `glm5_next_pool_cache.py` and adaptive
+  score into `glm5_next_pool_score.py`; benchmark modules now only wrap/
+  compile the owned code, with duplicate kernel implementations removed.
+  Independent additional-config flags enter the opaque indexer schema with
+  False defaults, preserving existing callers. Adaptive dispatch is limited
+  to decode R<=64/H32; prefill uses the existing scorer. Both flags require
+  compact cache; its existing SM80/kpool/spec guards remain intact.
+- Integration: **502 GLM GPU tests pass**, plus **79 CPU/config/profile
+  tests** including strict independent flags, qualified dispatch and opaque
+  schema defaults. Raw `owned-integration-gpu.log`, `owned-config-cpu.log`.
+- Next TP8 A/B enables only `glm5_next_singleton_pool_update`; adaptive
+  scoring and rejected router overlap remain FALSE. Baseline is retained
+  KDA-only102.763/476.888/657.832/899.056 and4,280,453-token pool.
+
+## 2026-09-09: singleton pool update retained; longer-context scorer baseline
+
+- Status: singleton update retained; adaptive scorer serving A/B pending.
+- Same registered TP8 profile, 8xA100-80GB, CUDA13/torch2.13, non-spec,
+  BF16 main KV, Marlin, maxseq64, FULL_DECODE_ONLY64, util0.95,
+  host72GiB/rank and disk256GiB/rank. Only singleton-update flag changed
+  versus KDA-only checkpoint; router and adaptive scoring disabled.
+- Exact1000/300, three repeats c1/c8/c16/c32:
+  102.619/104.772/104.557; 473.244/478.690/477.388;
+  670.162/657.920/658.092; 900.872/901.649/903.330 tok/s.
+  Medians **104.557/477.388/658.092/901.649**, changes versus KDA-only
+  **+1.746%/+0.105%/+0.040%/+0.288%**. Higher concurrency is unchanged
+  by dispatch and effectively flat. The small c1 win matches reduced
+  launch/pool work; its first repeat overlaps the baseline spread.
+- Correctness: all canaries and requested counts pass; harness exit0;
+  all11 serving/profile hashes match. GPU capacity unchanged4,280,453
+  tokens/50.74GiB/rank. Prior502 GPU and79 CPU integration tests apply.
+  These are not full model-quality, full1M or combined long-tier gates.
+- Raw `glm53f-tp8-singleton-update/attempt01/` including plan, server,
+  hashes and validation JSONs. Retain singleton flag as new checkpoint.
+- `validate_glm5_next.py` now accepts input/output token counts and
+  repeat-source while preserving1000/300 defaults. Two CPU harness tests
+  pass (`glm53f-compact-pool-cache/validation-shapes-cpu.log`). Current
+  engine stays live for a16384-input/300-output c1/8/16/32 three-repeat
+  baseline, output `attempt01/context16k/`. Underlying harness primes each
+  prompt before timing; result includes aligned-prefix restore/recompute,
+  not pure decode-kernel time. No competing GPU work or serving edits.
+- Quarantined next dense-projection experiment:
+  `benchmarks/{glm5_next_bf16_gemv_candidate,benchmark_glm5_next_bf16_gemv}.py`.
+  Read owned DSV4 projection/router CUDA references: one CTA/output row,
+  vector BF16 loads, full4096 reduction. Candidate groups2/4/8 output rows
+  with256/512/1024 K tiles, no repack/cache or precision change. All9
+  SM80 variants compile offline (`glm53f-mhc-deferred/bf16-gemv-offline.log`).
+  GPU numerical gate and16-disjoint-weight-matrix HBM timing NOT run;
+  nothing is serving-imported. Its existing merged-KDA tolerance is not
+  permission to relax the separate exact mHC-projection gate.
+
+- First16K matrix failed atc8 before HTTP submission: repeated-source
+  builder truncated to exactlyone prompt, so no second candidate window
+  existed. c1 completed84.10/83.57/85.18 (diagnostic only). Fixed benchmark
+  builder to allocate enough windows including offset/full source cycle,
+  preserving existing sufficient-source/default prompts.19 CPUtests pass;
+  real GLM tokenizer verifies32distinct exact prompts at16384 and131072.
+  Raw failure preserved in `attempt01/context16k/`; rerun with the fixed
+  builder in `attempt01/context16k-fixed/`, same engine/serving sources.
+  Adaptive A/B must use this same builder, not the failed partial baseline.
+
+- Next isolated KDA experiment prepared during the source freeze:
+  `benchmarks/glm5_next_kda_direct_output.py` launches the **unchanged**
+  owned packed-recurrent kernel into the final output view. Current plain
+  decode allocates a temporary then copies at all34 sites; speculative-only
+  already has direct output. Candidate is benchmark-only, not an integrated
+  serving fix.20 GPUcases collect onCPU (c1/8/16/32/64, TP4/TP8 heads,
+  lower-bound on/off, strided slots, padding/null rows,8changedreplays),
+  but have NOT run onGPU. Separate16-layer alternating graph timing runner
+  is ready. Run only after live serving releases allGPU allocations.
+- Read-only cache follow-up: current 16K exact timing reuses at most the
+  13,824-token aligned prefix and recomputes a2,560-token tail. This is not
+  a pure scorer/decode measurement. The existing compact indexer has
+  4,608-token pages (ratio8 to576-token MLA), reducing memory at the cost
+  of coarser prefix reuse. Investigate smaller indexer pages with separate
+  sized pools, starting from the existing Qwen multi-pool implementation;
+  do not simply shrink pages in the single fixed-stride pool and erase the
+  capacity win. `_chat_demand` currently assumes one non-Mamba block, so
+  its Qwen-specific sizing is not a drop-in GLM long-context solution.
+
+- Corrected16K matrix completed exit0. Medians c1/c8/c16/c32
+  **84.450/279.034/343.821/397.038** tok/s. Ranges83.579–85.104,
+  277.842–281.302,333.196–346.152,384.835–398.271. All12 exact JSONs
+  have16384/300 tokens per request; canaries pass;11 serving/profile and
+  3 client/source hashes match. Raw `attempt01/context16k-fixed/` and
+  `context16k-summary.json`. This is the retained checkpoint's long-prompt
+  baseline, not a before/after speedup or full1M quality qualification.
+- Same live engine now runs131072-input/300-output c1/8/16/32,3repeats,
+  fixed repeated-source builder; session2986, raw `attempt01/context131k/`
+  and `context131k.log`. Cold prompt priming is substantial; don't kill a
+  healthy run for taking longer than the short matrix. c32 is close to the
+  resident pool limit; record any preemption/tier activity honestly.
+- QuixiCore delta review completed read-only. New retained export payload:
+  compact pool update/cache scorer and mHC urgent/deferred finalization;
+  no adaptive scorer or rejected router overlap. Shared scratch/singleton
+  alignment are ownership/metadata utilities, not new GPU kernels. Preserve
+  Apache provenance, caller-owned stream/output semantics, undefined inactive
+  score columns, and exact whole-slab singleton parity. Independent numeric
+  oracles at umbrella tolerances remain required before conformance claims;
+  existing Transformers top-k parity does not establish raw-logit tolerance.
+  No QuixiCore tree edits/builds/GPU work yet.
+
+## 2026-09-09: long-context measurement attribution and partial-prefix lead
+
+- Status: in progress; same singleton-update checkpoint and131K harness
+  still live. No serving/profile/client edits during this comparison.
+- Prepared a separate aligned-prefix protocol at18433 and129025 input
+  tokens,2000 output tokens, c1/8/16/32,3repeats. These are one token past
+  a4608 boundary: prefix lookup must leave an input token for first logits.
+  Actual cache-hit/recompute evidence is required, not inferred from shape.
+  Keep the16K/131K300-output end-to-end matrices; don't relabel them pure
+  decode or compare aligned2000-output TPS directly with1000/300 baselines.
+  Reproduce via `attempt01/aligned-decode-protocol.md`; NOT launched yet.
+- `benchmarks/serving_cache_metrics.py`: model-filtered cache/recompute/
+  preemption counter parsing, missing values stay unknown, resets fail.
+  FourCPUtests pass. Not yet wired into the exact benchmark because its
+  client source is frozen; integrate after131K finishes, then use matching
+  new hashes for both aligned A/B arms. Existing server counters confirmed
+  present through a read-only metrics request.
+- `benchmarks/glm5_next_pool_oracle.py`: independent CPUFP64 learned-pool
+  and score semantics, optional6-case GPU diagnostic against retained
+  compact kernels. BF16 keys gate0.002/0.002; scorer from actual stored
+  keys gates1e-6absolute/1e-5relative (umbrella values), isolating scorer
+  arithmetic from pool-rounding differences. Fourclosed-form CPUoracle
+  tests pass; combinedoracle/metrics8pass. GPU comparison NOT run.
+- Finer-prefix candidate: clone an immutable partial indexer page into a
+  writable page at resume, preserving completed pool keys and masking
+  future columns with visible length. At a4-token-aligned resume boundary,
+  the next completed pool uses only newly written rows: an old raw ring
+  from a later suffix need not represent the prefix. This is a hypothesis
+  until the prepared4GPUtests pass atBS64/4608,576-equivalent offsets,
+  different physical pages and preserved source/padding. Tests onlyCPU-
+  collected (`partial-prefix-collect.log`); no scheduler/tier implementation.
+- Why not simply enable existing multi-pools: its one-block chat demand
+  underprovisions an indexer that grows with context, and fixed state-pool
+  reservations can remove the capacity needed for32long sessions. Partial-
+  page COW may avoid those changes. Real implementation still needs explicit
+  partial-hit lengths, bounded hash aliases tied to block ownership,
+  copy-before-write, KDA576-token boundary availability and matching
+  host/disk metadata. Passing a kernel clone test will not prove those.
+- Raw CPU gates: `glm53f-compact-pool-cache/{cache-metrics-cpu,
+  oracle-and-metrics-cpu,partial-prefix-collect}.log`. All new diagnostics
+  remain outside serving imports. Long131K run has now exercised actual
+  tier restores; final counts/results pending, no full tier acceptance claim.
+
+- Extended CPU gate now30pass (oracle, cache counters including nonfinite/
+  negative/reset rejection, prompt builder and shape harness), raw
+  `long-client-and-oracle-cpu.log`. c16 long131K repeats completed
+  133.37/135.11/136.22; c32 warmup live at08:56. These partial observations
+  are not a completed matrix or before/after performance claim.
+
+## 2026-09-09: duplicate immutable tier-page accounting
+
+- Status: measured CPU index behavior; sharing implementation pending.
+- Evidence: `HostTierConnector.get_num_new_matched_tokens` adopts an
+  already-covered GPU prefix only when `_partial_resume_ok` is true.
+  Mamba keeps a fresh request lineage; `HostKVTierIndex.stage_attention`
+  deduplicates within that owner, not across owners. This preserves branch
+  isolation but repeated immutable attention prefixes are staged again.
+  Do not revert to shared-first-block lineage keys: that previously mixed
+  concurrent conversations and destroyed resumability (August28 notebook).
+- `benchmarks/measure_glm5_tier_duplicate_pages.py` exercises the current
+  index at a129024-token shared prefix, TP8 attention ratios1/8 and4
+  independent tail-state groups. With actual profile capacities11915host /
+  42366disk slots,1/8/16/32 sequential owners cause252/2016/4032/8064
+  attention-page copies for252distinct attention pages. Tail copies remain
+  4/32/64/128, disk writes256/2048/4096/8192. All lineages remain resumable.
+  This is index accounting, NOT live c1/c8/c16/c32 throughput or a claim
+  that arbitrary real conversations share their full prefix.
+- A separate512host/2048disk-slot pressure diagnostic with4 owners stages
+  1008attention copies +16tails; two lineages demote despite only252unique
+  attention pages. FiveCPU accounting tests pass, including independent
+  tails and invalid-shape rejection. Raw compact-pool-cache results:
+  `tier-duplicate-pages-cpu.{json,log}`,
+  `tier-duplicate-profile-capacity.{jsonl,log}`,
+  `tier-duplicate-accounting-cpu.log`.
+- Correct next design is content-addressed immutable attention pages with
+  independent trajectory/tail ownership, not indiscriminate lineage adoption.
+  It must preserve references through host/disk demotion, pending writes,
+  promotion/read pins, branch divergence, last-reference eviction and slot
+  reuse. Current release/reclaim helpers assume exclusive slots, so merely
+  sharing integers would be incorrect. No serving source changed.
+- One live prefill snapshot: all8GPUs100% utilization, memory utilization
+  15–16%, SM1410MHz, power299–329W. This neither measures achieved FLOPs
+  nor attributes a kernel; it rules out treating the whole observed interval
+  as GPUs idle on disk. Fresh long-tail-prefill/decode traces remain priority.
+- Read-before-retry EP check: model MoE intermediate is2048 (TP8local256),
+  not1024. Current naive dispatch runs only with DP>1 or sequence parallel;
+  EP alone does not imply all-to-all. Do not propose removing a presumed
+  dispatch or repeat the rejected EP arm without checking actual resolved
+  SP/communication routing and a fresh profile.
+
+## 2026-09-09: aligned decode protocol capacity correction (not measured)
+
+- Live slab is8397 blocks (54480273408/6488064), and boot explicitly confirms
+  Mamba align. Four state groups need up to8 pages per request; the two
+  attention groups use576/4608-token pages. Conservative c32 demand is
+  `32*(ceil((input+output)/576)+ceil((input+output)/4608)+8)`.
+- Planned129025/2000 would require8480 blocks, exceeding the resident pool.
+  Corrected separate diagnostic to124417/2000, requiring8192 blocks, with
+ 205 blocks left before null/other reservations. Verify real cache metrics;
+  this capacity arithmetic is not evidence of actual preemption or a measured
+  speedup. Preserve the original131072/300 matrix (8512 conservative blocks)
+  as the full long-context/tier stress test, not an apples-to-apples decode
+  comparison. Serving and active131K client source remain frozen.
+
+- Attribution caveat: this engine was launched with `VLLM_KV_TIER_VERIFY=1`.
+  `kv_tier_dma.poll_done` calls `_verify` before reporting each restore done;
+  `_digest` performs `t.cpu().numpy().tobytes()` and SHA1. Thus restore-heavy
+  results include synchronous GPU-to-CPU diagnostic reads and CPU hashing,
+  not just production DMA/compute. Preserve these as correctness-instrumented
+  measurements. A separate matched verification-off run is required before
+  attributing the whole long-context gap to the production path. Do not
+  disable verification mid-run or compare different verification modes as a
+  kernel A/B. At one c32 checkpoint, metrics showed zero preemptions, two
+  running requests and21 deferred, with zero waiting for capacity. These
+  instantaneous counters do not prove the cause of the full-run slowdown.
+
+## 2026-09-09: retained singleton path full131K matrix completed
+
+- Raw `glm53f-tp8-singleton-update/attempt01/context131k/`, summary
+  `context131k-summary.json`; parent3504709/session2986 exited0. All12
+  exact131072/300 results and text/reasoning/image/tool canaries pass.
+  Three-repeat c1/c8/c16/c32 medians49.386/117.642/135.111/97.858 tok/s.
+  c32 repeats102.420/97.858/96.811: this is a regression versus c16,
+  not a finished optimization. No production uninstrumented TPS claim.
+- At completion: zero running/waiting requests, zero cumulative preemptions,
+  no server errors or reported byte mismatches. All8 ranks reported160
+  restore batches /37783 restore ops each cumulatively across this boot.
+  Missing expected digests are skipped by the verifier, so this is not a
+  claim of complete digest coverage. Both deferred and capacity waiting
+  occurred in snapshots. All original client/source hashes matched through
+  completion; no mid-matrix mutation.
+- After completion only: wired cache counters into exact-client existing
+  before/after HTTP snapshots, outside the timer. Missing counters remain
+  unknown; invalid/reset counters fail.29 CPU tests pass across metric
+  wiring/parser, prompt construction and validation shapes; raw
+  `glm53f-compact-pool-cache/cache-metrics-wiring-cpu.log`. This does not
+  change sampling, warmup requests or timed requests. New client hashes
+  are required for both arms of the aligned-prefix comparison.
+
+- Aligned124417/2000 baseline launched on the unchanged engine, parent
+  3562500/session89742. First c1 result94.31tok/s, exact counts; metrics
+  show124416GPU-hit prompt tokens,1computed token,1prefill request,
+  0externalhits/0preemptions. This verifies the intended prefix reuse for
+  that result, not the whole matrix. Second c1 result90.02; final medians
+  pending. Raw `attempt01/aligned124k/`; new client hashes preserved.
+
+## 2026-09-09: replicated indexer work / row-sharding diagnostic prepared
+
+- Evidence: GLM5 indexer query/weight projections are ReplicatedLinear;
+  every TP rank scores all request rows and runs full top-k. Assigning
+  contiguous request rows to ranks preserves the unchanged per-query score
+  arithmetic and full visible pool set. Gather only512selected pool indices
+  per query, then retain the existing expansion/attention path. This does
+  not shard or quantize KV, change sparse selection semantics, or itself
+  increase cache capacity. It targets repeated work limiting TP scaling.
+- New quarantined `benchmark_glm5_next_indexer_row_shard.py`:11disjoint
+  cache layers, original scorer/native top-k, fixed-count NCCL CUDA-graph
+  replay, five alternating timing repeats, maximum rank time. Tests exact
+  valid logits and selected sets under four changed-input/length replays.
+  CPU ownership/padding/gather-order tests36pass; raw
+  `glm53f-compact-pool-cache/row-shard-plan-cpu.log`. GPU correctness and
+  timing NOT RUN. No serving code imports the diagnostic.
+- Benchmark c1 retains replicated execution; c8/c16/c32 measure communication
+  including its likely short-context penalty. Short-context working sets may
+  be L2-hot despite disjoint layers, unlike full serving with intervening
+  weights. No speedup or production enablement claim until actual GPU and
+  matched profile A/B. Conditional long-context routing must also work under
+  CUDA graphs; do not bake a trace-time context length into replay.
+- Separate DCP investigation: current sparse backend returns noLSE and
+  resolves global top-k indices through unsharded pages, whereas the MLA
+  DCP caller requires LSE reduction and sharded token mapping. DCP is not a
+  safe knob flip. FP8 NoPE storage likewise needs an owned512-latent store/
+  decode path plus quality gates; the existing FP8 sparse path assumes576
+  elements with64RoPE. BF16 production KV remains unchanged.
+
+## 2026-09-09: tensor-core NoPE sparse MLA prototype (GPU gates pending)
+
+- Current owned BF16 sparse path in `csrc/quixicore/serving/mla_kernels.cuh`
+  remains lane-parallel loads plus sequential per-key FP32 dot/online
+  softmax inside each partition. References inspected: this path, DS4 ROCm
+  attention, QuixiCore ROCm absorbed MLA, and llama.cpp Ampere MMA attention
+  (512/512 head geometry uses32-key tiles). No wholesale vendoring.
+- New isolated `benchmarks/glm5_next_sparse_tc_candidate.py` shares gathered
+  BF16 KV across8/16heads, tensor-core QK and value products, and FP32
+  partition softmax/reduction. Value products use high+residual BF16
+  probability components; KV itself remains unchanged BF16. This changes
+  accumulation order and is NOT claimed bit-exact. Empty index tiles write
+  zero partials and skip MMA. Strided pages use64-bit byte-element addressing;
+  selected logical indices, holes and per-row lengths are honored.
+- Offline SM80 compile succeeds for H8/16 and splits32/64/128, including
+  empty-tile skip. Shared memory48/80/144KiB per partition CTA,512B reduction.
+  Raw compact-pool-cache `sparse-tc-{offline,empty-skip-offline}.{jsonl,log}`.
+  This is compiler evidence only; **no GPU correctness/timing yet**.
+-60GPU tests CPU-collected: c1/8/16/32, H8/16, BS64/576, padded physical
+  pages, shuffled block tables, holes, positive entries beyond tlen, empty
+  rows and five changed-input graph replays. Actual model QK scaling is
+ 256^-0.5 (not latent512^-0.5); both scales tested. Gates unchanged:
+  normalized max reference error<5e-3, BF16 pointwise0.002/0.002 and max
+  absolute vs retained native<1e-3. Raw `sparse-tc-collect.log`; not60passes.
+- New `benchmark_glm5_next_sparse_tc.py`:11disjoint layer caches with actual
+  packed MLA page stride, independent request pages, c1/8/16/32 at physical
+  contexts1000/131072. c32long requires about48GB cache on an otherwise idle
+  GPU, refuses insufficient memory rather than shrinking shape. Five
+  alternating graph timing repeats against nativeP128; GPU gates must pass
+  first. Short cases may beL2hot; only real profile A/B establishes a gain.
+- Existing adaptive-scorer test expanded to prefillR256/2048 with3shared
+  request caches, avoiding allocation of a full long cache per query token.
+  Same1e-6 score and exact selected-set gates, batched valid-column checks.
+  Eight tests collected (six previously GPU-tested shapes plus two new);
+  extended suite has not been GPU-run. No serving source changed.
+
+## 2026-09-09: aligned124K baseline complete; medium baseline live
+
+- Raw singleton-update/attempt01/aligned124k and aligned124k-summary.json.
+  Three-repeat exact124417/2000 medians c1/c8/c16/c32:
+ 90.481/307.599/464.679/702.056 tok/s; all12exact/canaries pass. Every timed
+  request has one computed prompt token, all remaining prompt tokens GPU-hit,
+  zero external hits and zero preemptions. Client/source hashes matched.
+- c32warmup was a different cache state:248832GPU-hit versus3732480external
+  hit tokens,32computed tokens/32requests,13.64tok/s. It is excluded from
+  medians. Timed c32 is GPU-resident; do not attribute its time to restores.
+  Verification remains enabled for offloads; do not compare these medians
+  directly with1000/300 or131072/300 as an optimization speedup.
+- Existing sparse Mamba retention policy was found during KV review:
+  `VLLM_PREFIX_CACHE_RETENTION_INTERVAL` preserves reachable checkpoints and
+  sparsifies state/window snapshots; full-attention caches remain dense.
+  No retention change or causal attribution for the warmup misses yet.
+  Inspect/reuse this policy before inventing another retention mechanism.
+- Medium aligned18433/2000 matrix now live, parent3607040/session66802;
+  same unchanged engine/API3462018. Canaries pass, c1first105.34tok/s at
+ 10:13. Finish all repeats, then release owned server and run pending GPU
+  gates. Do not overlap isolated benchmarks with the active profile.
+
+- Medium baseline completed0: exact18433/2000, medians
+ 105.471/465.203/738.142/1093.203 atc1/c8/c16/c32. All12exact/canaries
+  pass; each timed request computes1prompttoken with noexternalhits or
+  preemptions. Source/client hashes matched. Rawaligned18k-summary.json.
+  Endpoint verified0running/0waiting before TERM to ownedAPI3462018;
+  waitforallworkers/GPUcontexts toclear beforeisolatedtests.
+
+## 2026-09-09: prepared GPU gates — sparse tensor cores pass; adaptive prefill fails
+
+- Status: in progress; no new candidate enabled in serving.
+- All serving workers and GPU contexts cleared before isolated tests.
+  Prepared suite stopped at first failure: 71 passed, one failed in19.05s.
+  Partial-prefix clone4 and sparse-TC60 passed; adaptive7 passed, R2048
+  failed at one of67,110,912 compared entries (absolute1.9073486e-6,
+  relative2.23049e-6). Keep strict atol/rtol1e-6; adaptive remains off.
+  The later KDA20 suite did not run. Raw compact-pool-cache
+  `prepared-kernel-gates-gpu.log`.
+- Independent pool oracle's FP64 scorer checks pass all six cases, but
+  comparing stored keys to rounded BF16 FP64 pooling fails a few values.
+  Preserved `pool-independent-oracle-gpu.{jsonl,log}`. Added diagnostic
+  unrounded errors/midpoint examples without changing the original gate;
+  its four CPU oracle tests pass. Investigation remains open.
+- Sparse-TC timing now measures the passing candidate against nativeP128
+  on GPU0, eleven disjoint strided layer caches, five alternating graph
+  repeats, native max-absolute gate<1e-3. Raw
+  `sparse-tc-timing-gpu.{jsonl,log}`. No serving gain claimed yet.
+
+## 2026-09-09: sparse-TC isolated win; narrow serving A/B prepared
+
+- Baseline nativeP128 vs tensor-core BF16 NoPE MLA, TP8 geometry H8,
+  eleven disjoint layers, five alternating graph repeats, c1/8/16/32.
+  At1000 physical context, native median us/layer:
+  68.848/84.080/94.398/165.347; selected TC32(c1)/TC128(c8+):
+  9.521/20.855/38.576/67.914. At131072 physical context:
+  79.514/96.945/168.738/273.037 -> 10.058/36.871/60.205/106.785.
+  TC32 is slightly faster at c8long(35.082us) but TC128 reduces scratch
+  and wins short context; no context-dependent host branch is introduced.
+- All timing replay gates pass native max-absolute<1e-3; observed maximum
+  0.000244140625. Outputs are NOT bit-exact. Short cases may be L2-hot;
+  full serving A/B remains mandatory. Raw compact-pool-cache
+  `sparse-tc-timing-gpu.{jsonl,log}`. Benchmark completed0, GPU released.
+- Promoted the unchanged kernel to `vllm/quixicore/sparse_mla_tc.py`, with
+  explicit FP32 scratch dtypes. Benchmark module is now a compatibility
+  re-export. Backend has default-off compiler-hashed
+  `glm5_next_sparse_tc_decode`; only SM80, H8, no speculation, pure decode
+  R1..32. Other shapes/prefill retain the original bounded-scratch kernel.
+  No KV precision/layout change. TC32 below8rows, TC128 otherwise.
+- Expanded GPU gates after promotion:84candidate +14retained native tests
+  **98pass**, including additional R2/R4 graph replays. CPU option/fallback
+  tests18pass. Raw `sparse-tc-promoted-gates-gpu.log`,
+  `sparse-tc-dispatch-cpu.log`. No new native extension build required.
+- KDA direct-output20 GPU tests pass exact output/state, padded views and
+  changed-input graph replay. Isolated timing pending; not integrated.
+- Pool oracle diagnostic still FAILS its original rounded reference gate.
+  Examples place the disagreements within~1e-7 of BF16 midpoints, but the
+  same pointwise tolerance against unrounded FP64 also fails many ordinary
+  BF16 quantization values. This is NOT a successful conformance gate and
+  changing reference alone does not fix it. Original strict_pass preserved;
+  all scorer checks pass. Raw `pool-oracle-rounding-diagnostic-gpu.{jsonl,log}`.
+  Retained old-vs-compact byte parity is distinct from this stronger oracle.
+
+- Real sparse-TC candidate boot started10:42, API3628422/session91412;
+  profile flag enabled solely for A/B. TP8 other flags and verification-on
+  tier settings unchanged. Inactive torch profiler configured for later
+  trace. Validator3628492/session39703 waits for health then exact1000/300
+  c1/8/16/32, three repeats plus canaries. Raw
+  `glm53f-tp8-sparse-tc/attempt01/`, frozen16source/client hashes included.
+  No serving result yet. CPU config/profile suite90pass.
+
+## 2026-09-09: KDA direct-output isolated timing (not integrated)
+
+- Baseline unchanged packed recurrent kernel allocating temporary output,
+  then copy; candidate same kernel writing caller-owned output. Hypothesis:
+  eliminate one copy launch at each of34plain KDA decode sites.
+- GPU tests20pass, eight changed-input replays with exact entire state slab
+  and output including padded/invalid slots. Timing16disjoint layer states,
+  five alternating CUDA-graph repeats, H8/c1,8,16,32. Median us/layer:
+  5.559/10.712/16.264/28.264 -> 4.042/9.444/14.850/26.862.
+- Decision: promising small launch savings, not integrated while the larger
+  sparse-attention one-factor A/B runs. No serving TPS claim.
+- Raw compact-pool-cache `kda-direct-output-gates-gpu.log` and
+  `kda-direct-output-timing-gpu.{jsonl,log}`; both completed0.
+
+## 2026-09-09: sparse-TC TP8 short serving A/B passes; long A/B live
+
+- Same registered TP8 profile, singleton-update baseline vs only
+  `glm5_next_sparse_tc_decode=true`; BF16 KV/tiers/graphs unchanged.
+  Exact1000/300, c1/c8/c16/c32, three repeats and excluded warmups.
+  Medians109.654630/486.892838/677.277244/926.254877 tok/s:
+  +4.875%/+1.991%/+2.915%/+2.729% over104.557324/477.388208/
+  658.091931/901.649297. All12exact counts and canaries pass. No preemptions,
+  no external prefix hits; endpoint0running/0waiting at completion.
+- Pool unchanged4,280,453tokens/50.74GiB per rank; graph capture0.22GiB.
+  All16serving/client hashes match. Profiler inactive during all timed runs.
+  Raw `glm53f-tp8-sparse-tc/attempt01/{short,comparison.json}`.
+- Decision: short-workload win, not full long-context/quality qualification.
+  Source/profile remain frozen while aligned124417/2000 A/B runs.
+- After short harness completed0, separate bounded c1 profile request ran;
+  start/stop endpoints both200, profiler stopped successfully. Trace contains
+  `_sparse_tc_part`, confirming actual serving dispatch. Profile request TPS
+  is diagnostic only. Eight rank traces under`attempt01/traces/`.
+- Aligned124417/2000, c1/8/16/32, three repeats plus canaries now running
+  on the same unchanged candidate engine. Raw`attempt01/aligned124k/` and
+  `aligned124k.log`. Compare only with matching singleton-update aligned
+  baseline90.481/307.599/464.679/702.056, and verify prefix/tier counters.
+
+- Fresh c1 trace: sampled step8327.551us;1492kernels across four streams,
+  kernel-duration sum8771.554us but interval union7876.431us. All90mHC
+  partial markers present across streams49/21/0/20, not solely main stream.
+  CPU census now handles this without inventing per-layer ownership; three
+  tests pass. Failed original log preserved. Sparse-TC part11calls82.016us
+  plus reduce11calls36.703us confirms serving use. Remaining aggregate
+  work includes91allreduces725.817us,84Marlin calls1268.344us, plus dense
+  GEMM/GEMV and mHC kernels; these sums are not additive wall bottlenecks.
+- Long candidate c1 regresses:77.977/76.24/75.28tok/s versus90.481median
+  baseline. Same intended124416GPUhit/1computed prompt token,0externalhits/
+  preemptions; no restores. GPU SM clocks1410MHz; no competing GPU work.
+  Keep candidate under investigation, not universally retained. c8warmup
+  live at10:55, harness3644471/session92573; do not overlap other GPU work.
+- Next controls after long completes: repeat short1000/300 post-profiler,
+  profile the real long decode, and match native baseline lifecycle if
+  needed. Kernel/cache locality, profiler lifecycle and verification/offload
+  history are unproven hypotheses. Changed outputs alone are not proof of
+  the regression's cause. Preserve all raw measurements.
+
+## 2026-09-09: long A/B remains live; profiler and collective attribution controls
+
+- Verified live harness3644471/session92573 and owned engine/workers.
+  c8long completed322.185/315.951/317.039tok/s (median317.039 vs307.599,
+  +3.07%); all eight timed requests each compute1prompttoken, remaining
+  prefix GPU-hit, zero external hits/preemptions. c1regression remains.
+  c16warmup completed22.08tok/s; timed run now has16running/0waiting.
+- CPU-only measurement of actual `Worker.annotate_profile` with a stopped
+  `TorchProfilerWrapper` confirms9.06/10.65/12.60/16.57us per call at
+  c1/8/16/32 versus0.23–0.28us when never started. Five10,000-call repeats;
+  raw `attempt01/profiler-stopped-annotation-cpu.{jsonl,log}`. This overhead
+  should be removed after the frozen A/B, but does not explain millisecond-
+  scale c1long regression. No serving source changed during this control.
+- Eight saved rank traces agree on91allreduces in the same sampled decode.
+  Per-rank aggregate durations706–767us; median across-call fastest-rank
+  duration5.408us versus slowest7.807us. Native kernel includes start/end
+  peer barriers, so these are not pure network-transfer durations.
+  Raw `attempt01/collective-rank-census.json`.
+- Cross-rank absolute timestamp differences are NOT usable: apparent
+  median finish skew70.74us exceeds typical barrier-containing call duration,
+  despite a common trace epoch. Independent clock calibration is missing.
+  Artifact explicitly marks timestamp skew unusable; do not attribute that
+  apparent skew to workload imbalance. No collective implementation changed.
+
+- c16long now complete469.02/468.46/511.76tok/s, median469.02 versus
+  464.679 (~+0.93%); wide repeat spread prevents a strong gain claim.
+  c32warmup child3667298 is still priming,1running/23waiting atlatestcheck,
+  parent3644471/session92573 verified live. No serving sources changed.
+- Added five CPU regression tests for inactive/stopped/capped/delayed
+  profiler annotation work; all five reproduce the current bug. Raw
+  `attempt01/profiler-annotation-regression-before.log`. Fix deliberately
+  deferred until the frozen A/B and control captures finish. This is not
+  claimed as the c1regression cause or as a completed serving optimization.
+
+## 2026-09-09 19:45–20:00 UTC: instrumented long matrix complete; isolate tier audit overhead
+
+- Revalidated existing terminal harness92573: completed0 at11:38, server
+  remained idle. All16source/client hashes still match; only owned eight
+  workers hold GPU memory. No restart inferred from the observation gap.
+- Exact124417/2000 medians c1/c8/c16/c32:
+  76.240899/317.039233/469.016586/685.006942tok/s. All12exact/canaries
+  pass; every timed request has1computed token, remaining prefix GPU-hit,
+  zero external hits/preemptions. c32repeats735.399/685.007/539.294 have
+  large spread. Raw `attempt01/aligned124k-summary.json`. Candidate is not
+  universally retained on these results.
+- Post-profiler short c1 control completed0:106.088/106.692/106.258tok/s
+  versus initial candidate median109.655. Canaries pass. The modest drop
+  does not alone explain long regression. Raw `postprofile-short-c1/`.
+- Separate long profile completed0 and stopped explicitly. Its sampled
+  ordinary decode is10543.528us;11TCpart+11TCreduce sum148.257us. The first
+  one-token cached-prefix step spans1,071,233us in GPU annotation, but
+  arithmetic kernels do NOT occupy that whole span: most is waiting.
+  CPU annotation spans1,049,097us and includes249detach/250NumPy-related
+  resolve operations, consistent with synchronous host tier audit work.
+  Raw `long-decode-census.json`, `one-token-prefill-census.json`, second
+  rank trace set ending1788983353*. No profiled TPS used as a benchmark.
+- Text-vs-token-ID control: local encoding0.206s, endpoint tokenization
+  0.189–0.199s with exact same124417IDs; text32-output requests1.69–2.18s,
+  IDs1.74–1.92s. Pretokenizing does not remove the dominant delay. Raw
+  `text-vs-token-ids-control.{jsonl,log}`. Interval logs show request setup
+  delays before sustained c32generation; they are attribution, not TPS.
+- Identified avoidable copies in verification: DMA `_digest` materializes
+  `.numpy().tobytes()` for every slab page; NVMe `_row_digest` materializes
+  `bytes(buf)` again. The synchronous worker path audits whole prefix
+  offloads even for GPU-hit prompts. This strongly motivates matched
+  verification-OFF production timing, while preserving verification-ON
+  correctness gates. Exact attribution of all long regression remains open.
+- Stopped owned API3628422 after zero requests; all workers exited and GPUs
+  cleared. Implemented zero-copy hashing of stable C-contiguous buffers,
+  preserving strided logical-C-order fallback and the exact SHA1 digest.
+  No async verification or slot-lifetime change. Removed inactive profiler
+  annotation work, preserving delayed starts/caps via step-before-state-check.
+  CPU lifecycle/digest/IO tests14pass; GPU tier verification suite running.
+  No new native extension build required. Serving impact not yet measured.
+
+- Verification-enabled GPU tier regression suite18pass, including DMA
+  round trips, disk promotion, exact arena memory sizing and digest parity.
+  Additional lifecycle/digest/census CPU suite15pass; lint/diff checks pass.
+  Raw `zero-copy-digest-tier-gpu.log`, `instrumentation-regression-cpu.log`.
+- CPU hash benchmark:256disjoint6,488,064-byte rows (1.661GB), five
+  alternating repeats, exact same checksums. Median copy+hash1.035870s
+  versus buffer hash0.956970s (~7.6% less time); peak Python allocation
+  per checksum6,488,337B ->758B. Raw `zero-copy-digest-cpu-timing.{jsonl,log}`.
+  This retains verification semantics but does not eliminate its expensive
+  whole-prefix scan. Its scale corroborates the one-second audit span;
+  it is not itself a measured serving TPS gain.
+- Started fresh registered native baseline with
+  `VLLM_KV_TIER_VERIFY=0`, TC flagfalse, same TP8/KV/tier/graph settings;
+  profiler configured but must remain inactive throughout timing. Source
+  now includes the tested instrumentation fixes for both upcoming A/B arms.
+  Raw `glm53f-tp8-verify-off-native/attempt01/`, server session88175,
+  short c1/8/16/32 validator session65941. Twenty source/client hashes frozen.
+  Next: finish short then aligned124417/2000 baseline, followed by matching
+  TC candidate with verification OFF. Do not compare OFF results against
+  prior ON results as a kernel speedup. Real-profile tier audit and full1M
+  correctness remain open; goal not complete.
+
+## 2026-09-09 20:11 UTC: verification-OFF native short baseline complete
+
+- Status: baseline measured; optimization goal remains active.
+- Scope: registered glm53f-nvfp4-8, same eight A100s, BF16 main KV,
+  compact indexer/shared scratch/singleton alignment/KDA mHC overlap/
+  singleton pool update retained; sparse-TC optionfalse, tier verification0.
+  Includes tested zero-copy checksum and inactive-profiler fixes in both
+  planned A/B arms. Profiler configured but never activated in this boot.
+- Exact1000-input/300-output medians c1/c8/c16/c32:
+  105.072241/480.207654/662.717723/905.221838 tok/s. Three-repeat ranges:
+  104.091–105.320 / 477.696–481.432 / 662.252–667.776 / 901.503–907.572.
+  All12 exact checks and text/reasoning/image/tool canaries pass. Every
+  timed prompt fully computed, zero prefix/external hits and preemptions.
+- Decision: use as the matched verification-OFF short baseline, not as a
+  kernel gain against previous verification-ON measurements. Shortvalidator
+  session65941 completed0; all20source/client hashes match. KV capacity
+  unchanged4,280,453tokens/50.74GiB per rank. Only owned inference workers
+  occupy GPU memory; ZG remains CPU-only.
+- Raw artifacts: `perf/results/2026-09-09/glm53f-tp8-verify-off-native/attempt01/`
+  `short/`, `short-summary.json`, `source-client-sha256.txt`, `server.log`.
+- Next matched long baseline now running: same server session88175,
+  API3722292/engine3722840; harness3757133/session70364. Command:
+  `CUDA_VISIBLE_DEVICES='' OMP_NUM_THREADS=1 .venv/bin/python -m benchmarks.validate_glm5_next --tokenizer /home/ubuntu/models/GLM-5.3-Flash-NVFP4 --out perf/results/2026-09-09/glm53f-tp8-verify-off-native/attempt01/aligned124k --input-tokens 124417 --output-tokens 2000 --repeat-source --concurrency 1 8 16 32`.
+  Keep profiler inactive and serving sources frozen. No long result yet.
+- CPU-only profiler lifecycle/digest/trace regression rerun:15passed. Fixed
+  stale baseline-note wording: sparse-TC is short-qualified only and its
+  verification-ON long regression/spread prevents universal retention.
+
+## 2026-09-09 20:26 UTC: native long baseline progressing; promotion rollback defect isolated
+
+- Existing live harness70364/3757133 continues; server88175/API3722292 is
+  unchanged. Short baseline was completed, not restarted. Long c1 repeats
+  76.827485/76.490771/76.724874, median76.724874 tok/s. All three exact;
+  each timed request has124416GPU-hit prompt tokens, one computed token,
+  zero external hits and preemptions. c8 repeats435.83/421.16/417.96 are
+  complete; c16 warmup currently live. This is not a terminal/wedged harness.
+- New native c1 is also below the old verification-ON native90.48 result:
+  do not attribute the earlier long regression solely to sparse TC. The
+  much higher c8 result supports substantial audit overhead at concurrency,
+  but OFF-versus-ON includes instrumentation/lifecycle differences and is
+  not a kernel gain. Finish the matched OFF native/candidate comparison.
+- CPU review before immutable-page sharing found a concrete rollback bug
+  in `HostKVTierIndex.promote`: each allocated tail slot is already appended
+  to `new_slots`, but partial tail-allocation failure passes
+  `new_slots + list(tail.values())` to `_rollback_promotion`. That returns
+  each partial tail slot to the free list twice, potentially aliasing later
+  page allocations. The initial five-slot reproducer yields free-list
+  `[3,2,1,0,0]`, although only four slots are actually free.
+- Added regression in `tests/v1/core/test_kv_tier_index_disk.py`, expanded
+  to four cases including the GLM TP8 four-tail-group geometry. It checks
+  unique free slots, intact pending pages, surviving disk lookup and unique
+  subsequent allocations. The production-source test is deliberately RED
+  until the fix below is applied; this is not a completed serving fix.
+- Exact candidate correction: pass only `new_slots` at the failing call.
+  Tested by compiling only that method with this replacement in a separate
+  CPU process; serving file and loaded server remain unchanged. All51
+  core-index/disk/connector/compact-indexer CPU tests pass with this candidate.
+  This was not GPU DMA validation and does not prove a serving throughput gain.
+- Apply the correction at a source-change boundary, preserving matched
+  A/B source provenance; then rerun the tests normally and real tier gates.
+  Do not silently include it in just one arm or leave the regression RED
+  in the final deliverable. No evidence yet that this defect was exercised
+  by the current throughput benchmark.
+- Raw artifacts under verify-off-native/attempt01:
+  `partial-promotion-rollback-before.log`,
+  `partial-promotion-rollback-inmemory-fix.log` (48pass),
+  `partial-promotion-rollback-expanded-inmemory-fix.log` (51pass).
+  Benchmark/new accounting tests pass lint; nine pre-existing style errors
+  in the disk-index test file were confirmed against HEAD and left untouched.
+
+## 2026-09-09 20:26 UTC: distinct-prefix replay accounting for immutable tier sharing
+
+- Status: CPU accounting evidence, not a sharing implementation or serving TPS.
+- Refined `measure_glm5_tier_duplicate_pages` with explicit prefix families
+  and block count. The exact-token harness uses different prompt windows
+  within a batch but reuses each prompt across warmup/repeat calls. Therefore
+  model32 distinct prefix families replayed eight times, not256 requests
+  all sharing one prefix. Synthetic hashes represent these families; this
+  is not a replay of captured production hashes or generated suffix pages.
+- Command: `CUDA_VISIBLE_DEVICES='' OMP_NUM_THREADS=1 .venv/bin/python -m benchmarks.measure_glm5_tier_duplicate_pages --owners 256 --blocks 216 --prefix-families 32 --host-slots 11915 --disk-slots 42366`.
+- Results:62208attention copies for7776distinct pages,1024independent tail
+  pages,63232disk writes. At6488064bytes/slot, cumulative attention copies
+  occupy375.89GiB versus46.99GiB of unique attention pages:328.90GiB of
+  cumulative copy volume could be avoided per rank with correct sharing.
+  These are not simultaneous GPU-memory savings. Unique attention plus
+  all independent tail slots total53.17GiB in this synthetic workload.
+- Current index ends with171resumable trajectories out of256,123disk-only,
+  using11856host/42237disk slots. This demonstrates capacity pressure from
+  duplicates even when requests within each batch have different prefixes.
+  No claim that real generated suffixes or every deployment fit this model.
+- Correctness:10CPU accounting tests pass, including family separation,
+  independent tails, previous single-family behavior and invalid inputs.
+- Decision: prioritize content-addressed immutable attention pages, keeping
+  request-owned tail states and full hash-chain checks. Physical-page records
+  need references and pending-copy/read pins; reclamation must report actual
+  freed slots, not just deletion of an owner that had shared references.
+  Promotion rollback, cancelled writes, demotion, last-reference eviction
+  and delayed completion/slot reuse are mandatory tests before integration.
+- Raw: verify-off-native/attempt01/`tier-prefix-families-cpu.{json,log}`,
+  `tier-prefix-families-cpu-tests.log`. No serving source changed.
+
+## 2026-09-09 20:47 UTC: immutable physical-page pool implemented and CPU-qualified
+
+- Status: new core component implemented; not connected to serving yet.
+- Added `vllm/v1/core/immutable_kv_pages.py`: canonical full-attention keys
+  within one engine/group-layout namespace, independently releasable leases,
+  always-private tail pages, host/disk locations, and pinned two-phase
+  offload/writeback/promotion/restore tickets. All mutation is scheduler-thread
+  local. A submitted operation cannot be cancelled before worker completion.
+- Logical owners may disappear while work is outstanding; tickets retain
+  physical storage until completion. A new owner may join the same pending
+  immutable page. Ready redundant copies may be evicted LRU; the last valid
+  copy cannot. Foreign/stale/forged handles cannot release another owner or
+  complete a reused slot. No GPU tensor allocation, hidden synchronization,
+  asynchronous buffer mutation or Mamba-lineage sharing was introduced.
+- `tests/v1/core/test_immutable_kv_pages.py` covers delayed representative-byte
+  IO, private tails, divergent groups/hashes, orphan revival, cancelled partial
+  promotions, disk/host pins, failed transfers, duplicate callbacks and
+  8x600random lifecycle transitions. Profile-sized CPU inventories cover
+  1/8/16/32prefix families across8rounds,216blocks,4private tails per owner.
+  Every surviving page is read back after older owners release their leases.
+- Combined new-pool/accounting suite49passed. Lint and diff checks pass.
+  Raw `verify-off-native/attempt01/immutable-page-pool-final-cpu.log`.
+  Earlier29/43pass stages are preserved in their distinct raw logs.
+- Extended the CPU accounting CLI with `--implementation shared-pool`.
+  At families1/8/16/32, the implemented pool performs243/1944/3888/7776
+  attention copies plus32/256/512/1024private tail copies. Total physical
+  pages and disk writes275/2200/4400/8800. All8/64/128/256logical owners
+  have ready copies. The c32 case reduces total copies from63232 to8800
+  in the same synthetic inventory, not just in a theoretical estimate.
+  Raw `shared-page-pool-inventory.jsonl`. These are NOT live throughput,
+  trajectory-resumability, GPU-memory, 1M-context or DMA correctness claims.
+- Integration must replace raw per-owner slot ownership with page leases,
+  while retaining trajectory hash chains, private tail boundaries and group
+  ratios. Worker metadata must pin source/destination blocks separately;
+  complete pool tickets only after all participating ranks finish. In the
+  current connector, `get_finished` discards completed offload IDs and
+  `build_connector_meta` confirms host writes at the next scheduler step.
+  Do not blindly reuse that acknowledgement path as physical completion.
+  Extend completion aggregation and cancellation handling before wiring in
+  the pool. Main-resident rebind/hold support is also a separate compatibility
+  requirement; no unsupported path may silently adopt the new allocator.
+
+## 2026-09-09 20:47 UTC: native long c16 complete, c32 timed phase live
+
+- Same live harness70364/3757133 and source-frozen server88175. c16exact
+  repeats656.533018/575.023210/501.676357tok/s, median575.023210; all three
+  have1990656GPU-hit prompt tokens/16computed tokens, zero external hits or
+  preemptions. Corresponding wall times48.74/55.65/63.79s show substantial
+  lifecycle drift even with verification OFF. Do not present a stable gain
+  from this spread. c32warmup completed107.54tok/s (excluded from timing);
+  timed repeats now in progress. All20frozen source/client hashes match.
+- Read-only IO observation during c32cold warmup: tier opened O_DIRECT on
+  every rank. Guest storage identifies as QEMU HARDDISK, so physical media
+  cannot be inferred from its guest rotational flag. Five2-second samples
+  observe441–519MB/s writes, essentially all attributed to the eight owned
+  workers; write awaits5.69–11.25ms, guest device busy7–42%, negligible dirty
+  memory. This is NOT a storage bandwidth benchmark and does not establish
+  IO saturation or page-cache dirty throttling. Raw tier-io-observation.jsonl.
+- Next: finish existing c32 repeats, preserve exact metrics/hashes and
+  conduct the matched sparse-TC arm before touching loaded serving sources.
+  Pool integration, the known partial-promotion rollback correction, combined
+  live tier/1M gates and scaling remain required work. Goal remains active.
+
+## 2026-09-09 23:03 UTC: native timing complete; process-local stream cached into AOT graph
+
+- Status: correctness fix implemented, GPU/restart validation in progress.
+- Native verification-OFF aligned124417/2000 medians c1/8/16/32:
+  76.724874/421.161393/575.023210/682.066751 tok/s; all12exact/canaries,
+  each request1computed token/124416GPU prefix hits,0external/preemptions.
+  c32 repeats851.599794/682.066751/641.815969; lifecycle drift remains.
+  Short medians105.072241/480.207654/662.717723/905.221838, all12exact.
+  All20source/client hashes held through completion. Profiler never started.
+  Native server stopped gracefully after idle at22:04, all contexts gone.
+- Candidate verify-OFF attempts01/02 failed during graph-memory profiling,
+  before health. No candidate throughput. Repeated failure is in owned mHC
+  projection overlap: raw cuda_stream integer becomes a literal argument in
+  the disk-cached graph, then ExternalStream wraps a pointer from a dead
+  process. Attempt02 faulthandler pinpoints wait_stream; attempt01 kernel
+  journal records rank0/rank2 segfaults in libcuda. Generated call literal
+  1054131040 provides direct cache evidence. Not a sparse-TC numerical failure.
+- Hypothesis/fix: use a stable model stream-owner name in a new opaque op,
+  resolve actual stream from the current engine's forward context at runtime.
+  Preserves KDA overlap and graph capture; no global registry, cache deletion,
+  extra GPU buffer or pointer in compiled model inputs. Type/device/name guards
+  fail before CUDA. Old raw-handle op retained for standalone diagnostics only.
+- Also applied previously reproduced promotion rollback fix (new_slots only).
+  CPU normal suite75passed/13skipped, including4partial-tail regression shapes.
+  GPU numerical/replay plus two-fresh-process shared-Inductor-cache regression
+  running. No serving fix or performance gain claimed until actual profile
+  boots, cached restart, and exact workload succeed. New source provenance
+  requires BOTH native and candidate to be rerun for a matched comparison.
+- Added scheduler-only PageCompletionBarrier to unused immutable page pool:
+  validate-before-mutate submit/complete/cancel batches, distinct rank ACKs,
+  monotonic batch IDs and failed-operation pins until all ranks finish. New
+  18completion tests and pool/accounting tests:67passed. No connector wiring
+  or real IO/throughput claim; duplicate savings remain synthetic inventory.
+- Raw: `perf/results/2026-09-09/glm53f-tp8-verify-off-native/attempt01/`
+  summaries, `glm53f-tp8-verify-off-sparse-tc/attempt{01,02}/` failures and
+  page-completion-cpu.log, `glm53f-tp8-runtime-stream-fix/` current tests.
+
+## 2026-09-09 23:15 UTC: runtime stream first-boot gate; disjoint tier sequence fix
+
+- Status: runtime-stream fix passes isolated disk-cache restart and real
+  first boot. Full model cached restart remains next, not yet claimed.
+- GPU34passed: same Inductor cache reused by two fresh PIDs with different
+  stream handles; second process fxgraph_cache_hit=1/miss=0, four exact
+  changed-input CUDA graph replays per process. Kernel parity at M1/8/16/
+  32/64/65, BF16 and FP32 projection passed.16tier GPU tests passed before
+  sequence change;90additional CPU page/dispatch/lifecycle tests passed.
+- Registered glm53f-nvfp4-8 verification-OFF native first boot, no profiler
+  activation: text/reasoning/image/tool canaries and12exact1000/300 results
+  pass. c1 repeats104.158816/104.568910/104.786571; c8
+  479.949301/479.858271/478.026478; c16
+  667.168559/661.571768/672.660202; c32
+  905.416402/902.338974/905.371495. All prompts fully computed,0hits or
+  preemptions. Capacity4,280,453tokens/50.74GiB per rank, graph0.22GiB.
+  This is a correctness fix with approximately unchanged short performance,
+  not a new kernel speedup.21source hashes verified. Idle server stopped
+  gracefully23:13:50; GPU contexts gone before subsequent GPU testing.
+- Actual cached generated call now carries stable stream-owner string.
+  Raw `glm53f-tp8-runtime-native/attempt01/` includes source manifest,
+  generated-stream-call.txt, short-summary.json and exact per-run JSON.
+- New long-service correctness reproducer: worker restore namespace starts
+  at1<<20, but scheduler offloads count upward from0. An offload and pending
+  restore can both have1048577; poll of offload alone falsely finishes the
+  restore. No claim this occurred in preceding short/long throughput runs.
+- Fix: worker restore IDs strictly negative, scheduler IDs positive. Added
+  real-constructor CPU tests at offload1/1048577/2**40 and12steps with delayed,
+  reverse-order and duplicate completions. Normal47CPU tests pass. GPU
+  disk promotion/digest tests extended to negative and large negative IDs.
+  Transfer order, allocation, IO and numerical kernels unchanged. Future
+  shared-page barrier still uses one scheduler-owned batch namespace.
+- Raw `glm53f-tp8-runtime-stream-fix/tier-sequence-*.log`. First in-memory
+  harness failed on lost super() closure, not a candidate failure; corrected
+  isolated47pass and normal47pass retained separately. Next full cached
+  restart and matched native/TC arms include all three correctness fixes.
+
+## 2026-09-09 23:21 UTC: full cached restart verified; native post-fix baseline live
+
+- All8workers directly loaded the prior13e053b5... AOT artifacts, completed
+  graph-memory profiling/capture, reached health23:19:47 and passed all
+  text/reasoning/image/tool canaries. This is a real registered-profile
+  cached restart, not just a new compile or reduced reproducer. Native c1
+  exact repeats104.72/104.76/105.12 started; matrix still in progress.
+- Normal negative-ID GPU/DMA/disk/digest suite21passed, including byte-exact
+  disk promotion and digest preservation with negative IDs. CPU47passed.
+  No GPU tests overlap the serving run. No disabled rollback/namespace
+  regression remains RED. Raw runtime-stream-fix/tier-sequence-gpu.log.
+- New baseline command: `SLIMSERVE_KV_TIER_DIR=/home/ubuntu/.cache/slimserve/kv-tier VLLM_KV_TIER_VERIFY=0 PYTHONFAULTHANDLER=1 .venv/bin/python -m slimserve.cli glm53f-nvfp4-8 --serve --host 127.0.0.1 --port 8400 --torch-profile-dir perf/results/2026-09-09/glm53f-tp8-runtime-native/attempt02/traces -y`.
+  Server79338/API3873283; combined validator92002 runs short1000/300 THEN
+  aligned124417/2000 repeat-source, c1/8/16/32, three timed repeats each.
+ 22source/client hashes frozen; profiling remains inactive throughout.
+- Automatic memory profiling on cached startup chose4,304,412tokens/
+  ~51.02GiB KV per rank (first boot4,280,453/50.74GiB). Record this startup
+  lifecycle effect and match candidate lifecycle; not an optimization gain.
+- Read-only2-second GPU telemetry records clocks/power/temperature/utilization
+  to attempt02/gpu-telemetry.csv (session46183/PID3875728). Use same monitor
+  for candidate and stop each monitor at arm end. Prior short/long trace
+  comparison showed slower fixed-size kernels as well as more indexer work;
+  clock/power attribution is a hypothesis until telemetry establishes it.
+- Scope remains performance/KV c1/c8/c16/c32. The page-sharing component
+  remains CPU-only and unintegrated. Review found existing worker-metadata
+  aggregation suitable for explicit rank ACKs; current stats merely count
+  disk ACKs and next-step host confirmation is not all-rank IO completion.
+
+## 2026-09-09 23:41 UTC: cached native short complete; long c1/c8 stable; next kernel hypotheses
+
+- Runtime-native/attempt02 short1000/300 medians c1/c8/c16/c32:
+  104.758619/481.682668/666.585207/905.489373 tok/s. Three repeats each,
+  all12exact/canaries, all timed prompts fully computed,0hits/preemptions.
+  Raw short-summary.json and per-run JSON. Same22frozen source/client hashes.
+- Existing combined harness92002 automatically advanced to aligned124417/
+  2000, now PID3886304 under shell3873357. c1 repeats
+  76.569775/76.487559/76.634517 (median76.569775); c8
+  432.752712/432.401763/433.351169 (median432.752712). All6exact, each
+  request1computed token/124416GPU prefix hits,0external/preemptions.
+  c16warmup completed; timed c16/c32 still pending. Do not restart the run.
+- Telemetry attribution: approximate c1 timed windows from JSON mtime minus
+  measured wall duration contain32short/312long all-rank samples. Every
+  sampled SM clock1410MHz and memory clock1593MHz. Temperatures25–31C short,
+  22–32C long; median power177.7W/155.5W under500W limit. This argues against
+  sustained clock reduction as the c1 gap's cause, not against all possible
+  unsampled transients. Raw gpu-telemetry.csv and c1-telemetry-summary.json.
+- Concrete next selection lead: pooled indexer calls top_k_per_row_prefill;
+  its insertion/radix dispatch uses numRows/row ordinal, so all decode rows
+  remain insertion-sort even with a large visible pool count. Existing decode
+  top-k dispatch uses column capacity and supports splitting. Added quarantined
+  benchmark_glm5_next_pool_topk.py comparing prefill, fixed1M-capacity decode,
+  and a smaller-bound diagnostic that is NOT valid as a full1M serving path.
+  Synthetic normal/narrow logits, exact top-k values/unique IDs/-1 padding,
+  changed lengths and selected-set differences are reported. No serving import.
+  Seven CPU oracle tests pass; GPU correctness/timing NOT RUN while model lives.
+  Raw runtime-stream-fix/pool-topk-oracle-cpu.log. Do not call it an improvement.
+- New broader overlap hypothesis documented in perf/glm53f_deferred_mhc_design.md:
+  carry coefficient work across the entire consumer and join at the next
+  transition/final post-mix. Explicit lifetime/aliasing/capture/exception gates
+  required; no implementation or speedup claim. This goes beyond the rejected
+  router-projection-only experiment and does not assume simple AR fusion wins.
+- Next after frozen arms: exclusive-GPU projection, row-sharding and top-k
+  comparisons, then pick the next serving change from actual measurements.
+  Shared tier integration and combined1M/scaling qualification remain open.
+
+## 2026-09-09 23:55 UTC: long c16 variability includes GPU-idle admission stalls
+
+- Status: diagnosis in progress; no serving-source changes during the frozen
+  runtime-native/attempt02 arm. Short medians remain as recorded above.
+- Long c16 repeats are 667.621484/378.663185/511.606749 tok/s, with wall
+  durations 47.931351/84.507819/62.548041 seconds. All exact-token checks
+  pass; each batch has 16 computed prompt tokens, 1,990,656 GPU prefix hits,
+  zero external hits and zero preemptions. Exact tokens do not establish
+  semantic quality; the separate text/reasoning/image/tool canaries passed.
+- Raw gpu-telemetry.csv shows GPU0 at zero utilization from approximately
+  23:41:21 through 23:41:57 during repeat2; the other ranks also idle.
+  Server diagnostics have active requests but no generation during this
+  interval, then steady decode resumes. This is a stall, not evidence of
+  uniformly slower GPU kernels. Clock reduction during idle is not proof
+  of thermal throttling. The actual blocking operation remains unidentified.
+- c32 is still in its cold warmup. During this UNTImed phase only, took two
+  nonblocking stack dumps and 30-second, 5-Hz nonblocking CPU samples of
+  engine3873893 and worker0/3874221. Engine main-thread samples:116 waiting
+  for worker responses,20 in tier lookup; worker main-thread samples:63/130
+  in prepare_chunk_indices (GPU-to-CPU lengths synchronization), remaining
+  samples dispersed across ordinary prefill operations. Nonblocking sampling
+  reported13/19 errors; this does not isolate the cached c16 stall.
+- Raw c32-cold-{engine,worker0}-stack.txt and *-stacks.raw under attempt02.
+  Profilers finished before c32 timed repeats. No GPU profiler activation,
+  new GPU workload, or serving/client hash change. Initial unprivileged
+  attachment was denied; nonblocking read-only attachment used sudo -n.
+- Next: finish c32 timings, then use the same healthy server for separately
+  labeled repeated cached c16 requests with CPU stack sampling, including
+  all worker ranks. Do not infer that _reclaim caused the stall from code
+  inspection alone. Diagnose before choosing the next performance patch.
+
+## 2026-09-10 00:08 UTC: native matrix complete; separate admission trace live
+
+- Runtime-native/attempt02 validator92002 completed successfully. All24timed
+  exact-token runs and separate canaries pass. Long c32 repeats
+  828.820734/650.419160/622.037196 tok/s (median650.419160), wall
+  77.218145/98.398085/102.887738s. Each timed c32 batch has32computed
+  prompt tokens,3,981,312GPU prefix hits,zero external hits/preemptions.
+  Its cold warmup DID restore tier pages; do not extend the timed counter
+  claim to the full lifecycle. Native medians long c1/8/16/32:
+  76.569775/432.752712/511.606749/650.419160. No sparse-TC comparison yet.
+- New passive telemetry summarizer and5CPU tests correlate all24JSON files
+  with existing2-second sampling. Complete all-GPU zero-utilization observed
+  spans: c16r2/r3 36.053/16.037s; c32r1/r2/r3 12.016/36.044/42.065s.
+  These are distances between observed idle samples, NOT exact idle durations;
+  JSON-mtime windows are approximate. Raw attempt02/telemetry-summary.json,
+  telemetry-summary-tests.log; all22source/client hashes still match.
+- Separate diagnosis now uses the SAME server, no source or profile changes:
+  API3873283 plus descendants sampled with py-spy --subprocesses --nonblocking
+  --idle --threads --rate10 --duration240 --format speedscope. Session99095,
+  profiler3899992. Diagnostic validator33410/PID3900014 runs aligned124417/
+  2000 c16 two repeats plus standard warmups/canaries. Profiler timing is
+  diagnostic ONLY. Raw perf/results/2026-09-10/glm53f-tp8-admission-diagnostic/
+  attempt01/{client.log,profiler.log,stacks.json,c16/}. Passive GPU telemetry
+  continues in the preceding native attempt's CSV to preserve chronology.
+- Independent fault injection found another owned correctness defect:
+  KVTierDMA.pump forgets an earlier disk-write failure if the final completion
+  succeeds. New CPU test_kv_tier_write_completion:5fail/3pass on live source;
+  an isolated in-memory candidate tracking failed batch IDs passes8/8.
+  Raw native attempt02/write-completion-{before,inmemory-candidate}.log.
+  Production is deliberately unchanged until the diagnostic source boundary;
+  failure recovery remains fail-closed, not automatic retry. No evidence this
+  fault triggered the measured idle stalls or affected these successful runs.
+- Separate concrete prefill lead: GDNAttentionMetadataBuilder already builds
+  CPU-derived chunk indices, but KDA's fused chunk wrapper ignores them and
+  synchronizes GPU lengths in prepare_chunk_indices. Do not blindly pass
+  m.chunk_indices for mixed batches: GDN's metadata excludes decode rows,
+  while the current KDA chunk path includes all non-spec rows. No patch yet.
+
+## 2026-09-10 00:20 UTC: tier reclamation hotspot reproduced and optimized
+
+- Admission diagnostic completed: c16 repeats660.23/546.22tok/s, both exact
+  and full GPU prefix hits (16computed tokens/batch,0external/preemptions).
+  These profiled numbers are diagnostic only. py-spy recorded177194samples,
+  2856errors; interrupted its owned PID3899992 after the requested240seconds
+  and client completion to finalize output.85thread profiles include API,
+  engine, all8workers and IO threads. No server process was signaled by that
+  profiler stop. Raw stacks.json and engine-stack-summary.json.
+- Engine stacks show _stage_filled_attention_blocks -> stage_attention ->
+  _alloc_slot -> _reclaim -> _busy/host_slots repeatedly materializing whole
+  trajectories while disk write-through protects the host arena. This is
+  direct evidence of expensive admission bookkeeping, not a kernel inference.
+- Stopped idle API3873283 gracefully after metrics showed0running/0waiting.
+  Server79338 completed0; all GPU contexts gone. Stopped owned passive monitor
+  PID3875728. Native attempt02 retains the full pre-change source hashes,
+  raw telemetry, all24JSON and aligned124k-summary.json. No server currently
+  live at this checkpoint.
+- Implemented lazy _busy iteration and a cheap empty-host guard in _reclaim.
+  No extra persistent metadata, negative-result cache, ownership changes,
+  deferred frees, IO-completion relaxation, or different LRU decisions.
+- New CPU reproducer uses production stage/confirm APIs to fill11915host/
+  42366disk slots with216-block,ratio8 attention trajectories, then withholds
+  disk ACKs and stages cached batches. Two repeats each, CPU1thread, timing
+  excludes fixture construction/deepcopy. Before c1/8/16/32:
+  0.720006/5.897082/12.208356/25.657985seconds; after:
+  0.062627/0.511374/1.055013/2.256719seconds (roughly11–12x faster).
+  Every reservation remains rejected while slots are protected; all four
+  complete state fingerprints match baseline exactly. This is CPU bookkeeping
+  time, NOT a measured serving speedup. Raw admission-diagnostic/attempt01/
+  reclaim-{before,after}.jsonl. Baseline synthetic c32 timing was uncontended;
+  candidate run overlapped the small separate fault-test process, so repeat
+  isolated if interpreting sub-percent differences (not claimed here).
+- Implemented sticky write-batch failure tracking in KVTierDMA.pump. Real GPU
+  copies plus one-thread O_DIRECT IO reproduce both early-failure shapes on
+  old source (2failed), then pass with fixed source, including later successful
+  write/promotion byte equality. Failure handling remains fail-closed: a failed
+  disk batch is never confirmed, not automatically retried.
+- Normal CPU index/connector/namespace/reclaim/write-failure suite56passed;
+  GPU/DMA/disk/digest suite16passed with VLLM_KV_TIER_VERIFY=1. New efficiency
+  regression tests had2fail/3pass before the change; all now pass. Raw
+  cpu-after.log, gpu-after.log, write-completion-gpu-before.log. No native
+  rebuild needed for these Python-only changes. Extended CPU tests pending.
+- Next: fresh registered-profile short/long matrix with all current fixes,
+  same passive telemetry and profiler inactive. Use the clean native record,
+  not profiled diagnostic TPS, for comparison. Before the next server boot,
+  the previously prepared top-k selection microbenchmark is using exclusive
+  GPU0; raw perf/results/2026-09-10/glm53f-pool-topk/. No serving selection
+  change yet. Shared-page integration, mixed KDA metadata, sparse-TC matching,
+  full1M quality and scaling qualification remain open.
+
+## 2026-09-10 00:24 UTC: top-k comparison rejected; fresh serving arm booting
+
+- Exclusive GPU0 selection experiment completed16shapes: c1/8/16/32,
+  contexts1024/131072,normal/narrow synthetic scores,11disjoint layers,
+  five alternating50-step graph repeats and4changed-length replays/arm.
+  Selected-value/uniqueness/bounds/padding gates pass. Baseline prefill
+  versus fixed1M-capacity decode: short1.55–1.95us versus24.70–30.56us;
+  long normal21.29–27.34us versus48.41–73.06us. Long narrow scores favor
+  decode (72.91–80.52us versus42.66–67.75us), but tied selected sets differ:
+  29/285/595/1153 differences at c1/8/16/32; a normal c16 comparison differs
+  by one tie. Smaller-bound arm is not valid for1M serving. Decision: reject
+  a global selector swap; no model-output parity or serving gain claimed.
+  Future custom selection needs real score distributions and justified tie
+  gates. Raw perf/results/2026-09-10/glm53f-pool-topk/selection.{jsonl,log}.
+- Extended CPU NVMe/compact-indexer/immutable-page/barrier suite60passed;
+  normal CPU56 and GPU16 passed. All newly added formerly-red tests now pass.
+- Fresh registered-profile arm: server20772/API3903659/engine3904097,
+  workers3904307..3904314. Same native settings as control; only host-reclaim
+  short-circuit and sticky disk-failure accounting changed. Same22files frozen.
+  Raw perf/results/2026-09-10/glm53f-tp8-reclaim-shortcircuit/attempt01/.
+  Launch: `SLIMSERVE_KV_TIER_DIR=/home/ubuntu/.cache/slimserve/kv-tier VLLM_KV_TIER_VERIFY=0 PYTHONFAULTHANDLER=1 .venv/bin/python -m slimserve.cli glm53f-nvfp4-8 --serve --host 127.0.0.1 --port 8400 --torch-profile-dir perf/results/2026-09-10/glm53f-tp8-reclaim-shortcircuit/attempt01/traces -y`.
+- All8ranks loaded the SAME13e053b5... AOT cache at00:23:36. GPU pool
+  **4,304,412tokens**, exactly matching control (rounded memory51.03GiB).
+  Graph capture/health pending at this checkpoint. Combined validator69787,
+  shell3903731/current short3903733 waits for health, runs short1000/300
+  c1/8/16/32 three repeats, THEN aligned124417/2000 repeat-source same matrix.
+  Do not duplicate it. Passive2-second GPU monitor15354/PID3903743 uses the
+  same query as control. GPU profiler must remain INACTIVE. No serving edits
+  or new GPU work until the arm completes.
+
+## 2026-09-10 00:29 UTC: reclamation candidate healthy; short matrix complete
+
+- Registered TP8 reached health after cached AOT loading and full graph
+  capture. All text/reasoning/image/tool canaries pass. GPU pool remains
+  exactly4,304,412tokens (same as control); no cache-capacity reduction.
+- Reclaim-shortcircuit/attempt01 short1000/300 three-repeat medians
+  c1/8/16/32:104.761441/480.099853/675.116340/904.888892tok/s versus control
+  104.758619/481.682668/666.585207/905.489373. Broadly unchanged; do not
+  describe c16's within-spread fluctuation as a proven kernel gain. All12
+  exact, all timed prompts fully computed,0prefix/external hits/preemptions.
+  Raw short-summary.json,per-repeat JSON,short.log in this attempt.
+- Same combined validator69787 automatically moved to aligned124417/2000,
+  current long PID3909589 under shell3903731. Long canaries already pass;
+  timed long results pending. Same server20772/API3903659/engine3904097,
+  workers3904307..14,passive monitor15354/PID3903743.22source/client hashes
+  still match; profiler remains inactive. No additional GPU jobs or serving
+  source edits. Finish the long matrix and compare idle intervals before
+  claiming end-to-end benefit. Optimization objective remains active.
+
+## 2026-09-10 00:39 UTC: candidate long c1/c8 complete; KDA metadata gate prepared
+
+- Current reclaim-shortcircuit/attempt01 long c1 repeats
+  76.783386/76.574647/76.877959tok/s (median76.783386), versus native
+  median76.569775. c8 repeats450.431059/444.799135/439.605479, median
+  444.799135 versus432.752712 (+2.78%). All6exact, each request1computed
+  token/124416GPU prefix hits,0external/preemptions. The c8 downward trend
+  still needs explaining; do not extrapolate this partial result to c16/c32.
+  No multi-sample all-GPU idle span in the c1 and first2c8 telemetry windows;
+  complete correlation waits for the matrix. Raw current per-run JSON and
+  telemetry-summary.json. c16 cold warmup running under the existing client.
+- Same healthy server20772/API3903659/engine3904097/workers3904307..14;
+  long client3909589, combined session69787, monitor15354/PID3903743.
+ 22serving/client hashes match; no profiler activation or competing GPU job.
+- Prepared quarantined KDA pure-prefill metadata reuse candidate in
+  benchmarks/glm5_next_kda_metadata_candidate.py. It calls the UNCHANGED
+  fused gate/cumulative KDA kernels with the existing exact chunk table.
+  NVIDIA's KDA chunk path re-exports the local AMD Triton implementation;
+  inspected that actual source, not an assumed separate CUDA algorithm.
+  Pure-prefill gate excludes ordinary mixed batches AND speculation. GDN's
+  mixed table omits decode rows, while KDA's current chunk call includes all
+  non-spec rows; unit example proves the incompatible row numbering.
+- Eleven CPU wiring/routing tests pass, including bound/no-bound gates,
+  q/k normalization dispatch, chunk-size/scale/state forwarding and mixed
+  fallback. This is NOT GPU arithmetic or serving qualification. CLI smoke
+  and Ruff checks pass. Raw admission-diagnostic/attempt01/kda-metadata-
+  {cpu,cli}.log. No serving import or source change.
+- New benchmark_glm5_next_kda_metadata.py queues exact output/final-state
+  checks over4changed inputs and7sequence shapes, then alternating wall-time
+  measurements with fresh cu_seqlens per step, reused across34layer calls/
+  4metadata groups. This avoids accidentally timing only a permanent tensor
+  cache hit. Both arms clone V (the unchanged kernel can overwrite it),
+  and both exclude already-performed CPU metadata preparation. Initial-state
+  preservation is checked. GPU tests/timing are NOT RUN while the server lives.
+  Next exclusive-GPU command: CUDA_VISIBLE_DEVICES=0 OMP_NUM_THREADS=1
+  .venv/bin/python -m benchmarks.benchmark_glm5_next_kda_metadata.
+  Preserve mixed-batch fallback if later integrated; no speedup claim yet.
+
+## 2026-09-10 00:52 UTC: c16 admission stalls reduced; hash-first lookup CPU gate
+
+- Reclamation arm long124417/2000 c16 repeats676.465269/675.807024/
+  669.671294 tok/s, median675.807024 (+32.1% vs control511.606749).
+  Exact counts pass; each request1computed token/124416GPU prefix hits,
+  zero external/preemptions. Walls47.305/47.351/47.785s versus control
+  47.931/84.508/62.548s. No multi-sample all-GPU idle span in current c16
+  telemetry; control r2/r3 spans36.053/16.037s. Sample windows are approximate
+  and span distances are not exact idle durations. Result supports reduced
+  host-tier admission stalls, not a GPU kernel speedup. Same4,304,412-token
+  pool, all22 source/client hashes match, profiler inactive. Raw current
+  reclaim-shortcircuit/attempt01/aligned124k/exact_c16_r*.json and refreshed
+  telemetry-summary.json. c32 cold warmup still running; full arm pending.
+- Further hypothesis: hybrid lookup scans every trajectory's host/disk/main
+  page readiness before checking whether its hash chain could match. Since
+  hybrid resumability is tail_boundary or zero, reject chain mismatches first
+  and retain all existing readiness checks for positive candidates.
+- Quarantined candidate benchmarks/kv_tier_lookup_candidate.py: same owner
+  iteration, LRU tie-breaking, promotion exclusion and partial-resume fallback;
+  no extra index/cache or ownership changes. V2 adds first-hash and pending-tail
+  rejection before list copies. V1's small pending-only probe regressed from
+  23.29 to34.72us (diagnostic tool output only), motivating that guard; V1 source
+  archived before replacement. Production lookup remains UNCHANGED.
+- Correctness:23 CPU differential/efficiency tests pass, including random
+  missing groups/pending host/disk writes/shared prefixes/partial queries/LRU.
+  Isolated in-process override passes43 existing index/disk/connector/compact
+  tests and17 disk-connector/namespace/reclamation tests. Full positive lookup
+  still calls unchanged resumable_blocks, including main/tail validation.
+- V2 CPU pressure fixture, five alternating100-call repeats, median baseline
+  versus candidate: hit31969/250us; miss30766/28us; one-shared-prefix miss
+  33719/29us; all-owner-shared-prefix miss32191/501us; all-tails-pending
+  28.00/6.29us. Fixture build/copy excluded. CPU measurement overlaps live
+  serving; these are within-run bookkeeping comparisons, not GPU/E2E gains
+  or a clean V1/V2 comparison. Decision: queue serving trial after frozen arm,
+  do not claim production qualification. Raw admission-diagnostic/attempt01/
+  lookup-v2-{cpu,existing-suite,existing-extended}.log, lookup-v2-timing.jsonl,
+  lookup-v2-source.sha256 and lookup-v1-source.patch.
+
+## 2026-09-10 01:00 UTC: full-host-busy allocation guard, CPU-only candidate
+
+- Baseline: current lazy-reclamation path still walks trajectories on each
+  allocation failure under full disk-write pressure. Hypothesis: when an
+  existing busy/pending collection contains all host slot IDs, no trajectory
+  owning host slots can be reclaimed. Read those live collection lengths
+  before invoking reclamation; completions naturally make the guard false.
+- Quarantined FullBusyIndex._alloc_slot under benchmarks/ only, no serving
+  import. No persistent negative cache, metadata growth or changed ownership.
+  Existing allocator handles partial sets and free slots; main-slot allocator
+  is untouched. This is separate from the currently running serving arm.
+- Correctness:5 focused tests pass (pending-host and disk-busy cases,
+  one-trajectory completion immediately re-enables allocation, partial sets,
+  free slots and existing positive-capacity contract). Combined hash-first
+  lookup+guard isolated override passes60 existing index/connector/disk/
+  compact/namespace/reclaim tests. Ruff passes. Initial test wrongly expected
+  zero-capacity construction to succeed; corrected to its existing rejection.
+- Three alternating CPU repeats on real-API pressure fixture11915host/
+  42366disk slots,216blocks,ratio8, withheld disk ACKs; median baseline/guard
+  seconds c1 0.063676/0.000447, c8 0.511554/0.003621,
+  c16 1.084834/0.006853, c32 2.228115/0.015038. Fixture copy excluded; every
+  allocation remains rejected, state fingerprints identical between arms.
+  Timings overlap live serving, no GPU or serving-speedup claim.
+- Decision: queue serving integration after current frozen c32 completes;
+  CPU-only qualification so far. Raw admission-diagnostic/attempt01/
+  full-busy-{cpu-v2,lookup-existing-suite}.log, full-busy-timing.jsonl/.log,
+  full-busy-source.sha256. Current c32 cold queue continues normally; no
+  production edit, profiler activation, or competing GPU job in this turn.
+- Next kernel evidence: after the complete matrix, a bounded native c1
+  long-context decode trace on this already-configured server, separately
+  labeled as profiled diagnostics. Then exclusive KDA metadata GPU parity/
+  timing and the next source boundary. Do not activate profiling early.
+
+## 2026-09-10 01:08 UTC: reclamation arm complete; residual c32 admission diagnostic
+
+- Combined validator69787 completed0, long3909589 gone. All24exact-token
+  runs and text/reasoning/image/tool canaries pass. Short medians unchanged
+  within spread; long124417/2000 medians c1/8/16/32:
+  76.783386/444.799135/675.807024/1003.841066 tok/s, respectively
+  +0.28%/+2.78%/+32.10%/+54.34% versus native runtime control attempt02.
+  All timed long requests1computed token/124416GPU prefix hits,0external/
+  preemptions. c32 repeats1003.841066/1031.001635/960.592796; walls
+  63.755/62.076/66.626s. Full summaries/long-comparison.json saved.
+- All22frozen hashes match; same4,304,412-token pool and13e053b5 AOT cache.
+  GPU profiler NEVER activated during timing. Decision: retain lazy host
+  reclamation plus fail-closed sticky write-batch failures. This fixes CPU
+  bookkeeping and accounting, not GPU arithmetic. Isolated correctness and
+  IO-failure gates were recorded earlier; the exact production workload now
+  confirms a large high-concurrency end-to-end benefit.
+- Caveat: current c32r1/r2 have no observed all-GPU idle span, but r3 retains
+  a14.023s sampled span (control12.016/36.044/42.065s). c16 has none.
+  Do NOT claim all admission overhead eliminated. Warmup used7163reported
+  restore operations/rank; timed-no-restore counters do not cover warmup.
+- To isolate the remaining stall before kernel work, started110s10Hz
+  nonblocking engine-only py-spy (session58868, engine3904097), and a separate
+  exact124417/2000 c32 diagnostic (session64386) using the same prompts/
+  sampling and8-token priming. Raw current attempt/admission-postfix/
+  engine-stacks.json and exact-c32.json/.log. These profiled timings are NOT
+  included in the comparison. Server20772/API3903659 remains healthy,
+  monitor15354/PID3903743 continues. No serving edits yet; next collect native
+  c1 GPU trace after this diagnostic, then stop idle server for GPU kernel
+  gates and the next source boundary. Hash-first/full-busy candidates remain
+  quarantined, not part of the measured serving gain.
+
+## 2026-09-10 01:24 UTC: post-fix tracing, kernel gates, next admission arm
+
+- Post-fix c32 CPU diagnostic completed exact1014.525903tok/s with identical
+  timed-cache counters; excluded from serving comparison. Engine-only py-spy
+  5020samples/95errors,100.4sampled engine seconds: tier6.1s, lookup3.7s,
+  staging2.0s/reclaim1.8s (inclusive overlapping times). Raw reclaim-
+  shortcircuit/attempt01/admission-postfix/engine-summary.json.
+- Native c1 long8-iteration GPU trace after the completed matrix: rank0
+  region10.813ms,kernel union10.360ms;91allreduces1.437ms,11sparse MLA0.753ms,
+  11top-k0.728ms,37BF16GEMMs0.861ms. Rank-local collective sums0.625–1.531ms;
+  do not add overlapping streams or compare uncalibrated cross-GPU timestamps.
+  Raw native-long-{census,rank-census}.json and8traces1789002795*. Attempted
+  c32 capture1789002866* contains only single-request steps during admission;
+  tokens32 completeness gate correctly fails. No c32 kernel census claimed.
+  Next capture must activate profiling only once32requests are decoding.
+  CPU summary --tokens extension passes5tests, preserves full-marker check.
+- Server and workers stopped idle; all8GPUs0MiB/0% before exclusive tests.
+  KDA metadata reuse:7GPUshapes,4changed-input exact output/final-state checks
+  pass. Three alternating5-step measurements with34layers/4metadata groups,
+  fresh metadata objects each step. Median baseline/candidate us per step:
+  [1]14084/13421,[1]x8 14383/13513,[1]x16 15298/13427,[1]x32 14853/14133,
+  varied[63,64,65,127,128,129]14380/15073,[1024]14607/13987,
+  [8192]30494/29534. No graph/serving qualification; mixed-length regression
+  and variability warrant follow-up before retention. Serving path unchanged.
+  Raw admission-diagnostic/attempt01/kda-metadata-gpu.jsonl/.log and hashes.
+- BF16 projection benchmark: widths3336/6416,K4096,c1,16disjointmatrices,
+  11arms,8changed-input graph checks/arm,5alternating100ms repeats. Width3336
+  cuBLAS22.788us,ownedDSV419.171us,groupedN4K1024 18.966us; width6416
+  cuBLAS36.139us,ownedDSV432.678us,best grouped33.714us. All pass existing
+  BF16 projection atol/rtol0.008; nonbaseline arms NOT bit-exact, maxabs up
+  to0.015625. Decision: useful modest kernel candidates; no serving import,
+  model-quality claim or relaxation of mHC's exact gate. Raw
+  perf/results/2026-09-10/glm53f-bf16-gemv/timing.jsonl/.log/source.sha256.
+- Integrated the two CPU admission changes (hash-first lookup and live
+  full-host-busy allocation guard), with no kernel/profile changes. Benchmarks
+  preserve explicit frozen pre-change lookup/allocator references; tests now
+  exercise actual production code rather than duplicate candidates.96CPUtests
+  pass, Ruff/diff checks pass. GPU-free integrated CPU comparison: lookup
+  hit22448/164us,miss22684/23us,all-shared-prefix miss22800/375us,
+  all-tails-pending19.62/4.97us. Allocation c1/8/16/32 baseline seconds
+  0.061636/0.505778/1.052682/2.234800 versus
+  0.000457/0.003470/0.006943/0.016288, same state fingerprints. No serving
+  gain claimed yet for these additions. Raw next arm/*integrated-cpu.jsonl.
+- Fresh registered TP8 arm BOOTING: hash-first/attempt01/server.log,
+  server14511/API3953228. Validator69680/current short3953305, monitor87230/
+  PID3953313.22hashes frozen. Same command/settings as prior arm except new
+  trace path and the two index changes. Short1000/300 then aligned124417/
+  2000 full c1/8/16/32 three-repeat matrices queued. Health/AOT/capacity still
+  pending; keep profiler inactive and GPU/source exclusivity until complete.
+
+### 01:26 UTC health checkpoint
+
+- Hash-first arm reached health and passed text/reasoning/image/tool canaries.
+  All8ranks loaded identical13e053b5 AOT cache at01:25:14; full graph capture
+  passed. GPU KV51.03GiB/exactly4,304,412tokens, unchanged from control.
+  Short c1 warmup complete; exact matrix running under validator69680/
+  short3953305, then long automatically. Server14511/API3953228,
+  engine3953827/workers3954108..15, monitor87230/PID3953313.22frozen hashes
+  match; profiler inactive. No serving-performance claim yet for the new
+  hash-first/full-busy additions, and no competing GPU work permitted.
+
+## 2026-09-10 01:41 UTC: hash-first short complete; explicit long-depth qualification
+
+- Current short c1/8/16/32 medians105.119335/481.509238/665.244430/
+  906.046103tok/s, all12exact/canaries; broadly unchanged from the prior arm.
+  Long c1 median76.588333; c8 median438.114136, repeats444.742082/
+  438.114136/433.332071. All6exact,1computed token/124416GPU prefix hits
+  per request,0external/preemptions. No new serving improvement established;
+  c16 cold warmup active, c32 pending. Long client3964925/session69680;
+  server14511/API3953228/engine3953827, monitor87230/PID3953313.22hashes
+  match, no profiler activation, serving edits or competing GPU jobs.
+- Validation gap addressed in the separate WildChat harness: reaching a
+  wall-clock cap and having earlier recall probes cannot establish1M-context
+  correctness. New --require-target requires every session to complete a
+  successful target-tagged recall request with actual prompt_tokens >=target,
+  not the preceding prompt+completion estimate (which includes reasoning
+  omitted from the replayed conversation). A too-shallow probe resumes growth.
+- Strict mode uses session-unique markers, rejects arbitrary request errors
+  without relabeling them as context ceilings, and fails immediately on
+  missing/invalid usage. Final qualification fails closed on time caps,
+  missing/duplicate sessions, any request error or failed recall. Raw records
+  and qualification are persisted before exit1. Normal exploratory mode is
+  still available. TTFT also recognizes both reasoning delta field names.
+- Correctness:19 CPU tests pass, including mocked streaming, reasoning-token
+  accounting, false depth, failure classification, and actual CLI output/
+  exit behavior. Ruff/diff checks pass. Auditing the prior633-turn/530K raw
+  artifact correctly rejects it as1M evidence for all8sessions. No new GPU
+  long-depth workload was run while the performance arm lives. Raw current
+  attempt/deepcontext-qualification-cpu-final.log, deepcontext-qualification-
+  help.log/source.sha256 and deepcontext-historical-qualification.json.
+- Next depth gate after performance comparison: same WildChat data/seed and
+  c8 workload, `--ctx-target 1000000 --require-target --max-hours 4`,
+  preserving headroom for1024-token recall
+  below model limit1048576. This is conversation depth/recall qualification,
+  NOT physical tier-restore or byte-verification evidence. Those gates and
+  TP scaling remain open; performance optimization objective remains active.
+
+## 2026-09-10 02:02 UTC: c16 comparison and warp-aggregated histogram diagnostic
+
+- Status: in progress, NOT a retained kernel optimization.
+- Current hash-first long c16 median679.444794tok/s, repeats682.169657/
+  679.444794/672.048175, only+0.54% versus prior675.807024. All9completed
+  long runs exact,1computed token/124416GPU prefix hits per request,
+  zero external hits/preemptions. Telemetry through c16 has no observed
+  all-GPU idle spans for those repeats. c32 cold warmup live;22frozen
+  serving/client hashes match. No profiler or competing GPU jobs.
+- Hypothesis: sampler.cu's first FP16-bin histogram performs one shared
+  atomic per score. Narrow distributions concentrate lanes in a few bins;
+  match_any_sync can elect one leader per bin/warp and add the peer count.
+  This preserves integer counts, but has extra instructions for diffuse
+  distributions. Measure both before considering a serving dispatch.
+- Quarantined candidate in csrc/quixicore/glm53f_warp_histogram.cuh and
+  glm53f_histogram_benchmark.cu; no CMake/vLLM import or serving linkage.
+  Benchmark uses512threads/row and the serving float4 traversal,2048bins,
+  fixed262144-pool capacity,11layers,c1/8/16/32,visible256/32768/262144,
+  normal/narrow/constant scores,5alternating repeats of50graph steps.
+- Correctness so far: offline SM80 nvcc build succeeds;12CPU tests pass,
+  Ruff passes. GPU gate queued: exact integer histograms against CPU,
+  four changed-input/length replays, NaN padding and output canaries, plus
+ 32edge rows spanning zero length, float4 tails, partial warps, CTA loop
+  boundaries, signed zero/infinities and all-empty replay. No GPU execution
+  or kernel throughput yet. Histogram counts do not establish selected-ID
+  parity, complete top-k performance, or end-to-end model quality.
+- References inspected: local sampler.cu histogram/final-sort/dispatch,
+  QuixiCore ROCm lm_head_topk_kernels.cuh, CUDA lm_head_topkp.cu and
+  llama.cpp ggml-cuda/top-k.cu. Their small-k/sort choices do not directly
+  solve512-pool selection here. Earlier radix-only and fixed-capacity
+  split/merge diagnostics each lose on important distributions/shapes.
+- Raw perf/results/2026-09-10/glm53f-warp-histogram/: libhistogram.so,
+  build.log,cpu-oracle.log,source.sha256. Run GPU gate only after current
+  matrix and any diagnostic capture finish and the owned server is stopped.
+
+## 2026-09-10 02:11 UTC: hash-first admission serving gate complete
+
+- Status: retained CPU admission changes; not a GPU-kernel optimization.
+- Full three-repeat c1/8/16/32 matrices complete with24exact checks and
+  text/reasoning/image/tool canaries. Same4,304,412-token GPU pool, profiles,
+  kernels and AOT hash.22source/client hashes match. Profiler inactive for
+  all timings; passive telemetry stopped only after the final repeat.
+- Short medians105.119335/481.509238/665.244430/906.046103tok/s; long
+  76.588333/438.114136/679.444794/1056.612837. Long deltas versus prior
+  reclaim-shortcircuit -0.25%/-1.50%/+0.54%/+5.26%; short deltas+0.34%/
+  +0.29%/-1.46%/+0.13%. Do not describe this as an across-the-board win.
+- c32 repeats1056.612837/1067.498366/981.721960; first2 no observed
+  all-GPU idle span, final4.006s span plus isolated zero sample. Prior final
+  repeat had14.023s sampled span. These are distances between observed
+  samples, not exact stall durations. CPU additions improve c32 admission
+  but do not eliminate residual stalls. Positive lookup/ownership behavior
+  unchanged,96CPU tests and completed real-profile gate support retention.
+- All long timed requests1computed token/124416GPU prefix hits, zero
+  external hits/preemptions. Whole run6916restore ops/rank occurred in
+  warmup/priming; don't confuse cached timing with cold ingestion/restore.
+- Raw current hash-first/attempt01/matrix-comparison.json contains full
+  repeat arrays, exact gates and percentages; telemetry-summary.json has
+  all24timed windows. Baseline snapshot updated. Post-matrix c32/124417/
+  4000-output diagnostic now running with metric-gated profile activation;
+  native-long-c32-diagnostic and profile-trigger artifacts excluded from TPS.
+
+### 02:15 UTC: complete c32 decode census, then exclusive histogram gate
+
+- Metric-gated c32 diagnostic completed exact32x4000output, no preemptions,
+  fullGPU prefix hits. All8traces pass32-token region/90mHC-site checks.
+  Rank0 region22565.803us, kernel union22233.528us, summed durations
+  23577.094us (overlap).84Marlin MoE kernels5949.998us,11native sparse
+  MLA2758.310us,91allreduces2102.506us,11pool-logit scorers1998.504us,
+  90mHCpartials1618.395us,11topK789.532us. Other ranks' region spans
+  22462.661..22644.491us. Rank timestamps not synchronized for attribution.
+  This establishes real c32 kernel priorities: MoE, attention and scoring
+  exceed the small first-histogram opportunity. Trace is not throughput.
+- Raw current attempt/native-long-c32-rank-census.json plus8traces, exact
+  diagnostic and profile-trigger log. Server stopped gracefully only after
+  client exit and0running/0waiting. Allownedworkers gone; all8GPUs0MiB/0%.
+  Standalone histogram gate now runs exclusively onGPU0, not serving-linked.
+
+## 2026-09-10 02:18 UTC: reject explicit warp histogram aggregation
+
+- Status: rejected for serving; isolated diagnostic files retained as evidence.
+- Native edge32rows plus36timing cases pass exact histograms, poisoned
+  padding, output guards and four changed-input/length graph replays. Candidate
+  takes1.19x..9.04x baseline time across ALL cases, including constant scores.
+  Representative32768-pool c32 normal/narrow/constant values are in raw
+  gpu.jsonl; no full-selector integration warranted by any tested case.
+- Disassembly explains a likely reason: scalar increment emits
+  ATOMS.POPC.INC.32 already; explicit grouping introduces MATCH.ANY, votes,
+  leader election and ATOMS.ADD. This is inferred from local generated SASS
+  and consistent with measurements, not a claim about every GPU/compiler.
+- Initial GPU gate failed because the new benchmark cached the default
+  stream before capture; torch warned of an empty graph and all-empty replay
+  caught stale counts. Fixed both launch sites to resolve the current stream
+  dynamically. Failed artifacts preserved (gpu-failed-capture.log and
+  source-failed-capture.sha256); corrected session77825 exited0 with37records.
+  No serving sampler change. Raw glm53f-warp-histogram/gpu.jsonl/.log,
+  source.sha256,disassembly.sass; earlier12CPUtests and offline build pass.
+- Next one-factor arm uses sparse-TC decode with current admission fixes,
+  unchanged BF16 KV/tiers/other profile flags. Registry flag true ONLY for
+  this A/B; retention pending full matrix/quality. Fresh GPU and CPU gates
+  running before server launch under glm53f-tp8-admission-sparse-tc/attempt01.
+
+### 02:20 UTC: sparse-TC matched arm launched after98GPU/94CPU passing gates
+
+- Fresh gates exit0; prior standalone GPU jobs gone, all8GPUs0MiB/0% before
+  launch. Registered profile command uses verificationOFF,72GiB host and
+  256GiB disk/rank,full context and FULL_DECODE_ONLY64. ONLY sparse-TC
+  flag differs from completed hash-first baseline;22frozen hashes verify
+  this, and replacing true withfalse reproduces prior profiles.json hash.
+- Server21893/API4019529/engine4020072 booting; validator14576/current
+  short4020307 waits for health then runs short and aligned124K three-repeat
+  c1/8/16/32 matrices. Passive telemetry81862/PID4020316. Profiler inactive.
+  No health/capacity/AOT/full-graph or serving throughput claim yet. Keep GPU
+  exclusivity and source freeze until complete. Baseline is hash-first arm,
+  not the older pre-fix sparse-TC comparisons with confounded admission stalls.
+
+## 2026-09-10 02:34 UTC: sparse-TC short win, explicit KV cost, MoE tuning preparation
+
+- Status: short-workload qualified candidate; full long comparison pending.
+- Health/canaries/full graph capture passed. New AOTe2bc7d0f7d2ee0b3...
+  compiled/saved; a fresh-process cache-hit restart is still required for
+  this candidate. GPU KV4,280,453tokens/50.74GiB versus native4,304,412/
+  51.03GiB: -23,959tokens/-0.56%. This is part of the attention tradeoff,
+  not unchanged capacity. Graph capture reports0.22GiB.
+- Short c1/8/16/32 medians109.717290/489.634384/682.751705/928.972062
+  tok/s, +4.37%/+1.69%/+2.63%/+2.53% against hash-first native baseline.
+  All12exact and text/reasoning/image/tool canaries pass, no external hits/
+  preemptions. Raw admission-sparse-tc/attempt01/short-comparison.json.
+- Long c1 median102.610098 (repeats102.610098/102.235713/103.416627)
+  versus native76.588333. All3exact,1computed token/124416GPU prefix hits,
+  zero external/preemptions or observed all-GPU idle spans. Long4034488/
+  validator14576 now c8warming; c16/c32pending. No extrapolation of c1
+  gain to other concurrency or cold prefill. All22frozen hashes match,
+  profiler inactive, no serving edits or competing GPU jobs.
+- Independent MoE hypothesis: inherited Marlin determine_exec_config ranks
+  candidate tiles by allowed CTA count, not measured TP8 projection cost.
+  Actual checkpoint4096hidden/2048expert intermediate/8ranks gives gate/up
+  4096->512 and down256->4096,E288/top8. Generated tile families and public
+  op already expose thread_k/thread_n/blocks_per_sm; test those before
+  deciding whether scheduling, layouts or new kernels are needed.
+- New quarantined benchmark_glm5_next_marlin_tiles.py uses17choices,
+  c1/8/16/32,16route sets and disjoint/shared/uniform synthetic distributions.
+  Native packed weights/scales only, no weight duplication. Prepares both
+  GEMMs separately, changed-input/route/weight graph replay, output guards,
+  explicit finite/nonzero baseline and bit-exact reporting. Unsupported
+  host launch configs are recorded; unexpected CUDA faults abort. Finite
+  non-bit-exact timings remain diagnostics, never qualified replacements.
+-16CPU fixture/config tests pass; Ruff passes. GPU correctness/timing NOT
+  RUN while serving arm lives. Raw glm53f-marlin-tiles/cpu-plan.log,
+  help.log,source.sha256. Native-launch-census.json extracted existing real
+  traces: c1 42calls216CTAs/82,432B shared plus42calls432CTAs/40,704B;
+  c32 all84calls432CTAs/40,704B,128threads/122registers. Actual per-expert
+  token counts are not in this trace; synthetic routing is explicitly labeled.
+  Kernel-only winners still require combined MoE and full-model quality/TPS.
+
+### 02:36 UTC: long c8 does not reproduce the large c1 gain
+
+- c8 median439.879771tok/s, repeats439.879771/441.076611/439.705033;
+  +0.40% versus native438.114136. c1 median102.610098 is+33.98% versus
+  76.588333, but that result does not generalize across concurrency. All6
+  completed long checks exact,1computed token/124416GPU prefix hits per
+  request, no external/preemptions or observed all-GPU idle spans.
+- Raw admission-sparse-tc/attempt01/long-partial-comparison.json and
+  telemetry-summary.json. Long4034488/validator14576 live, c16warming and
+  c32pending. Source freeze/profiler inactivity/GPU exclusivity preserved.
+  Final MoE preparation16CPUtests pass; no native MoE timing yet.
+
+## 2026-09-10 03:01 UTC: sparse-TC c16 gain; direct full-K down prototype
+
+- Live serving comparison: c16 long700.141336/706.513174/710.484107,
+  median706.513174tok/s (+3.98% versus679.444794 native). All9completed
+  long checks exact,1computed token/124416GPU hits per request, zero
+  external/preemptions or observed GPU idle spans. c32warming. Source/GPU
+  exclusivity and inactive profiler preserved; no final retention decision.
+- New kernel status: CPU/offline-qualified prototype ONLY, not serving-linked.
+  benchmarks/glm5_next_nvfp4_down_candidate.py: one CTA per expert-aligned
+  eight-row/Ntile, entireK256, existing NVFP4 Marlin nibble and scale layouts,
+  no persistent repack, global partial sums or locks. Ntile64/128 compile
+  offline forSM80 at40,960/73,728B shared. GPU behavior/timing untested.
+- Numeric contract: native S0E5M3/FP4 fragments produce tiny BF16 weights
+  compensated by stored global scale. Construct equivalent normal product,
+  then integer-rebias its BF16 exponent by119 to avoid arithmetic on a
+  subnormal FP4 operand. Preserve native down's TWO BF16 rounding boundaries:
+  accumulator first, and router*global factor, then BF16 multiply. CPU
+  counterexamples reject moving scale before rounding or retaining FP32factor.
+-32CPU tests pass: routing/config/scheduler27 and numeric5. Full literal
+  bit oracle covers16codes x120scale bytes, signed zeros and clipped scales;
+  scale domain verified against owned converter for all finite nonnegative
+  E4M3 inputs. Initial shift6 error caught before compilation and corrected
+  toshift7; failed log/hash preserved. This is not native/full-GEMM parity.
+- Scheduler audit corrected the initial broad split-K hypothesis: native
+  Marlin uses DP plus two-tile SK, not global reduction for every tile. For
+  synthetic c32 disjoint routes/current432CTA down launch,7776DP+416tail
+  tiles havezero split tiles; c1 down256tiles allsplit. Fixed-K candidate must
+  win measured scheduling/decode overhead, not assume removal of allc32locks.
+- Existing MoE sweep gained explicit --direct-down (defaultoff), per-arm
+  failure context and repeated timed-graph stability checks vs same kernel
+  eager output. It still reports bit-exactness vs native auto separately;
+  non-bit-exact timings are unqualified diagnostics. Packed-weight working
+  sets and full/split tile counts are synthetic, not captured model routing.
+- Raw glm53f-nvfp4-direct-down/: cpu-combined.log,offline.jsonl/.log,
+  initial-failure artifacts,source.sha256,help.log. GPU queue waits until
+  serving matrix/diagnostics finish and allownedworkers release GPUs.
+
+## 2026-09-10: matched sparse-TC matrix completed; residual c32 stall remains
+
+- Status: full short/124K workload gates passed; cached restart and1M
+  qualification still pending. All24exact checks/canaries pass,22frozen
+  source/client hashes match. Long c32 repeats1162.670308/1195.071181/
+  1035.037738; median1162.670308 (+10.04% versus native1056.612837).
+- Full c1/8/16/32 long medians102.610098/439.879771/706.513174/1162.670308,
+  changes+33.98/+0.40/+3.98/+10.04%. Short+4.37/+1.69/+2.63/+2.53%.
+  Same prompt and output shapes, three repeats, no active profiler during
+  matrix. GPU pool costs23,959tokens/-0.56%; mainKV remainsBF16.
+- c32r3 has8.014s between first/last consecutive zero-utilization samples;
+  firsttwo repeats none. Residual admission stalls remain, exact duration
+  unknown. Timed long requests GPU-prefix hits, zero external/preemptions;
+  do not characterize these as cold-prefill or tier-restore throughput.
+- Raw admission-sparse-tc/attempt01/full-matrix-audit.json and refreshed
+  telemetry-summary.json. Postmatrix c32 diagnostic separately launched
+  only after validator exited and metrics0running/0waiting: sessions45847
+  (client)/50167(trigger), stable32decode gate, profiling excluded fromTPS.
+  New MoE GPU kernels still not executed while server owns the GPUs.
+
+### 03:13 UTC: sparse-TC c1/c32 postmatrix attribution, not TPS
+
+- Both separate diagnostics exact, GPU-prefix cached, no external hits or
+  preemptions. Stabledecode metric triggers passed. All8rank censuses pass
+  requested1/32token GPU annotation and90mHCsites. No profiling was active
+  during the completed benchmark matrix.
+- c32 rank0 TCpart980.772+reduce113.955us versus nativeMLA2758.310us;
+  Marlin8089.021us versus5949.998us. Total traced region23372.728us versus
+  native22565.803us. c1 TC77.643+36.475us versus752.886us, but collective
+  sum3840.856us versus1437.295us and totalregion12361.179us. Region-local
+  attribution confirms dispatch, not deterministic same-route model work;
+  do not add overlapping sums or use a one-step trace to predict TPS.
+- Server gracefully stopping after0running/0waiting; isolatedMoE GPUgates
+  next after confirmed release. Raw traces/*.census.json,diagnosticJSON,
+  triggerJSONL; fresh32CPUtests and four source hashes pass beforeGPUwork.
+
+## 2026-09-10 03:20 UTC: first native MoE data; sparse-TC scratch hypothesis
+
+- Status: MoE GPU sweep in progress; sharedscratch CPU-only prep.
+  Server gracefullyexited and all8GPUs0MiB/0% confirmed before launch.
+  MoE session88173/PID4086899 live; sevencompletecases, c8disjointdown
+  underway. Fourchangedgraphreplays/guards/finite and posttimingstability
+  checks pass so far. Full24case sweep stillrequired; no servingintegration.
+- c1disjoint baselinegateup15.665827us/down13.167719us. Native down
+ 64x128/3CTA10.076409us, but maxabs0.001953125/notbitexact. Newdirect
+ 64/128tiles27.574386/28.441296us, maxabs0.00390625/notbitexact. No
+  material bitexacttile win in completedc1routes. Raw marlin-tiles/
+  gpu-attempt01/gpu.jsonl/.log, source.sha256, partial-summary.json.
+- KV hypothesis: sparse_tc_nope allocates partial/max/denominator tensors
+  per call. Optional fixed-address owner can share them across sequential
+  layers and graphshapes without changing arithmetic; outputs stayprivate.
+  New SparseTCWorkspace + optionalworkspacekwarg, NOT backend/modelwired.
+  Registered2080/H8 shapes need544row-parttiles/8,947,712B.10CPUtests pass,
+ 5GPUtests pending. No concurrentmodel/streamsharing allowed.
+- Counterhypothesis: CUDAgraphallocator may already reuse private scratch,
+  making explicitresidentstorage pointless or worse. New isolated freshprocess
+  benchmark captures11layers/c1/8/16/32 with onegraphpool and measures actual
+  allocated/reserved/peakbytes plus unchanged-output/changedgraphgates and
+  perlayerlatency. RealprofileKVpool/TPS required before retention.
+- Raw sparse-tc-shared-scratch/cpu.log,help.log,source.sha256. GPUqueue
+  waits for currentMoE sweep and GPUrelease; neverbenchmark concurrently.
+
+## 2026-09-10 03:33 UTC: route-dependent Marlin tuning and serial GPU qualification
+
+- MoE sweep stillinprogress;20/24cases at03:32. c8sharedgateup automatic
+ 29.030938us versus128x64/2CTA15.733628us, but maxabs0.03125/notbitexact.
+  c16disjointgateup101.857812us, fastest101.443092us/notbitexact; disjoint
+  down74.852108us versus74.807229us/bitexact, not a material win. This
+  motivates actualrouting evidence, not assuming a synthetic sharedcase.
+- Added explicit SlimServe --enable-return-routed-experts diagnostic flag
+  forwarding to existingcapturebackend, no registrydefaultchange.67profile/
+  CLItests pass; dryrun preservesTP8/fullcontext/KV/tier/graph settings.
+  Capture incurs memory/D2H/payload overhead; exclude it frombaselineTPS.
+- Exactclient --dump-responses retainsfullJSON aftertiming, includingrouting
+  payloads.21CPUtests pass, with writeordering/defaultbehavior assertions.
+  Per-tokenexpertIDs do not preserve true scheduler-step batchgrouping;
+  future occupancy claims need that distinction. No actualcaptureboot yet.
+- Serial GPUqueue:88173MoE ->77297scratchtests/private/sharedallocation
+  ->96609eight-rankindexer-rowsharding. Each transition verifies prior
+  completion/results, sourcehashes and all8idleGPUs; no competingjobs.
+  Rowshard36CPUtests pass. No servingintegration of these candidates yet.
+  Raw glm53f-routing-capture andglm53f-indexer-row-shard under2026-09-10.
+
+## 2026-09-10 03:42 UTC: completed isolated experiments and cleanup
+
+- MoE decision REJECT directfixedKdown and statictileoverride.24complete
+  cases allfinite/guards/changedgraph/timedstability pass; no bitexactnative
+  config improvesby1%. Directtiles NOTbitexact and2.094..4.575xslower on
+  all12downcases. Full marlin-tiles/gpu-attempt01/summary.json andrawrepeats.
+- Sharedscratch decision REJECT ascapacityoptimization.15tests pass;
+  bothfreshprocessarms peakallocated120,365,568B, despite−20MiBreserved
+  allocatorstorage. Sharedresidentcost8,947,712B; c32~80.4us/layerbotharms,
+  c1~11.16vs11.03us. Not a measuredservingKVcapacity or meaningfulTPSwin.
+  Quarantinedclass/wrapperunderbenchmarks, productionwrapper restored to
+  matchedTCsourcehash.99GPUtests passpostcleanup; repeatedprivate/shared
+  arms showidenticalpeakagain. Raw sparse-tc-shared-scratch/*quarantined*,
+  post-quarantine-gpu.log/post-quarantine.sha256; initialhashes historical.
+- Rowshard decision FOLLOWUP/servingA/Brequired.12cases/8ranks allvalid
+  logits andselectedsets exact across4changedgraphreplays;5timingrepeats.
+  At131K, perlayerreplicated->sharded c8 72.721->67.984us, c16 111.549->
+  72.803us, c32 190.568->80.019us (1.07/1.53/2.38x). c1fallbackunchanged.
+  At1K c8/16/32regress3.14..3.55x;16Kc8/16regress,c32neutral. Query/cache
+  update/expansionexcluded; shortcacheL2 caveat. No claimedservingspeedup.
+  Source/rawunder glm53f-indexer-row-shard/. Futurecontextgating mustactually
+  work underCUDAgraphreplay, not freezeaPythonbranch atcapturetime.
+- FreshnormalTP8cachedrestart launchedafterallGPUjobs exitedandallGPUs0MiB.
+  Server2088/API4104772, shortvalidator67687/PID4104846, telemetry34259.
+  Samecurrentregisteredflags/tiers/fullcontext, no routingcapture/profiler
+  activation orrejectedkernelintegration. AOTcachedhealth/servingresults
+  pending. Raw glm53f-tp8-sparse-tc-cached-restart/attempt01/; freezeuntil
+  validatorcomplete. Full1M/combinedtier/scalingqualification stillopen.
+
+### 03:44 UTC: cached restart changes the capacity interpretation
+
+- All8ranks loaded cachedAOTe2bc7d0f7d2ee0b3... at03:43:44. GPUKVpool
+ 4,304,412tokens, equal to nativebaseline and23,959more thanfirstTCcompile
+  boot. SameTCflagtrue; productionwrapperrestored tooriginalhash, no shared
+  scratch. Thus−0.56% earliercapacitydifference was boot-dependent, not
+  establishedpermanentTCcost. Cached/newcompilebootstate differs; causenot
+  isolated. Do notcreditrejectedallocationexperiment. Health/fullgraph/
+  servinggates stillpending; validatorcontinuesonthisfrozenserver.
+
+### 03:49 UTC: cached sparse-TC serving gate passed; retain tested decode path
+
+- All12shortexactchecks and text/reasoning/image/toolcanaries pass. c1/8/16/32
+  medians109.931906/492.040836/681.866542/933.963014tok/s, three repeats.
+  CachedAOTloadedon8ranks; fullgraphs0.22GiB;4,304,412GPUKVtokens/51.03GiB.
+  Profileactivationpeak0.94GiB versus firstcompile1.16GiB. No claimedcause
+  isolation or attribution to rejectedsharedscratch (productionrestored).
+- Source/clienthashesmatch; no profiler duringtimings. Raw cached-restart/
+  attempt01/short-summary.json,telemetry-summary.json,canaries,rawexactJSON.
+  Validatorcompleted0, metrics0running/0waiting, passivemonitorstopped.
+  Server2088/API4104772 remainshealthyidle. No competingGPUjobs.
+- Decision retaincurrent sparseTCflag for testedSM80/TP8/H8/no-specdecode,
+  backed bymatchedshort+124Kmatrix andthiscachedrestart. Full1M/physical
+  combinedtier andTPscaling remainopen. RowshardservingA/B isnext measured
+  optimization; account for shortcontextregression andCUDAgraphbranching.
+
+### 2026-09-10 04:12 UTC: row-sharded indexer integrated; cached full matrix LIVE
+
+- Status: serving candidate, NOT retained. The preceding status turn verified
+  qualification completion; this turn audited all four exact JSONs and source
+  hashes, stopped the idle qualification server and launched a cached matrix.
+- Implementation in glm5_next_indexer.py factors unchanged score/topK into
+  _pooled_topk. Each rank scores contiguous R/8 rows, preserving global
+  row_req IDs/strided compact pages; gathers512int32 pool IDs per row before
+  unchanged expansion. Runtime group resolution inside the opaque op avoids
+  serializing communicator pointers. Strict SM80/TP8/DP1/PP1/H32/compact/
+  no-spec gate; only puredecodeR16/32. c1/c8/prefill/other shapes unchanged.
+  No Pythoncontext-length branch frozen at capture; adaptive scorer rejected.
+  TP8 registry row-shard flag is true EXPERIMENTALLY, pending serving A/B.
+- Integrated actual-vLLM-group eight-GPU benchmark:8cases, fivechanged graph
+  replays, ragged/zero lengths, query/page/request remapping, expanded-set/
+  bounds/guard and post-timing parity pass. At131072context c16 baseline
+  115.306->74.465us/layer, c32 194.016->82.017us INCLUDING expansion. At1024,
+  c16 12.223->32.662us and c32 12.817->32.260us: explicit shortcontext tax.
+  c1/c8 fallback unchanged.112 initialCPU/104 unchanged-pathGPU/105 post-enable
+  CPU gates pass. Raw glm53f-indexer-row-shard-integrated/ under2026-09-10.
+- First real compile boot passes text/reasoning/image/tool canaries and four
+  exact1000/300 checks:109.30/492.01/670.28/922.76tok/s atc1/8/16/32.
+  One repeat: qualification, NOT retention evidence.22source/client hashes
+  and CLI hash match. GPUKV4,280,453tokens; graph capture0.70GiB versus
+  baseline0.22GiB. Additional graphmemory must be counted, no capacity win.
+  AOT20013379fd5afd76b03c40f319a150c9f05cff6cf685a98fa6907c10a586247a.
+  API4126249 stopped gracefully after0running/0waiting; all8workers gone
+  and all8GPUs0MiB/0% verified before fresh launch.
+- CURRENT cached-attempt01: server9671/API4139241; matrix48726/shell4139331/
+  shortvalidator4139332; passive GPUtelemetry97235. Raw root
+  perf/results/2026-09-10/glm53f-tp8-row-shard/cached-attempt01/.
+  run_matrix.sh waits for health, runs canaries plus three exact repeats per
+  c1/c8/c16/c32 at1000/300, then124417/2000 (--repeat-source), and checks
+  hashes/all24exact outputs. Same registered fullcontext/BF16KV/72GiBhost+
+  256GiBdisk perrank; SLIMSERVE_KV_TIER_DIR=/home/ubuntu/.cache/slimserve/kv-tier,
+  verification0. Sources frozen, profiler NEVER activated, routingcaptureoff,
+  no competing GPU jobs. Do not restart on observation timeout.
+- CachedAOT/health/newcapacity/repeatedTPS pending at04:12. Short control is
+  sparse-TC cached-restart109.931906/492.040836/681.866542/933.963014tok/s,
+  4,304,412GPUKVtokens. Long TC control102.610098/439.879771/706.513174/
+  1162.670308 was a firstcompileboot with4,280,453tokens; a cached no-row-
+  shard long control may be needed for clean retention. Full1M/physical
+  combined-tier validation and TPscaling remain open.
+
+### 04:17 UTC: cached capacity confirmed; communicator-reuse candidate prepared
+
+- All8ranks loaded AOT20013379... at04:12:20. GPUKV4,304,412tokens/
+  51.03GiB, equal to retained cached sparse-TC control. Capture still0.70GiB
+  versus0.22GiB; unchanged token count does not erase additional graphmemory.
+  Cached serving canaries pass; short matrix running throughc32.
+- Read owned cuda_communicator.py/pynccl.py: an existing caller-stream NCCL
+  all_gather is available. Current serving rowshard uses PyTorch device_group.
+  Hypothesis ONLY: reusing existing PyNccl can avoid another communicator's
+  storage/internal-stream overhead. No attribution proven yet.
+- New benchmark-only glm5_next_indexer_gather_candidate.py preserves score/
+  select/expand and uses live group.device_communicator.pynccl_comm.all_gather.
+  Fails closed on missing/disabled communicator, no production wiring or
+  communicator pointers serialized.44 CPU plumbing/dispatch tests pass;
+  GPU correctness/performance/memory all PENDING. Ruff/help pass.
+- Integrated benchmark now supports --gather existing-pynccl (default remains
+  process-group). Coordination barriers/max-rank timing reduction use CPU
+  Gloo, so benchmark coordination does not initialize the very extra GPU
+  communicator being measured. Added per-rank allocator/free-memory snapshots
+  before case/warmup and after warmup/capture. Use separate fresh processes
+  for both arms AFTER the serving matrix and GPU release. No GPUjob queued.
+  Original integrated results used the old benchmark revision; new source
+  hashes in perf/results/2026-09-10/glm53f-indexer-existing-pynccl/source.sha256
+  distinguish this version. Existing serving source hashes remain unchanged.
+- Next isolated commands after full matrix/server exit: torchrun8ranks
+  -m benchmarks.benchmark_glm5_next_indexer_row_shard_integrated --gather
+  process-group, then separate freshprocess --gather existing-pynccl, with
+  separate JSONL/logs. Tests don't establish collective or model parity.
+
+### 04:18 UTC: cached row-shard short serving result
+
+- All12exact1000/300 checks and text/reasoning/image/tool canaries pass.
+  c1/8/16/32 medians110.328039/492.317002/674.969529/924.313557tok/s.
+  Versus cached sparse-TC no-shard control: +0.36/+0.06/-1.01/-1.03%.
+  Thus short-context tax is measured; no retention decision yet. KVcapacity
+  unchanged4,304,412tokens; extra graphmemory0.70vs0.22GiB stillcounts.
+- Raw cached-attempt01/{short-summary.json,short-comparison.json,
+  telemetry-summary.json}; sourcehashesmatch, profilerinactive. Long canaries
+  pass and validator4151603 is live at124417/2000, three repeats each shape.
+  ServerAPI4139241/matrix48726/telemetry97235 continue exclusively on GPUs.
+
+### 04:21 UTC: serving-to-isolated queue armed
+
+- Long matrix is live; c1repeats104.04/103.68/105.04tok/s exact, each request
+  1computedtoken/124416GPU-prefix hits,0external/preemptions. c8coldprefill
+  warmup ongoing. No allGPUidle spans in all12short timing windows.
+- Serial queue35561/shell4155597 waits for matrix4139331 exit then audits
+  all24exactJSONs/hashes, idlemetrics/APIidentity; gracefully stops only
+  ownedAPI4139241. Requires all8GPUsfree, then runs new freshprocess-group
+  and existing-PyNccl benchmark arms, checking8results/hashes aftereach.
+  This avoids GPUcompetition and preserves frozen serving/benchmark sources.
+  Script/raw glm53f-indexer-existing-pynccl/run_after_matrix.sh,pipeline.log.
+  No retention or modelTPS claim from pending isolated collective tests.
+
+### 04:28 UTC: c8 long result exposes an attribution confound
+
+- Long c8 repeats534.987973/522.988205/476.748025tok/s; median522.988205
+  versus earlier TC439.879771. All exact124417/2000, cachemetrics same:
+  8computedtokens/995328GPU-prefix hits, zeroexternal/preemptions. c8 is
+  nominally unchanged by rowshard dispatch. Thus neither this gain nor the
+  coming c16/c32 differences can be wholly credited to indexer sharding.
+- Old control was firstcompileboot versus current cachedboot; CLI/exact
+  client's routing-dump support added since (defaultoff), profile/indexer
+  changed, other22-listed serving hashes unchanged. Fresh matched cached
+  no-shard long control REQUIRED before retention; actualc8 capture-rowshape
+  may also need postmatrixtrace confirmation. No causal claim established.
+- Partial c1/c8 summary in cached-attempt01/long-partial-summary.json;
+  longvalidator4151603 and serialGPUqueue4155597 stilllive. c16warmup underway.
+
+## 2026-09-10 04:41 UTC: adjacent-query prefill score tiling, CPU/offline only
+
+- Status: new quarantined candidate; GPU correctness/performance pending.
+- Baseline: owned compact _cached_pool_logits uses one query per CTA row
+  withBP16/H32/D128, reloading pooled keys for each adjacent query. Decode
+  rowshard matrix continues unchanged; c16long706.07/745.64/757.77tok/s exact,
+  c32warmup live. No serving edits or competing GPU jobs during that matrix.
+- Hypothesis: adjacent prefill queries of the same request can share key
+  loads via a wider tensor-core N tile. New query2/query4 candidate uses
+  device-visible same-request detection, independent-row fallback for
+  boundaries, and explicit two16-head reduction. Preserves strided pages,
+  distinct per-query causal counts and incomplete groups. No dispatch wiring.
+- CPU4launch/page-stride tests pass;10GPU tests deferred/skipped. Offline
+  SM80compile passes both variants (20,480/36,864B shared). Ruff/help pass.
+  GPU gates retain1e-6 strict native tolerance/selected512sets/guard checks,
+  sixchanged graph replays and grouped/interleaved requests/zero/ragged rows.
+  No claim of changed-input GPU parity, faster prefill, or fullmodel quality.
+- Isolated timing driver prepared:11cachelayers,R128/512/2048 with8192/
+  131072contexts, grouped/interleaved layouts,native/query2/query4,5alternating
+  100ms repeats andperlayer/posttimingparity. GPUtests must pass first; no
+  new GPUqueue while matrix48726 and communicatorqueue35561 own the schedule.
+- Raw perf/results/2026-09-10/glm53f-pool-query-tile/ with CPU/offline logs,
+  help andthree-source hashes. Existing serving/communicator hashes match.
+  Decision followup required; never relax the oracle to retain this candidate.
+
+### 04:55 UTC: row-shard serving matrix complete, not retained yet
+
+- All24exact checks/canaries and22source/client+CLI hashes pass. Short
+  medians110.328039/492.317002/674.969529/924.313557tok/s. Long medians
+  104.040803/522.988205/745.644132/1183.014642tok/s (c1/8/16/32).
+  Longc32repeats1252.028020/1183.014642/1100.653862; all timed requests
+  124416GPU-prefix hits/1computedtoken,0external/preemptions.
+- Longc32r3 shows two isolatedallGPUzero samples plus2.003s observedzero
+  span; no allGPUidle samples in other23timingwindows. Admission stalls
+  stillpresent. Raw finaltelemetry andsummaries in cached-attempt01/.
+- Decision followup: shortc16/c32tax~1%, graphmemory+0.48GiB, longcontrol
+  notcached/matched and c8unchangedpath alsofaster. No claim of a retained
+  rowshard modelgain. Source/clienthashesmatch and profilerneveractivated.
+- Owned idle server gracefully stopped; serialqueue35561 now waits for
+  completeGPUrelease, then compares process-group vs existing-PyNccl in
+  separate eight-rank processes. No competing GPUjobs or serving edits.
+
+## 2026-09-10 05:12 UTC: existing communicator saves484MiB/rank; serving integrated
+
+- Fresh PG/direct eight-rank arms passed all16cases with changedgraph exact
+  selectedsets/guards/bounds. FirstR16 PG gather allocates507,510,784extra
+  non-PyTorch-allocator bytes perrank; directexistingPyNccl avoids that on
+  all8ranks and retains advantage acrossremainingcases. Firstc1/c8 havezero
+  difference. This isolates the additional communicator's memory cost.
+- At131K c16PG74.348/direct74.519us, c32PG81.872/direct82.015us. No meaningful
+  latency win; memory savings484MiB/rank, not a measured modelKVtoken increase.
+  Raw existing-pynccl/summary.json,memory-by-rank.json andtwoarmJSONL/logs.
+- Ported runtime caller-stream PyNccl gather into serving _pooled_select;
+  failclosed missing/disabledcomm, no AOT nativepointer, other shapesunchanged.
+  57CPUtests and8case actual-serving TP8GPUgate pass. HistoricalPG preserved
+  underbenchmarks; --gather serving(default) nowtestsactualserving. New source
+  hashes in existing-pynccl/serving-integration/. Priorqueue completed0.
+- RealTP8 qualification server31315/API14591 and shortvalidator6436/PID14669
+  nowlive afterallGPUsfree. Raw glm53f-tp8-row-shard-pynccl/attempt01/ contains
+  actualsource snapshots, hashes andrun_short.sh; passive telemetry62809.
+  Same fullcontext/BF16KV/tiers/flags, inactiveprofiler. Servingretention and
+  graphmemory proof pending; cached no-shard longcontrol stillrequired.
+
+## 2026-09-10 05:12 UTC: prefill query tile numerical correction and isolated win
+
+- InitialBQ2/4 strictGPUgate failed atR2048/context131076, replay5/homogeneous,
+  row423/pool21866, abs1.430511e-6. Reproduced unchanged inbothvariants.
+  Changed explicit two16-head reduction to query-separated H32 reduction;
+  same1e-6 oracle nowpasses2repro cases andall14tests. No tolerance relaxation.
+- Full12case sweep thenpassesper-layer/selected512/guards/posttimingchecks,
+  bitexactforbothtiles on11cachelayers/allcases.5alternating100msrepeats.
+  At131K/R2048 grouped: native9908.252us, Q27101.682us,Q45836.418us/layer.
+  At8K/R2048 grouped1057.274->Q4730.809us. InterleavedQ4 regresses24-35%,
+  Q2regresses3-11%. Score-only timings, not modelTPS orKVcapacity gains.
+- Decision followup, NOTservingwired. Need mixed-group fallback/scheduling
+  correction or justified metadata gating, then realprefill/quality/TPS gates.
+  Raw glm53f-pool-query-tile/summary.json,gpu-benchmark.jsonl/.log,
+  reduce32-full-gpu.log. Initialfailed logs/sourcehash remain; currentcode
+  uses reduce32-full.sha256 andactual source-reduce32/ snapshot.
+
+### 05:13 UTC: communicator memory reduction confirmed in real boot
+
+- TP8 realprofile healthy andallcanariespass. Graphcapture0.22GiB versus
+  PG0.70GiB; GPUKV4,304,412tokens unchanged. This confirms removedmemory
+  overhead, not a modelKVcapacity increase or modelthroughput gain.
+- Sourcevalidation invalidated all8 AOTloads and recompiled16.20s, saving
+  underexisting20013379... key. Not a directcachehit; unchanged-source
+  cachedrestart remainsrequired. Short c1repeats110.03/110.46/109.77tok/s;
+  validator14669 stilllive. Same frozenprofile/tiers, profilerinactive.
+
+### 05:21 UTC: communicator serving short gate passed; cached full rerun started
+
+- All12shortexact/canaries pass: medians110.031163/492.227398/676.794211/
+  925.940706tok/s. Graph0.22GiB, KV4,304,412tokens, no sampledallGPUidle.
+  Memoryfix qualified within rowsharded candidate; feature retention versus
+  unsharded path remains unproven. Firstboot recompiledAOT, notcachehit.
+- StoppedownedidleAPI/telemetry andverifiedallGPUsfree; same-source cached
+  server69175/API23773 andfullmatrix37303 nowlive, telemetry62982.
+  Raw row-shard-pynccl/cached-attempt01/ (samehashes/source asattempt01).
+  Three repeats each short/long,c1/8/16/32; no activeprofiler/competingGPUwork.
+- Futureexact-sourcelead: native topKPerRowJob rowLen<=topK shortcut does
+  notread logits in our non-multiple-block prefill specialization. Selection-
+  only scorer can potentially skip work for<=512completepools without
+  changing ascendingindices/tailorder. No implementation or performance
+  claim; poisonlogits/mixedlongrows/graphthreshold gates required first.
+
+### 05:23 UTC: cached runtime communicator qualification progresses
+
+- All8direct AOT20013379... loads confirmed at05:21:15. Graphmemory0.22GiB
+  andKV4,304,412tokens persist onunchanged-source cachedboot. Canariespass;
+  c1three repeats109.61/109.40/110.36tok/s. Fullmatrix37303 stilllive,
+  profilerinactive andsourcesfrozen. No claimed completedcachedlong results.
+
+## 2026-09-10 05:35 UTC: split prefill fallback prepared; cached matrix progressing
+
+- Status: follow-up required, benchmark-only. Previous turn was a status
+  response with a verified live validator; this turn adds candidate gates and
+  benchmark coverage without modifying any frozen serving source.
+- Baseline: measured merged query tile is bit-exact on the twelve-case sweep,
+  with Q4 1.70x faster at grouped R2048/131K but 24-35% slower interleaved.
+  Preserve that version in pool-query-tile/source-reduce32/, not current files.
+- Hypothesis: separating homogeneous wide-query CTAs from mixed independent
+  rows removes the latter's large shared-memory allocation and BQ-way serial
+  work. Two launches and inactive CTAs may offset this benefit; GPU measurement
+  is required. No claim of serving TPS or KV-capacity improvement.
+- Candidate: benchmarks/glm5_next_pool_query_split_candidate.py evaluates
+  complementary request-homogeneity predicates on device on every replay.
+  Wide launch disables the inline fallback; mixed launch uses one row per CTA.
+  No CPU readback, persistent row list, or serving dispatch. Original merged
+  behavior remains the default in its wrapper and benchmark CLI.
+- Offline SM80 compile passes for Q2/Q4 wide and mixed kernels: wide shared
+  memory 20,480/36,864 bytes; mixed 12,288 bytes for both. Original merged
+  offline compiler initially failed because ASTSource did not infer the new
+  default constexpr; explicitly supplying FALLBACK=True fixes it. Failure log
+  preserved. This was a benchmark compiler entry-point issue, not GPU parity.
+- CPU launch/strided-page/program-count gates: 24 passed, 20 GPU cases skipped;
+  lint passes. GPU tests now cover both implementations over seven changed
+  graph replays, including simultaneous homogeneous/mixed and partial groups,
+  keeping atol/rtol 1e-6, selected-512 sets and output guards unchanged.
+  Benchmark accepts --variants query2 query4 split2 split4 and --layouts
+  grouped interleaved mixed. GPU gates/timing are NOT run or queued while
+  the live TP8 matrix owns the GPUs. Raw: glm53f-pool-query-split/.
+- Cached PyNccl boot short matrix is complete: all12 exact checks/canaries,
+  medians109.612908/492.535253/676.543965/926.373823tok/s, c1/8/16/32.
+  All22 frozen serving/client hashes still match. Long validator31691 is live
+  under matrix37303/shell23850. Long c1 median104.009008, c8 repeats443.433952/
+  531.377361/474.709732 (median474.709732); all six exact checks pass and every
+  request has1computedtoken/124416GPU hits,0external/preemptions. Passive
+  telemetry shows no all-GPU-zero samples in those windows, so do not attribute
+  that c8 spread to measured all-GPU admission idle. c16/c32 still pending.
+  Partial telemetry is cached-attempt01/telemetry-partial.json. Matched cached
+  no-row-shard control is still needed; no row-shard retention claim.
+
+## 2026-09-10 06:00 UTC: wrong prefill query-to-request mapping reproduced and fixed
+
+- Status: GPU-correctness fix passes; real-profile requalification in progress.
+  Previous goal turn made progress on split-prefill CPU/offline gates. This
+  turn prepared selection-only score elision, then discovered a more important
+  serving correctness defect while tracing actual query layout.
+- Evidence: indexer.py metadata kernel writes token_to_seq over compressed
+  KV spans, identically in native slot_mapping_kernels.cuh:110 and Triton.
+  GLM consumed its first R elements as query rows. For sequence lengths
+  [4096,8192], query lengths [4,8], all12 entries were request0 instead of
+  four request0/eight request1. Sliced queries also failed even without cached
+  prefixes. Actual kernel CPU interpreter witness, not a rewritten kernel,
+  reproduces three divergent cases plus a passing fresh/full control.
+- Actual GLM consumer CPU regressions before fix:3fail/1pass. On A100 all4
+  cached full/sliced cases failed expanded-index sets against a correct-map
+  reference, for BOTH native and Triton metadata. This is not an upstream
+  dependency excuse: our GLM consumer misinterpreted an existing field.
+- Fix: _prefill_query_requests gathers token_to_seq at each query's
+  cu_seqlen_ks using int32 index_select. No host readback, score/top-k change,
+  or persistent allocation. Localized DCP bounds fail closed because GLM's
+  pooled selector has no qualified sharded-KV prefill path. The registered
+  TP4/TP8 profiles have unsharded bounds. Generic KV metadata is unchanged.
+- Post-fix:13targeted tests pass, including8actualGPUcases covering native/
+  Triton metadata, raw/compact strided cache, full/sliced query offsets;
+  broader161GPUtests pass. New six-test distinct-record recall oracle passes
+  on CPU. New files lint clean; existing unrelated GLM module lint debt was
+  left untouched. No native source changes or CMake rebuild needed; actual
+  native metadata/top-k operators executed in the tests.
+- Raw: glm53f-prefill-row-map/{cpu-interpreter*.jsonl,cpu-before.log,
+  gpu-before.log,gpu-after.log,broader-gpu.log,isolation-oracle-cpu.log}.
+- Interrupted previous cached PyNccl matrix during c32 cold warmup. Completed
+  12short+9long exact records preserved, not a full matrix. Long c1/8/16
+  medians104.009008/474.709732/719.383057tok/s; no sampled all-GPU idle in
+  those9windows. Sources matched before fix. These counts do not establish
+  correct cached multi-request prefill; do not retain row-sharding from them.
+  Raw cached-attempt01/telemetry-interrupted.json. Validator31691 terminated,
+  orphan owned c32 warmup42336 terminated, API23773 needed another interrupt
+  to close remaining HTTP connections; all processes and GPU allocations
+  were confirmed gone before the new boot.
+- Earlier this turn, serial microbenchmark queue43251/shell42055 was started
+  with exact PID/start-time and idle/GPU-release gates. It was deliberately
+  cancelled143 before any transition or GPU job when this defect emerged.
+  DO NOT rerun glm53f-prefill-serial/run_after_matrix.sh (old IDs/failed matrix).
+- Parked score-elision candidate: native top-k count<=512 does not read logits;
+  candidate skips score rows only, preserves native selection/expansion.
+  5CPUtests pass/11GPU skipped; BS64/576 offline compile passes12KiBshared.
+  Poisoned-logit and 2047/2048/2051/2052 boundary graph tests plus19-case
+  eleven-layer/full1M-stride benchmark are ready but not GPU-run. Split-query
+  candidate also remains GPU-unvalidated. No production wiring for either.
+  Raw glm53f-pool-skip/, glm53f-pool-query-split/; source snapshots preserved.
+- CURRENT real TP8 server34015/API51217, matrix39384/shell52064,
+  telemetry95112: glm53f-tp8-prefill-row-map/attempt01/. Same registry flags,
+  BF16/full1M/tiers, inactive profiler; only prefill mapping changed.26source/
+  client hashes+CLI and actual source-snapshot frozen. First distinct-record
+  cached-prefix recall at c1/8/16/32, then three-repeat short and124K matrices.
+  Recall counters prove aggregate cache reuse, not exact scheduler chunk
+  membership; targeted GPU tests separately force the failing chunks.
+  No competing/queued GPU microbenchmarks. Need health/gates/TPS before
+  retention, then unchanged-source cache restart, strict1M/tiers/scaling.
+
+### 06:10 UTC: profile healthy; cached-extend canary isolates a second correctness failure
+
+- Fixed-map real TP8 boot healthy,4,304,412GPUKVtokens/graph0.22GiB. All8
+  ranks source-invalidated oldAOT and recompiled/saved20013379...; not a direct
+  cached load. Server34015/API51217, engine51751, workers51990..51997,
+  telemetry95112/PID52075 remain live. Profiler inactive. No GPU competitors.
+- First isolation fixture returned the correct c1 marker but ZERO cache hits;
+  its gate correctly failed. It was an unaligned6000-token chat prime, not
+  cached-prefill evidence. Preserved isolation/c1*.json andisolation.log.
+  Changed only the client to prime raw rendered-chat token IDs at9217, then
+  extend the same prefix in a12069-token chat request. First aligned attempt
+  caught installed tokenizer tokenize=True returning BatchEncoding, notflat
+  IDs, before any HTTPrequest. Explicit tokenize=False/render+encode without
+  extra special tokens fixes it. NineCPUoracle/fixturetests pass.
+- Aligned-v2 nowproves9216GPU-prefix hits/2853computedtokens, but c1response
+  is400repeated exclamation marks in reasoning, null content, finish=length.
+  Do NOT increase budget/relax quality oracle or proceed with TPS matrices.
+- Separate controlled salted diagnostic30579 completed0 (it records outcomes,
+  does not assert quality): identical prompt cold→correct marker,65output
+  tokens; independently primed cached→same400-exclamation corruption.
+  Cold0hits/12069computed; prime0hits/9217computed; cached9216hits/2853computed.
+  All zeroexternalhits/preemptions. This is resident-GPU cached-extend failure,
+  not established host/disk corruption, and not fixed by query-map correction.
+  Raw glm53f-prefill-row-map/cold-v-cached.jsonl/.log; executable reproducer
+  benchmarks/reproduce_glm5_next_cached_extend.py (--salt must be fresh).
+- Matrix39384 failed on initial fixture;44381 failed tokenizer guard;88707
+  failed actual cached quality gate. All terminal, no short/long matrix run
+  on this new boot. API51217 is healthy and idle, not benchmarking. No queues.
+  Source-client-sha256.txt now records corrected aligned client, with original
+  source-client-before-fixture-fix.txt/source-snapshot and intermediate
+  isolation-aligned-client.py preserved. Current client actualcopy is
+  isolation-aligned-client-v3.py. Serving sources have not changed since boot.
+- NEXT: isolate first bad operation on cached vs cold execution, including
+  restored KDA/convolution state, cache-block ownership/copying, and attention
+  inputs/outputs; do not assume KDA is the cause without finite/state evidence.
+  Exact local anchors: kimi_gdn_linear_attn.py:643-725, gather_initial_states.py,
+  gdn_attn.py:283, MambaManager and scheduler._mamba_block_aligned_split.
+  Owned-layer/kernel investigation required; do not work around by disabling
+  prefix caching, lowering context, or accepting token counts as quality.
+
+### 06:38 UTC: cached-extend first non-finite boundary isolated to sparse attention
+
+- Status: correctness investigation in progress, no new TPS qualification.
+  The intervening status-report turn made no implementation progress; this
+  continuation revalidated raw evidence and resumed owned-stack diagnostics.
+- Diagnostic attempt02 reached health and served the cold control correctly.
+  On cached extend, all eight ranks first fail at layer3.attention: shape
+  [576,4096], 2,355,200 non-finite elements (575 complete rows). The preceding
+  layer3.pre_attention is finite, max absolute 0.0947265625. KDA layers0..2
+  and their inspected initial states/conv/core outputs remain finite.
+  This narrows the first failing boundary to the first sparse attention
+  layer; it does not yet identify an individual cache/index/GPU operation.
+- Raw: glm53f-cached-extend-finite/attempt02/{server.log,reproducer.jsonl,
+  probes/pid-69445..69452.jsonl,probes/pid-*-first-bad.pt}. Diagnostic exception
+  terminated that server. All GPU allocations were gone before attempt03.
+  Attempt01 failed compilation because the temporary finite probe was not
+  defunctionalized; explicit pass support fixes that diagnostic-only issue.
+- Added opt-in prefill MLA diagnostics under SLIMSERVE_GLM53F_FINITE_DIR:
+  compare every current KV insert against its source, preserving page stride;
+  save Q/output/selected indices/lengths/block tables/referenced BF16 pages
+  on the first non-finite sparse-kernel output. No whole-cache flattening and
+  no enablement in normal serving. Eight diagnostic GPU/CPU tests pass,
+  including strided-page snapshots and non-finite writes. These synchronized
+  probes are not a performance candidate and their timings are inadmissible.
+- Attempt03 is booting the unchanged registered TP8 profile with diagnostics;
+  fresh-salted cold/prime/cached reproducer waits for health. Sources frozen in
+  attempt03/source-snapshot with hashes. No competing GPU benchmarks. Next
+  use saved insert/gather evidence to isolate and reproduce the failing op;
+  do not resume c1/c8/c16/c32 matrices until cached correctness passes.
+
+### 06:54 UTC: cached-prefix corruption traced to hybrid prefill graph dispatch
+
+- Attempt03 confirms all eight ranks have finite Q, finite insert sources,
+  and exact equality between current source and written KV rows. Older prefix
+  physical pages46/49 contain non-finite/extreme values. Cold12069-token arm
+  correctly returns the marker (39 completion tokens), prime9217 succeeds,
+  cached arm fails. This isolates corrupt cache input, not sparse arithmetic.
+- Attempt04 retains layer3 write history. Both affected pages were written
+  correctly during prime (steps8/9), then rows0..529 changed; rows530..575
+  remain exactly equal to source. The changed542720-byte range matches TP8
+  KDA state: 3072*3*2 conv bytes + 8*128*128*4 recurrent bytes. Same physical
+  pages previously served KDA state on the cold request. All current inserts
+  remain exact; this is an overwrite, not an initially unwritten page.
+- Diagnostic caveat: the executor can run an already-queued next batch after
+  a worker failure. The initial1728-token cached chunk failed, followed by a
+  576-token chunk; the filename sparse-first-bad.pt was overwritten with the
+  later capture. Raw logs/write history preserve both attempts. Do not infer
+  the first failing query row from that filename or the later row count.
+- Found actual dispatch mismatch: GPUModelRunner inferred uniform decode
+  from token counts only. GDN/KDA metadata explicitly treats one-token
+  prompts/tail chunks as prefill, skipping the captured decode state-index
+  buffer update. FULL replay can consequently use stale KDA state slots,
+  now reallocated as another request's MLA prefix pages.
+- Regression uses actual V1 runner and CudagraphDispatcher plus the actual
+  GDN split helper: before fix9fail/6pass for fresh/tail/mixed batches at
+  c1/8/16/32. Fix checks the same CPU computed<prompt phase condition for
+  hybrid uniform candidates and excludes FULL for those prefills, including
+  any DP redispatch. Actual decode and explicit dummy-capture overrides keep
+  FULL. After fix22pass including existing V2 dispatch tests. No GPU sync,
+  cache disablement, context reduction, or alternate math path introduced.
+- Raw: glm53f-cached-extend-finite/attempt03/ andattempt04/, including source
+  snapshots, all-rank-input-summary.jsonl, sparse-analysis-rank0.json,
+  dispatch-before.log/dispatch-after.log. Eight diagnostic tests also pass.
+- CURRENT non-diagnostic registered TP8 boot: glm53f-hybrid-prefill-graph/
+  attempt01/, API95143/server session26209. Source snapshot and hash list
+  frozen. Quality script runs fresh-salted cold/prime/cached checks then
+  distinct-record cached recall c1/8/16/32. No competing GPU jobs. This is a
+  candidate correctness fix pending live qualification, not new TPS evidence.
+
+### 07:01 UTC: cached correctness passes all target concurrencies; probe cleanup
+
+- Candidate real-profile run completed successfully: cold prompt recalls in
+  41tokens, independently primed cached prompt recalls in42tokens with exactly
+  9216GPUhits/2853computed. Distinct-record cached canaries pass1/1,8/8,16/16,
+  32/32; respective prefix hits9216/73728/147456/294912, zeroexternalhits and
+  preemptions. Frozen source hashes allmatch. Fullcontext/BF16/tiers retained,
+  GPU pool4,304,412tokens andgraph0.22GiB unchanged. No exact TPS matrix ran.
+- All8rank attempt04 histories independently confirm affected pages46/49
+  were correctly inserted, then exactlyrows0..529 overwritten, trailing46
+  unchanged. Raw all-rank-overwrite-summary.jsonl records this check.
+- Important performance hygiene: attempt01 directly loaded diagnostic AOT
+  key45c089ab..., with probe functions runtime-disabled. Though there were
+  no active finite checks/synchronization, compiled diagnostic nodes may
+  remain. Do not use it as a production performance baseline.
+- Stopped owned API95143 cleanly after qualityclient82421 completed0;
+  server26209 completed0. Waited for CUDA resource teardown and verified all
+  8GPUs0MiB. Removed temporary model/KDA/MLA probes, compiler special handling,
+  glm5_next_debug.py andtest_finite_debug.py. These exact diagnostic sources
+  and test results remain recoverable in the attempt source snapshots.
+  Only the actual graph-dispatch fix and regression tests remain from this
+  correctness change; prior unrelated optimizations preserved.
+- Probe-free regression suite and restart prepared under
+  glm53f-hybrid-prefill-graph/attempt02/. Repeat quality then exact short/124K
+  c1/8/16/32 matrices serially, with passive telemetry, before any new tuning.
+
+- 07:04 continuation: probe-free regression suite35pass (including13 actual
+  prefill-query-map cases and22dispatch cases). New registered TP8 server
+  session51508/API102761 is booting; serial matrix9464/shell104454 waitshealth
+  inattempt02/run_matrix.sh. Freshsalt cold/cached then57recalls precede any
+  short1000/300 orlong124417/2000 exact timing. Sourcehashes/snapshots frozen;
+  passive telemetry starts onlyafterquality andendswithmatrix. No competing
+  GPUwork/profiler. Current cleanboot notyethealthy andno newTPSclaim.
+
+## 2026-09-10 07:16 UTC: probe-free short matrix qualified; production-shaped candidate gates
+
+- Status: short checkpoint complete; long matrix running. Same registered
+  TP8 profile with both prefill correctness fixes, full1M/BF16/tiers and
+  experimentalrowshard unchanged. No probe hooks, no activeprofiler, no
+  competing GPU workload. Prior turn made concrete correctness progress.
+- Cleanboot compiled fresh AOTde6565114...; GPU pool4,280,453tokens and
+  graph0.22GiB. Prior runtime-disabled diagnosticboot used4,304,412tokens;
+  this0.56% difference repeats an earlier firstcompile/cachedboot pattern.
+  No claim of a permanent fix-induced memory regression; restart stillneeded.
+- Correctness: original cold/cached reproducer passes again;57/57 distinct
+  cachedrecords pass at1/8/16/32 with expectedGPUhits, zero externalhits and
+  preemptions. Text/reasoning/image/tool canaries pass. Frozen sourcehashes
+  stillmatch. All12shortexactchecks pass1000in/300out, three repeats each:
+  c1[108.399467,108.924090,108.756832], median108.756832;
+  c8[489.245287,490.440566,487.558655], median489.245287;
+  c16[675.183879,682.569383,671.864795], median675.183879;
+  c32[923.031269,929.673105,924.461716], median924.461716.
+  Everyshortrequest computes1000tokens, no prefix/externalhits/preemptions.
+  These numbers qualify tested shortperformance, not fullproduction readiness.
+- Raw glm53f-hybrid-prefill-graph/attempt02/short-completed-summary.json;
+  telemetry-short-completed.json captured12short+firstlongexact run, allpass
+  andno sampledallGPUidle windows. Timing-window bounds are approximate.
+- CURRENT server51508/API102761/engine103620, matrix9464/shell104454,
+  longvalidator115285, passive telemetry110566. Long124417/2000 canariespass,
+  c1r1=102.39tok/s; remaininglongrepeats pending. Do not stop orlaunchGPU
+  candidates while this run owns the host. Matrixtrap owns telemetrycleanup.
+- Benchmark preparation only: found parked poolskip/querytile/splitquery
+  benchmarks used576-token indexerpages andtwo-column strides rather than
+  registered compact4608-token pages in aneleven-column slab. Updated both
+  benchmarks to default4608 andreport6,488,064-byte page stride, with a shared
+  page-major allocation helper. Added actualgeometry CPU launchcoverage and
+  GPU tests for4608pages and4607/4608/4611/4612 transitions. Arithmetic and
+  serving sources unchanged. Prior576micro results remain diagnostic, not
+  actualgeometry qualification.
+- CPU candidate tests59pass/47GPU skipped; lintpass. Score-elision offline
+  compile64/576/4608passes12KiBshared. Query/split offline entrypoints now
+  default4608 but have NOT been rerun at that geometry, norhaveGPU parity/
+  timings run. No candidate servingwiring. Hypothesis remains: skip unused
+  scores below513pools; amortize longprefillkeyloads overhomogeneousqueries.
+  Raw glm53f-pool-skip-geometry/ withtests/offlineoutputs/source snapshots.
+
+## 2026-09-10: campaign resumed - MTP, TP scaling, 1M qualification (operator: "Proceed")
+
+- Tree: the 09-07..09-10 sessions' uncommitted, profile-qualified work
+  is committed as the baseline (ac4cacd37); four candidate-prototype tests
+  quarantined as xfail. Fast gates: registry 65, tier 69, GLM 999 pass.
+- Baseline re-measured through the profile (validate_glm5_next.py, 1000
+  in / 300 out, two warmed repeats): c1 109.9 / c8 494.6 / c16 676.0 /
+  c32 929.9. Raw: perf/results/2026-09-10/glm53f-mtp-sweep/nospec/.
+- c1 is latency-bound, not idle-bound: GPU utilization 97% at c1 with 181 W
+  (278 W at c32); async scheduling is already on. The 09-09 decode census
+  counts ~1,490 kernels per token across four streams (847 on the main
+  stream, 4.76 ms). The TP-invariant residue is the kernel-latency floor,
+  so ownership-style collective fusion cannot reach the 1.5x gate at c1;
+  kernel-count reduction and MTP can.
+- MTP: the registered k=1 adapter loses at c1 (95.7 vs 105.2 tok/s on the
+  equal-feature baseline) despite a healthy mean acceptance length of 1.71
+  (of 2): a speculative step costs ~17.9 ms vs 9.5 ms plain. ROOT CAUSE:
+  llm_base_proposer.initialize_cudagraph_keys gives the drafter PIECEWISE
+  graphs only when the main mode's mixed_mode is PIECEWISE/FULL; the
+  record's FULL_DECODE_ONLY = (FULL, NONE) resolves the drafter to NONE,
+  so every draft pass ran eager (hundreds of Python launches). Sweep 4
+  reruns k = 1/3/5 under FULL_AND_PIECEWISE with a matching non-spec arm.
+- Two record features refuse speculation at construction (indexer row
+  sharding, sparse tensor-core decode). Both are per-row and structurally
+  fine with speculative rows; guards relaxed (tests updated: 51 pass),
+  serving validation owed once MTP earns its place. Row sharding off
+  costs nothing at 1000-token context (c16 +1.6%); TC decode off costs
+  3-4% - the sweep baseline has both off for a fair comparison.
+- MTP k sweep under FULL_AND_PIECEWISE (drafter gets piecewise graphs),
+  row shard + TC decode off on every arm, validate_glm5_next.py 1000/300
+  two warmed repeats, aggregate tok/s (mean acceptance length in
+  parentheses; nospec = the full-feature record):
+  | arm            | c1    | c8    | c16   | c32   |
+  | nospec (record)| 109.9 | 494.6 | 676.0 | 929.9 |
+  | fp-nospec-min  | 104.2 | 483.4 | 667.5 | 902.9 |
+  | fp-k1 (1.72)   | 100.2 | 456.6 | 684.9 | 892.4 |
+  | fp-k3 (1.96)   | 117.1 | 410.0 | 598.5 | 472.0 |
+  | fp-k5 (1.96)   |  99.6 | 399.6 | 271.2 | 451.6 |
+  k=3 is the c1 sweet spot (+12% over its equal-feature baseline, +6.5%
+  over the record); acceptance saturates at ~1.96 from k=3 on, so k=5
+  only adds draft cost; c8+ loses at every k and c32 halves (verify rows
+  exceed the 64-token capture set). A speculative step still carries a
+  fixed ~7 ms regardless of k (16.7 ms at k=3 vs 9.6 plain), unexplained
+  on the V1 runner. Raw: perf/results/2026-09-10/glm53f-mtp-sweep/.
+- OPERATOR DIRECTIVE (2026-09-10 17:50): V2 model runner only; V1 is
+  deprecated (banner in gpu_model_runner.py, warning at the selection
+  point in gpu_worker.py). GLM-5.3-Flash currently runs on V1 (hybrid,
+  not in DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES) and its MTP adapter is
+  V1-only, so the sweep above is a V1 result and the census/k=4 arms
+  were dropped. Next: GLM on V2, then incoai/GLM-5.3-Flash-DFlash2
+  (operator's choice) through the V2 DFlash2 speculator. Tap contract from
+  SGLang PR 36708: aux hidden state at layer k = hc_contract(stream
+  tensor after layer k) = mean over the 4 mHC streams.
+
+## 2026-09-10: GLM-5.3-Flash moved to the V2 model runner; DFlash2 drafter registered
+
+- V1 deprecated (banner + selection warning, 633f988d5). glm5_next was on
+  V1 because hybrids need an explicit V2 qualification; both GLM
+  architectures are now in DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES. First V2
+  boot of the registered TP8 record: health, 4,306,451-token pool (V1:
+  4,280,453), no V2-unsupported-feature warnings. Validation below.
+- incoai/GLM-5.3-Flash-DFlash2 (revision bf582e4e, 2.34 GB bf16, 81
+  tensors, no own embedding/head) is the registered speculator of the
+  glm53f-nvfp4 source (dflash, block 8, up to 7 drafts), replacing the
+  V1-only checkpoint-MTP adapter. Target side: glm5_next now implements
+  the EAGLE-3 aux-hidden-state interface; a tap at layer k is the mean over
+  the four mHC streams of layer k's completed output (glm5_mhc_post of the
+  layer's MLP output against its residual, then mean(dim=1)), matching
+  SGLang PR 36708's hc_contract; taps (6, 15, 25, 34, 43) in the +1
+  convention = target_layer_ids [5, 14, 24, 33, 42]. The V2 DFlash2
+  speculator borrows the target's embed_tokens/lm_head through
+  get_language_model(). Registry: 65 pass; CPU MTP/registry contracts 86.
+- V2 probe validated (validate_glm5_next.py, two warmed repeats): c1 109.6 /
+  c8 490.3 tok/s vs the V1 record's 109.9 / 494.6 - the same throughput
+  class; text (+reasoning), image, tool canaries pass. Raw: perf/results/
+  2026-09-10/glm53f-v2-runner-probe/. glm5_next is V2 by default from here.
+- DFLASH2 ON V2 WORKS. First arm (k=3, registered record otherwise
+  unchanged, FULL_DECODE_ONLY): c1 153.3 / c8 514.8 / c16 677.8 tok/s vs
+  the non-spec record 109.9 / 494.6 / 676.0 (+40% / +4% / 0%), mean
+  acceptance length 2.23 (of 4), text/image/tool canaries pass, KV pool
+  3,082,532 tokens (the drafter's weights + KV take ~1.2M tokens of pool).
+  The first boot failed on method resolution (SupportsEagle3's concrete
+  defaults preceded the GLM mixin in the bases; fixed) and k=7 on the
+  compact indexer cache's five-token ring cap (8-row raw ring; widening
+  it is a page-geometry change, deferred). Raw: perf/results/2026-09-10/
+  glm53f-dflash2/d3/. k=5 arm running; c32/c64 and a per-batch schedule
+  follow before the record flips to speculative by default.
+- DFlash2 k=5: c1 155.8 / c8 471.7 / c16 336.5, acceptance 2.40 - +1.6% at
+  c1 over k=3 for -8% at c8 and a halving at c16 (16 x 6 verify rows
+  overflow the 64-token capture set). k=3 is the small-batch choice; a
+  per-batch schedule arm (k=3 to 8 requests, k=1 above, capture 128,
+  c1..c64) decides the drop point. Raw: glm53f-dflash2/d5/.
+- Per-batch schedule: the V2 DFlash speculator drafts a FIXED block and
+  asserts on any partial k ("DFlash drafts a fixed block of 3; the
+  scheduler asked for num_steps=1"), so [[1,8,3],[9,64,1]] died at c16
+  (c1 156.8 / c8 482.6 before the death). Its own contract: schedules pair
+  k with 0 only (the runner skips drafting above the range). Rerunning
+  as [[1,8,3],[9,64,0]] through c64. Raw: glm53f-dflash2/sched3-1/.
+- DFlash2 arms through c64 (two warmed repeats; c1 medians hide a wide
+  spread because acceptance is sampled-text dependent at temperature 1.0):
+  | arm                                   | c1    | c8    | c16   | c32   | c64    |
+  | static k=3, capture 64 (d3)           | 153.3 | 514.8 | 677.8 | -     | -      |
+  | static k=3, capture 256 (d3-cap256)   | 183.2 | 509.0 | 687.9 | 818.7 | 965.5  |
+  | [[1,8,3],[9,64,0]], capture 64        | 125.8 | 472.7 | 662.1 | 899.1 | 1089.7 |
+  | non-spec record                       | 109.9 | 494.6 | 676.0 | 929.9 | (931.9 09-06) |
+  Per-run c1 throughput tracks the run's acceptance length exactly
+  (213.6 tok/s at 3.20, 116.8 at 1.55); the STEP RATE is 71-75 steps/s in
+  every arm (14 ms per speculative step vs 9.1 ms plain, ~2.2 tokens per
+  step), so neither the capture set nor the dynamic-schedule path costs
+  anything at c1, and the c1 gain is (mean acceptance) x 9.1/14 =
+  +40..45% at the measured 2.2 acceptance. k=3 through c16 (level or
+  better), 0 above (c32 loses 12% with k=3; c64 with drafting skipped
+  reaches 1089.7). Final schedule arm [[1,16,3],[17,64,0]] with capture
+  256 running before the record flips.
+- Final schedule arm [[1,16,3],[17,64,0]], capture 256: c1 141.6 (runs
+  117.2 @1.58 / 165.9 @2.35 acceptance), c8 503.4, c16 693.2, c32 891.6,
+  c64 1076.1. Above 16 requests drafting is skipped except during ramp
+  and drain (acceptance 1.5-1.7 there), costing ~4% at c32 vs non-spec;
+  c64 matches the k=0 arm (1089.7), which also says today's non-spec
+  c64 is ~1080-1090, not the 931.9 of 09-06. RECORD: glm53f-nvfp4-8 goes
+  speculative by default with this schedule. Raw: glm53f-dflash2/
+  sched16-0-cap256/.
+- RECORD FLIPPED (e6c876c9e): glm53f-nvfp4-8 speculative by default -
+  DFlash2, [[1,16,3],[17,64,0]], capture 256. Through `slimserve --serve`,
+  three warmed repeats, medians: c1 153.6 / c8 495.0 / c16 687.3 / c32
+  879.5 / c64 1074.5 (acceptance 2.0-2.3 at c1-c16; 1.5-1.7 at c32/c64
+  ramp/drain); canaries pass; pool 3,082,532 tokens; no V1 fallback.
+  Forced-eviction tier acceptance, WildChat leg and the 1M-context leg
+  run next on this record. Raw: perf/results/2026-09-10/glm53f-final-spec/.
+- First tier acceptance on the speculative record FAILED (client timeout):
+  the DFlash2 drafter's five sliding-window layers form KV group 13
+  (SlidingWindowSpec, block 1152); the connector counted it as an
+  attention group, planned a restore into it, found no target block at
+  position 1 (null outside the 2048-token window), dropped the plan and
+  left the request in WAITING_FOR_REMOTE_KVS forever (1 hit, 0 restores,
+  3 tail saves; the churn never got past the build phase). Two fixes
+  (640a9a3d0, 49 tier tests): window-only groups beside mamba state leave
+  the tier-managed set and are zeroed with the final restore chunk (the
+  drafter rebuilds its window from the taps; only acceptance is affected,
+  drafts are verified), and an unstageable restore now fails closed -
+  the promised GPU blocks are reported as failed loads through the
+  worker (invalid_block_ids) and the request is released to recompute.
+  The acceptance reruns after the WildChat leg, ahead of the 1M leg.
+- WildChat leg on the speculative record (before the connector fixes
+  booted): 71/72 marker recalls, prefix hit 85.4%, 191 tier hits and
+  restores over 38 minutes of forced eviction, then the engine died at
+  20:14:24 in `scheduler.schedule -> allocate_slots ->
+  BlockPool.get_new_blocks` with `assert block.ref_cnt == 0`: a block
+  came off the free list holding a reference, i.e. an earlier double
+  free or an in-place refcount write on a free-list block. Eight
+  sessions errored at the death. The last scheduler event was a pinned
+  boundary-state save. Static tracing of every refcount writer (tail
+  pins touch/free through the same per-group pool; CoW retentions
+  release through the multi-pool free helper; the two in-place
+  increments in the mamba manager act on blocks already off the free
+  list) did not isolate the site, so the block pool now fails fast at
+  the offending call instead: a second append of a block into the free
+  list, a free below zero, or a touch of a block sitting in the free
+  list raises with the block id (`kv_cache_utils._assert_unlinked`,
+  `BlockPool.free_blocks/touch`); the leg reruns on that tree
+  (`glm53f-leg-spec-instr`) after the tier acceptance. The 1M leg is
+  parked until the root cause is fixed. Raw: perf/results/2026-09-10/
+  glm53f-leg-spec/ (server.log holds the traceback).
+- Tier acceptance RERUN on the speculative record with the connector
+  fixes (window group 13 excluded and zeroed; fail-closed restores):
+  PASS. 6/6 markers recalled after a 3,891,841-token churn of the
+  3,096,255-token pool; 20 hits, 20 restores staged, failed_closed 0,
+  2,578 tail saves, VLLM_KV_TIER_VERIFY 160 batches / 0 mismatched.
+  Log: "window-only groups [13] are not tier-managed (zeroed on
+  resume)". No block-pool assert in this run (20 restores; the leg
+  needed ~190). Raw: perf/results/2026-09-10/glm53f-final-spec-tier2/.
+
+## 2026-09-10: operator decision - glm53f-nvfp4-8 goes TP4 x DP2; prefix-affinity DP routing
+
+- Operator (2026-09-10): "we should use DP2 since we will always be c8+ in
+  prod", reversing the 09-03 TP8 decision. The 09-03 matrix's DP2 c1 loss
+  (67.2 vs TP8 83.0) decomposes as TP4-replica latency (standalone TP4
+  73.6, 4.1 s vs 3.6 s per 1000/300 request) plus a 10% DP overhead on
+  the active replica (4.5 s under DP2) that the operator regards as an
+  implementation bug to chase. EP stays off (loses everywhere).
+- Queue on the GPUs, in order: instrumented WildChat leg (block-pool
+  double free), matrix on today's tree with the record's full config and
+  DFlash2 (mx-tp8, mx-tp8-ep, mx-tp4dp2, mx-tp4dp2-ep at c1-c64), a
+  standalone mx-tp4 arm to isolate the DP overhead, then the DFlash2 k=4
+  arms. The record flips once mx-tp4dp2 passes canaries + exact, then the
+  full gate set (text/image canaries, exact, tier acceptance, leg) runs
+  through `slimserve --serve`.
+- Prefix-affinity routing for the DP load balancer
+  (vllm/v1/engine/dp_prefix_affinity.py, wired into DPLBAsyncMPClient):
+  each replica owns its prefix cache and KV tiers and the balancer picked
+  the least-loaded replica, so a continued conversation re-prefilled its
+  whole history on the wrong replica about half the time. The router
+  keeps a bounded per-replica memory of routed prompt block hashes
+  (chained blake2b over full blocks, cache_salt-seeded; local, so only
+  self-consistent) and charges cost = prompt_tokens - matched_prefix
+  + LOAD_TOKENS x (waiting*4 + running); with no history it is
+  least-loaded, a long cached history outweighs a moderate imbalance but
+  not a severe one. Env: VLLM_DP_PREFIX_AFFINITY (default on),
+  VLLM_DP_PREFIX_AFFINITY_LOAD_TOKENS (2048), _BLOCKS (262144 per
+  replica). 9 unit tests incl. the balancer request path. NOT yet live:
+  the DP2 validation runs measure it (multi-turn recall on the leg is the
+  check: hit rate must not halve under DP2).
+- DP OVERHEAD ROOT CAUSE (code + boot evidence): with expert parallel off,
+  vLLM's FusedMoEParallelConfig.make flattens the MoE tensor-parallel
+  group across DP (tp_size = dp x tp, rank = dp_rank x tp + tp_rank), so
+  "TP4 x DP2" holds only 1/8 of every expert per rank and every MoE layer
+  all-gathers tokens across both replicas (naive dispatch/combine on the
+  EP group), which is also why idle replicas must dummy-step in lockstep
+  and why the runner syncs token counts across DP every step. Boot logs
+  prove it: model weights 24.96 GiB/rank under TP4 x DP2 vs 44.89 GiB at
+  plain TP4 (perf/results/2026-09-02/glm53-8gpu-matrix/{tp4dp2,tp4}).
+  So the 09-03 "DP2" arm was TP4 attention over TP8 MoE in lockstep, not
+  two independent engines; its 10% c1 loss vs standalone TP4 is that
+  coupling. New `--data-parallel-replicate-moe` (ParallelConfig
+  data_parallel_replicate_moe): each replica keeps the full expert set
+  sharded over its own TP group (moe dp_size 1: no naive dispatch), the
+  forward context builds no DPMetadata, the V2 runner dispatches the
+  batch descriptor locally instead of the cross-DP all-reduce, and an
+  idle replica yields instead of dummy-stepping. Rejected with EP. Costs
+  dp x expert memory (fits: 45 GiB/rank on 80 GB). 4 unit tests
+  (tests/model_executor/test_moe_parallel_config_replicate.py). The
+  matrix now runs mx-tp4dp2 (replicated) beside mx-tp4dp2-flat (default
+  flattening) and mx-tp4 (standalone) - the replicated arm's c1 should
+  match standalone TP4 and its c8+ should beat the flattened arm.
+- Leg 2 (fail-fast invariants) and leg 3 (+ cross-pool checks) on the
+  speculative record both died the same way after ~35 min at c8 under
+  tier restores (154-160 hits): leg 2 `popleft_n` walked off the free
+  list with num_free_blocks still positive; leg 3 popped the fake tail
+  sentinel (block -1, ref_cnt 1) - the list is shorter than its count,
+  and no double append, negative free, or cross-pool touch/free was
+  reported. Recall stayed 68/68 and 72/72 until the death; 8 sessions
+  error at the death each time. The free list now carries a shadow
+  membership set checked at every mutating call (commit after
+  7a453f9b3); leg 4 (`glm53f-leg-spec-instr3`, queue4.sh) runs on it.
+  Raw: perf/results/2026-09-10/glm53f-leg-spec-instr{,2}/.
+- DP2 arms (queue2) all failed to boot: the record's
+  glm5_next_indexer_row_shard is TP8/DP1-only ("Indexer row sharding
+  requires SM80, TP8/DP1/PP1, 32 indexer heads and the compact cache"),
+  as did the standalone TP4 arm. Rerun (queue3.sh) with the row shard
+  off on all four arms. k=4 arms: pure k=4 died on the record's k=3
+  schedule ("DFlash drafts a fixed block of 4; the scheduler asked for
+  num_steps=3" - a static k must come with a matching schedule) and the
+  scheduled k=4 arm hit a stale output directory; both rerun in queue4.
+- TP8-only kernel guards generalized to TP4 (2026-09-11): the sparse
+  tensor-core decode Triton kernel already tiles 16 query rows per token
+  (`h = arange(16)`, masked at H=8) and compile_only covered H=16, so
+  `_sparse_tc_option`/`_sparse_tc_split` now accept 8 or 16 heads per
+  rank; the GPU parity suite (tests/glm5_next/test_sparse_tc_candidate.py,
+  48 cases incl. every heads=16 geometry) passes on one A100 slice. The
+  indexer row shard shards R in (16, 32) rows over the replica's own TP
+  group, so it accepts TP4 (4/8 rows per rank) and DP replicas; the
+  all_gather still runs on the live pynccl communicator of that TP group.
+  Dispatch tests 51 pass. queue5 runs the TP4/DP2 arms with both kernels
+  OFF (baseline), queue6 reruns mx-tp4dp2 and mx-tp4 with both ON; the
+  record flip (flip_dp2.py) takes whichever the arms qualify.
+- Leg 4 (04:16-04:52, shadow-set check) FIRED: `FreeKVCacheBlockQueue.
+  popleft_n (pool 0): num_free_blocks=4862 but the list holds 4790
+  blocks` after 36 min at c8 (69/69 recall, 8 sessions errored at the
+  death). No code outside the queue writes list pointers and every pool
+  has its own pool_id, so a count that outruns the list can only come
+  from appending a second object that carries an already-linked block
+  id; the append now raises there with that object's pool id and
+  refcount (e4f3fe151). Leg 5 reruns on it (queue5, results
+  2026-09-11/glm53f-leg-spec-instr3). Raw of leg 4: the failure text in
+  ~/.local/scratch/glm53/queue4.log (its server.log was overwritten by
+  a concurrent chain - two queue scripts raced for the GPUs between
+  03:00 and 05:10; only queue5/queue6 remain).
+- First DP2 numbers on today's tree (flattened default MoE, DFlash2 on,
+  row shard + sparse TC off, from the raced 03:20 arm): canaries PASS;
+  c1 172.1/91.2, c8 510.6/425.6, c16 729.5/766.7, c32 959.1/992.9, c64
+  1149.8/1188.2 tok/s; weights 26.36 GiB/rank. Already +6-10% over the
+  TP8 record at c16-c64 (687.3 / 879.5 / 1074.5) without the replicated
+  MoE. The replicated arm booted with 46.28 GiB/rank (full expert set
+  per replica, as designed) but was cut off by the queue reshuffle; it
+  reruns in queue5. Raw: perf/results/2026-09-10/glm53f-dflash2/
+  mx-tp4dp2-flat-0320/.
+
+## 2026-09-11: 8-GPU matrix on today's tree (DFlash2 on, record config)
+
+Exact-token c1/c8/c16/c32/c64, two repeats each (r1/r2), canaries pass
+unless noted; TP4 arms with the two TP8-only kernels OFF unless "-k".
+Raw: perf/results/2026-09-10/glm53f-dflash2/mx-*/.
+
+| arm | weights/rank | pool tokens | c1 | c8 | c16 | c32 | c64 |
+|---|---|---|---|---|---|---|---|
+| TP8 record (09-10, kernels on) | 24.0 GiB | 3.08M | 153.6 | 495.0 | 687.3 | 879.5 | 1074.5 |
+| tp8-ep | 24.0 | 3.08M | 111/119 | 504/490 | 673/658 | 860/863 | 1049/1050 |
+| tp4dp2-flat (default DP: flattened MoE) | 26.4 | 2.87M | 166/123 | 504/487 | 757/733 | 930/932 | 1145/1145 |
+| tp4dp2-ep | 26.4 | 2.78M | 100/85 | 440/418 | 617/611 | 860/854 | 1051/1062 |
+| tp4 standalone (4 GPUs) | 46.3 | 1.67M | 131/130 | 379/393 | 503/493 | 650/653 | 795/791 |
+| tp4-k standalone (row shard + sparse TC on) | 46.3 | 1.65M | 138/155 | 412/409 | 524/501 | 680/676 | 794/793 |
+| tp4dp2 replicated MoE | 46.3 | 1.67M | HANG | | | | |
+| tp4dp2-k replicated MoE, kernels on | 46.3 | 1.65M | HANG | | | | |
+
+- Flattened DP2 beats the TP8 record at c16/c32/c64 by +8% / +6% / +7%
+  even with both TP8-only kernels off, and matches c8; its c1 is
+  bimodal with acceptance (166 vs 123) like every DFlash arm.
+- EP loses everywhere again (tp8-ep -28% c1, tp4dp2-ep -13% c8).
+- The TP4-generalized kernels are worth +6% c1/c8 and +4% c16/c32 on a
+  standalone TP4 engine (tp4-k vs tp4).
+- Replicated-MoE DP2 boots (46.3 GiB/rank = full expert set per
+  replica) but the FIRST request hangs: "RPC call to sample_tokens timed
+  out" on DP0 300 s after the canary - a cross-replica collective is
+  still being entered by the active replica while the idle replica no
+  longer dummy-steps. Reproducing under py-spy to find it.
+- k=3/k=4 arms all died with a torch.compile shape-guard assert
+  ("expected size 3==4, stride 12288==16384") - the drafter's compiled
+  graph is keyed without the DFlash block size, so k=3 and k=4 share a
+  cache entry (the compile-cache A/B hazard). Fix owed: fold the draft
+  block size into the compile hash; rerun the k arms after.
+- Replicated-DP2 hang root cause (code): the V2 speculator base
+  (`vllm/v1/worker/gpu/spec_decode/speculator.py`) keeps its own
+  `dp_size` and the DFlash proposer calls `dispatch_cg_and_sync_dp` with
+  it, so the active replica entered the drafter's cross-DP all-reduce on
+  its first speculative step while the idle replica, which no longer
+  dummy-steps in replicated mode, never joined - "RPC call to
+  sample_tokens timed out" 300 s after the canary. Fixed (db08f2fbe):
+  the speculator and the cudagraph manager use a DP sync size of 1 under
+  data_parallel_replicate_moe, matching the runner. Also keyed the
+  compile cache by draft block size for block drafters (2705757ee).
+  Queue: probe (py-spy stacks of the hang, dp2hang/) -> leg 6 with
+  VLLM_FREE_LIST_TRACE=1 (queue7) -> mx-tp4dp2-k2, the replicated arm
+  with the fix and both TP4 kernels on (queue8) = record candidate.
+- BLOCK-POOL FAULT ROOT CAUSE (leg 6 trace, 10:26): the last free-list
+  mutation before the divergence was `popleft_n n=0` through the slow
+  path - a NEGATIVE count. `single_type_kv_cache_manager.
+  allocate_external_computed_blocks` asks the pool for
+  `cdiv(local + external tokens, block) - len(req_blocks)`, and when the
+  local prefix hit already holds more blocks than the external (tier)
+  tokens extend to, that is negative; `get_new_blocks` only checked the
+  upper bound and `popleft_n(-k)` did `num_free_blocks -= n`, adding k to
+  the count while linking nothing. Every leg death fits: the count runs
+  ahead of the list by sums of small k (16/72/88), until an allocation
+  walks past the tail and pops a sentinel or a still-referenced block
+  (the original `assert block.ref_cnt == 0`). Fix: the pool and the queue
+  reject negative counts, and the external allocation clamps at zero with
+  a one-time warning naming the manager/group/block size and token counts
+  (tests/v1/core/test_block_pool_negative_alloc.py). The fail-fast
+  invariants and the trace ring stay (trace env-gated). The WildChat leg
+  and the 1M leg on the DP2 record rerun on this tree.
+- DP2 RECORD WildChat leg PASS on the fixed tree (11:31-12:49, the
+  1.25 h cap, c8, ctx-target 1M): 557 turns, 0 errors, 88/88 marker
+  recalls, max context 476,986 (median 444,044), 123.1M prompt tokens,
+  432 tier hits, no free-list divergence. The negative-allocation clamp
+  fired 51 distinct times, all of the shape "FullAttentionManager (group
+  10/11, block 1152): local hit holds 344 blocks but local 0 + external
+  387072 tokens need 336": the attention groups had a full local prefix
+  hit while a lagging group (KDA state) missed, so the scheduler took the
+  connector's external path for the whole prefix and the tier restored
+  content the attention groups already held (identical bytes - benign,
+  but wasted restore bandwidth). Follow-up: skip restore ops for
+  attention blocks the local hit already covers. Raw: perf/results/
+  2026-09-11/glm53f-leg-dp2/.
+- DP2 RECORD 1M-context leg (12:54-14:20, c2, ctx-target 1,040,000,
+  tiers + byte verify): both sessions reached target (max 1,047,243,
+  median 1,043,755), 168 turns, 0 errors, 88.1M prompt tokens, tier 130
+  hits / 164 tail saves / 520 verify batches 0 mismatched, no free-list
+  fault. Recall 25/28: the three failures are all above 900K context
+  (902,755 / 905,237 / 980,301). Six clamp events at 13:19 (a 866,304-
+  token restore where the attention groups already held 760-768 local
+  blocks) precede them; whether the misses are the model's own limit
+  near 1M or a restore/recompute seam is open, so two controls run now
+  (queue12): the same 1M leg on the TP8 layout and a DP2 repeat. Raw:
+  perf/results/2026-09-10/glm53f-1m-leg/dp2-1m/.
+- k=3 vs k=4 on the DP2 record (compile cache keyed by k, c1/c8/c16/c32/
+  c64 medians of two): k=3 static 142.5 / 551.2 / 820.7 / 1011.6 /
+  1193.2 (acceptance 2.21); k=4 static 100.0 / 556.1 / 727.3 / 893.1 /
+  1092.0 (2.27); k=4 scheduled [[1,16,4],[17,64,0]] 168.3 / 513.4 /
+  726.6 / 885.6 / 1122.6. k=4 loses c16-c64 by 8-11%: acceptance barely
+  moves (2.21 -> 2.27) while every step verifies one more draft token.
+  DECISION: the record keeps k=3. Raw: perf/results/2026-09-10/
+  glm53f-dflash2/dp2-{k3-pair,k4,sched16-0-k4}/.

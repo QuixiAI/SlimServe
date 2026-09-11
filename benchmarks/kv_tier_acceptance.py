@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 import time
 import urllib.request
@@ -169,6 +170,44 @@ def _metrics(base: str) -> dict[str, float]:
     return out
 
 
+def _churn(fill, target_tokens: int, estimated_tokens: int, concurrency: int):
+    """Submit distinct fillers until reported prompt usage meets the target.
+
+    Token estimates size batches only. They are not eviction evidence; actual
+    tier-hit counters and byte verification remain separate acceptance gates.
+    """
+    if min(target_tokens, estimated_tokens, concurrency) <= 0:
+        raise ValueError("churn target, estimate and concurrency must be positive")
+    records = []
+    total = 0
+    with ThreadPoolExecutor(max_workers=concurrency) as ex:
+        while total < target_tokens:
+            estimate = total / len(records) if records else estimated_tokens
+            count = min(concurrency, math.ceil((target_tokens - total) / estimate))
+            first = len(records)
+            for record in ex.map(fill, range(first, first + count)):
+                tokens = record["prompt_tokens"]
+                if type(tokens) is not int or tokens <= 0:
+                    raise ValueError(
+                        "filler response must report positive prompt_tokens"
+                    )
+                total += tokens
+                records.append(record)
+            print(
+                json.dumps(
+                    {
+                        "churn_progress": {
+                            "fillers": len(records),
+                            "prompt_tokens": total,
+                            "target_tokens": target_tokens,
+                        }
+                    }
+                ),
+                flush=True,
+            )
+    return records, total
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--base-url", default="http://127.0.0.1:8001")
@@ -181,6 +220,13 @@ def main() -> int:
         help="GPU KV pool size in tokens (boot log: 'GPU KV cache size')",
     )
     ap.add_argument("--filler-tokens", type=int, default=55000)
+    ap.add_argument(
+        "--churn-factor",
+        type=float,
+        default=1.0,
+        help="minimum actual filler prompt tokens / GPU pool tokens; increase "
+        "to force host demotion as well, then verify actual disk restores",
+    )
     ap.add_argument(
         "--filler-concurrency",
         type=int,
@@ -203,6 +249,14 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
+    if (
+        not math.isfinite(args.churn_factor)
+        or args.churn_factor <= 0
+        or min(args.pool_tokens, args.filler_tokens, args.filler_concurrency) <= 0
+    ):
+        ap.error(
+            "pool/filler sizes, concurrency and finite churn factor must be positive"
+        )
 
     base = args.base_url.rstrip("/")
     depths = [int(d) for d in args.depths.split(",")]
@@ -264,11 +318,45 @@ def main() -> int:
         print(json.dumps({"planted": rec}), flush=True)
         convos.append((convo, rec))
     # Phase 2: evict the whole GPU pool once with distinct fillers.
-    n_fill = args.pool_tokens // args.filler_tokens + 2
+    target_tokens = math.ceil(args.pool_tokens * args.churn_factor)
     planted_tokens = sum((r["prompt_tokens"] or 0) for _, r in convos)
+    t_ev = time.monotonic()
+
+    def fill(j):
+        response, ttft = _chat(
+            base,
+            args.model,
+            [
+                {
+                    "role": "user",
+                    "content": _filler(10_000 + j, args.filler_tokens) + "\nReply OK.",
+                }
+            ],
+            8,
+            args.seed,
+        )
+        return {
+            "id": j,
+            "prompt_tokens": (response["usage"] or {}).get("prompt_tokens"),
+            "usage": response["usage"],
+            "ttft_s": ttft,
+        }
+
+    filler_records, filler_prompt_tokens = _churn(
+        fill, target_tokens, args.filler_tokens, args.filler_concurrency
+    )
+    n_fill = len(filler_records)
+    evict_s = time.monotonic() - t_ev
+    eviction = {
+        "fillers": n_fill,
+        "prompt_tokens": filler_prompt_tokens,
+        "target_tokens": target_tokens,
+        "evict_s": round(evict_s, 1),
+    }
+    print(json.dumps({"evicted": eviction}), flush=True)
     capacity_bound = False
     if args.arena_tokens:
-        offloaded = planted_tokens + n_fill * args.filler_tokens
+        offloaded = planted_tokens + filler_prompt_tokens
         capacity_bound = offloaded > args.arena_tokens
         print(
             json.dumps(
@@ -277,7 +365,7 @@ def main() -> int:
                         "arena_tokens": args.arena_tokens,
                         "pool_tokens": args.pool_tokens,
                         "planted_tokens": planted_tokens,
-                        "filler_tokens": n_fill * args.filler_tokens,
+                        "filler_tokens": filler_prompt_tokens,
                         "capacity_bound": capacity_bound,
                     }
                 }
@@ -292,29 +380,6 @@ def main() -> int:
                 "miss below is a CAPACITY result.",
                 flush=True,
             )
-    t_ev = time.monotonic()
-
-    def fill(j):
-        _chat(
-            base,
-            args.model,
-            [
-                {
-                    "role": "user",
-                    "content": _filler(10_000 + j, args.filler_tokens) + "\nReply OK.",
-                }
-            ],
-            8,
-            args.seed,
-        )
-
-    with ThreadPoolExecutor(max_workers=args.filler_concurrency) as ex:
-        list(ex.map(fill, range(n_fill)))
-    evict_s = time.monotonic() - t_ev
-    print(
-        json.dumps({"evicted": {"fillers": n_fill, "evict_s": round(evict_s, 1)}}),
-        flush=True,
-    )
     # Phase 3: probe every depth; each must now come from the host tier.
     results = []
     for convo, rec in convos:
@@ -352,7 +417,13 @@ def main() -> int:
         results.append(rec)
     with open(args.out, "w") as f:
         json.dump(
-            {"args": vars(args), "results": results, "capacity_bound": capacity_bound},
+            {
+                "args": vars(args),
+                "results": results,
+                "capacity_bound": capacity_bound,
+                "eviction": eviction,
+                "filler_records": filler_records,
+            },
             f,
             indent=1,
         )

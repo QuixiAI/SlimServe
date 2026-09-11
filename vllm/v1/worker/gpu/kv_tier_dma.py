@@ -24,16 +24,16 @@ Ordering contract:
 from __future__ import annotations
 
 import contextlib
-import hashlib
 import os
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 
 from vllm.logger import init_logger
-from vllm.v1.worker.gpu.kv_tier_nvme import PAGE, DiskOp, NvmeTierFile
+from vllm.v1.worker.gpu.kv_tier_nvme import PAGE, DiskOp, NvmeTierFile, _row_digest
 
 logger = init_logger(__name__)
 
@@ -41,7 +41,7 @@ _VERIFY = os.environ.get("VLLM_KV_TIER_VERIFY", "0") == "1"
 
 
 def _digest(t: torch.Tensor) -> str:
-    return hashlib.sha1(t.cpu().numpy().tobytes()).hexdigest()[:12]
+    return _row_digest(t.cpu().numpy())
 
 
 @dataclass
@@ -54,12 +54,12 @@ class TierOpBatch:
     # GPU blocks to zero with the batch (a resumed request's ring block:
     # the framework never zeroes ring blocks, so this is defensive
     # determinism over the stale-claimed bytes internal hits run on).
-    zero: list[int] = None  # type: ignore[assignment]
+    zero: list[tuple[int, int]] = None  # type: ignore[assignment]  # (gpu_block, kv_group)
     # NVMe tier: write-through (host_slot, disk_slot) of rows whose GPU ->
     # host copy an EARLIER batch produced (the scheduler stages them one
     # confirmation later); promotion reads (disk_slot, host_slot) that must
     # land before this request's restore copies run.
-    disk_writes: list[tuple[int, int]] = None  # type: ignore[assignment]
+    disk_writes: Sequence[tuple[int, int] | tuple[int, int, int]] = None  # type: ignore[assignment]
     disk_reads: list[tuple[int, int]] = None  # type: ignore[assignment]
     req_id: str | None = None
 
@@ -156,10 +156,20 @@ class KVTierDMA:
         device: torch.device,
         group_nbytes: dict[int, int] | None = None,
         disk: NvmeTierFile | None = None,
+        pool_backings: dict[int, tuple[torch.Tensor, int]] | None = None,
+        gid_pool: dict[int, int] | None = None,
     ):
         assert backing.dtype == torch.int8 and backing.is_cuda
         assert backing.numel() % block_stride == 0
         self.blocks = backing.view(-1, block_stride)
+        # Multi-pool packed slab: other page-size classes keep their own
+        # (smaller) backing; ops carry the group id, which selects the view.
+        self._pool_blocks: dict[int, torch.Tensor] = {0: self.blocks}
+        for pool, (pb, pstride) in (pool_backings or {}).items():
+            assert pb.dtype == torch.int8 and pb.is_cuda and pb.numel() % pstride == 0
+            assert pstride <= block_stride, "pool stride exceeds the arena row"
+            self._pool_blocks[pool] = pb.view(-1, pstride)
+        self._gid_pool = dict(gid_pool or {})
         self.disk = disk
         if disk is not None:
             assert disk.slot_bytes == padded_stride(block_stride)
@@ -195,6 +205,7 @@ class KVTierDMA:
         # op id -> ("w", batch_seq) | ("r", req_id)
         self._disk_ops: dict[int, tuple[str, Any]] = {}
         self._write_remaining: dict[int, int] = {}
+        self._write_failed: set[int] = set()
         self._disk_done: list[int] = []
         self._read_remaining: dict[str, int] = {}
         self._read_failed: set[str] = set()
@@ -285,13 +296,17 @@ class KVTierDMA:
                         self._slot_digests[host_slot] = d
                         self._slot_nbytes[host_slot] = n
             if kind == "w":
+                if err is not None:
+                    self._write_failed.add(key)
                 left = self._write_remaining[key] - 1
                 if left <= 0:
                     del self._write_remaining[key]
                     # A failed write leaves the disk slot unconfirmed for
                     # the scheduler (never reported done): the block stays
                     # host-resident and the trajectory is not demotable.
-                    if err is None:
+                    failed = key in self._write_failed
+                    self._write_failed.discard(key)
+                    if not failed:
                         self._disk_done.append(key)
                 else:
                     self._write_remaining[key] = left
@@ -320,9 +335,18 @@ class KVTierDMA:
         done, self._disk_done = self._disk_done, []
         return done
 
+    def mark_invalid(self, blocks) -> None:
+        """Report GPU blocks whose promised restore never happened (the
+        scheduler side failed the plan closed); the scheduler recomputes them."""
+        self._invalid_blocks.update(int(b) for b in blocks)
+
     def take_invalid_blocks(self) -> set[int]:
         inv, self._invalid_blocks = self._invalid_blocks, set()
         return inv
+
+    def _blocks_for(self, gid: int) -> torch.Tensor:
+        """Block view of the pool that owns KV-cache group `gid`."""
+        return self._pool_blocks.get(self._gid_pool.get(gid, 0), self.blocks)
 
     def _issue_copies(self, batch: TierOpBatch) -> None:
         """Enqueue a batch of copies on the copy stream (and its disk
@@ -352,13 +376,15 @@ class KVTierDMA:
             for gpu_block, slot, gid in batch.offload:
                 n = self._group_nbytes.get(gid, self._stride)
                 self.arena[slot][:n].copy_(
-                    self.blocks[gpu_block][:n], non_blocking=True
+                    self._blocks_for(gid)[gpu_block][:n], non_blocking=True
                 )
-            for gpu_block in batch.zero:
-                self.blocks[gpu_block].zero_()
+            for gpu_block, gid in batch.zero:
+                # The group selects the pool: a ring block id is NOT an
+                # attention block id under the multi-pool slab.
+                self._blocks_for(gid)[gpu_block].zero_()
             for slot, gpu_block, gid in batch.restore:
                 n = self._group_nbytes.get(gid, self._stride)
-                self.blocks[gpu_block][:n].copy_(
+                self._blocks_for(gid)[gpu_block][:n].copy_(
                     self.arena[slot][:n], non_blocking=True
                 )
             event = torch.cuda.Event()
@@ -416,7 +442,7 @@ class KVTierDMA:
         for slot, gpu_block, gid in batch.restore:
             n = self._group_nbytes.get(gid, self._stride)
             expect = self._slot_digests.get(slot)
-            got = _digest(self.blocks[gpu_block][:n])
+            got = _digest(self._blocks_for(gid)[gpu_block][:n])
             host = _digest(self.arena[slot][:n])
             if expect is not None and got != expect:
                 bad += 1

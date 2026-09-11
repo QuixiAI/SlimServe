@@ -178,6 +178,14 @@ class CustomAllreduce:
         # Buffers memory are owned by this Python class and passed to C++.
         # Metadata composes of two parts: metadata for synchronization and a
         # temporary buffer for storing intermediate allreduce results.
+        if envs.VLLM_CUSTOM_AR_PCIE_MAX_BYTES > 0:
+            # PCIe opt-in with a payload cap: size the IPC buffers for the
+            # capped payloads instead of the 8 MiB default, which on a 24 GB
+            # card at gpu_memory_utilization 0.975 tipped the startup free-
+            # memory check (2026-09-07, qwen38fn-nvfp4-4).
+            max_size = min(
+                max_size, max(envs.VLLM_CUSTOM_AR_PCIE_MAX_BYTES, 64 * 1024)
+            )
         self.meta_ptrs = self.create_shared_buffer(
             ops.meta_size() + max_size, group=group, uncached=True
         )
@@ -253,11 +261,15 @@ class CustomAllreduce:
         # for 4 or more non NVLink-capable GPUs, custom allreduce provides
         # little performance improvement over NCCL -- unless the platform has
         # real PCIe P2P (large-BAR1 patched driver) and the user opted in.
-        if (
-            self.world_size == 2
-            or self.fully_connected
-            or envs.VLLM_CUSTOM_AR_ALLOW_PCIE
-        ):
+        if self.world_size == 2 or self.fully_connected:
+            return inp_size < self.max_size
+        if envs.VLLM_CUSTOM_AR_ALLOW_PCIE:
+            # PCIe P2P opt-in: the one-shot all-peers-read pattern beats NCCL
+            # only at decode-size payloads (VLLM_CUSTOM_AR_PCIE_MAX_BYTES);
+            # larger ones go back to NCCL.
+            cap = envs.VLLM_CUSTOM_AR_PCIE_MAX_BYTES
+            if cap and inp_size > cap:
+                return False
             return inp_size < self.max_size
         return False
 

@@ -40,7 +40,13 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--quant", help="quant to serve; profile default otherwise")
     parser.add_argument("-p", "--prompt", help="run one prompt and exit")
     parser.add_argument("--serve", action="store_true", help="open an HTTP endpoint")
-    parser.add_argument(
+    speculation = parser.add_mutually_exclusive_group()
+    speculation.add_argument(
+        "--spec",
+        action="store_true",
+        help="opt in to the profile's registered speculative decoder",
+    )
+    speculation.add_argument(
         "--no-spec",
         action="store_true",
         help="disable speculative decoding for performance diagnosis",
@@ -106,6 +112,11 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="diagnostic: fixed reductions for native-order GLM53 RTX6000",
     )
+    parser.add_argument(
+        "--enable-return-routed-experts",
+        action="store_true",
+        help="diagnostic: return per-token MoE expert IDs (adds memory and copies)",
+    )
     return parser
 
 
@@ -121,6 +132,7 @@ def _help() -> None:
         ("--quant NAME", "Quant to serve. Profile default otherwise."),
         ("-p, --prompt TEXT", "Run one prompt and exit."),
         ("--serve", "OpenAI-compatible endpoint instead of the prompt."),
+        ("--spec", "Opt in to the profile's registered speculative decoder."),
         ("--no-spec", "Disable speculative decoding for performance diagnosis."),
         ("--host HOST", "Bind address for --serve. Default: 127.0.0.1"),
         ("--port N", "Bind port for --serve. Default: 8000"),
@@ -140,6 +152,10 @@ def _help() -> None:
         (
             "--request-metrics",
             "Include request timings and cached prompt-token counts.",
+        ),
+        (
+            "--enable-return-routed-experts",
+            "Diagnostic MoE routing capture; adds overhead.",
         ),
         ("--list", "List every profile, including ones this machine cannot run."),
     ):
@@ -398,6 +414,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.no_spec:
         plan = replace(plan, speculative=False)
+    elif args.spec:
+        if not plan.speculator:
+            term.fail("This profile has no registered speculative decoder.")
+            return 2
+        plan = replace(plan, speculative=True)
     if args.ctx:
         plan = replace(plan, engine={**plan.engine, "max_model_len": args.ctx})
     if args.served_model_name:
@@ -412,6 +433,10 @@ def main(argv: list[str] | None = None) -> int:
                 **plan.engine,
                 "default_chat_template_kwargs": {"thinking": True},
             },
+        )
+    if args.enable_return_routed_experts:
+        plan = replace(
+            plan, engine={**plan.engine, "enable_return_routed_experts": True}
         )
     if args.torch_profile_dir:
         profile_dir = Path(args.torch_profile_dir).expanduser().resolve()

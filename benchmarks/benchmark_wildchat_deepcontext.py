@@ -74,6 +74,9 @@ async def run_session(client, model, sid, turns, pastes, records, stop_at,
                       args, sem):
     rng = random.Random(args.seed * 1000 + sid)
     marker = f"ZX{rng.randint(1000, 9999)}Q"
+    if args.require_target:
+        # A cross-session cache mix-up must not pass through a marker collision.
+        marker = f"ZX{sid:04d}{marker[2:]}"
     history = [
         {
             "role": "user",
@@ -124,11 +127,17 @@ async def run_session(client, model, sid, turns, pastes, records, stop_at,
                 probe_marker=marker if probe else None,
             )
             if reply is None:
+                if args.require_target:
+                    # Strict qualification must not relabel an arbitrary API
+                    # error as a successful context-ceiling test.
+                    ended = "error"
+                    break
                 # Most likely the context ceiling: try one squeeze turn with
                 # a tiny budget; if that also fails, the session is done.
                 history.pop()
                 history.append(
-                    {"role": "user", "content": "Summarize our conversation in one line."}
+                    {"role": "user",
+                     "content": "Summarize our conversation in one line."}
                 )
                 reply = await _turn(
                     client, model, history, records, sid, depth, args, 32
@@ -136,10 +145,38 @@ async def run_session(client, model, sid, turns, pastes, records, stop_at,
                 ended = "ceiling" if reply is not None else "error"
                 break
             history.append({"role": "assistant", "content": reply})
-            last = [r for r in records if r.get("session") == sid and "prompt_tokens" in r]
+            last = [r for r in records
+                    if r.get("session") == sid and "prompt_tokens" in r]
             if last:
                 ctx_tokens = last[-1]["prompt_tokens"] + last[-1]["completion_tokens"]
             if ctx_tokens >= args.ctx_target:
+                if args.require_target:
+                    history.append({
+                        "role": "user",
+                        "content": "What is my project codename, exactly?",
+                    })
+                    reply = await _turn(
+                        client, model, history, records, sid, depth, args, 1024,
+                        probe_marker=marker, target_probe=True,
+                    )
+                    if reply is None:
+                        ended = "error"
+                        break
+                    history.append({"role": "assistant", "content": reply})
+                    last_probe = next(
+                        r for r in reversed(records)
+                        if r.get("session") == sid and r.get("target_probe")
+                    )
+                    ctx_tokens = (last_probe["prompt_tokens"]
+                                  + last_probe["completion_tokens"])
+                    if not last_probe.get("recall_ok"):
+                        ended = "recall_failure"
+                        break
+                    # Prior completion usage includes reasoning that isn't
+                    # replayed in history. Require actual prompt usage on the
+                    # recall request, not prompt+completion or an estimate.
+                    if last_probe["prompt_tokens"] < args.ctx_target:
+                        continue
                 ended = "target"
                 break
     records.append(
@@ -149,7 +186,7 @@ async def run_session(client, model, sid, turns, pastes, records, stop_at,
 
 
 async def _turn(client, model, messages, records, sid, depth, args, max_tokens,
-                probe_marker=None):
+                probe_marker=None, target_probe=False):
     t0 = time.perf_counter()
     ttft = None
     chunks = []
@@ -172,6 +209,7 @@ async def _turn(client, model, messages, records, sid, depth, args, max_tokens,
             if ev.choices and ev.choices[0].delta and (
                 ev.choices[0].delta.content
                 or getattr(ev.choices[0].delta, "reasoning_content", None)
+                or getattr(ev.choices[0].delta, "reasoning", None)
             ):
                 if ttft is None:
                     ttft = time.perf_counter() - t0
@@ -182,6 +220,18 @@ async def _turn(client, model, messages, records, sid, depth, args, max_tokens,
             {"session": sid, "depth": depth,
              "error": f"{type(e).__name__}: {e}"[:300], "t": time.time()}
         )
+        return None
+    if args.require_target and (
+        usage is None or any(
+            not isinstance(getattr(usage, key, None), int)
+            or isinstance(getattr(usage, key, None), bool)
+            or getattr(usage, key) <= 0
+            for key in ("prompt_tokens", "completion_tokens")
+        )
+    ):
+        records.append({"session": sid, "depth": depth,
+                        "error": "InvalidUsage: missing or invalid actual token usage",
+                        "t": time.time()})
         return None
     reply = "".join(chunks)
     rec = {
@@ -196,6 +246,12 @@ async def _turn(client, model, messages, records, sid, depth, args, max_tokens,
     if probe_marker is not None:
         rec["probe"] = True
         rec["recall_ok"] = probe_marker in reply
+        if not rec["recall_ok"]:
+            # Keep enough of the miss to tell a wrong answer from garbage.
+            rec["marker"] = probe_marker
+            rec["reply_head"] = reply[:400]
+    if target_probe:
+        rec["target_probe"] = True
     records.append(rec)
     return reply
 
@@ -207,6 +263,49 @@ def bucket_of(tokens):
     return ">=262K"
 
 
+def qualify_target(records, concurrency, ctx_target):
+    """Fail closed on target depth, recall, usage, and session completion.
+
+    This qualifies conversation depth/recall only. Physical tier restores,
+    byte verification, and benchmark throughput remain separate gates.
+    """
+    expected = set(range(concurrency))
+    failures = []
+    if concurrency < 1 or ctx_target < 1:
+        raise ValueError("concurrency and ctx_target must be positive")
+    if any(r.get("session") not in expected for r in records):
+        failures.append("unexpected or missing session ID")
+    if any("error" in r for r in records):
+        failures.append("request errors occurred")
+    requests = [r for r in records if not r.get("final") and "error" not in r]
+    if not requests or any(
+        not isinstance(r.get(key), int)
+        or isinstance(r.get(key), bool)
+        or r[key] <= 0
+        for r in requests for key in ("prompt_tokens", "completion_tokens")
+    ):
+        failures.append("missing or invalid actual token usage")
+    if any(r.get("probe") and r.get("recall_ok") is not True for r in records):
+        failures.append("recall probe failed")
+    sessions = []
+    for sid in sorted(expected):
+        owned = [r for r in records if r.get("session") == sid]
+        finals = [r for r in owned if r.get("final")]
+        deep_probes = [
+            r for r in owned
+            if r.get("target_probe") and r.get("recall_ok") is True
+            and isinstance(r.get("prompt_tokens"), int)
+            and r["prompt_tokens"] >= ctx_target
+        ]
+        passed = (len(finals) == 1 and finals[0].get("ended") == "target"
+                  and bool(deep_probes))
+        if not passed:
+            failures.append(f"session {sid} lacks completed target-depth recall")
+        sessions.append({"session": sid, "passed": passed})
+    return {"passed": not failures, "target_prompt_tokens": ctx_target,
+            "failures": failures, "sessions": sessions}
+
+
 async def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--parquet", required=True)
@@ -215,6 +314,12 @@ async def main():
     ap.add_argument("--concurrency", type=int, default=32)
     ap.add_argument("--max-hours", type=float, default=2.0)
     ap.add_argument("--ctx-target", type=int, default=255_000)
+    ap.add_argument(
+        "--require-target", action="store_true",
+        help="Require all sessions to recall their marker at actual prompt depth "
+             ">= ctx-target; time caps, request errors, or missing usage fail. "
+             "Leave context headroom for the 1024-token recall response.",
+    )
     ap.add_argument("--paste-chars", type=int, default=30_000)
     ap.add_argument("--reply-tokens", type=int, default=512)
     ap.add_argument("--probe-every", type=int, default=6)
@@ -268,6 +373,7 @@ async def main():
             "target": sum(1 for r in finals if r["ended"] == "target"),
             "wall_clock": sum(1 for r in finals if r["ended"] == "wall_clock"),
             "error": sum(1 for r in finals if r["ended"] == "error"),
+            "recall_failure": sum(1 for r in finals if r["ended"] == "recall_failure"),
             "max_ctx": max((r["ctx_tokens"] for r in finals), default=0),
             "median_ctx": statistics.median(
                 [r["ctx_tokens"] for r in finals]) if finals else 0,
@@ -296,9 +402,15 @@ async def main():
     for r in errs:
         k = r["error"].split(":")[0]
         summary["error_kinds"][k] = summary["error_kinds"].get(k, 0) + 1
+    if args.require_target:
+        summary["target_qualification"] = qualify_target(
+            records, args.concurrency, args.ctx_target
+        )
     with open(args.out, "w") as f:
         json.dump({"summary": summary, "records": records}, f, indent=1)
     print(json.dumps(summary, indent=2), flush=True)
+    if args.require_target and not summary["target_qualification"]["passed"]:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

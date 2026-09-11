@@ -1210,6 +1210,25 @@ class FusedMoEParallelConfig:
         dp_rank = get_dp_group().rank_in_group if dp_size > 1 else 0
         pcp_size = pcp_size_
         pcp_rank = get_pcp_group().rank_in_group if pcp_size > 1 else 0
+        if not use_ep and vllm_parallel_config.data_parallel_replicate_moe:
+            # True DP: experts are sharded over this replica's TP group only
+            # and every replica computes its own tokens; the runner sees
+            # dp_size 1 and never dispatches across replicas.
+            assert pcp_size == 1, "replicated MoE is not defined with PCP"
+            return FusedMoEParallelConfig(
+                tp_size=tp_size_,
+                tp_rank=0 if tp_size_ == 1 else get_tensor_model_parallel_rank(),
+                pcp_size=1,
+                pcp_rank=0,
+                dp_size=1,
+                dp_rank=0,
+                ep_size=1,
+                ep_rank=0,
+                sp_size=sp_size_,
+                use_ep=False,
+                all2all_backend=vllm_parallel_config.all2all_backend,
+                enable_eplb=vllm_parallel_config.enable_eplb,
+            )
         tp_size, tp_rank = FusedMoEParallelConfig.flatten_tp_across_dp_and_pcp(
             tp_size_, dp_size_, dp_rank, pcp_size_, pcp_rank
         )

@@ -65,7 +65,7 @@ def validate_plan(plan):
     engine = plan.engine
     options = engine.get("compilation_config", {}).get("inductor_compile_config", {})
     require(
-        plan.profile_id == "glm53-nvfp4-4"
+        plan.profile_id in ("glm53-nvfp4-4", "glm53f-nvfp4-4")
         and plan.platform == "rtx6000"
         and plan.gpus == 4
         and plan.quant.name == "NVFP4"

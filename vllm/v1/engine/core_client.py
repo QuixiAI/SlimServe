@@ -48,6 +48,7 @@ from vllm.v1.engine import (
     UtilityOutput,
 )
 from vllm.v1.engine.coordinator import DPCoordinator
+from vllm.v1.engine.dp_prefix_affinity import PrefixAffinityRouter
 from vllm.v1.engine.core import EngineCore, EngineCoreProc
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.engine.tensor_ipc import TensorIpcSender
@@ -1459,6 +1460,17 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         self.eng_start_index = (
             len(self.core_engines) * self.client_index
         ) // client_count
+        # Prefix-affinity routing: each replica owns its prefix cache and
+        # KV tiers, so a continued conversation must land where its history
+        # is, or it re-prefills the whole history.
+        self.prefix_router: PrefixAffinityRouter | None = None
+        if envs.VLLM_DP_PREFIX_AFFINITY:
+            self.prefix_router = PrefixAffinityRouter(
+                len(self.core_engines),
+                vllm_config.cache_config.block_size,
+                capacity_blocks=envs.VLLM_DP_PREFIX_AFFINITY_BLOCKS,
+                load_tokens=envs.VLLM_DP_PREFIX_AFFINITY_LOAD_TOKENS,
+            )
 
     def get_core_engine_for_request(self, request: EngineCoreRequest) -> EngineIdentity:
         # Engines are in rank order.
@@ -1470,17 +1482,27 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             current_counts = self.lb_engines
             # TODO use P2C alg for larger DP sizes
             num_engines = len(current_counts)
-            min_score = sys.maxsize
-            eng_index = 0
-            for i in range(num_engines):
-                # Start from client_index to help with balancing when engines
-                # are empty.
-                idx = (self.eng_start_index + i) % num_engines
-                waiting, running = current_counts[idx]
-                score = waiting * 4 + running
-                if score < min_score:
-                    min_score = score
-                    eng_index = idx
+            if self.prefix_router is not None and request.prompt_token_ids:
+                eng_index, _ = self.prefix_router.choose(
+                    request.prompt_token_ids,
+                    request.cache_salt,
+                    [w * 4 + r for w, r in current_counts],
+                    self.eng_start_index,
+                )
+                if self.prefix_router.routed % 100 == 0:
+                    logger.info("dp prefix affinity: %s", self.prefix_router.stats())
+            else:
+                min_score = sys.maxsize
+                eng_index = 0
+                for i in range(num_engines):
+                    # Start from client_index to help with balancing when
+                    # engines are empty.
+                    idx = (self.eng_start_index + i) % num_engines
+                    waiting, running = current_counts[idx]
+                    score = waiting * 4 + running
+                    if score < min_score:
+                        min_score = score
+                        eng_index = idx
             # Increment local waiting count for better balancing between stats
             # updates from the coordinator (which happen every 100ms).
             current_counts[eng_index][0] += self.client_count

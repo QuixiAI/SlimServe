@@ -4,7 +4,7 @@
 
 Profiles are discovered from the registry instead of copied into this script.
 Each compatible profile is loaded in isolation, checked for the required
-DSpark/TurboQuant configuration, given a text request, and—when its registered
+registered drafter and FP8 policy, given a text request, and—when its registered
 modalities include images—a deterministic image request. The complete matrix
 is attempted by default so one failed profile cannot hide later omissions.
 """
@@ -96,7 +96,10 @@ def resolve_profiles(
         raise RuntimeError(f"{registry.platform_title(machine.platform)}: {blocked}")
 
     compatible = compatible_profile_ids(machine)
-    selected = requested or compatible
+    selected = (
+        list(dict.fromkeys(registry.canonical_profile_id(p) for p in requested))
+        if requested else compatible
+    )
     if not selected:
         raise RuntimeError("no compatible profiles found")
 
@@ -125,20 +128,18 @@ def resolve_profiles(
 def validate_acceleration(plan: Plan) -> dict[str, Any]:
     """Require the resolved plan to match its registered speculator exactly.
 
-    Every profile registers a drafter (DSpark with a TurboQuant draft KV, a
+    Every profile registers a drafter (DSpark with FP8 draft KV, a
     DFlash block drafter, or a checkpoint's own MTP head); the resolved
     executable configuration must carry every registered engine setting.
     """
     speculative = engine_kwargs(plan).get("speculative_config")
     if not isinstance(speculative, dict):
         raise RuntimeError("resolved plan has no speculative configuration")
-    registered = plan.source["speculator"]["engine"]
+    registered = plan.speculator["engine"]
     required = dict(registered)
-    if registered.get("method") == "dspark":
-        required.update(
-            attention_backend="TURBOQUANT",
-            kv_cache_dtype="turboquant_k8v4",
-        )
+    # Platform variants can register a different drafter/method or verify
+    # width; those are part of the profile's authoritative configuration.
+    required.update(plan.speculative_overrides)
     mismatches = {
         key: speculative.get(key)
         for key, expected in required.items()
@@ -193,8 +194,15 @@ def _request(
         )
     )
     answer = visible_text(raw)
+    # A correct-looking number in the reasoning is not a completed answer.
+    if not answer.strip() or any(
+        choice.get("finish_reason") == "length"
+        for event in events
+        for choice in event.get("choices") or []
+    ):
+        raise RuntimeError(f"empty or truncated chat answer: {events}")
     return {
-        "answer": answer[:500],
+        "answer": answer,
         "seconds": time.perf_counter() - started,
         "response_events": events,
         "answer_source": "content",
@@ -205,6 +213,13 @@ def _require_match(result: dict[str, Any], pattern: str, label: str) -> None:
     answer = str(result["answer"])
     if not re.search(pattern, answer, flags=re.IGNORECASE):
         raise RuntimeError(f"{label} check failed; answer was {answer!r}")
+
+
+def profile_modalities(plan: Plan) -> list[str]:
+    """Honor platform-specific text-only profiles of multimodal checkpoints."""
+    if plan.engine.get("language_model_only"):
+        return ["text"]
+    return list(plan.source["modalities"])
 
 
 def run_profile(
@@ -244,7 +259,7 @@ def run_profile(
         _require_match(text_result, r"(?<!\d)4(?!\d)", "text")
 
         image_result = None
-        if "image" in plan.source["modalities"]:
+        if "image" in profile_modalities(plan):
             image_result = _request(
                 plan,
                 server.base_url,
@@ -260,7 +275,7 @@ def run_profile(
         "source": plan.source_key,
         "quant": plan.quant.name,
         "gpus": plan.gpus,
-        "modalities": plan.source["modalities"],
+        "modalities": profile_modalities(plan),
         "speculative_method": speculative.get("method"),
         "speculative_tokens": speculative["num_speculative_tokens"],
         "draft_attention_backend": speculative.get("attention_backend"),
@@ -310,12 +325,19 @@ def main() -> int:
                 "source": plan.source_key,
                 "quant": plan.quant.name,
                 "gpus": plan.gpus,
-                "modalities": plan.source["modalities"],
+                "modalities": profile_modalities(plan),
                 "log": str(log_dir / f"{plan.profile_id}.log"),
                 "passed": False,
                 "error": str(error),
             }
         results.append(result)
+        # Keep completed rows even if a later model crashes or the matrix
+        # is interrupted. The final aggregate JSON remains the pass gate.
+        print(json.dumps(result), file=sys.stderr, flush=True)
+        if args.output:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            with args.output.with_suffix(".jsonl").open("a") as stream:
+                stream.write(json.dumps(result) + "\n")
         if not result["passed"] and args.fail_fast:
             break
 

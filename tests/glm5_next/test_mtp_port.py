@@ -10,7 +10,7 @@ from transformers import PretrainedConfig
 from vllm.config.load import LoadConfig
 from vllm.config.speculative import SpeculativeConfig
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
-from vllm.model_executor.models.glm5_next_mtp import Glm5NextMTP
+from vllm.model_executor.models.glm5_next_sm120_mtp import Glm5NextMTP
 
 
 def _vl_config():
@@ -36,7 +36,9 @@ def test_hf_config_override_promotes_text_config_and_quant():
     assert draft.n_predict == 1
     assert draft.num_hidden_layers == 45
     assert draft.quantization_config["quant_method"] == "compressed-tensors"
-    assert draft.index_share_for_mtp_iteration is True
+    # Shared config defaults remain conservative; the SM120 profile explicitly
+    # enables the older adapter's index sharing through SpeculativeConfig.
+    assert draft.index_share_for_mtp_iteration is False
 
 
 def test_spec_layer_index_is_found_after_prefix_strip():

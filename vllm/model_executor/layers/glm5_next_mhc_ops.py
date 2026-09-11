@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""torch.compile-opaque wrappers over the quixicore Ampere mHC kernels.
+"""torch.compile-opaque dispatch for owned GLM mHC kernels.
 
 The MHCPreOp/MHCPostOp/MHCFusedPostPreOp CustomOps call the quixicore
 pybind entry points directly, which Dynamo cannot trace (DSV4's A100 model
@@ -10,14 +10,23 @@ custom ops with fake implementations. Streams are [T, 4, D] bf16; fn is
 float32 (or opt-in lossless BF16 storage) [(2+4)*4, 4*D]; scale float32 [3];
 base float32 [(2+4)*4]. All fn operands are converted to FP32 inside the
 kernels; accumulation and reduction precision do not change.
+On A100, small batches use the split SIMT Triton transition; larger prefill
+uses the QuixiCore CUDA implementation. Both can fuse the following RMSNorm.
 """
 
 import torch
 
 from slimserve.model_journal import instrument_mhc
+from vllm.model_executor.layers.glm5_next_mhc_triton import mhc_transition
+from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
 
 _HC = 4
+# The new dispatch has been measured on A100 only. Preserve the existing
+# native implementation on other CUDA architectures and on ROCm/Metal.
+_USE_SM80_SIMT = current_platform.is_cuda() and current_platform.is_device_capability(
+    (8, 0)
+)
 
 
 def load_lossless_mhc_fn(param: torch.Tensor, weight: torch.Tensor) -> None:
@@ -79,17 +88,61 @@ def glm5_mhc_pre(
     hc_eps: float,
     post_mult: float,
     sinkhorn_iters: int,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     T, hc, D = residual.shape
-    post, comb, layer_input = _qc().dsv4_mhc_pre(
-        residual.view(-1, hc, D), fn, hc_scale, hc_base, rms_eps, hc_eps,
-        hc_eps, post_mult, sinkhorn_iters, None, 0.0,
-    )
+    if (
+        _USE_SM80_SIMT
+        and 0 < T <= 64
+        and hc == 4
+        and D == 4096
+        and fn.dtype == torch.float32
+    ):
+        _, post, comb, layer_input = mhc_transition(
+            None,
+            residual,
+            None,
+            None,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_eps,
+            post_mult,
+            sinkhorn_iters,
+            norm_weight,
+            norm_eps,
+        )
+    else:
+        post, comb, layer_input = _qc().dsv4_mhc_pre(
+            residual.view(-1, hc, D),
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_eps,
+            hc_eps,
+            post_mult,
+            sinkhorn_iters,
+            norm_weight,
+            norm_eps,
+        )
     return post.reshape(T, hc, 1), comb.reshape(T, hc, hc), layer_input.reshape(T, D)
 
 
-def _glm5_mhc_pre_fake(residual, fn, hc_scale, hc_base, rms_eps, hc_eps,
-                       post_mult, sinkhorn_iters):
+def _glm5_mhc_pre_fake(
+    residual,
+    fn,
+    hc_scale,
+    hc_base,
+    rms_eps,
+    hc_eps,
+    post_mult,
+    sinkhorn_iters,
+    norm_weight=None,
+    norm_eps=0.0,
+):
     T, hc, D = residual.shape
     return (
         residual.new_empty((T, hc, 1), dtype=torch.float32),
@@ -110,14 +163,49 @@ def glm5_mhc_fused_post_pre(
     hc_eps: float,
     post_mult: float,
     sinkhorn_iters: int,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     T, hc, D = residual.shape
-    res, post, comb, layer_input = _qc().dsv4_mhc_fused_post_pre(
-        x.view(-1, D), residual.view(-1, hc, D),
-        post_mix.view(-1, hc).contiguous(), comb_mix.view(-1, hc, hc).contiguous(),
-        fn, hc_scale, hc_base, rms_eps, hc_eps, hc_eps, post_mult,
-        sinkhorn_iters, None, 0.0,
-    )
+    if (
+        _USE_SM80_SIMT
+        and 0 < T <= 64
+        and hc == 4
+        and D == 4096
+        and fn.dtype == torch.float32
+    ):
+        res, post, comb, layer_input = mhc_transition(
+            x.view(-1, D),
+            residual,
+            post_mix.contiguous(),
+            comb_mix.contiguous(),
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_eps,
+            post_mult,
+            sinkhorn_iters,
+            norm_weight,
+            norm_eps,
+        )
+    else:
+        res, post, comb, layer_input = _qc().dsv4_mhc_fused_post_pre(
+            x.view(-1, D),
+            residual.view(-1, hc, D),
+            post_mix.view(-1, hc).contiguous(),
+            comb_mix.view(-1, hc, hc).contiguous(),
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_eps,
+            hc_eps,
+            post_mult,
+            sinkhorn_iters,
+            norm_weight,
+            norm_eps,
+        )
     return (
         res.reshape(T, hc, D),
         post.reshape(T, hc, 1),
@@ -126,9 +214,21 @@ def glm5_mhc_fused_post_pre(
     )
 
 
-def _glm5_mhc_fused_post_pre_fake(x, residual, post_mix, comb_mix, fn, hc_scale,
-                                  hc_base, rms_eps, hc_eps, post_mult,
-                                  sinkhorn_iters):
+def _glm5_mhc_fused_post_pre_fake(
+    x,
+    residual,
+    post_mix,
+    comb_mix,
+    fn,
+    hc_scale,
+    hc_base,
+    rms_eps,
+    hc_eps,
+    post_mult,
+    sinkhorn_iters,
+    norm_weight=None,
+    norm_eps=0.0,
+):
     T, hc, D = residual.shape
     return (
         residual.new_empty((T, hc, D)),
@@ -146,8 +246,10 @@ def glm5_mhc_post(
 ) -> torch.Tensor:
     T, hc, D = residual.shape
     out = _qc().dsv4_mhc_post(
-        x.view(-1, D), residual.view(-1, hc, D),
-        post_mix.view(-1, hc).contiguous(), comb_mix.view(-1, hc, hc).contiguous(),
+        x.view(-1, D),
+        residual.view(-1, hc, D),
+        post_mix.view(-1, hc).contiguous(),
+        comb_mix.view(-1, hc, hc).contiguous(),
     )
     return out.reshape(T, hc, D)
 

@@ -148,6 +148,9 @@ if TYPE_CHECKING:
     VLLM_QWEN4_EXP_TQ_MAIN_KV: bool = False
     VLLM_CUSTOM_AR_ALLOW_PCIE: bool = False
     VLLM_CUSTOM_AR_MAX_SIZE_MB: int = 8
+    VLLM_CUSTOM_AR_PCIE_MAX_BYTES: int = 0
+    VLLM_QWEN4_EXP_SKINNY_GEMM: bool = False
+    VLLM_QWEN4_EXP_SKINNY_W8: bool = False
     VLLM_GDN_DECODE_KERNEL: Literal["cuda", "triton"] = "cuda"
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
     VLLM_ROCM_FP8_PADDING: bool = True
@@ -169,6 +172,9 @@ if TYPE_CHECKING:
     VLLM_DP_RANK: int = 0
     VLLM_DP_RANK_LOCAL: int = -1
     VLLM_DP_SIZE: int = 1
+    VLLM_DP_PREFIX_AFFINITY: bool = True
+    VLLM_DP_PREFIX_AFFINITY_LOAD_TOKENS: int = 2048
+    VLLM_DP_PREFIX_AFFINITY_BLOCKS: int = 262144
     VLLM_USE_STANDALONE_COMPILE: bool = True
     VLLM_ENABLE_PREGRAD_PASSES: bool = True
     VLLM_USE_BREAKABLE_CUDAGRAPH: bool = False
@@ -1290,6 +1296,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_CUSTOM_AR_MAX_SIZE_MB": lambda: int(
         os.getenv("VLLM_CUSTOM_AR_MAX_SIZE_MB", "8")
     ),
+    # PCIe-only custom allreduce: payloads above this many bytes fall back to
+    # NCCL (0 = no extra cap). The one-shot kernel reads every peer's slice,
+    # so it wins only at decode-size payloads: on 4x RTX 3090 (PCIe P2P)
+    # 24-25 us vs NCCL 40 us at <=16 KiB, 50+ us from 40 KiB up.
+    "VLLM_CUSTOM_AR_PCIE_MAX_BYTES": lambda: int(
+        os.getenv("VLLM_CUSTOM_AR_PCIE_MAX_BYTES", "0")
+    ),
+    # Qwen4Exp on SM 8.6: route the bf16 decode projections through the
+    # weight-stationary Triton skinny GEMMs (models/qwen4_exp/nvidia/
+    # skinny_gemm_sm86.py). Registered here so it is part of the
+    # torch.compile cache key: a cached decode graph otherwise keeps cuBLAS.
+    "VLLM_QWEN4_EXP_SKINNY_GEMM": lambda: (
+        os.getenv("VLLM_QWEN4_EXP_SKINNY_GEMM", "0").lower() in ("1", "true")
+    ),
+    # int8 weight-only storage for the skinny-routed linears (E8); a
+    # compile factor for the same reason.
+    "VLLM_QWEN4_EXP_SKINNY_W8": lambda: (
+        os.getenv("VLLM_QWEN4_EXP_SKINNY_W8", "0").lower() in ("1", "true")
+    ),
     # use rocm skinny gemms
     "VLLM_ROCM_USE_SKINNY_GEMM": lambda: (
         os.getenv("VLLM_ROCM_USE_SKINNY_GEMM", "True").lower() in ("true", "1")
@@ -1387,6 +1412,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # In some system, find_loaded_library() may not work. So we allow users to
     # specify the path through environment variable VLLM_CUDART_SO_PATH.
     "VLLM_CUDART_SO_PATH": lambda: os.getenv("VLLM_CUDART_SO_PATH", None),
+    # DP load balancer: route a request to the replica that already holds
+    # its prompt prefix (approximate per-replica block memory), charging
+    # LOAD_TOKENS of prefill per unit of the replica's load score;
+    # BLOCKS bounds the per-replica memory.
+    "VLLM_DP_PREFIX_AFFINITY": lambda: bool(
+        int(os.getenv("VLLM_DP_PREFIX_AFFINITY", "1"))
+    ),
+    "VLLM_DP_PREFIX_AFFINITY_LOAD_TOKENS": lambda: int(
+        os.getenv("VLLM_DP_PREFIX_AFFINITY_LOAD_TOKENS", "2048")
+    ),
+    "VLLM_DP_PREFIX_AFFINITY_BLOCKS": lambda: int(
+        os.getenv("VLLM_DP_PREFIX_AFFINITY_BLOCKS", "262144")
+    ),
     # Rank of the process in the data parallel setting
     "VLLM_DP_RANK": lambda: int(os.getenv("VLLM_DP_RANK", "0")),
     # Rank of the process in the data parallel setting.

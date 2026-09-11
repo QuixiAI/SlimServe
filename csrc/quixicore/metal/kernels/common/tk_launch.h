@@ -4210,7 +4210,8 @@ void launch_kv_cache_scatter(E& e, typename E::in_t key, typename E::in_t value,
                              typename E::out_t key_cache,
                              typename E::out_t value_cache, int num_tokens,
                              int num_heads, int head_size, int block_size,
-                             int block_mult, const std::string& type_name) {
+                             uint64_t cache_block_stride,
+                             const std::string& type_name) {
   e.pipeline(kv_cache_kernel_name("scatter", type_name));
   e.in(key, 0);
   e.in(value, 1);
@@ -4220,7 +4221,7 @@ void launch_kv_cache_scatter(E& e, typename E::in_t key, typename E::in_t value,
   e.bytes(num_heads, 5);
   e.bytes(head_size, 6);
   e.bytes(block_size, 7);
-  e.bytes(block_mult, 8);
+  e.bytes(cache_block_stride, 8);
   e.dispatch(num_tokens, 1, 1, 256, 1, 1);
 }
 
@@ -6633,6 +6634,44 @@ void launch_qgemv_nvfp4_mv4r(E& e, typename E::out_t d, typename E::in_t wq,
   e.bytes(K, 6);
   e.bytes(M, 7);
   e.dispatch(N / 8, (M + 1) / 2, 1, 64, 1, 1);
+}
+
+// Planar-layout tiled GEMM for prefill / batch-verify M (any M): classic
+// 64x32 output tile, 128 threads, K stepped 32-wide, weights decoded
+// in-kernel from the checkpoint's planar buffers (no bf16 copy ever).
+// Caller guards: K % 32 == 0, contiguous row-major X (M, K) / D (M, N),
+// uint8 Wq/WS (nvfp4) or uint8 Wq + fp32 WS (fp8ch), fp32 GS.
+template <class E>
+void launch_qgemm_nvfp4_planar(E& e, typename E::out_t d, typename E::in_t wq,
+                               typename E::in_t x, typename E::in_t w_scale,
+                               typename E::in_t global_scale, int N, int K,
+                               int M, const std::string& type_name) {
+  e.pipeline(type_name == "bfloat16" ? "qgemm_nvfp4_planar_bfloat16"
+                                     : "qgemm_nvfp4_planar");
+  e.out(d, 0);
+  e.in(wq, 1);
+  e.in(x, 2);
+  e.in(w_scale, 3);
+  e.in(global_scale, 4);
+  e.bytes(N, 5);
+  e.bytes(K, 6);
+  e.bytes(M, 7);
+  e.dispatch((N + 63) / 64, (M + 31) / 32, 1, 128, 1, 1);
+}
+
+template <class E>
+void launch_qgemm_fp8ch(E& e, typename E::out_t d, typename E::in_t wq,
+                        typename E::in_t x, typename E::in_t w_scale, int N,
+                        int K, int M, const std::string& type_name) {
+  e.pipeline(type_name == "bfloat16" ? "qgemm_fp8ch_bfloat16" : "qgemm_fp8ch");
+  e.out(d, 0);
+  e.in(wq, 1);
+  e.in(x, 2);
+  e.in(w_scale, 3);
+  e.bytes(N, 4);
+  e.bytes(K, 5);
+  e.bytes(M, 6);
+  e.dispatch((N + 63) / 64, (M + 31) / 32, 1, 128, 1, 1);
 }
 
 // Weight-stationary multi-row GEMV over M activation rows. M must be one of

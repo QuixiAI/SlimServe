@@ -193,6 +193,24 @@ class MetalAttentionMetadata:
         return self._seq_lens_cpu
 
 
+class MetalFP8AttentionBackend(MetalAttentionBackend):
+    """FP8 E4M3 with byte pages, explicit strides and native gather/store."""
+
+    supported_kv_cache_dtypes = ["fp8", "fp8_e4m3"]
+
+    @classmethod
+    def get_supported_head_sizes(cls) -> list[int]:
+        return [*super().get_supported_head_sizes(), 512]
+
+    @classmethod
+    def supports_sink(cls) -> bool:
+        return True
+
+    @classmethod
+    def indexes_kv_by_block_stride(cls) -> bool:
+        return True
+
+
 class MetalAttentionMetadataBuilder(AttentionMetadataBuilder[MetalAttentionMetadata]):
     def __init__(
         self,
@@ -289,8 +307,9 @@ class MetalAttentionImpl(AttentionImpl):
         self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
         self.use_native_range_gather = quixicore_ops.has("kv_cache_gather_range")
 
-        if sinks is not None:
-            raise NotImplementedError("Attention sinks require TurboQuant on Metal.")
+        self.sinks = sinks
+        if sinks is not None and kv_cache_dtype not in ("fp8", "fp8_e4m3"):
+            raise NotImplementedError("Attention sinks require FP8 KV on Metal.")
         if alibi_slopes is not None:
             raise NotImplementedError("ALiBi has no Metal attention path.")
         # Sliding windows ride the paged-attention kernel's `window` argument
@@ -368,6 +387,32 @@ class MetalAttentionImpl(AttentionImpl):
             and self.head_size in _PAGED_HEAD_SIZES
         )
 
+    def _fp8_scales(self, layer, device):
+        if not hasattr(self, "_fp8_scales_cache"):
+            self._fp8_scales_cache = tuple(
+                getattr(layer, name)
+                .to(device=device, dtype=torch.float32)
+                .expand(self.num_kv_heads)
+                .contiguous()
+                for name in ("_k_scale", "_v_scale")
+            )
+        return self._fp8_scales_cache
+
+    def _store_fp8(self, layer, key, value, kv_cache, slots):
+        ks, vs = self._fp8_scales(layer, key.device)
+        quixicore_ops.qc_kv_cache_scatter_fp8(
+            key.contiguous(),
+            value.contiguous(),
+            slots.to(torch.long).contiguous(),
+            kv_cache[0],
+            kv_cache[1],
+            self.num_kv_heads,
+            self.head_size,
+            kv_cache.shape[2],
+            ks,
+            vs,
+        )
+
     def do_kv_cache_update(
         self,
         layer: torch.nn.Module,
@@ -381,6 +426,15 @@ class MetalAttentionImpl(AttentionImpl):
         clamped onto block 0, the null block, whose contents are never read
         (no host sync on a data-dependent mask)."""
         if self.kv_sharing_target_layer_name is not None:
+            return
+        if self.kv_cache_dtype in ("fp8", "fp8_e4m3"):
+            self._store_fp8(
+                layer,
+                key[: slot_mapping.numel()],
+                value[: slot_mapping.numel()],
+                kv_cache,
+                slot_mapping,
+            )
             return
         _, num_blocks, block_size, _, _ = kv_cache.shape
         slot = slot_mapping.to(torch.long).clamp_min(0)
@@ -423,6 +477,27 @@ class MetalAttentionImpl(AttentionImpl):
         _, num_blocks, block_size, _, _ = kv_cache.shape
         key_cache = kv_cache[0]
         value_cache = kv_cache[1]
+
+        if self.kv_cache_dtype in ("fp8", "fp8_e4m3"):
+            self._fp8_scales(layer, query.device)
+            if self.kv_sharing_target_layer_name is None:
+                self._store_fp8(
+                    layer,
+                    key[:num_tokens],
+                    value[:num_tokens],
+                    kv_cache,
+                    attn_metadata.slot_mapping[:num_tokens],
+                )
+            self._sdpa_forward(
+                query.view(-1, num_heads, head_size),
+                output[:num_tokens].view(-1, num_heads, head_size),
+                attn_metadata,
+                key_cache,
+                value_cache,
+                num_blocks,
+                block_size,
+            )
+            return output
 
         # Page-local physical layout [num_blocks, 2, block_size, H, D]
         # (get_kv_cache_stride_order): block b's K and V are dense blocks 2b
@@ -702,32 +777,44 @@ class MetalAttentionImpl(AttentionImpl):
                 kv_start = max(0, seq_len - query_len_req - self.sliding_window + 1)
             seq_len = min(seq_len, num_req_blocks * block_size)
 
-            if self.use_native_range_gather and not bound_mode:
+            first_block = kv_start // block_size
+            if bound_mode and first_block > 0:
+                # The CPU bound can cross the exact window's page boundary.
+                # Include the preceding page; the GPU mask below selects the
+                # exact visible tokens without synchronizing the sequence length.
+                first_block -= 1
+            row_start = 0 if bound_mode else kv_start - first_block * block_size
+            row_end = seq_len - first_block * block_size
+            gather_start = first_block * block_size + row_start
+
+            if self.kv_cache_dtype in ("fp8", "fp8_e4m3"):
+                ks, vs = self._fp8_scales_cache
+                keys, values = quixicore_ops.kv_cache_gather_range_fp8(
+                    key_cache,
+                    value_cache,
+                    metadata.block_table[req],
+                    gather_start,
+                    row_end - row_start,
+                    ks,
+                    vs,
+                    query,
+                )
+            elif self.use_native_range_gather:
                 # MPS index_select uses signed 32-bit element offsets for this
                 # strided source. A hybrid cache page beyond 2^31 elements is
                 # therefore read from the wrong address. The native gather
                 # carries the physical block stride and all cache arithmetic
-                # in 64 bits; it also avoids materializing unused rows in the
-                # first/last page of a sliding-window request. Bound mode
-                # keeps the block-window fallback below: its kv_start may
-                # exceed the exact window, which the fallback absorbs with
-                # the one-block backoff + GPU validity mask.
+                # in 64 bits and avoids MPS materializing the strided pool.
+                # Bound-mode draft attention uses the same page backoff and
+                # GPU validity mask as the fallback, preserving its numerics.
                 keys, values = quixicore_ops.kv_cache_gather_range(
                     key_cache,
                     value_cache,
                     metadata.block_table[req],
-                    kv_start,
-                    seq_len - kv_start,
+                    gather_start,
+                    row_end - row_start,
                 )
             else:
-                first_block = kv_start // block_size
-                if bound_mode and first_block > 0:
-                    # The bound may exceed the exact seq_len by up to the
-                    # draft length, which can push the window start past the
-                    # exact window's first block. Back off one block and
-                    # start at row 0 — the GPU validity mask enforces the
-                    # exact range.
-                    first_block -= 1
                 blocks = (
                     metadata.block_table[req, first_block:num_req_blocks]
                     .to(torch.long)
@@ -736,9 +823,6 @@ class MetalAttentionImpl(AttentionImpl):
                     # discarded; a real run never clamps.
                     .clamp_(0, num_blocks - 1)
                 )
-                row_start = 0 if bound_mode else kv_start - first_block * block_size
-                row_end = seq_len - first_block * block_size
-
                 if dense_kv is not None:
                     keys = dense_kv.index_select(0, blocks * 2)
                     values = dense_kv.index_select(0, blocks * 2 + 1)
@@ -769,6 +853,14 @@ class MetalAttentionImpl(AttentionImpl):
                 if self.sliding_window is not None:
                     lo = (sl - (query_len_req + self.sliding_window - 1)).clamp_min(0)
                     valid &= key_pos >= lo
+                # Recycled sliding-window pages are not necessarily zeroed.
+                # An attention mask alone cannot exclude NaN keys or infinite
+                # values: the matmuls can still evaluate NaN + -inf or 0 * inf.
+                # These gathered tensors are private; clear only invisible
+                # rows, preserving nonfinite values in the actual context.
+                invisible = ~valid[:, None, None]
+                keys.masked_fill_(invisible, 0)
+                values.masked_fill_(invisible, 0)
                 mask = valid[None, None, :]
             if metadata.causal and query_len > 1:
                 # Query j sits at absolute position seq_len - query_len + j and
@@ -784,6 +876,30 @@ class MetalAttentionImpl(AttentionImpl):
                         query_pos[:, None] - self.sliding_window
                     )
                 mask = mask[None]
+
+            if self.sinks is not None:
+                # A sink contributes exp(sink[head]) to the softmax denominator
+                # and zero to the value sum. Model it as one zero K/V row with
+                # a per-head additive bias, preserving the existing window mask.
+                keys = torch.cat((keys, keys.new_zeros((1, keys.shape[1], head_size))))
+                values = torch.cat(
+                    (values, values.new_zeros((1, values.shape[1], head_size)))
+                )
+                if mask is None:
+                    bias = torch.zeros(
+                        (self.num_heads, 1, keys.shape[0]),
+                        device=query.device,
+                        dtype=query.dtype,
+                    )
+                else:
+                    bias = torch.zeros(
+                        (self.num_heads, mask.shape[-2], keys.shape[0]),
+                        device=query.device,
+                        dtype=query.dtype,
+                    )
+                    bias[..., :-1].masked_fill_(~mask, float("-inf"))
+                bias[..., -1] = self.sinks.to(query.dtype)[:, None]
+                mask = bias
 
             attended = F.scaled_dot_product_attention(
                 query[begin:end].transpose(0, 1),

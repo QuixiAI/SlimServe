@@ -34,6 +34,23 @@ else:
 logger = init_logger(__name__)
 
 
+
+def _mamba_blocks_available(kv_cache_config) -> int:
+    """Blocks a decode sequence can draw its Mamba state from: with the
+    multi-pool packed slab the state groups live in their own pools, so the
+    bound is the smallest state pool, not pool 0 (the attention class)."""
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    pools = getattr(kv_cache_config, "pool_num_blocks", None)
+    if not pools:
+        return kv_cache_config.num_blocks
+    counts = [
+        pools[kv_cache_config.pool_of_group(gid)]
+        for gid, group in enumerate(kv_cache_config.kv_cache_groups)
+        if isinstance(group.kv_cache_spec, MambaSpec)
+    ]
+    return min(counts) if counts else kv_cache_config.num_blocks
+
 class CompilationMode(enum.IntEnum):
     """The compilation approach used for torch.compile-based compilation of the
     model."""
@@ -1489,14 +1506,15 @@ class CompilationConfig:
             and cudagraph_mode.has_full_cudagraphs()
             and not is_profiling
             and kv_cache_config.has_mamba_layers
-            and max_num_reqs > kv_cache_config.num_blocks
+            and max_num_reqs > _mamba_blocks_available(kv_cache_config)
         ):
+            mamba_blocks = _mamba_blocks_available(kv_cache_config)
             raise ValueError(
                 f"max_num_seqs ({max_num_reqs}) exceeds available Mamba cache "
-                f"blocks ({kv_cache_config.num_blocks}). Each decode sequence "
+                f"blocks ({mamba_blocks}). Each decode sequence "
                 "requires one Mamba cache block, so CUDA graph capture cannot "
                 "proceed. Please lower max_num_seqs to at most "
-                f"{kv_cache_config.num_blocks} or increase "
+                f"{mamba_blocks} or increase "
                 "gpu_memory_utilization."
             )
 

@@ -211,11 +211,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Data parallelism.
         self.dp_size = self.parallel_config.data_parallel_size
         self.dp_rank = self.parallel_config.data_parallel_rank
+        # Replicated-MoE DP has no per-step cross-replica collective, so the
+        # batch descriptor is dispatched locally (as with dp_size 1).
+        self.dp_sync_size = (
+            1 if self.parallel_config.data_parallel_replicate_moe else self.dp_size
+        )
 
         # Detect EP all2all peer faults to prevent emitting corrupted output.
         # Only meaningful for MoE + DP with an FT-capable all2all backend.
         self.check_ep_fault = False
-        if self.dp_size > 1 and self.model_config.is_moe:
+        if (
+            self.dp_size > 1
+            and self.model_config.is_moe
+            and not self.parallel_config.data_parallel_replicate_moe
+        ):
             self.check_ep_fault = get_ep_all2all_manager().support_fault_tolerance
 
         # Decode context parallelism.
@@ -634,6 +643,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.vllm_config,
         )
         self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
+        # Host-resident main KV (docs/host_resident_kv_design.md): size the
+        # per-step tables and mirror the main-KV group's block ids on the CPU.
+        from vllm.v1.worker.gpu.kv_residency import get_main_kv_residency
+
+        self.main_kv_residency = get_main_kv_residency()
+        if self.main_kv_residency is not None:
+            res = self.main_kv_residency
+            table = self.block_tables.input_block_tables[res.group_id]
+            res.bind(
+                res.group_id,
+                res.block_size,
+                table.shape[0],
+                table.shape[1],
+                self.block_tables.slot_mappings.shape[1],
+            )
+            self.block_tables.enable_cpu_mirror(res.group_id)
 
     def _init_kv_zero_meta(self) -> None:
         """Build KV-block zeroing metadata; invoked from gpu_worker."""
@@ -1233,6 +1258,62 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         return block_tables, slot_mappings
 
+    def _prepare_main_kv_residency(
+        self,
+        input_batch: InputBatch,
+        block_tables: tuple[torch.Tensor, ...],
+        slot_mappings: torch.Tensor,
+        dummy: bool,
+    ) -> None:
+        """Feed the host-resident main-KV residency this step's writes.
+
+        Blocks written this step are the ones covering each scheduled
+        request's [num_computed, num_computed + scheduled) positions; every
+        request's tail block is protected from demotion (a partially filled
+        block keeps its row until it is full)."""
+        res = getattr(self, "main_kv_residency", None)
+        if res is None:
+            return
+        gid = res.group_id
+        if dummy:
+            res.prepare_step(block_tables[gid], slot_mappings[gid], [], [], dummy=True)
+            return
+        sub_tokens = res.block_size  # residency row = kernel page
+        sub = res.sub_blocks
+        mirror = self.block_tables.mirror_np
+        counts = self.block_tables.num_blocks.np[gid]
+        written: list[int] = []
+        tails: list[int] = []
+
+        def row_id(req_row, g):  # global kernel page g -> residency row id
+            b = int(req_row[g // sub])
+            return -1 if b < 0 else b * sub + g % sub
+
+        for r in range(input_batch.num_reqs):
+            req_index = int(input_batch.idx_mapping_np[r])
+            n = int(input_batch.num_scheduled_tokens[r])
+            nb = int(counts[req_index])
+            if nb <= 0:
+                continue
+            req_row = mirror[req_index]
+            # Batch-ordered (gathered by idx_mapping), unlike the mirror/counts.
+            start = int(input_batch.num_computed_tokens_np[r])
+            max_g = nb * sub - 1
+            # Protect the row holding the last computed token and the next.
+            for pos in (max(start - 1, 0), start):
+                g = pos // sub_tokens
+                if g <= max_g and (rid := row_id(req_row, g)) >= 0:
+                    tails.append(rid)
+            if n <= 0:
+                continue
+            for g in range(
+                start // sub_tokens, min((start + n - 1) // sub_tokens, max_g) + 1
+            ):
+                rid = row_id(req_row, g)
+                if rid >= 0:
+                    written.append(rid)
+        res.prepare_step(block_tables[gid], slot_mappings[gid], written, tails)
+
     def prepare_dummy_attn(
         self, input_batch: InputBatch
     ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
@@ -1369,7 +1450,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # token that disagrees).
             self.thinking_budget_state.apply_mask(logits, input_batch)
 
-        if input_batch.num_draft_tokens == 0 or self.rejection_sampler is None:
+        # Metal's verifier uses a position-keyed inverse CDF, while the plain
+        # sampler uses Gumbel noise. Keep zero-draft rows on the verifier too:
+        # otherwise an unrelated request's drafts change their seeded draw.
+        if self.rejection_sampler is None or (
+            input_batch.num_draft_tokens == 0 and logits.device.type != "mps"
+        ):
             assert self.sampler is not None
             sampler_output = self.sampler(logits, input_batch)
         else:
@@ -1546,7 +1632,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_reqs,
             num_toks,
             uniform_tok_count,
-            self.dp_size,
+            self.dp_sync_size,
             self.dp_rank,
             need_eager=is_profile or skip_compiled,
             num_active_loras=num_active_loras,
@@ -1562,6 +1648,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Prepare all the inputs and copy to the input buffers.
             input_batch = self.prepare_inputs(scheduler_output, batch_desc)
             block_tables, slot_mappings = self.prepare_attn(input_batch)
+            self._prepare_main_kv_residency(
+                input_batch, block_tables, slot_mappings, False
+            )
             # Mamba "align" pre-copy: migrate recurrent state across block
             # boundaries before the forward. Runs only on real batches, and
             # before model_state.prepare_attn gathers num_accepted_tokens so the
@@ -1590,6 +1679,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             if not skip_attn_for_dummy_run:
                 block_tables, slot_mappings = self.prepare_dummy_attn(input_batch)
+                self._prepare_main_kv_residency(
+                    input_batch, block_tables, slot_mappings, True
+                )
             else:
                 assert batch_desc.cg_mode != CUDAGraphMode.FULL, (
                     "Attention metadata must be prepared for dummy runs when using "

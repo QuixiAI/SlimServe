@@ -93,7 +93,7 @@ behavior:
 
 - Build native changes with `cmake --build build/temp.linux-x86_64-cpython-312 --target _C_stable_libtorch -j$(nproc)` and copy the rebuilt `.so` into `vllm/` for editable imports when needed.
 - Smoke imports with `import vllm._C_stable_libtorch` and inspect relevant `torch.ops` schemas.
-- End-to-end DSV4 performance must be measured through SlimServe profiles such as `dsv4-2` and `dsv4-4`, because those profiles own downloads, parser settings, DSpark/TurboQuant environment, KV dtype, and CUDA graph settings.
+- End-to-end DSV4 performance must be measured through SlimServe profiles such as `dsv4-2` and `dsv4-4`, because those profiles own downloads, parser settings, DSpark/FP8 environment, KV dtype, and CUDA graph settings.
 
 ## Performance Notebook
 
@@ -121,7 +121,10 @@ behavior:
 - Live validation must discover every registry profile compatible with the
   current machine. Do not substitute one tensor-parallel size for another.
 - Every supported profile must run with its registered DSpark drafter and
-  TurboQuant draft KV configuration.
+  registered draft KV configuration. FP8 is the only permitted KV cache
+  quantization; TurboQuant is prohibited for targets and drafters.
+- Enable vision on every profile whose model supports vision; validate both
+  text and image requests.
 - For vision profiles, test both text and image requests. For text-only
   profiles, test text requests.
 

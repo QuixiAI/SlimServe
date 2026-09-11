@@ -44,7 +44,7 @@ def validate_plan(plan) -> None:
     if not enabled():
         return
     if not (
-        plan.profile_id == "glm53-nvfp4-4"
+        plan.profile_id in ("glm53-nvfp4-4", "glm53f-nvfp4-4")
         and plan.platform == "rtx6000"
         and plan.gpus == 4
         and plan.quant.name == "NVFP4"

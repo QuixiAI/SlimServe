@@ -1081,6 +1081,14 @@ class quixicore_ops:
         )
 
     @staticmethod
+    def kv_cache_gather_range_fp8(*args):
+        return _qc().kv_cache_gather_range_fp8(*args)
+
+    @staticmethod
+    def qc_kv_cache_scatter_fp8(*args):
+        return _qc().qc_kv_cache_scatter_fp8(*args)
+
+    @staticmethod
     def kv_cache_gather_range(
         key_cache: torch.Tensor,
         value_cache: torch.Tensor,
@@ -1767,7 +1775,14 @@ class quixicore_ops:
         vLLM cannot store an fp8 KV cache there. Returns [tokens, heads, 512].
         """
         return _qc().mla_decode_bf16_sparse_glm(
-            q, kv, block_table, indices, topk_length, block_size, scale, partition_size,
+            q,
+            kv,
+            block_table,
+            indices,
+            topk_length,
+            block_size,
+            scale,
+            partition_size,
             page_stride_bytes,
         )
 
@@ -1805,7 +1820,13 @@ class quixicore_ops:
         [tokens, heads, 512]. partition_size > 0 splits each (head, token)
         walk over ceil(max_topk / partition_size) blocks plus a reduce."""
         return _qc().mla_decode_bf16_sparse_nope(
-            q, kv, block_table, indices, topk_length, block_size, scale,
+            q,
+            kv,
+            block_table,
+            indices,
+            topk_length,
+            block_size,
+            scale,
             partition_size,
             page_stride_bytes,
         )

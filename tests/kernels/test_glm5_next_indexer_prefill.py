@@ -232,7 +232,7 @@ def test_tp_pool_exchange_preserves_rows_tails_and_padding(query_lens, cached):
     q_full[leading : leading + rows] = q
     w_full[leading : leading + rows] = w
     # KV starts identify requests, as in production chunk metadata.
-    ks = torch.tensor(
+    cumulative = torch.tensor(
         [
             0,
             *torch.tensor([a + b for a, b in zip(query_lens, cached)])
@@ -241,22 +241,29 @@ def test_tp_pool_exchange_preserves_rows_tails_and_padding(query_lens, cached):
         ],
         device=DEV,
         dtype=torch.int32,
-    )[req.long()]
+    )
+    ks = cumulative[req.long()]
+    token_to_seq = torch.repeat_interleave(
+        torch.arange(len(query_lens), device=DEV, dtype=torch.int32),
+        torch.tensor(
+            [a + b for a, b in zip(query_lens, cached)], device=DEV
+        ),
+    )
     chunks = []
     for start in range(0, rows, 11):
         end = min(start + 11, rows)
-        # Each subchunk retains the request table used by its row labels.
-        # Include the prior request's start in the first row so row_req maps
-        # to the sliced table's zero-based request IDs, as real metadata does.
-        req_first = int(req[start])
-        req_last = int(req[end - 1])
+        # Real query subchunks keep the original request table, even when the
+        # first query belongs to request >0. Renumbering would select wrong KV.
         chunks.append(
             SimpleNamespace(
                 token_start=leading + start,
                 token_end=leading + end,
                 cu_seqlen_ks=ks[start:end],
                 cu_seqlen_ke=ks[start:end] + vis[start:end],
-                block_table=bt[req_first : req_last + 1],
+                block_table=bt,
+                cu_seq_lens=cumulative,
+                local_cu_seq_lens=cumulative,
+                token_to_seq=token_to_seq,
                 max_seq_len=max_pools * KP,
             )
         )
@@ -266,7 +273,8 @@ def test_tp_pool_exchange_preserves_rows_tails_and_padding(query_lens, cached):
     ids = torch.empty((rows, KSEL), device=DEV, dtype=torch.int32)
     for c in chunks:
         lo, hi = c.token_start, c.token_end
-        row_req = gi._prefill_row_req(c, hi - lo)
+        row_req = req[lo - leading : hi - leading]
+        assert torch.equal(gi._prefill_row_req(c, hi - lo), row_req)
         logits = torch.empty(hi - lo, max_pools, device=DEV)
         sel = gi._pooled_topk(
             q_full[lo:hi],

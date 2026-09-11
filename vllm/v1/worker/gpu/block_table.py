@@ -3,6 +3,7 @@
 from collections.abc import Iterable
 from functools import cache
 
+import numpy as np
 import torch
 
 from vllm.triton_utils import tl, triton
@@ -188,6 +189,16 @@ class BlockTables:
         )
         self.input_block_table_ptrs = self._make_ptr_tensor(self.input_block_tables)
 
+    def enable_cpu_mirror(self, group_id: int) -> None:
+        """Keep a CPU copy of one group's block ids (host-resident main KV
+        residency decides from it without a device sync)."""
+        self.mirror_group = group_id
+        self.mirror_np = np.full(
+            (self.max_num_reqs, self.block_tables[group_id].gpu.shape[1]),
+            -1,
+            dtype=np.int32,
+        )
+
     def append_block_ids(
         self,
         req_index: int,
@@ -202,6 +213,8 @@ class BlockTables:
                 block_ids = [b * bpk + k for b in block_ids for k in range(bpk)]
             self.block_tables[i].stage_write(req_index, start, block_ids)
             self.num_blocks.np[i, req_index] = start + len(block_ids)
+            if i == getattr(self, "mirror_group", -1) and block_ids:
+                self.mirror_np[req_index, start : start + len(block_ids)] = block_ids
 
     def apply_staged_writes(self) -> None:
         if self.num_kv_cache_groups == 1:

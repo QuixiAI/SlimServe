@@ -45,7 +45,10 @@ from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_utils import BlockHash
+
+logger = init_logger(__name__)
 
 # hash position -> attention group ids whose KV block completes there
 DueGids = Callable[[int], frozenset[int]]
@@ -80,10 +83,25 @@ class Trajectory:
     disk_attn: list[dict[int, int]] = field(default_factory=list)
     disk_tail_slots: dict[int, int] = field(default_factory=dict)
     disk_tail_boundary: int = -1
+    # Host-resident main KV (docs/host_resident_kv_design.md, milestone 4):
+    # one main-KV tier slot per attention position holding the block's
+    # sub-rows. Reserved when the scheduler allocates the block (demotions
+    # land in the slot directly), confirmed once the fill is flushed into
+    # it; a restore REBINDS the new block onto the slot with no copy, so a
+    # resumable position needs its slot present and confirmed.
+    main_slots: list[int | None] = field(default_factory=list)
 
-    def _attn_complete(
-        self, i: int, due: "DueGids", disk_pending: set[int]
-    ) -> bool:
+    def main_slot_list(self) -> list[int]:
+        return [m for m in self.main_slots if m is not None]
+
+    def _main_ready(self, i: int, main_pending: set[int]) -> bool:
+        return (
+            i < len(self.main_slots)
+            and self.main_slots[i] is not None
+            and self.main_slots[i] not in main_pending
+        )
+
+    def _attn_complete(self, i: int, due: DueGids, disk_pending: set[int]) -> bool:
         """Every attention group DUE at position i is on the host or on disk.
 
         ``due(i)`` is the set of attention groups whose block completes at
@@ -111,7 +129,10 @@ class Trajectory:
         )
 
     def resumable_blocks(
-        self, due: "DueGids", disk_pending: set[int] | None = None
+        self,
+        due: DueGids,
+        disk_pending: set[int] | None = None,
+        main_pending: set[int] | None = None,
     ) -> int:
         """Longest gap-free attention prefix ending at the tail boundary,
         with the boundary block's hash matching the saved tail state.
@@ -131,10 +152,12 @@ class Trajectory:
         for i in range(self.tail_boundary):
             if not self._attn_complete(i, due, pending):
                 break
+            if main_pending is not None and not self._main_ready(i, main_pending):
+                break
             n += 1
         return n if n == self.tail_boundary else 0
 
-    def attn_prefix_len(self, due: "DueGids") -> int:
+    def attn_prefix_len(self, due: DueGids) -> int:
         """Longest gap-free HOST-staged attention prefix, tail-agnostic.
 
         The resumable span for attention-only models: KV blocks are
@@ -159,7 +182,7 @@ class Trajectory:
             self.disk_tail_slots.values()
         )
 
-    def fully_on_disk(self, due: "DueGids", disk_pending: set[int]) -> bool:
+    def fully_on_disk(self, due: DueGids, disk_pending: set[int]) -> bool:
         """Every resumable position and the current tail are disk-resident,
         so the host copies can be released without losing resumability."""
         if self.tail_boundary <= 0 or self.disk_tail_boundary != self.tail_boundary:
@@ -186,6 +209,7 @@ class HostKVTierIndex:
         attn_gids: list[int] | None = None,
         num_disk_slots: int = 0,
         attn_ratio: dict[int, int] | None = None,
+        num_main_slots: int = 0,
     ):
         assert num_slots > 0
         self.num_slots = num_slots
@@ -195,15 +219,11 @@ class HostKVTierIndex:
         # block is a multiple of the hash block). A group is due at position
         # i only when its block completes there; resume boundaries must be
         # multiples of the ratios' lcm so every group's last block is whole.
-        self.attn_ratio = {
-            g: int((attn_ratio or {}).get(g, 1)) for g in self.attn_gids
-        }
+        self.attn_ratio = {g: int((attn_ratio or {}).get(g, 1)) for g in self.attn_gids}
         assert all(r >= 1 for r in self.attn_ratio.values())
         self.resume_align = 1
         for r in self.attn_ratio.values():
-            self.resume_align = self.resume_align * r // math.gcd(
-                self.resume_align, r
-            )
+            self.resume_align = self.resume_align * r // math.gcd(self.resume_align, r)
         self._free: list[int] = list(range(num_slots - 1, -1, -1))
         self._trajectories: OrderedDict[str, Trajectory] = OrderedDict()
         self._pending_write: set[int] = set()
@@ -232,18 +252,40 @@ class HostKVTierIndex:
         # Promotions in flight: host slots being filled from disk; confirmed
         # by the worker's restore completion for the resuming request.
         self._promotions: dict[str, list[int]] = {}
+        # Main-KV tier slots (milestone 4). require_main: a position is
+        # resumable only with a confirmed main slot.
+        self.num_main_slots = max(0, int(num_main_slots))
+        self.require_main = self.num_main_slots > 0
+        self._main_free: list[int] = list(range(self.num_main_slots - 1, -1, -1))
+        self._main_pending: set[int] = set()  # reserved or flush in flight
+        # slot -> request ids that have it rebound read-only
+        self._main_pinned: dict[int, set[str]] = {}
+        # Holds: pool blocks whose residency rows point INTO a slot (a home
+        # they demoted into, or a rebind). Unlike pins they outlive the
+        # request: the block stays in the GPU prefix cache and a later hit
+        # would read the slot, so the slot cannot be reclaimed until the
+        # pool reuses the block id or a confirmed flush moved its rows.
+        self._main_held: dict[int, set[int]] = {}  # slot -> block ids
+        self._held_by_block: dict[int, set[int]] = {}  # block id -> slots
 
     def due(self, i: int) -> frozenset[int]:
         """Attention groups whose block completes at hash position i."""
         if self.resume_align == 1:
             return self.attn_gids
-        return frozenset(
-            g for g, r in self.attn_ratio.items() if (i + 1) % r == 0
-        )
+        return frozenset(g for g, r in self.attn_ratio.items() if (i + 1) % r == 0)
 
     # ------------------------------------------------------------------ write
 
     def _alloc_slot(self, protect: str) -> int | None:
+        # These collections contain unique IDs within this host arena. If
+        # either covers every slot, no trajectory can release a host slot.
+        # Read the live collections: a completion must immediately enable
+        # the normal reclamation path again, without invalidating a cache.
+        if not self._free and (
+            len(self._host_busy) == self.num_slots
+            or len(self._pending_write) == self.num_slots
+        ):
+            return None
         if not self._free and not self._reclaim(protect):
             return None
         slot = self._free.pop()
@@ -417,6 +459,117 @@ class HostKVTierIndex:
             ):
                 traj.tail_pending = False
 
+    # ----------------------------------------------------------- main slots
+
+    def _alloc_main_slot(self, protect: str) -> int | None:
+        if not self._main_free and not self._reclaim(protect):
+            return None
+        if not self._main_free:
+            return None
+        slot = self._main_free.pop()
+        self._main_pending.add(slot)
+        return slot
+
+    def _free_main_slot(self, slot: int) -> None:
+        self._main_pending.discard(slot)
+        self._main_pinned.pop(slot, None)
+        for block in self._main_held.pop(slot, ()):
+            slots = self._held_by_block.get(block)
+            if slots is not None:
+                slots.discard(slot)
+                if not slots:
+                    del self._held_by_block[block]
+        self._main_free.append(slot)
+
+    def reserve_main_slot(self, owner: str, logical: int) -> int | None:
+        """Give attention position `logical` of `owner` a main-KV slot before
+        its block is written, so the residency demotes straight into it.
+        Returns the slot (existing or new), None when the tier is full."""
+        if not self.require_main:
+            return None
+        traj = self._trajectories.setdefault(owner, Trajectory())
+        self.touch(owner)
+        while len(traj.main_slots) <= logical:
+            traj.main_slots.append(None)
+        if traj.main_slots[logical] is not None:
+            return traj.main_slots[logical]
+        slot = self._alloc_main_slot(owner)
+        if slot is None:
+            return None
+        traj.main_slots[logical] = slot
+        return slot
+
+    def main_slot(self, owner: str, logical: int) -> int | None:
+        traj = self._trajectories.get(owner)
+        if traj is None or logical >= len(traj.main_slots):
+            return None
+        return traj.main_slots[logical]
+
+    def confirm_main(self, slots: list[int]) -> None:
+        """The worker flushed these blocks' sub-rows into their slots."""
+        for slot in slots:
+            self._main_pending.discard(slot)
+
+    def release_main_reservations(self, owner: str, filled_upto: int) -> list[int]:
+        """Free reserved slots at positions >= filled_upto that were never
+        confirmed (the request ended before those blocks filled)."""
+        traj = self._trajectories.get(owner)
+        if traj is None:
+            return []
+        freed: list[int] = []
+        for i in range(filled_upto, len(traj.main_slots)):
+            slot = traj.main_slots[i]
+            if slot is not None and slot in self._main_pending:
+                traj.main_slots[i] = None
+                self._free_main_slot(slot)
+                freed.append(slot)
+        return freed
+
+    def main_slots_for(self, owner: str, n: int) -> list[int]:
+        traj = self._trajectories[owner]
+        out = [traj.main_slots[i] for i in range(n)]
+        assert all(m is not None for m in out)
+        return out  # type: ignore[return-value]
+
+    def pin_main(self, owner: str, n: int, req_id: str) -> None:
+        """A resuming request rebinds `owner`'s first n main slots read-only:
+        the trajectory must not be reclaimed while the request runs."""
+        for slot in self.main_slots_for(owner, n):
+            self._main_pinned.setdefault(slot, set()).add(req_id)
+
+    def unpin_main(self, req_id: str) -> None:
+        for slot in [s for s, reqs in self._main_pinned.items() if req_id in reqs]:
+            self._main_pinned[slot].discard(req_id)
+            if not self._main_pinned[slot]:
+                del self._main_pinned[slot]
+
+    def hold_main(self, block: int, slot: int) -> None:
+        """Pool block `block`'s residency rows now point into `slot`."""
+        self._main_held.setdefault(slot, set()).add(block)
+        self._held_by_block.setdefault(block, set()).add(slot)
+
+    def unhold_main(self, block: int, keep: int | None = None) -> None:
+        """Drop `block`'s holds (all of them, or every slot but `keep`): the
+        pool reallocated the block id, or a confirmed flush moved its rows
+        into `keep`."""
+        for slot in list(self._held_by_block.get(block, ())):
+            if slot == keep:
+                continue
+            self._held_by_block[block].discard(slot)
+            blocks = self._main_held.get(slot)
+            if blocks is not None:
+                blocks.discard(block)
+                if not blocks:
+                    del self._main_held[slot]
+        if not self._held_by_block.get(block):
+            self._held_by_block.pop(block, None)
+
+    def _main_busy(self, traj: Trajectory) -> bool:
+        return any(
+            m in self._main_pending or m in self._main_pinned or m in self._main_held
+            for m in traj.main_slot_list()
+        )
+
     # ------------------------------------------------------------- disk tier
 
     def take_disk_writes(
@@ -497,7 +650,7 @@ class HostKVTierIndex:
             for gid, d in traj.disk_tail_slots.items():
                 s = self._alloc_slot(owner)
                 if s is None:
-                    self._rollback_promotion(traj, new_slots + list(tail.values()))
+                    self._rollback_promotion(traj, new_slots)
                     return None
                 tail[gid] = s
                 new_slots.append(s)
@@ -582,18 +735,34 @@ class HostKVTierIndex:
                 )
                 best_owner = owner
                 continue
-            n = traj.resumable_blocks(self.due, self._disk_pending)
+            # Hybrid resumability is exactly tail_boundary or zero. Reject
+            # unrelated chains before walking all their host/disk/main pages.
+            # Positive matches still pass the unchanged readiness checks.
+            n = traj.tail_boundary
             if n <= 0 or n > len(hashes):
                 continue
             if best is not None and n <= best[1]:
+                continue
+            if not traj.hashes or traj.hashes[0] != hashes[0]:
+                continue
+            if not traj._tail_available(self._disk_pending):
+                continue
+            if traj.hashes[:n] != hashes[:n]:
+                continue
+            if (
+                traj.resumable_blocks(
+                    self.due,
+                    self._disk_pending,
+                    self._main_pending if self.require_main else None,
+                )
+                != n
+            ):
                 continue
             if any(
                 s in self._pending_write
                 for d in traj.attn_slots[:n]
                 for s in d.values()
             ):
-                continue
-            if traj.hashes[:n] != hashes[:n]:
                 continue
             tail = {} if traj.tail_pending else dict(traj.tail_state_slots)
             best = (
@@ -658,8 +827,16 @@ class HostKVTierIndex:
         return traj.host_slots()
 
     def _busy(self, traj: Trajectory) -> bool:
+        # Do not materialize every slot before checking the first one. Cached
+        # prefix admission can attempt thousands of reservations while disk
+        # write-through protects the entire host tier.
         return any(
-            s in self._pending_write or s in self._host_busy for s in traj.host_slots()
+            s in self._pending_write or s in self._host_busy
+            for blocks in traj.attn_slots
+            for s in blocks.values()
+        ) or any(
+            s in self._pending_write or s in self._host_busy
+            for s in traj.tail_state_slots.values()
         )
 
     def _delete(self, owner: str, traj: Trajectory) -> None:
@@ -669,6 +846,8 @@ class HostKVTierIndex:
             self._free.append(s)
         for d in traj.disk_slots():
             self._free_disk_slot(d)
+        for m in traj.main_slot_list():
+            self._free_main_slot(m)
         del self._trajectories[owner]
 
     def _reclaim(self, protect: str) -> bool:
@@ -678,12 +857,21 @@ class HostKVTierIndex:
             if owner == protect or owner in self._promotions:
                 continue
             traj = self._trajectories[owner]
-            if self._busy(traj):
+            # Demoted trajectories keep their position-indexed empty dicts.
+            # Their host slot list is empty; test this in C before walking
+            # those dicts in Python or constructing temporary slot lists.
+            if not traj.tail_state_slots and not any(traj.attn_slots):
+                continue
+            if self._busy(traj) or self._main_busy(traj):
                 continue
             host = traj.host_slots()
             if not host:
                 continue  # already disk-only; nothing to free here
-            if traj.fully_on_disk(self.due, self._disk_pending):
+            # Main-KV slots have no disk copy yet (milestone 4a): a
+            # trajectory that carries them is deleted, never demoted.
+            if not traj.main_slot_list() and traj.fully_on_disk(
+                self.due, self._disk_pending
+            ):
                 for s in host:
                     self._disk_of_host.pop(s, None)
                     self._free.append(s)
@@ -691,6 +879,14 @@ class HostKVTierIndex:
                 traj.tail_state_slots = {}
                 traj.tail_pending = False
             else:
+                if traj.main_slot_list():
+                    logger.info(
+                        "host-tier index: reclaimed %s (%d main slots, %d held "
+                        "elsewhere)",
+                        owner[-8:],
+                        len(traj.main_slot_list()),
+                        len(self._main_held),
+                    )
                 self._delete(owner, traj)
             return True
         return False
@@ -724,7 +920,7 @@ class HostKVTierIndex:
         traj = self._trajectories.get(owner)
         if traj is None:
             return
-        if self._busy(traj) or owner in self._promotions:
+        if self._busy(traj) or self._main_busy(traj) or owner in self._promotions:
             return
         if any(d in self._disk_pending for d in traj.disk_slots()):
             return
@@ -740,7 +936,12 @@ class HostKVTierIndex:
             "resumable": sum(
                 1
                 for t in self._trajectories.values()
-                if t.resumable_blocks(self.due, self._disk_pending) > 0
+                if t.resumable_blocks(
+                    self.due,
+                    self._disk_pending,
+                    self._main_pending if self.require_main else None,
+                )
+                > 0
                 or t.attn_prefix_len(self.due) > 0
             ),
             "pending_writes": len(self._pending_write),
@@ -752,4 +953,8 @@ class HostKVTierIndex:
                 for t in self._trajectories.values()
                 if not t.host_slots() and t.disk_slots()
             ),
+            "main_slots": self.num_main_slots,
+            "main_used": self.num_main_slots - len(self._main_free),
+            "main_pending": len(self._main_pending),
+            "main_held": len(self._main_held),
         }

@@ -417,6 +417,12 @@ class Worker(WorkerBase):
                 GPUModelRunner as GPUModelRunnerV1,
             )
 
+            logger.warning(
+                "DEPRECATED: falling back to the V1 GPU model runner "
+                "(vllm/v1/worker/gpu_model_runner.py). SlimServe serves on the "
+                "V2 runner only (operator directive 2026-09-10); a config that "
+                "lands here needs V2 support added, not a V1 qualification."
+            )
             self.model_runner = GPUModelRunnerV1(self.vllm_config, self.device)
         bootstamp(f"worker[{self.rank}]: model runner ready")
 
@@ -991,6 +997,12 @@ class Worker(WorkerBase):
             return nullcontext()
 
         self.profiler.step()
+
+        # step() owns delayed starts and automatic iteration limits. A stopped
+        # profiler object stays attached to the worker; do not keep building
+        # request metadata or record_function ranges after recording ends.
+        if not self.profiler.is_running:
+            return nullcontext()
 
         iteration_details = compute_iteration_details(scheduler_output)
 

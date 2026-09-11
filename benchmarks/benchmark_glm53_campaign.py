@@ -590,7 +590,9 @@ def main():
         ap.error("boots, repeats and concurrency must be positive; output tokens >= 2")
     machine = hardware.detect()
     compatible = compatible_profile_ids(machine)
-    if args.profile not in compatible:
+    if registry.canonical_profile_id(args.profile) not in {
+        registry.canonical_profile_id(p) for p in compatible
+    }:
         ap.error(f"profile not compatible; available: {compatible}")
     plan = registry.resolve(args.profile, machine.platform, machine.count, None)
     from slimserve.glm53_ordering import validate_plan

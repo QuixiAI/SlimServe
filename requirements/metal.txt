@@ -16,6 +16,8 @@
 # torch with MPS. 2.13 is what the Metal kernels are developed and tested
 # against; bf16 support on MPS is the reason for the floor.
 torch == 2.13.0
+# Native Qwen vision/video processors require torchvision.
+torchvision == 0.28.0
 
 # GGUF metadata parsing for the loader and the config parsers.
 gguf >= 0.10.0

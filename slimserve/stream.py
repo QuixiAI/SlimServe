@@ -117,6 +117,8 @@ def chat_completion(
                 continue
             if on_event is not None:
                 on_event(chunk)
+            if error := chunk.get("error"):
+                raise RuntimeError(f"chat stream failed: {error}")
             for choice in chunk.get("choices") or []:
                 delta = choice.get("delta") or {}
                 # Reasoning models split the reply across fields, and which

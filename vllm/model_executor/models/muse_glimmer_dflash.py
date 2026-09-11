@@ -59,6 +59,26 @@ def _store_kv_at_slots(
     head_size = k_heads.shape[-1]
     if kv_cache.dim() == 5 and kv_cache.shape[0] == 2:
         block_size = kv_cache.shape[2]
+        if kv_cache.device.type == "mps":
+            from vllm.quixicore.ops import quixicore_ops
+
+            if slot.numel() == 0:
+                return
+            # Context projections are sliced views; copy only those new rows.
+            # The native scatter honors packed page strides and skips PAD_SLOT_ID
+            # instead of interpreting -1 as a write into the final cache page.
+            quixicore_ops.qc_kv_cache_scatter(
+                k_heads.to(kv_cache.dtype).contiguous(),
+                v_heads.to(kv_cache.dtype).contiguous(),
+                slot.to(torch.long).contiguous(),
+                kv_cache[0],
+                kv_cache[1],
+                k_heads.shape[-2],
+                head_size,
+                block_size,
+                1,
+            )
+            return
         block_idx, block_off = slot // block_size, slot % block_size
         kv_cache[0][block_idx, block_off] = k_heads.to(kv_cache.dtype)
         kv_cache[1][block_idx, block_off] = v_heads.to(kv_cache.dtype)

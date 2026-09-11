@@ -16,7 +16,10 @@ import numpy as np
 
 def diagnostic_plan(plan, directory):
     """Opt into a deliberately non-baseline capture on the target profile only."""
-    if plan.profile_id != "glm53-nvfp4-4" or plan.platform != "rtx6000":
+    if (
+        plan.profile_id not in ("glm53-nvfp4-4", "glm53f-nvfp4-4")
+        or plan.platform != "rtx6000"
+    ):
         raise ValueError("routing journal currently supports GLM-5.3 on RTX6000 TP4")
     if plan.speculative:
         raise ValueError("routing journal requires the no-spec profile")
