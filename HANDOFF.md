@@ -35,22 +35,38 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): kernel speed work resumed
+### Latest checkpoint (2026-09-11): H16 sparse prefill retained
 
-2026-09-11 UTC correction: **the first sparse swapAB serving pair was a no-op**.
-Checkpoint64 global attention heads / TP4 = H16; the candidate only admitted
-H32. Both complete runs are preserved; no serving gain or regression follows.
-Earlier H32 component gains and the52-case H32 sweep do NOT establish this
-profile's behavior. Native now specializes H16 (two math/one IO warps, every
-reader releases), benchmark derives heads and1/sqrt256 scale from checkpoint,
-and dispatch test asserts native invocation. First H16 component screen passes
-all12 sampled FP64 rows/graphs and improves4.2–10.4% at fixed2048/7616 rows,
-32K/128K. InstalledSHA c2c4a996; all10 H16 GPU tests pass, full paged-graph
-racecheck0 hazards and memcheck0 errors. Next new same-binary flag0/flag1 pair.
-Profile stillOFF. Original
-no-op outputs:`sparse-swapab-serving-{control,candidate}/`; H16:`sparse-swapab/h16.json`.
-Review/integration map:`docs/glm53-flash-sm120-review.md`. GitHub still401;
-host-tier allocation and QuixiCore port branch still await operator decisions.
+Phase 4.3/4.5 native BF16 swapAB is now enabled in the RTX6000 profile through
+`VLLM_GLM53_SPARSE_PREFILL_SWAPAB=1`. It specializes the actual 64 global heads
+/ TP4 = H16, using two math warps and one IO warp with all-reader release.
+Recipe v1, native library c2c4a996, BF16 Q/KV and FP16 P/V are unchanged.
+
+One same-source/same-binary flag0/flag1 pair on `6b2fea199`, three repetitions:
+cold 32K engine TTFT 2526.339 -> 2519.428 ms (-0.274%); 128K 10001.190 ->
+9949.508 ms (-0.517%). Every candidate TTFT is below every control at each
+length. Candidate c1/c8/c16 E2E 156.663 / 579.222 / 780.644 tok/s is neutral
+within the pair's spread, not a decode gain. All exact-token, text/image and
+six retrieval contrasts per arm pass. Ten GPU tests, sampled FP64 rows,
+memcheck and racecheck pass; five focused profile tests pass. Both servers
+exited successfully and released their GPUs. Raw: `sparse-swapab-h16-serving-*`
+and `sparse-swapab/h16*` under `perf/results/2026-09-11/`.
+
+The first H32 serving pair was a NO-OP; its candidate never ran on H16.
+Both original runs remain preserved. The old H32 component gains and 52-case
+H32 sweep are not target-profile evidence. Corrected benchmark heads/scale
+come from the checkpoint; the dispatch test asserts the native call, and
+serving logs H16 activation on rank0 before timing.
+
+Next: Phase 5 integration/publication, not another scoring or tile sweep.
+Broader 2.3 next-layer prefetch and 4.4 persistent decode remain explicitly
+unimplemented/deferred, with evidence in `docs/glm53-flash-sm120-review.md`.
+Foundry has overlapping uncommitted changes and still needs its real eight-wide
+application gate. Host-tier allocation and QuixiCore port branch await operator
+choices. Both GitHub API and Git dry-run publishing fail authentication; no
+remote ref changed and no PR/review has occurred. Do not mark the roadmap done.
+
+#### Earlier development checkpoints (superseded by the H16 result above)
 
 2026-09-11 UTC: **Phase4.3/4.5 native BF16 swapAB prefill is integrated OPT-IN**,
 pending a same-library flag0/flag1 serving pair. Direct Triton transpose and

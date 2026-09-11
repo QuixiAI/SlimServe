@@ -2002,6 +2002,47 @@ released, no retries or quant/native/default changes; original oracle remains a
 historical failure. Raw `indexer-serving-v1/closure.json` under2026-09-10, SHA
 0d1302e05d6f2350d1bcf60be4d04691f489d6c3040f1bbca37fd890d139fa8b.
 
+### RTX6000 H16 BF16 sparse swapAB prefill retained - 2026-09-11
+
+Profile enables `VLLM_GLM53_SPARSE_PREFILL_SWAPAB=1`, SM120/H16/BF16 and
+2048..8192 rows. Selected recipe v1, TP4/no-spec, wide Marlin and TP indexer
+sharding are unchanged. Flag0 restores Triton. Native binary
+c2c4a99648315d753e8d60cb728c28476634d137bbaf6299dd817d56d81ef92d.
+
+One control and one candidate start on6b2fea199, three repeats each, exact
+1000/300 c1/c8/c16, cold prefixes, existing text/image/retrieval and cold32K/
+128K checks. Benchmark sources (including sparse dispatcher), prompt, profile,
+recipe, package/native hashes and CPU affinity match. Only environment difference
+is swapAB0/1. No timing exclusions or replacements. Startup166.061/152.079s.
+
+| Measurement | Control median [min,max] | Candidate median [min,max] | Change |
+|---|---:|---:|---:|
+| c1 E2E tok/s | 156.893 [156.693,156.946] | 156.663 [156.578,156.895] | -0.146%, overlapping ranges |
+| c8 E2E tok/s | 581.076 [579.158,581.518] | 579.222 [575.895,580.437] | -0.319%, overlapping ranges |
+| c16 E2E tok/s | 781.150 [778.895,781.430] | 780.644 [778.577,782.468] | -0.065%, overlapping ranges |
+| cold32K engine TTFT ms | 2526.339 [2524.065,2528.348] | 2519.428 [2518.482,2522.893] | -0.274% |
+| cold128K engine TTFT ms | 10001.190 [9977.932,10028.370] | 9949.508 [9922.302,9974.362] | -0.517% |
+
+Retained for the small prefill improvement: every candidate TTFT beats every
+control at each length. Effective engine-TTFT input rates13006.13/13173.72tok/s.
+Decode is treated as neutral within this pair's spread, not improved; one pair
+does not establish across-start variance or a tight non-regression bound.
+
+All18 exact-token measurements, text/image canaries and12 retrieval contrasts
+pass; scored-text means -2.723973/-2.726924 over4096 tokens each. Ten focused
+GPU tests, sampled FP64 rows and changed-input graphs pass; memcheck0 errors,
+racecheck0 hazards. Rank0 logs native H16 activation before timed requests.
+Logger's default local scope suppresses other ranks' duplicate messages; this
+is not an all-rank operation trace. No new128K generated-retrieval qualification
+or resolution of historical scoring-repeatability limits is claimed.
+
+The earlier `sparse-swapab-serving-*` pair is a preserved NO-OP: H32 dispatch
+never ran on the actual64-global-head/TP4=H16 checkpoint. H32 component results
+do not count as this profile's qualification. Corrected component gains are
+4.2–10.4%; serving gains are the smaller numbers above. Both servers exited0,
+owned GPUs released. Raw `perf/results/2026-09-11/sparse-swapab-h16-serving-*`
+and `sparse-swapab/h16*`; exact commands and corrected history in the notebook.
+
 ### RTX6000 TP row-sharded indexer retained - 2026-09-11
 
 Selected recipe v1, native libraries and existing wide-Marlin flag unchanged.

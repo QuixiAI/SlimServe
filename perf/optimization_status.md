@@ -28824,3 +28824,88 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - H16 memcheck now completes:0 errors, both paged-graph fixtures pass. Raw
   `h16-memcheck.log`. Serving source catalog now includes the sparse-prefill
   Python dispatcher alongside the native library receipt; no new controller.
+
+### H16 serving pair complete — retain small prefill win
+
+- Status: retained in RTX6000 profile; other platforms default to Triton.
+  Source6b2fea199, same installed c2c4a996 native binary in both arms. Selected
+  recipe v1/TP4/no speculation unchanged. Exactly one flag0 control and one
+  flag1 candidate, three repetitions each, no timing exclusions or retries.
+  Sources, prompt, profile, package/native hashes and CPU affinity match;
+  only environment difference is `VLLM_GLM53_SPARSE_PREFILL_SWAPAB`0/1.
+- Cold32K engine TTFT2526.339 ->2519.428ms (-0.274%);128K10001.190
+  ->9949.508ms (-0.517%). Every candidate reading is below every control at
+  each length; complete ranges are in the new baseline snapshot. These are
+  small serving gains, NOT the4.2–10.4% component improvement. Kernel-warm,
+  prefix-cold; all cache counts0. Warmups remain separately recorded.
+- c1/c8/c16 E2E156.893/581.076/781.150 ->156.663/579.222/780.644tok/s
+  (-0.146/-0.319/-0.065%), with overlapping ranges: treated as neutral within
+  this pair, not a decode gain or tight across-start non-regression bound.
+- All18 exact-token measurements, text/image canaries and12 standard retrieval
+  contrasts pass.4096-token text scores -2.723973/-2.726924. Historical scoring
+  warnings/repeatability limits are unchanged; no extra scoring investigation.
+  This pair does not add generated retrieval at128K. The native local FP64/
+  graph/memory/race gates are recorded above.
+- Dispatch proof: candidate server.log line471 explicitly reports active H16
+  native prefill before timing; control has no such message. Correction to the
+  prospective wording above: `logger.info_once` defaults to local-rank0 scope,
+  so this is a rank0 dispatch log, NOT four independent per-rank traces. The
+  GPU dispatch regression additionally asserts the native function is called.
+- Both controllers exit0; startup166.061/152.079s; owned GPUs released. Decision:
+  enable the flag only in `glm53-nvfp4-4`/rtx6000. Retain flag0 as opt-out.
+  Native library and numerical policy are unchanged by profile promotion.
+- Raw:`perf/results/2026-09-11/sparse-swapab-h16-serving-{control,candidate}/`.
+  Exact control command below; candidate changes only flag0 to1 and output
+  suffix `control` to `candidate`:
+
+  ```sh
+  systemd-run --user --scope --quiet \
+    --property=MemoryMax=150G --property=MemorySwapMax=0 \
+    env -u NCCL_P2P_DISABLE CUDA_VISIBLE_DEVICES=0,1,2,3 \
+    SLIMSERVE_CACHE=/raid/weights CUDA_HOME=/usr/local/cuda-13.0 \
+    VLLM_CACHE_ROOT=/home/tiny/.local/scratch/slimserve-glm53/vllm-cache \
+    OMP_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1 \
+    VLLM_GLM53_MARLIN_PREFILL_WIDE=1 VLLM_GLM53_INDEXER_TP_PREFILL=1 \
+    VLLM_GLM53_SPARSE_PREFILL_SWAPAB=0 SLIMSERVE_GLM53_NATIVE_ORDER=0 \
+    VLLM_GLM5_MHC_PREFILL_TC=0 \
+    .venv/bin/python benchmarks/benchmark_glm53_campaign.py \
+    --profile glm53-nvfp4-4 \
+    --source /home/tiny/.local/scratch/slimserve-glm53/prompt-source.txt \
+    --output perf/results/2026-09-11/sparse-swapab-h16-serving-control \
+    --boots 1 --repeats 3 --concurrency 1 8 16 \
+    --input-tokens 1000 --output-tokens 300 --cold-prefix --quality --prefill
+  ```
+
+## 2026-09-11 - Remaining roadmap disposition and integration review
+
+- Status: research deferrals and integration blockers, not roadmap completion.
+  Detailed source/evidence map: `docs/glm53-flash-sm120-review.md`.
+- 2.3 broader next-layer prefetch remains unimplemented/deferred: the retained
+  approximately5.1us custom-reduction wait is much shorter than the original
+  NCCL window. The actual FP8 output-weight prefetch saved~7us across34 layers
+  atc1 and regressed batched windows. That does not prove broader prefetch
+  impossible; reopen on a specific measured independent window/cache benefit.
+- 4.4 persistent decode remains unimplemented/deferred: the recorded0.427ms
+  graph-gap budget is7.4% of5.740ms, an optimistic removable-span bound only.
+  Existing stream-K, the losing cross-item expert candidate, marginal paired
+  activation and losing whole-head KDA fusion do not justify a monolithic
+  replacement on launch-count claims alone. No persistent-kernel speed claim.
+- Phase5 port inventory is complete/read-only against canonical QuixiCore-CUDA
+  main5e89180. Shared MLA header already matches; retain only the used native
+  families, fix scoped standalone build plumbing, and validate public routes
+  after porting. Branch selection requires user direction under that repo's
+  policy. No port branch, code changes or build were made there.
+- Foundry's overlapping uncommitted registry/deployment/orchestrator changes
+  were preserved. Current SGLang dialect/health/model-name and long-thinking
+  policy differ from the historical4K-output director fixture. Matched usable
+  eight-wide application qualification is still required before cutover.
+- Host/NVMe tier size/directory choice remains unanswered; RTX tiers stay off.
+  Proposed opt-in test:8GiB host +16GiB NVMe/rank, `/raid/slimserve-kv-tier`.
+- Publication: `gh api user` returns401; a separate non-mutating
+  `GIT_TERMINAL_PROMPT=0 git push --dry-run origin HEAD:refs/heads/glm53-flash-sm120`
+  also fails authentication. No remote ref changed, no PR/review occurred.
+  Reauthentication is required; no credential search or identity substitution.
+
+- Profile-retention check: five focused GLM53 CPU tests pass (65 unrelated
+  cases deselected), including the new RTX6000-only swapAB flag. Raw:
+  `sparse-swapab/h16-profile-tests.xml`. No further GPU work or native changes.

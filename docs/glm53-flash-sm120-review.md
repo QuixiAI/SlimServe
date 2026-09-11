@@ -23,8 +23,12 @@ prefill and TP-row-sharded indexer prefill. The indexer serving pair reduces
 cold 128K engine TTFT from 10.658 to 10.009 seconds; decode is neutral.
 The first BF16 swapAB serving pair was a no-op: its dispatch required H32,
 but the actual checkpoint has 64 global heads / TP4 = H16. Its H32 component
-gain is not evidence for this profile. Corrected H16 work is in progress;
-component gains alone do not authorize profile promotion.
+gain is not evidence for this profile. The corrected H16 pair qualifies a
+small retained win: 32K/128K engine TTFT 2526.339/10001.190 ->
+2519.428/9949.508 ms (-0.274/-0.517%). All three candidate timings beat all
+controls at each length. Decode is neutral within the observed spread, not
+improved. GPU/parity/sanitizer and serving checks pass; detailed ranges and
+limitations are recorded in the baseline snapshot.
 
 ## Review order
 
@@ -139,11 +143,13 @@ Read-only comparison against clean `main` at `5e89180` found:
 | mHC | Retained cooperative/split/post/head paths and paired-BF16 prefill, not tensor-core/last-block experiments |
 | Small-k sampler | Corrected cutoff/tie/nucleus/noise semantics |
 | Sparse decode | Channel-owned NoPE reducer and launch selection |
+| Sparse prefill | Retained H16 BF16 swapAB, including all-reader barriers, checked binding and focused tests |
 
 `mla_kernels.cuh` is already byte-identical, including packed-page stride.
 Wide Marlin and TP indexer sharding live in vLLM; do not import vLLM wholesale.
-Sparse swapAB remains excluded until the serving decision. Extract bindings;
-do not copy the entire `tm_cuda_serving.cu` translation unit.
+Sparse H16 swapAB is now retained and belongs in the port; its prior H32
+prototype does not. Extract bindings; do not copy the entire
+`tm_cuda_serving.cu` translation unit.
 
 Port prerequisites: user-selected branch (QuixiCore forbids choosing one),
 scoped build plumbing (`setup.py` omits nine initializer dependencies and
@@ -153,8 +159,9 @@ existing SlimServe measurements are provenance, not standalone port validation.
 
 ## Publication
 
-GitHub authentication currently returns HTTP 401, including the 2026-09-11
-check. User reauthentication is required before pushing/opening the requested
+GitHub authentication returns HTTP 401. The separate Git publishing dry run
+also fails with invalid credentials, without updating remote refs. User
+reauthentication is required before pushing/opening the requested
 PR. Use Auroter <auroter@users.noreply.github.com> for author and committer.
 Keep review feedback/fixes and final cleanup as remaining work, not completed
 items merely because this review map exists.

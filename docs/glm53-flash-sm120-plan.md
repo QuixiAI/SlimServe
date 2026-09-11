@@ -1,7 +1,7 @@
 # GLM-5.3-Flash on 4x RTX PRO 6000 Blackwell (sm_120): performance plan
 
 Status: historical research plan; current optimization direction updated
-2026-09-10. Branch `glm53-flash-sm120`, cut from upstream/main 9247eedad.
+2026-09-11. Branch `glm53-flash-sm120`, cut from upstream/main 9247eedad.
 The implementation has advanced substantially since the original plan.
 Use HANDOFF.md for current priorities and perf/baseline_status.md for current
 fixed-start results. Original target tables and bandwidth estimates below are
@@ -71,16 +71,17 @@ budget; otherwise document deferral, not a fictitious implemented result.
 | 3 | MTP port tested; off after losses on the relevant concurrent workload |
 | 4.1 | Paired-column/fused-SwiGLU successor implemented and parked: ~54us c1 step budget, batched neutral, stress comparison differences recorded; no serving promotion |
 | 4.2 | Whole-head conv/state/norm fusion implemented and rejected; paired K128 fg_b parked; projection-inclusive fusion deferred on measured value |
-| 4.3 | ACTIVE: first H32 serving pair is a no-op because actual TP4 is H16; corrected H16 native component improves4.2–10.4%; GPU/serving qualification pending |
+| 4.3 | H16 native BF16 swapAB retained: cold 32K/128K TTFT -0.274/-0.517%, decode neutral within pair spread; original H32 pair preserved as a no-op |
 | 4.4 | Persistent per-layer decode unimplemented/deferred; enabling fusions do not currently justify replacement (review map) |
-| 4.5 | TP row-sharded prefill indexer retained (-6.09% cold128K TTFT), alongside wide Marlin; broader structural work not closed |
+| 4.5 | TP row-sharded indexer, wide Marlin and H16 swapAB prefill retained; no claim that all structural possibilities are exhausted |
 | 5 | Final integration/tier qualification/port-back not completed |
 
 The first swapAB pair exposed a fixture/dispatch error: the checkpoint has
 64 global attention heads, hence H16 at TP4, not H32. Both no-op controls stay
-recorded. The earlier H32 local sweep cannot close H16 work. Corrected native
-ownership, checkpoint-derived benchmark shape/scale and an asserted native
-dispatch are now being qualified. Detailed integration gates, research
+recorded. The earlier H32 local sweep cannot close H16 work. Corrected H16
+ownership, checkpoint-derived shape/scale and asserted native dispatch pass
+the component and serving gates; the RTX6000 profile now enables the kernel.
+Detailed integration gates, research
 deferral evidence for2.3/4.4 and minimal port-back map are in
 `docs/glm53-flash-sm120-review.md`. Deferred does not mean implemented or
 exhausted; Phase5 and PR/review remain open.

@@ -35,7 +35,7 @@ logger = init_logger(__name__)
 # factor): VLLM_MLA_SPARSE_PREFILL_TC=0 keeps prefill chunks on the decode
 # walk.
 ENABLED = os.getenv("VLLM_MLA_SPARSE_PREFILL_TC", "1") != "0"
-# Opt-in until the same-binary profile comparison establishes serving value.
+# Enabled by the qualified RTX6000 profile; other profiles default to Triton.
 SWAPAB_ENABLED = os.getenv("VLLM_GLM53_SPARSE_PREFILL_SWAPAB", "0") == "1"
 
 LATENT = 512
