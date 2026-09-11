@@ -63,23 +63,11 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.platforms import current_platform
 from vllm.quixicore.ops import quixicore_ops
 from vllm.scalar_type import ScalarType, scalar_types
+from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
-# Marlin's lock/counter workspace only has to be zero when a kernel starts
-# and the kernel leaves it zero, which is why the dense Marlin methods
-# allocate it once per layer. Allocating (and zeroing) one per call put a
-# fill kernel in front of every MoE layer at decode; keep one per device.
-_MARLIN_MOE_WORKSPACE: dict[torch.device, torch.Tensor] = {}
 _CANONICAL_MOE_DIAGNOSTIC = canonical_moe_enabled()
 _STABLE_ALIGN_DIAGNOSTIC = stable_align_enabled()
 _NATIVE_ORDER = native_order_enabled()
-
-
-def _marlin_moe_workspace(device: torch.device) -> torch.Tensor:
-    workspace = _MARLIN_MOE_WORKSPACE.get(device)
-    if workspace is None:
-        workspace = marlin_make_workspace_new(device, 4)
-        _MARLIN_MOE_WORKSPACE[device] = workspace
-    return workspace
 
 
 def _fused_marlin_moe(
@@ -127,7 +115,9 @@ def _fused_marlin_moe(
     N = marlin_moe_intermediate_size(w1, w2)
     w13_num_shards = 2 if activation.is_gated else 1
     if workspace is None:
-        workspace = _marlin_moe_workspace(hidden_states.device)
+        # Standalone calls have no serialized layer/ubatch owner. Their locks
+        # must not alias another invocation, including independent CUDA graphs.
+        workspace = marlin_make_workspace_new(hidden_states.device, 4)
 
     if intermediate_cache13 is None:
         intermediate_cache13 = torch.empty(
@@ -697,6 +687,10 @@ class MarlinExpertsBase(mk.FusedMoEExpertsModular):
             num_dispatchers=num_dispatchers,
         )
         vllm_config = get_current_vllm_config_or_none()
+        self._use_ubatching = (
+            vllm_config is not None and vllm_config.parallel_config.use_ubatching
+        )
+        self._marlin_workspaces: dict[tuple[torch.device, int], torch.Tensor] = {}
         extra = vllm_config.additional_config if vllm_config is not None else {}
         self._singleton_alignment = make_singleton_alignment(
             moe_config,
@@ -706,6 +700,18 @@ class MarlinExpertsBase(mk.FusedMoEExpertsModular):
             current_platform.is_cuda()
             and current_platform.is_device_capability((8, 0)),
         )
+
+    def _marlin_workspace(self, device: torch.device) -> torch.Tensor:
+        # Marlin leaves its locks zero. Reuse removes the per-call fill, but
+        # ownership must follow the runner's serialized layer/ubatch lifecycle,
+        # not the device or capture stream shared by otherwise independent work.
+        ubatch_id = dbo_current_ubatch_id() if self._use_ubatching else 0
+        key = (device, ubatch_id)
+        workspace = self._marlin_workspaces.get(key)
+        if workspace is None:
+            workspace = marlin_make_workspace_new(device, 4)
+            self._marlin_workspaces[key] = workspace
+        return workspace
 
     @staticmethod
     def _supports_current_device() -> bool:
@@ -897,6 +903,7 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
                 moe_sum=self.moe_sum,
                 expert_map=expert_map,
                 output=output,
+                workspace=self._marlin_workspace(hidden_states.device),
                 # Workspaces are swapped in workspace_shapes() to account for proper
                 # output buffer allocation. Please refer to workspace_shapes().
                 intermediate_cache13=workspace2,
@@ -1023,6 +1030,7 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
             moe_sum=moe_sum_with_lora,
             expert_map=expert_map,
             output=output,
+            workspace=self._marlin_workspace(hidden_states.device),
             intermediate_cache13=workspace2,
             intermediate_cache2=workspace13,
             g_idx1=self.w13_g_idx,
@@ -1157,6 +1165,7 @@ class BatchedMarlinExperts(MarlinExpertsBase):
             input_global_scale1=self.a1_gscale,
             input_global_scale2=self.a2_gscale,
             output=output,
+            workspace=self._marlin_workspace(hidden_states.device),
             intermediate_cache13=workspace13,
             intermediate_cache2=workspace2,
             g_idx1=self.w13_g_idx,
