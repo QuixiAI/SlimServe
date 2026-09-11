@@ -190,6 +190,7 @@ class BlockPool:
         # To represent a placeholder block with block_id=0.
         # The ref_cnt of null_block is not maintained, needs special care to
         # avoid freeing it.
+        self.free_block_queue.pool_id = pool_id
         self.null_block = self.free_block_queue.popleft()
         self.null_block.is_null = True
 

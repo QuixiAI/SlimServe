@@ -240,6 +240,13 @@ class FreeKVCacheBlockQueue:
         # in the queue has prev and next blocks.
         self.fake_free_list_head = KVCacheBlock(block_id=-1)
         self.fake_free_list_tail = KVCacheBlock(block_id=-1)
+        # Shadow membership of the linked list, kept by every link/unlink.
+        # `_check()` compares it with num_free_blocks at the start of each
+        # mutating call, so a divergence is reported at the first operation
+        # after the one that caused it (with that caller's stack), instead of
+        # much later when popleft_n walks off the end of the list.
+        self._linked: set[int] = {b.block_id for b in blocks}
+        self.pool_id = -1
         if self.num_free_blocks > 0:
             # Connect fake_head and fake_tail to the first and last block
             # respectively.
@@ -251,6 +258,15 @@ class FreeKVCacheBlockQueue:
             # For empty list, simply connect the fake head and tail.
             self.fake_free_list_head.next_free_block = self.fake_free_list_tail
             self.fake_free_list_tail.prev_free_block = self.fake_free_list_head
+
+    def _check(self, where: str) -> None:
+        if len(self._linked) != self.num_free_blocks:
+            raise RuntimeError(
+                f"FreeKVCacheBlockQueue.{where} (pool {self.pool_id}): "
+                f"num_free_blocks={self.num_free_blocks} but the list holds "
+                f"{len(self._linked)} blocks; the count and the list diverged "
+                "in an earlier operation"
+            )
 
     def popleft(self) -> KVCacheBlock:
         """Pop the first free block and reduce num_free_blocks by 1.
@@ -268,7 +284,9 @@ class FreeKVCacheBlockQueue:
             )
             raise ValueError("No free blocks available")
 
+        self._check("popleft")
         first_block: KVCacheBlock = self.fake_free_list_head.next_free_block
+        self._linked.discard(first_block.block_id)
 
         if first_block.next_free_block is None:
             # This should not happen if the block is from the free list.
@@ -300,6 +318,7 @@ class FreeKVCacheBlockQueue:
         """
         if n == 0:
             return []
+        self._check("popleft_n")
         assert self.num_free_blocks >= n
         self.num_free_blocks -= n
 
@@ -314,6 +333,7 @@ class FreeKVCacheBlockQueue:
                     f"(asked for {n}); the count and the list have diverged"
                 )
             ret.append(curr_block)
+            self._linked.discard(curr_block.block_id)
             last_block = curr_block
             curr_block = curr_block.next_free_block
             # Reset prev_free_block and next_free_block of all popped blocks
@@ -333,10 +353,12 @@ class FreeKVCacheBlockQueue:
         Args:
             block: The block to remove.
         """
+        self._check("remove")
         if block.prev_free_block is None or block.next_free_block is None:
             # This should not happen if the block is from the free list.
             # It indicates a bug in the caller's logic.
             raise RuntimeError(f"remove() called on an invalid block: {block}")
+        self._linked.discard(block.block_id)
 
         # Link the previous block to the next block.
         block.prev_free_block.next_free_block = block.next_free_block
@@ -359,7 +381,9 @@ class FreeKVCacheBlockQueue:
                 "prev_free_block of fake_free_list_tail should always exist"
             )
         last_block: KVCacheBlock = self.fake_free_list_tail.prev_free_block
+        self._check("append")
         _assert_unlinked(block, "FreeKVCacheBlockQueue.append")
+        self._linked.add(block.block_id)
 
         # Connect the new block after the last block.
         last_block.next_free_block = block
@@ -381,9 +405,11 @@ class FreeKVCacheBlockQueue:
             "next_free_block of fake_free_list_head should always exist"
         )
 
+        self._check("prepend_n")
         prev_block = self.fake_free_list_head
         for block in blocks:
             _assert_unlinked(block, "FreeKVCacheBlockQueue.prepend_n")
+            self._linked.add(block.block_id)
             block.prev_free_block = prev_block
             prev_block.next_free_block = block
             prev_block = block
@@ -406,9 +432,11 @@ class FreeKVCacheBlockQueue:
         assert last_block is not None, (
             "prev_free_block of fake_free_list_tail should always exist"
         )
+        self._check("append_n")
         # Add inter-connections between consecutive blocks
         for block in blocks:
             _assert_unlinked(block, "FreeKVCacheBlockQueue.append_n")
+            self._linked.add(block.block_id)
             block.prev_free_block = last_block
             last_block.next_free_block = block
             last_block = block
