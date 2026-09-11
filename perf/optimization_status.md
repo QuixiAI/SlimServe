@@ -25445,3 +25445,13 @@ arm (queue17).
   DSV4 fused kernel exists but its Python gate is batch-1 only:
   `should_fuse_dsv4_mhc` requires (1, 4096) inputs - a batched variant is
   the work), sampler/launch-count fusions, host-resident main KV.
+- THINKING BUDGET (2026-09-11, operator): the V2 runner enforces a
+  per-request thinking_token_budget (nudge to wrap up at 85%, hard
+  force-close of the think block at 100%, capped at max_tokens - 1), but
+  neither GLM-5.3 record configured one - only the qwen38 records carry
+  override_generation_config.thinking_token_budget 2000. That is why the
+  1M-leg probes at 900K+ thought through their whole 1,024-token reply
+  budget and answered nothing. Both glm53f records now set the fleet
+  convention (2000) with a registry test; the harness sends probes a
+  per-request budget of half their max_tokens so the answer keeps room.
+  The closing DP2 1M leg (queue15) validates it end to end.

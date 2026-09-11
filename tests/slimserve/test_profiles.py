@@ -1294,3 +1294,13 @@ def test_glm53f_8_is_tp4_dp2_with_replicated_moe():
     assert plan.engine["data_parallel_size"] == 2
     assert plan.engine["data_parallel_replicate_moe"] is True
     assert plan.engine["enable_expert_parallel"] is False
+
+
+def test_glm53f_records_carry_a_thinking_budget():
+    """Thinking is always on, so every GLM-5.3 record must bound it: the 1M
+    legs (2026-09-11) showed deep-context probes exhausting max_tokens inside
+    the think block with no budget to close it."""
+    for profile_id in ("glm53f-nvfp4-8", "glm53f-nvfp4-4"):
+        rec = registry._registry()["profiles"][profile_id]["variants"]["a100"]
+        budget = rec["engine"]["override_generation_config"]["thinking_token_budget"]
+        assert 500 <= budget <= 4000, (profile_id, budget)
