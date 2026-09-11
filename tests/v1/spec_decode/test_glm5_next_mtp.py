@@ -8,6 +8,7 @@ import torch
 
 import vllm.v1.spec_decode.glm5_next_mtp as glm_proposer
 from vllm.v1.kv_cache_interface import MLAAttentionSpec, UniformTypeKVCacheSpecs
+from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.glm5_next_mtp import Glm5NextMTPProposer
 
 MLA_LAYER = "draft.model.layers.45.self_attn.attn"
@@ -161,7 +162,7 @@ def test_next_step_recomputes_the_indexer_slots_with_its_own_block_size(monkeypa
     )  # old positions, one per request
     common = SimpleNamespace(slot_mapping=torch.tensor([100, 200]), max_seq_len=10)
     monkeypatch.setattr(
-        Glm5NextMTPProposer.__mro__[2],
+        EagleProposer,
         "_update_positions_dependent_metadata",
         lambda self, pos, cm, b, ib, bs: pos + 1,
     )

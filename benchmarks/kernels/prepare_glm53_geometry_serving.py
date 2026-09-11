@@ -18,7 +18,7 @@ from benchmarks.kernels.check_glm53_attention_norms import load_checked, require
 from benchmarks.kernels.check_glm53_geometry_loader import ORDER, check_launch
 from benchmarks.kernels.check_glm53_rmsnorm_geometry import write_new
 from slimserve.rmsnorm_diagnostic import sha
-from slimserve.rmsnorm_geometry import AOT_CLOSURE_SHA, AOT_PAIR_SHA, SERVING_SCHEMA
+from slimserve.rmsnorm_geometry import AOT_CLOSURE_SHA, AOT_PAIR_SHA, CASES, SERVING_SCHEMA
 
 ROOT = Path(__file__).resolve().parents[2]
 INTEGRATION_SITES = {
@@ -27,11 +27,6 @@ INTEGRATION_SITES = {
     ROOT / "benchmarks/benchmark_glm53_campaign.py",
     ROOT / "benchmarks/kernels/audit_glm53_geometry_loader.py",
 }
-CASES = (
-    ("control", "control"),
-    ("geometry", "geometry"),
-    ("return-control", "control"),
-)
 
 
 def completed_evidence(pair_path, closure_path):

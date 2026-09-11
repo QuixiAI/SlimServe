@@ -75,11 +75,11 @@ def test_glm_route_align_matches_router_and_alignment(tokens):
         routed_scaling_factor=SCALE,
         e_score_correction_bias=bias,
     )
-    assert torch.equal(
-        ids.sort(dim=1).values, ref_ids.to(torch.int32).sort(dim=1).values
-    )
+    ordered, permutation = ids.sort(dim=1)
+    ref_ordered, ref_permutation = ref_ids.to(torch.int32).sort(dim=1)
+    assert torch.equal(ordered, ref_ordered)
     torch.testing.assert_close(
-        w.sort(dim=1).values, ref_w.sort(dim=1).values, atol=1e-6, rtol=1e-6
+        w.gather(1, permutation), ref_w.gather(1, ref_permutation), atol=1e-6, rtol=1e-6
     )
 
     ref_sorted, ref_experts, ref_pad = moe_align_block_size(
@@ -163,5 +163,8 @@ def test_glm_route_align_is_total_on_non_finite_logits(tokens):
 def test_glm_route_align_rejects_unsupported_shapes():
     logits = torch.zeros(17, E, device=DEV)
     bias = torch.zeros(E, device=DEV)
-    with pytest.raises(RuntimeError):
-        torch.ops.vllm.glm_route_align(logits, bias, K, 0, True, SCALE, 8, 64, 8)
+    max_padded, max_blocks = glm_route_align.alignment_geometry(17, K, E, 8)
+    with pytest.raises(RuntimeError, match="M must be"):
+        torch.ops.vllm.glm_route_align(
+            logits, bias, K, 0, True, SCALE, 8, max_padded, max_blocks
+        )

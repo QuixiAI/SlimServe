@@ -249,6 +249,20 @@ def test_quantize_beta_lays_each_rank_in_its_own_block():
         fp8_swapset.quantize_beta(w, tp_size=3)
 
 
+@pytest.mark.parametrize("tp_size", [0, -4])
+def test_beta_quantization_rejects_nonpositive_shards(tp_size):
+    with pytest.raises(ValueError, match="must be positive"):
+        fp8_swapset.quantize_beta(torch.ones(8, 128), tp_size=tp_size)
+
+
+@pytest.mark.parametrize("tp_size", [None, 0, -4])
+def test_kda_builder_rejects_nonpositive_shards_before_reading_weights(tp_size):
+    with pytest.raises(SystemExit, match="positive --tp-size"):
+        fp8_swapset.build(
+            "unused-native", "unused-model", self_quant_kda=True, tp_size=tp_size
+        )
+
+
 def test_self_quant_kda_extends_sidecar_manifest_and_targets(tmp_path, monkeypatch):
     monkeypatch.delenv(fp8_swapset.SWAPSET_ENV, raising=False)
     native, conv = _fake_checkpoints(tmp_path)

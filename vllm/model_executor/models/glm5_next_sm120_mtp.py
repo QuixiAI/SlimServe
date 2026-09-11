@@ -314,6 +314,9 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
     stacked_params_mapping = [
         ("fused_qkv_a_proj", "q_a_proj", 0),
         ("fused_qkv_a_proj", "kv_a_proj_with_mqa", 1),
+        ("fused_qkv_a_proj", "indexer.wk", 2),
+        ("fused_qkv_a_proj", "indexer.index_kpool_compress_gate", 3),
+        ("fused_qkv_a_proj", "indexer.weights_proj", 4),
         ("gate_up_proj", "gate_proj", 0),
         ("gate_up_proj", "up_proj", 1),
     ]
