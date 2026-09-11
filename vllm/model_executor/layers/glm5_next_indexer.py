@@ -399,7 +399,7 @@ def _pooled_topk(
 def _pooled_select(
     q, weights, ape, cache, block_table, row_req, visible, logits,
     max_pools, block_size, softmax_scale, ksel, topk_out, kp,
-    adaptive_score=False, row_shard=False, group=1,
+    adaptive_score=False, row_shard=False, row_group=1,
 ) -> None:
     R = q.shape[0]
     if R == 0:
@@ -424,7 +424,7 @@ def _pooled_select(
             q[lo:hi], weights[lo:hi], ape, cache, block_table,
             row_req[lo:hi], visible[lo:hi], logits[:local_rows],
             max_pools, block_size, softmax_scale, ksel, kp,
-            group=group if local_rows % max(group, 1) == 0 else 1,
+            group=row_group if local_rows % max(row_group, 1) == 0 else 1,
         )
         sel = torch.empty((R, ksel), dtype=torch.int32, device=q.device)
         # Reuse the live serving communicator on the caller stream. Creating
@@ -435,7 +435,7 @@ def _pooled_select(
         sel = _pooled_topk(
             q, weights, ape, cache, block_table, row_req, visible, logits,
             max_pools, block_size, softmax_scale, ksel, kp, adaptive_score,
-            group=group,
+            group=row_group,
         )
     _expand_topk_kernel[(R,)](
         sel, visible, topk_out, sel.stride(0),
@@ -537,7 +537,7 @@ def glm5_next_pooled_indexer(
             row_shard=_row_shard_dispatch(row_shard_decode, R, md.num_prefills, next_n),
             # Decode rows are request-major (row_req = arange // next_n), so a
             # request's k+1 verify rows are contiguous.
-            group=next_n if R % max(next_n, 1) == 0 else 1,
+            row_group=next_n if R % max(next_n, 1) == 0 else 1,
         )
 
 
