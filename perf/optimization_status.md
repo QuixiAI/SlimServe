@@ -25237,3 +25237,37 @@ restart is the operator's call.
   per replica, as designed) but was cut off by the queue reshuffle; it
   reruns in queue5. Raw: perf/results/2026-09-10/glm53f-dflash2/
   mx-tp4dp2-flat-0320/.
+
+## 2026-09-11: 8-GPU matrix on today's tree (DFlash2 on, record config)
+
+Exact-token c1/c8/c16/c32/c64, two repeats each (r1/r2), canaries pass
+unless noted; TP4 arms with the two TP8-only kernels OFF unless "-k".
+Raw: perf/results/2026-09-10/glm53f-dflash2/mx-*/.
+
+| arm | weights/rank | pool tokens | c1 | c8 | c16 | c32 | c64 |
+|---|---|---|---|---|---|---|---|
+| TP8 record (09-10, kernels on) | 24.0 GiB | 3.08M | 153.6 | 495.0 | 687.3 | 879.5 | 1074.5 |
+| tp8-ep | 24.0 | 3.08M | 111/119 | 504/490 | 673/658 | 860/863 | 1049/1050 |
+| tp4dp2-flat (default DP: flattened MoE) | 26.4 | 2.87M | 166/123 | 504/487 | 757/733 | 930/932 | 1145/1145 |
+| tp4dp2-ep | 26.4 | 2.78M | 100/85 | 440/418 | 617/611 | 860/854 | 1051/1062 |
+| tp4 standalone (4 GPUs) | 46.3 | 1.67M | 131/130 | 379/393 | 503/493 | 650/653 | 795/791 |
+| tp4-k standalone (row shard + sparse TC on) | 46.3 | 1.65M | 138/155 | 412/409 | 524/501 | 680/676 | 794/793 |
+| tp4dp2 replicated MoE | 46.3 | 1.67M | HANG | | | | |
+| tp4dp2-k replicated MoE, kernels on | 46.3 | 1.65M | HANG | | | | |
+
+- Flattened DP2 beats the TP8 record at c16/c32/c64 by +8% / +6% / +7%
+  even with both TP8-only kernels off, and matches c8; its c1 is
+  bimodal with acceptance (166 vs 123) like every DFlash arm.
+- EP loses everywhere again (tp8-ep -28% c1, tp4dp2-ep -13% c8).
+- The TP4-generalized kernels are worth +6% c1/c8 and +4% c16/c32 on a
+  standalone TP4 engine (tp4-k vs tp4).
+- Replicated-MoE DP2 boots (46.3 GiB/rank = full expert set per
+  replica) but the FIRST request hangs: "RPC call to sample_tokens timed
+  out" on DP0 300 s after the canary - a cross-replica collective is
+  still being entered by the active replica while the idle replica no
+  longer dummy-steps. Reproducing under py-spy to find it.
+- k=3/k=4 arms all died with a torch.compile shape-guard assert
+  ("expected size 3==4, stride 12288==16384") - the drafter's compiled
+  graph is keyed without the DFlash block size, so k=3 and k=4 share a
+  cache entry (the compile-cache A/B hazard). Fix owed: fold the draft
+  block size into the compile hash; rerun the k arms after.
