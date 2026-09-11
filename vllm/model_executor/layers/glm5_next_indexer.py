@@ -29,6 +29,7 @@ opaque to torch.compile and captures into decode CUDA graphs.
 from __future__ import annotations
 
 import os
+from functools import cache as cache_once
 
 import torch
 from torch import nn
@@ -38,6 +39,7 @@ from slimserve.index_journal import instrument_pooled_indexer, instrument_topk
 
 from vllm import _custom_ops as ops
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
+from vllm.distributed import get_dcp_group, get_pcp_group, get_tp_group
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import ReplicatedLinear
@@ -76,6 +78,21 @@ _PREFILL_MATMUL = os.getenv("VLLM_GLM5_INDEXER_PREFILL_MATMUL", "1") != "0"
 _SM120_TILES = os.getenv("VLLM_GLM5_INDEXER_SM120_TILES", "0") == "1"
 _ROW_TILE = 2 if _SM120_TILES else 8
 _POOL_TILE = 128 if _SM120_TILES else 64
+_TP_PREFILL_SHARD = os.getenv("VLLM_GLM53_INDEXER_TP_PREFILL", "0") == "1"
+
+
+@cache_once
+def _prefill_shard_group():
+    # Explicit SM120/TP4 opt-in. Decode, short prefills and other platforms
+    # retain the existing zero-communication path.
+    if (not _TP_PREFILL_SHARD or not torch.cuda.is_available()
+            or torch.cuda.get_device_capability() != (12, 0)):
+        return None
+    group = get_tp_group()
+    if (group.world_size != 4 or get_dcp_group().world_size != 1
+            or get_pcp_group().world_size != 1):
+        return None
+    return group
 
 
 class Glm5NextIndexerBackend(DeepseekV32IndexerBackend):
@@ -494,7 +511,7 @@ def _prefill_row_req(chunk, R: int) -> torch.Tensor:
     return torch.cumsum(new_req, 0, dtype=torch.int32) - 1
 
 
-def _pooled_select(
+def _pooled_topk(
     q: torch.Tensor,           # [R, H, D] bf16
     weights: torch.Tensor,     # [R, H] fp32
     ape: torch.Tensor,         # [KP, D] fp32
@@ -507,13 +524,12 @@ def _pooled_select(
     block_size: int,
     softmax_scale: float,
     ksel: int,
-    topk_out: torch.Tensor,    # [R, OUT_W] int32
     kp: int,
     by_request: bool = False,  # rows grouped by request: prefill chunks
-) -> None:
+) -> torch.Tensor:
     R, H, D = q.shape
     if R == 0:
-        return
+        return torch.empty((0, ksel), dtype=torch.int32, device=q.device)
     n_pools = torch.div(visible, kp, rounding_mode="floor").to(torch.int32)
     if by_request:
         _pooled_logits_by_request(
@@ -539,10 +555,70 @@ def _pooled_select(
         logits[:R], zeros, n_pools, sel, R, logits.stride(0), logits.stride(1),
         ksel,
     )
+    return sel
+
+
+def _pooled_select(
+    q, weights, ape, cache, block_table, row_req, visible, logits,
+    max_pools, block_size, softmax_scale, ksel, topk_out, kp,
+    by_request=False,
+) -> None:
+    R = q.shape[0]
+    if R == 0:
+        return
+    sel = _pooled_topk(
+        q, weights, ape, cache, block_table, row_req, visible, logits,
+        max_pools, block_size, softmax_scale, ksel, kp, by_request,
+    )
     _expand_topk_kernel[(R,)](
         sel, visible, topk_out, sel.stride(0),
         KP=kp, KSEL=ksel, OUT_W=topk_out.shape[1], BLOCK_S=64,
     )
+
+
+def _pooled_prefill_tp_select(
+    q, weights, ape, cache, chunks, topk_out, block_size,
+    softmax_scale, ksel, kp, group,
+) -> None:
+    """Disjoint query rows; one pool-ID exchange before token expansion.
+
+    Adapted from vLLM #54951's row-ownership design. Pool IDs are 4x smaller
+    than expanded indices for GLM53. No score reduction/quantization change.
+    Chunk offsets exclude leading decode rows and trailing graph padding.
+    """
+    first, last = chunks[0].token_start, chunks[-1].token_end
+    owned = triton.cdiv(last - first, group.world_size)
+    start = first + group.rank_in_group * owned
+    stop = min(start + owned, last)
+    local = torch.full((owned, ksel), -1, dtype=torch.int32, device=q.device)
+    for chunk in chunks:
+        lo, hi = max(start, chunk.token_start), min(stop, chunk.token_end)
+        if lo >= hi:
+            continue
+        R = chunk.token_end - chunk.token_start
+        offset = slice(lo - chunk.token_start, hi - chunk.token_start)
+        visible = (chunk.cu_seqlen_ke - chunk.cu_seqlen_ks).to(torch.int32)
+        row_req = _prefill_row_req(chunk, R)
+        max_pools = max(1, chunk.max_seq_len // kp)
+        logits = torch.empty((hi - lo, max_pools), dtype=torch.float32, device=q.device)
+        local[lo - start:hi - start] = _pooled_topk(
+            q[lo:hi], weights[lo:hi], ape, cache, chunk.block_table,
+            row_req[offset], visible[offset], logits, max_pools, block_size,
+            softmax_scale, ksel, kp, by_request=True,
+        )
+    # Keep local alive until all dependent work is enqueued. Empty owners still
+    # participate with padding; every rank issues exactly one collective.
+    gathered = group.all_gather(local, dim=0)
+    for chunk in chunks:
+        R = chunk.token_end - chunk.token_start
+        if R <= 0:
+            continue
+        selected = gathered[chunk.token_start - first:chunk.token_end - first]
+        visible = (chunk.cu_seqlen_ke - chunk.cu_seqlen_ks).to(torch.int32)
+        _expand_topk_kernel[(R,)](
+            selected, visible, topk_out[chunk.token_start:chunk.token_end],
+            selected.stride(0), KP=kp, KSEL=ksel, OUT_W=topk_out.shape[1], BLOCK_S=64,
+        )
 
 
 @instrument_pooled_indexer
@@ -586,7 +662,21 @@ def glm5_next_pooled_indexer(
     # 2) prefill chunks.
     if md.num_prefills > 0:
         assert md.prefill is not None
-        for chunk in md.prefill.chunks:
+        chunks = md.prefill.chunks
+        group = None
+        if (_TP_PREFILL_SHARD and _PREFILL_MATMUL and chunks
+                and chunks[-1].token_end - chunks[0].token_start >= 2048
+                and md.prefill.max_prefill_seq_len >= 32768):
+            group = _prefill_shard_group()
+        if group is not None:
+            logger.info_once(
+                "GLM53 TP4 prefill indexer row sharding active (pool-ID exchange)."
+            )
+            _pooled_prefill_tp_select(
+                q, weights, ape, cache, chunks, topk_indices_buffer,
+                block_size, softmax_scale, ksel, kp, group,
+            )
+        for chunk in (() if group is not None else chunks):
             R = chunk.token_end - chunk.token_start
             if R <= 0:
                 continue

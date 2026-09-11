@@ -28446,3 +28446,43 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   ```
 
   Use a new output path; the benchmark refuses to overwrite existing results.
+
+## 2026-09-11 - Phase 4.5 TP row-sharded indexer: integrate for serving pair
+
+- Status: component win; opt-in integration, not yet serving-qualified.
+- Research: read vLLM #54951 production patches at
+  b466281a9ab20e483444736f85d650418ca40d44. Independent query rows let ranks
+  divide replicated scoring/top-k. Our adaptation exchanges512 pool IDs before
+  expansion, not2051 token IDs; one padded uniform TP all-gather per forward.
+  Equal contiguous row ownership keeps the implementation small. Preserve all
+  scoring, pooling, selector, expansion kernels and recipe numerics.
+- Complete component includes pooling, score allocation, top-k, communication
+  and expansion. Synthetic replicated BF16 Q/paged cache, FP32 APE/head weights;
+  actual serving kernels and NCCL2.29.7 TP group, P2P SYS on four SM120 GPUs.
+  Fixed7616 rows,32K/128K contexts, original subchunk score budget128MiB
+  (metadata512MiB in unpooled units). Three A/B/A rounds, two warmups/five
+  synchronized eager windows per arm, report slowest rank wall time including
+  host launches. Not model TPS or a physical-floor estimate.
+- Median before/candidate/after:32K2.43265/1.26015/2.43447ms;
+  128K10.09315/3.08420/9.99169ms. ~48%/69% lower component latency. All rows'
+  selected token sets and tail entries match on all four ranks; ordering is
+  not bit-exact because the unchanged selector publishes unordered results.
+  Additional2177-row ragged/changed-input fixture passes. No quant/order policy
+  changes to force equality. First launch failed at missing vLLM config context
+  before kernel measurements; corrected initialization, successful probe exit0.
+- Integration: extract `_pooled_topk` without altering the default arithmetic;
+  `_pooled_prefill_tp_select` preserves global chunk/leading-decode offsets,
+  request-local block tables, tail expansion and graph padding. Empty owners
+  still join the exchange. Opt-in `VLLM_GLM53_INDEXER_TP_PREFILL=1` gates only
+  SM120/TP4, no DCP/PCP, >=2048 prefill rows and >=32768 context. Other paths
+  unchanged.16 targeted GPU tests pass, including ragged subchunks, every TP
+  owner, small/empty owners, leading decode and untouched trailing padding.
+- Raw: `perf/results/2026-09-11/indexer-shard/`:screen.json,tests.xml, exact
+  prototype benchmark/indexer snapshots. Probe/test scopes16GiB/no swap.
+- Next: one control flag0 and one candidate flag1, same committed source,
+  installed library/profile/recipe, wideMarlin1 and native-order0. Existing
+  campaign command from the wide-Marlin entry, new
+  `perf/results/2026-09-11/indexer-shard-serving-{control,candidate}/` outputs;
+  boots1/repeats3/cold-prefix/quality/prefill, c1/c8/c16 exact1000/300. Serving
+  cap150GiB/swap0. Keep every result; no replacement or best-of starts. Only a
+  meaningful measured TTFT gain without relevant regressions merits promotion.

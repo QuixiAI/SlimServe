@@ -32,6 +32,10 @@ but saves only ~20 us across 34 layers; parked without a serving campaign.
 window c1 19.36 ->19.16 us, c8 27.18 ->28.37 us, c16 34.98 ->36.52 us.
 All output/state comparisons are exact; the ~7 us/34-layer c1 budget and batched
 regressions do not merit integration. No serving run or extra variants.
+Active: **4.5 prefill indexer TP row sharding**, adapted from #54951 with pool-ID
+exchange before expansion. Complete TP4 component32K/128K windows improve
+2.43 ->1.26ms /10.0 ->3.08ms. Integrated opt-in,16 focused tests pass; one
+control/candidate serving pair is next. No serving gain/promotion claimed yet.
 No new serving gain is claimed. The broader stream-K/fused-expert successor and
 whole-layer KDA fusion are not thereby implemented or declared impossible.
 
@@ -46,7 +50,7 @@ whole-layer KDA fusion are not thereby implemented or declared impossible.
 | 4.2 | Paired K128 fg_b implemented, locally faster but parked for small full-stack value; whole-layer fusion unimplemented |
 | 4.3 | Sparse MLA/indexer improvements retained; recent local variants rejected; structural work not closed |
 | 4.4 | Persistent per-layer decode unimplemented; conditional on 4.1–4.3 evidence |
-| 4.5 | Prefill improvements including wide Marlin retained; remaining structural work not closed |
+| 4.5 | **Active:** TP row-sharded prefill indexer locally faster, opt-in integration awaiting serving pair; wide Marlin retained |
 | 5 | Final integration/tier qualification/port-back not completed |
 
 The 4.1 prototype is quarantined under `benchmarks/kernels/` with its binding

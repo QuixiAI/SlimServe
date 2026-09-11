@@ -37,6 +37,18 @@ the old history. Upstream history is unchanged and nothing was pushed.
 
 ### Latest checkpoint (2026-09-10): kernel speed work resumed
 
+2026-09-11 UTC: active **Phase4.5 prefill indexer TP row sharding**. Actual
+serving kernels, synthetic inputs, real TP4 pool-ID exchange: complete7616-row
+32K/128K windows2.43 ->1.26ms /10.0 ->3.08ms. Exact selected sets/tails on all
+ranks, unordered legacy selector output is NOT bit-exact. Production helper
+integrated opt-in `VLLM_GLM53_INDEXER_TP_PREFILL=1`; SM120/TP4 only, >=2048
+prefill rows and >=32768 context, no decode change.16 focused GPU tests pass.
+Raw `perf/results/2026-09-11/indexer-shard/`. NEXT: exactly one flag0 control
+then one flag1 candidate through existing campaign harness, three repeats,
+cold1000/300 c1/c8/c16, quality/needles and cold32K/128K. Same recipe/library,
+wideMarlin1, native-order0. No scoring campaign, sweep or replacement starts.
+No new serving speed claim or default promotion until that pair finishes.
+
 2026-09-11 UTC: **Phase 4.1 cross-item pipeline implemented, tested, rejected.**
 One fixed NT16/K512/S4 candidate improves gate/up 26.28 -> 22.02 us and down
 17.30 -> 15.39 us versus its draining control, but Marlin is 16.35/10.85 us.
