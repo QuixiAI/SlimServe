@@ -151,7 +151,7 @@ layer/device/microbatch scratch and invocation-local standalone fallback.
 rebuild needed. Raw `pr-review/part2-workspace-fixed.xml` (first fixture error
 retained in `part2-workspace.xml`). Include this fix in the final serving check;
 do not start a DBO qualification or claim an unmeasured speedup.
-CodeRabbit allows ONE included review per hour. Remaining #27/#28/#25;
+CodeRabbit allows ONE included review per hour. Remaining #28/#25;
 Part1's13 threads resolved. #27 review completed21:05 UTC:17 findings/six nits.
 Valid fixesceafefbed/311f5accf/dbb4ab817 (plus part3aa2efae02) cover builder
 validation/rebuilds, packaged case dispatch, optional symbols, all folded MTP
@@ -161,8 +161,19 @@ projection shards, aborted journal frames, sampler fallback metadata and tests.
 and V2-port reports do not apply. Keep the distinct MTP adapters (SM120 block
 renamed for clarity), no unmeasured persistent pooled-key cache. Existing
 qualification records are linked in the review map; no new scoring campaign.
-Individual replies/resolution pending; no server or GPU job is running.
-Next included slot about21:42 UTC on2026-09-11, for #28 then #25.
+All17 threads are resolved; six nits dispositioned. Parts1/2/5 are complete.
+Final combined serving on clean f9963f878 PASSED: one boot/three exact1000/300
+cold-prefix repeats, E2E medians156.838/577.605/782.960 tok/s; cold32K/128K
+engine TTFT2511.369/9921.773ms. Text/image and all six retrieval contrasts
+pass;4096 scored tokens/mean -2.731236241. Includes second main merge and
+all serving fixes, same QC61616000/stable-libtorch binaries, no source changes
+or timing exclusions. Known recovered scoring allocation warnings remain.
+Teardown exit0; independent check confirms no compute processes/all GPUs idle.
+Raw `pr-review/serving-final-review/`; baseline snapshot preserves full ranges.
+No new speedup, DBO/MTP or historical score-repeatability claim. Later changes
+confined to diagnostics need focused tests, not another serving campaign.
+Part3/#28 review requested21:42:55 UTC on2026-09-11; part4/#25 waits for the
+next included hourly slot. Keep all PRs draft until those reviews/cleanup close.
 Do not change billing or infer that any unreviewed layer has passed review.
 Raw regression XML: perf/results/2026-09-11/pr-review/part5.xml.
 Do not label the whole historical roadmap completed.

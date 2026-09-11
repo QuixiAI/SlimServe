@@ -281,8 +281,8 @@ profile record is identical as parsed JSON; upstream thinking-budget changes
 are confined to A100.120 focused CPU checks pass, eight GPU-only cases skipped.
 The native rebuild passes (QC61616000, stable-libtorch unchanged), followed by
 66 GPU tests for merged indexer/grouped-scoring/BF16-FP8 sparse-MLA behavior.
-GPUs released. The completed serving result above predates this merge; defer
-the final merged-tree serving check until remaining review fixes are settled.
+GPUs released. That serving result predates this merge; the final combined
+qualification below includes it and the serving-review fixes.
 
 CodeRabbit resolved all13 part1 threads. Part2 review completed21:05 UTC with
 17 findings/six nits. Fixesceafefbed/311f5accf/dbb4ab817 plus part3aa2efae02
@@ -295,10 +295,10 @@ report inspected a partial review layer. The registered RTX6000 V1 override
 also makes the requested V2 port inapplicable. Keep the distinct MTP adapters;
 the SM120 block now has an unambiguous name. Decline unmeasured persistent
 pooled-key caches. Qualification links above preserve existing evidence.
-Individual review replies/resolution and parts3/4 remain pending. One included
-review/hour; next slot about21:42 UTC for #28, then #25. Do not enable paid
-overages or repeatedly request over-quota reviews. Part5's ten threads remain
-resolved. GPU routing check has exited; all GPUs are released.
+All17 individual review threads are resolved and all six nits dispositioned.
+Parts3/4 remain pending. Part3/#28 was requested21:42:55 UTC; part4/#25 waits
+for the next included hourly slot. Do not enable paid overages or repeatedly
+request over-quota reviews. Part5's ten threads remain resolved.
 
 Local ownership review found that Marlin's per-device lock cache could alias
 overlapping layers or microbatches. Fix166d19ced uses layer/device/microbatch
@@ -307,8 +307,20 @@ explicit scratch allocate per invocation. Steady-state serving retains reuse
 without a per-call fill. The target needs about126KiB total scratch per GPU
 across42 layers.18 focused ownership/fallback tests pass on the combined tree,
 raw `part2-workspace-fixed.xml`; the first fixture's wrong positional argument
-is preserved in `part2-workspace.xml`. No DBO serving or performance claim;
-this Python-only fix joins the final combined-profile qualification.
+is preserved in `part2-workspace.xml`. No DBO serving or performance claim.
+
+Final combined qualification on clean f9963f878 completed successfully with
+main0313f5228, the owned scratch fix and all part2 fixes present. One boot,
+three exact1000/300 cold-prefix repetitions: c1/c8/c16 E2E medians
+156.838/577.605/782.960 tok/s; cold32K/128K engine TTFT2511.369/9921.773ms.
+All timed batches, text/image and six retrieval contrasts pass;4096 scored
+tokens, mean logprob -2.731236241. Known recovered scoring allocation warnings
+remain; no diagnostic default changed. Sources/binaries stayed fixed, exit0,
+GPU release independently verified. Full ranges/identity/limitations are in
+the baseline snapshot; raw `pr-review/serving-final-review/`. This preserves
+performance, not a paired speedup or resolution of score-repeatability limits.
+Later diagnostic-only review fixes need focused tests, not another model boot;
+do not extend this qualification to subsequent serving-path changes.
 
 Main's existing
 glm53f-q2-1/metal record references a missing glm53f-gguf source and lacks its

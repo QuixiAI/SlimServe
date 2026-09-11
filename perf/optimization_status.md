@@ -1,5 +1,35 @@
 # SlimServe Optimization Status
 
+## 2026-09-11 - Final combined SM120 serving-review qualification
+
+- Status: retained; completed on clean f9963f878, including main0313f5228
+  and all serving-review fixes. No new kernel optimization is claimed.
+- Baseline: corrected review-tree156.608/578.251/783.254 E2E tok/s,
+  cold32K/128K engine TTFT2508.750/9906.629ms; that run predates the second
+  main merge and layer/microbatch-owned Marlin scratch.
+- Hypothesis: reviewed contracts and merged platform paths preserve the
+  selected recipe's serving correctness/performance without new defaults.
+- Workload: canonical glm53f-nvfp4-4, recipe v1, stock4xSM120/TP4/no-spec,
+  explicit V1, BF16 KV/head. One boot/three repeats atc1/c8/c16, exact1000/300
+  cold prefixes, temperature1/top_p0.95/top_k20/seed42, prescribed warmups.
+  Sources/native binaries stayed fixed; no restart or timing exclusions.
+- Correctness: all nine timed batches exact, text/image canaries pass,
+  all six retrieval contrasts rank first,4096 scored text tokens with mean
+  logprob -2.731236241. Recoverable4,718,592,000-byte scoring allocations
+  still warn; the opt-in chunked diagnostic is unchanged. No scoring campaign.
+- Results: E2E medians156.838/577.605/782.960 tok/s; cold32K/128K engine
+  TTFT2511.369/9921.773ms. Full ranges and native identity are in the baseline
+  snapshot. Startup196.073s; quality91.059s. Exit0, GPU release verified.
+  Four terminated workers awaited PID1 reaping, with no remaining GPU owners.
+- Decision: serving performance preserved, not a paired gain or resolution
+  of historical repeatability limits. CodeRabbit resolved all17 part2 threads;
+  six nits dispositioned. Parts1/2/5 complete. Part3 review requested21:42:55
+  UTC; part4 waits for the next included hourly slot. All PRs remain draft
+  and mergeable; no merge into main. Later diagnostic-only fixes require
+  focused regressions, not an automatic model restart.
+- Raw: `perf/results/2026-09-11/pr-review/serving-final-review/`, including
+  summary.json, boot-1/prefill/summary.json and boot-1/quality.json.
+
 ## 2026-09-11 - Serving PR review contracts and evidence map
 
 - Scope: part2/#27 of the SM120 review stack; recipe v1/TP4/no-spec/BF16 KV
@@ -23,8 +53,9 @@
   review map now links existing warmup, alias/combine, sampler, sparse MLA,
   F32, optional ordering/reduction and GLM prompt-score records. Historical
   failures/limits stay intact; no scoring or old permutation campaign resumed.
-- Decision: retain valid fixes; individual replies and remaining external
-  reviews precede final qualification. GPUs released after routing checks.
+- Decision: retain valid fixes; all17 individual threads are now resolved and
+  all six nits dispositioned. Final combined qualification is recorded above;
+  the two remaining external reviews are parts3/4. GPUs released.
 - Raw:`perf/results/2026-09-11/pr-review/part2-review-cpu.xml`,
   `part2-routing-gpu.xml`, `part2-final-cpu.xml`. Existing qualification index:
   `docs/glm53-flash-sm120-review.md#qualification-record-map`.

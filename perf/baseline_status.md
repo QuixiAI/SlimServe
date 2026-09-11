@@ -2150,6 +2150,48 @@ released, no retries or quant/native/default changes; original oracle remains a
 historical failure. Raw `indexer-serving-v1/closure.json` under2026-09-10, SHA
 0d1302e05d6f2350d1bcf60be4d04691f489d6c3040f1bbca37fd890d139fa8b.
 
+### RTX6000 final combined-review qualification - 2026-09-11
+
+Clean `f9963f878949a44f45b4e7c7c305acf65e46f83d`, including main0313f5228,
+layer/microbatch-owned Marlin scratch and all part2 serving-review fixes.
+Canonical `glm53f-nvfp4-4`, recipe `glm53-redhatai-nvfp4-fp8-kda-tp4-v1`:
+RedHatAI NVFP4 experts, pinned FP8 sidecars/FP32 repairs, BF16 KV/head,
+TP4/no EP/no speculation, explicit V1 runner. Four RTX PRO6000 SM120 GPUs,
+stock600W, driver580.173.02, torch2.13.0+cu130. Native QC SHA256
+`61616000433f4371e23f2f4b34451cbf679194cd18f9691b105e421913aa57c4`;
+stable-libtorch `fe4a7c2a3c2c03cc8f725528e40aead70f2570cdbb9bb1481d4874c7e6427639`.
+
+One boot, three exact1000-input/300-output cold-prefix repetitions per
+concurrency, temperature1/top_p0.95/top_k20/seed42, prescribed warmups.
+All nine timed batches retained; no source changes, restart or exclusion.
+
+| Measurement | Median [min,max] |
+|---|---:|
+| c1 E2E tok/s | 156.838 [156.689,157.100] |
+| c8 E2E tok/s | 577.605 [577.499,578.503] |
+| c16 E2E tok/s | 782.960 [781.820,784.241] |
+| cold32K engine TTFT ms | 2511.369 [2508.355,2513.162] |
+| cold128K engine TTFT ms | 9921.773 [9896.923,9948.182] |
+
+Text/image canaries and all six retrieval contrasts pass;4096 scored text
+tokens, mean logprob -2.731236241. Startup196.073s; quality91.059s. Known
+recoverable4,718,592,000-byte scoring allocation warnings remain; chunked
+scoring stays opt-in. Teardown completed/exit0; independent GPU check found
+no compute processes and all four GPUs idle. Four terminated worker zombies
+awaited PID1 reaping; none retained GPU allocations.
+
+This preserves prior performance, not a paired speedup or an across-start
+variance estimate, and does not resolve historical score-repeatability limits.
+No A100, DBO, MTP or disabled-tier qualification is implied. Parts3/4 reviews
+remain pending; diagnostic-only changes need focused tests, not another boot.
+Raw commands, source/native hashes and complete receipts:
+`perf/results/2026-09-11/pr-review/serving-final-review/`.
+Reproduce with `.venv/bin/python benchmarks/benchmark_glm53_campaign.py
+--profile glm53f-nvfp4-4 --source <same-prompt-source> --output <new-run-dir>
+--boots 1 --repeats 3 --concurrency 1 8 16 --input-tokens 1000
+--output-tokens 300 --cold-prefix --quality --prefill`; the receipt identifies
+the exact source and environment. No further serving run is currently needed.
+
 ### RTX6000 review-fix qualification - 2026-09-11
 
 One fixed corrected-tree boot on eb8c345a9, recipe v1/TP4/no-spec, stock
