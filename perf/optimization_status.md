@@ -25301,3 +25301,16 @@ Raw: perf/results/2026-09-10/glm53f-dflash2/mx-*/.
   (tests/v1/core/test_block_pool_negative_alloc.py). The fail-fast
   invariants and the trace ring stay (trace env-gated). The WildChat leg
   and the 1M leg on the DP2 record rerun on this tree.
+- DP2 RECORD WildChat leg PASS on the fixed tree (11:31-12:49, the
+  1.25 h cap, c8, ctx-target 1M): 557 turns, 0 errors, 88/88 marker
+  recalls, max context 476,986 (median 444,044), 123.1M prompt tokens,
+  432 tier hits, no free-list divergence. The negative-allocation clamp
+  fired 51 distinct times, all of the shape "FullAttentionManager (group
+  10/11, block 1152): local hit holds 344 blocks but local 0 + external
+  387072 tokens need 336": the attention groups had a full local prefix
+  hit while a lagging group (KDA state) missed, so the scheduler took the
+  connector's external path for the whole prefix and the tier restored
+  content the attention groups already held (identical bytes - benign,
+  but wasted restore bandwidth). Follow-up: skip restore ops for
+  attention blocks the local hit already covers. Raw: perf/results/
+  2026-09-11/glm53f-leg-dp2/.
