@@ -37,6 +37,19 @@ the old history. Upstream history is unchanged and nothing was pushed.
 
 ### Latest checkpoint (2026-09-10): kernel speed work resumed
 
+Current follow-up: fixed-shape wide Marlin specialization passes18 actual-weight
+composed fixtures with BIT-EXACT outputs to the retained wide kernel and sampled
+independent FP64 checks. Isolated paired speedups1.0093..1.0315. It fixes only
+known gate/up/down dimensions and flags at compile time; existing arithmetic,
+split-K, M64/N512/K64/three-stage geometry and quant are unchanged. Four focused
+CPU tests and lint pass. Native dispatch is opt-in behind
+`VLLM_GLM53_MARLIN_PREFILL_FIXED=1`, subordinate to PREFILL_WIDE=1.
+NEXT: native MoE build/install, installed/probe parity, then exactly one fixed0
+control and one fixed1 candidate profile start, three repetitions each. Keep all
+observations; enable only if serving improves. Current profile still has fixed
+off. Rejected M48/S3/S4, whole-K scheduling and K32/S4/S5/S6 are recorded; don't
+repeat them. Raw `marlin-prefill-{row48,fixed,whole,k32}/` under2026-09-10.
+
 The same-live-input scoring diagnostic is COMPLETE; do not restart or extend it.
 All four ranks pass exact paired scoring/input immutability and HTTP coverage
 (56 requests, 104 calls, 330,288 paired rows per rank). Historical window-quality

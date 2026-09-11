@@ -4,6 +4,7 @@ import argparse
 import pytest
 import torch
 
+from benchmarks.kernels.benchmark_glm53_marlin_prefill import parse_prefill_config
 from benchmarks.kernels.benchmark_glm53_marlin_schedule import footprint, parse_config
 from benchmarks.kernels.check_glm53_marlin_schedule import decode_fragments
 
@@ -14,6 +15,15 @@ def test_only_existing_generated_launch_shapes():
     for invalid in ("64,64,1", "128,128,0", "64,128,5", "bad", "1,2"):
         with pytest.raises(argparse.ArgumentTypeError):
             parse_config(invalid)
+
+
+def test_prefill_probe_adds_only_the_isolated_wide_tiles():
+    assert parse_prefill_config("64,512,1") == (64, 512, 1)
+    assert parse_prefill_config("32,512,1") == (32, 512, 1)
+    assert parse_prefill_config("64,256,2") == (64, 256, 2)
+    for invalid in ("32,512,2", "32,256,1", "64,1024,1"):
+        with pytest.raises(argparse.ArgumentTypeError):
+            parse_prefill_config(invalid)
 
 
 def test_unique_weight_footprint_groups_by_layer_not_route():

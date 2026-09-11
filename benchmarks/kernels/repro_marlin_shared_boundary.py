@@ -115,6 +115,11 @@ def build(args):
     namespace = "marlin_shared_probe_" + args.boundary
     source = (
         f"#define MARLIN_NAMESPACE_NAME {namespace}\n"
+        + (
+            '#include "libtorch_stable/moe/marlin_moe_wna16/kernel.h"\n'
+            if "fixed_glm53_projection" in original
+            else ""
+        )
         + isolated_source(original, args.boundary)
         + WRAPPER
     )

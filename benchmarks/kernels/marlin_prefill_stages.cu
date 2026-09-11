@@ -5,14 +5,26 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
 #define MARLIN_NAMESPACE_NAME marlin_prefill_stages
+#include "libtorch_stable/moe/marlin_moe_wna16/kernel.h"
 #include "libtorch_stable/moe/marlin_moe_wna16/marlin_template.h"
 
-template <int N, int STAGES>
+#ifndef PREFILL_ROWS
+#define PREFILL_ROWS 64
+#endif
+#ifndef PREFILL_FIXED
+#define PREFILL_FIXED 0
+#endif
+#ifndef PREFILL_K
+#define PREFILL_K 64
+#endif
+
+template <int N, int STAGES, int PROJECTION = 0>
 at::Tensor launch(at::Tensor a, at::Tensor out, at::Tensor weight,
                  at::Tensor scales, at::Tensor global_scale, at::Tensor workspace,
                  at::Tensor sorted_ids, at::Tensor experts, at::Tensor padded,
                  at::Tensor routing_weights, int top_k, bool weighted, int blocks) {
-  constexpr int M = 64, K = 64, THREADS = std::min(N, 256);
+  constexpr int M = PREFILL_ROWS, K = PREFILL_K, THREADS = std::min(N, 256);
+  static_assert(M == 32 || M == 48 || M == 64);
   constexpr int a_bytes = STAGES * M * K * 2;
   constexpr int b_bytes = STAGES * K * N / 2;
   constexpr int red_bytes = M * (N + 8) * 2;
@@ -24,7 +36,7 @@ at::Tensor launch(at::Tensor a, at::Tensor out, at::Tensor weight,
   auto kernel = MARLIN_NAMESPACE_NAME::Marlin<
       vllm::kBFloat16.id(), vllm::kFE2M1f.id(), vllm::kBFloat16.id(),
       vllm::kFE4M3fn.id(), THREADS, M / 16, N / 16, K / 16,
-      false, STAGES, 1, false>;
+      false, STAGES, 1, false, PROJECTION>;
   int sms, max_shared;
   C10_CUDA_CHECK(cudaDeviceGetAttribute(
       &sms, cudaDevAttrMultiProcessorCount, a.get_device()));
@@ -73,8 +85,29 @@ at::Tensor run(at::Tensor a, at::Tensor out, at::Tensor weight,
   TORCH_CHECK(scales.sizes() == at::IntArrayRef({288, a.size(1) / 16, out.size(1)}));
   TORCH_CHECK(global_scale.numel() == 288 && padded.numel() == 1 &&
               routing_weights.numel() == out.size(0) &&
-              experts.numel() * 64 >= sorted_ids.numel());
+              experts.numel() * PREFILL_ROWS >= sorted_ids.numel());
   TORCH_CHECK(blocks >= 1 && blocks <= 2);
+#if PREFILL_FIXED
+  TORCH_CHECK(n_tile == 512 && blocks == 1);
+#define FIXED(S) \
+  if (stages == S) { \
+    if (weighted) \
+      return launch<512, S, 2>(a, out, weight, scales, global_scale, workspace, \
+          sorted_ids, experts, padded, routing_weights, top_k, weighted, blocks); \
+    return launch<512, S, 1>(a, out, weight, scales, global_scale, workspace, \
+        sorted_ids, experts, padded, routing_weights, top_k, weighted, blocks); \
+  }
+#if PREFILL_K == 32
+  FIXED(4)
+  FIXED(5)
+  FIXED(6)
+#else
+  FIXED(3)
+#endif
+#undef FIXED
+  TORCH_CHECK(false, "unsupported fixed pipeline configuration");
+#else
+  static_assert(PREFILL_K == 64);
 #define CALL(N, S) return launch<N, S>(a, out, weight, scales, global_scale, workspace, \
     sorted_ids, experts, padded, routing_weights, top_k, weighted, blocks)
   if (n_tile == 128) {
@@ -88,9 +121,13 @@ at::Tensor run(at::Tensor a, at::Tensor out, at::Tensor weight,
   } else if (n_tile == 512) {
     if (stages == 2) { CALL(512, 2); }
     if (stages == 3) { CALL(512, 3); }
+#if PREFILL_ROWS <= 48
+    if (stages == 4) { CALL(512, 4); }
+#endif
   }
 #undef CALL
   TORCH_CHECK(false, "unsupported pipeline configuration");
+#endif
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("run", &run); }

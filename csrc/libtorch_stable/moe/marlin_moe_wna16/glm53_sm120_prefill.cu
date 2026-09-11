@@ -5,6 +5,9 @@
 #include "kernel.h"
 #include "marlin_template.h"
 
+#include <cstdlib>
+#include <cstring>
+
 namespace MARLIN_NAMESPACE_NAME {
 
 cudaError_t launch_glm53_sm120_prefill(MARLIN_KERNEL_PARAMS, int sms,
@@ -18,6 +21,23 @@ cudaError_t launch_glm53_sm120_prefill(MARLIN_KERNEL_PARAMS, int sms,
   auto kernel = Marlin<vllm::kBFloat16.id(), vllm::kFE2M1f.id(),
                        vllm::kBFloat16.id(), vllm::kFE4M3fn.id(),
                        256, 4, 32, 4, false, 3, 1, false>;
+  static const bool fixed_shapes = [] {
+    const char* value = std::getenv("VLLM_GLM53_MARLIN_PREFILL_FIXED");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+  }();
+  // ops.cu has already checked both shapes and every specialized policy.
+  // The flag keeps a same-binary control available for serving measurements.
+  if (fixed_shapes) {
+    if (top_k == 8) {
+      kernel = Marlin<vllm::kBFloat16.id(), vllm::kFE2M1f.id(),
+                      vllm::kBFloat16.id(), vllm::kFE4M3fn.id(),
+                      256, 4, 32, 4, false, 3, 1, false, 1>;
+    } else {
+      kernel = Marlin<vllm::kBFloat16.id(), vllm::kFE2M1f.id(),
+                      vllm::kBFloat16.id(), vllm::kFE4M3fn.id(),
+                      256, 4, 32, 4, false, 3, 1, false, 2>;
+    }
+  }
   auto error = cudaFuncSetAttribute(
       kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
   if (error != cudaSuccess) return error;

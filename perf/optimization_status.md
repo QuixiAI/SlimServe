@@ -28126,3 +28126,76 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   RTX6000-only flag assertion; A100 records and weight recipe remain unchanged.
   Ruff and diff checks pass. No additional GPU campaign was needed for the
   registry-only change to the exact flag value already measured above.
+
+## 2026-09-10 - Reject smaller-row wide Marlin prefill tiles
+
+- Status: rejected; installed library and profile unchanged at8f22c0d40.
+- Baseline: retained M64/N512/K64/three-stage kernel, flag1; same fixed
+  NVFP4/BF16 recipe, actual layer3 TP4 rank0 weights on one RTX PRO6000 SM120.
+- Hypothesis: M48/N512 permits four shared-memory stages and fewer accumulator
+  registers; reduced expert padding might offset additional weight traffic.
+- Change: isolated probe admits M32/48/64 at build time. Measured M48/K64/N512,
+  one block/SM, three and four stages. No serving dispatcher or quant change.
+- Workload:2048/7616 input tokens, uniform/skewed synthetic top8 routes over288
+  experts, composed gate/up + existing activation + weighted down; three A/B/A
+  rounds x five replays per case, all results retained.
+- Correctness: all eight local comparisons pass rtol/atol0.01. No independent
+  oracle/sanitizer/serving run warranted for these losing candidates.
+- Results: four-stage paired speed ratios0.825/1.030/0.985/0.972, three-stage
+  0.830/1.033/0.992/0.977 (2048 uniform/skewed,7616 uniform/skewed). At2048
+  uniform the control is~842us versus1015-1022us candidate. Full-chunk A-before
+  and A-after differ materially, so the small paired full-chunk losses are not
+  precise effect estimates; the clear2048 regression already rejects rollout.
+- Decision: keep M64. Next bounded hypothesis specializes known gate/up/down
+  shapes and flags at compile time without changing the reduction schedule.
+- Raw: `perf/results/2026-09-10/marlin-prefill-row48/{stages3,stages4}.json`
+  and isolated `build/`. Initial direct script invocation failed import before
+  compilation; subsequent commands use `python -m benchmarks.kernels...`.
+  Builds80GiB/-j2, probes16GiB, swap0; no concurrent GPU jobs or serving builds.
+
+### Fixed-shape specialization and whole-K screen
+
+- Same baseline/weights, four2048/7616 uniform/skewed cases; five A/B/A rounds
+  x ten replays. Compile-time gate/up versus down shapes eliminate unused bias,
+  atomic and lower-precision reduction branches without changing arithmetic.
+- Fixed-shape K64/S3: all four composed outputs bit-exact to installed wide;
+  paired speed ratios1.012/1.031/1.029/1.030. Full-chunk candidate2857/2806us
+  versus A-before2909/2860us and A-after2945/2886us. Provisional isolated win;
+  not yet serving-qualified. Registers255/254, no local memory or stack.
+- Whole-K scheduling additionally removes the split-K tail: local parity passes,
+  paired ratios0.994/1.003/1.011/1.007, slower than the fixed-shape candidate.
+  Rejected; experimental whole-K template/dispatch has been removed. Raw binary
+  and all observations preserved. Load balancing is worth keeping here.
+- Next: halve K staging tiles to32 while deepening the pipeline to4/5/6 stages.
+  M64/N512 and the fixed recipe remain unchanged. Six stages fit98304 dynamic
+  +1024 static shared bytes, doubling in-flight K work versus K64/three stages.
+- Raw: `marlin-prefill-fixed/screen.json`, `marlin-prefill-whole/screen.json`,
+  their isolated builds, and next `marlin-prefill-k32/` under2026-09-10.
+
+- K32/S4/S5/S6 completed: all12 local composed checks pass, paired ratios
+  0.994..1.006 versus the generic wide baseline; no consistent improvement.
+  All three are slower than K64/S3 fixed shapes in the full-chunk screen.
+  Rejected; these alternatives remain isolated benchmark instantiations only.
+  Four/six-stage results are `marlin-prefill-k32/stages{4,5,6}.json`.
+- Selected next candidate is fixed-shape M64/N512/K64/S3 with existing split-K.
+  Native dispatch is prepared behind `VLLM_GLM53_MARLIN_PREFILL_FIXED=1`, default
+  off, subordinate to the already-qualified wide dispatch. Current installed
+  library/profile remain unchanged pending focused checks and serving A/B.
+
+### Fixed-shape candidate clears the composed actual-weight screen
+
+- All18 fixtures (layers3/23/44, batches2048/2176/7616, both route distributions)
+  pass with composed outputs bit-exact to the retained wide kernel. Independent
+  first/middle/last-token FP64 checks pass for gate/up, activation and output;
+  maximum sampled output NRMS0.000486573. Same original rtol/atol0.01.
+- Five A/B/A rounds x ten replays; paired speedups1.00933..1.03149. Full-chunk
+  fixed-shape candidates are below both A-before and A-after in all six cases.
+  No serving gain claimed yet. Raw `marlin-prefill-fixed/composed.json`.
+- Four focused helper CPU tests pass/1.36s; Ruff/diff checks pass. No new
+  sanitizer claim: layouts/addresses and reduction schedule are unchanged;
+  the retained wide kernel already has targeted memory-safety coverage.
+- Next after native build/import and installed/probe parity: one fixed0 control
+  and one fixed1 candidate start, wide1 in both, three repeats each. Same registry
+  recipe/cache/prompt source and exact1000/300 c1/c8/c16, cold32K/128K, text/image
+  and existing quality requests. No retries, result exclusions or scoring detour.
+  Output directories `marlin-fixed-serving-{control,candidate}/` under2026-09-10.
