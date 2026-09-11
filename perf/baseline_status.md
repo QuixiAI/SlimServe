@@ -2183,7 +2183,8 @@ awaited PID1 reaping; none retained GPU allocations.
 This preserves prior performance, not a paired speedup or an across-start
 variance estimate, and does not resolve historical score-repeatability limits.
 No A100, DBO, MTP or disabled-tier qualification is implied. Parts3/4 reviews
-remain pending; diagnostic-only changes need focused tests, not another boot.
+are now complete; later diagnostic-only fixes172c68bf7 have107 CPU+1 environment
++1 GPU pass/23 expected skips, with no serving/native change or another boot.
 Raw commands, source/native hashes and complete receipts:
 `perf/results/2026-09-11/pr-review/serving-final-review/`.
 Reproduce with `.venv/bin/python benchmarks/benchmark_glm53_campaign.py

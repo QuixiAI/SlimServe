@@ -1,5 +1,35 @@
 # SlimServe Optimization Status
 
+## 2026-09-11 - Final SM120 PR reviews and diagnostic cleanup complete
+
+- Status: review/cleanup complete; stack ready in dependency order
+  #26 -> #27 -> #28 -> #25 -> #24, no automatic merge into main.
+- Baseline: final combined serving on f9963f878,156.838/577.605/782.960 E2E
+  tok/s and cold32K/128K engine TTFT2511.369/9921.773ms. No later change under
+  csrc/, slimserve/ or vllm/; native binaries and selected recipe unchanged.
+- Review: #28 full83-file static review at21:44:39 UTC found no actionable
+  defects (comment5640985715, not formal GitHub approval). #25 full review
+  completed22:08:35 UTC with nine findings/four nits. All49 inline threads
+  across the stack are resolved, no exclusions; all PRs mergeable/CI guards pass.
+- Hypothesis/change:172c68bf7 strengthens diagnostic evidence only: reject
+  unknown routing kinds, preserve pool-set/exact-tail gates after changed input,
+  collect and save actual per-rank results, detect added common SASS copies,
+  anchor source/Git paths, validate serialized archive paths, fix test
+  environment/device/probe assumptions. Shared SHA uses chunked reads on3.10;
+  tie replay derives capture extents. Propagated asf66cfdc70.
+- Correctness:107 focused CPU passes; inherited-NATIVE_ORDER regression1 pass;
+  actual compiled-indexer GPU archive-path regression1 pass;23 expected skips
+  for missing multi-GPU/probe prerequisites with one visible GPU. Ruff/diff
+  checks pass, GPU contexts released. New cross-rank accounting tests use
+  mocked CPU collectives; no new TP scaling or performance claim.
+- Decision: retain bounded fixes. AOT diagnostic copies remain independent;
+  existing eight-arm series measures2,955,108,352 allocated bytes/2.752GiB.
+  Protocol documents cost and failed-preparation preservation/new-path recovery.
+  No writable-cache sharing, evidence deletion, native rebuild, benchmark sweep
+  or model restart. Do not label broader deferred kernel work exhausted.
+- Raw: `perf/results/2026-09-11/pr-review/part4-{cpu,env,gpu}.xml`;
+  review/nit links and final scope in `docs/glm53-flash-sm120-review.md`.
+
 ## 2026-09-11 - Final combined SM120 serving-review qualification
 
 - Status: retained; completed on clean f9963f878, including main0313f5228

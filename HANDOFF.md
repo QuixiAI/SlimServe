@@ -172,9 +172,21 @@ Teardown exit0; independent check confirms no compute processes/all GPUs idle.
 Raw `pr-review/serving-final-review/`; baseline snapshot preserves full ranges.
 No new speedup, DBO/MTP or historical score-repeatability claim. Later changes
 confined to diagnostics need focused tests, not another serving campaign.
-Part3/#28 review requested21:42:55 UTC on2026-09-11; part4/#25 waits for the
-next included hourly slot. Keep all PRs draft until those reviews/cleanup close.
-Do not change billing or infer that any unreviewed layer has passed review.
+Part3/#28 full83-file static review completed21:44:39 UTC with no findings:
+https://github.com/QuixiAI/SlimServe/pull/28#issuecomment-5640985715 . This is a
+CodeRabbit chat review, not a formal approval. Its unused formal slot allowed
+#25 to start21:48:31 UTC; completed22:08:35 UTC, nine findings/four nits.
+All fixed/dispositioned in172c68bf7 and forward mergef66cfdc70: stricter journal,
+per-rank/set-tail/SASS/archive evidence; cwd/environment/device/probe isolation;
+compatible shared SHA and capture geometry. No serving/native/recipe changes.
+107 CPU+1 inherited-environment+1 GPU regression pass;23 expected one-GPU/probe
+skips. Raw `pr-review/part4-{cpu,env,gpu}.xml`. GPUs released. AOT disk cost and
+preserved-failure/fresh-path recovery documented; no closed campaign rerun.
+Review/cleanup complete:49/49 inline threads resolved, all five PRs mergeable,
+CI guards pass. Stack ready in dependency order #26 -> #27 -> #28 -> #25 -> #24;
+part4 now57 files, all below100. Do not merge automatically or restart kernel/
+scoring work absent a new scoped request. Foundry/tiers/port-back remain outside
+this PR. Broader2.3/4.4 work remains deferred, not claimed implemented/exhausted.
 Raw regression XML: perf/results/2026-09-11/pr-review/part5.xml.
 Do not label the whole historical roadmap completed.
 

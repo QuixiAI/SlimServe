@@ -228,14 +228,16 @@ The stack is published; review/merge dependency order is:
 | 1 | [#26](https://github.com/QuixiAI/SlimServe/pull/26) | Native kernels, bindings, focused probes/tests | 94 |
 | 2 | [#27](https://github.com/QuixiAI/SlimServe/pull/27) | Serving recipe, platform integration and regressions | 83 |
 | 3 | [#28](https://github.com/QuixiAI/SlimServe/pull/28) | Numerical diagnostics and prefill qualification | 83 |
-| 4 | [#25](https://github.com/QuixiAI/SlimServe/pull/25) | Indexer/routing diagnostics and qualification | 56 |
+| 4 | [#25](https://github.com/QuixiAI/SlimServe/pull/25) | Indexer/routing diagnostics and qualification | 57 |
 | 5 | [#24](https://github.com/QuixiAI/SlimServe/pull/24) | Campaign harnesses, evidence and roadmap | 55 |
 
 History join e5d0ec096 is byte-identical to qualified-content c41148025 and
 retains every original campaign commit. No force-push or merge into main.
 Layer1 targets main; each later PR targets the preceding branch. Keep this
 dependency order when landing; retarget the next PR after its base lands.
-All remain draft. CodeRabbit completed part5 at18:58 UTC on2026-09-11:
+All review/cleanup gates are complete; the stack is ready for review/landing in
+dependency order, not authorized for automatic merge. CodeRabbit completed
+part5 at18:58 UTC on2026-09-11:
 ten actionable comments and two small test cleanups are addressed. Fixes cover
 failed/timeout process exit status, interrupted workload receipts, unavailable
 decode rates for one-event streams, captured graph-output checks, Python3.10
@@ -296,9 +298,31 @@ also makes the requested V2 port inapplicable. Keep the distinct MTP adapters;
 the SM120 block now has an unambiguous name. Decline unmeasured persistent
 pooled-key caches. Qualification links above preserve existing evidence.
 All17 individual review threads are resolved and all six nits dispositioned.
-Parts3/4 remain pending. Part3/#28 was requested21:42:55 UTC; part4/#25 waits
-for the next included hourly slot. Do not enable paid overages or repeatedly
-request over-quota reviews. Part5's ten threads remain resolved.
+Part3/#28 received a full83-file static review at21:44:39 UTC with no actionable
+defects ([review comment](https://github.com/QuixiAI/SlimServe/pull/28#issuecomment-5640985715)).
+This is an explicit CodeRabbit chat review, not a formal GitHub approval. It
+did not consume the formal review slot: part4/#25 was triggered21:48:31 UTC
+and completed22:08:35 UTC with nine findings/four nits. All nine threads are
+resolved; the [nit disposition](https://github.com/QuixiAI/SlimServe/pull/25#issuecomment-5641266239)
+records every decision. No paid overages or repeated quota retries.
+
+Part4 fixes172c68bf7 (forward mergef66cfdc70) reject unknown routing-record
+kinds; keep pool-set and positional-tail checks separate after changed input;
+record gathered per-rank checks before failing; anchor source/Git provenance
+to the repo root; detect added SASS copies; validate serialized archive paths;
+and isolate environment/device/probe assumptions in tests. Shared replay SHA
+uses Python3.10-compatible chunked reads; tie replay derives capture geometry.
+The old eight-arm AOT diagnostic occupies2.752GiB allocated. Independent caches
+and failed-preparation evidence remain intentionally preserved; the protocol
+documents cost and fresh-path recovery rather than sharing writable artifacts.
+
+Focused combined-tree checks:107 CPU passes, one inherited-NATIVE_ORDER test
+pass, one compiled-indexer GPU archive-path pass,23 expected unavailable-device/
+probe skips. Raw `pr-review/part4-{cpu,env,gpu}.xml`; Ruff/diff checks pass.
+No changes under csrc/, slimserve/ or vllm/ since qualified f9963f878. Native
+binaries/recipe unchanged, GPUs released; no model boot or performance rerun.
+Final audit:49/49 inline threads resolved (13/17/0/9/10 by dependency order),
+all five PRs mergeable and CI guards passing. No merge into main.
 
 Local ownership review found that Marlin's per-device lock cache could alias
 overlapping layers or microbatches. Fix166d19ced uses layer/device/microbatch
