@@ -3,17 +3,13 @@
 """Bounded installed top-k repeatability probe; synthetic inputs, no timing claim."""
 
 import argparse
-import hashlib
 import json
 import subprocess
 from pathlib import Path
 
 import torch
 
-
-def sha(path):
-    with path.open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
+from benchmarks.kernels.replay_glm53_indexer import sha
 
 
 def selection_validity(logits, indices, k=512):

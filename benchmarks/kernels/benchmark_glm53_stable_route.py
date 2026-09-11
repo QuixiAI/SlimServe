@@ -28,19 +28,10 @@ from vllm.model_executor.layers.fused_moe.router.glm_route_align import (
 )
 from vllm.quixicore.ops import quixicore_ops as qc
 
+ROOT = Path(__file__).resolve().parents[2]
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("--native", action="store_true")
-    args = parser.parse_args()
-    args.output.mkdir(parents=True, exist_ok=False)
-    torch.set_num_threads(1)
-    torch.cuda.set_device(0)
-    assert torch.cuda.get_device_capability() == (12, 0)
-    probe = None if args.native else build()
-    import vllm._quixicore_C as native
 
+def source_paths(native, probe=None):
     sources = [
         Path(__file__),
         Path(native.__file__),
@@ -58,6 +49,22 @@ def main():
     ]
     if probe is not None:
         sources.append(Path(probe.__file__))
+    return [ROOT / path for path in sources]
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--native", action="store_true")
+    args = parser.parse_args()
+    args.output.mkdir(parents=True, exist_ok=False)
+    torch.set_num_threads(1)
+    torch.cuda.set_device(0)
+    assert torch.cuda.get_device_capability() == (12, 0)
+    probe = None if args.native else build()
+    import vllm._quixicore_C as native
+
+    sources = source_paths(native, probe)
     hashes = {str(p): sha(p) for p in sources}
     result = dict(
         status="running",
@@ -69,9 +76,11 @@ def main():
         device_properties=str(torch.cuda.get_device_properties(0)),
         source_sha256=hashes,
         git_commit=subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], text=True
+            ["git", "rev-parse", "HEAD"], text=True, cwd=ROOT
         ).strip(),
-        git_status=subprocess.check_output(["git", "status", "--porcelain"], text=True),
+        git_status=subprocess.check_output(
+            ["git", "status", "--porcelain"], text=True, cwd=ROOT
+        ),
         hardware=subprocess.check_output(
             [
                 "nvidia-smi",

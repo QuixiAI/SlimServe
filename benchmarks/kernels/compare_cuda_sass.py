@@ -65,7 +65,7 @@ def signatures(path):
 
 def compare(before, candidate):
     common = sorted(before.keys() & candidate.keys())
-    changed = [name for name in common if before[name] - candidate[name]]
+    changed = [name for name in common if before[name] != candidate[name]]
     removed = sorted(before.keys() - candidate.keys())
     added = sorted(
         name for name in candidate if candidate[name] - before.get(name, Counter())

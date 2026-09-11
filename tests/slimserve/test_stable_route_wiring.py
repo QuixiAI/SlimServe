@@ -12,6 +12,19 @@ from vllm.model_executor.layers.fused_moe.router import glm_route_align as route
 from vllm.scalar_type import scalar_types
 
 
+def test_benchmark_source_paths_do_not_depend_on_cwd(tmp_path, monkeypatch):
+    from benchmarks.kernels.benchmark_glm53_stable_route import ROOT, source_paths
+
+    native = SimpleNamespace(__file__=str(tmp_path / "native.so"))
+    probe = SimpleNamespace(__file__=str(tmp_path / "probe.so"))
+    before = source_paths(native, probe)
+    monkeypatch.chdir(tmp_path)
+    assert source_paths(native, probe) == before
+    assert all(path.is_absolute() for path in before)
+    assert ROOT / "csrc/quixicore/serving/glm_moe_routing.cuh" in before
+    assert before[-1] == tmp_path / "probe.so"
+
+
 def test_stale_native_fails_only_when_stable_requested(monkeypatch):
     from vllm.quixicore import ops
 

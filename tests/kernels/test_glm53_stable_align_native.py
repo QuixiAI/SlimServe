@@ -22,7 +22,10 @@ def probe():
 
     # Load the qualified binary directly. Do not rebuild an archived control
     # against the now-integrated header or silently change its source identity.
-    directory = Path(os.environ["SLIMSERVE_GLM53_STABLE_ALIGN_PROBE"])
+    location = os.environ.get("SLIMSERVE_GLM53_STABLE_ALIGN_PROBE")
+    if not location:
+        pytest.skip("set SLIMSERVE_GLM53_STABLE_ALIGN_PROBE to the archived probe")
+    directory = Path(location)
     path = directory / "glm53_stable_align_probe.so"
     assert (
         reference.sha(path)

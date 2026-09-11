@@ -5,6 +5,7 @@ from slimserve.canonical_moe import enabled, geometry
 
 
 def test_flag_is_off_and_requires_bounded_journal(monkeypatch):
+    monkeypatch.delenv("SLIMSERVE_GLM53_NATIVE_ORDER", raising=False)
     monkeypatch.delenv("SLIMSERVE_GLM53_CANONICAL_MOE", raising=False)
     assert not enabled()
     monkeypatch.setenv("SLIMSERVE_GLM53_CANONICAL_MOE", "yes")

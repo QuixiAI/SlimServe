@@ -193,6 +193,7 @@ def test_changed_inputs(probe, tokens, scoring, renormalize, block):
 
 @pytest.mark.parametrize("device", range(4))
 @pytest.mark.parametrize("stable", (False, True))
+@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="requires four CUDA devices")
 def test_foreign_current_device(probe, device, stable):
     with torch.cuda.device(device):
         logits = torch.zeros(13, 288, device="cuda")
@@ -219,7 +220,12 @@ def test_foreign_current_device(probe, device, stable):
         "experts",
         "dtype",
         "bias_shape",
-        "bias_device",
+        pytest.param(
+            "bias_device",
+            marks=pytest.mark.skipif(
+                torch.cuda.device_count() < 2, reason="requires two CUDA devices"
+            ),
+        ),
         "scoring",
         "topk",
         "block0",
