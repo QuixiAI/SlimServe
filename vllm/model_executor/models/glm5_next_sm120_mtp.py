@@ -38,7 +38,7 @@ from vllm.model_executor.models.deepseek_v2 import (
     DeepseekV2MixtureOfExperts,
     DeepseekV2MoE,
 )
-from vllm.model_executor.models.glm5_next import Glm5NextMTPBlock
+from vllm.model_executor.models.glm5_next import Glm5NextSM120MTPBlock
 from vllm.model_executor.models.utils import (
     get_spec_layer_idx_from_weight_name,
     maybe_prefix,
@@ -80,7 +80,7 @@ class Glm5NextMultiTokenPredictorLayer(nn.Module):
         )
         # Prefix stays the layer's so the compressed-tensors targets for this
         # layer match; checkpoint names are rewritten onto ``mtp_block``.
-        self.mtp_block = Glm5NextMTPBlock(
+        self.mtp_block = Glm5NextSM120MTPBlock(
             config,
             vllm_config,
             prefix=prefix,
