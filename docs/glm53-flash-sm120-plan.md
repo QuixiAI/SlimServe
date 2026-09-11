@@ -23,6 +23,33 @@ resume validation infrastructure or exhaust every possible configuration.
 
 ### Current research decision (2026-09-10)
 
+Execution checkpoint (2026-09-11 UTC): use the original phase/item IDs below;
+this is their status, not a replacement roadmap. The **4.1 cross-item pipeline**
+is implemented and rejected: faster than its draining control, still slower
+than retained Marlin. Next active subtask is **4.2, the KDA fg_b projection**,
+adapting our existing small-M BF16 tensor-core design to the paired K128 shape.
+No new serving gain is claimed. The broader stream-K/fused-expert successor and
+whole-layer KDA fusion are not thereby implemented or declared impossible.
+
+| Existing item | State / remaining work |
+|---|---|
+| 0 | Bring-up/profile/baseline completed |
+| 1 | Selected weight recipe implemented; FP8 KV/W4A4 are outside that recipe |
+| 2.1–2.2 | Main transport/launch fusions retained; rejected variants stay closed |
+| 2.3 | L2 prefetch unimplemented; queued, not the active item |
+| 3 | MTP port tested; off after losses on the relevant concurrent workload |
+| 4.1 | Cross-item prototype rejected against Marlin; stream-K/fused successor unimplemented |
+| 4.2 | **In progress:** paired K128 fg_b projection; existing component fusions retained; whole-layer fusion unimplemented |
+| 4.3 | Sparse MLA/indexer improvements retained; recent local variants rejected; structural work not closed |
+| 4.4 | Persistent per-layer decode unimplemented; conditional on 4.1–4.3 evidence |
+| 4.5 | Prefill improvements including wide Marlin retained; remaining structural work not closed |
+| 5 | Final integration/tier qualification/port-back not completed |
+
+The 4.1 prototype is quarantined under `benchmarks/kernels/` with its binding
+and benchmark. Raw: `perf/results/2026-09-11/nvfp4-cross-item/`. Gate/up
+26.28 -> 22.02 us versus Marlin 16.35 us; down 17.30 -> 15.39 us versus Marlin
+10.85 us. All 90 actual-weight projection checks pass; no serving run warranted.
+
 - The local SGLang Kimi path (`models/kimi_linear.py`,
   `ColumnParallelBatchedLinear` in `layers/linear.py`) merges q/k/v/beta/f_a/g_a
   then uses a strided batched fg_b projection. SlimServe already implements
@@ -38,7 +65,7 @@ resume validation infrastructure or exhaust every possible configuration.
   the expert stream regressed; joining per layer also lost the benefit. Its
   +7.1% c1 steps/s used BF16 projections and a speculative workload, so it is
   a mechanism precedent, not a prediction for this recipe.
-- Next bounded candidate: KDA **output-projection prefetch only**, after the
+- Queued Phase 2.3 candidate: KDA **output-projection prefetch only**, after the
   input projection while fg_b/conv/recurrent/norm execute. Our TP4 output weight
   is FP8 `[4096, 2048]` (8 MiB plus 2 KiB scales), consumed by the existing
   W8A16 QuixiCore kernel, not cuBLAS. Keep arithmetic and weights unchanged.

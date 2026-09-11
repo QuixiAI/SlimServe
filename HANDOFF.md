@@ -37,6 +37,16 @@ the old history. Upstream history is unchanged and nothing was pushed.
 
 ### Latest checkpoint (2026-09-10): kernel speed work resumed
 
+2026-09-11 UTC: **Phase 4.1 cross-item pipeline implemented, tested, rejected.**
+One fixed NT16/K512/S4 candidate improves gate/up 26.28 -> 22.02 us and down
+17.30 -> 15.39 us versus its draining control, but Marlin is 16.35/10.85 us.
+All 90 actual-weight/captured-route projection checks pass; no serving run or
+promotion warranted. Kernel quarantined under `benchmarks/kernels/`, raw in
+`perf/results/2026-09-11/nvfp4-cross-item/`. Production unchanged. Broader
+stream-K/fused-expert successor remains unimplemented, not declared exhausted.
+Active next: **Phase 4.2 paired K128 fg_b projection**, adapting the retained
+small-M BF16 tensor-core design. The existing plan's phase/item tracker is current.
+
 Follow-up CLOSED: fixed-shape wide specialization (d02ebe696) gives bit-exact
 composed outputs and0.9-3.1% isolated gains, but only0.15/0.16% lower cold32K/128K
 TTFT with overlapping ranges in its one-control/one-candidate serving pair.
@@ -61,7 +71,7 @@ kernel. Use a focused comparison to confirm the hypothesis, not permutation
 search to discover one. Spills alone do not identify the dominant bottleneck.
 Reference review completed: SGLang's merged KDA projections are already present;
 FlashInfer #4709's output-only kernel is speculative verification, not a drop-in
-for our state-updating decode. Next bounded candidate is KDA output-weight L2
+for our state-updating decode. Queued Phase 2.3 candidate is KDA output-weight L2
 prefetch during independent attention work (mechanism from
 local-inference-lab/vllm #576), adapted to our 8 MiB FP8 output projection.
 Details and stop conditions: `docs/glm53-flash-sm120-plan.md`, current research

@@ -28313,3 +28313,53 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   gain with plausible 34-layer benefit merits integration and a focused
   real-profile comparison. This remains an unimplemented hypothesis, not a
   new speed improvement or a claim that other structural options are exhausted.
+
+## 2026-09-11 - Phase 4.1 cross-item NVFP4 pipeline: reject against Marlin
+
+- Status: implemented, built, tested, rejected; production unchanged. No serving
+  starts. The original roadmap item is 4.1, not an additional optimization track.
+- Baseline/hypothesis: the September 8 planar prototype drains its cp.async ring
+  between grid-stride work items and aliases stages with reduction scratch.
+  Keep the ring alive across items/expert boundaries, using separate reduction
+  storage. Preserve dequant and arithmetic between control/candidate; one fixed
+  NT16/K512/S4, eight-warps, one-CTA-per-SM schedule, not a geometry search.
+  Reference: local BF16 decode kernel and A100 GLM52 staged-fragment lessons.
+- Both variants specialize the two target K extents. The archived prototype's
+  exponent shortcut also needed an explicit zero/subnormal E4M3 scale case;
+  that correction is common to both variants. The new draining control is not
+  asserted bit-identical in timing/launch policy to the old September 8 run.
+- Scope: RTX PRO 6000 SM120 GPU0, CUDA13.0, stock600W, fixed recipe weights,
+  rank0 TP4 slices. Actual layers3/23/44, 15 predetermined captured c1 routes
+  each, synthetic BF16 inputs. Forty-five independent weight allocations per
+  projection exceed three128MiB L2 capacities (down ~405MiB; gate/up ~810MiB).
+  Both GEMMs use unweighted outputs for this staging comparison; no complete
+  weighted/fused expert-path or E2E claim. Serving Marlin is the decisive bar.
+- Correctness:90 projection cases pass; pipeline and drain are bit-exact.
+  Sampled independent planar-byte FP64 oracle (32 rows/expert) passes at
+  rtol/atol0.01; max NRMS0.000006353. Max NRMS versus Marlin0.000063860.
+- Timing: three fixed Marlin/drain/pipeline/drain/Marlin rounds, ten graph
+  replays per arm,45 projections/replay. All samples retained. Median us:
+
+  | Projection | Drain | Pipeline | Marlin before / after |
+  |---|---:|---:|---:|
+  | Gate/up | 26.278 | 22.016 | 16.354 / 16.377 |
+  | Down | 17.301 | 15.387 | 10.854 / 10.845 |
+
+- Decision: staging hypothesis helps this prototype (~16%/11% latency reduction)
+  but does not beat production. Do not promote, run serving, or sweep geometry.
+  Quarantine source with its benchmark under `benchmarks/kernels/`; no unused
+  alternate kernel remains in the serving-source directory. Broader balanced
+  stream-K/fused-expert work is still unimplemented, not proven exhausted.
+- Build: one isolated module,80GiB cap/MAX_JOBS2; probe16GiB/swap0. Initial direct
+  script invocation failed before compilation because `benchmarks` was not on
+  sys.path; corrected to `python -m benchmarks.kernels.benchmark_glm53_nvfp4_pipeline`.
+  Native compile succeeds; lint/diff checks pass. No additional sanitizer claim.
+- Raw: `perf/results/2026-09-11/nvfp4-cross-item/`: `screen.json`, `screen.log`,
+  both build logs, and exact tested header/binding/benchmark snapshots preceding
+  quarantine. Reproduce with the module above, `--build-dir`, `--model` for the
+  selected recipe, `--journal` pointing to the existing routing census and a NEW
+  `--output`; fixed comparison counts are in the benchmark, no tuning flags.
+- Next existing item:4.2, paired K128 KDA fg_b projection. Study/adapt the retained
+  small-M BF16 tensor-core kernel; measure against the current strided bmm before
+  any model integration. Whole-layer KDA fusion remains a separate unfinished
+  part of4.2, not something this projection comparison will claim to complete.
