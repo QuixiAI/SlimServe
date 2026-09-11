@@ -28613,3 +28613,55 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   frozen-state speculative verification. Keep projection kernels, FP32 state,
   BF16 conv state and epsilon1e-5; measure full window and account for c1's
   low full-head CTA count before considering integration.
+
+## 2026-09-11 - Phase 4.2 whole-head KDA core fusion: reject
+
+- Status: implemented, corrected, measured, rejected; serving unchanged. Native
+  GDN whole-head state/norm fusion is the mechanism precedent. One Triton CTA
+  owns a KDA head and fuses width4 convolution, gate, FP32 delta-rule update,
+  BF16 output boundary and sigmoid-gated RMSNorm (epsilon1e-5). Existing merged
+  input, strided fg_b bmm and FP8 output projections stay unchanged. This is a
+  core-fusion implementation, not a claim that every projection is one kernel.
+- Baseline:1ed336189, selected recipe/SM120, actual TP4 rank0 layers0/22/44
+  weights, synthetic inputs/state. Complete fg_b ->conv ->recurrent ->placement
+  ->norm ->FP8 output projection window, reused from the prefetch comparison.
+  51 independent8MiB output weights exceed3x128MiB L2; three fixed A/B/A rounds,
+  ten graph replays each, M1/8/16. Eight warps/full128x128 state, no tile sweep.
+- Initial candidate fails state parity before timing. Exact convolution values
+  and history movement localize the problem; instrumentation changes the error.
+  Root cause: full-head layouts duplicate convolution-history readers across
+  warps, while a canonical writer can shift the global history before all
+  duplicate readers finish. Add a CTA barrier before each in-place history
+  shift. One-launch shared-memory racecheck reports0 hazards; it does not cover
+  this global-memory dependency. Initial sanitizer filter syntax was rejected
+  before launch; corrected `kns=_core` invocation is recorded in racecheck.log.
+- Corrected candidate: all306 output/state graph comparisons pass unchanged
+  thresholds, including changed inputs, reversed slots and null slot0. Conv and
+  FP32 recurrent states are BIT-EXACT on every case. Maximum final-output error
+  0 at c1 and0.00390625 at c8/c16. Null indices are restored to valid indices
+  BEFORE timing, so measured c1 is not a null-state no-op.181 registers,0 spills.
+- Complete-window medians, microseconds:
+
+  | Batch | Before | Fused core | After |
+  |---|---:|---:|---:|
+  | 1 | 17.3317 | 18.3476 | 17.3357 |
+  | 8 | 25.2866 | 24.4634 | 25.2867 |
+  | 16 | 33.0690 | 34.6632 | 33.0730 |
+
+- Decision: reject. c1/c16 regress5.9%/4.8%; c8 saves0.823us/core window, only
+  ~28us over34 layers. Fewer launches and zero spills do not offset lost
+  parallelism/high register footprint. No serving integration, extra geometry
+  variants, or model starts. Full projection-inclusive/persistent KDA remains
+  unimplemented; this measured fusion does not justify escalating to it now.
+- Raw:`perf/results/2026-09-11/kda-core/`: screen/diagnosis/state-diagnosis/racecheck
+  failures remain, corrected `barrier.json` completes. Failure tensors and PTX
+  preserve localization. GPU0/16GiB/swap0, no concurrent workload. Reproduce:
+  `python -m benchmarks.kernels.benchmark_glm53_kda_core --model
+  /raid/weights/GLM-5.3-Flash-NVFP4-FP8-KDA-TP4 --output <NEW.json>`.
+  Prototype is under benchmarks only. No installed binary/profile changes.
+- Next4.3/4.5: source-directed swapAB attention operand ownership from merged
+  FlashInfer#4802/#4751, head ffa47d54ace70904f5c1becd5ab895a04c9393f9. Read the
+  implementation: its FP8 query/cache/probability path is NOT a drop-in for
+  recipe v1. Adapt only candidates-on-M/heads-on-N and transposed output
+  accumulation to our BF16 Q/KV and existing FP16 PV. No FlashInfer source build,
+  runtime tuner, FP8 KV, or reopening of the rejected local tile/split sweep.

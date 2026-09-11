@@ -37,6 +37,17 @@ the old history. Upstream history is unchanged and nothing was pushed.
 
 ### Latest checkpoint (2026-09-10): kernel speed work resumed
 
+2026-09-11 UTC: **Phase4.2 whole-head KDA core fusion REJECTED** after fixing
+a duplicate-reader/in-place-conv-history race. All306 graph checks pass;
+convolution and FP32 recurrent state exact. Full window c1/c8/c16
+17.33/25.29/33.07 ->18.35/24.46/34.66us: regressions at c1/c16 and only~28us
+full-step c8 budget. No serving integration/run. Prototype in
+`benchmarks/kernels/{glm53_kda_core,benchmark_glm53_kda_core}.py`; raw
+`perf/results/2026-09-11/kda-core/barrier.json`, with original failures preserved.
+Next4.3/4.5: swapAB sparse-attention operand ownership, source-reviewed merged
+FlashInfer#4802/#4751. Keep BF16 Q/KV and FP16 PV, not its FP8 arithmetic.
+Do not resume the closed local tile/split sweep or KDA geometry variants.
+
 2026-09-11 UTC: **Phase4.1 paired-column Marlin SwiGLU fusion PARKED**.
 One layout-only/fused-epilogue candidate, existing decode schedules. Complete
 gate/up ->activation ->weighted-down c1 24.98 ->23.69us, c8 123.80 ->124.10us,

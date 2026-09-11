@@ -48,8 +48,15 @@ unchanged tolerance; same-paired-layout epilogue is exact, and a sampled FP64
 dot explains the first differing rounding. All failures remain recorded; no
 serving qualification or promotion. Production source restored; prototype is
 quarantined in benchmarks. Raw `2026-09-11/marlin-swiglu/`.
-Next implementation is **4.2 whole-head KDA conv/state/norm fusion**, retaining
-the existing projections and exact recipe. Retained Marlin ALREADY uses DP plus two-tile
+**4.2 whole-head KDA conv/state/norm fusion is implemented and rejected**:
+c1/c8/c16 complete windows17.33/25.29/33.07 ->18.35/24.46/34.66us. All306
+corrected graph comparisons pass; convolution and FP32 recurrent state exact.
+The initial duplicate-reader/history-shift race is fixed and failures preserved.
+Only~28us/34-layer c8 budget, with c1/c16 regressions; no serving integration.
+Next **4.3/4.5 swapAB sparse-attention operand ownership** from merged
+FlashInfer#4802/#4751, adapted to BF16 Q/KV and existing FP16 PV. This is not
+its FP8 attention path or a repetition of the closed tile/split variants.
+Retained Marlin ALREADY uses DP plus two-tile
 stream-K (`marlin_template.h:396`). Do not treat adding stream-K itself as an
 unclaimed mechanism or repeat the closed planar prototype/launch sweeps. A
 successor needs a specific fusion/dequant/traffic saving with enough full-stack
@@ -63,8 +70,8 @@ budget; otherwise document deferral, not a fictitious implemented result.
 | 2.3 | Output-weight prefetch implemented and rejected; broader next-layer prefetch not implemented |
 | 3 | MTP port tested; off after losses on the relevant concurrent workload |
 | 4.1 | Paired-column/fused-SwiGLU successor implemented and parked: ~54us c1 step budget, batched neutral, stress comparison differences recorded; no serving promotion |
-| 4.2 | ACTIVE: whole-head conv/state/norm fusion; paired K128 fg_b already parked for small full-stack value |
-| 4.3 | Sparse MLA/indexer improvements retained; recent local variants rejected; structural work not closed |
+| 4.2 | Whole-head conv/state/norm fusion implemented and rejected; paired K128 fg_b parked; projection-inclusive fusion deferred on measured value |
+| 4.3 | ACTIVE: swapAB operand ownership; retained sparse MLA/indexer improvements stay; local tile/split variants remain closed |
 | 4.4 | Persistent per-layer decode unimplemented; conditional on 4.1–4.3 evidence |
 | 4.5 | TP row-sharded prefill indexer retained (-6.09% cold128K TTFT), alongside wide Marlin; broader structural work not closed |
 | 5 | Final integration/tier qualification/port-back not completed |
