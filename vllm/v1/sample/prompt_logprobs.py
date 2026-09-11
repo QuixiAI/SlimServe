@@ -1,8 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Bounded row-wise prompt scoring; not installed in the serving path yet.
+"""Opt-in bounded row-wise GLM53 prompt scoring; not a profile default.
 
 Keep the full, unchanged lm_head result. Only split the subsequent independent
 row operations, using the existing sampler's log_softmax/top-k/rank functions.
+
+The native-order diagnostic passed exact-score/memory checks; production-order
+rollout stopped on the unchanged control's historical quality gate. Full records:
+docs/glm53-flash-sm120-review.md, "Qualification record map". No speedup claim.
 """
 
 import torch

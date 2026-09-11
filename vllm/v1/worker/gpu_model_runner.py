@@ -5957,6 +5957,8 @@ class GPUModelRunner(
                 "glm5_next_text",
             ):
                 raise ValueError("prompt-score chunks are qualified for GLM53 only")
+            # GLM opt-in memory-fix qualification and failed default rollout:
+            # docs/glm53-flash-sm120-review.md, "Qualification record map".
             chunk_rows = CHUNK_ROWS
 
         if not hasattr(self, "_slimserve_score_journal"):

@@ -5,7 +5,12 @@ Uses a supported, cache-keyed Inductor option. No generated-source mutation,
 runtime replacement, global PyTorch determinism or production default change.
 
 Not promoted: the 2026-09-10 full-model no-combo start repeated its scores exactly
-but failed 12/32 unchanged per-window quality gates. See the performance notebook.
+but failed 12/32 historical per-window quality gates. Against normal compilation,
+the hypothesis was repeatable reduction scheduling. Diagnostic c1/c8/c16 rates
+were 155.740/574.245/777.768 tok/s, not a speedup or accepted baseline. Raw:
+perf/results/2026-09-10/deterministic-no-combo-serving/fresh-a/.
+Full baseline, limits and decision: docs/glm53-flash-sm120-review.md,
+"Qualification record map". Do not resume this closed diagnostic campaign.
 """
 
 import copy
