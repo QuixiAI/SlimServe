@@ -36,8 +36,7 @@ def update_window(doc, index, value):
     )
 
 
-@pytest.fixture
-def docs():
+def build_docs():
     document = {
         "status": "complete",
         "source_sha256": "test-source",
@@ -83,6 +82,11 @@ def docs():
                 )
             document["needles"].append(row)
     return [copy.deepcopy(document) for _ in range(5)]
+
+
+@pytest.fixture
+def docs():
+    return build_docs()
 
 
 def test_fixed_identical_runs_pass(docs):
