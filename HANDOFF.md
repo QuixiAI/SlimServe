@@ -109,11 +109,21 @@ all implementation/tests/diagnostics and the original campaign history. Do not
 exclude files via review filters, force-push, or merge into main. Keep #24 as
 the stack tip. Published review order: #26 (kernels,92 files) -> #27
 (serving,80) -> #28 (numerics/prefill,83) -> #25 (indexer/routing,56) -> #24
-(harnesses/evidence,54). Four new upstream glm53-sm120-review-{1..4}-* branches
+(harnesses/evidence,initially54). Four new upstream glm53-sm120-review-{1..4}-* branches
 are cumulative. History join e5d0ec096 has the identical tree to c41148025 and
 preserves all campaign commits; no forced push/main merge. PR24 now targets
 glm53-sm120-review-4-indexer. All remain draft. Substantive review, feedback
 fixes and final cleanup remain open; see the review map for links.
+
+Part5 review arrived18:58 UTC: ten actionable comments/two small test cleanups
+addressed,128 focused CPU tests pass. One new graph-benchmark gate test makes
+PR24's diff55 files. Source/recipe/native kernels unchanged; no GPU run warranted.
+The fixture-builder change belongs to #28 (476f3290e), merged forward through
+#25/#24. Publish/reply/resolve these findings, then continue external reviews.
+CodeRabbit allows ONE included review per hour: #26/#27/#28/#25 were quota
+blocked, first next slot about19:40 UTC on2026-09-11. Prioritize #26 then #27.
+Do not change billing or infer that any unreviewed layer has passed review.
+Raw regression XML: perf/results/2026-09-11/pr-review/part5.xml.
 Do not label the whole historical roadmap completed.
 
 #### Earlier development checkpoints (superseded by the H16 result above)

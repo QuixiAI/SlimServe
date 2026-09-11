@@ -202,14 +202,28 @@ The stack is published; review/merge dependency order is:
 | 2 | [#27](https://github.com/QuixiAI/SlimServe/pull/27) | Serving recipe, platform integration and regressions | 80 |
 | 3 | [#28](https://github.com/QuixiAI/SlimServe/pull/28) | Numerical diagnostics and prefill qualification | 83 |
 | 4 | [#25](https://github.com/QuixiAI/SlimServe/pull/25) | Indexer/routing diagnostics and qualification | 56 |
-| 5 | [#24](https://github.com/QuixiAI/SlimServe/pull/24) | Campaign harnesses, evidence and roadmap | 54 |
+| 5 | [#24](https://github.com/QuixiAI/SlimServe/pull/24) | Campaign harnesses, evidence and roadmap | 55 |
 
 History join e5d0ec096 is byte-identical to qualified-content c41148025 and
 retains every original campaign commit. No force-push or merge into main.
 Layer1 targets main; each later PR targets the preceding branch. Keep this
 dependency order when landing; retarget the next PR after its base lands.
-All remain draft pending substantive review and feedback. Initial publication
-is complete; review requests and resulting fixes are the remaining work.
+All remain draft. CodeRabbit completed part5 at18:58 UTC on2026-09-11:
+ten actionable comments and two small test cleanups are addressed. Fixes cover
+failed/timeout process exit status, interrupted workload receipts, unavailable
+decode rates for one-event streams, captured graph-output checks, Python3.10
+digest compatibility at the reported sites, isolated test environments and
+matching Auroter authorship instructions. The shared fixture helper is committed
+in part3 and propagated forward; no history rewrite or serving-code change.
+Focused CPU suite:128 passed in30.41s, raw XML
+`perf/results/2026-09-11/pr-review/part5.xml`. This is harness fault-injection
+coverage, not another serving benchmark or native-kernel qualification.
+
+Parts1–4 remain unreviewed: the service explicitly permits only one included
+review per hour. First next slot is about19:40 UTC; prioritize #26 (kernels),
+then #27 (runtime), #28 and #25. Do not enable paid overages or repeatedly
+request over-quota reviews. Feedback replies/resolution and the remaining
+four external reviews are the outstanding publication work.
 
 Main's existing
 glm53f-q2-1/metal record references a missing glm53f-gguf source and lacks its

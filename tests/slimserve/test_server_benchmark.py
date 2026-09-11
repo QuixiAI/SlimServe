@@ -101,7 +101,10 @@ def test_incomplete_round_never_becomes_fast_result(bench, defect):
         bench.check_round(result, 1)
 
 
-@pytest.mark.parametrize("failure", [None, "counts", "image", "cache", "canary-only"])
+@pytest.mark.parametrize(
+    "failure",
+    [None, "counts", "image", "cache", "canary-only", "interrupt", "single-event"],
+)
 def test_fixed_workload_uses_shared_function_and_retains_failure(
     bench, monkeypatch, tmp_path, failure
 ):
@@ -135,11 +138,16 @@ def test_fixed_workload_uses_shared_function_and_retains_failure(
     monkeypatch.setattr(bench, "chat_completion", chat)
     monkeypatch.setattr(bench, "gpu_snapshot", lambda: "no GPU used")
     calls = []
+    interruption = KeyboardInterrupt("operator stop")
 
     def fake_round(url, model, prompts, output, seed, cold_prefix=False):
         assert cold_prefix == (failure == "cache")
         calls.append((len(prompts), output, seed))
+        if failure == "interrupt" and len(calls) == 4:
+            raise interruption
         result = result_for(len(prompts))
+        if failure == "single-event":
+            result["client_decode_tps"] = None
         if failure == "counts" and len(calls) == 4:
             result["requests"][0]["usage"]["completion_tokens"] = 299
         if failure == "cache" and len(calls) == 4:
@@ -161,6 +169,14 @@ def test_fixed_workload_uses_shared_function_and_retains_failure(
             == "RedRed"
         )
         assert not calls
+    elif failure == "interrupt":
+        with pytest.raises(KeyboardInterrupt) as raised:
+            bench.run(args)
+        assert raised.value is interruption
+        receipt = json.loads((args.output / "summary.json").read_text())
+        assert receipt["status"] == "failed"
+        assert receipt["error"] == repr(interruption)
+        assert len(calls) == 4
     elif failure in ("counts", "cache"):
         with pytest.raises(
             ValueError, match="cold-prefix" if failure == "cache" else "exact-token"

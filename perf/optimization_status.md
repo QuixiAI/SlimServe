@@ -30005,6 +30005,24 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   c41148025 tree or losing campaign history. Every PR targets the preceding
   layer (first targets main); PR24 is the original tip. All drafts pending
   review/feedback/cleanup. No new runtime work or repeated serving run.
+
+### Part5 review feedback (2026-09-11)
+
+- CodeRabbit completed #24 at18:58 UTC: ten actionable findings/two small
+  test cleanups. Fixed all verified findings: fail-closed arm/timeout exit
+  status, interrupted workload receipts, null/unavailable client decode rate
+  for zero-duration streaming windows, captured graph-output acceptance before
+  timing, reported Python3.10 digest sites (plus the touched sampler benchmark),
+  isolated campaign-test environment, fixture reuse, and authorship/docs lint.
+- Focused CPU-only suite128 passed in30.41s; graph failure is injected in a
+  mock, not a new native qualification. Ruff fatal/import checks and diff-check
+  pass. No serving/kernel/quant changes or new throughput claim. Added test
+  moves PR24 from54 to55 files. Shared fixture helper476f3290e belongs to #28
+  and is merged forward without rewriting history. Raw:
+  perf/results/2026-09-11/pr-review/part5.xml.
+- Parts1–4 remain unreviewed: explicitly one included CodeRabbit review/hour,
+  next slot about19:40 UTC. Prioritize kernel #26 then runtime #27; do not
+  silently enable billing or treat rate-limited requests as completed reviews.
 ## 2026-09-06: GLM-5.2 A100 tier records re-measured after the sparse-decode copy removal
 
 - Both records boot through their profiles with the host tier active

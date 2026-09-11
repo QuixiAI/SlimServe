@@ -21,7 +21,7 @@ results without adding permutations or repeated starts. The sparse-prefill local
 variant screen is closed. Historical phase gates below are not instructions to
 resume validation infrastructure or exhaust every possible configuration.
 
-### Current research decision (2026-09-10)
+## Current research decision (2026-09-10)
 
 Execution checkpoint (2026-09-11 UTC): use the original phase/item IDs below;
 this is their status, not a replacement roadmap. The **4.1 cross-item pipeline**

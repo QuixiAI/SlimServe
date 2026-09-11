@@ -166,8 +166,11 @@ def test_single_block_decode_changed_inputs(
         ("native_sha256", root / "vllm/_C_stable_libtorch.abi3.so"),
         ("test_source_sha256", Path(__file__)),
     ):
+        digest = hashlib.sha256()
         with path.open("rb") as stream:
-            record_property(key, hashlib.file_digest(stream, "sha256").hexdigest())
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        record_property(key, digest.hexdigest())
     rows, next_n = 8, 2
     backing = torch.full((rows * columns * stride + 2,), 417.0, device="cuda")
     logits = backing[1:-1:stride].view(rows, columns)

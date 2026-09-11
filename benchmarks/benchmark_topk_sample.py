@@ -35,13 +35,16 @@ def reference(logits, k, p, noise):
 def measure(fn, repeats):
     for _ in range(5):
         fn()
+    expected = fn().clone()
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        fn()
+        captured = fn()
     for _ in range(5):
         graph.replay()
     torch.cuda.synchronize()
+    if not torch.equal(captured, expected):
+        raise AssertionError("CUDA Graph output differs from eager output")
     eager, replay = [], []
     for _ in range(3):
         start = time.perf_counter()
@@ -60,6 +63,7 @@ def measure(fn, repeats):
         b.synchronize()
         replay.append(a.elapsed_time(b) * 1000 / repeats)
     return {
+        "graph_correct": True,
         "eager_wall_us": eager,
         "graph_cuda_us": replay,
         "eager_median_us": statistics.median(eager),
@@ -83,8 +87,10 @@ def main():
     if active:
         parser.error(f"GPUs already have compute processes: {active}")
     native = next(Path("vllm").glob("_quixicore_C*.so"))
+    digest = hashlib.sha256()
     with native.open("rb") as stream:
-        digest = hashlib.file_digest(stream, "sha256").hexdigest()
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
     result = {
         "git_commit": subprocess.check_output(
             ["git", "rev-parse", "HEAD"], text=True
@@ -92,7 +98,7 @@ def main():
         "git_status": subprocess.check_output(
             ["git", "status", "--short"], text=True
         ).strip(),
-        "native_sha256": digest,
+        "native_sha256": digest.hexdigest(),
         "torch": torch.__version__,
         "gpu": torch.cuda.get_device_name(),
         "repeats": args.repeats,
@@ -118,13 +124,24 @@ def main():
             row = {
                 "batch": batch,
                 "case": case,
-                "correct": torch.equal(native_fn(), ref_fn()),
+                "eager_correct": torch.equal(native_fn(), ref_fn()),
+                "correct": False,
+                "status": "pending",
             }
             result["rows"].append(row)
             args.output.write_text(json.dumps(result, indent=2) + "\n")
-            assert row["correct"], (batch, case)
-            row["native"] = measure(native_fn, args.repeats)
-            row["reference"] = measure(ref_fn, args.repeats)
+            try:
+                assert row["eager_correct"], (batch, case)
+                row["native"] = measure(native_fn, args.repeats)
+                row["reference"] = measure(ref_fn, args.repeats)
+                row["correct"] = True
+                row["status"] = "complete"
+            except BaseException as error:
+                row["status"] = "failed"
+                row["error"] = repr(error)
+                raise
+            finally:
+                args.output.write_text(json.dumps(result, indent=2) + "\n")
             print(json.dumps(row), flush=True)
             args.output.write_text(json.dumps(result, indent=2) + "\n")
 

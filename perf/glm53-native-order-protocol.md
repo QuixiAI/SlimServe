@@ -35,7 +35,7 @@ Serving errors stop this run and remain failures. No replacement starts.
 
 Native SHA256s:
 
-```
+```text
 QC   39b302f041bb846712b396f84100aefefcb332ed3fd04bd787853fa43bfdb31c
 core fe4a7c2a3c2c03cc8f725528e40aead70f2570cdbb9bb1481d4874c7e6427639
 MoE  1093b8a4ca7cb308d4ebff254ab502d7b01d65eb86423b2640c8f8a4bff4ac1a

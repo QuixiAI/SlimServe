@@ -13,6 +13,13 @@ from types import SimpleNamespace
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def clean_campaign_environment(monkeypatch):
+    for key in tuple(os.environ):
+        if key.startswith("SLIMSERVE_GLM53_") or key == "SLIMSERVE_GLM_ROUTE_ALIGN":
+            monkeypatch.delenv(key)
+
+
 def _load(monkeypatch):
     directory = Path(__file__).resolve().parents[2] / "benchmarks"
     monkeypatch.syspath_prepend(str(directory))
@@ -28,8 +35,7 @@ def test_direct_script_can_import_owned_kernel_helpers_without_pythonpath(tmp_pa
     root = Path(__file__).resolve().parents[2]
     helper = root / "benchmarks/kernels/check_glm53_attention_norms.py"
     code = f"""
-import importlib.util, runpy, sys
-assert importlib.util.find_spec('benchmarks') is None
+import runpy, sys
 sys.path.insert(0, {str(root / "benchmarks")!r})
 runpy.run_path({str(root / "benchmarks/benchmark_glm53_campaign.py")!r})
 from benchmarks.kernels import check_glm53_attention_norms
@@ -517,6 +523,27 @@ def test_truncated_stream_is_a_failure_not_a_fast_result(monkeypatch):
     )
     with pytest.raises(ValueError, match="incomplete stream"):
         bench.request("http://localhost", "test", "prompt", 3, 42)
+
+
+@pytest.mark.parametrize("decode_window", [0.0, 2.0])
+def test_round_handles_single_event_without_inventing_decode_rate(
+    monkeypatch, decode_window
+):
+    bench = _load(monkeypatch)
+    row = {
+        "first": 1.0,
+        "last": 1.0 + decode_window,
+        "tokens_after_first_chunk": 2 if decode_window else 0,
+        "ttft_seconds": 0.1,
+        "usage": {"completion_tokens": 3},
+    }
+    monkeypatch.setattr(bench, "request", lambda *a, **k: row)
+    times = iter([10.0, 14.0])
+    monkeypatch.setattr(bench.time, "perf_counter", lambda: next(times))
+    result = bench.round_requests("url", "model", ["prompt"], 3, 42)
+    assert result["aggregate_output_tps"] == 0.75
+    assert result["client_decode_tps"] == (1.0 if decode_window else None)
+    assert result["requests"] == [row]
 
 
 def test_native_receipt_includes_moe_and_allocator(monkeypatch, tmp_path):

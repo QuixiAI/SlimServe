@@ -233,9 +233,15 @@ def run(args):
                     row.update({k: v for k, v in result.items() if k != "requests"})
                     row["status"] = "complete"
                     save()
+                    decode_rate = result["client_decode_tps"]
+                    decode_label = (
+                        f"{decode_rate:.2f}"
+                        if decode_rate is not None
+                        else "unavailable"
+                    )
                     print(
                         f"{kind} c{c}: E2E {result['aggregate_output_tps']:.2f}, "
-                        f"client decode {result['client_decode_tps']:.2f} tok/s",
+                        f"client decode {decode_label} tok/s",
                         flush=True,
                     )
         if args.quality:
@@ -292,7 +298,7 @@ def run(args):
             }
         require_benchmark_sources()
         receipt["status"] = "complete"
-    except Exception as error:
+    except BaseException as error:
         receipt["status"] = "failed"
         receipt["error"] = repr(error)
         raise

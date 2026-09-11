@@ -39,3 +39,4 @@ def test_input_digest_is_value_and_order_sensitive(probe):
     value = torch.arange(24, dtype=torch.float32).bfloat16().reshape(2, 3, 4)
     assert probe.tensor_digest(value) == probe.tensor_digest(value.clone())
     assert probe.tensor_digest(value) != probe.tensor_digest(value.flip(0))
+    assert probe.tensor_digest(value) != probe.tensor_digest(value + 1)

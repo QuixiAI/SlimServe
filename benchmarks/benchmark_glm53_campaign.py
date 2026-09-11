@@ -229,8 +229,11 @@ def round_requests(
         "wall_seconds": wall,
         "aggregate_output_tps": sum(r["usage"]["completion_tokens"] for r in rows)
         / wall,
-        "client_decode_tps": sum(r["tokens_after_first_chunk"] for r in rows)
-        / decode_window,
+        "client_decode_tps": (
+            sum(r["tokens_after_first_chunk"] for r in rows) / decode_window
+            if decode_window > 0
+            else None
+        ),
         "ttft_mean_seconds": statistics.mean(r["ttft_seconds"] for r in rows),
         "requests": rows,
     }
@@ -811,10 +814,16 @@ def main():
                             }
                         )
                         record.write_text(json.dumps(receipt, indent=2) + "\n")
+                        decode_rate = result["client_decode_tps"]
+                        decode_label = (
+                            f"{decode_rate:.2f}"
+                            if decode_rate is not None
+                            else "unavailable"
+                        )
                         print(
                             f"boot {boot} repeat {rep + 1} c{c}: "
                             f"E2E {result['aggregate_output_tps']:.2f}, "
-                            f"client decode {result['client_decode_tps']:.2f} tok/s, "
+                            f"client decode {decode_label} tok/s, "
                             f"TTFT {1000 * result['ttft_mean_seconds']:.1f} ms",
                             flush=True,
                         )

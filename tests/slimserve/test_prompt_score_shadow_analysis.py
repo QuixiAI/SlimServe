@@ -11,7 +11,7 @@ from tests.slimserve import test_quality_pair_analysis as quality_tests
 
 @pytest.fixture(scope="module")
 def quality():
-    doc = quality_tests.docs.__wrapped__()[0]
+    doc = quality_tests.build_docs()[0]
     for row in doc["needles"]:
         row["prefix_ids"][0] = 1 if row["position"] == 0.25 else 2
     requests = [(r["prompt_ids"], r["response"]) for r in doc["text"]]

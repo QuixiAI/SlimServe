@@ -126,7 +126,11 @@ def run(args):
                         row["error"] = "150-second diagnostic bound exceeded"
                         stop_container(identity)
                         row["exit_code"] = process.wait(timeout=10)
-                row["status"] = "complete" if row["exit_code"] == 0 else "failed"
+                row["status"] = (
+                    "complete"
+                    if row["exit_code"] == 0 and "error" not in row
+                    else "failed"
+                )
                 print(f"{label}: {row['status']}", flush=True)
             except BaseException as error:
                 row["status"] = "failed"
@@ -139,16 +143,21 @@ def run(args):
                     command("docker", "rm", identity)
                     row["owned_container_removed"] = True
                 save()
-        receipt["status"] = "finished"
+        receipt["status"] = (
+            "complete"
+            if all(row["status"] == "complete" for row in receipt["arms"])
+            else "failed"
+        )
     except BaseException as error:
         receipt["status"] = "failed"
         receipt["error"] = repr(error)
         raise
     finally:
         save()
+    return receipt
 
 
-if __name__ == "__main__":
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--jit-cache", type=Path, required=True)
@@ -157,4 +166,8 @@ if __name__ == "__main__":
         raise KeyboardInterrupt(f"signal {signum}")
 
     signal.signal(signal.SIGTERM, interrupted)
-    run(parser.parse_args())
+    return int(run(parser.parse_args(argv))["status"] != "complete")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

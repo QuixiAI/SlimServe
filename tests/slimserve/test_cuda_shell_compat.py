@@ -8,7 +8,9 @@ from pathlib import Path
 import pytest
 
 
-@pytest.mark.parametrize("failure", [None, "timeout", "interrupt"])
+@pytest.mark.parametrize(
+    "failure", [None, "timeout", "timeout-zero", "interrupt", "success"]
+)
 def test_fixed_arms_keep_failures_and_only_remove_owned_containers(
     monkeypatch, tmp_path, failure
 ):
@@ -46,11 +48,13 @@ def test_fixed_arms_keep_failures_and_only_remove_owned_containers(
         def wait(self, timeout):
             if len(created) == 1 and not self.waited:
                 self.waited = True
-                if failure == "timeout":
+                if failure in ("timeout", "timeout-zero"):
                     raise subprocess.TimeoutExpired("owned", timeout)
                 if failure == "interrupt":
                     raise KeyboardInterrupt("operator stop")
-            return 0 if len(created) == 2 else 1
+            return (
+                0 if failure in ("success", "timeout-zero") or len(created) == 2 else 1
+            )
 
     monkeypatch.setattr(bench, "command", command)
     monkeypatch.setattr(bench, "stop_container", stop)
@@ -59,7 +63,7 @@ def test_fixed_arms_keep_failures_and_only_remove_owned_containers(
         with pytest.raises(KeyboardInterrupt):
             bench.run(args)
     else:
-        bench.run(args)
+        returned = bench.run(args)
     result = json.loads((args.output / "summary.json").read_text())
     assert len(created) == (1 if failure == "interrupt" else 3)
     assert removed == [str(i) * 64 for i in range(1, len(created) + 1)]
@@ -73,7 +77,22 @@ def test_fixed_arms_keep_failures_and_only_remove_owned_containers(
         assert result["status"] == "failed"
         assert result["arms"][0]["status"] == "failed"
     else:
-        assert result["status"] == "finished"
-        assert [r["status"] for r in result["arms"]] == ["failed", "complete", "failed"]
-        if failure == "timeout":
+        assert returned == result
+        assert result["status"] == ("complete" if failure == "success" else "failed")
+        expected = (
+            ["complete"] * 3
+            if failure == "success"
+            else ["failed", "complete", "complete"]
+            if failure == "timeout-zero"
+            else ["failed", "complete", "failed"]
+        )
+        assert [r["status"] for r in result["arms"]] == expected
+        if failure in ("timeout", "timeout-zero"):
             assert "150-second" in result["arms"][0]["error"]
+
+    for status, exit_code in (("complete", 0), ("failed", 1)):
+        monkeypatch.setattr(bench, "run", lambda args: {"status": status})
+        assert (
+            bench.main(["--output", str(tmp_path), "--jit-cache", str(tmp_path)])
+            == exit_code
+        )
