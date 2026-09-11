@@ -27,11 +27,13 @@ def _sparse_tc_part(
     PAGE_STRIDE,
     CACHE_PAGES,
     SCALE,
+    KV_SCALE,
     H: tl.constexpr,
     BS: tl.constexpr,
     MAX_TOPK: tl.constexpr,
     PARTS: tl.constexpr,
     SPLIT: tl.constexpr,
+    FP8: tl.constexpr,
 ):
     row, part = tl.program_id(0), tl.program_id(1)
     h, d = tl.arange(0, 16), tl.arange(0, 512)
@@ -53,14 +55,36 @@ def _sparse_tc_part(
         tl.store(PART_M + base, float("-inf"), h < H)
         tl.store(PART_L + base, 0.0, h < H)
         return
-    kv = tl.load(
-        CACHE
-        + page[:, None].to(tl.int64) * PAGE_STRIDE
-        + (logical[:, None] % BS) * 512
-        + d[None, :],
-        valid[:, None],
-        0,
-    )
+    if FP8:
+        # e4m3 bytes -> fp32 by bit assembly (sm80 has no fp8 hardware):
+        # normal: sign | (exp - 7 + 127) << 23 | man << 20;
+        # subnormal (exp == 0): man * 2^-9; exp 15 & man 7 is NaN -> 0.
+        raw = tl.load(
+            CACHE
+            + page[:, None].to(tl.int64) * PAGE_STRIDE
+            + (logical[:, None] % BS) * 512
+            + d[None, :],
+            valid[:, None],
+            0,
+        ).to(tl.int32)
+        sign = (raw >> 7) & 1
+        exp = (raw >> 3) & 15
+        man = raw & 7
+        normal_bits = (sign << 31) | ((exp + 120) << 23) | (man << 20)
+        normal = normal_bits.to(tl.float32, bitcast=True)
+        sub = tl.where(sign == 1, -1.0, 1.0) * man.to(tl.float32) * 0.001953125
+        val = tl.where(exp == 0, sub, normal)
+        val = tl.where((exp == 15) & (man == 7), 0.0, val)
+        kv = (val * KV_SCALE).to(tl.bfloat16)
+    else:
+        kv = tl.load(
+            CACHE
+            + page[:, None].to(tl.int64) * PAGE_STRIDE
+            + (logical[:, None] % BS) * 512
+            + d[None, :],
+            valid[:, None],
+            0,
+        )
     q = tl.load(
         Q + (row.to(tl.int64) * H + h[:, None]) * 512 + d[None, :],
         h[:, None] < H,
@@ -109,12 +133,18 @@ def _sparse_tc_reduce(
     tl.store(OUT + (row.to(tl.int64) * H + head) * 512 + d, result)
 
 
-def sparse_tc_nope(q, cache, block_table, indices, topk_length, scale, *, split=32):
+def sparse_tc_nope(
+    q, cache, block_table, indices, topk_length, scale, *, split=32, kv_scale=1.0
+):
+    """`cache` is the bf16 latent [pages, BS, 512] or its fp8 (e4m3) storage
+    viewed as uint8 [pages, BS, 512]; fp8 is decoded in-kernel and scaled by
+    kv_scale (the per-tensor fp8 MLA scale)."""
     if split not in (32, 64, 128):
         raise ValueError("split must be32,64 or128")
     assert q.ndim == 3 and q.shape[1] in (8, 16) and q.shape[2] == 512
     assert cache.ndim == 3 and cache.shape[2] == 512
-    assert q.dtype == cache.dtype == torch.bfloat16
+    fp8 = cache.dtype == torch.uint8
+    assert q.dtype == torch.bfloat16 and (fp8 or cache.dtype == torch.bfloat16)
     assert cache.stride()[1:] == (512, 1) and cache.shape[1] > 0
     assert indices.shape[0] == block_table.shape[0] == q.shape[0]
     assert topk_length.shape == (q.shape[0],)
@@ -145,11 +175,13 @@ def sparse_tc_nope(q, cache, block_table, indices, topk_length, scale, *, split=
         cache.stride(0),
         cache.shape[0],
         scale,
+        float(kv_scale),
         heads,
         cache.shape[1],
         indices.shape[1],
         parts,
         split,
+        fp8,
         num_warps=4,
         num_stages=1,
     )
@@ -185,11 +217,14 @@ def compile_only():
         "PAGE_STRIDE": "i32",
         "CACHE_PAGES": "i32",
         "SCALE": "fp32",
+        "KV_SCALE": "fp32",
     }
     for heads in (8, 16):
         for split in (32, 64, 128):
             parts = triton.cdiv(2080, split)
-            constants = dict(H=heads, BS=576, MAX_TOPK=2080, PARTS=parts, SPLIT=split)
+            constants = dict(
+                H=heads, BS=576, MAX_TOPK=2080, PARTS=parts, SPLIT=split, FP8=False
+            )
             kernel = triton.compile(
                 ASTSource(_sparse_tc_part, signature, constexprs=constants),
                 target=GPUTarget("cuda", 80, 32),
