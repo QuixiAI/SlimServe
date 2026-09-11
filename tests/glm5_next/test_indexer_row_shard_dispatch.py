@@ -40,13 +40,21 @@ def test_opt_in_and_config_boundary(monkeypatch):
     assert indexer._row_shard_option(
         config(speculative_config=object()), 32
     ) is True
-    for bad in (
-        config(additional_config={"glm5_next_indexer_row_shard": True}),
+    # TP4 (8 rows per rank at R=32) and DP replicas (rows shard over the
+    # replica's own TP group) are accepted since 2026-09-11.
+    for good in (
         config(parallel_config=SimpleNamespace(
             tensor_parallel_size=4, data_parallel_size=1, pipeline_parallel_size=1
         )),
         config(parallel_config=SimpleNamespace(
-            tensor_parallel_size=8, data_parallel_size=2, pipeline_parallel_size=1
+            tensor_parallel_size=4, data_parallel_size=2, pipeline_parallel_size=1
+        )),
+    ):
+        assert indexer._row_shard_option(good, 32) is True
+    for bad in (
+        config(additional_config={"glm5_next_indexer_row_shard": True}),
+        config(parallel_config=SimpleNamespace(
+            tensor_parallel_size=2, data_parallel_size=1, pipeline_parallel_size=1
         )),
         config(parallel_config=SimpleNamespace(
             tensor_parallel_size=8, data_parallel_size=1, pipeline_parallel_size=2

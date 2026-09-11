@@ -25249,3 +25249,119 @@ restart is the operator's call.
   matrix now runs mx-tp4dp2 (replicated) beside mx-tp4dp2-flat (default
   flattening) and mx-tp4 (standalone) - the replicated arm's c1 should
   match standalone TP4 and its c8+ should beat the flattened arm.
+- Leg 2 (fail-fast invariants) and leg 3 (+ cross-pool checks) on the
+  speculative record both died the same way after ~35 min at c8 under
+  tier restores (154-160 hits): leg 2 `popleft_n` walked off the free
+  list with num_free_blocks still positive; leg 3 popped the fake tail
+  sentinel (block -1, ref_cnt 1) - the list is shorter than its count,
+  and no double append, negative free, or cross-pool touch/free was
+  reported. Recall stayed 68/68 and 72/72 until the death; 8 sessions
+  error at the death each time. The free list now carries a shadow
+  membership set checked at every mutating call (commit after
+  7a453f9b3); leg 4 (`glm53f-leg-spec-instr3`, queue4.sh) runs on it.
+  Raw: perf/results/2026-09-10/glm53f-leg-spec-instr{,2}/.
+- DP2 arms (queue2) all failed to boot: the record's
+  glm5_next_indexer_row_shard is TP8/DP1-only ("Indexer row sharding
+  requires SM80, TP8/DP1/PP1, 32 indexer heads and the compact cache"),
+  as did the standalone TP4 arm. Rerun (queue3.sh) with the row shard
+  off on all four arms. k=4 arms: pure k=4 died on the record's k=3
+  schedule ("DFlash drafts a fixed block of 4; the scheduler asked for
+  num_steps=3" - a static k must come with a matching schedule) and the
+  scheduled k=4 arm hit a stale output directory; both rerun in queue4.
+- TP8-only kernel guards generalized to TP4 (2026-09-11): the sparse
+  tensor-core decode Triton kernel already tiles 16 query rows per token
+  (`h = arange(16)`, masked at H=8) and compile_only covered H=16, so
+  `_sparse_tc_option`/`_sparse_tc_split` now accept 8 or 16 heads per
+  rank; the GPU parity suite (tests/glm5_next/test_sparse_tc_candidate.py,
+  48 cases incl. every heads=16 geometry) passes on one A100 slice. The
+  indexer row shard shards R in (16, 32) rows over the replica's own TP
+  group, so it accepts TP4 (4/8 rows per rank) and DP replicas; the
+  all_gather still runs on the live pynccl communicator of that TP group.
+  Dispatch tests 51 pass. queue5 runs the TP4/DP2 arms with both kernels
+  OFF (baseline), queue6 reruns mx-tp4dp2 and mx-tp4 with both ON; the
+  record flip (flip_dp2.py) takes whichever the arms qualify.
+- Leg 4 (04:16-04:52, shadow-set check) FIRED: `FreeKVCacheBlockQueue.
+  popleft_n (pool 0): num_free_blocks=4862 but the list holds 4790
+  blocks` after 36 min at c8 (69/69 recall, 8 sessions errored at the
+  death). No code outside the queue writes list pointers and every pool
+  has its own pool_id, so a count that outruns the list can only come
+  from appending a second object that carries an already-linked block
+  id; the append now raises there with that object's pool id and
+  refcount (e4f3fe151). Leg 5 reruns on it (queue5, results
+  2026-09-11/glm53f-leg-spec-instr3). Raw of leg 4: the failure text in
+  ~/.local/scratch/glm53/queue4.log (its server.log was overwritten by
+  a concurrent chain - two queue scripts raced for the GPUs between
+  03:00 and 05:10; only queue5/queue6 remain).
+- First DP2 numbers on today's tree (flattened default MoE, DFlash2 on,
+  row shard + sparse TC off, from the raced 03:20 arm): canaries PASS;
+  c1 172.1/91.2, c8 510.6/425.6, c16 729.5/766.7, c32 959.1/992.9, c64
+  1149.8/1188.2 tok/s; weights 26.36 GiB/rank. Already +6-10% over the
+  TP8 record at c16-c64 (687.3 / 879.5 / 1074.5) without the replicated
+  MoE. The replicated arm booted with 46.28 GiB/rank (full expert set
+  per replica, as designed) but was cut off by the queue reshuffle; it
+  reruns in queue5. Raw: perf/results/2026-09-10/glm53f-dflash2/
+  mx-tp4dp2-flat-0320/.
+
+## 2026-09-11: 8-GPU matrix on today's tree (DFlash2 on, record config)
+
+Exact-token c1/c8/c16/c32/c64, two repeats each (r1/r2), canaries pass
+unless noted; TP4 arms with the two TP8-only kernels OFF unless "-k".
+Raw: perf/results/2026-09-10/glm53f-dflash2/mx-*/.
+
+| arm | weights/rank | pool tokens | c1 | c8 | c16 | c32 | c64 |
+|---|---|---|---|---|---|---|---|
+| TP8 record (09-10, kernels on) | 24.0 GiB | 3.08M | 153.6 | 495.0 | 687.3 | 879.5 | 1074.5 |
+| tp8-ep | 24.0 | 3.08M | 111/119 | 504/490 | 673/658 | 860/863 | 1049/1050 |
+| tp4dp2-flat (default DP: flattened MoE) | 26.4 | 2.87M | 166/123 | 504/487 | 757/733 | 930/932 | 1145/1145 |
+| tp4dp2-ep | 26.4 | 2.78M | 100/85 | 440/418 | 617/611 | 860/854 | 1051/1062 |
+| tp4 standalone (4 GPUs) | 46.3 | 1.67M | 131/130 | 379/393 | 503/493 | 650/653 | 795/791 |
+| tp4-k standalone (row shard + sparse TC on) | 46.3 | 1.65M | 138/155 | 412/409 | 524/501 | 680/676 | 794/793 |
+| tp4dp2 replicated MoE | 46.3 | 1.67M | HANG | | | | |
+| tp4dp2-k replicated MoE, kernels on | 46.3 | 1.65M | HANG | | | | |
+
+- Flattened DP2 beats the TP8 record at c16/c32/c64 by +8% / +6% / +7%
+  even with both TP8-only kernels off, and matches c8; its c1 is
+  bimodal with acceptance (166 vs 123) like every DFlash arm.
+- EP loses everywhere again (tp8-ep -28% c1, tp4dp2-ep -13% c8).
+- The TP4-generalized kernels are worth +6% c1/c8 and +4% c16/c32 on a
+  standalone TP4 engine (tp4-k vs tp4).
+- Replicated-MoE DP2 boots (46.3 GiB/rank = full expert set per
+  replica) but the FIRST request hangs: "RPC call to sample_tokens timed
+  out" on DP0 300 s after the canary - a cross-replica collective is
+  still being entered by the active replica while the idle replica no
+  longer dummy-steps. Reproducing under py-spy to find it.
+- k=3/k=4 arms all died with a torch.compile shape-guard assert
+  ("expected size 3==4, stride 12288==16384") - the drafter's compiled
+  graph is keyed without the DFlash block size, so k=3 and k=4 share a
+  cache entry (the compile-cache A/B hazard). Fix owed: fold the draft
+  block size into the compile hash; rerun the k arms after.
+- Replicated-DP2 hang root cause (code): the V2 speculator base
+  (`vllm/v1/worker/gpu/spec_decode/speculator.py`) keeps its own
+  `dp_size` and the DFlash proposer calls `dispatch_cg_and_sync_dp` with
+  it, so the active replica entered the drafter's cross-DP all-reduce on
+  its first speculative step while the idle replica, which no longer
+  dummy-steps in replicated mode, never joined - "RPC call to
+  sample_tokens timed out" 300 s after the canary. Fixed (db08f2fbe):
+  the speculator and the cudagraph manager use a DP sync size of 1 under
+  data_parallel_replicate_moe, matching the runner. Also keyed the
+  compile cache by draft block size for block drafters (2705757ee).
+  Queue: probe (py-spy stacks of the hang, dp2hang/) -> leg 6 with
+  VLLM_FREE_LIST_TRACE=1 (queue7) -> mx-tp4dp2-k2, the replicated arm
+  with the fix and both TP4 kernels on (queue8) = record candidate.
+- BLOCK-POOL FAULT ROOT CAUSE (leg 6 trace, 10:26): the last free-list
+  mutation before the divergence was `popleft_n n=0` through the slow
+  path - a NEGATIVE count. `single_type_kv_cache_manager.
+  allocate_external_computed_blocks` asks the pool for
+  `cdiv(local + external tokens, block) - len(req_blocks)`, and when the
+  local prefix hit already holds more blocks than the external (tier)
+  tokens extend to, that is negative; `get_new_blocks` only checked the
+  upper bound and `popleft_n(-k)` did `num_free_blocks -= n`, adding k to
+  the count while linking nothing. Every leg death fits: the count runs
+  ahead of the list by sums of small k (16/72/88), until an allocation
+  walks past the tail and pops a sentinel or a still-referenced block
+  (the original `assert block.ref_cnt == 0`). Fix: the pool and the queue
+  reject negative counts, and the external allocation clamps at zero with
+  a one-time warning naming the manager/group/block size and token counts
+  (tests/v1/core/test_block_pool_negative_alloc.py). The fail-fast
+  invariants and the trace ring stay (trace env-gated). The WildChat leg
+  and the 1M leg on the DP2 record rerun on this tree.
