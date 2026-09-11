@@ -117,39 +117,52 @@ rules in section 6 exist so it does not happen again.
   `.venv`. The `.so` files in `vllm/` were built from the deleted branch's
   `csrc` and are STALE for this tree: rebuild before any serving.
 
-### 1d. Salvage policy (operator decision, see section 11)
+### 1d. Salvage verdict (code read 2026-09-11)
 
-Recommended: re-land the retained kernel and loader pieces from
-`upstream/pr/26` and `upstream/pr/27` as individual commits on this branch,
-each re-measured on this tree, each with its parity test, and nothing else
-from those PRs (no diagnostics, no harnesses, no notebook history). The set
-is small in code terms and represents ~55 % at c1 that would be wasteful to
-re-derive from scratch:
+Operator's answer: "if there's kernel pieces that work then great, we can
+use them; I don't care about throwing away code." The five closed PRs added
+~83K lines; the serving-path code worth carrying is about 1,500. The four
+kernel headers were read in full: they are small, clean and built like the
+repo's own Ampere kernels (cp.async staging, ldmatrix, mma.sync m16n8k16,
+one shared-memory reduction, total over bad inputs).
 
-| piece | source (pr/26, pr/27) | why it is worth re-landing |
-|---|---|---|
-| `bf16_decode_gemm.cuh`, `fp8_decode_gemm.cuh` + `decode_gemm` bindings + the `quixicore_decode_linear` custom op in `layers/utils.py` | pr/26, pr/27 | +1.5 % c1, and the FP8 backbone needs the W8A16 decode path |
-| `slimserve/fp8_swapset.py` builder + the loader hook (config group `slimserve_fp8_swapset`) | pr/27 | +5.5 % c1 (dense/shared/DSA) and +10.6 % c1 (KDA) |
-| `slimserve/f32_overrides.py` + loader hook | pr/27 (also on `glm53-flash-sm120-mtp`) | correctness of routing; +0.03 nats |
-| `glm_moe_routing.cuh` (`glm_route_align`, NaN-safe, both `__syncwarp`s) + `glm_moe_combine.cuh` (`moe_sum_add`) + the router publish/consume wiring | pr/26, pr/27 | -160 launches per step |
-| the router GEMV tier in `gate_linear.py` (bf16 in, fp32 logits) | `glm53-flash-sm120-mtp` bb9fa28a4 | upstream now has an SM80 FP32 router; check which is the better fit on sm_120 |
-| sparse MLA `_bf16_partition` rule (32 for B<=8, 64 above) + `VLLM_MLA_SPARSE_REDUCE` default 2 (`paged_attention_reduce_channels<bf16,512>`) | pr/26, pr/27 | +3.7 % c1; the reducer already exists in upstream's header |
-| `VLLM_CUSTOM_AR_ALLOW_PCIE=1` on the record env; `VLLM_CUSTOM_AR_MAX_SIZE_MB` env | pr/27 | +11 % c1; the fork already has the escape hatch, the env is the whole change |
-| mHC `VLLM_DSV4_MHC_MODE` last-block variant | pr/26 | neutral; take only if the Phase 2 mHC work builds on it |
-| small-k sampler tie/nucleus fix (`topk_sample.cuh`) | pr/26 | correctness; verify upstream has not fixed it since |
-| platform `rtx6000` (hardware classify, profiles.json platform + variant, deepgemm cmake guard) | 6b062ad3f on `glm53-flash-sm120-mtp` | Phase 0 |
+KEEP, re-landed one commit at a time and re-measured on this tree:
 
-Already upstream and NOT to be re-landed: KDA o_norm through Triton, g_a
-merged into in_proj, paired f_b/g_b, FP32 router on SM80 H4096/E288, SIMT mHC
-with fused RMSNorm, TP indexer row sharding, compact pooled-indexer cache,
-sparse tensor-core decode, the V2 runner, DFlash2 as the registered
-speculator, fp8 main KV for the 512-wide NoPE path. Each of these is
-SM80-gated in code and is a Phase 0/1 qualification item on sm_120, not a
-port.
+| piece | lines | verdict |
+|---|---:|---|
+| `bf16_decode_gemm.cuh` | 234 | weight-streaming M<=16 tensor-core GEMM; +1.5 % alone, and the base of the FP8 kernel |
+| `fp8_decode_gemm.cuh` | 212 | same pipeline, exact e4m3 -> f16x2 conversion, one 128x128 scale per K chunk; W8A16 output bit-identical to a BF16 dequant; the kernel behind +5.5 % and +10.6 % c1 |
+| `glm_moe_routing.cuh` | 173 | fused scoring / top-8 / renorm / Marlin alignment in one block, NaN-total; drop the `STABLE_ALIGNMENT` template branch (a determinism diagnostic) |
+| `glm_moe_combine.cuh` | 80 | fused routed sum + shared-expert add |
+| decode-linear custom op in `layers/utils.py` | ~180 | correct compile-opaque pattern with the compile-cache factor |
+| `fp8_swapset.py`, `f32_overrides.py` builders + the `glm5_next.py` loader hooks | ~600 | keep; the KDA self-quant bakes a TP4-specific beta-shard layout into the artifact (fine for a per-platform record; note it in the record) |
+| indexer fold (wk / kpool gate / weights_proj into `fused_qkv_a_proj`) | +71/-23 | not upstream; re-apply from the exported patch |
+| Marlin workspace allocated once per device | ~15 | upstream still allocates per call; re-implement |
+| sparse MLA partition 32 (B<=8) / 64 rule + channel reducer selection | ~30 | upstream's `_bf16_partition` is a 128-token scratch-cap rule and no binding uses `paged_attention_reduce_channels`; re-implement from the notebook |
+| tests `test_quixicore_decode_gemm{,_fp8}.py`, `test_quixicore_glm_route_align.py`, `test_quixicore_moe_sum_add.py`, `test_f32_overrides.py` | ~600 | with their kernels |
+| bring-up patch (platform `rtx6000`, record, DeepGEMM cmake guard) | ~75 | Phase 0 |
 
-Alternative (if the operator prefers a clean slate): implement the same
-items from the notebook entries alone, treating pr/26 and pr/27 as reference
-only. Costs roughly two extra days for the same end state.
+ALREADY UPSTREAM (only an env or a capability gate is needed): custom
+all-reduce over PCIe and its size cap (`VLLM_CUSTOM_AR_ALLOW_PCIE`,
+`VLLM_CUSTOM_AR_PCIE_MAX_BYTES`); the FP32 router GEMV (`dsv4_router_gemm`,
+gated to SM80 and 288 experts: widen after parity); KDA o_norm through
+Triton, g_a merged into in_proj, paired f_b / g_b.
+
+DROP: the small-k sampler (`topk_sample.cuh` 413 lines + 200 in
+`sampler.cu`: a tie-handling argument, not a measured throughput item;
+revisit only if the Phase 0 trace ranks sampling); the mHC last-block
+variant (neutral); H16 swapAB sparse prefill and tensor-core mHC prefill
+(0.3-0.5 % TTFT; the latter failed its quality gate); `glm_moe_stable_align.cuh`;
+the publish/consume-by-tensor-identity routing wiring (rewrite the ~60
+lines); `weight_recipe.py`'s recipe-directory mechanism; every
+`slimserve/*_journal.py`, `*_diagnostic.py`, `canonical_moe.py`,
+`glm53_ordering.py`, `reduction_receipts.py`, `rmsnorm_*.py`,
+`prompt_score_*.py`, `index_journal.py`; the campaign harnesses and the
+notebook history.
+
+Exported copies of the KEEP set: `~/.local/scratch/slimserve-glm53/salvage/`
+(`csrc/`, `python/`, `patches/`). The local branch and the fetched PR refs
+are deleted; the PR heads remain on GitHub as `refs/pull/{24..28}/head`.
 
 ## 2. Where the tree stands (upstream/main 2b355117e, 2026-09-11)
 
@@ -609,7 +622,9 @@ re-measured (expected gains are Codex's like-state deltas):
 
 1. F32 sidecar loader hook (correctness; neutral).
 2. Custom all-reduce over PCIe on the record env (+11 % c1) and the AR size
-   cap for prefill chunks (-14 % c8 prefill).
+   cap for prefill chunks (-14 % c8 prefill); both knobs exist upstream
+   (`VLLM_CUSTOM_AR_ALLOW_PCIE`, `VLLM_CUSTOM_AR_PCIE_MAX_BYTES`), so this is
+   record env plus a measurement.
 3. bf16 M<=16 decode GEMM custom op (+1.5 % c1).
 4. FP8 swap-set (dense/shared/DSA; +5.5 % c1) then FP8 KDA projections
    (+10.6 % c1, NLL gate mandatory; ZAI kept these BF16).
@@ -749,21 +764,41 @@ microbench GB/s and an e2e entry.
 - Commit as Auroter, no trailers; push to `upstream` (QuixiAI) branch
   `glm53f-rtx6000` when the operator says so; PRs target QuixiAI main.
 
-## 11. Decisions needed from the operator
+## 11. Decisions (operator answers recorded 2026-09-11)
 
-1. Salvage policy (section 1d): re-land the listed kernel and loader pieces
-   from the closed PRs as re-measured commits (recommended), or clean slate.
-2. Driver: upgrade tinybox to a CUDA 13.3-capable driver so the B12X control
-   runs unhandicapped (it changes nothing for our stack, which builds against
-   13.0; it makes the control comparison honest). Shared box, your call.
-3. Speculator for the `rtx6000` record: DFlash2 (upstream default, NC
-   license) vs the checkpoint MTP head vs off; measured in Phase 3, but the
-   license constraint decides whether DFlash2 can be the record.
-4. The `rtx6000` KV tier sizes for Phase 6 (32 GiB host per rank + disk on
-   /raid proposed) and whether Foundry-shape workloads (director prompts,
-   8-wide, thinking on) should be added as a recorded shape from Phase 1 on.
-5. Whether the local branch `glm53-flash-sm120-mtp` and the fetched
-   `upstream/pr/*` refs may be deleted once the salvage commits land.
+1. Salvage: yes, the KEEP set of section 1d, one commit at a time,
+   re-measured. Nothing else from the closed PRs.
+2. Driver upgrade for an unhandicapped B12X control: still open; it only
+   changes how honest the external comparison is, not our stack.
+3. Speculator: whichever is fastest on the measured workloads. The DFlash2
+   drafter's cc-by-nc-nd license is acceptable for self-hosted and internal
+   use; the campaign may end with two records (DFlash2 for the fastest,
+   the checkpoint's own MTP head as the commercially clean alternative).
+   Phase 3 measures both on the prose harness and the structured 8-wide
+   workload.
+4. KV tier (explained, default chosen): SlimServe's HostTierConnector keeps
+   evicted KV blocks in pinned host RAM and then on disk so long
+   conversations and shared prefixes restore instead of re-prefilling. The
+   A100 records carry 72 GiB per rank of pinned host RAM plus 256 GiB per
+   rank of disk, which does not transfer to a 188 GB host with four ranks.
+   Default for the `rtx6000` record: 32 GiB pinned per rank (128 GiB total)
+   plus a disk tier under `/raid` sized to what is free at Phase 6. It is a
+   completeness item, not a throughput item.
+5. Cleanup: done for the local branch, the fetched PR refs and 32 GB of
+   scratch build products, traces and stale compile cache. Two deletions on
+   `/raid` were blocked by the tool sandbox and are left to the operator:
+   `/raid/scratch/slimserve-glm53` (a 148 KB CMake cache) and
+   `/raid/weights/GLM-5.3-Flash-NVFP4-FP8-KDA-TP4` (a 7.2 GB duplicate of
+   the sidecars that live next to the checkpoint, verified byte-identical,
+   plus symlinks).
+6. NEW, needs an answer before Phase 6: hosting of the FP8 hybrid
+   artifacts. The retained record depends on two sidecars built from the
+   306 GB native checkpoint (`f32-overrides.safetensors` 1.2 MB,
+   `fp8-swapset.safetensors` 7.2 GB). For anyone else to run the profile,
+   `slimserve.fetch` must be able to download them: publish the sidecars in
+   a SlimServe Hugging Face repo (recommended, small), or publish the full
+   hybrid checkpoint (~200 GB). Until then the record is reproducible only
+   with both checkpoints on disk and the builders.
 
 ## 12. Next command
 
