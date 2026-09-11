@@ -25455,3 +25455,35 @@ arm (queue17).
   convention (2000) with a registry test; the harness sends probes a
   per-request budget of half their max_tokens so the answer keeps room.
   The closing DP2 1M leg (queue15) validates it end to end.
+- A/B arms on the DP2 record (c1/c8/c16/c32/c64, two repeats, medians):
+  base 165 / 566 / 848 / 989 / 1200 (acc 2.21); two API servers 167 /
+  516 / 805 / 949 / 1194 (no gain - the single frontend is not the
+  limiter); drafting at every batch size ([[1,64,3]]) 116 / 581 / 800 /
+  993 / 1190 (acc 2.18) - within run-to-run noise of the record's
+  schedule, so no flip; NUMA binding failed to parse
+  (`--numa-bind-nodes` rejects the JSON list; rerun with the accepted
+  form). Run-to-run spread at fixed config is +-5% (acceptance), so two
+  repeats cannot resolve smaller wins.
+- PROFILE, DP2 record, 32 requests per replica, one worker trace (window
+  1,887 ms, kernels busy 98%): marlin MoE GEMM 31.6% (2,940 launches);
+  custom allreduce 19.4% (1-stage 9.7% + 2-stage 9.7%, 3,672 launches);
+  mHC partials 10.3% + pre-mix/finalize 2.5%; KDA recurrent 5.4%; dense
+  bf16 GEMMs ~9%; sparse MLA decode 1.6% + reduce 0.9%; top-k/top-p
+  sampler 1.1%; moe_sum/align/act/topk ~1.8%. So allreduce + mHC is
+  ~32% of GPU time at production batch - the batched fused
+  mHC-allreduce is the top kernel item (est. up to 15-20%), ahead of MoE
+  fusion (act/sum/align ~2%); MoE itself is 32% and its launches per step
+  are the next target after that. Raw: ~/.local/scratch/glm53/prof-dp2-c32/.
+- CLOSING 1M LEG (dp2-1m-c, budget on): both sessions reached 1.04M;
+  27 probes, 23 recalled, 19 of them recalled inside the reasoning
+  text (the nudge works). The four misses: one coherent "I don't have a
+  codename" at 213K, and THREE PROBES OF PURE '!' TOKENS (content and
+  reasoning) at 911,894 / 991,581 / 1,040,594, each with e2e 519-553 s =
+  a full cold re-prefill of the ~900K+ prefix (no cache hit, no tier
+  hit; the tier holds 123 hits for the incremental turns). The earlier
+  legs' "empty answer at 900K+" probes were the same failure. So a cold
+  prefill of >= ~900K tokens produces garbage logits on this path while
+  incremental extension of the same context is fine. Bisection queued
+  (queue18: cold single requests at 200K/500K/800K/900K/1M with a
+  planted marker). Also: one 400 at 1,048,065 prompt tokens - the
+  harness overshoots the 1,048,576 ceiling by its 512 reply tokens.
