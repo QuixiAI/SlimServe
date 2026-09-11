@@ -37,6 +37,21 @@ the old history. Upstream history is unchanged and nothing was pushed.
 
 ### Latest checkpoint (2026-09-10): kernel speed work resumed
 
+2026-09-11 UTC: **Phase4.1 paired-column Marlin SwiGLU fusion PARKED**.
+One layout-only/fused-epilogue candidate, existing decode schedules. Complete
+gate/up ->activation ->weighted-down c1 24.98 ->23.69us, c8 123.80 ->124.10us,
+c16 215.65 ->214.78us. Only~54us/42-layer c1 budget; no serving integration.
+63 normal-input cases and changed-input graphs pass; amplified32x inputs have
+seven failed activation/down comparisons, retained in diagnostic-only timing.
+Epilogue is exact on the same paired layout; one sampled FP64 dot agrees with
+candidate rounding, not original. Not blanket quality qualification. Original
+serving template restored; prototype quarantined under benchmarks. Raw
+`perf/results/2026-09-11/marlin-swiglu/`. Next4.2 full-head KDA conv/state/norm
+fusion with projections unchanged; native GDN is the relevant reference.
+PR publication additionally needs GitHub reauthentication: configured account
+returns401 even without GH_TOKEN/GITHUB_TOKEN overrides. User notified; kernel
+work continues. No PR has been created.
+
 2026-09-11 UTC: **Phase4.5 prefill indexer TP row sharding RETAINED**.
 Profile now enables `VLLM_GLM53_INDEXER_TP_PREFILL=1` for SM120/TP4, >=2048
 prefill rows and >=32768 context; no decode/short-prefill change. Cold-prefix

@@ -41,7 +41,15 @@ additional cold128K generated-retrieval checks pass with sharding active.
 Profile enables `VLLM_GLM53_INDEXER_TP_PREFILL=1`; flag0 restores the old path.
 No claim of full roadmap completion or resolution of scoring-repeatability limits.
 The broader fused-expert successor and whole-layer KDA fusion remain unimplemented.
-Next review is **4.1**, against retained Marlin, which ALREADY uses DP plus two-tile
+Phase **4.1 paired Marlin SwiGLU fusion** is now implemented and parked:
+complete expert c1 24.98 ->23.69us (~54us/42-layer step budget), c8 neutral,
+c16~0.4% component improvement. Seven amplified-input comparisons exceed the
+unchanged tolerance; same-paired-layout epilogue is exact, and a sampled FP64
+dot explains the first differing rounding. All failures remain recorded; no
+serving qualification or promotion. Production source restored; prototype is
+quarantined in benchmarks. Raw `2026-09-11/marlin-swiglu/`.
+Next implementation is **4.2 whole-head KDA conv/state/norm fusion**, retaining
+the existing projections and exact recipe. Retained Marlin ALREADY uses DP plus two-tile
 stream-K (`marlin_template.h:396`). Do not treat adding stream-K itself as an
 unclaimed mechanism or repeat the closed planar prototype/launch sweeps. A
 successor needs a specific fusion/dequant/traffic saving with enough full-stack
@@ -54,8 +62,8 @@ budget; otherwise document deferral, not a fictitious implemented result.
 | 2.1–2.2 | Main transport/launch fusions retained; rejected variants stay closed |
 | 2.3 | Output-weight prefetch implemented and rejected; broader next-layer prefetch not implemented |
 | 3 | MTP port tested; off after losses on the relevant concurrent workload |
-| 4.1 | Next source-directed review: fused successor unimplemented; retained Marlin already has DP/two-tile stream-K |
-| 4.2 | Paired K128 fg_b implemented, locally faster but parked for small full-stack value; whole-layer fusion unimplemented |
+| 4.1 | Paired-column/fused-SwiGLU successor implemented and parked: ~54us c1 step budget, batched neutral, stress comparison differences recorded; no serving promotion |
+| 4.2 | ACTIVE: whole-head conv/state/norm fusion; paired K128 fg_b already parked for small full-stack value |
 | 4.3 | Sparse MLA/indexer improvements retained; recent local variants rejected; structural work not closed |
 | 4.4 | Persistent per-layer decode unimplemented; conditional on 4.1–4.3 evidence |
 | 4.5 | TP row-sharded prefill indexer retained (-6.09% cold128K TTFT), alongside wide Marlin; broader structural work not closed |

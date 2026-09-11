@@ -28551,3 +28551,65 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   completed. Source review during serving waits confirms retained Marlin already
   implements DP/two-tile stream-K; a successor must identify another mechanism,
   not rename existing scheduling or repeat the rejected planar/geometry probes.
+
+## 2026-09-11 - Phase 4.1 paired Marlin SwiGLU: park for small serving budget
+
+- Status: implemented and measured; NOT promoted. Serving sources and native
+  libraries unchanged. Prototype and complete template quarantined under
+  `benchmarks/kernels/marlin_glm_swiglu*`; original template restored exactly.
+- Baseline:6cba6fdee, recipe v1, actual TP4 rank0 NVFP4 bytes, SM120/CUDA13,
+  installed Marlin gate/up -> clamped SwiGLU -> weighted down. No quant change.
+- Hypothesis: adapt the DS4/Q4_K paired-gate epilogue and Metal fused-SwiGLU
+  precedent without its doubled accumulator pressure. Permute columns at load
+  time to gate32/up32 groups, retain Marlin tile dimensions and DP/two-tile SK,
+  then consume the already BF16-rounded gate/up in shared memory. Preserve the
+  BF16 SiLU boundary, FP32 multiply and clamp10. Down weighting stays unchanged.
+- Candidate uses recorded auto schedules: c1 M8/N64/K128/S4/two CTAs per SM;
+  c8/16 M8/N128/K64/S4/three CTAs per SM. No geometry sweep. The benchmark-only
+  loader permutes original packed bytes/scales; a production implementation
+  would need load-time replacement AND matching prefill/LoRA dispatch, never a
+  lazy duplicate weight cache. That integration was deliberately not added.
+- Correctness:63 normal-input composed cases and changed-input captured graphs
+  pass rtol/atol0.01. Amplified inputs (32x) produce THREE activation and FOUR
+  down comparisons outside that same threshold; these remain failed checks.
+  The first fail stops `screen.json` before timing. `diagnosis.json` reproduces
+  it; fused activation is BIT-EXACT against installed unfused activation on the
+  same paired weights/schedule. The difference is column ownership changing
+  SK summation order, not an epilogue rounding omission. First failing element:
+  layer3/expert51/gate356 FP64 dot1.074217775132921 -> BF16 1.0703125 (candidate),
+  original1.078125; resulting activation7.96875 versus8.0625. This single oracle
+  observation is not blanket accuracy qualification. No threshold was relaxed.
+- The final explicitly `--diagnostic-timing` run records ALL seven failures
+  instead of aborting, so timing can bound further engineering value. Its
+  terminal status is `diagnostic_timing_only`, not a correctness pass. No
+  serving run or model-quality claim follows. The earlier console line saying
+  "composed correctness passed" in that mode was misleading; reporter fixed
+  to print recorded failures. Raw JSON always recorded them correctly.
+- Three A/B/A rounds, ten graph replays; layers3/23/44, fifteen captured c1
+  routes per layer and three c8/c16 routes each. Synthetic BF16 inputs; actual
+  checkpoint bytes/routes. Union weight footprints959/1235/1886 MB exceed3xL2.
+  Complete gate/up, activation and weighted-down medians in microseconds:
+
+  | Batch | Control before | Fused candidate | Control after |
+  |---|---:|---:|---:|
+  | 1 | 24.9833 | 23.6908 | 24.9787 |
+  | 8 | 123.8020 | 124.0974 | 123.8016 |
+  | 16 | 215.6544 | 214.7783 | 215.7451 |
+
+- Decision: c1 component improves5.17%, only~54us/42-layer decode-step budget;
+  c8 neutral/slower, c16~0.4% component improvement. Park without expensive
+  layout/prefill integration or model runs. This is not a serving gain and does
+  not establish that every possible fused expert architecture is exhausted.
+- Build80GiB/MAX_JOBS2; probe16GiB/swap0, GPU0, no concurrent workload. All runs
+  terminal. Raw:`perf/results/2026-09-11/marlin-swiglu/` (`screen.json`,
+  `diagnosis.json`, failure tensors, `timing.json`). Reproduce using
+  `python -m benchmarks.kernels.benchmark_glm53_marlin_swiglu --build-dir <scratch>
+  --model /raid/weights/GLM-5.3-Flash-NVFP4-FP8-KDA-TP4 --journal
+  perf/results/2026-09-08/routing-census/boot-1/routing/routing-623340.jsonl
+  --output <NEW.json>`; add `--diagnostic-timing` only to record failures and
+  timing without qualifying the candidate. `--build-only` compiles separately.
+- Next existing item4.2: whole-head conv/state/norm fusion. Reference is the
+  owned native GDN full-head state+norm implementation, not FlashInfer's
+  frozen-state speculative verification. Keep projection kernels, FP32 state,
+  BF16 conv state and epsilon1e-5; measure full window and account for c1's
+  low full-head CTA count before considering integration.

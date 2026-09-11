@@ -52,7 +52,7 @@ def route_cases(path, batches, count):
     return selected
 
 
-def load_layer(model, layer_id, rank):
+def load_layer(model, layer_id, rank, *, gate_up_tile=0):
     """Use checkpoint planar bytes, then the SAME Marlin load-time conversion."""
     from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
         prepare_nvfp4_moe_layer_for_marlin,
@@ -123,6 +123,16 @@ def load_layer(model, layer_id, rank):
         }
         for key, t in raw.items()
     }
+    if gate_up_tile:
+        # Diagnostic layout-only gate/up pairing for a fused Marlin epilogue.
+        # Hashes above remain the original checkpoint bytes, not reordered data.
+        if gate_up_tile != 64:
+            raise ValueError("paired decode probe uses one fixed N64 tile")
+        order = torch.arange(1024).view(2, 16, 32).transpose(0, 1).reshape(-1)
+        for key in ("w13", "s13"):
+            raw[key] = (
+                raw[key].view(torch.uint8)[:, order].contiguous().view(raw[key].dtype)
+            )
     device = {key: t.cuda() for key, t in raw.items()}
     layer = SimpleNamespace(
         num_experts=288,
