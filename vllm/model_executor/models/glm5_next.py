@@ -28,6 +28,7 @@ from collections.abc import Iterable
 
 from typing import ClassVar, Literal
 
+import dataclasses
 import torch
 from torch import nn
 
@@ -239,6 +240,14 @@ class Glm5NextMLAAttention(nn.Module):
     ) -> None:
         super().__init__()
         cache_config = vllm_config.cache_config
+        extra = vllm_config.additional_config or {}
+        if extra.get("glm5_next_main_kv_fp8", False):
+            # Per-layer fp8 (e4m3) main KV for the sparse NoPE MLA layers only:
+            # the KDA state, the pooled indexer cache and a block drafter's
+            # own attention keep the engine-wide dtype. The sparse backend
+            # decodes fp8 in software on sm80 (mla_decode_fp8_sparse_nope).
+            cache_config = dataclasses.replace(cache_config, cache_dtype="fp8")
+            logger.info_once("glm5_next: sparse MLA layers use fp8 (e4m3) main KV")
         quant_config = vllm_config.quant_config
         self.hidden_size = config.hidden_size
         self.qk_nope_head_dim = config.qk_nope_head_dim

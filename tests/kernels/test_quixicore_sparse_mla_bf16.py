@@ -121,3 +121,40 @@ def test_glm_576_strided_pages():
         view.stride(0) * view.element_size(),
     )
     assert torch.equal(dense, strided)
+
+
+# ---- fp8 (e4m3) NoPE latent: the NFP8=512 instantiation (2026-09-11) ----
+
+
+def _fp8_inputs(heads, kv_scale):
+    q, kv, bt, idx, tlen = _inputs(512, heads)
+    # Store kv / kv_scale as e4m3; the kernel multiplies decoded values by
+    # kv_scale (SMODE 1, vLLM's per-tensor fp8 MLA layout).
+    stored = (kv.float() / kv_scale).to(torch.float8_e4m3fn)
+    dequant = (stored.float() * kv_scale).to(torch.bfloat16)
+    return q, stored.view(torch.uint8), dequant, bt, idx, tlen
+
+
+@pytest.mark.parametrize("heads", [8, 16])
+@pytest.mark.parametrize("partition_size", [0, 128])
+@pytest.mark.parametrize("kv_scale", [1.0, 2.0])
+def test_nope_512_fp8_matches_reference(heads, partition_size, kv_scale):
+    q, data, dequant, bt, idx, tlen = _fp8_inputs(heads, kv_scale)
+    out = qc.mla_decode_fp8_sparse_nope(
+        q, data.reshape(-1), bt, idx, tlen, BS, 1.0 / math.sqrt(512), kv_scale,
+        partition_size,
+    )
+    ref = _reference(q, dequant, idx, 512)
+    err = (out.float() - ref).abs().max().item() / ref.abs().max().item()
+    assert err < 5e-3, err
+
+
+def test_nope_512_fp8_tracks_bf16_within_fp8_error():
+    """fp8 storage vs the bf16 kernel on the same latents: the difference is
+    the e4m3 rounding, bounded well inside a few percent."""
+    q, kv, bt, idx, tlen = _inputs(512, 16)
+    data = kv.to(torch.float8_e4m3fn).view(torch.uint8)
+    a = qc.mla_decode_bf16_sparse_nope(q, kv.reshape(-1), bt, idx, tlen, BS, 1.0 / math.sqrt(512), 128)
+    b = qc.mla_decode_fp8_sparse_nope(q, data.reshape(-1), bt, idx, tlen, BS, 1.0 / math.sqrt(512), 1.0, 128)
+    err = (a.float() - b.float()).abs().max().item() / a.float().abs().max().item()
+    assert err < 5e-2, err
