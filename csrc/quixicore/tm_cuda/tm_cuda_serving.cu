@@ -273,6 +273,9 @@ static void py_glm_stable_align(
 
 static void py_moe_sum_add(torch::Tensor x, torch::Tensor shared, torch::Tensor out) {
     CK(x); CK(shared); CK(out);
+    TORCH_CHECK(shared.device() == x.device() && out.device() == x.device(),
+                "moe_sum_add: tensors must be on the same device");
+    const c10::cuda::CUDAGuard guard(x.device());
     TORCH_CHECK(x.scalar_type() == torch::kBFloat16 && shared.scalar_type() == torch::kBFloat16 &&
                     out.scalar_type() == torch::kBFloat16,
                 "moe_sum_add: bf16 tensors");
@@ -282,7 +285,12 @@ static void py_moe_sum_add(torch::Tensor x, torch::Tensor shared, torch::Tensor 
     TORCH_CHECK(shared.size(0) == T && shared.size(1) == d && out.size(0) == T && out.size(1) == d,
                 "moe_sum_add: shape mismatch");
     TORCH_CHECK(d % glm_moe_combine::VEC == 0, "moe_sum_add: D must be a multiple of 8");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0 &&
+                reinterpret_cast<uintptr_t>(shared.data_ptr()) % 16 == 0 &&
+                reinterpret_cast<uintptr_t>(out.data_ptr()) % 16 == 0,
+                "moe_sum_add: tensor pointers must be 16-byte aligned");
     glm_moe_combine::launch_moe_sum_add(bpm(out), bp(x), bp(shared), T, int(d), int(topk), stream());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 static torch::Tensor py_decode_gemm(torch::Tensor x, torch::Tensor weight,
@@ -347,22 +355,27 @@ static torch::Tensor py_topk_sample(torch::Tensor logits, torch::Tensor top_k,
     candidates_kernel<<<dim3(NB, B), THREADS, 0, stream()>>>(
         logits.data_ptr<float>(), logits.stride(0), V, cand_val.data_ptr<float>(), cand_idx.data_ptr<int>(),
         thresholds.data_ptr<float>(), omitted.data_ptr<int>());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
     cutoff_kernel<<<B, MERGE_THREADS, 0, stream()>>>(
         cand_val.data_ptr<float>(), cand_idx.data_ptr<int>(), thresholds.data_ptr<float>(),
         omitted.data_ptr<int>(), top_k.data_ptr<int>(), p_ptr, cutoffs, prefixes.data_ptr<int>());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
     if (noise.scalar_type() == torch::kFloat64) {
         sample_partitions_kernel<double><<<dim3(NB, B), SAMPLE_THREADS, 0, stream()>>>(
             logits.data_ptr<float>(), logits.stride(0), V, noise.data_ptr<double>(), cutoffs,
             prefixes.data_ptr<int>(), part_score.data_ptr<double>(), part_id.data_ptr<int>());
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
         finish_kernel<double><<<B, 32, 0, stream()>>>(
             part_score.data_ptr<double>(), part_id.data_ptr<int>(), out.data_ptr<long>());
     } else {
         sample_partitions_kernel<float><<<dim3(NB, B), SAMPLE_THREADS, 0, stream()>>>(
             logits.data_ptr<float>(), logits.stride(0), V, noise.data_ptr<float>(), cutoffs,
             prefixes.data_ptr<int>(), part_score.data_ptr<float>(), part_id.data_ptr<int>());
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
         finish_kernel<float><<<B, 32, 0, stream()>>>(
             part_score.data_ptr<float>(), part_id.data_ptr<int>(), out.data_ptr<long>());
     }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }
 
@@ -469,21 +482,6 @@ static int dsv4_mhc_coop_max_t() {
     return value;
 }
 
-// Persistent device counter for the last-block kernel (one launch in flight
-// per stream; the last block resets it). Allocated on first use, which is an
-// eager call - vLLM warms every shape up before it captures graphs.
-static int* dsv4_mhc_counter() {
-    static int* counter = [] {
-        int* ptr = nullptr;
-        TORCH_CHECK(cudaMalloc(&ptr, sizeof(int)) == cudaSuccess,
-                    "dsv4 mHC counter: cudaMalloc failed");
-        TORCH_CHECK(cudaMemset(ptr, 0, sizeof(int)) == cudaSuccess,
-                    "dsv4 mHC counter: cudaMemset failed");
-        return ptr;
-    }();
-    return counter;
-}
-
 static int dsv4_mhc_splits() {
     static const int splits = [] {
         const char* value = std::getenv("VLLM_DSV4_MHC_SPLITS");
@@ -530,6 +528,10 @@ static void launch_dsv4_mhc_pre_transition(
     };
     const int T = residual.size(0);
     if (dsv4_mhc_mode() == 1 && T == 1) {
+        // Per-invocation state isolates devices, streams and independently
+        // captured graphs. Initialization is captured too; a per-stream cache
+        // would still alias graphs captured on one stream then replayed apart.
+        auto counter = torch::zeros({1}, residual.options().dtype(torch::kInt32));
         dsv4_mhc::fused_pre_transition_lastblock<FUSED_POST, RMS_NORM, 4096,
                                                  NSPLITS, FnT>
             <<<dim3(NSPLITS, 1), dim3(dsv4_mhc::THREADS), 0, stream()>>>(
@@ -537,18 +539,23 @@ static void launch_dsv4_mhc_pre_transition(
                 residual_out_ptr, partial_ptr, scale_ptr, base_ptr,
                 next_post_ptr, next_comb_ptr, layer_input_ptr, norm_ptr,
                 rms_eps, pre_eps, sinkhorn_eps, post_multiplier,
-                sinkhorn_repeat, norm_eps, dsv4_mhc_counter());
+                sinkhorn_repeat, norm_eps, counter.data_ptr<int>());
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
         return;
     }
     // All T x NSPLITS blocks must be co-resident for the grid barrier.
-    static const int max_coresident = [&] {
-        int device = 0, sms = 0, blocks_per_sm = 0;
-        cudaGetDevice(&device);
-        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
-        cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &blocks_per_sm, kernel, dsv4_mhc::THREADS, 0);
-        return blocks_per_sm * sms;
-    }();
+    static thread_local int configured_device = -1;
+    static thread_local int max_coresident = 0;
+    int device = -1;
+    C10_CUDA_CHECK(cudaGetDevice(&device));
+    if (configured_device != device) {
+        int sms = 0, blocks_per_sm = 0;
+        C10_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
+        C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &blocks_per_sm, kernel, dsv4_mhc::THREADS, 0));
+        max_coresident = blocks_per_sm * sms;
+        configured_device = device;
+    }
     TORCH_CHECK(T * NSPLITS <= max_coresident,
                 "DSV4 cooperative mHC: ", T * NSPLITS,
                 " blocks exceed the co-resident limit ", max_coresident,

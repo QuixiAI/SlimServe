@@ -62,3 +62,32 @@ def test_moe_sum_add_rejects_bad_shapes():
         )
     with pytest.raises(RuntimeError):
         qc.moe_sum_add(x.float(), shared, torch.empty_like(shared))
+
+
+@pytest.mark.parametrize("argument", [0, 1, 2])
+def test_moe_sum_add_rejects_misaligned_contiguous_views(argument):
+    tensors = [
+        torch.zeros(2, 8, 16, device=DEV, dtype=torch.bfloat16),
+        torch.zeros(2, 16, device=DEV, dtype=torch.bfloat16),
+        torch.zeros(2, 16, device=DEV, dtype=torch.bfloat16),
+    ]
+    tensor = tensors[argument]
+    tensors[argument] = torch.zeros(tensor.numel() + 1, device=DEV, dtype=tensor.dtype)[
+        1:
+    ].view_as(tensor)
+    assert tensors[argument].is_contiguous()
+    assert tensors[argument].data_ptr() % 16 == 2
+    with pytest.raises(RuntimeError, match="16-byte aligned"):
+        qc.moe_sum_add(*tensors)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two GPUs")
+def test_moe_sum_add_checks_and_guards_device():
+    x = torch.ones(2, 8, 16, device="cuda:1", dtype=torch.bfloat16)
+    shared = torch.ones(2, 16, device="cuda:1", dtype=torch.bfloat16)
+    out = torch.empty_like(shared)
+    with torch.cuda.device(0):
+        qc.moe_sum_add(x, shared, out)
+        with pytest.raises(RuntimeError, match="same device"):
+            qc.moe_sum_add(x, shared.to("cuda:0"), out)
+    torch.testing.assert_close(out, _reference(x, shared), rtol=0, atol=0)

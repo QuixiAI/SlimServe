@@ -162,6 +162,7 @@ def main():
         },
         "cases": [],
     }
+    args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("x") as stream:
         json.dump(result, stream, indent=2)
 

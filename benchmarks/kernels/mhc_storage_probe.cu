@@ -52,9 +52,13 @@ std::vector<Tensor> run_typed(
         if (T >= 64) {
             auto kernel = partials_prefill<
                 FUSED, 4096, FnT, PAIRED_FN && std::is_same_v<FnT, __nv_bfloat16>>;
-            static const auto configured = cudaFuncSetAttribute(
-                kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, PREFILL_SMEM);
-            C10_CUDA_CHECK(configured);
+            static thread_local int configured_device = -1;
+            const int device = residual.get_device();
+            if (configured_device != device) {
+                C10_CUDA_CHECK(cudaFuncSetAttribute(
+                    kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, PREFILL_SMEM));
+                configured_device = device;
+            }
             kernel<<<dim3(SPLITS, (T + PREFILL_TILE - 1) / PREFILL_TILE),
                      THREADS, PREFILL_SMEM, stream>>>(
                 xp, rp, pp, cp, fp, rop, parp, T);

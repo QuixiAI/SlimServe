@@ -138,17 +138,18 @@ def sparse_mla_prefill_nope(
     ):
         from vllm.quixicore import quixicore_ops
 
-        logger.info_once("GLM53 SM120 H16 BF16 sparse swapAB prefill active.")
-        return quixicore_ops.mla_prefill_bf16_sparse_nope_sm120(
-            q,
-            kv_cache,
-            block_table,
-            indices,
-            topk_length,
-            block_size,
-            scale,
-            page_stride * kv_cache.element_size(),
-        )
+        if quixicore_ops.has("mla_prefill_bf16_sparse_nope_sm120"):
+            logger.info_once("GLM53 SM120 H16 BF16 sparse swapAB prefill active.")
+            return quixicore_ops.mla_prefill_bf16_sparse_nope_sm120(
+                q,
+                kv_cache,
+                block_table,
+                indices,
+                topk_length,
+                block_size,
+                scale,
+                page_stride * kv_cache.element_size(),
+            )
     out = torch.empty_like(q)
     _sparse_mla_prefill_kernel[(B,)](
         q,

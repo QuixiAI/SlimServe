@@ -8,6 +8,7 @@ only metadata/digests, not model tensors. Must not be used for performance claim
 import hashlib
 import json
 import os
+import stat
 from pathlib import Path
 
 STAGES = (
@@ -17,6 +18,34 @@ STAGES = (
     "target_token_ids",
     "selected_logprobs",
 )
+
+
+def private_directory(path, *, exist_ok=True):
+    """Keep diagnostic data private without changing existing artifacts."""
+    path = Path(path)
+    path.mkdir(mode=0o700, parents=True, exist_ok=exist_ok)
+    info = path.lstat()
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or stat.S_IMODE(info.st_mode) & 0o077
+    ):
+        raise ValueError(
+            f"journal directory must be private and owned by this user: {path}"
+        )
+    return path
+
+
+def private_open(path, *, binary=False, buffering=-1):
+    """Exclusive creation with owner-only permissions, independent of umask."""
+    path = Path(path)
+    private_directory(path.parent)
+    return open(
+        path,
+        "xb" if binary else "x",
+        buffering=buffering,
+        opener=lambda name, flags: os.open(name, flags, 0o600),
+    )
 
 
 class ScoreJournal:
@@ -54,10 +83,9 @@ class ScoreJournal:
             raise ValueError("score journal requires 640 token IDs and 1..8 matches")
         self.prompt_ids, self.limit = ids, limit
         self.matches, self.active = 0, None
-        directory = Path(config["output_directory"])
-        directory.mkdir(parents=True, exist_ok=True)
+        directory = private_directory(config["output_directory"])
         self.path = directory / f"score-{os.getpid()}.jsonl"
-        self.stream = self.path.open("x", buffering=1)
+        self.stream = private_open(self.path, buffering=1)
         root = Path(__file__).resolve().parents[1]
         source_paths = (
             "slimserve/canonical_indexer.py",

@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 import hashlib
 import json
+import os
+import stat
+from pathlib import Path
 
 import pytest
 import torch
 
-from slimserve.score_journal import STAGES, ScoreJournal
+from slimserve.score_journal import STAGES, ScoreJournal, private_open
 
 
 @pytest.fixture
@@ -24,6 +27,53 @@ def config(tmp_path):
 def test_disabled_does_not_read_configuration(monkeypatch):
     monkeypatch.delenv("SLIMSERVE_GLM53_SCORE_JOURNAL", raising=False)
     assert ScoreJournal.from_env("unrelated") is None
+
+
+def test_journal_permissions_ignore_permissive_umask(config):
+    from slimserve.model_journal import ModelJournal
+
+    previous = os.umask(0)
+    try:
+        score = ScoreJournal(config[0])
+        model = ModelJournal(score)
+    finally:
+        os.umask(previous)
+    try:
+        assert stat.S_IMODE(score.path.parent.stat().st_mode) == 0o700
+        for path in (score.path, model.path):
+            assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    finally:
+        model.close()
+        score.close()
+
+
+@pytest.mark.parametrize("kind", ["public", "symlink"])
+def test_nonprivate_journal_directory_rejected_without_chmod(config, kind):
+    path, value = config
+    directory = Path(value["output_directory"])
+    if kind == "public":
+        directory.mkdir(mode=0o755)
+        directory.chmod(0o755)
+    else:
+        target = path.parent / "target"
+        target.mkdir(mode=0o700)
+        directory.symlink_to(target, target_is_directory=True)
+    before = directory.lstat().st_mode
+    with pytest.raises(ValueError, match="must be private"):
+        ScoreJournal(path)
+    assert directory.lstat().st_mode == before
+    assert list(directory.iterdir()) == []
+
+
+def test_private_open_preserves_existing_file_and_symlink_target(tmp_path):
+    target = tmp_path / "existing"
+    target.write_text("preserve")
+    link = tmp_path / "link"
+    link.symlink_to(target)
+    for path in (target, link):
+        with pytest.raises(FileExistsError):
+            private_open(path)
+    assert target.read_text() == "preserve"
 
 
 def test_enabled_is_model_scoped(config, monkeypatch):

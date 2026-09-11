@@ -11,6 +11,8 @@ namespace tms::glm_stable_align {
 constexpr int EXPERTS = 288;
 constexpr int THREADS = 256;
 constexpr int MAX_WORDS = 8192 * 8 / 32;
+// Both host launchers enforce ids [17..8192, 8] before narrowing numel;
+// scatter_bitmap therefore never receives more than MAX_WORDS bitmap words.
 
 // Integer histograms determine the same padded expert ranges as Marlin's
 // alignment. A second CTA initializes all sorted capacity, including tails.
