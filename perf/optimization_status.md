@@ -1,5 +1,69 @@
 # SlimServe Optimization Status
 
+## 2026-09-11 - Native quantized prefill GEMM on Metal; FP8-KV directive state; two walls found
+
+- Directive (operator): CT weights stay in native quantized form ALWAYS -
+  no resident bf16 copy, no per-call dequant copies. Executes the recorded
+  follow-up from UPDATE 56 ("native quantized-GEMM prefill via qgemm_sm")
+  and backlog item #1.
+- Baseline: qwen38-nvfp4-1/metal loaded 76.3 GiB for a 21.8 GiB checkpoint
+  (bf16 materialized for M > 8), capping the KV pool at 18.06 GiB and
+  blocking the model-default 262144 context; the per-call escape
+  (CT_DEQUANT=call) crashed the engine mid-262k-prefill (2026-09-10).
+- Change: qgemm_nvfp4_planar + qgemm_fp8ch
+  (csrc/.../quantization/qgemm/qgemm_planar.metal) - llama.cpp classic
+  64x32 simdgroup-MMA geometry (moe_mm_id skeleton) with the qgemv
+  campaign's measured-winner decode bodies (select-free E2M1/E4M3 bit
+  constructs; NVFP4 group scale folded pre-MMA with the exact 2^22
+  rebias, FP8ch 256*WS[row] in the epilogue). Host ops grew a batch>8
+  branch; the Python kernel classes route EVERY M natively and the
+  materialize/per-call defaults are gone (VLLM_METAL_CT_DEQUANT=once is
+  a diagnostic-only escape; a stale .so fails loudly; a misaligned layer
+  materializes itself alone with a warning).
+- Correctness: float64 oracle 29/29 (tests/kernels/test_metal_ct_gemm.py:
+  both formats, K = 5120/17408, N/M tails, lm_head-class N, prefill width
+  M=2176, repeat-call bit-stable, GEMV band untouched). Live: registered
+  profile boots at 24.93 GiB packed-only (vision tower included), full
+  24 GiB pool granted (299,593 tokens bf16 / 576,945 fp8), and the seeded
+  "2+2" probe answers '4' through the native GEMM (bf16 KV).
+- Throughput: NOT re-pinned yet - the gate's bench legs mis-invoked the
+  harness (missing --source) and the 262k needle hit the SDPA wall below.
+  Decode expectation is neutral (decode never touched bf16); the 2500x64
+  prefill leg must be measured before comparing to the 08-27 pins.
+- Decision: RETAINED (directive). Follow-up levers: qgemm_sm-style
+  split-K twin for M in [9,32]; Metal-4 mpp::tensor_ops variant on M5.
+
+### Wall 1: dense/GQA deep-context prefill (blocks 262k on this profile)
+- metal_attn prefill is a per-request torch-SDPA loop; a 254,881-token
+  needle drove the box to memory exhaustion (compressor spiral, engine
+  wedged in MPSStream::copy_and_sync; sample in perf/results/2026-09-11/
+  nvfp4-native-gemm/). O(ctx)-shaped SDPA score tensors in ever-growing
+  shapes are the bomb - independent of KV dtype and of the GEMM work,
+  and the likely unstated reason for the old 32768 cap. max_model_len
+  stays 262144 per the default-context policy, with the profile note
+  stating the open gate: deep-context prefill needs a flash-style
+  memory-bounded attention (prefill_fa-class) wired into this backend
+  before the 262k needle can pass.
+
+### Wall 2: FP8-KV directive state on Metal (operator 2026-09-11)
+- dsv4-xxs-1: fp8_ds_mla, already compliant.
+- qwen38-nvfp4-1: fp8 REVERTED to bfloat16 with a blocker note - under
+  fp8 the model generates as if the prompt were empty on BOTH weight
+  paths while bf16 answers '4' (isolation legs in perf/results/
+  2026-09-11/nvfp4-native-gemm/parity_*). The SDPA path does call
+  kv_cache_gather_range_fp8 with layer scales, so the fault is in the
+  fp8 scatter/gather or scale application at this geometry (GQA 24/4,
+  head_dim 256, partial rotary; the unit roundtrip covers dim 64 only).
+- qwen38-q2kxl-1, muse-kdyn-1: fp8 REVERTED to auto with blocker notes -
+  first request dies with "quixicore(metal): unsupported dtype Byte"
+  (fused GDN / muse decode paths read the cache as bf16).
+- glm52-xxs-1: declared fp8 for its eventual bring-up (profile is
+  plan-time gated not-ready on Metal).
+- Cross-box follow-ups (their own boxes): mi300x/a100 records still on
+  auto (glm52-q2k-*, k3-xxs-*, dsv4-q4ktail/mxfp4 a100, qwen38 mi300x,
+  glm53f-nvfp4-*).
+- Raw artifacts: perf/results/2026-09-11/nvfp4-native-gemm/.
+
 ## 2026-09-10 - FP8-only KV quantization and vision on NVFP4 Metal
 
 - Operator policy: remove TurboQuant from every profile, including draft KV;
