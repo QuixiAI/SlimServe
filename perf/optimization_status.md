@@ -25581,3 +25581,21 @@ arm (queue17).
   the restore/recompute path at that depth, not at prefill. A forced-
   eviction tier acceptance at 950K context runs now (queue28,
   perf/results/2026-09-12/glm53f-tier950k/).
+- TIER ACCEPTANCE AT 950K CONTEXT (DP2 record, forced eviction, byte
+  verify): PASS - 4/4 markers recalled after a 2,044,297-token churn of
+  the 1,669,244-token pool, 576 restores, 2,304 verify batches / 0
+  mismatched, 0 negative-allocation clamps. So a single deep session's
+  eviction + restore at ~950K is clean; the 1M-leg garbage (three probes,
+  each after a >=900K restore in a TWO-session run where the clamp fired)
+  is not reproduced by this shape. Next reproduction: the clamp path
+  (attention groups fully hit locally while a lagging state group missed,
+  then external restore + recompute over the kept blocks), which this run
+  never entered. Raw: perf/results/2026-09-12/glm53f-tier950k/.
+- fp8 main-KV arm RE-MEASURED on the lane-parallel decode (dp2-fp8kv2):
+  c8 553 / c16 746 / c32 978 / c64 1185 (medians of two) vs base 566 /
+  848 / 989 / 1200 - within noise except c16 (-12%, one low repeat);
+  pool 2.94M tokens (1.78x). With the throughput cost gone, fp8 main KV
+  is the policy-preferred cache (FP8 is the official KV quantization,
+  operator 2026-09-10): the record is flipped in the working tree and
+  its gate set runs now (queue31: canaries + exact x3, tier acceptance
+  under verify, WildChat leg) before the commit.
