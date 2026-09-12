@@ -25715,3 +25715,7 @@ arm (queue17).
   drafter+verify cadence needed to keep acceptance up, so the pipeline
   compounds the kernel saving. New record medians queued (queue36:
   c1..c64 x3 + canaries on the committed tree).
+- RECORD re-measured with the mHC warp-split kernel (2026-09-12): c1
+  127.1 / c8 497.0 / c16 843.9 / c32 1023.3 / c64 1320.8 tok/s, canaries
+  pass (raw perf/results/2026-09-12/glm53f-mhcws-record/). Baseline and
+  profile note updated.

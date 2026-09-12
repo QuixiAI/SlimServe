@@ -2411,6 +2411,20 @@ graph capture for the hybrid GDN+MTP decode, Gemma-aware fused norm+quant.
   `glm53f-tp8-handoff-baseline/` (c16 after CPU isolation). Repeat spreads,
   commands, traces and correctness details are in the optimization notebook.
 
+## GLM-5.3-Flash NVFP4 glm53f-nvfp4-8 - mHC warp-split kernel record, 2026-09-12 (current)
+- Same configuration as the fp8 main-KV record below plus the warp-split
+  mHC transition partials kernel (csrc/quixicore/serving/mhc_ampere.cuh
+  partials_batched_ws, default on; 31 -> 13.6 us at 32 tokens, 98 -> 33
+  us at 128 tokens, residual bit-exact).
+- Exact-token (1000 in / 300 out, temp 1.0 / top-p 0.95 / top-k 20,
+  three warmed repeats, medians):
+  | c1    | c8    | c16   | c32    | c64    |
+  | 127.1 | 497.0 | 843.9 | 1023.3 | 1320.8 |
+  fp8 record (same day, before the kernel): 118.4 / 559.1 / 730.0 /
+  971.6 / 1139.3. The c64 gain (+16%) matches the dedicated A/B (+12.8%,
+  two repeats per arm); c8 sits inside its 481-589 spread. Canaries pass.
+  Raw: perf/results/2026-09-12/glm53f-mhcws-record/.
+
 ## GLM-5.3-Flash NVFP4 glm53f-nvfp4-8 - TP4 x DP2 + fp8 main KV record, 2026-09-12
 - Layout: TP4 x DP2 with replicated MoE (data_parallel_replicate_moe,
   2026-09-11: each replica keeps the full expert set sharded over its own
