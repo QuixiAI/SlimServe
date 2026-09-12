@@ -1599,6 +1599,27 @@ class quixicore_ops:
         )
 
     @staticmethod
+    def kda_decode(
+        mixed_qkv: torch.Tensor,
+        raw_g: torch.Tensor,
+        raw_beta: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        state: torch.Tensor,
+        state_indices: torch.Tensor,
+        scale: float,
+        lower_bound: float | None,
+    ) -> torch.Tensor:
+        """KDA single-token decode recurrence (packed q|k|v per head, K=V=128):
+        the CUDA port of fused_recurrent_kda_packed_decode. Updates `state`
+        in place for state_indices > 0; returns out [1, N, H, V] bf16."""
+        return _qc().kda_decode(
+            mixed_qkv, raw_g, raw_beta, A_log, dt_bias, state, state_indices,
+            scale, 0.0 if lower_bound is None else float(lower_bound),
+            lower_bound is not None,
+        )
+
+    @staticmethod
     def mla_decode_fp8_sparse_nope(
         q: torch.Tensor,
         data: torch.Tensor,

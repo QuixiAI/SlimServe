@@ -25613,3 +25613,27 @@ arm (queue17).
   - no gain at the record's batch, +12% only at T=128. REJECTED as
   default; kept env-gated as a documented diagnostic for larger
   verify batches.
+- KDA decode recurrence, CUDA port (csrc/quixicore/serving/
+  kda_decode_kernels.cuh, warp-per-state-row with 128-bit lane loads,
+  exact replica of the packed-decode Triton math): parity 8/8 vs the
+  Triton kernel (rtol 2e-3 outputs, 1e-4 state). Microbench H=16,
+  K=V=128: N=16 18.9 vs 28.0 us (-32%), N=32 46.7 vs 45.9, N=64 93.5 vs
+  92.9 - equal at N>=32, i.e. the isolated packed-decode kernel already
+  moves the 64 MB state at ~1.4 TB/s; the 115 us seen in the serving
+  profile was the SPECULATIVE fwd kernel at 4 rows per request (4x the
+  state traffic), not a slow decode kernel. VERDICT: no throughput lever
+  at the record's batch; kept env-gated (KDA_DECODE_CUDA=1) for the small-
+  batch win. The real KDA lever is the spec path's 4x state traffic
+  (one state read/write per draft row) - a fused multi-row update that
+  reads the state once per request is the follow-up.
+- fp8 main-KV GATES: canaries PASS; exact x3 medians c1 142 / c8 489 /
+  c16 778 / c32 975 / c64 1179 (bf16 record 118 / 507 / 787 / 986 /
+  1158; pool 2.97M vs 1.65M). The tier acceptance and the leg both
+  CRASHED the engine: the first fp8 restore failed closed ("58 blocks
+  reported invalid, request released to recompute") and the scheduler's
+  invalid-block handler then died on `(req_block_ids,) = get_block_ids(
+  req_id)` - it assumes a single KV group (a TODO in vLLM), so the
+  fail-closed path never worked on this 14-group model. Two items: (1)
+  generalize _update_requests_with_invalid_blocks to hybrid groups;
+  (2) find why fp8 restores are unstageable. The record flip is on hold
+  (working tree reverted to bf16 until both are fixed).

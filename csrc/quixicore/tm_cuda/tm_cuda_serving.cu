@@ -1,6 +1,7 @@
 // tk_cuda serving/decode bindings: torch wrappers over the validated W4/W5
 // kernels (kernels/serving/*_kernels.cuh). Registered into the _C module by
 // init_serving(m), called from tm_cuda_ext.cu's PYBIND11_MODULE.
+#include "kda_decode_kernels.cuh"
 #include "kv_cache_kernels.cuh"
 #include "paged_attn_v2_kernels.cuh"
 #include "rope_kv_kernels.cuh"
@@ -1519,6 +1520,38 @@ static torch::Tensor py_mla_decode_bf16_sparse_nope(torch::Tensor q, torch::Tens
     return out;
 }
 
+// KDA single-token decode recurrence (GLM-5.3 KDA layers): see
+// serving/kda_decode_kernels.cuh. Returns out [N, H, V] bf16; state updated
+// in place for state_indices[n] > 0 (rows with index <= 0 write zeros).
+static torch::Tensor py_kda_decode(torch::Tensor mixed_qkv, torch::Tensor raw_g,
+        torch::Tensor raw_beta, torch::Tensor A_log, torch::Tensor dt_bias,
+        torch::Tensor state, torch::Tensor state_indices, double scale,
+        double lower_bound, bool use_lower_bound) {
+    TORCH_CHECK(mixed_qkv.is_cuda() && mixed_qkv.dim() == 2 && mixed_qkv.stride(1) == 1 &&
+                mixed_qkv.scalar_type() == torch::kBFloat16, "mixed_qkv: [N, C] bf16, unit inner stride");
+    TORCH_CHECK(state.is_cuda() && state.dim() == 4 && state.scalar_type() == torch::kFloat &&
+                state.stride(3) == 1, "state: [cache, H, V, K] fp32");
+    const int N = mixed_qkv.size(0), H = state.size(1), V = state.size(2), K = state.size(3);
+    TORCH_CHECK(K == 128 && V == 128, "kda_decode: K == V == 128 only");
+    TORCH_CHECK(state.stride(1) == int64_t(V) * K && state.stride(2) == K, "state head layout");
+    TORCH_CHECK(raw_g.dim() == 4 && raw_g.size(1) == N && raw_g.size(2) == H && raw_g.size(3) == K &&
+                raw_g.stride(3) == 1 && raw_g.stride(2) == K, "raw_g: [1, N, H, K]");
+    TORCH_CHECK(raw_beta.dim() == 3 && raw_beta.size(1) == N && raw_beta.size(2) == H &&
+                raw_beta.stride(2) == 1, "raw_beta: [1, N, H]");
+    TORCH_CHECK(A_log.numel() == H && A_log.is_contiguous() && A_log.scalar_type() == torch::kFloat, "A_log");
+    TORCH_CHECK(dt_bias.numel() == int64_t(H) * K && dt_bias.is_contiguous() &&
+                dt_bias.scalar_type() == torch::kFloat, "dt_bias");
+    TORCH_CHECK(state_indices.dim() == 1 && state_indices.numel() == N &&
+                state_indices.scalar_type() == torch::kInt && state_indices.is_contiguous(), "state_indices");
+    TORCH_CHECK(mixed_qkv.size(1) >= 2 * H * K + H * V, "packed qkv width");
+    auto out = torch::empty({1, N, H, V}, mixed_qkv.options());
+    if (N == 0) return out;
+    tms::kda::kda_decode_kernel<128, 128><<<N * H, tms::kda::THREADS, 0, stream()>>>(
+        bp(mixed_qkv), bp(raw_g), bp(raw_beta), fp(A_log), fp(dt_bias), fpm(state),
+        state_indices.data_ptr<int>(), bpm(out), H, mixed_qkv.stride(0), raw_g.stride(1),
+        raw_beta.stride(1), state.stride(0), float(scale), float(lower_bound), use_lower_bound ? 1 : 0);
+    return out;
+}
 // GLM-5.3-Flash (glm5_next) fp8 geometry: NoPE latent, q/cache slot are 512
 // fp8 elements (no rope tail), the value is the full 512, one per-tensor
 // kv_scale (vLLM's fp8 MLA layout, SMODE 1). The bf16 NoPE path above is the
@@ -2304,6 +2337,10 @@ void init_serving(py::module_& m) {
           py::arg("topk_length"), py::arg("block_size"), py::arg("scale"),
           py::arg("partition_size") = 0,
           py::arg("page_stride_bytes") = 0);
+    m.def("kda_decode", &py_kda_decode, py::arg("mixed_qkv"), py::arg("raw_g"),
+          py::arg("raw_beta"), py::arg("A_log"), py::arg("dt_bias"), py::arg("state"),
+          py::arg("state_indices"), py::arg("scale"), py::arg("lower_bound"),
+          py::arg("use_lower_bound"));
     m.def("mla_decode_fp8_sparse_nope", &py_mla_decode_fp8_sparse_nope, py::arg("q"),
           py::arg("data"), py::arg("block_table"), py::arg("indices"),
           py::arg("topk_length"), py::arg("block_size"), py::arg("scale"),

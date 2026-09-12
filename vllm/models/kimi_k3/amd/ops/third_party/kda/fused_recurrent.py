@@ -588,6 +588,16 @@ def fused_recurrent_kda_packed_decode(
         raise ValueError("`state_indices` must contain one entry per token.")
 
     BK = next_power_of_2(K)
+    if K == 128 and V == 128 and os.getenv("KDA_DECODE_CUDA", "0") == "1":
+        # QuixiCore CUDA port (csrc/quixicore/serving/kda_decode_kernels.cuh):
+        # warp-per-row, 128-bit lane loads; same math as the kernel below.
+        from vllm.quixicore import quixicore_ops as qc
+
+        out = qc.kda_decode(
+            mixed_qkv, raw_g, raw_beta, A_log, dt_bias, initial_state,
+            state_indices, K**-0.5 if scale is None else scale, lower_bound,
+        )
+        return out, initial_state
     # Tile/warp choice is an experiment hook (2026-09-11 GLM-5.3 profile:
     # 0.56 TB/s effective at 32 decode rows); defaults are the vendored ones.
     BV = min(next_power_of_2(V), int(os.getenv("KDA_DECODE_BV", "32")))
