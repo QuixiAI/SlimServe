@@ -25929,3 +25929,11 @@ Phases, by value over risk:
   +60% per-token latency. Under continuous arrivals the prefill of new
   prompts runs inside the decode steps, which is the production shape
   without prefix hits.
+- PHASE 3 premise REJECTED (2026-09-12, queue42, ~/.local/scratch/glm53/
+  overlap_probe.py): a DRAM-bound reduction over 512 MB (328 us, 1.64
+  TB/s) and 24 cuBLAS bf16 GEMMs at M=128 (730 us) on two CUDA streams run
+  in 1070 us against 1045 us serial (ideal overlap 30%). Grid-filling
+  kernels time-slice on A100 rather than co-schedule, so a two-micro-batch
+  runner could not hide the MoE weight stream behind attention compute;
+  it would need SM partitioning (green contexts), which Ampere lacks.
+  Micro-batch overlap is dropped from the program.
