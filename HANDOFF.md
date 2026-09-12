@@ -4067,3 +4067,28 @@ TP4 = 36 MLA + 18 indexer + 4 KDA state pages; 106 at TP8 = 68 + 34 + 4.
   (ERR_NVGPUCTRPERM). QuixiCore-CUDA port of the mHC family and the KDA
   kernel is grafted (kernels/serving/, tm_cuda_serving.cu) pending its
   compile check and commit.
+
+## 2026-09-12 21:40: throughput program - record at fixed k=2, sustained metric, closed levers
+
+- RECORD glm53f-nvfp4-8: DFlash2 fixed k=2 (b2cc96fea). Exact c1 128.0 /
+  c8 567.1 / c16 875.6 / c32 1110.0 / c64 1413.8; sustained (vllm bench
+  serve random 1000/300) c64 1227-1411, c128 1672-1674 output tok/s; leg
+  785 turns / 0 errors / 126/126 recall. The per-batch draft schedule was
+  inert under DP (engine falls back to fixed k); k=3 had been running
+  everywhere. Dynamic schedules are now allowed under replicated-MoE DP,
+  zero-draft ranges rejected at config time (they crash KV init).
+- Primary metric is now sustained load: ~/.local/scratch/glm53/sustained.sh
+  <outdir> <conc...> against a running :8400 server (reproducible within
+  2%; the exact harness spreads 5-10% at c96+).
+- Closed by measurement (notebook 2026-09-12): stream overlap of MoE
+  weight streaming with compute (A100 time-slices grid-filling kernels,
+  -2%), fp8 marlin dense weights (slower than cuBLAS), custom W8A16
+  skinny GEMM (cuBLAS parity at best after 4 restructurings; committed,
+  gated off, tests 113/113, kernel csrc/quixicore/serving/
+  w8a16_gemm_ampere.cuh, method vllm/model_executor/layers/quantization/
+  qc_w8a16.py, env VLLM_QC_DENSE_W8A16), k=4 drafts (-13%).
+- NEXT: prefill-step profile (queue47) - continuous prefill is first-order
+  in the sustained metric; then the DP replicas' per-replica dynamic k if
+  the c8 point (4 per replica) prefers a longer draft.
+- Rule re-learned the hard way: never cp the extension .so into vllm/ while
+  any server is booting or running (killed the k=4 arm's boot).
