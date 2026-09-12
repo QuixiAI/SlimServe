@@ -134,12 +134,18 @@ def _load_f32_overrides(model_path: str | None) -> dict[str, torch.Tensor]:
     return overrides
 
 
-def iter_with_f32_overrides(
+def iter_with_overrides(
     weights: Iterable[tuple[str, torch.Tensor]],
     overrides: dict[str, torch.Tensor],
+    extras: dict[str, torch.Tensor] | None = None,
+    strict: bool = False,
 ) -> Iterable[tuple[str, torch.Tensor]]:
-    """Yield ``weights`` with any name present in ``overrides`` replaced."""
-    if not overrides:
+    """Yield ``weights`` with any name present in ``overrides`` replaced, then
+    the ``extras`` (tensors the checkpoint stream does not carry, such as the
+    block scales of a swapped FP8 weight). ``strict`` turns an override that
+    never appeared into an error: for the FP8 swap-set a missing substitution
+    would let the loader copy a BF16 shard into an FP8 parameter."""
+    if not overrides and not extras:
         yield from weights
         return
     pending = set(overrides)
@@ -150,12 +156,65 @@ def iter_with_f32_overrides(
         else:
             yield name, weight
     if pending:
-        logger.warning(
-            "glm5_next: %d F32 override tensors never appeared in the "
-            "checkpoint stream, e.g. %s",
-            len(pending),
-            sorted(pending)[0],
+        msg = (
+            f"glm5_next: {len(pending)} override tensors never appeared in the "
+            f"checkpoint stream, e.g. {sorted(pending)[0]}"
         )
+        if strict:
+            raise ValueError(msg)
+        logger.warning(msg)
+    if extras:
+        yield from extras.items()
+
+
+def _load_fp8_swapset(
+    model_path: str | None,
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    """(weights to substitute, block scales to inject) from the FP8 swap-set
+    ``slimserve.fp8_swapset`` wrote next to the checkpoint; empty when the
+    files are absent or ``SLIMSERVE_FP8_SWAPSET=0``. The quantization config
+    group that makes those modules block-FP8 is added by the model loader
+    from the same manifest, so the two cannot disagree."""
+    import json
+    import os
+
+    from slimserve.fp8_swapset import manifest_path
+
+    path = manifest_path(model_path)
+    if path is None:
+        return {}, {}
+    with open(path) as fh:
+        manifest = json.load(fh)
+    from safetensors.torch import load_file
+
+    file = os.path.join(model_path, manifest["file"])
+    tensors = load_file(file)
+    if sorted(tensors) != sorted(manifest["tensors"]):
+        raise ValueError(f"{file}: tensor names do not match the manifest {path}")
+    if manifest.get("self_quantized"):
+        tp_size = get_tensor_model_parallel_world_size()
+        if manifest.get("tp_size") != tp_size:
+            raise ValueError(
+                f"{path}: the self-quantized KDA beta layout is for tp_size="
+                f"{manifest.get('tp_size')}, serving with {tp_size}; rebuild the "
+                "swap-set with --self-quant-kda --tp-size"
+            )
+    subs = {k: v for k, v in tensors.items() if k.endswith(".weight")}
+    extras = {k: v for k, v in tensors.items() if k.endswith(".weight_scale")}
+    bad = [k for k, v in subs.items() if v.dtype != torch.float8_e4m3fn]
+    bad += [k for k, v in extras.items() if v.dtype != torch.float32]
+    if bad or len(subs) + len(extras) != len(tensors):
+        raise ValueError(
+            f"{file}: expected float8_e4m3fn weights and float32 weight_scale "
+            f"tensors only, e.g. {(bad or sorted(tensors))[0]}"
+        )
+    logger.info(
+        "glm5_next: FP8 swap-set from %s: %d weights, %d block scales",
+        file,
+        len(subs),
+        len(extras),
+    )
+    return subs, extras
 
 
 class Glm5NextMLAAttention(nn.Module):
@@ -210,9 +269,7 @@ class Glm5NextMLAAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.q_b_proj",
         )
-        self.kv_a_layernorm = RMSNorm(
-            self.kv_lora_rank, eps=config.rms_norm_eps
-        )
+        self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
         self.kv_b_proj = ColumnParallelLinear(
             self.kv_lora_rank,
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
@@ -302,12 +359,9 @@ class Glm5NextDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.rms_norm_eps = config.rms_norm_eps
         self._fuse_mhc_norm = (
-            current_platform.is_cuda()
-            and current_platform.is_device_capability((8, 0))
+            current_platform.is_cuda() and current_platform.is_device_capability((8, 0))
         )
-        self.is_linear = (
-            config.layer_types[self.layer_idx] == "linear_attention"
-        )
+        self.is_linear = config.layer_types[self.layer_idx] == "linear_attention"
 
         if self.is_linear:
             self.self_attn = KimiGatedDeltaNetAttention(
@@ -315,7 +369,9 @@ class Glm5NextDecoderLayer(nn.Module):
             )
         else:
             self.self_attn = Glm5NextMLAAttention(
-                config, vllm_config, prefix=f"{prefix}.self_attn",
+                config,
+                vllm_config,
+                prefix=f"{prefix}.self_attn",
                 topk_indices_buffer=topk_indices_buffer,
                 indexer_workspace=indexer_workspace,
             )
@@ -337,9 +393,7 @@ class Glm5NextDecoderLayer(nn.Module):
             )
 
         self.input_layernorm = RMSNorm(self.hidden_size, config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
-            self.hidden_size, config.rms_norm_eps
-        )
+        self.post_attention_layernorm = RMSNorm(self.hidden_size, config.rms_norm_eps)
 
         self.hc_mult = config.hc_mult
         self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
@@ -362,33 +416,49 @@ class Glm5NextDecoderLayer(nn.Module):
 
         self._mhc_stream_key = mhc_stream_key
         self._overlap_kda = (
-            bool(mhc_stream_key) and self._fuse_mhc_norm and self.is_linear
+            bool(mhc_stream_key)
+            and self._fuse_mhc_norm
+            and self.is_linear
             and plain_bf16_projection(self.self_attn.in_proj_qkvgfab)
         )
         self._overlap_router = (
-            bool(mhc_stream_key) and self._fuse_mhc_norm
+            bool(mhc_stream_key)
+            and self._fuse_mhc_norm
             and enable_router_projection
             and isinstance(self.mlp, DeepseekV2MoE)
             and prepare_router_projection(self.mlp)
         )
 
-
     def _site_pre(self, residual, fn, scale, base, norm_weight):
         post_mix, res_mix, x = torch.ops.vllm.glm5_mhc_pre(
-            residual, fn, scale, base, self.rms_norm_eps, self.hc_eps,
-            self.hc_post_alpha, self.hc_sinkhorn_iters,
-            norm_weight if self._fuse_mhc_norm else None, self.rms_norm_eps,
+            residual,
+            fn,
+            scale,
+            base,
+            self.rms_norm_eps,
+            self.hc_eps,
+            self.hc_post_alpha,
+            self.hc_sinkhorn_iters,
+            norm_weight if self._fuse_mhc_norm else None,
+            self.rms_norm_eps,
         )
         return residual, post_mix, res_mix, x
 
-    def _site_fused(
-        self, x, residual, post_mix, res_mix, fn, scale, base, norm_weight
-    ):
+    def _site_fused(self, x, residual, post_mix, res_mix, fn, scale, base, norm_weight):
         return torch.ops.vllm.glm5_mhc_fused_post_pre(
-            x, residual, post_mix, res_mix, fn, scale, base,
-            self.rms_norm_eps, self.hc_eps, self.hc_post_alpha,
+            x,
+            residual,
+            post_mix,
+            res_mix,
+            fn,
+            scale,
+            base,
+            self.rms_norm_eps,
+            self.hc_eps,
+            self.hc_post_alpha,
             self.hc_sinkhorn_iters,
-            norm_weight if self._fuse_mhc_norm else None, self.rms_norm_eps,
+            norm_weight if self._fuse_mhc_norm else None,
+            self.rms_norm_eps,
         )
 
     def forward(
@@ -403,22 +473,42 @@ class Glm5NextDecoderLayer(nn.Module):
         if residual is None:
             # First layer: x is the expanded [T, hc_mult, D] stream tensor.
             residual, post_mix, res_mix, x = self._site_pre(
-                x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base,
+                x,
+                self.hc_attn_fn,
+                self.hc_attn_scale,
+                self.hc_attn_base,
                 self.input_layernorm.weight,
             )
         elif self._overlap_kda:
-            residual, post_mix, res_mix, x, projected = torch.ops.vllm.glm5_mhc_project_runtime(
-                x, residual, post_mix, res_mix,
-                self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base,
-                self.input_layernorm.weight, self.self_attn.in_proj_qkvgfab.weight,
-                self._mhc_stream_key, False,
-                self.rms_norm_eps, self.hc_eps, self.hc_post_alpha,
-                self.hc_sinkhorn_iters, self.rms_norm_eps,
+            residual, post_mix, res_mix, x, projected = (
+                torch.ops.vllm.glm5_mhc_project_runtime(
+                    x,
+                    residual,
+                    post_mix,
+                    res_mix,
+                    self.hc_attn_fn,
+                    self.hc_attn_scale,
+                    self.hc_attn_base,
+                    self.input_layernorm.weight,
+                    self.self_attn.in_proj_qkvgfab.weight,
+                    self._mhc_stream_key,
+                    False,
+                    self.rms_norm_eps,
+                    self.hc_eps,
+                    self.hc_post_alpha,
+                    self.hc_sinkhorn_iters,
+                    self.rms_norm_eps,
+                )
             )
         else:
             residual, post_mix, res_mix, x = self._site_fused(
-                x, residual, post_mix, res_mix,
-                self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base,
+                x,
+                residual,
+                post_mix,
+                res_mix,
+                self.hc_attn_fn,
+                self.hc_attn_scale,
+                self.hc_attn_base,
                 self.input_layernorm.weight,
             )
         # Only the measured SM80 path fuses norm inside the mHC transition.
@@ -433,21 +523,37 @@ class Glm5NextDecoderLayer(nn.Module):
         else:
             attn_out = self.self_attn(positions, x)
 
-
         router_logits = None
         if self._overlap_router:
-            residual, post_mix, res_mix, x, router_logits = torch.ops.vllm.glm5_mhc_project_runtime(
-                attn_out, residual, post_mix, res_mix,
-                self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base,
-                self.post_attention_layernorm.weight, self.mlp.gate.weight,
-                self._mhc_stream_key, True,
-                self.rms_norm_eps, self.hc_eps, self.hc_post_alpha,
-                self.hc_sinkhorn_iters, self.rms_norm_eps,
+            residual, post_mix, res_mix, x, router_logits = (
+                torch.ops.vllm.glm5_mhc_project_runtime(
+                    attn_out,
+                    residual,
+                    post_mix,
+                    res_mix,
+                    self.hc_ffn_fn,
+                    self.hc_ffn_scale,
+                    self.hc_ffn_base,
+                    self.post_attention_layernorm.weight,
+                    self.mlp.gate.weight,
+                    self._mhc_stream_key,
+                    True,
+                    self.rms_norm_eps,
+                    self.hc_eps,
+                    self.hc_post_alpha,
+                    self.hc_sinkhorn_iters,
+                    self.rms_norm_eps,
+                )
             )
         else:
             residual, post_mix, res_mix, x = self._site_fused(
-                attn_out, residual, post_mix, res_mix,
-                self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base,
+                attn_out,
+                residual,
+                post_mix,
+                res_mix,
+                self.hc_ffn_fn,
+                self.hc_ffn_scale,
+                self.hc_ffn_base,
                 self.post_attention_layernorm.weight,
             )
         if not self._fuse_mhc_norm:
@@ -498,21 +604,27 @@ class Glm5NextTextModel(nn.Module):
             vllm_config.additional_config,
             sm80=current_platform.is_cuda()
             and current_platform.is_device_capability((8, 0)),
-            hidden_size=config.hidden_size, hc_mult=config.hc_mult,
+            hidden_size=config.hidden_size,
+            hc_mult=config.hc_mult,
             dtype=vllm_config.model_config.dtype,
             lora=vllm_config.lora_config is not None,
         ):
             self.mhc_projection_stream = torch.cuda.Stream()
             mhc_stream_key = maybe_prefix(prefix, "mhc_projection_stream")
             register_projection_stream(
-                vllm_config.compilation_config, mhc_stream_key,
+                vllm_config.compilation_config,
+                mhc_stream_key,
                 self.mhc_projection_stream,
             )
-        enable_router_projection = router_projection_enabled(vllm_config.additional_config)
+        enable_router_projection = router_projection_enabled(
+            vllm_config.additional_config
+        )
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: Glm5NextDecoderLayer(
-                config, vllm_config, prefix=prefix,
+                config,
+                vllm_config,
+                prefix=prefix,
                 topk_indices_buffer=self.topk_indices_buffer,
                 indexer_workspace=self.indexer_workspace,
                 mhc_stream_key=mhc_stream_key,
@@ -528,10 +640,8 @@ class Glm5NextTextModel(nn.Module):
                 sum(getattr(layer, "_overlap_router", False) for layer in self.layers),
             )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.make_empty_intermediate_tensors = (
-            make_empty_intermediate_tensors_factory(
-                ["hidden_states"], config.hidden_size
-            )
+        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
+            ["hidden_states"], config.hidden_size
         )
         # EAGLE-3 / DFlash convention: a value v in this tuple captures the
         # completed output of layer v - 1 (set_eagle3_aux_hidden_state_layers
@@ -582,11 +692,15 @@ class Glm5NextTextModel(nn.Module):
         return hidden_states
 
 
-
-
 # EAGLE-3 / DFlash auxiliary hidden-state taps (V2 speculators call
 # set_eagle3_aux_hidden_state_layers on the top-level model).
-_DFLASH_DEFAULT_TAPS = (6, 15, 25, 34, 43)  # incoai/GLM-5.3-Flash-DFlash2 target_layer_ids + 1
+_DFLASH_DEFAULT_TAPS = (
+    6,
+    15,
+    25,
+    34,
+    43,
+)  # incoai/GLM-5.3-Flash-DFlash2 target_layer_ids + 1
 
 
 class _Glm5NextAuxTaps:
@@ -604,6 +718,7 @@ class _Glm5NextAuxTaps:
 
     def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
         return _DFLASH_DEFAULT_TAPS
+
 
 class Glm5NextForCausalLM(
     nn.Module, _Glm5NextAuxTaps, HasInnerState, IsHybrid, SupportsPP, SupportsEagle3
@@ -686,9 +801,7 @@ class Glm5NextForCausalLM(
             tp_size,
             hf_config.linear_attn_config["num_heads"],
             hf_config.linear_attn_config["head_dim"],
-            conv_kernel_size=hf_config.linear_attn_config[
-                "short_conv_kernel_size"
-            ],
+            conv_kernel_size=hf_config.linear_attn_config["short_conv_kernel_size"],
             num_spec=num_spec,
         )
 
@@ -705,16 +818,12 @@ class Glm5NextForCausalLM(
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
-        return self.model(
-            input_ids, positions, intermediate_tensors, inputs_embeds
-        )
+        return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.logits_processor(self.lm_head, hidden_states)
 
-    def load_weights(
-        self, weights: Iterable[tuple[str, torch.Tensor]]
-    ) -> set[str]:
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         num_text_layers = self.config.num_hidden_layers
         expert_params_mapping = fused_moe_make_expert_params_mapping(
             self,
@@ -725,9 +834,10 @@ class Glm5NextForCausalLM(
         )
         params_dict = dict(self.named_parameters())
         loaded: set[str] = set()
-        weights = iter_with_f32_overrides(
-            weights, _load_f32_overrides(getattr(self, "_model_path", None))
-        )
+        model_path = getattr(self, "_model_path", None)
+        weights = iter_with_overrides(weights, _load_f32_overrides(model_path))
+        fp8_weights, fp8_scales = _load_fp8_swapset(model_path)
+        weights = iter_with_overrides(weights, fp8_weights, fp8_scales, strict=True)
         for name, weight in weights:
             # Vision tower and MTP layer: later phases.
             if name.startswith("model.visual."):
@@ -736,7 +846,7 @@ class Glm5NextForCausalLM(
                 continue
             for pref, new in self.hf_to_vllm_prefix.items():
                 if name.startswith(pref):
-                    name = new + name[len(pref):]
+                    name = new + name[len(pref) :]
                     break
             else:
                 continue
@@ -746,9 +856,7 @@ class Glm5NextForCausalLM(
             if not is_expert:
                 for target, ckpt_name, shard_id in self.stacked_params_mapping:
                     token = f".{ckpt_name}."
-                    if token not in name and not name.endswith(
-                        f".{ckpt_name}"
-                    ):
+                    if token not in name and not name.endswith(f".{ckpt_name}"):
                         continue
                     tgt = name.replace(ckpt_name, target)
                     if tgt not in params_dict:
@@ -789,9 +897,7 @@ class Glm5NextForCausalLM(
                 logger.warning_once("glm5_next: unmatched weight %s", name)
                 continue
             param = params_dict[name]
-            loader = getattr(
-                param, "weight_loader", None
-            )
+            loader = getattr(param, "weight_loader", None)
             if loader is not None:
                 loader(param, weight)
             else:
@@ -936,7 +1042,9 @@ class Glm5NextDummyInputsBuilder(BaseDummyInputsBuilder[Glm5NextProcessingInfo])
         w, h = self.info.get_image_size_with_most_features()
         return {
             "image": self._get_dummy_images(
-                width=w, height=h, num_images=num_images,
+                width=w,
+                height=h,
+                num_images=num_images,
                 overrides=mm_options.get("image"),
             )
         }
@@ -979,8 +1087,13 @@ class Glm5NextMultiModalProcessor(BaseMultiModalProcessor[Glm5NextProcessingInfo
     dummy_inputs=Glm5NextDummyInputsBuilder,
 )
 class Glm5NextForConditionalGeneration(
-    nn.Module, _Glm5NextAuxTaps, SupportsMultiModal, SupportsPP, HasInnerState,
-    IsHybrid, SupportsEagle3,
+    nn.Module,
+    _Glm5NextAuxTaps,
+    SupportsMultiModal,
+    SupportsPP,
+    HasInnerState,
+    IsHybrid,
+    SupportsEagle3,
 ):
     """GLM-5.3-Flash: vision tower + hybrid text backbone."""
 
@@ -1098,7 +1211,7 @@ class Glm5NextForConditionalGeneration(
             if not name.startswith("model.visual."):
                 text_weights.append((name, weight))
                 continue
-            vname = name[len("model.visual."):]
+            vname = name[len("model.visual.") :]
             # merger: gate/up/down live on the merger's mlp submodule
             for leaf in ("gate_proj", "up_proj", "down_proj"):
                 vname = vname.replace(f"merger.{leaf}", f"merger.mlp.{leaf}")

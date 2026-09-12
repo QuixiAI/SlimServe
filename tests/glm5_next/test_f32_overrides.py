@@ -12,7 +12,7 @@ from vllm.model_executor.models.glm5_next import (
     F32_OVERRIDES_ENV,
     F32_OVERRIDES_FILE,
     _load_f32_overrides,
-    iter_with_f32_overrides,
+    iter_with_overrides,
 )
 
 NAME = "model.language_model.layers.3.mlp.gate.e_score_correction_bias"
@@ -31,7 +31,7 @@ def test_overrides_replace_matching_names_only(tmp_path, monkeypatch):
     )
     overrides = _load_f32_overrides(str(tmp_path))
     assert set(overrides) == {NAME}
-    got = dict(iter_with_f32_overrides(_stream(), overrides))
+    got = dict(iter_with_overrides(_stream(), overrides))
     assert got[NAME].dtype == torch.float32 and float(got[NAME][0]) == pytest.approx(
         7.01
     )
@@ -47,7 +47,7 @@ def test_missing_file_and_kill_switch_are_no_ops(tmp_path, monkeypatch):
     save_file({NAME: torch.ones(288)}, str(tmp_path / F32_OVERRIDES_FILE))
     monkeypatch.setenv(F32_OVERRIDES_ENV, "0")
     assert _load_f32_overrides(str(tmp_path)) == {}
-    assert dict(iter_with_f32_overrides(_stream(), {}))[NAME].dtype == torch.bfloat16
+    assert dict(iter_with_overrides(_stream(), {}))[NAME].dtype == torch.bfloat16
 
 
 def test_non_f32_sidecar_is_rejected(tmp_path, monkeypatch):

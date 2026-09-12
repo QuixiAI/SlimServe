@@ -25675,3 +25675,32 @@ launches-per-step of the profiled round. Baseline for the phase: p0-nospec
 - Raw: `perf/results/2026-09-11/p1-dgemm-pass{1,2,3}/`, gates
   `p1-dgemm-gate{1,2}.json`, trace
   `~/.local/scratch/slimserve-glm53/profile-state-p1-dgemm/`.
+
+### Item 4a: FP8 swap-set, native e4m3 block tensors for the dense MLP, shared experts and DSA q_b/o_proj - RETAINED
+
+- Hypothesis: RedHatAI's conversion stores ZAI's own FP8 block-128 tensors
+  (dense MLP of layers 0-2, the 42 shared experts, DSA `q_b_proj` /
+  `o_proj`) as their BF16 dequant, twice the bytes per step;
+  `slimserve.fp8_swapset` reads the FP8 bytes and 128x128 scales from the
+  native shards into `<model>/fp8-swapset.safetensors` (314 tensors, 2.5 GB,
+  dequant bit-identical to the conversion's BF16: 0 elements differ), the
+  loader substitutes them, the manifest's compressed-tensors group makes
+  those 112 modules block-FP8 (and drops them from `ignore`), and the M<=16
+  decode GEMM runs W8A16 on them (CUTLASS w8a8 above 16 tokens, the kernel
+  vLLM selects for the scheme on sm_120). Salvage table item 7: +5.5 % c1.
+- Result (p1-fp8swap, on top of item 3): c1 128.4 / 130.7 / 130.7, c8
+  480.2 / 482.5 / 481.1, c16 651.1 / 652.9 / 649.8; medians 130.7 / 481.1 /
+  651.1 = +5.4 / +1.9 / +1.5 % over p1-dgemm; cumulative over the Phase 0
+  baseline +15.4 / +7.1 / +6.6 %. `exact: true` on all nine runs. State:
+  in-step idle 0.172 ms, kernel busy 6.42 ms (6.76 before), 1558
+  launches/step. Gates -2.410 / -2.428 (band -2.407..-2.478). Canaries
+  text / tool / image pass (text: 207 chars of content after 1427 of
+  reasoning, finish stop).
+- Decision: retained. `SLIMSERVE_FP8_SWAPSET=0` serves the BF16 twins; the
+  manifest digest is a compile-cache factor. The runtime sidecar is the
+  campaign's vehicle; Phase 6 folds these tensors into the hybrid
+  checkpoint the profile will name (campaign doc, section 11).
+- Raw: `perf/results/2026-09-12/p1-fp8swap-pass{1,2,3}/`, gates
+  `p1-fp8swap-gate{1,2}.json`, trace
+  `~/.local/scratch/slimserve-glm53/profile-state-p1-fp8swap/`; sidecar
+  build log `~/.local/scratch/slimserve-glm53/serve-logs/swapset-build-4a.out`.

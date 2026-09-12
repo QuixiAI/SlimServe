@@ -568,6 +568,9 @@ class VllmConfig:
             f"quixicore_decode_gemm={decode_gemm_enabled()}"
             f",fp8={decode_gemm_fp8_enabled()}"
         )
+        from slimserve.fp8_swapset import hash_factor
+
+        vllm_factors.append(hash_factor(self.model_config.model))
         factors.append(vllm_factors)
 
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()[

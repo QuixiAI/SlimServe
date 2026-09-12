@@ -41,7 +41,12 @@ SUFFIXES = (
     "self_attn.dt_bias",
 )
 
-_DTYPES = {"F32": torch.float32, "BF16": torch.bfloat16, "F16": torch.float16}
+_DTYPES = {
+    "F32": torch.float32,
+    "BF16": torch.bfloat16,
+    "F16": torch.float16,
+    "F8_E4M3": torch.float8_e4m3fn,
+}
 
 
 def _headers(model_dir: str) -> dict[str, tuple[dict, str, int]]:

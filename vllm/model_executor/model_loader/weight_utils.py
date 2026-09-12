@@ -264,6 +264,14 @@ def get_quant_config(
         # compressed-tensors uses a compressions_config
         hf_quant_config = getattr(model_config.hf_config, "compression_config", None)
 
+    # SlimServe FP8 swap-set (slimserve.fp8_swapset): a sidecar next to the
+    # checkpoint that serves the native FP8 block tensors of modules the
+    # conversion left in BF16; its manifest carries the config group that
+    # quantizes exactly those modules, and they leave the ignore list.
+    from slimserve.fp8_swapset import apply_config_group
+
+    apply_config_group(model_config.model, hf_quant_config)
+
     # Pipe information about heads to enable TP-aware loading of attn_head scales
     if (
         hf_quant_config is not None
