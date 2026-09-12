@@ -480,7 +480,18 @@ __global__ void mla_decode_fp8_v(const bf16* q, const uint8_t* data_cache,
     // measured 6.75 us per row. Four bytes per lane per round turns that into
     // QW/128 coalesced 128-byte rounds, and dims [0, VW) land exactly in the
     // full rounds while the tail round is rope-only score work.
-    constexpr bool VECFP8 = (NFP8 == QW) && (QW % 4 == 0) && (VW % 128 == 0);
+    // All-fp8 NoPE latents with one per-tensor scale (GLM-5.3 fp8 main KV:
+    // NFP8 == QW == VW == 512, SMODE 1) take the lane-parallel structure of
+    // VECBF16 below: 32 indices resolved per round, one 16-byte load per lane
+    // per row (dims [16*lane, +16)), BF_G rows in flight, e4m3 decoded in
+    // registers. kv_scale is folded into q for the score and applied once to
+    // the accumulator at the end, so the per-element multiply disappears.
+    // Measured motive: the 4-byte-per-lane VECFP8 chain below made fp8 main KV
+    // 10-17% slower than bf16 at c16+ on the TP4 x DP2 record (2026-09-12).
+    constexpr bool VECFP8L = SPARSE && (NFP8 == QW) && (QW == VW) &&
+                             (VW == 512) && (SMODE == 1);
+    constexpr bool VECFP8 = (NFP8 == QW) && (QW % 4 == 0) && (VW % 128 == 0) &&
+                            !VECFP8L;
     constexpr bool VECDSV4 =
         (QW == 512) && (VW == 512) && (NFP8 == 448) && (SMODE == 0);
     constexpr int VR = VW / 128;              // full 4-byte rounds (V dims)
@@ -539,6 +550,17 @@ __global__ void mla_decode_fp8_v(const bf16* q, const uint8_t* data_cache,
         qv[13] = float(qt[1]);
         qv[14] = float(qr[0]);
         qv[15] = float(qr[1]);
+    } else if constexpr (VECFP8L) {
+        // dims [16*lane, +16): two 16-byte loads, pre-scaled by kv_scale.
+        #pragma unroll
+        for (int h2 = 0; h2 < 2; ++h2) {
+            const uint4 w = *reinterpret_cast<const uint4*>(
+                &q[q_base + 16 * lane + 8 * h2]);
+            const bf16* qb = reinterpret_cast<const bf16*>(&w);
+            #pragma unroll
+            for (int k = 0; k < 8; ++k)
+                qv[8 * h2 + k] = float(qb[k]) * source_kv_scale;
+        }
     } else if constexpr (VECFP8) {
         #pragma unroll
         for (int i = 0; i < VR; i++) {
@@ -657,6 +679,94 @@ __global__ void mla_decode_fp8_v(const bf16* q, const uint8_t* data_cache,
                     const bf16* tb = reinterpret_cast<const bf16*>(&wt[u]);
                     #pragma unroll
                     for (int k = 0; k < 8; ++k) partial += qtail[k] * float(tb[k]);
+                }
+                const float score = warp_sum_f(partial) * scale;
+                const float nm = fmaxf(m, score);
+                const float alpha = (l == 0.0f) ? 0.0f : expf(m - nm);
+                const float beta = expf(score - nm);
+                #pragma unroll
+                for (int i = 0; i < VPL; i++) acc[i] = acc[i] * alpha + beta * lat[i];
+                l = l * alpha + beta;
+                m = nm;
+            }
+        }
+    }
+    } else if constexpr (VECFP8L) {
+    const bool packed_page = source_page_stride_bytes > 0;
+    for (int j0 = j_beg; j0 < j_end; j0 += 32) {
+        int my_block = -1, my_slot = 0;
+        const int jj = j0 + lane;
+        if (jj < j_end) {
+            const int t = source_indices[batch * source_max_topk + jj];
+            if (t >= 0) {
+                if (source_indices_are_slots) {
+                    const int blk = int(int64_t(t) / source_block_size);
+                    if (!(source_num_cache_blocks > 0 &&
+                          blk >= source_num_cache_blocks)) {
+                        my_block = blk;
+                        my_slot = t - blk * source_block_size;
+                    }
+                } else {
+                    const int col = t / source_block_size;
+                    if (col >= 0 && col < source_bt_stride) {
+                        const int blk =
+                            source_block_table[batch * source_bt_stride + col];
+                        if (blk >= 0 &&
+                            !(source_num_cache_blocks > 0 &&
+                              blk >= source_num_cache_blocks)) {
+                            my_block = blk;
+                            my_slot = t - col * source_block_size;
+                        }
+                    }
+                }
+            }
+        }
+        const int n = min(32, j_end - j0);
+        for (int g = 0; g < n; g += BF_G) {
+            uint4 w[BF_G];
+            bool ok[BF_G];
+            #pragma unroll
+            for (int u = 0; u < BF_G; ++u) {
+                const int src = min(g + u, 31);
+                const int blk = __shfl_sync(0xffffffffu, my_block, src);
+                const int slt = __shfl_sync(0xffffffffu, my_slot, src);
+                ok[u] = (g + u < n) && (blk >= 0);
+                if (ok[u]) {
+                    const int64_t dbase = packed_page
+                        ? int64_t(blk) * source_page_stride_bytes +
+                              int64_t(slt) * SLOT_BYTES
+                        : (int64_t(blk) * source_block_size + slt) * SLOT_BYTES;
+                    w[u] = *reinterpret_cast<const uint4*>(
+                        source_data_cache + dbase + 16 * lane);
+                }
+            }
+            #pragma unroll
+            for (int u = 0; u < BF_G; ++u) {
+                if (!ok[u]) continue;
+                float lat[QPL];
+                float partial = 0.0f;
+                // Branchless pair decode: an e4m3 byte b is exactly the fp16
+                // with bits ((b & 0x7F) << 7) | ((b & 0x80) << 8), times 2^8 --
+                // for subnormals too (fp16 subnormal man * 2^-17 * 256 =
+                // man * 2^-9). Two bytes per 32-bit word half become one
+                // half2 multiply; NaN codes decode to 480 like e4m3_decode.
+                const uint32_t* ww = reinterpret_cast<const uint32_t*>(&w[u]);
+                const __half2 k256 = __floats2half2_rn(256.0f, 256.0f);
+                #pragma unroll
+                for (int i4 = 0; i4 < 4; ++i4) {
+                    const uint32_t wv = ww[i4];
+                    const uint32_t lo = ((wv & 0x007F007Fu) << 7) | ((wv & 0x00800080u) << 8);
+                    const uint32_t hi = (((wv >> 8) & 0x007F007Fu) << 7) |
+                                        (((wv >> 8) & 0x00800080u) << 8);
+                    const float2 f01 = __half22float2(__hmul2(*reinterpret_cast<const __half2*>(&lo), k256));
+                    const float2 f23 = __half22float2(__hmul2(*reinterpret_cast<const __half2*>(&hi), k256));
+                    // lo holds bytes 0 (low half) and 2 (high half); hi holds bytes 1 and 3.
+                    lat[4 * i4 + 0] = f01.x;
+                    lat[4 * i4 + 2] = f01.y;
+                    lat[4 * i4 + 1] = f23.x;
+                    lat[4 * i4 + 3] = f23.y;
+                    partial += qv[4 * i4] * f01.x + qv[4 * i4 + 1] * f23.x +
+                               qv[4 * i4 + 2] * f01.y + qv[4 * i4 + 3] * f23.y;
                 }
                 const float score = warp_sum_f(partial) * scale;
                 const float nm = fmaxf(m, score);
@@ -855,6 +965,16 @@ __global__ void mla_decode_fp8_v(const bf16* q, const uint8_t* data_cache,
                 make_float2(acc[12] / l, acc[13] / l);
             *reinterpret_cast<float2*>(&tmp_out[ob + 448 + 2 * lane]) =
                 make_float2(acc[14] / l, acc[15] / l);
+        } else if constexpr (VECFP8L) {
+            // acc[k] holds dim 16*lane + k (raw e4m3 values): scale once here.
+            const float inv = source_kv_scale / l;
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                float4 v;
+                v.x = acc[4 * i] * inv;     v.y = acc[4 * i + 1] * inv;
+                v.z = acc[4 * i + 2] * inv; v.w = acc[4 * i + 3] * inv;
+                *reinterpret_cast<float4*>(&tmp_out[ob + 16 * lane + 4 * i]) = v;
+            }
         } else if constexpr (VECFP8) {
             // acc[4i+k] holds dim 4*lane + 128*i + k; store float4 to the
             // canonical layout so the unchanged reduce kernel reads it as-is.
@@ -884,6 +1004,16 @@ __global__ void mla_decode_fp8_v(const bf16* q, const uint8_t* data_cache,
                 for (int k = 0; k < 8; ++k)
                     v[k] = (l == 0.0f) ? bf16(0.0f) : bf16(acc[8 * i + k] / l);
                 *reinterpret_cast<uint4*>(&out[out_base + 8 * lane + 256 * i]) =
+                    *reinterpret_cast<const uint4*>(v);
+            }
+        } else if constexpr (VECFP8L) {
+            const float inv = (l == 0.0f) ? 0.0f : source_kv_scale / l;
+            #pragma unroll
+            for (int h2 = 0; h2 < 2; ++h2) {
+                bf16 v[8];
+                #pragma unroll
+                for (int k = 0; k < 8; ++k) v[k] = bf16(acc[8 * h2 + k] * inv);
+                *reinterpret_cast<uint4*>(&out[out_base + 16 * lane + 8 * h2]) =
                     *reinterpret_cast<const uint4*>(v);
             }
         } else if constexpr (VECDSV4) {

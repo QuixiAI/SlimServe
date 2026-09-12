@@ -8,6 +8,8 @@ rounding the whole probability to one BF16 value. Numerical equivalence and
 serving performance require separate correctness gates and profile A/B.
 """
 
+import os
+
 import torch
 
 from vllm.triton_utils import tl, triton
@@ -59,6 +61,9 @@ def _sparse_tc_part(
         # e4m3 bytes -> fp32 by bit assembly (sm80 has no fp8 hardware):
         # normal: sign | (exp - 7 + 127) << 23 | man << 20;
         # subnormal (exp == 0): man * 2^-9; exp 15 & man 7 is NaN -> 0.
+        # (A 16-bit assembly to fp16 measured 4.6x slower in Triton on
+        # sm80, 2026-09-12; int32 is the fast form here.) kv_scale is folded
+        # into q and the accumulator, so the tile is used raw.
         raw = tl.load(
             CACHE
             + page[:, None].to(tl.int64) * PAGE_STRIDE
@@ -75,7 +80,7 @@ def _sparse_tc_part(
         sub = tl.where(sign == 1, -1.0, 1.0) * man.to(tl.float32) * 0.001953125
         val = tl.where(exp == 0, sub, normal)
         val = tl.where((exp == 15) & (man == 7), 0.0, val)
-        kv = (val * KV_SCALE).to(tl.bfloat16)
+        kv = val.to(tl.bfloat16)
     else:
         kv = tl.load(
             CACHE
@@ -100,6 +105,8 @@ def _sparse_tc_part(
     low = (probabilities - high.to(tl.float32)).to(tl.bfloat16)
     accumulator = tl.dot(high, kv)
     accumulator = tl.dot(low, kv, accumulator)
+    if FP8:
+        accumulator = accumulator * KV_SCALE
     tl.store(PART_OUT + base[:, None] * 512 + d[None, :], accumulator, h[:, None] < H)
     tl.store(PART_M + base, maximum, h < H)
     tl.store(PART_L + base, denominator, h < H)
@@ -145,9 +152,13 @@ def sparse_tc_nope(
     assert cache.ndim == 3 and cache.shape[2] == 512
     fp8 = cache.dtype == torch.uint8
     assert q.dtype == torch.bfloat16 and (fp8 or cache.dtype == torch.bfloat16)
-    if fp8 and split > 64:
-        # The in-kernel e4m3 decode holds int32 temporaries of the [SPLIT, 512]
-        # tile; SPLIT=128 exceeds sm80's 164 KB of shared memory (278 KB asked).
+    if fp8 and kv_scale != 1.0:
+        # Fold the per-tensor scale into q outside the kernel (an in-kernel
+        # q rescale changed Triton's operand layout and doubled the time).
+        q = (q.float() * kv_scale).to(torch.bfloat16).contiguous()
+    if fp8 and split > 64 and os.getenv("QC_SPARSE_TC_FP8_SPLIT128", "0") != "1":
+        # The 16-bit e4m3 decode halves the tile footprint of the int32 one;
+        # SPLIT=128 is re-tested behind this switch before it becomes default.
         split = 64
     assert cache.stride()[1:] == (512, 1) and cache.shape[1] > 0
     assert indices.shape[0] == block_table.shape[0] == q.shape[0]
