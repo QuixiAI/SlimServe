@@ -1141,9 +1141,15 @@ def test_quantized_main_kv_is_an_explicit_validated_choice():
         for platform, record in entry.get("variants", {}).items():
             dtype = record.get("engine", {}).get("kv_cache_dtype", "auto")
             env = record.get("env", {})
-            quantized = dtype not in {"auto", "bfloat16"} or any(
-                env.get(k) == "1"
-                for k in ("VLLM_QWEN4_EXP_TQ_MAIN_KV", "VLLM_QWEN4_EXP_FP8_MAIN_KV")
+            extra = record.get("engine", {}).get("additional_config", {}) or {}
+            quantized = (
+                dtype not in {"auto", "bfloat16"}
+                or any(
+                    env.get(k) == "1"
+                    for k in ("VLLM_QWEN4_EXP_TQ_MAIN_KV", "VLLM_QWEN4_EXP_FP8_MAIN_KV")
+                )
+                # GLM-5.3's per-layer fp8 main KV (sparse MLA layers only).
+                or bool(extra.get("glm5_next_main_kv_fp8", False))
             )
             if not quantized:
                 continue
@@ -1288,3 +1294,27 @@ def test_glm53f_8_is_tp4_dp2_with_replicated_moe():
     assert plan.engine["data_parallel_size"] == 2
     assert plan.engine["data_parallel_replicate_moe"] is True
     assert plan.engine["enable_expert_parallel"] is False
+
+
+def test_glm53f_records_carry_a_thinking_budget():
+    """Thinking is always on, so every GLM-5.3 record must bound it: the 1M
+    legs (2026-09-11) showed deep-context probes exhausting max_tokens inside
+    the think block with no budget to close it."""
+    for profile_id in ("glm53f-nvfp4-8", "glm53f-nvfp4-4"):
+        rec = registry._registry()["profiles"][profile_id]["variants"]["a100"]
+        budget = rec["engine"]["override_generation_config"]["thinking_token_budget"]
+        assert 500 <= budget <= 4000, (profile_id, budget)
+
+
+def test_scalar_list_engine_args_render_space_separated():
+    """vLLM's nargs list flags (numa_bind_nodes) take space-separated values;
+    a JSON-rendered list is rejected at parse time (2026-09-11 NUMA arm)."""
+    from dataclasses import replace
+    from slimserve.engine import serve_argv
+
+    plan = resolve("glm53f-nvfp4-8", "a100", 8, None)
+    plan = replace(plan, engine={**plan.engine, "numa_bind_nodes": [0, 0, 1, 1]})
+    argv = serve_argv(plan, "127.0.0.1", 8400)
+    i = argv.index("--numa-bind-nodes")
+    assert argv[i + 1 : i + 5] == ["0", "0", "1", "1"]
+    assert "[0, 0, 1, 1]" not in argv

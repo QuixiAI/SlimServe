@@ -1599,6 +1599,36 @@ class quixicore_ops:
         )
 
     @staticmethod
+    def mla_decode_fp8_sparse_nope(
+        q: torch.Tensor,
+        data: torch.Tensor,
+        block_table: torch.Tensor,
+        indices: torch.Tensor,
+        topk_length: torch.Tensor,
+        block_size: int,
+        scale: float,
+        kv_scale: float = 1.0,
+        partition_size: int = 0,
+        page_stride_bytes: int = 0,
+    ) -> torch.Tensor:
+        """NoPE sparse MLA decode over an fp8 (e4m3) latent cache: 512 fp8
+        per slot, one per-tensor kv_scale (vLLM's fp8 MLA layout). The
+        NFP8=512 instantiation of the bf16 NoPE kernel; sm80 decodes fp8 in
+        software. Returns [tokens, heads, 512]."""
+        return _qc().mla_decode_fp8_sparse_nope(
+            q,
+            data,
+            block_table,
+            indices,
+            topk_length,
+            block_size,
+            scale,
+            kv_scale,
+            partition_size,
+            page_stride_bytes,
+        )
+
+    @staticmethod
     def mla_decode_bf16_sparse_nope(
         q: torch.Tensor,
         kv: torch.Tensor,

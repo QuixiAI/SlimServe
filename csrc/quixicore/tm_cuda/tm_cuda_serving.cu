@@ -307,6 +307,29 @@ static void launch_dsv4_mhc_partials(
     }
 }
 
+// Decode batches (T > 1): tile TT tokens per block so fn is read once per
+// tile (see dsv4_mhc::partials_batched). Same per-token arithmetic order as
+// the per-token kernel, so the partials are bit-identical.
+template <int NOUT>
+static void launch_dsv4_mhc_partials_batched(
+        const __nv_bfloat16* x, const __nv_bfloat16* residual,
+        const float* post, const float* comb, torch::Tensor fn,
+        __nv_bfloat16* residual_out, float* partial, int hidden_size, int tokens) {
+    constexpr int TT = 4;
+    const dim3 grid(dsv4_mhc::SPLITS, (tokens + TT - 1) / TT);
+    if (fn.scalar_type() == torch::kHalf) {
+        dsv4_mhc::partials_batched<NOUT, TT, half>
+            <<<grid, dsv4_mhc::THREADS, 0, stream()>>>(
+                x, residual, post, comb,
+                reinterpret_cast<const half*>(fn.data_ptr()), residual_out,
+                partial, hidden_size, tokens);
+    } else {
+        dsv4_mhc::partials_batched<NOUT, TT, float>
+            <<<grid, dsv4_mhc::THREADS, 0, stream()>>>(
+                x, residual, post, comb, fp(fn), residual_out, partial,
+                hidden_size, tokens);
+    }
+}
 static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> py_dsv4_mhc_pre(
         torch::Tensor residual, torch::Tensor fn, torch::Tensor hc_scale,
         torch::Tensor hc_base, double rms_eps, double pre_eps,
@@ -409,9 +432,15 @@ py_dsv4_mhc_fused_post_pre(
         }
         return {residual_out, next_post, next_comb, layer_input};
     }
-    launch_dsv4_mhc_partials<dsv4_mhc::MIXES, true>(
-        bp(x), bp(residual), fp(post_mix), fp(comb_mix), fn,
-        bpm(residual_out), fpm(partial), H, dim3(dsv4_mhc::SPLITS, T));
+    if (T > 1) {
+        launch_dsv4_mhc_partials_batched<dsv4_mhc::MIXES>(
+            bp(x), bp(residual), fp(post_mix), fp(comb_mix), fn,
+            bpm(residual_out), fpm(partial), H, T);
+    } else {
+        launch_dsv4_mhc_partials<dsv4_mhc::MIXES, true>(
+            bp(x), bp(residual), fp(post_mix), fp(comb_mix), fn,
+            bpm(residual_out), fpm(partial), H, dim3(dsv4_mhc::SPLITS, T));
+    }
     dsv4_mhc::finalize_pre_mix<<<T, 32, 0, stream()>>>(
         fpm(partial), fp(hc_scale), fp(hc_base), fpm(next_post),
         fpm(next_comb), H, float(rms_eps), float(pre_eps),
@@ -1450,6 +1479,44 @@ static torch::Tensor py_mla_decode_bf16_sparse_nope(torch::Tensor q, torch::Tens
     return out;
 }
 
+// GLM-5.3-Flash (glm5_next) fp8 geometry: NoPE latent, q/cache slot are 512
+// fp8 elements (no rope tail), the value is the full 512, one per-tensor
+// kv_scale (vLLM's fp8 MLA layout, SMODE 1). The bf16 NoPE path above is the
+// NFP8=0 instantiation of the same kernel; this is the NFP8=512 one, so the
+// selected-row walk, the partition split and the reduce are shared. On sm80
+// the fp8 decode is software (no fp8 hardware), as for the 576 GLM-5.2 path.
+static torch::Tensor py_mla_decode_fp8_sparse_nope(torch::Tensor q, torch::Tensor data,
+        torch::Tensor bt, torch::Tensor indices, torch::Tensor topk_length,
+        int64_t block_size, double scale, double kv_scale,
+        int64_t partition_size, int64_t page_stride_bytes) {
+    CK(q); TORCH_CHECK(data.is_cuda() && data.stride(-1) == 1, "data must be a CUDA tensor with unit inner stride"); CK(bt); CK(indices); CK(topk_length);
+    const int B = q.size(0), H = q.size(1);
+    TORCH_CHECK(q.size(2) == 512, "NoPE MLA expects q width 512, got ", q.size(2));
+    const int max_topk = indices.size(1);
+    auto out = torch::empty({B, H, 512}, q.options());
+    if (partition_size <= 0) {
+        mla_decode_fp8_v<true, false, 512, 512, 512, 1><<<dim3(H, B), 32, 0, stream()>>>(
+            bp(q), data.data_ptr<uint8_t>(), nullptr, bt.data_ptr<int>(), nullptr,
+            indices.data_ptr<int>(), topk_length.data_ptr<int>(), max_topk, bpm(out),
+            nullptr, nullptr, nullptr, int(block_size), int(bt.size(1)), float(scale), H, 1, 0,
+            float(kv_scale), nullptr, 0, int(page_stride_bytes));
+        return out;
+    }
+    const int P = int((max_topk + partition_size - 1) / partition_size);
+    auto opts = q.options().dtype(torch::kFloat);
+    auto tmp = torch::empty({B, H, P, 512}, opts);
+    auto ml = torch::empty({B, H, P}, opts);
+    auto es = torch::empty({B, H, P}, opts);
+    mla_decode_fp8_v<true, true, 512, 512, 512, 1><<<dim3(H, B, P), 32, 0, stream()>>>(
+        bp(q), data.data_ptr<uint8_t>(), nullptr, bt.data_ptr<int>(), nullptr,
+        indices.data_ptr<int>(), topk_length.data_ptr<int>(), max_topk, nullptr,
+        tmp.data_ptr<float>(), ml.data_ptr<float>(), es.data_ptr<float>(),
+        int(block_size), int(bt.size(1)), float(scale), H, P, int(partition_size),
+        float(kv_scale), nullptr, 0, int(page_stride_bytes));
+    paged_attention_reduce<__nv_bfloat16, 512><<<dim3(H, B), 32, 0, stream()>>>(
+        tmp.data_ptr<float>(), ml.data_ptr<float>(), es.data_ptr<float>(), bpm(out), H, P);
+    return out;
+}
 // GLM-5.2-Vision geometry: q/cache slot are 576 fp8 elements, the value is the
 // leading 512, and the cache carries one per-tensor kv_scale (vLLM's fp8 MLA
 // layout) rather than per-64 e8 exponents. `indices` are request-local logical
@@ -2196,6 +2263,11 @@ void init_serving(py::module_& m) {
           py::arg("kv"), py::arg("block_table"), py::arg("indices"),
           py::arg("topk_length"), py::arg("block_size"), py::arg("scale"),
           py::arg("partition_size") = 0,
+          py::arg("page_stride_bytes") = 0);
+    m.def("mla_decode_fp8_sparse_nope", &py_mla_decode_fp8_sparse_nope, py::arg("q"),
+          py::arg("data"), py::arg("block_table"), py::arg("indices"),
+          py::arg("topk_length"), py::arg("block_size"), py::arg("scale"),
+          py::arg("kv_scale"), py::arg("partition_size") = 0,
           py::arg("page_stride_bytes") = 0);
     m.def("mla_decode_fp8_sparse_glm", &py_mla_decode_fp8_sparse_glm, py::arg("q"),
           py::arg("data"), py::arg("block_table"), py::arg("indices"),

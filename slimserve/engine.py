@@ -108,6 +108,12 @@ def serve_argv(plan: Plan, host: str, port: int) -> list[str]:
         if isinstance(value, bool):
             if value:
                 argv.append(flag)
+        elif isinstance(value, list) and value and all(
+            isinstance(v, (int, float, str)) and not isinstance(v, bool) for v in value
+        ):
+            # vLLM parses scalar lists (numa_bind_nodes, cuda graph sizes) as
+            # space-separated values (nargs), not JSON.
+            argv += [flag, *[str(v) for v in value]]
         elif isinstance(value, (dict, list)):
             argv += [flag, json.dumps(value)]
         else:

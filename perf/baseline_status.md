@@ -2540,6 +2540,8 @@ TP4 replica; c1 tracks DFlash acceptance 1.5-3.2 per run). Gates at this
 baseline: text/image/tool canaries pass; forced-eviction tier acceptance
 6/6 markers after a 2,155,789-token churn of the 1,653,769-token pool,
 24 hits, VLLM_KV_TIER_VERIFY 96 batches / 0 mismatched, 0 failed-closed.
-Owed on this record (running): WildChat deep-context leg and the 1M leg
-on the tree with the block-pool negative-allocation fix (9c24bc5ad).
+WildChat deep-context leg PASS (2026-09-11, tree with the block-pool
+negative-allocation fix 9c24bc5ad): 557 turns, 0 errors, 88/88 recall,
+max context 476,986, 432 tier hits (perf/results/2026-09-11/
+glm53f-leg-dp2/). Owed (running): the 1M-context leg.
 Raw: perf/results/2026-09-11/glm53f-final-dp2/.

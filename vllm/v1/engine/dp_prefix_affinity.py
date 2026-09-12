@@ -69,6 +69,12 @@ class PrefixAffinityRouter:
         self._seen: list[OrderedDict[bytes, None]] = [
             OrderedDict() for _ in range(num_engines)
         ]
+        # Routing statistics for the periodic log line.
+        self.routed = 0
+        self.routed_with_match = 0
+        self.matched_blocks_total = 0
+        self.prompt_blocks_total = 0
+        self.followed_affinity = 0
 
     @property
     def num_engines(self) -> int:
@@ -115,10 +121,11 @@ class PrefixAffinityRouter:
         self.resize(num_engines)
         hashes = prompt_block_hashes(prompt_token_ids, self.block_size, cache_salt)
         n_tokens = len(prompt_token_ids)
-        best, best_cost, best_matched = 0, None, 0
+        best, best_cost, best_matched, max_matched = 0, None, 0, 0
         for i in range(num_engines):
             idx = (start_index + i) % num_engines
             matched = self.matched_blocks(idx, hashes) if hashes else 0
+            max_matched = max(max_matched, matched)
             cost = (
                 n_tokens
                 - matched * self.block_size
@@ -128,4 +135,18 @@ class PrefixAffinityRouter:
                 best, best_cost, best_matched = idx, cost, matched
         if hashes:
             self.record(best, hashes)
+        self.routed += 1
+        self.prompt_blocks_total += len(hashes)
+        if max_matched:
+            self.routed_with_match += 1
+            self.matched_blocks_total += best_matched
+            if best_matched >= max_matched:
+                self.followed_affinity += 1
         return best, best_matched
+
+    def stats(self) -> str:
+        return (
+            f"routed={self.routed} with_prefix={self.routed_with_match} "
+            f"followed={self.followed_affinity} matched_blocks="
+            f"{self.matched_blocks_total}/{self.prompt_blocks_total}"
+        )

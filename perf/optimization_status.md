@@ -25365,3 +25365,181 @@ Raw: perf/results/2026-09-10/glm53f-dflash2/mx-*/.
   (tests/v1/core/test_block_pool_negative_alloc.py). The fail-fast
   invariants and the trace ring stay (trace env-gated). The WildChat leg
   and the 1M leg on the DP2 record rerun on this tree.
+- DP2 RECORD WildChat leg PASS on the fixed tree (11:31-12:49, the
+  1.25 h cap, c8, ctx-target 1M): 557 turns, 0 errors, 88/88 marker
+  recalls, max context 476,986 (median 444,044), 123.1M prompt tokens,
+  432 tier hits, no free-list divergence. The negative-allocation clamp
+  fired 51 distinct times, all of the shape "FullAttentionManager (group
+  10/11, block 1152): local hit holds 344 blocks but local 0 + external
+  387072 tokens need 336": the attention groups had a full local prefix
+  hit while a lagging group (KDA state) missed, so the scheduler took the
+  connector's external path for the whole prefix and the tier restored
+  content the attention groups already held (identical bytes - benign,
+  but wasted restore bandwidth). Follow-up: skip restore ops for
+  attention blocks the local hit already covers. Raw: perf/results/
+  2026-09-11/glm53f-leg-dp2/.
+- DP2 RECORD 1M-context leg (12:54-14:20, c2, ctx-target 1,040,000,
+  tiers + byte verify): both sessions reached target (max 1,047,243,
+  median 1,043,755), 168 turns, 0 errors, 88.1M prompt tokens, tier 130
+  hits / 164 tail saves / 520 verify batches 0 mismatched, no free-list
+  fault. Recall 25/28: the three failures are all above 900K context
+  (902,755 / 905,237 / 980,301). Six clamp events at 13:19 (a 866,304-
+  token restore where the attention groups already held 760-768 local
+  blocks) precede them; whether the misses are the model's own limit
+  near 1M or a restore/recompute seam is open, so two controls run now
+  (queue12): the same 1M leg on the TP8 layout and a DP2 repeat. Raw:
+  perf/results/2026-09-10/glm53f-1m-leg/dp2-1m/.
+- k=3 vs k=4 on the DP2 record (compile cache keyed by k, c1/c8/c16/c32/
+  c64 medians of two): k=3 static 142.5 / 551.2 / 820.7 / 1011.6 /
+  1193.2 (acceptance 2.21); k=4 static 100.0 / 556.1 / 727.3 / 893.1 /
+  1092.0 (2.27); k=4 scheduled [[1,16,4],[17,64,0]] 168.3 / 513.4 /
+  726.6 / 885.6 / 1122.6. k=4 loses c16-c64 by 8-11%: acceptance barely
+  moves (2.21 -> 2.27) while every step verifies one more draft token.
+  DECISION: the record keeps k=3. Raw: perf/results/2026-09-10/
+  glm53f-dflash2/dp2-{k3-pair,k4,sched16-0-k4}/.
+- 1M-context controls (queue12): TP8 layout 26/27 recall (miss at
+  903,670; one session errored, 38 min), DP2 repeat 26/28 (misses at
+  981,382 / 983,702; both sessions to 1,046,061). Every failed probe on
+  every run has completion_tokens == 1024 (the probe cap) and an EMPTY
+  answer, while passing probes at 1,040K-1,047K used 9-779 tokens: at
+  900K+ context the model sometimes spends the whole budget thinking and
+  never answers. Not a KV/tier fault (the same marker is recalled at
+  1.045M on the same session, byte verify 0/520 mismatched) and not
+  layout-specific. Harness change: the marker found in the reasoning
+  text counts as recall (recall_in_reasoning), and budget_exhausted is
+  recorded; a closing DP2 1M run (dp2-1m-c) uses it. Raw:
+  perf/results/2026-09-10/glm53f-1m-leg/{tp8-1m,dp2-1m-b}/.
+
+## 2026-09-11: TP4 x DP2 throughput program (operator: "implement all of your suggested improvements")
+
+Staged with a measurement gate per item; GPU order: A/B arms (queue14),
+closing 1M leg (queue15), c32-per-replica profile (queue16), fp8 main-KV
+arm (queue17).
+- Async scheduling: already active on the DP2 record (the boot log's
+  "Disabling NCCL for DP synchronization when using async scheduling");
+  no change needed.
+- Second API server: `vllm.entrypoints.openai.api_server` (what SlimServe
+  execs) only ran one frontend; it now takes the `vllm serve` multi-server
+  path when `--api-server-count > 1` (ad61a11a8). A/B arm dp2-api2.
+- NUMA binding: numactl installed; the GPUs report no NUMA affinity
+  (numa_node -1 on every PCI device: cloud topology), so the A/B arm
+  dp2-numa binds GPUs 0-3 / 4-7 to nodes 0 / 1 by assumption.
+- Indexer scoring once per request: `cached_pool_logits_grouped`
+  (glm5_next_pool_cache.py) reads each pooled-cache tile once for the k+1
+  speculative verify rows of a request (rows are request-major in decode)
+  and dots it against all G x 32 query heads; dispatched from
+  `_pooled_topk` when the decode batch is uniform in next_n (row shard
+  keeps groups intact when its local slice divides). Bit-exact against
+  the per-row kernel (7 cases incl. G=2/3/4/5/8). Cuts the deep-context
+  indexer's cache traffic by up to (k+1)x for speculative rows.
+- FP8 main KV for the 512-wide NoPE path: `mla_decode_fp8_sparse_nope`
+  (NFP8=512/SMODE=1 instantiation, 7b0323050) plus an in-kernel e4m3
+  decode in the tensor-core Triton kernel; parity 9 + 6 cases. Halves
+  the sparse-gather bytes and doubles the per-replica pool. A/B arm
+  dp2-fp8kv (canaries + exact); tier acceptance and leg follow before any
+  record flip (registry test requires the note to name format + evidence).
+- Speculation to all batch sizes: arm dp2-k3-all (schedule [[1,64,3]]);
+  the earlier dp2-k3-pair arm already measured 1012 / 1193 at c32/c64 vs
+  the record's 986 / 1158.
+- Deferred behind the profile: fused marlin MoE, mHC-in-allreduce (the
+  DSV4 fused kernel exists but its Python gate is batch-1 only:
+  `should_fuse_dsv4_mhc` requires (1, 4096) inputs - a batched variant is
+  the work), sampler/launch-count fusions, host-resident main KV.
+- THINKING BUDGET (2026-09-11, operator): the V2 runner enforces a
+  per-request thinking_token_budget (nudge to wrap up at 85%, hard
+  force-close of the think block at 100%, capped at max_tokens - 1), but
+  neither GLM-5.3 record configured one - only the qwen38 records carry
+  override_generation_config.thinking_token_budget 2000. That is why the
+  1M-leg probes at 900K+ thought through their whole 1,024-token reply
+  budget and answered nothing. Both glm53f records now set the fleet
+  convention (2000) with a registry test; the harness sends probes a
+  per-request budget of half their max_tokens so the answer keeps room.
+  The closing DP2 1M leg (queue15) validates it end to end.
+- A/B arms on the DP2 record (c1/c8/c16/c32/c64, two repeats, medians):
+  base 165 / 566 / 848 / 989 / 1200 (acc 2.21); two API servers 167 /
+  516 / 805 / 949 / 1194 (no gain - the single frontend is not the
+  limiter); drafting at every batch size ([[1,64,3]]) 116 / 581 / 800 /
+  993 / 1190 (acc 2.18) - within run-to-run noise of the record's
+  schedule, so no flip; NUMA binding failed to parse
+  (`--numa-bind-nodes` rejects the JSON list; rerun with the accepted
+  form). Run-to-run spread at fixed config is +-5% (acceptance), so two
+  repeats cannot resolve smaller wins.
+- PROFILE, DP2 record, 32 requests per replica, one worker trace (window
+  1,887 ms, kernels busy 98%): marlin MoE GEMM 31.6% (2,940 launches);
+  custom allreduce 19.4% (1-stage 9.7% + 2-stage 9.7%, 3,672 launches);
+  mHC partials 10.3% + pre-mix/finalize 2.5%; KDA recurrent 5.4%; dense
+  bf16 GEMMs ~9%; sparse MLA decode 1.6% + reduce 0.9%; top-k/top-p
+  sampler 1.1%; moe_sum/align/act/topk ~1.8%. So allreduce + mHC is
+  ~32% of GPU time at production batch - the batched fused
+  mHC-allreduce is the top kernel item (est. up to 15-20%), ahead of MoE
+  fusion (act/sum/align ~2%); MoE itself is 32% and its launches per step
+  are the next target after that. Raw: ~/.local/scratch/glm53/prof-dp2-c32/.
+- CLOSING 1M LEG (dp2-1m-c, budget on): both sessions reached 1.04M;
+  27 probes, 23 recalled, 19 of them recalled inside the reasoning
+  text (the nudge works). The four misses: one coherent "I don't have a
+  codename" at 213K, and THREE PROBES OF PURE '!' TOKENS (content and
+  reasoning) at 911,894 / 991,581 / 1,040,594, each with e2e 519-553 s =
+  a full cold re-prefill of the ~900K+ prefix (no cache hit, no tier
+  hit; the tier holds 123 hits for the incremental turns). The earlier
+  legs' "empty answer at 900K+" probes were the same failure. So a cold
+  prefill of >= ~900K tokens produces garbage logits on this path while
+  incremental extension of the same context is fine. Bisection queued
+  (queue18: cold single requests at 200K/500K/800K/900K/1M with a
+  planted marker). Also: one 400 at 1,048,065 prompt tokens - the
+  harness overshoots the 1,048,576 ceiling by its 512 reply tokens.
+- STEADY DECODE STEP at 32 requests per replica (from the profile, one
+  step, 49.3 ms, 1,947 kernels): marlin MoE 19.4 ms (39%; ~170 distinct
+  experts read per step = 1.4 TB/s, i.e. at bandwidth), mHC partials
+  (CUDA `tms::dsv4_mhc::partials`, 89 launches) 7.0 ms (14%), dense bf16
+  GEMMs ~6 ms, KDA recurrent 3.9 ms (34 launches at 0.56 TB/s effective
+  - ~2x headroom), custom allreduce 2.9 ms (6%), mHC pre-mix + finalize
+  1.8 ms, sparse MLA 1.4 ms, sampler 0.7 ms. The whole-window allreduce
+  share (19%) was barrier WAITING in the eager prefill steps (1-stage
+  p50 9 us vs p90 411 us; ranks 2/3 idle 7 ms/step on the host side
+  there), so the fused mHC-allreduce is demoted; prefill-step launch
+  gaps are a separate item (FULL_AND_PIECEWISE arm queued).
+- mHC partials batched (dsv4_mhc::partials_batched<24, TT=4>): the
+  per-token kernel re-read the 1.5 MiB fn matrix per token; the batched
+  kernel reads it once per 4-token tile with the same per-element
+  arithmetic. Microbench at T=32: 31 us vs 78 us in the serving profile
+  (the whole transition op 49 us). residual_out bit-exact; fp32 mixing
+  coefficients within 2e-7 (FMA contraction), normed layer input within
+  one bf16 ulp. Expected ~4 ms of the 49 ms step (~8%). Same-day base
+  arm queued (dp2-base-mhcb) for the serving A/B.
+- Cold-prefill probe attempt 1 died silently on worker 3 during the
+  first 200K prefill (no CUDA error, no OOM); the boot had reloaded a
+  torch.compile cache that two concurrent profile boots wrote at 19:55
+  ("Cubin file saved by TritonBundler not found" warnings). The cache
+  (56 GB) was set aside; the probe reruns on a clean cache (queue22).
+
+## 2026-09-12: A/B results on the DP2 record (c1/c8/c16/c32/c64 medians of two)
+
+| arm | c1 | c8 | c16 | c32 | c64 | note |
+|---|---|---|---|---|---|---|
+| base (09-11 20:30) | 165 | 566 | 848 | 989 | 1200 | acc 2.21 |
+| numa_bind 0000/1111 | 126 | 499 | 830 | 1006 | 1176 | no gain |
+| FULL_AND_PIECEWISE | 139 | 521 | 782 | 1027 | 1176 | decode unchanged; prefill not measured here |
+| fp8 main KV (per-layer) | 150 | 550 | 698 | 873 | 998 | pool 2.94M (1.78x) but -10..-17% at c16+ |
+| base on batched-partials tree | 114 | 544 | 756 | 936 | 1172 | acc 2.17; within noise of base |
+
+- Run-to-run spread at a fixed config is 5-10% at c16/c32 (acceptance
+  1.5-3.2 varies the DFlash gain), so two repeats resolve only >10%.
+- fp8 main KV: capacity win (per-replica pool 1.65M -> 2.94M tokens)
+  but the software e4m3 decode costs more than the halved bytes save at
+  batch on sm80 (the TC kernel runs split 64 on fp8 and the native fp8
+  kernel decodes per element). Not for the record; keep as the capacity
+  option and revisit the fp8 decode kernels (vectorized e4m3 -> bf16 in
+  the native kernel; a smaller-register decode in the TC kernel).
+- KDA decode kernel sweep (microbench, H=16, K=V=128): BV=32/4 warps
+  (the vendored defaults) are best at every N; wider tiles or 8 warps
+  are equal or slower. The 0.56 TB/s effective is the kernel's
+  per-element state update, not a tiling choice; a rewrite (state in
+  bf16 registers, vectorized loads) is the next lever there.
+- Batched mHC partials: 2.5x at the kernel; the serving arm sits inside
+  the noise band. Needs a 5-repeat paired A/B, or the kernel share is
+  smaller at these batch sizes than in the profiled step (the Triton
+  SIMT transition path serves T <= 64 at the MoE site).
+- Cold prefill (clean compile cache): 31K/62K/124K/249K/435K/559K/621K
+  prompt tokens all answer correctly with no '!' garbage; the earlier
+  probe's requested lengths tokenized at 2.62 chars/token, so the 900K+
+  regime was not reached - rerun queued (queue23, 700K..1.04M actual).
