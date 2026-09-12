@@ -25719,3 +25719,20 @@ arm (queue17).
   127.1 / c8 497.0 / c16 843.9 / c32 1023.3 / c64 1320.8 tok/s, canaries
   pass (raw perf/results/2026-09-12/glm53f-mhcws-record/). Baseline and
   profile note updated.
+- MoE ROUTING HISTOGRAM (2026-09-12, VLLM_MOE_EXPERT_STATS=100 on the
+  record under the exact bench at c16/c64, DP0 rank 0, 42 MoE layers;
+  raw perf/results/2026-09-10/glm53f-dflash2/moe-stats2/server.log):
+  distinct experts per layer per call - <=8-token calls 27.7, 16-token
+  57.9, 32-token (c16 spec steps) 94.6 (68-146 by layer), 128-token (c64
+  spec steps) 167.0 (128-243; layers 3-6 ~240, layers 34-44 ~130-160),
+  prefill chunks (1760 tokens) 246.6. Each expert is 13.5 MB of NVFP4
+  (gate/up [2048,4096] + down [4096,2048] packed + fp8 scales), so a
+  128-token step streams 167 x 13.5 / 4 = 564 MB per rank per layer -
+  336 us at 1.7 TB/s - and the measured marlin_moe time is 191 us x 1.76
+  launches = 336 us per layer. At 32 tokens: 95 experts = 320 MB = 190 us
+  vs 210 us measured. VERDICT: the NVFP4 marlin MoE runs at the HBM
+  roofline at both production batch points; no kernel lever. The lever
+  is expert bytes per token: more tokens per step per replica (the DP2
+  layout streams each replica's active set independently; at c64 that
+  is 2 x 564 MB vs one TP8 stream of ~210 x 13.5 / 8 = 354 MB, which TP8
+  loses back on everything else), or fewer distinct experts per step.
