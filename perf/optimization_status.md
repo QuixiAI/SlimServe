@@ -25971,3 +25971,9 @@ Phases, by value over risk:
   GB/rank memory saving alone is not worth it). The remaining known
   step is a stream-K work split (no partial traffic, whole tiles
   written in-CTA) plus deeper register pipelining - CUTLASS-grade work.
+- RECORD at fixed k=2 (2026-09-12, queue46): canaries pass; exact medians
+  c1 128.0 / c8 567.1 / c16 875.6 / c32 1110.0 / c64 1413.8 (k=3: 127.1 /
+  497.0 / 843.9 / 1023.3 / 1320.8); WildChat leg 785 turns / 0 errors /
+  126/126 recall / 658K max ctx (k=3 leg: 737 turns). Baseline and
+  profile note updated. The k=2 flip is the day's largest serving gain:
+  +7-14% exact at c8-c64, +17-22% sustained at c64/c128.
