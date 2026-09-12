@@ -25792,3 +25792,29 @@ arm (queue17).
   exhausted at this batch; the remaining items are the KDA
   deferred-commit design (runner + tier interplay) and the skinny GEMM
   with counters.
+- PROFILER ENABLED (2026-09-12, operator: NVreg_RestrictProfilingToAdminUsers=0
+  via /etc/modprobe.d/nvidia-profiling.conf + driver reload + initramfs;
+  RmProfilingAdminOnly now 0). First readout, 128x4096x6144 bf16 GEMM:
+  cuBLAS 128x128 kernel 51 us - DRAM 52%, SM 55%, 96 CTAs of 4 warps at
+  246 registers, achieved occupancy 5.7%, 5.3 cycles per issued
+  instruction; skinny v1 77 us - DRAM 35%, 1.8 warps per scheduler with
+  0.27 eligible, 7.6 cycles per issue. Double-buffering the ldmatrix
+  fragments across k16 and a 128x128 / 2-stage tile (cfg 8) brought it to
+  57-60 us (DRAM 46%, SM 46%; stalls per issue: wait 3.2, long scoreboard
+  1.4, MIO throttle 1.0, math-pipe throttle 0.7, LG throttle 0.7, barrier
+  0.6; registers cap it at 2 blocks/SM). Both kernels are issue/latency
+  bound with <= 8 warps per SM; the compute roofline at M=128 is ~21 us
+  and the memory roofline ~30 us, so a CUTLASS-grade mainloop tops out
+  near 30-35 us: ~1.3 ms of the c64 step at best (<3%). DECISION: stop
+  the custom dense GEMM here; the op stays parked with cfg 8 as its best.
+- mHC partials_batched_ws under the profiler (T=128, 36 us): DRAM 9.5%,
+  L2 31%, SM 54%, 27 active warps per SM (42% occupancy), 0.57 issued
+  per scheduler-cycle; stalls per issue: short scoreboard 1.8 (shared
+  loads), wait 1.4, MIO throttle 1.1, math-pipe throttle 1.1, long
+  scoreboard 1.2, barrier 0.9 -> instruction-issue bound (~1500
+  instructions per thread: scalar fn/value/residual loads, bf16
+  conversions, per-token predication). Vectorizing the fn and value loads
+  (float4), the residual loads (bf16x2) and dropping the per-token
+  predicates would cut roughly 40% of the stream: ~33 -> ~22 us at
+  T=128, ~1 ms of the c64 step (about 2%). Below the keep rule on its
+  own; recorded as the next step if the mHC transition is revisited.

@@ -145,26 +145,38 @@ __global__ void __launch_bounds__(NW * 32) skinny_gemm_bf16_kernel(
         }
         const __nv_bfloat16* as = a_stage(step % STAGES);
         const __nv_bfloat16* bs = b_stage(step % STAGES);
-#pragma unroll
-        for (int kk = 0; kk < BK / 16; ++kk) {
-            unsigned a[L::MT][4];
+        // Fragments double-buffered across the k16 steps: the ldmatrix for
+        // step kk+1 is issued before the mma chain of step kk (ncu 2026-09-12:
+        // 76% of cycles had no eligible warp, a third of the stall on the
+        // fixed-latency ldmatrix -> mma dependency).
+        unsigned a[2][L::MT][4];
+        unsigned b[2][L::NT / 2][4];
+        auto load_frags = [&](int buf, int kk) {
 #pragma unroll
             for (int i = 0; i < L::MT; ++i) {
                 const int r = row_base + i * 16 + (lane & 15);
                 const int c = kk * 16 + (lane >> 4) * 8;
-                ldmatrix_x4(a[i], as + r * LDS + c);
+                ldmatrix_x4(a[buf][i], as + r * LDS + c);
             }
 #pragma unroll
-            for (int j = 0; j < L::NT; j += 2) {
-                unsigned b[4];
+            for (int j = 0; j < L::NT / 2; ++j) {
                 const int q = lane >> 3;
-                const int r = col_base + j * 8 + (q >> 1) * 8 + (lane & 7);
+                const int r = col_base + j * 16 + (q >> 1) * 8 + (lane & 7);
                 const int c = kk * 16 + (q & 1) * 8;
-                ldmatrix_x4(b, bs + r * LDS + c);
+                ldmatrix_x4(b[buf][j], bs + r * LDS + c);
+            }
+        };
+        load_frags(0, 0);
+#pragma unroll
+        for (int kk = 0; kk < BK / 16; ++kk) {
+            const int cur = kk & 1;
+            if (kk + 1 < BK / 16) load_frags(cur ^ 1, kk + 1);
+#pragma unroll
+            for (int j = 0; j < L::NT / 2; ++j) {
 #pragma unroll
                 for (int i = 0; i < L::MT; ++i) {
-                    mma_bf16_16816(acc[i][j], a[i], b[0], b[1]);
-                    mma_bf16_16816(acc[i][j + 1], a[i], b[2], b[3]);
+                    mma_bf16_16816(acc[i][2 * j], a[cur][i], b[cur][j][0], b[cur][j][1]);
+                    mma_bf16_16816(acc[i][2 * j + 1], a[cur][i], b[cur][j][2], b[cur][j][3]);
                 }
             }
         }

@@ -1569,7 +1569,7 @@ static torch::Tensor py_skinny_gemm(torch::Tensor x, torch::Tensor w,
     // cfg (tile sweep, all within 15% of each other, none beating cuBLAS):
     // 0 = BN64/4 warps/3 stages, 1 = BN128/8 warps/3 stages, 2 = BN64/4 warps/4 stages,
     // 3 = BN128/8 warps/2 stages, 4 = BN64/8 warps/3 stages
-    const int BN = (cfg == 1 || cfg == 3) ? 128 : 64;
+    const int BN = (cfg == 1 || cfg == 3 || cfg >= 6) ? 128 : 64;
     const int n_tiles = (N + BN - 1) / BN;
     const int k_steps = K / tms::skinny::BK;
     int want = std::max(1, int((target_ctas + n_tiles - 1) / n_tiles));
@@ -1587,6 +1587,10 @@ static torch::Tensor py_skinny_gemm(torch::Tensor x, torch::Tensor w,
         case 2: launch_skinny<128, 64, 4, 4>(xp, wp, pp, M, N, K, splits, k_slice); break;
         case 3: launch_skinny<128, 128, 8, 2>(xp, wp, pp, M, N, K, splits, k_slice); break;
         case 4: launch_skinny<128, 64, 8, 3>(xp, wp, pp, M, N, K, splits, k_slice); break;
+        case 5: launch_skinny<128, 64, 4, 2>(xp, wp, pp, M, N, K, splits, k_slice); break;
+        case 6: launch_skinny<128, 128, 8, 2>(xp, wp, pp, M, N, K, splits, k_slice); break;
+        case 7: launch_skinny<128, 128, 8, 3>(xp, wp, pp, M, N, K, splits, k_slice); break;
+        case 8: launch_skinny<128, 128, 4, 2>(xp, wp, pp, M, N, K, splits, k_slice); break;
         default:
             if (M > 64)      launch_skinny<128, 64, 4, 3>(xp, wp, pp, M, N, K, splits, k_slice);
             else if (M > 32) launch_skinny<64, 64, 4, 3>(xp, wp, pp, M, N, K, splits, k_slice);
