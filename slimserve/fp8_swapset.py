@@ -14,7 +14,8 @@ and writes two files next to the served checkpoint:
 * ``<model>/fp8-swapset.json``: the manifest - tensor list, the vLLM modules
   they load into, and the compressed-tensors config group that quantizes
   exactly those modules (copied from the checkpoint's own FP8 group so the
-  schema matches what the loader parses).
+  schema matches what the loader parses). The two files share a stem;
+  ``--out`` names both.
 
 When both files are present the loader substitutes the weights, injects the
 scales, and the quantization config gains the group; set
@@ -298,7 +299,7 @@ def build(
     if kda:
         manifest["self_quantized"] = kda
         manifest["beta_block_rows"] = BETA_ROWS
-    manifest_file = out_path.with_name(MANIFEST_FILE)
+    manifest_file = out_path.with_suffix(".json")  # same stem as the tensors
     with open(manifest_file, "w") as fh:
         json.dump(manifest, fh, indent=1)
     nbytes = sum(t.numel() * t.element_size() for t in tensors.values())

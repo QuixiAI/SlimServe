@@ -187,7 +187,9 @@ def _load_fp8_swapset(
         manifest = json.load(fh)
     from safetensors.torch import load_file
 
-    file = os.path.join(model_path, manifest["file"])
+    # The tensor file shares the manifest's stem, so a sidecar selected by
+    # stem (SLIMSERVE_FP8_SWAPSET=<stem>) reads its own weights.
+    file = os.path.splitext(path)[0] + ".safetensors"
     tensors = load_file(file)
     if sorted(tensors) != sorted(manifest["tensors"]):
         raise ValueError(f"{file}: tensor names do not match the manifest {path}")
