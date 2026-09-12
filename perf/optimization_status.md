@@ -25617,3 +25617,34 @@ backbone + decode GEMM re-land (bytes); (2) custom all-reduce over PCIe
 indexer prefill scoring; the native NVFP4 expert kernel moves up to Phase 2
 because the control's c8 / c16 lead is mostly its expert path. Test
 classification and upstream breakages: campaign doc section 12.
+
+## 2026-09-11: rtx6000 Phase 1 (decode bytes and overhead), item by item
+
+Same box, harness and profile as the Phase 0 entry; every arm is
+`ab.sh <run> [ENV=..] -- --no-spec` (boot, canaries, three passes of
+c1/c8/c16 1000/300, a profiled c1 round for the state label, two gate.py
+runs), medians reported, like-state checked through the in-step idle and
+launches-per-step of the profiled round. Baseline for the phase: p0-nospec
+113.3 / 449.2 / 611.0 (in-step idle 0.17 ms, 1583 launches/step).
+
+### Item 2: vLLM custom all-reduce over PCIe (`VLLM_CUSTOM_AR_ALLOW_PCIE=1`) - RETAINED
+
+- Hypothesis: NCCL's ring all-reduce costs ~11 us per small reduction on
+  four PCIe-only ranks against ~5 us for vLLM's one-shot custom kernel over
+  peer mappings, and the step has ~90 reductions (mHC transitions plus the
+  attention/MLP TP reductions); the switch exists because vLLM disables the
+  custom kernel on more than two ranks without NVLink. Salvage table item 8
+  measured +11 % c1 on the Codex tree.
+- Result (p1-car): c1 121.3 / 122.9 / 122.9, c8 467.9 / 466.2 / 468.2, c16
+  640.1 / 638.6 / 640.9; medians 122.9 / 468.2 / 640.9 = +8.5 / +4.2 / +4.9 %.
+  `exact: true` on all nine runs. State: in-step idle 0.168 ms, 1577
+  launches/step (fast state, like-for-like). Gates -2.441 / -2.432 (band
+  -2.407..-2.478); canaries not run on this arm (the switch changes no
+  numerics path beyond reduction order). Trace
+  `~/.local/scratch/slimserve-glm53/profile-state-p1-car/`.
+- Decision: retained; `VLLM_CUSTOM_AR_ALLOW_PCIE=1` on the rtx6000 record
+  env with a note. `VLLM_CUSTOM_AR_PCIE_MAX_BYTES` (the two-shot cap,
+  default 8 MiB) is left for the prefill campaign: 4096-token chunks reduce
+  32 MiB per layer and stay on NCCL either way.
+- Raw: `perf/results/2026-09-11/p1-car-pass{1,2,3}/`, gates
+  `perf/results/2026-09-11/p1-car-gate{1,2}.json`.
