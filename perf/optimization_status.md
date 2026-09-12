@@ -25890,3 +25890,18 @@ Phases, by value over risk:
 4. Prefill: the record's prompt throughput during the c64 ramp reads
    4.8-12K tok/s per replica; a prefill-step profile decides whether the
    indexer/sparse path or the MoE at large M is the limiter.
+- Phase 2 (dense weight quantization) REJECTED by microbench (2026-09-12):
+  fp8 weight-only marlin (W8A16, the path vLLM's Fp8LinearMethod takes on
+  Ampere) vs cuBLAS bf16 at the per-rank dense shapes: M=32 0.27-1.25x
+  (only 4096x6144 wins), M=128 0.39-0.79x - slower everywhere that
+  matters (marlin's tiles are built for M <= 16-64 and 4-bit weights).
+  Halving the dense weight bytes only pays with a purpose-built W8A16
+  kernel for M=32-128, which is the same skinny-GEMM problem already
+  closed today. Raw: ~/.local/scratch/glm53/fp8_marlin_bench.py.
+- Standalone audit (operator directive 2026-09-12): every custom kernel
+  lives under csrc/quixicore/ (serving/*.cuh, tm_cuda/*.cu) and is built
+  by this repo's CMake target _quixicore_C, loaded as vllm._quixicore_C
+  through vllm/quixicore/ops.py; all includes resolve inside csrc/
+  (quixicore + libtorch_stable); no Python imports anything from
+  ~/QuixiCore. The QuixiCore-CUDA repo only receives ports of finished
+  kernels and is not a build or runtime dependency.
