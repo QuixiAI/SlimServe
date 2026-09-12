@@ -7,6 +7,7 @@
 # Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
 # ruff: noqa: E501
 
+import os
 import torch
 
 from vllm.third_party.flash_linear_attention.ops.op import exp, log
@@ -344,8 +345,8 @@ def fused_recurrent_kda_fwd(
     if scale is None:
         scale = K**-0.5
 
-    BV = 32 if use_gate_in_kernel else 8
-    num_warps = 4 if use_gate_in_kernel else 1
+    BV = int(os.getenv("KDA_DECODE_BV", "32")) if use_gate_in_kernel else 8
+    num_warps = int(os.getenv("KDA_DECODE_WARPS", "4")) if use_gate_in_kernel else 1
     grid = (cdiv(V, BV) * N * H,)
     fused_recurrent_kda_fwd_kernel[grid](
         q=q,
@@ -587,7 +588,10 @@ def fused_recurrent_kda_packed_decode(
         raise ValueError("`state_indices` must contain one entry per token.")
 
     BK = next_power_of_2(K)
-    BV = min(next_power_of_2(V), 32)
+    # Tile/warp choice is an experiment hook (2026-09-11 GLM-5.3 profile:
+    # 0.56 TB/s effective at 32 decode rows); defaults are the vendored ones.
+    BV = min(next_power_of_2(V), int(os.getenv("KDA_DECODE_BV", "32")))
+    decode_warps = int(os.getenv("KDA_DECODE_WARPS", "4"))
     if scale is None:
         scale = K**-0.5
 
@@ -615,7 +619,7 @@ def fused_recurrent_kda_packed_decode(
         BV=BV,
         SOFTPLUS_THRESHOLD=20.0,
         USE_LOWER_BOUND=lower_bound is not None,
-        num_warps=4,
+        num_warps=decode_warps,
         num_stages=2,
     )
     return out, initial_state
