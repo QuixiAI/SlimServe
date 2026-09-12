@@ -81,3 +81,46 @@ def test_apply_config_group_refuses_non_compressed_tensors(tmp_path):
     with pytest.raises(ValueError):
         fp8_swapset.apply_config_group(str(tmp_path), {"quant_method": "fp8"})
     assert not fp8_swapset.apply_config_group(str(tmp_path / "missing"), {})
+
+
+def test_beta_block_rows_only_for_listed_self_quantized_modules(tmp_path):
+    manifest = {
+        "file": fp8_swapset.SWAPSET_FILE,
+        "tensors": ["model.language_model.layers.0.self_attn.b_proj.weight"],
+        "modules": ["language_model.model.layers.0.self_attn.in_proj_qkvgfab"],
+        "config_group": {},
+        "self_quantized": ["model.language_model.layers.0.self_attn.b_proj.weight"],
+        "beta_block_rows": 128,
+    }
+    (tmp_path / fp8_swapset.MANIFEST_FILE).write_text(json.dumps(manifest))
+    assert (
+        fp8_swapset.beta_block_rows(
+            str(tmp_path), "model.layers.0.self_attn.in_proj_qkvgfab"
+        )
+        == 128
+    )
+    assert (
+        fp8_swapset.beta_block_rows(
+            str(tmp_path), "model.layers.1.self_attn.in_proj_qkvgfab"
+        )
+        is None
+    )
+    manifest.pop("self_quantized")
+    (tmp_path / fp8_swapset.MANIFEST_FILE).write_text(json.dumps(manifest))
+    assert (
+        fp8_swapset.beta_block_rows(
+            str(tmp_path), "model.layers.0.self_attn.in_proj_qkvgfab"
+        )
+        is None
+    )
+
+
+def test_manifest_selected_by_environment_stem(tmp_path, monkeypatch):
+    (tmp_path / "fp8-swapset-dense.json").write_text("{}")
+    assert fp8_swapset.manifest_path(str(tmp_path)) is None
+    monkeypatch.setenv(fp8_swapset.SWAPSET_ENV, "fp8-swapset-dense")
+    assert fp8_swapset.manifest_path(str(tmp_path)) == str(
+        tmp_path / "fp8-swapset-dense.json"
+    )
+    monkeypatch.setenv(fp8_swapset.SWAPSET_ENV, "missing")
+    assert fp8_swapset.manifest_path(str(tmp_path)) is None

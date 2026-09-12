@@ -18,7 +18,8 @@ and writes two files next to the served checkpoint:
 
 When both files are present the loader substitutes the weights, injects the
 scales, and the quantization config gains the group; set
-``SLIMSERVE_FP8_SWAPSET=0`` to serve the BF16 twins for an A/B.
+``SLIMSERVE_FP8_SWAPSET=0`` to serve the BF16 twins for an A/B, or to the stem
+of another manifest next to the checkpoint to serve that sidecar instead.
 
 ``self_attn.q_a_proj`` / ``kv_a_proj_with_mqa`` are left out: they load into
 ``fused_qkv_a_proj`` together with three indexer shards the native
@@ -27,13 +28,12 @@ checkpoint keeps in BF16, and one module takes one scheme.
 ``--self-quant-kda`` adds the KDA (linear-attention) projections, which every
 GLM-5.3-Flash checkpoint keeps in BF16: ``q/k/v/b/f_a/g_a_proj`` (the merged
 ``in_proj_qkvgfab``) and the KDA ``o_proj`` are quantized here to the same
-128x128 block format (per-block absmax / 448). The merged projection's beta
-shard is 16 rows per rank, so its block scales cannot be sharded by the
-loader; the sidecar stores ``b_proj`` per rank, padded to 128 rows (zeros
-after the rank's rows) with one scale row per rank, and the model reserves
-128 beta rows per rank when the manifest lists the module. That layout is
-tensor-parallel specific: the manifest records ``tp_size`` and the loader
-refuses another. Quality is the experiment's gate, not a given.
+128x128 block format (per-block absmax / 448), each tensor in its checkpoint
+shape, so the sidecar is tensor-parallel agnostic. The merged projection's
+beta shard (``b_proj``, one row per head) is smaller than a scale block, so
+the model gives it a whole replicated block of rows when the manifest lists
+the module (``beta_block_rows``) and each rank reads its heads from it.
+Quality is the experiment's gate, not a given.
 
     python -m slimserve.fp8_swapset --native /path/to/GLM-5.3-Flash \\
         --model /path/to/GLM-5.3-Flash-NVFP4
@@ -87,8 +87,7 @@ KDA_SUFFIXES = (
     "self_attn.o_proj",
 )
 KDA_MARKER = "self_attn.b_proj"  # a tensor only the KDA layers carry
-BETA_SUFFIX = "self_attn.b_proj"
-BETA_ROWS = BLOCK  # rows per rank reserved for the beta shard of in_proj_qkvgfab
+BETA_ROWS = BLOCK  # rows the model reserves for the replicated beta shard
 FP8_MAX = 448.0  # float8_e4m3fn
 _LAYER_RE = re.compile(
     r"^(?P<prefix>.*\.layers\.)(?P<layer>\d+)\.(?P<suffix>.+)\.weight$"
@@ -100,9 +99,15 @@ def enabled() -> bool:
 
 
 def manifest_path(model_path: str | None) -> str | None:
+    """``<model>/fp8-swapset.json`` when present and enabled. The environment
+    variable also selects another manifest by stem (``SLIMSERVE_FP8_SWAPSET=
+    fp8-swapset-dense`` reads ``<model>/fp8-swapset-dense.json``), so two
+    sidecars can be compared without renaming files."""
     if not model_path or not enabled():
         return None
-    path = os.path.join(model_path, MANIFEST_FILE)
+    choice = os.environ.get(SWAPSET_ENV, "1")
+    name = MANIFEST_FILE if choice == "1" else f"{choice}.json"
+    path = os.path.join(model_path, name)
     return path if os.path.isfile(path) else None
 
 
@@ -168,23 +173,6 @@ def quantize_block(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return q.view(rows * BLOCK, k)[:n].contiguous(), scale.view(rows, k // BLOCK)
 
 
-def quantize_beta(w: torch.Tensor, tp_size: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """The beta projection [num_heads, K] laid out per rank: rank r's rows in
-    block r of a [tp_size * BETA_ROWS, K] tensor (zeros after them), one scale
-    row per rank, so the merged loader's plain row slice gives each rank its
-    heads with a whole block scale of its own."""
-    if tp_size < 1:
-        raise ValueError("tp_size must be positive")
-    n, k = w.shape
-    if n % tp_size or n // tp_size > BETA_ROWS:
-        raise ValueError(f"{n} beta rows do not shard over tp={tp_size}")
-    local = n // tp_size
-    padded = torch.zeros(tp_size * BETA_ROWS, k, dtype=w.dtype, device=w.device)
-    for r in range(tp_size):
-        padded[r * BETA_ROWS : r * BETA_ROWS + local] = w[r * local : (r + 1) * local]
-    return quantize_block(padded)
-
-
 def targets_for(names: list[str]) -> list[str]:
     """compressed-tensors ``re:`` targets on the vLLM module names, one per
     (module suffix, layer set); explicit layer lists so a KDA ``o_proj``
@@ -238,10 +226,7 @@ def build(
     out: str | None = None,
     skip_layer: int | None = 45,
     self_quant_kda: bool = False,
-    tp_size: int | None = None,
 ) -> Path:
-    if self_quant_kda and (tp_size is None or tp_size < 1):
-        raise SystemExit("--self-quant-kda requires a positive --tp-size")
     native = _headers(native_dir)
     converted = _headers(model_dir)
     names = select(native, converted, skip_layer)
@@ -249,7 +234,7 @@ def build(
         raise SystemExit("nothing to swap: no FP8 twins of BF16 conversion tensors")
     kda = select_kda(converted, skip_layer) if self_quant_kda else []
     if self_quant_kda and not kda:
-        raise SystemExit("--self-quant-kda needs KDA BF16 tensors and --tp-size")
+        raise SystemExit("--self-quant-kda found no BF16 KDA projections")
     group = _fp8_group_template(model_dir)
     group["targets"] = targets_for(names + kda)
     tensors: dict[str, torch.Tensor] = {}
@@ -259,20 +244,9 @@ def build(
     for name in kda:
         base = name[: -len(".weight")]
         w = _read(*converted[name]).to(device)
-        if _split(name)[2] == BETA_SUFFIX:
-            q, sc = quantize_beta(w, tp_size)
-        else:
-            q, sc = quantize_block(w)
+        q, sc = quantize_block(w)
         d = dequant_bf16(q.cpu(), sc.cpu()).float()
-        ref = torch.zeros_like(d)
-        if _split(name)[2] == BETA_SUFFIX:
-            local = w.shape[0] // tp_size
-            for r in range(tp_size):
-                ref[r * BETA_ROWS : r * BETA_ROWS + local] = (
-                    w[r * local : (r + 1) * local].float().cpu()
-                )
-        else:
-            ref = w.float().cpu()
+        ref = w.float().cpu()
         err = d - ref
         key = base.split(".layers.", 1)[1].split(".", 1)[1]
         qerr[key].append(
@@ -323,8 +297,7 @@ def build(
     }
     if kda:
         manifest["self_quantized"] = kda
-        manifest["tp_size"] = tp_size
-        manifest["beta_rows"] = BETA_ROWS
+        manifest["beta_block_rows"] = BETA_ROWS
     manifest_file = out_path.with_name(MANIFEST_FILE)
     with open(manifest_file, "w") as fh:
         json.dump(manifest, fh, indent=1)
@@ -357,10 +330,10 @@ def _manifest(model_path: str | None) -> dict | None:
         return json.load(fh)
 
 
-def beta_shard_rows(model_path: str | None, module: str) -> int | None:
-    """Rows per rank the KDA layer must reserve for its beta shard when the
-    swap-set self-quantized ``module`` (a vLLM ``in_proj_qkvgfab`` name); None
-    keeps the model's own layout."""
+def beta_block_rows(model_path: str | None, module: str) -> int | None:
+    """Rows the KDA layer reserves for its replicated beta shard when the
+    swap-set self-quantized ``module`` (a vLLM ``in_proj_qkvgfab`` name);
+    None keeps the model's own layout."""
     manifest = _manifest(model_path)
     if not manifest or not manifest.get("self_quantized"):
         return None
@@ -368,7 +341,7 @@ def beta_shard_rows(model_path: str | None, module: str) -> int | None:
     # wrapping (multimodal vs text-only) while the manifest stores one form.
     tail = module.split(".layers.", 1)[-1]
     listed = {m.split(".layers.", 1)[-1] for m in manifest["modules"]}
-    return manifest["beta_rows"] if tail in listed else None
+    return manifest["beta_block_rows"] if tail in listed else None
 
 
 def apply_config_group(model_path: str | None, hf_quant_config: dict | None) -> bool:
@@ -413,10 +386,7 @@ def main() -> None:
     ap.add_argument(
         "--self-quant-kda",
         action="store_true",
-        help="also quantize the BF16 KDA projections (needs --tp-size)",
-    )
-    ap.add_argument(
-        "--tp-size", type=int, help="tensor-parallel size the KDA beta layout is for"
+        help="also quantize the BF16 KDA projections",
     )
     args = ap.parse_args()
     build(
@@ -425,7 +395,6 @@ def main() -> None:
         args.out,
         args.skip_layer,
         self_quant_kda=args.self_quant_kda,
-        tp_size=args.tp_size,
     )
 
 

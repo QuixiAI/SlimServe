@@ -25704,3 +25704,36 @@ launches-per-step of the profiled round. Baseline for the phase: p0-nospec
   `p1-fp8swap-gate{1,2}.json`, trace
   `~/.local/scratch/slimserve-glm53/profile-state-p1-fp8swap/`; sidecar
   build log `~/.local/scratch/slimserve-glm53/serve-logs/swapset-build-4a.out`.
+
+### Item 4b: FP8 KDA projections (self-quantized, ZAI kept them BF16) - RETAINED, quality gate extended below
+
+- Hypothesis: the 34 KDA layers' merged `in_proj_qkvgfab` (6528 x 4096 per
+  rank) and `o_proj` (4096 x 2048) are the largest BF16 bytes left per step
+  (1.36 GB per rank at TP4); block-128 e4m3 halves them. The merged
+  projection's beta shard is one row per head (16 per rank), smaller than a
+  scale block and unsplittable by the block-scale loader, so the model gives
+  it a replicated whole block (`beta_block_rows=128`, the checkpoint's
+  [64, K] zero-padded on load) and each rank reads its heads from it; the
+  sidecar stores every tensor in its checkpoint shape, so it is
+  tensor-parallel agnostic (the Codex tree's per-rank padded beta layout was
+  TP-bound and is retired). `--self-quant-kda`: 238 tensors, rel Frobenius
+  error 2.6-2.8 %, worst element 3.8 % of absmax. Salvage table item 9:
+  +10.6 % c1, gate -0.014 nats.
+- Result (p1-fp8kda, on top of 4a): c1 141.8 / 144.8 / 144.7, c8 500.2 /
+  501.1 / 501.5, c16 672.2 / 671.2 / 669.7; medians 144.7 / 501.1 / 671.2 =
+  +10.7 / +4.2 / +3.1 % over p1-fp8swap; cumulative over Phase 0 +27.7 /
+  +11.6 / +9.9 %. `exact: true` on all nine runs. State: in-step idle
+  0.174 ms, kernel busy 5.79 ms (6.42 before), 1557 launches/step. Gates
+  -2.437 / -2.467: inside the band (-2.407..-2.478) but the pair's mean is
+  0.027 nats under the 4a boot's, at the size of the boot jitter, so the
+  gate is re-run eight times per arm (dense-only sidecar vs dense+KDA) on
+  fresh boots before the item is called clean; see the next entry. Canaries
+  tool / image pass; the text canary hit its 400-token cap inside a
+  coherent reasoning block ("A hash table is a data structure that stores
+  key-value pairs ..."), the cap is now 1200 tokens.
+- Decision: retained pending the extended gate. `SLIMSERVE_FP8_SWAPSET`
+  now also selects a sidecar by manifest stem for such comparisons.
+- Raw: `perf/results/2026-09-12/p1-fp8kda-pass{1,2,3}/`, gates
+  `p1-fp8kda-gate{1,2}.json`, trace
+  `~/.local/scratch/slimserve-glm53/profile-state-p1-fp8kda/`; sidecar
+  build log `~/.local/scratch/slimserve-glm53/serve-logs/swapset-build-4b.out`.
