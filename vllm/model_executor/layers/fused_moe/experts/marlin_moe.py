@@ -10,6 +10,7 @@ import torch
 import vllm._custom_ops as ops
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.config import get_current_vllm_config_or_none
+from vllm.model_executor.layers.fused_moe import combine_shared
 from vllm.model_executor.layers.fused_moe.activation import (
     MoEActivation,
     apply_moe_activation,
@@ -26,6 +27,7 @@ from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
     batched_moe_align_block_size,
     moe_align_block_size,
 )
+from vllm.model_executor.layers.fused_moe.router import glm_route_align
 from vllm.model_executor.layers.fused_moe.singleton_alignment import (
     SingletonAlignment,
     make_singleton_alignment,
@@ -56,7 +58,9 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kNvfp4Static,
 )
 from vllm.platforms import current_platform
+from vllm.quixicore.ops import quixicore_ops
 from vllm.scalar_type import ScalarType, scalar_types
+from vllm.utils.torch_utils import current_stream
 
 
 def _fused_marlin_moe(
@@ -334,7 +338,19 @@ def fused_marlin_moe(
     if input_dtype is not None and input_dtype.itemsize == 1:
         block_size_m = max(block_size_m, 16)
 
+    alignment = glm_route_align.consume(topk_ids)
     if (
+        alignment is not None
+        and alignment.block_size == block_size_m
+        and expert_map is None
+        and global_num_experts == E
+    ):
+        # The fused router already aligned this very batch for this block
+        # size: skip moe_align_block_size's kernels and fill.
+        sorted_token_ids = alignment.sorted_token_ids
+        expert_ids = alignment.expert_ids
+        num_tokens_post_padded = alignment.num_tokens_post_padded
+    elif (
         hidden_states.shape[0] == 1
         and expert_map is None
         and global_num_experts == E
@@ -971,8 +987,31 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
     ) -> None:
         if expert_map is not None:
             ops.moe_sum(input, output, topk_ids, expert_map)
-        else:
-            ops.moe_sum(input, output)
+            return
+        shared = combine_shared.consume(topk_ids)
+        if (
+            shared is not None
+            and quixicore_ops.has_moe_sum_add()
+            and input.is_cuda
+            and input.dtype == torch.bfloat16
+            and shared.output.dtype == torch.bfloat16
+            and shared.output.shape == output.shape
+            and shared.output.device == output.device
+            and input.is_contiguous()
+            and output.is_contiguous()
+            and shared.output.is_contiguous()
+            and input.data_ptr() % 16 == 0
+            and output.data_ptr() % 16 == 0
+            and shared.output.data_ptr() % 16 == 0
+        ):
+            # The runner published this batch's shared-expert output: fold it
+            # into the sum, one launch instead of moe_sum and the runner's add.
+            if shared.stream is not None:
+                current_stream().wait_stream(shared.stream)
+            quixicore_ops.moe_sum_add(input, shared.output, output)
+            shared.folded = True
+            return
+        ops.moe_sum(input, output)
 
 
 class BatchedMarlinExperts(MarlinExpertsBase):

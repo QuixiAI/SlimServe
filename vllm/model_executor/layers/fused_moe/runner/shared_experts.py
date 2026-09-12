@@ -150,6 +150,41 @@ class SharedExperts(torch.nn.Module):
 
         return output
 
+    def forward_deferred_join(
+        self,
+        shared_experts_input: torch.Tensor,
+        prequant_input: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.cuda.Stream | None] | None:
+        """Run the shared experts ahead of the routed experts for a combine
+        that folds their output: on the aux stream when the overlap order
+        applies, WITHOUT the join (the consumer waits on the returned stream
+        before reading), else on the current stream. None when the modular
+        kernel overlaps the shared experts internally; the caller then uses
+        forward(). The output is also kept for the ``output`` property."""
+        order = self._determine_shared_experts_order(shared_experts_input)
+        if order == SharedExpertsOrder.MK_INTERNAL_OVERLAPPED:
+            return None
+        assert self._output[self._output_idx] is None
+        stream = None
+        if order == SharedExpertsOrder.MULTI_STREAM_OVERLAPPED:
+            assert self._stream is not None
+            stream = self._stream
+            with torch.cuda.stream(self._stream):
+                output = self._run_layer(shared_experts_input, prequant_input)
+        else:
+            output = self._run_layer(shared_experts_input, prequant_input)
+        self._output[self._output_idx] = output
+        return output, stream
+
+    def _run_layer(
+        self,
+        shared_experts_input: torch.Tensor,
+        prequant_input: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if prequant_input is None:
+            return self._layer(shared_experts_input)
+        return self._layer(shared_experts_input, prequant_input=prequant_input)
+
     @property
     def _output_idx(self) -> int:
         return dbo_current_ubatch_id() if self.enable_dbo else 0

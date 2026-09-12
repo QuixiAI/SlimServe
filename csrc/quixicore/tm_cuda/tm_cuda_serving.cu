@@ -20,9 +20,12 @@
 #include "dsv4_projection_ampere.cuh"
 #include "bf16_decode_gemm.cuh"
 #include "fp8_decode_gemm.cuh"
+#include "glm_moe_routing.cuh"
+#include "glm_moe_combine.cuh"
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -43,6 +46,72 @@ static float* fpm(torch::Tensor& t) { return t.data_ptr<float>(); }
 // The backbone projections at decode: x[M, K] @ weight[N, K]^T (+ fp32 bias),
 // fp32 accumulation, bf16 or fp32 output. `supports` is the shape gate the
 // kernels were tuned for (N in 2048..16384 / 1024..16384, K % 128 == 0).
+static std::vector<torch::Tensor> py_glm_route_align(
+        torch::Tensor logits, torch::Tensor bias, int64_t topk, int64_t scoring,
+        bool renormalize, double scaling, int64_t block_size, int64_t max_padded,
+        int64_t max_blocks) {
+    CK(logits); CK(bias);
+    TORCH_CHECK(logits.scalar_type() == torch::kFloat32 && logits.dim() == 2,
+                "glm_route_align expects fp32 [M, E] router logits");
+    TORCH_CHECK(bias.scalar_type() == torch::kFloat32 && bias.dim() == 1 &&
+                    bias.numel() == logits.size(1),
+                "glm_route_align expects an fp32 [E] correction bias");
+    TORCH_CHECK(bias.device() == logits.device(),
+                "glm_route_align bias must be on the logits device");
+    const int M = int(logits.size(0)), E = int(logits.size(1));
+    TORCH_CHECK(M >= 1 && M <= glm_route::MAX_TOKENS,
+                "glm_route_align handles 1..16 tokens");
+    TORCH_CHECK(E == 288 && topk == 8,
+                "glm_route_align is instantiated for E=288, topk=8");
+    TORCH_CHECK(scoring == 0 || scoring == 1,
+                "glm_route_align expects sigmoid or sqrt-softplus scoring");
+    TORCH_CHECK(block_size == 8 || block_size == 16 || block_size == 32 ||
+                    block_size == 48 || block_size == 64,
+                "glm_route_align unsupported block size");
+    // moe_align_block_size's buffer geometry (pad_sorted_ids=False).
+    const int64_t expected_capacity = std::min(
+        M * topk * block_size, M * topk + E * (block_size - 1));
+    TORCH_CHECK(max_padded == expected_capacity &&
+                    max_blocks == (expected_capacity + block_size - 1) / block_size,
+                "glm_route_align alignment capacity mismatch");
+    const c10::cuda::CUDAGuard guard(logits.device());
+    auto i32 = logits.options().dtype(torch::kInt32);
+    auto topk_weights = torch::empty({M, topk}, logits.options());
+    auto topk_ids = torch::empty({M, topk}, i32);
+    auto sorted = torch::empty({max_padded}, i32);
+    auto expert_ids = torch::empty({max_blocks}, i32);
+    auto post_pad = torch::empty({1}, i32);
+    glm_route::route_align_kernel<288, 8><<<1, glm_route::THREADS, 0, stream()>>>(
+        fp(logits), fp(bias), fpm(topk_weights), topk_ids.data_ptr<int32_t>(),
+        sorted.data_ptr<int32_t>(), expert_ids.data_ptr<int32_t>(),
+        post_pad.data_ptr<int32_t>(), M, int(scoring), float(scaling), renormalize,
+        int(block_size), int(max_padded), int(max_blocks));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return {topk_weights, topk_ids, sorted, expert_ids, post_pad};
+}
+
+static void py_moe_sum_add(torch::Tensor x, torch::Tensor shared, torch::Tensor out) {
+    CK(x); CK(shared); CK(out);
+    TORCH_CHECK(shared.device() == x.device() && out.device() == x.device(),
+                "moe_sum_add: tensors must be on the same device");
+    const c10::cuda::CUDAGuard guard(x.device());
+    TORCH_CHECK(x.scalar_type() == torch::kBFloat16 && shared.scalar_type() == torch::kBFloat16 &&
+                    out.scalar_type() == torch::kBFloat16,
+                "moe_sum_add: bf16 tensors");
+    TORCH_CHECK(x.dim() == 3 && shared.dim() == 2 && out.dim() == 2,
+                "moe_sum_add: x [T, topk, D], shared/out [T, D]");
+    const int64_t T = x.size(0), topk = x.size(1), d = x.size(2);
+    TORCH_CHECK(shared.size(0) == T && shared.size(1) == d && out.size(0) == T && out.size(1) == d,
+                "moe_sum_add: shape mismatch");
+    TORCH_CHECK(d % glm_moe_combine::VEC == 0, "moe_sum_add: D must be a multiple of 8");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0 &&
+                reinterpret_cast<uintptr_t>(shared.data_ptr()) % 16 == 0 &&
+                reinterpret_cast<uintptr_t>(out.data_ptr()) % 16 == 0,
+                "moe_sum_add: tensor pointers must be 16-byte aligned");
+    glm_moe_combine::launch_moe_sum_add(bpm(out), bp(x), bp(shared), T, int(d), int(topk), stream());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 static torch::Tensor py_decode_gemm(torch::Tensor x, torch::Tensor weight,
                                     c10::optional<torch::Tensor> bias, bool fp32_out) {
     CK(x); CK(weight);
@@ -2153,6 +2222,13 @@ void init_serving(py::module_& m) {
     m.def("dsv4_hash_router_debug", &py_dsv4_hash_router_debug);
     m.def("dsv4_projection_gemv", &py_dsv4_projection_gemv, py::arg("x"),
           py::arg("weight"), py::arg("bf16_output") = false);
+    m.def("glm_route_align", &py_glm_route_align, py::arg("logits"),
+          py::arg("bias"), py::arg("topk"), py::arg("scoring"),
+          py::arg("renormalize"), py::arg("scaling"), py::arg("block_size"),
+          py::arg("max_padded"), py::arg("max_blocks"),
+          "fused small-M routing: scored top-k with bias selection + Marlin block alignment");
+    m.def("moe_sum_add", &py_moe_sum_add, py::arg("x"), py::arg("shared"), py::arg("out"),
+          "out[t] = shared[t] + sum_k x[t, k]: Marlin per-assignment sum + shared-expert add, one launch");
     m.def("decode_gemm", &py_decode_gemm, py::arg("x"), py::arg("weight"),
           py::arg("bias") = py::none(), py::arg("fp32_out") = false,
           "bf16 M<=16 GEMM on tensor cores: x @ weight^T (+ bias), fp32 accumulation");

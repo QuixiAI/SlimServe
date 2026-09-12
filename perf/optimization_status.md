@@ -25793,3 +25793,76 @@ Decision: FP8 KDA retained without reservation. Raw:
 - Raw: `perf/results/2026-09-12/p1-router-pass{1,2,3}/`, gates
   `p1-router-gate{1..4}.json`, trace
   `~/.local/scratch/slimserve-glm53/profile-state-p1-router/`.
+
+### Item 7b: fused mHC norm (`_fuse_mhc_norm`) on sm_120 - REJECTED
+
+- Hypothesis: `Glm5NextDecoderLayer` fuses the mHC post/pre norms into the
+  `glm5_mhc_fused_post_pre` kernel on SM80 only; taking the same fusion on
+  sm_120 removes the separate triton norm launches (about 90 per step).
+- Result (p1-mhcnorm, on top of item 7a): c1 142.3 / 142.3 / 142.1, c8
+  491.9 / 492.4 / 491.0, c16 668.6 / 664.6 / 666.4; medians 142.3 / 491.9 /
+  666.4 = -5.6 / -2.8 / -1.9 % against p1-router. `exact: true` on all
+  nine runs. State: 1423 launches/step (93 fewer) but kernel busy 5.90 ms
+  (+0.33 ms): the Ampere-tuned fused kernel runs slower on this part than the
+  norms it replaces. Gates -2.438 / -2.463 / -2.442 / -2.450 (mean -2.448).
+- Decision: rejected, `_fuse_mhc_norm` stays SM80-gated. The mHC transition
+  (0.78 ms/step at c1, 91 launches of about 8.6 us, latency-bound) stays a
+  Phase 2 target for an sm_120-specific kernel rather than the A100 fusion.
+- Raw: `perf/results/2026-09-12/p1-mhcnorm-pass{1,2,3}/`, gates
+  `p1-mhcnorm-gate{1..4}.json`.
+
+### Item 8: FP8 main KV for the 11 sparse-MLA layers (`glm5_next_main_kv_fp8`) - REJECTED FOR NOW
+
+- Hypothesis: FP8 is the official KV cache quantization; the per-layer e4m3
+  main KV for the DSA layers halves the sparse decode's KV bytes (the 2048
+  gathered rows x 576 channels per head group) and the KV footprint.
+- Result (p1-fp8kv, on top of item 7a, the mHC edit reverted first): c1
+  148.3 / 148.2 / 148.2, c8 489.5 / 490.2 / 489.0, c16 650.7 / 649.7 / 650.6;
+  medians 148.2 / 489.5 / 650.6 = -1.7 / -3.3 / -4.2 % against p1-router.
+  `exact: true` on all nine runs. State: kernel busy 5.63 ms (+0.06 ms),
+  1512 launches/step; the loss grows with concurrency, so it sits in the
+  fp8 sparse decode kernel (`mla_decode_fp8_sparse_nope`), which did not get
+  item 5's 32/64-token partition rule (the bf16 path did) and pays the e4m3
+  dequant per gathered row. Gates -2.437 / -2.442 / -2.429 / -2.449 (mean
+  -2.439): no quality cost.
+- Decision: rejected for now; the record keeps the unquantized main KV,
+  which the policy permits. Re-measure once the fp8 sparse decode path gets
+  the partition rule and a fused dequant (Phase 2); the profile should move
+  to FP8 KV when it is at parity, for the footprint.
+- Raw: `perf/results/2026-09-12/p1-fp8kv-pass{1,2,3}/`, gates
+  `p1-fp8kv-gate{1..4}.json`.
+
+### Item 6: fused route+align and shared-expert combine on the Marlin MoE path - RETAINED
+
+- Hypothesis: per MoE layer the decode path spent four launches on routing
+  (grouped_topk 3.5 us, moe_align_block_size 3.0 us, count_and_sort 1.6 us
+  and a fill) and two on the combine (moe_sum 1.2 us, the traced
+  shared + routed add 1.3 us). QuixiCore `glm_route_align` does the sigmoid
+  scores, bias-only top-8, renormalize + scale and the Marlin block alignment
+  in one block for M <= 16; the router publishes the alignment and
+  fused_marlin_moe consumes it (matched on the topk_ids tensor).
+  `moe_sum_add` folds the shared-expert output into the per-assignment sum
+  (fp32 accumulation, one bf16 rounding): the runner launches the shared
+  experts first, still on the aux stream, hands the output to Marlin's
+  moe_sum through `combine_shared`, and the add moves inside a new
+  `moe_forward_folded` op so the traced forward no longer emits it.
+- Result (p1-item6, on top of item 7a): c1 149.9 / 154.7 / 154.7, c8 512.2 /
+  510.9 / 508.8, c16 684.5 / 680.8 / 682.8; medians 154.7 / 510.9 / 682.8 =
+  +2.6 / +0.9 / +0.6 % over p1-router; cumulative over Phase 0 +36.5 /
+  +13.7 / +11.8 %. `exact: true` on all nine runs. State: wall/step 5.75 ms,
+  kernel busy 5.43 ms (-0.14 ms), 1348 launches/step (-168). Trace:
+  route_align_kernel 42/step at 4.7 us, moe_sum_add 42/step at 1.5 us;
+  grouped_topk, moe_align, count_and_sort, moe_sum and the traced add are
+  gone. Gates -2.463 / -2.473 / -2.464 / -2.432 (mean -2.458). Canaries pass.
+- Also seen in the trace (Phase 2 notes): 66 int `fill_` launches per step
+  (six per DSA layer, about 90 us) in the sparse MLA metadata path, and 11
+  cuBLAS bf16 wmma GEMMs of 4.9 us (one per DSA layer, about 54 us).
+- Decision: retained. Kill-switches `SLIMSERVE_GLM_ROUTE_ALIGN=0` and
+  `SLIMSERVE_MOE_COMBINE_SHARED=0` keep the reference paths for diagnosis.
+  The kernel is instantiated for E=288 / top-8 / M <= 16; MTP-3 decode
+  batches beyond 16 tokens take the reference path until a wider variant.
+- Raw: `perf/results/2026-09-12/p1-item6-pass{1,2,3}/`, gates
+  `p1-item6-gate{1..4}.json`, trace
+  `~/.local/scratch/slimserve-glm53/profile-state-p1-item6/`. Tests:
+  `tests/kernels/test_quixicore_glm_route_align.py`,
+  `test_quixicore_moe_sum_add.py`, `test_moe_shared_handoff.py`.

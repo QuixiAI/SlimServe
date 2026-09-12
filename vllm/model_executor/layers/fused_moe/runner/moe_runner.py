@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Callable, Iterable
 from contextlib import nullcontext
-import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -22,6 +22,7 @@ from vllm.forward_context import (
     is_forward_context_available,
 )
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe import combine_shared
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
@@ -52,6 +53,7 @@ from vllm.platforms import current_platform
 from vllm.utils.torch_utils import (
     _USE_LAYERNAME,
     LayerName,
+    current_stream,
     direct_register_custom_op,
 )
 
@@ -216,6 +218,37 @@ direct_register_custom_op(
 )
 
 
+def _moe_forward_folded(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    shared_experts_input: torch.Tensor | None,
+    input_ids: torch.Tensor | None,
+    prequant_input: torch.Tensor | None,
+    layer_name: _layer_name_type,
+    hidden_dim_unpadded: int,
+) -> torch.Tensor:
+    """moe_forward_shared with the shared-expert add done inside the op:
+    at decode the routed combine folds it (see combine_shared), otherwise
+    the op adds the two outputs itself. One output, like moe_forward."""
+    layer = get_layer_from_name(_resolve_layer_name(layer_name))
+    return layer._forward_impl(
+        hidden_states,
+        router_logits,
+        shared_experts_input,
+        input_ids,
+        prequant_input,
+        fold_shared=True,
+    )
+
+
+direct_register_custom_op(
+    op_name="moe_forward_folded",
+    op_func=_moe_forward_folded,
+    fake_impl=_moe_forward_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
 def _unpack(
     result: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
 ) -> tuple[torch.Tensor | None, torch.Tensor]:
@@ -314,10 +347,26 @@ class MoERunner(MoERunnerInterface):
             # Note: CPU doesn't require wrapped _forward_impl.
             return _moe_forward if self._shared_experts is None else _moe_forward_shared
 
+        if self._shared_experts is None:
+            return torch.ops.vllm.moe_forward
+        if self._fold_shared_static():
+            return torch.ops.vllm.moe_forward_folded
+        return torch.ops.vllm.moe_forward_shared
+
+    def _fold_shared_static(self) -> bool:
+        """Whether this layer's shared-expert add belongs inside the MoE op
+        (moe_forward_folded): nothing sits between the fused output and the
+        add that the traced forward would otherwise apply."""
+        assert self._shared_experts is not None
         return (
-            torch.ops.vllm.moe_forward
-            if self._shared_experts is None
-            else torch.ops.vllm.moe_forward_shared
+            combine_shared.enabled()
+            and current_platform.is_cuda()
+            and not self._shared_experts.enable_dbo
+            and self.routed_scaling_factor == 1.0
+            and self.routed_input_transform is None
+            and self.routed_output_transform is None
+            and not self.moe_config.is_sequence_parallel
+            and not self.moe_config.moe_parallel_config.use_ep
         )
 
     @property
@@ -599,6 +648,7 @@ class MoERunner(MoERunnerInterface):
         input_ids: torch.Tensor | None = None,
         prequant_input: torch.Tensor | None = None,
         preselected: tuple[torch.Tensor, torch.Tensor] | None = None,
+        fold_shared: bool = False,
     ) -> tuple[torch.Tensor | None, torch.Tensor]:
         """Run expert routing and the fused MoE kernel via the quant method.
 
@@ -606,10 +656,24 @@ class MoERunner(MoERunnerInterface):
         via the router, and the actual fused MoE computation. Returns
         (shared_expert_output, fused_expert_output).
         """
-        self._maybe_apply_shared_experts(
-            shared_experts_input, SharedExpertsOrder.NO_OVERLAP, prequant_input
-        )
+        # With fold_shared, a decode batch whose routed combine can fold the
+        # shared-expert output runs the shared experts first (still on the aux
+        # stream when the overlap order applies) and hands the output to the
+        # combine; any other batch gets the add here, inside the op.
+        deferred = None
+        if fold_shared and self._shared_fold_eligible(
+            hidden_states, shared_experts_input, prequant_input
+        ):
+            assert self._shared_experts is not None
+            deferred = self._shared_experts.forward_deferred_join(
+                shared_experts_input, prequant_input
+            )
+        if deferred is None:
+            self._maybe_apply_shared_experts(
+                shared_experts_input, SharedExpertsOrder.NO_OVERLAP, prequant_input
+            )
 
+        entry: combine_shared.SharedOutput | None = None
         if self.routed_experts.quant_method.is_monolithic:
             # Monolithic kernels: pass router_logits to routed_experts
             fused_out = self.routed_experts.forward_monolithic(
@@ -618,7 +682,6 @@ class MoERunner(MoERunnerInterface):
                 input_ids=input_ids,
             )
         else:
-            # Modular kernels: select experts first, then call routed_experts
             if preselected is None:
                 topk_weights, topk_ids = self.router.select_experts(
                     hidden_states=hidden_states,
@@ -628,7 +691,9 @@ class MoERunner(MoERunnerInterface):
                 )
             else:
                 topk_weights, topk_ids = preselected
-
+            if deferred is not None:
+                entry = combine_shared.SharedOutput(topk_ids, *deferred)
+                combine_shared.publish(entry)
             fused_out = self.routed_experts.forward_modular(
                 x=hidden_states,
                 topk_weights=topk_weights,
@@ -637,16 +702,47 @@ class MoERunner(MoERunnerInterface):
                 shared_experts_input=shared_experts_input,
                 prequant_input=prequant_input,
             )
+            combine_shared.clear()
 
-        self._maybe_apply_shared_experts(
-            shared_experts_input,
-            SharedExpertsOrder.MULTI_STREAM_OVERLAPPED,
-            prequant_input,
+        if deferred is None:
+            self._maybe_apply_shared_experts(
+                shared_experts_input,
+                SharedExpertsOrder.MULTI_STREAM_OVERLAPPED,
+                prequant_input,
+            )
+
+        shared_output = (
+            self._shared_experts.output if self._shared_experts is not None else None
         )
+        if entry is not None and entry.stream is not None and not entry.folded:
+            # The combine did not take it: join the aux stream here, as the
+            # overlap order would have.
+            current_stream().wait_stream(entry.stream)
+        if fold_shared:
+            if entry is None or not entry.folded:
+                assert shared_output is not None
+                fused_out.add_(shared_output)
+            shared_output = None
+        return shared_output, fused_out
 
+    def _shared_fold_eligible(
+        self,
+        hidden_states: torch.Tensor,
+        shared_experts_input: torch.Tensor | None,
+        prequant_input: torch.Tensor | None,
+    ) -> bool:
+        """Whether this batch's shared-expert output may be handed to the
+        routed combine (see combine_shared): a plain bf16 decode batch."""
         return (
-            self._shared_experts.output if self._shared_experts is not None else None,
-            fused_out,
+            self._shared_experts is not None
+            and shared_experts_input is not None
+            and prequant_input is None
+            and not self.routed_experts.quant_method.is_monolithic
+            and not self._fused_output_is_reduced
+            and hidden_states.is_cuda
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.shape == shared_experts_input.shape
+            and hidden_states.shape[0] <= combine_shared.MAX_TOKENS
         )
 
     def _sequence_parallel_context(self):
@@ -842,6 +938,7 @@ class MoERunner(MoERunnerInterface):
         self,
         shared_output: torch.Tensor | None,
         hidden_states: torch.Tensor,
+        fold_shared: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor | None, torch.Tensor]:
         if self.do_naive_dispatch_combine:
             hidden_states = get_ep_group().combine(
@@ -854,7 +951,7 @@ class MoERunner(MoERunnerInterface):
         ):
             hidden_states = get_pcp_group().reduce_scatter(hidden_states, dim=0)
 
-        if self.shared_experts is not None:
+        if self.shared_experts is not None and not fold_shared:
             assert shared_output is not None
             return shared_output, hidden_states
         else:
@@ -867,6 +964,7 @@ class MoERunner(MoERunnerInterface):
         shared_experts_input: torch.Tensor | None,
         input_ids: torch.Tensor | None = None,
         prequant_input: torch.Tensor | None = None,
+        fold_shared: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Entry point called by the custom op to run the MoE computation.
 
@@ -966,11 +1064,13 @@ class MoERunner(MoERunnerInterface):
                 input_ids=input_ids,
                 prequant_input=prequant_input,
                 preselected=preselected,
+                fold_shared=fold_shared,
             )
 
             return self._maybe_combine(
                 shared_output,
                 hidden_states,
+                fold_shared=fold_shared,
             )
 
     #########################################################

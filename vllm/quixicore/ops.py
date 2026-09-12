@@ -67,6 +67,49 @@ class quixicore_ops:
 
     @staticmethod
     @cache
+    def has_glm_route_align() -> bool:
+        return quixicore_ops.is_available() and hasattr(_qc(), "glm_route_align")
+
+    @staticmethod
+    def glm_route_align(
+        logits: torch.Tensor,
+        bias: torch.Tensor,
+        topk: int,
+        scoring: int,
+        renormalize: bool,
+        scaling: float,
+        block_size: int,
+        max_padded: int,
+        max_blocks: int,
+    ) -> list[torch.Tensor]:
+        """Fused small-M routing: scored top-k with bias-only selection plus
+        the Marlin block alignment, one launch. Returns [topk_weights,
+        topk_ids, sorted_token_ids, expert_ids, num_tokens_post_padded]."""
+        return _qc().glm_route_align(
+            logits,
+            bias,
+            topk,
+            scoring,
+            renormalize,
+            scaling,
+            block_size,
+            max_padded,
+            max_blocks,
+        )
+
+    @staticmethod
+    @cache
+    def has_moe_sum_add() -> bool:
+        return quixicore_ops.is_available() and hasattr(_qc(), "moe_sum_add")
+
+    @staticmethod
+    def moe_sum_add(x: torch.Tensor, shared: torch.Tensor, out: torch.Tensor) -> None:
+        """out[t] = shared[t] + sum_k x[t, k] (bf16 in/out, fp32 accumulation):
+        the Marlin per-assignment sum and the shared-expert add in one launch."""
+        _qc().moe_sum_add(x, shared, out)
+
+    @staticmethod
+    @cache
     def has_decode_gemm() -> bool:
         return quixicore_ops.is_available() and hasattr(_qc(), "decode_gemm")
 
