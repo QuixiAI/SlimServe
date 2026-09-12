@@ -1608,6 +1608,58 @@ static torch::Tensor py_skinny_gemm(torch::Tensor x, torch::Tensor w,
         pp, bp_, reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), MN, N, splits);
     return out;
 }
+// Speculative-row KDA kernels (see kda_decode_kernels.cuh, kda_spec_kernel).
+template <int MODE>
+static void launch_kda_spec(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor raw_g,
+                            torch::Tensor raw_beta, torch::Tensor A_log, torch::Tensor dt_bias,
+                            torch::Tensor state, torch::Tensor cu_seqlens, torch::Tensor state_indices,
+                            torch::Tensor prev_accepted, c10::optional<torch::Tensor> new_accepted,
+                            c10::optional<torch::Tensor> boundary_row, c10::optional<torch::Tensor> out,
+                            double scale, double lower_bound, bool use_lower_bound) {
+    // q/k/v/g: [1, N, H, D] (token stride may exceed H*D); beta [1, N, H]; state [slots, H, V, K].
+    TORCH_CHECK(q.dim() == 4 && q.size(0) == 1 && q.size(3) == 128 && v.size(3) == 128, "K = V = 128");
+    TORCH_CHECK(q.stride(3) == 1 && q.stride(2) == 128 && k.stride(1) == q.stride(1) && v.stride(1) == q.stride(1), "dense q/k/v heads");
+    TORCH_CHECK(state_indices.dim() == 2 && state_indices.stride(1) == 1 && state_indices.scalar_type() == torch::kInt32, "state_indices [R, S] int32");
+    const int H = q.size(2);
+    const int R = cu_seqlens.numel() - 1;
+    const int* na = new_accepted.has_value() ? new_accepted->data_ptr<int>() : nullptr;
+    const int* br = boundary_row.has_value() ? boundary_row->data_ptr<int>() : nullptr;
+    __nv_bfloat16* op = out.has_value() ? reinterpret_cast<__nv_bfloat16*>(out->data_ptr()) : nullptr;
+    const int64_t stride_out = out.has_value() ? out->stride(1) : 0;
+    const int max_rows = int(state_indices.size(1));   // rows per request <= spec columns
+    TORCH_CHECK(max_rows <= tms::kda::SPEC_MAX_T, "rows per request <= 8");
+#define KDA_SPEC_LAUNCH(TT)                                                                                        \
+    tms::kda::kda_spec_kernel<128, 128, MODE, TT><<<R * H, tms::kda::THREADS, 0, stream()>>>(                      \
+        bp(q), bp(k), bp(v), bp(raw_g), bp(raw_beta), fp(A_log), fp(dt_bias), state.data_ptr<float>(),             \
+        cu_seqlens.data_ptr<int>(), state_indices.data_ptr<int>(), prev_accepted.data_ptr<int>(), na, br, op,     \
+        H, q.stride(1), raw_g.stride(1), raw_beta.stride(1), stride_out, state.stride(0),                          \
+        int(state_indices.stride(0)), float(scale), float(lower_bound), use_lower_bound ? 1 : 0)
+    if (max_rows <= 4) { KDA_SPEC_LAUNCH(4); } else { KDA_SPEC_LAUNCH(8); }
+#undef KDA_SPEC_LAUNCH
+}
+static torch::Tensor py_kda_spec_fwd(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor raw_g,
+                                     torch::Tensor raw_beta, torch::Tensor A_log, torch::Tensor dt_bias,
+                                     torch::Tensor state, torch::Tensor cu_seqlens, torch::Tensor state_indices,
+                                     torch::Tensor prev_accepted, double scale, double lower_bound,
+                                     bool use_lower_bound, bool store_states, c10::optional<torch::Tensor> out) {
+    torch::Tensor o = out.has_value() ? out.value() : torch::empty_like(v);
+    TORCH_CHECK(cu_seqlens.numel() - 1 <= 4096 && v.size(1) / std::max<int64_t>(cu_seqlens.numel() - 1, 1) <= tms::kda::SPEC_MAX_T, "rows per request <= 8");
+    if (store_states)
+        launch_kda_spec<0>(q, k, v, raw_g, raw_beta, A_log, dt_bias, state, cu_seqlens, state_indices, prev_accepted,
+                           c10::nullopt, c10::nullopt, o, scale, lower_bound, use_lower_bound);
+    else
+        launch_kda_spec<1>(q, k, v, raw_g, raw_beta, A_log, dt_bias, state, cu_seqlens, state_indices, prev_accepted,
+                           c10::nullopt, c10::nullopt, o, scale, lower_bound, use_lower_bound);
+    return o;
+}
+static void py_kda_spec_commit(torch::Tensor k, torch::Tensor v, torch::Tensor raw_g, torch::Tensor raw_beta,
+                               torch::Tensor A_log, torch::Tensor dt_bias, torch::Tensor state,
+                               torch::Tensor cu_seqlens, torch::Tensor state_indices, torch::Tensor prev_accepted,
+                               torch::Tensor new_accepted, torch::Tensor boundary_row, double lower_bound,
+                               bool use_lower_bound) {
+    launch_kda_spec<2>(k, k, v, raw_g, raw_beta, A_log, dt_bias, state, cu_seqlens, state_indices, prev_accepted,
+                       new_accepted, boundary_row, c10::nullopt, 1.0, lower_bound, use_lower_bound);
+}
 static torch::Tensor py_kda_decode(torch::Tensor mixed_qkv, torch::Tensor raw_g,
         torch::Tensor raw_beta, torch::Tensor A_log, torch::Tensor dt_bias,
         torch::Tensor state, torch::Tensor state_indices, double scale,
@@ -2424,6 +2476,15 @@ void init_serving(py::module_& m) {
           py::arg("page_stride_bytes") = 0);
     m.def("skinny_gemm", &py_skinny_gemm, py::arg("x"), py::arg("w"), py::arg("bias") = py::none(),
           py::arg("target_ctas") = 256, py::arg("cfg") = 0, "Skinny bf16 GEMM (M <= 128): x [M,K] . w [N,K]^T + bias, split-K");
+    m.def("kda_spec_fwd", &py_kda_spec_fwd, py::arg("q"), py::arg("k"), py::arg("v"), py::arg("raw_g"),
+          py::arg("raw_beta"), py::arg("A_log"), py::arg("dt_bias"), py::arg("state"), py::arg("cu_seqlens"),
+          py::arg("state_indices"), py::arg("prev_accepted"), py::arg("scale"), py::arg("lower_bound"),
+          py::arg("use_lower_bound"), py::arg("store_states") = true, py::arg("out") = py::none(),
+          "KDA speculative-row forward (K=V=128): outputs, optional per-row state stores");
+    m.def("kda_spec_commit", &py_kda_spec_commit, py::arg("k"), py::arg("v"), py::arg("raw_g"), py::arg("raw_beta"),
+          py::arg("A_log"), py::arg("dt_bias"), py::arg("state"), py::arg("cu_seqlens"), py::arg("state_indices"),
+          py::arg("prev_accepted"), py::arg("new_accepted"), py::arg("boundary_row"), py::arg("lower_bound"),
+          py::arg("use_lower_bound"), "KDA speculative deferred commit: replay accepted rows, store committed/boundary states");
     m.def("kda_decode", &py_kda_decode, py::arg("mixed_qkv"), py::arg("raw_g"),
           py::arg("raw_beta"), py::arg("A_log"), py::arg("dt_bias"), py::arg("state"),
           py::arg("state_indices"), py::arg("scale"), py::arg("lower_bound"),

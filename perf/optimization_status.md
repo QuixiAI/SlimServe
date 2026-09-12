@@ -25818,3 +25818,45 @@ arm (queue17).
   predicates would cut roughly 40% of the stream: ~33 -> ~22 us at
   T=128, ~1 ms of the c64 step (about 2%). Below the keep rule on its
   own; recorded as the next step if the mHC transition is revisited.
+- KDA SPECULATIVE PATH, deferred commit (2026-09-12, operator go-ahead).
+  Contract mapped: with speculation the aligned mamba table is
+  [batch, num_spec + 1] = bt[state_idx + t] per draft row t; the forward
+  reads column prev_accepted - 1 and stores every row's state into its
+  column; the align pre-copy reads column acc - 1 at boundary crossings
+  and the post-copy reads the boundary row's column when a block boundary
+  falls inside the accepted rows (postprocess_mamba_fused_kernel:
+  token_bias = aligned_new_computed - num_tokens_running_state). A commit
+  that runs after sampling and stores only column acc - 1 plus the
+  boundary row's column keeps every consumer valid; a commit fused into
+  the NEXT step's forward (2 traffic units) would break the boundary
+  snapshot the post-copy takes at the end of the step - rejected.
+  Kernels written and parity-tested (tests/kernels/test_kda_spec_cuda.py
+  8/8, bit-exact vs the per-row-store forward on the committed and
+  boundary columns): Triton STORE_STATES=False flag + Triton
+  fused_recurrent_kda_commit; CUDA kda_spec_kernel<MODE> (MODE 0 today's
+  contract, 1 store-free forward, 2 replay-commit), 4 lanes per state row
+  with interleaved 16 B chunks, TT-templated (4/8 rows).
+  Measured (A100, H=16, K=V=128, 32 requests x 4 rows, us):
+  | kernel | time |
+  |---|---|
+  | Triton forward, per-row stores (today) | 128 (ncu: DRAM 60%) |
+  | Triton forward, no stores | 88 (DRAM 21%, SM 50%: issue-bound) |
+  | CUDA forward, per-row stores | 136 |
+  | CUDA forward, no stores | 57-60 (ncu: occupancy 22%, 118 regs, mixed long/short scoreboard) |
+  | CUDA commit, acc=2 / acc=4 | 55 / 66 (1 read + 1 write: 1.2 TB/s) |
+  | no-store forward + commit(acc=2) | 112-117 (-9..-13% vs today) |
+  Rejected variants: one row per warp (127 us, latency-bound on 10
+  shuffles per token per row), 8 rows per warp interleaved (80 -> 57 us
+  with 4-row templating), 4 lanes per row with private 128 B runs (147 us,
+  half-sector loads), forced 80 registers (spills, 64 us).
+  Floor analysis: the recurrence does two 128x128 matrix-vector products
+  and a rank-1 update per token per head (~100M FMAs at 32 requests plus
+  a cross-lane reduction per row per token), so the store-free forward
+  floors near 40-50 us, not at the 24 us memory floor; the deferred
+  commit is therefore worth ~25% of the KDA speculative cost at best
+  (~0.9 ms of the 44 ms c64 step, 2%; ~3.5% at c16) and needs the runner
+  plumbing (per-layer retained inputs, a post-sampling commit launch
+  inside/after the captured graph). DECISION: not wired; kernels kept as
+  tested diagnostics. The only larger lever left on this path is the
+  fused next-step commit (2 units) with the boundary snapshot moved to
+  after the replay, which is an align state-machine redesign.
