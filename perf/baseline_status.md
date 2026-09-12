@@ -2411,6 +2411,32 @@ graph capture for the hybrid GDN+MTP decode, Gemma-aware fused norm+quant.
   `glm53f-tp8-handoff-baseline/` (c16 after CPU isolation). Repeat spreads,
   commands, traces and correctness details are in the optimization notebook.
 
+## GLM-5.3-Flash NVFP4 glm53f-nvfp4-8 - TP4 x DP2 + fp8 main KV record, 2026-09-12
+- Layout: TP4 x DP2 with replicated MoE (data_parallel_replicate_moe,
+  2026-09-11: each replica keeps the full expert set sharded over its own
+  TP4 group, prefix-affinity DP routing), DFlash2 k=3 per replica for
+  <= 16 running requests, TP4-capable indexer row shard and sparse
+  tensor-core decode on, thinking budget 2000.
+- Main NoPE-MLA KV fp8 (e4m3) per layer (additional_config
+  glm5_next_main_kv_fp8; the KDA state and indexer pools stay
+  unquantized): native fp8 lane-parallel sparse decode and fp8 sparse
+  tensor-core decode at bf16 parity. VRAM pool 2,969,768 tokens (bf16:
+  1,669,244), 2.83x the 1M context per replica.
+- Exact-token (1000 in / 300 out, temp 1.0 / top-p 0.95 / top-k 20,
+  three warmed repeats, medians):
+  | c1    | c8    | c16   | c32   | c64    |
+  | 118.4 | 559.1 | 730.0 | 971.6 | 1139.3 |
+  bf16 DP2 record (2026-09-11): 117.8 / 506.8 / 786.5 / 985.8 / 1158.0;
+  TP8 record (2026-09-10): 153.6 / 495.0 / 687.3 / 879.5 / 1074.5. The
+  fp8 flip is capacity-neutral on throughput (within the run-to-run
+  spread of the three repeats).
+- Gates: text/reasoning/image/tool canaries pass; eviction-restore
+  acceptance 6/6 markers after a 3.74M-token churn with
+  VLLM_KV_TIER_VERIFY=1 (88 verify batches, 0 mismatched); WildChat
+  deep-context leg c8: 737 turns, 0 errors, 119/119 recall probes, 549
+  tier restores, 93.4% prefix hit rate, sessions to 624K tokens. Raw:
+  perf/results/2026-09-12/glm53f-fp8-gates2/ and glm53f-leg-fp8-2/.
+
 ## GLM-5.3-Flash NVFP4 glm53f-nvfp4-8 - V2 runner + DFlash2 speculative record, 2026-09-10
 - Runner: V2 (V1 deprecated 2026-09-10). Speculative by default:
   incoai/GLM-5.3-Flash-DFlash2 (revision bf582e4e) through the V2 DFlash2

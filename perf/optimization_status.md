@@ -25660,3 +25660,12 @@ arm (queue17).
   design pass with the tier and boundary-migration paths mapped first.
   Next kernel target comes from a fresh per-kernel profile of the DP2
   record at c16 and c64 (queue34, after the fp8 gates).
+- fp8 main-KV RECORD FLIP (2026-09-12): after the host-tier hash fix
+  (29e6fdf98) the gates rerun clean - canaries pass; exact medians c1
+  118.4 / c8 559.1 / c16 730.0 / c32 971.6 / c64 1139.3 (bf16 117.8 /
+  506.8 / 786.5 / 985.8 / 1158.0, within spread); eviction-restore
+  acceptance 6/6 after 3.74M-token churn, 88 verify batches 0
+  mismatched; WildChat leg c8 737 turns / 0 errors / 119/119 recall /
+  549 restores / 93.4% prefix hits / 624K max ctx. Pool 2.97M vs 1.67M
+  tokens. glm53f-nvfp4-8/a100 now carries glm5_next_main_kv_fp8: true.
+  Raw: perf/results/2026-09-12/glm53f-fp8-gates2/, glm53f-leg-fp8-2/.
