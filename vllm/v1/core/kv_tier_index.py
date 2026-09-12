@@ -316,23 +316,12 @@ class HostKVTierIndex:
         else:
             self._free.append(slot)
 
-    def stage_attention(
-        self,
-        owner: str,
-        logical: int,
-        block_hash: BlockHash,
-        gid: int = 0,
-        supersede: bool = False,
-    ) -> int | None:
-        """Reserve a slot for attention group ``gid`` of block `logical`.
-
-        With ``supersede`` (attention-only lineages), a position already
-        staged under a DIFFERENT hash means the chain diverged there (an
-        adopted conversation grew past its previous generation boundary):
-        the stale suffix is freed and restaged, mirroring what the GPU
-        prefix cache does with a diverged tail. Without it (mamba), an
-        occupied position is left untouched.
-        """
+    def _ensure_position(
+        self, owner: str, logical: int, block_hash: BlockHash, supersede: bool
+    ) -> Trajectory | None:
+        """Extend ``owner``'s trajectory to ``logical`` and bind that
+        position's hash. Returns None when the position is already bound to
+        a different hash and superseding is not allowed."""
         traj = self._trajectories.setdefault(owner, Trajectory())
         self.touch(owner)
         while len(traj.attn_slots) <= logical:
@@ -353,7 +342,39 @@ class HostKVTierIndex:
                 traj.attn_slots[i] = {}
                 traj.disk_attn[i] = {}
                 traj.hashes[i] = _EMPTY_HASH
-        if gid in traj.attn_slots[logical]:
+        traj.hashes[logical] = block_hash
+        return traj
+
+    def note_hash(
+        self, owner: str, logical: int, block_hash: BlockHash, supersede: bool = False
+    ) -> bool:
+        """Bind position ``logical``'s hash without staging any group. Every
+        hash position must be bound for lookup/resumable_blocks to walk it,
+        including positions where NO attention group's block completes -
+        which is every odd position when all attention blocks are 2 hash
+        blocks wide (fp8 main KV on GLM-5.3-Flash: MLA 2304 over the
+        1152-token KDA hash block)."""
+        return self._ensure_position(owner, logical, block_hash, supersede) is not None
+
+    def stage_attention(
+        self,
+        owner: str,
+        logical: int,
+        block_hash: BlockHash,
+        gid: int = 0,
+        supersede: bool = False,
+    ) -> int | None:
+        """Reserve a slot for attention group ``gid`` of block `logical`.
+
+        With ``supersede`` (attention-only lineages), a position already
+        staged under a DIFFERENT hash means the chain diverged there (an
+        adopted conversation grew past its previous generation boundary):
+        the stale suffix is freed and restaged, mirroring what the GPU
+        prefix cache does with a diverged tail. Without it (mamba), an
+        occupied position is left untouched.
+        """
+        traj = self._ensure_position(owner, logical, block_hash, supersede)
+        if traj is None or gid in traj.attn_slots[logical]:
             return None
         slot = self._alloc_slot(owner)
         if slot is None:

@@ -61,10 +61,10 @@ class FakeRequest:
     num_computed_tokens: int = 0
 
 
-def make_groups():
+def make_groups(attn_ratio=1):
     attn = SimpleNamespace(
         kv_cache_spec=FullAttentionSpec(
-            block_size=BLOCK, num_kv_heads=1, head_size=8, dtype=torch.bfloat16
+            block_size=BLOCK * attn_ratio, num_kv_heads=1, head_size=8, dtype=torch.bfloat16
         ),
         layer_names=["attn"],
     )
@@ -86,14 +86,14 @@ def make_groups():
     return [attn, ring, *mamba]
 
 
-def make_connector(indexer_ratio=None, window=False):
+def make_connector(indexer_ratio=None, window=False, attn_ratio=1):
     vllm_config = SimpleNamespace(
         cache_config=SimpleNamespace(block_size=8),  # deliberately stale
         kv_transfer_config=SimpleNamespace(
             kv_connector_extra_config={"host_tier_gb_per_rank": 1.0}
         ),
     )
-    groups = make_groups()
+    groups = make_groups(attn_ratio)
     if window:
         # A drafter's sliding-window group (DFlash2 on GLM-5.3-Flash): the
         # tier neither stages nor restores it; it is zeroed on resume.
@@ -193,11 +193,11 @@ def sched_output(step_tokens, new_reqs=(), cached=None):
     )
 
 
-def alloc(n_attn, planned, base=0, window=False):
+def alloc(n_attn, planned, base=0, window=False, attn_ratio=1):
     """Allocation shape mirroring the engine at external-load admission:
     attention positional; ring exactly one block; mamba groups shaped
     [null] * (planned - 1) + [real tail] (+ live compute blocks after)."""
-    attn = [FakeBlock(base + i) for i in range(n_attn)]
+    attn = [FakeBlock(base + i) for i in range(-(-n_attn // attn_ratio))]
     ring = [FakeBlock(base + 90)]
     mamba = []
     for g in range(2):
@@ -212,14 +212,16 @@ def alloc(n_attn, planned, base=0, window=False):
     return FakeKVCacheBlocks(blocks=(attn, ring, *mamba))
 
 
-def run_conversation(conn, req_id, n_blocks, base=0):
+def run_conversation(conn, req_id, n_blocks, base=0, attn_ratio=1):
     """Fill a request, freeze its boundary states in the fake pool's prefix
     cache (as the engine's align mode does), and finish it."""
     req = FakeRequest(
         req_id, [h(i) for i in range(n_blocks)], num_tokens=n_blocks * BLOCK + 4
     )
     conn.on_new_request(req)
-    conn.update_state_after_alloc(req, alloc(n_blocks, planned=0, base=base), 0)
+    conn.update_state_after_alloc(
+        req, alloc(n_blocks, planned=0, base=base, attn_ratio=attn_ratio), 0
+    )
     conn.build_connector_meta(sched_output({req_id: n_blocks * BLOCK}))
     req.num_computed_tokens = n_blocks * BLOCK
     meta = conn.build_connector_meta(sched_output({req_id: 1}))
@@ -443,3 +445,30 @@ def test_worker_reports_failed_restore_as_invalid_blocks_and_received():
     assert done == {"r9"}
     _, done_again = conn.get_finished(set())
     assert done_again is None
+
+
+def test_hash_block_follows_the_scheduler_gcd_not_the_attention_block():
+    """fp8 main KV on GLM-5.3-Flash widens every MLA block to 2x the KDA
+    state block; the scheduler hashes at the gcd (the state block), and so
+    must the tier, or every boundary and state tail position is 2x off."""
+    conn = make_connector(attn_ratio=2)
+    assert conn.hash_block_size == BLOCK
+    assert conn._attn_ratio == {0: 2}
+    assert conn._state_ratio == {2: 1, 3: 1}
+    assert conn._resume_align == 2
+
+    run_conversation(conn, "w1", 4, attn_ratio=2)
+
+    fresh = FakeRequest("w2", [h(i) for i in range(4)], num_tokens=4 * BLOCK + 8)
+    conn.on_new_request(fresh)
+    n_ext, is_async = conn.get_num_new_matched_tokens(fresh, 0)
+    assert is_async and n_ext == 4 * BLOCK
+    conn.update_state_after_alloc(
+        fresh, alloc(5, planned=4, base=200, attn_ratio=2), n_ext
+    )
+    meta = conn.build_connector_meta(sched_output({}))
+    ops = meta.restores["w2"]
+    # Two 2-hash-block attention restores + both mamba tails at position 3.
+    assert len(ops) == 2 + 2
+    assert {200, 201, 295, 296} <= {b for _, b, _ in ops}
+    assert "w2" not in meta.failed
