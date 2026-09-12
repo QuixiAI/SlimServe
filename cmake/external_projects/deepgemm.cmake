@@ -84,6 +84,16 @@ endif()
 cuda_archs_loose_intersection(DEEPGEMM_ARCHS
   "${DEEPGEMM_SUPPORT_ARCHS}" "${CUDA_ARCHS}")
 
+# The per-Python builder (tools/build_deepgemm_C.py) was dropped with the
+# other-platform build scaffolding; without it the target cannot be built on
+# any arch, so treat it like an unsupported arch instead of failing ninja.
+# A100 (8.0) never reached this branch; sm_120 (12.0f) does.
+if(DEEPGEMM_ARCHS AND NOT EXISTS "${CMAKE_SOURCE_DIR}/tools/build_deepgemm_C.py")
+  message(STATUS "DeepGEMM will not compile: "
+    "tools/build_deepgemm_C.py is absent (arch ${DEEPGEMM_ARCHS})")
+  set(DEEPGEMM_ARCHS "")
+endif()
+
 if(DEEPGEMM_ARCHS)
   message(STATUS "DeepGEMM CUDA architectures: ${DEEPGEMM_ARCHS}")
 
