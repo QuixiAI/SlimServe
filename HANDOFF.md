@@ -4033,3 +4033,37 @@ TP4 = 36 MLA + 18 indexer + 4 KDA state pages; 106 at TP8 = 68 + 34 + 4.
 - GPU queue: q19 NUMA arm -> q20 fp8-KV arm + FULL_AND_PIECEWISE arm ->
   q21 same-day base on the batched-partials tree -> q22 parity test +
   cold-prefill bisection. Logs ~/.local/scratch/glm53/queue*.log.
+
+## 2026-09-12 12:10: fp8 main KV on the record; mHC warp-split kernel; roofline audit
+
+- RECORD (glm53f-nvfp4-8/a100): TP4 x DP2 replicated MoE + fp8 (e4m3) main
+  NoPE-MLA KV (glm5_next_main_kv_fp8, pool 2.97M tokens) + mHC warp-split
+  partials. Exact medians c1 127.1 / c8 497.0 / c16 843.9 / c32 1023.3 /
+  c64 1320.8 tok/s (perf/baseline_status.md, raw perf/results/2026-09-12/
+  glm53f-mhcws-record/). Gates for the fp8 flip: canaries, eviction-restore
+  6/6 with verify (0/88 mismatched), WildChat leg 737 turns / 0 errors /
+  119/119 recall / 549 restores / 93.4% prefix hits.
+- Fixed on the way (29e6fdf98): the host tier hashed at the smallest
+  attention block while the scheduler hashes at the gcd of every group
+  (fp8 widens MLA blocks to 2304 beside the 1152 KDA block), and the tier
+  index never bound hashes at positions where no attention block completes;
+  the scheduler's invalid-block handler assumed one KV group and killed the
+  engine on the first fail-closed restore. tests/v1/core/
+  test_scheduler_invalid_blocks_hybrid.py, test_host_tier_connector.py.
+- Kernel pass (notebook 2026-09-12): mHC partials warp-split
+  (partials_batched_ws, c8bf2d250): 31 -> 13.6 us at T=32, 98 -> 33 at
+  T=128, serving +12.8% at c64. KDA CUDA decode kernel: env-gated, no lever
+  (Triton at bandwidth from N=32). Roofline audit of the c64 128-token
+  step: marlin NVFP4 MoE at the HBM roofline (167 distinct experts/layer,
+  VLLM_MOE_EXPERT_STATS diagnostic), all-reduce 1stage +2.2% (rejected),
+  dense bf16 GEMMs at 0.3-0.9 TB/s under cuBLAS - skinny split-K GEMM
+  written (skinny_gemm_ampere.cuh, op skinny_gemm, tests 54/54) but load-
+  bound at 0.65 TB/s; parked with the v2 design in the notebook.
+- OPEN: KDA speculative path (1 read + 4 per-row state stores per layer,
+  7% of the step) needs a deferred-commit runner design; the 1M-leg '!'
+  garbage after >= 900K restores in two-session runs is unreproduced;
+  registry tests fail on another session's glm53f-q2-1/metal and
+  glm53f-gguf records (not this record); Nsight Compute is blocked
+  (ERR_NVGPUCTRPERM). QuixiCore-CUDA port of the mHC family and the KDA
+  kernel is grafted (kernels/serving/, tm_cuda_serving.cu) pending its
+  compile check and commit.
