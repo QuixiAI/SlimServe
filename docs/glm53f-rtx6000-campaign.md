@@ -231,6 +231,11 @@ pairs through the root complex (NODE); P2P reads work on every pair (52 GB/s,
 8 KB copy 9.5 us). Host: EPYC 9334 32c/64t, one NUMA node, 188 GB RAM,
 earlyoom active. CUDA 12.8 / 13.0 / 13.2 toolkits; the driver is 13.0, so
 CUDA 13.3 images run handicapped (NCCL cuMem/P2P and CUDA IPC fail).
+Driver install: Ubuntu's own `nvidia-driver-580-open` 580.173.02 with the
+prebuilt signed modules `linux-modules-nvidia-580-open-7.0.0-31-generic`
+for the HWE kernel; no DKMS (the DKMS build fails on every 7.0.0-2x
+kernel, which is why the box moved to prebuilt modules on 2026-09-01 and
+holds the 580 packages); secure boot off.
 
 GLM-5.3-Flash: 45 layers (3 dense FFN 12288, 42 MoE: 288 routed experts
 top-8 at intermediate 2048 = 25.2M params each, plus one shared expert), 34
@@ -769,7 +774,21 @@ microbench GB/s and an e2e entry.
 1. Salvage: yes, the KEEP set of section 1d, one commit at a time,
    re-measured. Nothing else from the closed PRs.
 2. Driver upgrade for an unhandicapped B12X control: still open; it only
-   changes how honest the external comparison is, not our stack.
+   changes how honest the external comparison is, not our stack. Specifics:
+   the control image is CUDA 13.3.1, whose driver branch is 610 (per
+   `cuda-compat-13-3` = 610.57). On the 580 driver it runs in minor-version
+   compatibility and had to be started with `NCCL_CUMEM_ENABLE=0`,
+   `NCCL_P2P_DISABLE=1`, `B12X_PCIE_ALLREDUCE=0`: all-reduce through host
+   shared memory, its PCIe all-reduce off. Ubuntu ships prebuilt 610-open
+   modules for this exact kernel (`linux-modules-nvidia-610-open-7.0.0-31-generic`,
+   driver 610.43.02), the same no-DKMS mechanism that works today, so the
+   upgrade is `apt install nvidia-driver-610-open
+   linux-modules-nvidia-610-open-generic-hwe-24.04` after unholding the 580
+   set, re-hold the 610 set, reboot; rollback is the 2026-09-01 apt command
+   from the history log. Do not use the NVIDIA repo's `nvidia-open` (615,
+   DKMS). Our stack (torch cu130) is indifferent. If done, do it before the
+   Phase 0 baseline so the campaign runs on one driver, and drop
+   `NCCL_P2P_DISABLE=1` from `~/.config/fish/conf.d/tinybox-env.fish`.
 3. Speculator: whichever is fastest on the measured workloads. The DFlash2
    drafter's cc-by-nc-nd license is acceptable for self-hosted and internal
    use; the campaign may end with two records (DFlash2 for the fastest,
@@ -791,14 +810,21 @@ microbench GB/s and an e2e entry.
    `/raid/weights/GLM-5.3-Flash-NVFP4-FP8-KDA-TP4` (a 7.2 GB duplicate of
    the sidecars that live next to the checkpoint, verified byte-identical,
    plus symlinks).
-6. NEW, needs an answer before Phase 6: hosting of the FP8 hybrid
-   artifacts. The retained record depends on two sidecars built from the
-   306 GB native checkpoint (`f32-overrides.safetensors` 1.2 MB,
-   `fp8-swapset.safetensors` 7.2 GB). For anyone else to run the profile,
-   `slimserve.fetch` must be able to download them: publish the sidecars in
-   a SlimServe Hugging Face repo (recommended, small), or publish the full
-   hybrid checkpoint (~200 GB). Until then the record is reproducible only
-   with both checkpoints on disk and the builders.
+6. Hosting of the FP8 hybrid artifacts (needs an HF org and a name by
+   Phase 6; nothing now). This is not about third parties reproducing the
+   benchmark (they download the RedHatAI quant and run vLLM). It is about
+   the profile working on any RTX PRO 6000 box: `slimserve glm53f-nvfp4-4
+   --serve` downloads what the source names, and the retained record serves
+   157 backbone weights in FP8 that are not in the RedHatAI quant (cut out of
+   ZAI's 306 GB native checkpoint, KDA ones self-quantized). Without
+   publishing them the record only runs here. Decision: publish a hybrid
+   checkpoint on Hugging Face as its own quant (RedHatAI NVFP4 experts +
+   native FP8 dense / shared / DSA / KDA projections + the F32 tensors
+   RedHatAI downcast, ~198 GB), name it as the profile source, and retire
+   the runtime swap-set loader; keep the TP-bound KDA beta rows BF16 so the
+   checkpoint is TP-agnostic. Alternatives rejected: a 7.2 GB sidecar repo
+   (two sources per quant, loader hooks stay) or cutting the tensors from the
+   306 GB native download at first boot.
 
 ## 12. Next command
 
