@@ -25563,3 +25563,21 @@ arm (queue17).
   .so while the workers were importing it (my collision). Probe 5 runs
   after the pair-decode build (queue27) with the calibrated 6.8
   chars/token filler (probe 3 covered 271K-403K real tokens: all clean).
+- fp8 NoPE decode, pair decode LANDED (1a524cb69): native fp8 613 us vs
+  native bf16 602 us at B=32 (was 1206), parity 24/24 - fp8 storage now
+  costs nothing at decode on the native kernel and moves half the bytes.
+  Triton TC fp8: the in-kernel per-element scale form stays (361 us at
+  split 64); folding the scale into q/accumulator measured 632 us
+  (REJECTED, Triton codegen), the 16-bit assembly 1655 us (REJECTED).
+  The TC fp8 path remains 2.5x TC bf16, so fp8 serving decode at c<=32
+  routes through TC only when the TC kernel wins; the fp8 arm's
+  -10..-17% needs a re-measure now that the native path is at parity
+  (queued after the tier test). Raw: perf/results/2026-09-12/kernel-bench/.
+- COLD PREFILL at real 704K / 855K / 956K / 1,046K prompt tokens on the
+  DP2 record: all four answer the planted codename correctly, no '!'
+  garbage, e2e 90-324 s (probe 5, calibrated 6.8 chars/token). So a cold
+  single-request prefill to the 1M ceiling is clean; the 1M-leg garbage
+  probes (each right after a tier restore of a >=900K prefix) point at
+  the restore/recompute path at that depth, not at prefill. A forced-
+  eviction tier acceptance at 950K context runs now (queue28,
+  perf/results/2026-09-12/glm53f-tier950k/).
