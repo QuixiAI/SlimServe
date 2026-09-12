@@ -25704,3 +25704,14 @@ arm (queue17).
   times 2.4 waves. Expected serving effect: ~4.6 ms of 49 ms per c64
   step (9%), ~1.6 ms of 26 ms per c16 step (6%); serving A/B queued
   (queue35: WS=1 vs WS=0, c16/c64, two repeats each).
+- mHC warp-split kernel, SERVING A/B (2026-09-12, fp8 DP2 record, exact
+  harness, two repeats per arm, raw perf/results/2026-09-10/glm53f-dflash2/
+  mhc-ws{1,0}-r{1,2}): WS=1 c64 1330.9 / 1292.5 / 1330.6 / 1302.0 vs WS=0
+  1179.2 / 1125.9 / 1159.8 / 1173.9 tok/s -> median 1316 vs 1167, +12.8%;
+  c16 733.9 / 841.9 / 865.2 / 766.9 vs 778.2 / 770.0 / 727.9 / 821.3 ->
+  median 805 vs 774, +4% (inside the c16 spread). KEPT (default on). The
+  c64 gain exceeds the kernel's own 4.6 ms/step estimate; at 32 requests
+  per replica with k=3 the 128-token verify step is now shorter than the
+  drafter+verify cadence needed to keep acceptance up, so the pipeline
+  compounds the kernel saving. New record medians queued (queue36:
+  c1..c64 x3 + canaries on the committed tree).
