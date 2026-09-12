@@ -25,7 +25,7 @@ class GateLinear(ReplicatedLinear):
     4. fp32 specialized kernel  (SM90+, bf16/fp32 in, fp32 out, M<=32,
        (H, E) in {(3072, 256), (6144, 128), (6144, 256)})
     5. experimental bf16x3 CuteDSL kernel (opt-in, SM100, bf16 in, fp32 weight)
-    6. cuBLAS bf16×bf16→fp32 (SM90+, or GLM-5.3-Flash SM80 shape)
+    6. cuBLAS bf16×bf16→fp32 (SM90+, or the GLM-5.3-Flash shape elsewhere)
     7. F.linear via ReplicatedLinear (ultimate fallback)
 
     The ``out_dtype`` attribute is mutable and can be set after init
@@ -89,13 +89,15 @@ class GateLinear(ReplicatedLinear):
         self.allow_dsv4_ampere_router_gemm = (
             self._dsv4_ampere_router_shape and out_dtype == torch.float32
         )
-        # GLM-5.3-Flash requires FP32 router logits. Ampere supports cuBLAS
-        # BF16 inputs with FP32 output; rounding to BF16 and then casting
-        # back loses information (and adds a copy) before expert selection.
+        # GLM-5.3-Flash requires FP32 router logits. cuBLAS takes BF16 inputs
+        # with FP32 output on every CUDA arch (Ampere, and sm_120 which has
+        # none of the SM90/SM100 specialized kernels); rounding to BF16 and
+        # then casting back loses information (and adds a copy) before
+        # expert selection.
         self._glm5_next_ampere_router_shape = (
             not bias
             and current_platform.is_cuda()
-            and current_platform.is_device_capability((8, 0))
+            and not can_use_specialized_kernels
             and input_size == 4096
             and output_size == 288
         )

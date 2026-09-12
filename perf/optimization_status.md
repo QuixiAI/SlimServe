@@ -25774,3 +25774,22 @@ Decision: FP8 KDA retained without reservation. Raw:
 - Decision: retained (both NoPE bindings, bf16 and fp8 cache).
 - Raw: `perf/results/2026-09-12/p1-part-pass{1,2,3}/`, trace
   `~/.local/scratch/slimserve-glm53/profile-state-p1-part/`.
+
+### Item 7a: FP32 router logits through cuBLAS bf16 x bf16 -> fp32 on sm_120 - RETAINED
+
+- Hypothesis: `GateLinear` reserved its cuBLAS bf16-in / fp32-out tier for
+  the GLM-5.3-Flash shape on SM80 only; on sm_120 (no SM90/SM100
+  specialized router kernels) the router ran F.linear in bf16 and cast the
+  logits to fp32 afterwards: a rounding step before expert selection and one
+  more launch per MoE layer. The tier is now taken wherever the specialized
+  kernels are absent.
+- Result (p1-router, on top of item 5): c1 150.6 / 151.1 / 150.8, c8 507.0 /
+  506.2 / 505.7, c16 679.0 / 679.4 / 674.8; medians 150.8 / 506.2 / 679.0 =
+  +1.0 / +1.0 / +0.2 % over p1-part; cumulative over Phase 0 +33.1 / +12.7 /
+  +11.1 %. `exact: true` on all nine runs. State: in-step idle 0.170 ms,
+  kernel busy 5.57 ms, 1516 launches/step (38 fewer: the casts). Gates
+  -2.455 / -2.444 / -2.430 / -2.441 (mean -2.443). Canaries pass.
+- Decision: retained.
+- Raw: `perf/results/2026-09-12/p1-router-pass{1,2,3}/`, gates
+  `p1-router-gate{1..4}.json`, trace
+  `~/.local/scratch/slimserve-glm53/profile-state-p1-router/`.
