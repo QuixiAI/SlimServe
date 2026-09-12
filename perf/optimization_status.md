@@ -25860,3 +25860,33 @@ arm (queue17).
   tested diagnostics. The only larger lever left on this path is the
   fused next-step commit (2 units) with the boundary snapshot moved to
   after the replay, which is an align state-machine redesign.
+
+## 2026-09-12 THROUGHPUT PROGRAM: glm53f-nvfp4-8 to the practical maximum (operator: "world's fastest GLM-5.3-Flash NVFP4 on 8x A100")
+
+Metrics. (1) Registry exact-token medians (1000 in / 300 out, one batch
+of N requests, wall clock incl. prefill and drain) stay the record's
+comparability number. (2) NEW primary target: sustained output tok/s under
+continuous load, `vllm bench serve` random dataset 1000/300, 640 prompts,
+max-concurrency 64 and 128 (steady state dominates; continuous prefill is
+production-like). (3) WildChat deep-context leg tok/s and recall as the
+production-shape check. Note from the record log: during the exact c64
+batch each replica holds only 13-18 running requests at a time (prefill
+ramp, then drain) and the engine's own generation rate reads ~1.8K tok/s
+while the harness reports 1.3K - the exact number is prefill-heavy.
+Phases, by value over risk:
+1. Batch shape and draft length (measurement only): exact c64/c96/c128;
+   k=4 and k=2 at all batch sizes vs the record's k=3 (<=16) / 0 (17-64)
+   schedule (queue40). Then sustained-load baselines at c64/c128.
+2. Dense weight quantization: ~10 GB of bf16 attention/KDA/indexer weights
+   per model (2.5 GB per rank) stream through cuBLAS at 0.3-0.9 TB/s; fp8
+   weight-only marlin (W8A16, online quantization of the bf16 checkpoint
+   weights, the fp8 path vLLM already uses on Ampere) halves the bytes.
+   Quality gates: canaries, recall probes, exact medians; an accuracy
+   decision for the operator.
+3. Micro-batch overlap: the step is ~34% HBM-streaming MoE and ~66%
+   compute-bound kernels at 20-50% DRAM; two half-batches on two streams
+   overlap one's MoE stream with the other's attention/dense compute.
+   Runner + CUDA-graph redesign; design pass first.
+4. Prefill: the record's prompt throughput during the c64 ramp reads
+   4.8-12K tok/s per replica; a prefill-step profile decides whether the
+   indexer/sparse path or the MoE at large M is the limiter.
