@@ -25543,3 +25543,23 @@ arm (queue17).
   prompt tokens all answer correctly with no '!' garbage; the earlier
   probe's requested lengths tokenized at 2.62 chars/token, so the 900K+
   regime was not reached - rerun queued (queue23, 700K..1.04M actual).
+- Kernel pass (QuixiCore handbook loop, 2026-09-12): sparse MLA fp8 NoPE
+  decode. Baseline at B=32 rows x 16 heads x top-2048: native bf16 602 us,
+  native fp8 1206 us, TC bf16 (split 128) 145 us, TC fp8 (split 64) 361
+  us - the fp8 paths are 2-2.5x bf16 while moving half the bytes and
+  neither is byte-bound (bf16 TC: 64 MB in 145 us = 0.44 TB/s), i.e. the
+  decode structure is the cost. (1) VECFP8L: a lane-parallel fp8 row path
+  in the native kernel mirroring VECBF16 (32 indices per round, one
+  16-byte load per lane, 4 rows in flight, kv_scale folded into q and
+  applied once to the accumulator): 1206 -> 982 us (-19%), parity 24/24.
+  (2) Triton TC decode via 16-bit assembly to fp16: 361 -> 1655 us
+  (REJECTED - Triton's int16 path is far slower on sm80; reverted to the
+  int32 assembly, keeping the folded scale). Next: a branchless half2
+  pair decode in the native path (an e4m3 byte is exactly the fp16
+  ((b&0x7F)<<7 | (b&0x80)<<8) x 256, subnormals included) - built and
+  queued for parity + bench. The fp8 opt-in remains a capacity feature
+  (1.78x pool) with a decode cost until fp8 matches bf16.
+- Cold-prefill probe 4 died at boot: the extension rebuild copied the new
+  .so while the workers were importing it (my collision). Probe 5 runs
+  after the pair-decode build (queue27) with the calibrated 6.8
+  chars/token filler (probe 3 covered 271K-403K real tokens: all clean).
