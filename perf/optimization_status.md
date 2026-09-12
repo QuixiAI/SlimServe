@@ -25977,3 +25977,18 @@ Phases, by value over risk:
   126/126 recall / 658K max ctx (k=3 leg: 737 turns). Baseline and
   profile note updated. The k=2 flip is the day's largest serving gain:
   +7-14% exact at c8-c64, +17-22% sustained at c64/c128.
+- PREFILL PROFILE (2026-09-12, queue47, 32 requests x ~3K-token prompts,
+  1 output token, torch profiler on DP0 rank 0; raw ~/.local/scratch/
+  glm53/prof-prefill-c32): window 6.9 s, 97% kernel-busy, 19 chunked
+  prefill steps of ~2.5K tokens per replica (~7K tok/s per replica).
+  Shares: sparse MLA attention via the DECODE kernel mla_decode_fp8_v
+  38.9% (209 launches x 12.4 ms: every query token streams its own
+  top-2048 keys, ~1 MB per token per layer), marlin NVFP4 MoE 21.4% +
+  3.4% (75 ms per step), mHC partials 8.3% + finalize 2.8%, dense bf16
+  GEMMs ~10% (256x128 tiles: compute-bound, fine), NCCL all-reduce 5.2%
+  (the 2.5K-token messages go to NCCL, 350 ms), KDA chunk kernels ~2%.
+  TARGET: a prefill-shaped sparse attention kernel (block of queries x
+  union of their selected keys on tensor cores with a per-query mask)
+  replaces the per-token decode kernel; the attention share should drop
+  from 39% to ~10%, i.e. prefill ~1.4x faster, which feeds the sustained
+  metric directly.
