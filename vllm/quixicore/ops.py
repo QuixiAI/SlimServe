@@ -1599,6 +1599,26 @@ class quixicore_ops:
         )
 
     @staticmethod
+    def mla_sparse_prefill_fp8(
+        q: torch.Tensor,
+        data: torch.Tensor,
+        bt: torch.Tensor,
+        indices: torch.Tensor,
+        topk_length: torch.Tensor,
+        block_size: int,
+        scale: float,
+        kv_scale: float,
+        page_stride_bytes: int = 0,
+    ) -> torch.Tensor:
+        """Sparse NoPE-MLA attention for prefill chunks over the fp8 latent:
+        groups of 4 consecutive queries attend on tensor cores over the union
+        of their selected 4-token pools with a per-query mask. Same inputs as
+        mla_decode_fp8_sparse_nope; q must be [T, 16, 512] (TP4 heads)."""
+        return _qc().mla_sparse_prefill_fp8(
+            q, data, bt, indices, topk_length, block_size, scale, kv_scale, page_stride_bytes
+        )
+
+    @staticmethod
     def kda_decode(
         mixed_qkv: torch.Tensor,
         raw_g: torch.Tensor,
