@@ -87,11 +87,23 @@ _SPARSE_PREFILL: bool | None = None
 
 
 def _sparse_prefill_enabled() -> bool:
+    """Profile flag additional_config.glm5_next_sparse_prefill (default on),
+    env VLLM_QC_SPARSE_PREFILL=0/1 overrides for A/B runs."""
     global _SPARSE_PREFILL
     if _SPARSE_PREFILL is None:
         import os
 
-        _SPARSE_PREFILL = os.getenv("VLLM_QC_SPARSE_PREFILL", "0") == "1"
+        env = os.getenv("VLLM_QC_SPARSE_PREFILL")
+        if env is not None:
+            _SPARSE_PREFILL = env == "1"
+        else:
+            try:
+                from vllm.config import get_current_vllm_config
+
+                extra = get_current_vllm_config().additional_config or {}
+                _SPARSE_PREFILL = bool(extra.get("glm5_next_sparse_prefill", True))
+            except Exception:
+                _SPARSE_PREFILL = True
     return _SPARSE_PREFILL
 
 

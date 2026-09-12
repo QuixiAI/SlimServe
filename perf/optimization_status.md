@@ -25992,3 +25992,24 @@ Phases, by value over risk:
   replaces the per-token decode kernel; the attention share should drop
   from 39% to ~10%, i.e. prefill ~1.4x faster, which feeds the sustained
   metric directly.
+- SPARSE MLA PREFILL KERNEL (2026-09-12): csrc/quixicore/serving/
+  mla_sparse_prefill_kernels.cuh + op mla_sparse_prefill_fp8, dispatched
+  from the sparse backend's MQA forward for chunks with prefill tokens
+  (flag glm5_next_sparse_prefill, env VLLM_QC_SPARSE_PREFILL override).
+  Design: CTA per 4 consecutive queries x 16 local heads (64 rows), the
+  prep kernel sorts the (physical pool, query, token-bit) entries of the
+  4 index lists (bitonic sort in smem, block scan) into a union pool list
+  + 4-bit masks; tiles of 8 pools (32 keys) dequantized e4m3 -> bf16 into
+  smem once and used by Q.K^T (ldmatrix) and P.V (ldmatrix.trans); the
+  warp pair of a query splits the 512-dim reduction and swaps partial
+  scores through smem; FA2 online softmax in fp32, kv_scale folded into
+  q and applied to O. Parity: tests/kernels/test_quixicore_sparse_prefill
+  5/5 vs the torch reference (< 5e-3), sparse decode tests still 23/23.
+  Microbench (worst case, random non-overlapping pools): 1.7-2.0x the
+  decode kernel; real prefill has heavy pool overlap between neighbours.
+  Serving A/B (same protocol, one run per arm, k=2 record): sustained
+  c64 1508 vs 1417 (+6.4%), c128 1864 vs 1674 (+11.3%); exact c8/c16/c64
+  within spread (prefill is one burst there); canaries pass both arms.
+  KEPT (default on). Semantics note: duplicate indices (tail inside a
+  selected pool) count once, twice in the decode kernel. Prefill profile
+  and WildChat leg with it on: queue49.
