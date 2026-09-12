@@ -25637,3 +25637,26 @@ arm (queue17).
   generalize _update_requests_with_invalid_blocks to hybrid groups;
   (2) find why fp8 restores are unstageable. The record flip is on hold
   (working tree reverted to bf16 until both are fixed).
+- KDA speculative path, traffic analysis (2026-09-12, no GPU needed): the
+  115 us/layer "spec fwd" cost at 32 requests x 4 rows is NOT a slow
+  kernel. fused_recurrent_kda_fwd_kernel keeps the state in registers
+  across the rows, reads it once, but STORES it once per row (per-row
+  state slots so the next step can resume from the accepted row:
+  initial_token = num_accepted - 1). Traffic = 1 read + 4 writes of
+  33.5 MB (H=16, K=V=128 fp32, 32 requests) = 168 MB; 115 us = 1.46 TB/s
+  = A100 bandwidth. The decode kernel is 2x (1 read + 1 write, 46 us).
+  The only lever is fewer state stores: (a) deferred commit - the spec
+  kernel stores nothing, the NEXT step replays the accepted rows from
+  the initial slot (inputs of the previous step's rows retained per
+  state slot, ~1.5 MB/layer) and commits once: 2x traffic, ~46 us, i.e.
+  ~2.3 ms per step x 34 layers, 4-7% at c8-c16 where k=3 runs (per
+  replica batch <= 16). Hazard: every other state consumer (packed
+  decode after a spec->decode transition, align-mode boundary
+  migrations, tier snapshots/DMA of frozen blocks) sees an uncommitted
+  slot between steps, so the commit must run before any of them; (b)
+  reverse-replay from the final state divides by exp(gate) in (0.0067,
+  1) and amplifies fp32 error up to 150x per row - rejected. DEFERRED:
+  (a) is a runner state-machine change, not a kernel change; it needs a
+  design pass with the tier and boundary-migration paths mapped first.
+  Next kernel target comes from a fresh per-kernel profile of the DP2
+  record at c16 and c64 (queue34, after the fp8 gates).
