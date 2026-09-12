@@ -25761,3 +25761,14 @@ arm (queue17).
   Compute is blocked on this box (ERR_NVGPUCTRPERM); enabling
   NVreg_RestrictProfilingToAdminUsers=0 would make the next attempt far
   cheaper.
+- Custom all-reduce algorithm A/B (2026-09-12, record, exact harness,
+  two repeats per arm; raw perf/results/2026-09-10/glm53f-dflash2/
+  ar-{1stage,default}-r{1,2}): the 128-token step's 1 MB bf16 message
+  sits above the 512 KB one-shot/two-shot crossover, so the record runs
+  cross_device_reduce_2stage (29 us p50) 90x per step. Forcing
+  VLLM_CUSTOM_ALLREDUCE_ALGO=1stage: c64 1360.7 / 1322.5 / 1359.0 /
+  1365.5 vs default 1338.3 / 1297.7 / 1324.5 / 1344.7 tok/s (median
+  1360 vs 1331, +2.2%); c16 815 vs 806 (+1%). REJECTED under the 3% keep
+  rule (consistent but small; the all-reduce is 7% of the step, so even
+  a free one-shot could not exceed ~4%). The GLM-5.3 path cannot use the
+  fused all-reduce + add + RMS norm: its residual is the mHC transition.
