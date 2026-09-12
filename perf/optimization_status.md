@@ -25920,3 +25920,12 @@ Phases, by value over risk:
   never synchronize), so a per-replica dynamic schedule is available
   again. Decision deferred to the sustained-load metric (queue41 k=3
   baseline, queue45 k=2).
+- SUSTAINED-LOAD BASELINE (2026-09-12, queue41, `vllm bench serve` random
+  1000/300 +-20%, 10 x concurrency prompts, ignore_eos, record k=3; raw
+  perf/results/2026-09-12/glm53f-sustained-base/): c64 1139.9 / 1157.4
+  output tok/s (TPOT 51 ms), c128 1424.6 / 1425.8 (TPOT 82 ms).
+  Reproducible within 2% (the exact harness spreads 5-10% at c96+), so
+  this is the program's primary number. c128 gives +25% throughput for
+  +60% per-token latency. Under continuous arrivals the prefill of new
+  prompts runs inside the decode steps, which is the production shape
+  without prefix hits.
