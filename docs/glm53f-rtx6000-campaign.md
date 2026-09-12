@@ -17,7 +17,7 @@ identity is used, per the operator's 2026-09-09 instruction).
 Serve **GLM-5.3-Flash** from **`RedHatAI/GLM-5.3-Flash-NVFP4`** (NVFP4 group-16
 routed experts, FP8 tail layer, BF16 backbone as shipped) on **tinybox** (4x
 RTX PRO 6000 Blackwell Workstation, sm_120, PCIe 5 x16, no NVLink, driver
-580.173.02 = CUDA 13.0) through a new `rtx6000` record of the registry profile
+610.43.02 = CUDA 13.3 since 2026-09-11) through a new `rtx6000` record of the registry profile
 `glm53f-nvfp4-4`, and make that record the fastest way to run this model,
 quant and card combination anywhere: decode (single-stream and concurrent) and
 prefill both measured, both beating the published external stacks, with the
@@ -229,13 +229,19 @@ practical streaming, lm_head measured 1.58-1.63), 3090 MHz boost, 600 W.
 Topology: GPU0-GPU1 and GPU2-GPU3 under one host bridge each (PHB), cross
 pairs through the root complex (NODE); P2P reads work on every pair (52 GB/s,
 8 KB copy 9.5 us). Host: EPYC 9334 32c/64t, one NUMA node, 188 GB RAM,
-earlyoom active. CUDA 12.8 / 13.0 / 13.2 toolkits; the driver is 13.0, so
-CUDA 13.3 images run handicapped (NCCL cuMem/P2P and CUDA IPC fail).
-Driver install: Ubuntu's own `nvidia-driver-580-open` 580.173.02 with the
-prebuilt signed modules `linux-modules-nvidia-580-open-7.0.0-31-generic`
-for the HWE kernel; no DKMS (the DKMS build fails on every 7.0.0-2x
-kernel, which is why the box moved to prebuilt modules on 2026-09-01 and
-holds the 580 packages); secure boot off.
+earlyoom active. CUDA 12.8 / 13.0 / 13.2 toolkits. Driver 610.43.02 (CUDA
+13.3 branch) since 2026-09-11: Ubuntu's own `nvidia-driver-610-open` with
+the prebuilt signed modules `linux-modules-nvidia-610-open-7.0.0-31-generic`
+for the HWE kernel, no DKMS (the DKMS build fails on every 7.0.0-2x kernel;
+the box ran Ubuntu's prebuilt 580.173.02 the same way from 2026-09-01).
+`/etc/apt/preferences.d/nvidia-driver-ubuntu-only` pins every driver
+package from the NVIDIA CUDA repo to -1 so apt never swaps in its
+DKMS-based builds; unattended-upgrades blacklists `nvidia-`/`libnvidia-`.
+Secure boot off. Rollback: `~/.local/scratch/slimserve-glm53/driver-580-rollback.sh`.
+Post-upgrade smoke: all four cards P2P-reachable, bf16 8192^3 matmul
+426-433 TFLOP/s per card, no throttle reasons, `vllm._C_stable_libtorch`
+imports. The box-wide `NCCL_P2P_DISABLE=1` was removed from
+`~/.config/fish/conf.d/tinybox-env.fish` the same day.
 
 GLM-5.3-Flash: 45 layers (3 dense FFN 12288, 42 MoE: 288 routed experts
 top-8 at intermediate 2048 = 25.2M params each, plus one shared expert), 34
@@ -299,8 +305,8 @@ our shape.
 Gates for this campaign (in order of strictness):
 
 1. Floor (mandatory): beat the local B12X control in every cell on our
-   protocol, including a fresh control run in Phase 0 on the newest image
-   that boots on this driver.
+   protocol, including a fresh unhandicapped control run in Phase 0 on the
+   newest image.
 2. Target (no speculation): c1 >= 250, c8 >= 700, c16 >= 850, cold 32K
    TTFT <= 2.0 s, cold 128K TTFT <= 8 s. These are 65-75 % of the physics
    ceilings in section 3 with the FP8 backbone.
@@ -612,9 +618,10 @@ and are re-derived from the Phase 0 trace before Phase 1 starts.
    1000/300, 1000/2000 at c1 and c8, cold 32K and 128K TTFT, state label,
    gate, canaries, one profiler pair capture (c1 and c8) for the attribution
    table. Record in `perf/baseline_status.md`.
-5. Fresh B12X control on the same protocol with the newest image that boots
-   on this driver (R24 is pulled; check rtx6kpro for a newer tag). If the
-   operator upgrades the driver (section 11), re-run unhandicapped.
+5. Fresh B12X control on the same protocol with the newest image (R24 is
+   pulled; check rtx6kpro for a newer tag), unhandicapped: the 610 driver
+   matches the image's CUDA 13.3, so run it without `NCCL_CUMEM_ENABLE=0`,
+   `NCCL_P2P_DISABLE=1` or `B12X_PCIE_ALLREDUCE=0`.
 
 Exit: profile healthy, baseline row written with the attribution, every
 SM80-gated feature listed with its sm_120 status (works / needs smem
@@ -773,22 +780,12 @@ microbench GB/s and an e2e entry.
 
 1. Salvage: yes, the KEEP set of section 1d, one commit at a time,
    re-measured. Nothing else from the closed PRs.
-2. Driver upgrade for an unhandicapped B12X control: still open; it only
-   changes how honest the external comparison is, not our stack. Specifics:
-   the control image is CUDA 13.3.1, whose driver branch is 610 (per
-   `cuda-compat-13-3` = 610.57). On the 580 driver it runs in minor-version
-   compatibility and had to be started with `NCCL_CUMEM_ENABLE=0`,
-   `NCCL_P2P_DISABLE=1`, `B12X_PCIE_ALLREDUCE=0`: all-reduce through host
-   shared memory, its PCIe all-reduce off. Ubuntu ships prebuilt 610-open
-   modules for this exact kernel (`linux-modules-nvidia-610-open-7.0.0-31-generic`,
-   driver 610.43.02), the same no-DKMS mechanism that works today, so the
-   upgrade is `apt install nvidia-driver-610-open
-   linux-modules-nvidia-610-open-generic-hwe-24.04` after unholding the 580
-   set, re-hold the 610 set, reboot; rollback is the 2026-09-01 apt command
-   from the history log. Do not use the NVIDIA repo's `nvidia-open` (615,
-   DKMS). Our stack (torch cu130) is indifferent. If done, do it before the
-   Phase 0 baseline so the campaign runs on one driver, and drop
-   `NCCL_P2P_DISABLE=1` from `~/.config/fish/conf.d/tinybox-env.fish`.
+2. Driver upgrade: DONE 2026-09-11 (operator ran
+   `~/.local/scratch/slimserve-glm53/driver-610-install.sh`, rebooted).
+   Reason: the control image is CUDA 13.3.1, whose driver branch is 610; on
+   the 580 driver it ran in minor-version compatibility with NCCL cuMem, P2P
+   and its PCIe all-reduce off. Details of the install in section 10. The
+   whole campaign, including the Phase 0 baseline, runs on 610.43.02.
 3. Speculator: whichever is fastest on the measured workloads. The DFlash2
    drafter's cc-by-nc-nd license is acceptable for self-hosted and internal
    use; the campaign may end with two records (DFlash2 for the fastest,
