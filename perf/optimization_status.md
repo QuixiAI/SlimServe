@@ -25669,3 +25669,38 @@ arm (queue17).
   549 restores / 93.4% prefix hits / 624K max ctx. Pool 2.97M vs 1.67M
   tokens. glm53f-nvfp4-8/a100 now carries glm5_next_main_kv_fp8: true.
   Raw: perf/results/2026-09-12/glm53f-fp8-gates2/, glm53f-leg-fp8-2/.
+- PROFILE of the fp8 DP2 record (2026-09-12, torch profiler, per replica;
+  raw ~/.local/scratch/glm53/prof-dp2-c16 and prof-dp2-c64): c16 = 8
+  requests/replica x 4 spec rows = 32-token steps, 26 ms of GPU time per
+  step; c64 = 32 requests/replica x 4 rows (k=3 still active) = 128-token
+  steps, 49 ms per step, 98% kernel-busy, ranks balanced in steady state
+  (all-reduce 3.3 ms/step per rank; the 10 ms/step "waits" seen on three
+  ranks were confined to the ramp/prefill phase). Per 128-token step:
+  marlin NVFP4 MoE 15.0 ms (31%, 79 launches x 191 us), mHC transition
+  partials 7.3 ms (15%, 83 x 88 us) + finalize 1.0 ms, all-reduce 3.3 ms,
+  KDA spec recurrence 3.5 ms (34 x 104 us, bandwidth-bound on per-row
+  state stores), dense bf16 GEMMs ~6 ms, MLA fp8 decode + reduce 1.2 ms.
+  Per 32-token step (c16): marlin 9.4 ms (36%, 105 us/launch), mHC 1.9,
+  KDA 0.9, dense GEMMs 3.5. Only 2 CUDA-graph launches and ~115 eager
+  launches per step: launch overhead is not the limiter at either batch.
+- mHC transition partials, warp-split kernel (partials_batched_ws, default
+  on, QC_MHC_PARTIALS_WS=0 restores partials_batched): the batched kernel
+  kept TT x 24 accumulators + 24 fn values per thread (164 registers ->
+  1 block/SM), so its L2 fn loads ran latency-bound. The new kernel mixes
+  the block's 512 elements once into shared memory, then each warp streams
+  3 of the 24 fn rows over the chunk with 12 accumulators per lane (64
+  registers, 4 blocks/SM). Isolated (A100, hidden 4096): T=4 11.4 -> 8.1
+  us, T=32 31.1 -> 13.6, T=64 50.7 -> 19.9, T=128 97.9 -> 33.4, T=256
+  193 -> 60. Correctness: residual_out bit-exact vs partials_batched at
+  every T; coefficients within 5e-7 (fp32 partial-sum grouping);
+  layer_input 1-ulp bf16 flips; tests/glm5_next/test_mhc_partials_batched
+  5/5. Rejected on measurement: transpose-reduce epilogue (31 shuffles
+  instead of 125: 2x SLOWER - 128 accumulators spilled), 8-token tiles
+  (+15-30% at every T: half the blocks, same per-block latency),
+  load-all-fn-then-compute (79 registers -> 3 blocks/SM, +10%), hoisting
+  the phase-1 activation loads (neutral). Removing either load stream in a
+  diagnostic build only saved 4-6 us at T=128: the remaining ~8 us per
+  block is fixed latency (two syncs, staged coefficients, 12 warp sums)
+  times 2.4 waves. Expected serving effect: ~4.6 ms of 49 ms per c64
+  step (9%), ~1.6 ms of 26 ms per c16 step (6%); serving A/B queued
+  (queue35: WS=1 vs WS=0, c16/c64, two repeats each).

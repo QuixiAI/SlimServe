@@ -341,6 +341,25 @@ static void launch_dsv4_mhc_partials_batched(
     }
     constexpr int TT = 4;
     const dim3 grid(dsv4_mhc::SPLITS, (tokens + TT - 1) / TT);
+    static const bool warp_split = [] {
+        const char* v = std::getenv("QC_MHC_PARTIALS_WS");
+        return v == nullptr || std::atoi(v) != 0;   // default on (2026-09-12)
+    }();
+    if (warp_split) {
+        if (fn.scalar_type() == torch::kHalf) {
+            dsv4_mhc::partials_batched_ws<NOUT, TT, half>
+                <<<grid, dsv4_mhc::THREADS, 0, stream()>>>(
+                    x, residual, post, comb,
+                    reinterpret_cast<const half*>(fn.data_ptr()), residual_out,
+                    partial, hidden_size, tokens);
+        } else {
+            dsv4_mhc::partials_batched_ws<NOUT, TT, float>
+                <<<grid, dsv4_mhc::THREADS, 0, stream()>>>(
+                    x, residual, post, comb, fp(fn), residual_out, partial,
+                    hidden_size, tokens);
+        }
+        return;
+    }
     if (fn.scalar_type() == torch::kHalf) {
         dsv4_mhc::partials_batched<NOUT, TT, half>
             <<<grid, dsv4_mhc::THREADS, 0, stream()>>>(

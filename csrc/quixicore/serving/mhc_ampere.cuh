@@ -116,6 +116,153 @@ __global__ void partials(
     }
 }
 
+// partials_batched with the 24 outputs split across the 8 warps (3 each).
+// partials_batched keeps TT x NOUT accumulators plus NOUT fn values per
+// thread (~140 registers): one block per SM, so its fn loads (24 x 64 KiB
+// per token tile, L2-resident) run latency-bound - 31 us at T=32, 98 us at
+// T=128 on the GLM-5.3 TP4 x DP2 profile (2026-09-12; a transpose-reduce
+// epilogue made it slower, so the epilogue was not the cost). Here the
+// block's 2 x THREADS elements are mixed ONCE into shared memory (phase 1,
+// also the residual_out write), then warp w streams fn rows [3w, 3w + 3)
+// over the chunk with TT x 3 accumulators per lane (phase 2); the square
+// sum rides on warp 0. Registers ~40, so 4-6 blocks per SM keep the L2
+// loads in flight. Same per-element arithmetic and bf16 rounding as
+// partials_batched; the fp32 partial sums group differently (finalize
+// tolerates any grouping).
+template <int NOUT, int TT, typename FnT = float>
+__global__ void partials_batched_ws(
+    const __nv_bfloat16* x,
+    const __nv_bfloat16* residual,
+    const float* post,
+    const float* comb,
+    const FnT* fn,
+    __nv_bfloat16* residual_out,
+    float* partial,
+    int hidden_size,
+    int tokens) {
+    constexpr int WARPS = THREADS / 32;
+    constexpr int OPW = NOUT / WARPS;   // outputs per warp
+    static_assert(NOUT % WARPS == 0, "outputs must split evenly across warps");
+    constexpr int EPT = 2;              // elements per thread (hidden 4096 x 4 streams / 32 splits)
+    constexpr int CHUNK = THREADS * EPT;
+    const int split = blockIdx.x;
+    const int token0 = blockIdx.y * TT;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int total = HC * hidden_size;
+    __shared__ float mix_coeffs[TT][HC + HC * HC];
+    __shared__ float values[TT][CHUNK];
+    for (int i = tid; i < TT * (HC + HC * HC); i += THREADS) {
+        const int t = i / (HC + HC * HC);
+        const int j = i - t * (HC + HC * HC);
+        const int token = token0 + t;
+        float v = 0.0f;
+        if (token < tokens) {
+            v = (j < HC) ? post[token * HC + j] : comb[token * HC * HC + (j - HC)];
+        }
+        mix_coeffs[t][j] = v;
+    }
+    __syncthreads();
+    // Phase 1: mix, round, write residual_out, stage values. Element set
+    // per block = the strided set of partials_batched (split * THREADS +
+    // k * SPLITS * THREADS + tid), so residual_out coverage is identical.
+    // All EPT x TT x (1 + HC) loads are issued up front with clamped
+    // indices (predicating them per token serialized the block on HBM
+    // latency); the token bound only gates the store and the staged value.
+    const int last_token = tokens - 1;
+    __nv_bfloat16 xv[EPT][TT];
+    __nv_bfloat16 rv[EPT][TT][HC];
+    int flats[EPT];
+#pragma unroll
+    for (int e = 0; e < EPT; ++e) {
+        const int flat = split * THREADS + e * SPLITS * THREADS + tid;
+        flats[e] = flat;
+        const int cflat = flat < total ? flat : 0;
+        const int stream = cflat / hidden_size;
+        const int dim = cflat - stream * hidden_size;
+#pragma unroll
+        for (int t = 0; t < TT; ++t) {
+            const int token = min(token0 + t, last_token);
+            xv[e][t] = x[token * hidden_size + dim];
+#pragma unroll
+            for (int input_stream = 0; input_stream < HC; ++input_stream) {
+                rv[e][t][input_stream] = residual[(token * HC + input_stream) * hidden_size + dim];
+            }
+        }
+    }
+#pragma unroll
+    for (int e = 0; e < EPT; ++e) {
+        const int flat = flats[e];
+        const bool in = flat < total;
+        const int stream = (in ? flat : 0) / hidden_size;
+#pragma unroll
+        for (int t = 0; t < TT; ++t) {
+            const int token = token0 + t;
+            float value = 0.0f;
+            if (in && token < tokens) {
+                value = mix_coeffs[t][stream] * float(xv[e][t]);
+#pragma unroll
+                for (int input_stream = 0; input_stream < HC; ++input_stream) {
+                    value += mix_coeffs[t][HC + input_stream * HC + stream] * float(rv[e][t][input_stream]);
+                }
+                const __nv_bfloat16 rounded = __float2bfloat16_rn(value);
+                residual_out[token * total + flat] = rounded;
+                value = float(rounded);
+            }
+            values[t][e * THREADS + tid] = value;
+        }
+    }
+    __syncthreads();
+    // Phase 2: warp w owns outputs [w * OPW, (w + 1) * OPW).
+    float acc[TT][OPW];
+    float sq[TT];
+#pragma unroll
+    for (int t = 0; t < TT; ++t) {
+        sq[t] = 0.0f;
+#pragma unroll
+        for (int j = 0; j < OPW; ++j) acc[t][j] = 0.0f;
+    }
+    // Fully unrolled so all CHUNK / 32 x OPW fn loads are in flight at once
+    // (a rolled loop serialized on L2 latency: 38 us at T=128).
+#pragma unroll
+    for (int it = 0; it < CHUNK / 32; ++it) {
+        const int c = it * 32 + lane;
+        const int e = c / THREADS;
+        const int flat = split * THREADS + e * SPLITS * THREADS + (c - e * THREADS);
+        const bool in = flat < total;
+        float f[OPW];
+#pragma unroll
+        for (int j = 0; j < OPW; ++j) {
+            f[j] = in ? float(fn[(warp * OPW + j) * total + flat]) : 0.0f;
+        }
+#pragma unroll
+        for (int t = 0; t < TT; ++t) {
+            const float value = values[t][c];
+#pragma unroll
+            for (int j = 0; j < OPW; ++j) acc[t][j] += value * f[j];
+            if (warp == 0) sq[t] += value * value;
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < TT; ++t) {
+        const int token = token0 + t;
+#pragma unroll
+        for (int j = 0; j < OPW; ++j) {
+            const float sum = warp_sum(acc[t][j]);
+            if (lane == 0 && token < tokens) {
+                partial[(token * SPLITS + split) * (NOUT + 1) + warp * OPW + j] = sum;
+            }
+        }
+        if (warp == 0) {
+            const float sum = warp_sum(sq[t]);
+            if (lane == 0 && token < tokens) {
+                partial[(token * SPLITS + split) * (NOUT + 1) + NOUT] = sum;
+            }
+        }
+    }
+}
+
 // Batched form of `partials` for decode batches: one block owns (split,
 // tile of TT tokens) and loads each fn column once for all TT tokens. The
 // per-token kernel re-reads the whole fn matrix (NOUT x 4 x hidden fp32,
