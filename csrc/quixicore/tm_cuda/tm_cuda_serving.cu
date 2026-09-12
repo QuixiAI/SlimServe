@@ -3,6 +3,7 @@
 // init_serving(m), called from tm_cuda_ext.cu's PYBIND11_MODULE.
 #include "kda_decode_kernels.cuh"
 #include "skinny_gemm_ampere.cuh"
+#include "w8a16_gemm_ampere.cuh"
 #include "kv_cache_kernels.cuh"
 #include "paged_attn_v2_kernels.cuh"
 #include "rope_kv_kernels.cuh"
@@ -1558,6 +1559,80 @@ static void launch_skinny(const __nv_bfloat16* x, const __nv_bfloat16* w, float*
     tms::skinny::skinny_gemm_bf16_kernel<BM, BN, NW, STAGES><<<grid, L::THREADS, L::SMEM, stream()>>>(
         x, w, partial, M, N, K, k_slice);
 }
+// W8A16 skinny GEMM: fp8 e4m3 weights (fragment-packed) x bf16 activations.
+static torch::Tensor py_w8a16_pack(torch::Tensor w_fp8) {
+    // w_fp8: [N, K] float8_e4m3fn, contiguous. Returns packed uint8 [N*K].
+    CK(w_fp8);
+    TORCH_CHECK(w_fp8.scalar_type() == torch::kFloat8_e4m3fn && w_fp8.dim() == 2, "w [N,K] e4m3");
+    const int N = w_fp8.size(0), K = w_fp8.size(1);
+    TORCH_CHECK(N % 32 == 0 && K % 64 == 0, "N % 32 == 0, K % 64 == 0");
+    auto out = torch::empty({int64_t(N) * K}, w_fp8.options().dtype(torch::kUInt8));
+    const int total = (K / 16) * (N / 32) * 32 * 4;
+    tms::w8a16::w8a16_pack_kernel<<<(total + 255) / 256, 256, 0, stream()>>>(
+        reinterpret_cast<const uint8_t*>(w_fp8.data_ptr()), out.data_ptr<uint8_t>(), N, K);
+    return out;
+}
+template <int BN, int STAGES, int NW = 4>
+static void launch_w8a16(const __half* x, const uint8_t* wp, float* partial, int M, int N, int K,
+                         int splits, int k_slice) {
+    using L = tms::w8a16::Layout<BN, STAGES, NW>;
+    static bool attr_set = false;
+    if (!attr_set) {
+        cudaFuncSetAttribute(tms::w8a16::w8a16_gemm_kernel<BN, STAGES, NW>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, L::SMEM);
+        attr_set = true;
+    }
+    const dim3 grid((N + BN - 1) / BN, splits);
+    tms::w8a16::w8a16_gemm_kernel<BN, STAGES, NW><<<grid, L::THREADS, L::SMEM, stream()>>>(x, wp, partial, M, N, K, k_slice);
+}
+static torch::Tensor py_w8a16_gemm(torch::Tensor x, torch::Tensor wp, torch::Tensor scale,
+                                   c10::optional<torch::Tensor> bias, int64_t N, int64_t target_ctas, int64_t cfg) {
+    // x [M, K] bf16; wp packed (from w8a16_pack); scale [N] fp32 (per channel, already x 2^8).
+    CK(x); CK(wp); CK(scale);
+    TORCH_CHECK(x.scalar_type() == torch::kBFloat16 && x.dim() == 2, "x [M,K] bf16");
+    const int M = x.size(0), K = x.size(1);
+    TORCH_CHECK(M >= 1 && M <= 128 && K % 64 == 0 && N % 32 == 0, "M <= 128, K % 64, N % 32");
+    TORCH_CHECK(wp.numel() == int64_t(N) * K, "packed weight size");
+    const int BN = (cfg == 1 || cfg == 3) ? 64 : (cfg == 6 ? 256 : 128);
+    const int n_tiles = (N + BN - 1) / BN;
+    const int k_steps = K / tms::w8a16::BK;
+    int want = std::max(1, int((target_ctas + n_tiles - 1) / n_tiles));
+    int splits = 1;
+    for (int d = 1; d <= k_steps; ++d) if (k_steps % d == 0 && d <= want) splits = d;
+    const int k_slice = K / splits;
+    auto partial = torch::empty({splits, M, N}, x.options().dtype(torch::kFloat32));
+    auto out = torch::empty({M, N}, x.options());
+    auto x16 = torch::empty({M, K}, x.options().dtype(torch::kHalf));
+    {
+        const int n8 = M * K / 8;
+        tms::w8a16::w8a16_convert_a_kernel<<<(n8 + 255) / 256, 256, 0, stream()>>>(
+            reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), reinterpret_cast<__half*>(x16.data_ptr()), n8);
+    }
+    const auto* xp = reinterpret_cast<const __half*>(x16.data_ptr());
+    float* pp = partial.data_ptr<float>();
+    if (cfg == 1) launch_w8a16<64, 3>(xp, wp.data_ptr<uint8_t>(), pp, M, N, K, splits, k_slice);
+    else if (cfg == 2) launch_w8a16<128, 3>(xp, wp.data_ptr<uint8_t>(), pp, M, N, K, splits, k_slice);
+    else if (cfg == 3) launch_w8a16<64, 4>(xp, wp.data_ptr<uint8_t>(), pp, M, N, K, splits, k_slice);
+    else if (cfg == 4) launch_w8a16<128, 3, 8>(xp, wp.data_ptr<uint8_t>(), pp, M, N, K, splits, k_slice);
+    else if (cfg == 5) launch_w8a16<128, 2, 8>(xp, wp.data_ptr<uint8_t>(), pp, M, N, K, splits, k_slice);
+    else if (cfg == 6) launch_w8a16<256, 2, 8>(xp, wp.data_ptr<uint8_t>(), pp, M, N, K, splits, k_slice);
+    else launch_w8a16<128, 2>(xp, wp.data_ptr<uint8_t>(), pp, M, N, K, splits, k_slice);
+    const __nv_bfloat16* bp_ = nullptr;
+    if (bias.has_value()) { CK(bias.value()); bp_ = reinterpret_cast<const __nv_bfloat16*>(bias->data_ptr()); }
+    const int MN = M * N;
+    tms::w8a16::w8a16_reduce_kernel<<<(MN / 2 + 255) / 256, 256, 0, stream()>>>(
+        pp, scale.data_ptr<float>(), bp_, reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), MN, N, splits);
+    return out;
+}
+static torch::Tensor py_w8a16_dequant(torch::Tensor wp, torch::Tensor scale, int64_t N, int64_t K) {
+    CK(wp); CK(scale);
+    TORCH_CHECK(wp.numel() == N * K && N % 32 == 0 && K % 64 == 0, "packed size");
+    auto out = torch::empty({N, K}, scale.options().dtype(torch::kBFloat16));
+    const int total = int((K / 16) * (N / 32) * 32 * 4);
+    tms::w8a16::w8a16_dequant_kernel<<<(total + 255) / 256, 256, 0, stream()>>>(
+        wp.data_ptr<uint8_t>(), scale.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), int(N), int(K));
+    return out;
+}
 static torch::Tensor py_skinny_gemm(torch::Tensor x, torch::Tensor w,
                                     c10::optional<torch::Tensor> bias, int64_t target_ctas, int64_t cfg) {
     CK(x); CK(w);
@@ -2474,6 +2549,12 @@ void init_serving(py::module_& m) {
           py::arg("topk_length"), py::arg("block_size"), py::arg("scale"),
           py::arg("partition_size") = 0,
           py::arg("page_stride_bytes") = 0);
+    m.def("w8a16_dequant", &py_w8a16_dequant, py::arg("wp"), py::arg("scale"), py::arg("N"), py::arg("K"),
+          "Unpack fp8 weights to bf16 [N,K] (prefill path)");
+    m.def("w8a16_pack", &py_w8a16_pack, py::arg("w_fp8"), "Pack [N,K] e4m3 weights into mma fragment order");
+    m.def("w8a16_gemm", &py_w8a16_gemm, py::arg("x"), py::arg("wp"), py::arg("scale"), py::arg("bias") = py::none(),
+          py::arg("N") = 0, py::arg("target_ctas") = 256, py::arg("cfg") = 0,
+          "W8A16 skinny GEMM (M <= 128): bf16 x . fp8 W^T * scale + bias, split-K");
     m.def("skinny_gemm", &py_skinny_gemm, py::arg("x"), py::arg("w"), py::arg("bias") = py::none(),
           py::arg("target_ctas") = 256, py::arg("cfg") = 0, "Skinny bf16 GEMM (M <= 128): x [M,K] . w [N,K]^T + bias, split-K");
     m.def("kda_spec_fwd", &py_kda_spec_fwd, py::arg("q"), py::arg("k"), py::arg("v"), py::arg("raw_g"),

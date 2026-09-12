@@ -167,6 +167,18 @@ class CompressedTensorsConfig(QuantizationConfig):
             if quant_scheme is not None:
                 layer.scheme = quant_scheme
                 quant_method = CompressedTensorsLinearMethod(self)
+            else:
+                # Dense layers the checkpoint leaves in bf16: optional fp8
+                # weight-only serving on the QuixiCore skinny kernel.
+                from vllm.config import get_current_vllm_config
+                from vllm.model_executor.layers.quantization.qc_w8a16 import (
+                    QcW8A16LinearMethod,
+                    dense_layer_wants_w8a16,
+                )
+
+                extra = get_current_vllm_config().additional_config
+                if dense_layer_wants_w8a16(prefix, extra):
+                    quant_method = QcW8A16LinearMethod()
 
             # choose transform method
             if any((input_tfms, output_tfms)):
