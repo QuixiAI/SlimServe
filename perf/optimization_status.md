@@ -25511,3 +25511,35 @@ arm (queue17).
   torch.compile cache that two concurrent profile boots wrote at 19:55
   ("Cubin file saved by TritonBundler not found" warnings). The cache
   (56 GB) was set aside; the probe reruns on a clean cache (queue22).
+
+## 2026-09-12: A/B results on the DP2 record (c1/c8/c16/c32/c64 medians of two)
+
+| arm | c1 | c8 | c16 | c32 | c64 | note |
+|---|---|---|---|---|---|---|
+| base (09-11 20:30) | 165 | 566 | 848 | 989 | 1200 | acc 2.21 |
+| numa_bind 0000/1111 | 126 | 499 | 830 | 1006 | 1176 | no gain |
+| FULL_AND_PIECEWISE | 139 | 521 | 782 | 1027 | 1176 | decode unchanged; prefill not measured here |
+| fp8 main KV (per-layer) | 150 | 550 | 698 | 873 | 998 | pool 2.94M (1.78x) but -10..-17% at c16+ |
+| base on batched-partials tree | 114 | 544 | 756 | 936 | 1172 | acc 2.17; within noise of base |
+
+- Run-to-run spread at a fixed config is 5-10% at c16/c32 (acceptance
+  1.5-3.2 varies the DFlash gain), so two repeats resolve only >10%.
+- fp8 main KV: capacity win (per-replica pool 1.65M -> 2.94M tokens)
+  but the software e4m3 decode costs more than the halved bytes save at
+  batch on sm80 (the TC kernel runs split 64 on fp8 and the native fp8
+  kernel decodes per element). Not for the record; keep as the capacity
+  option and revisit the fp8 decode kernels (vectorized e4m3 -> bf16 in
+  the native kernel; a smaller-register decode in the TC kernel).
+- KDA decode kernel sweep (microbench, H=16, K=V=128): BV=32/4 warps
+  (the vendored defaults) are best at every N; wider tiles or 8 warps
+  are equal or slower. The 0.56 TB/s effective is the kernel's
+  per-element state update, not a tiling choice; a rewrite (state in
+  bf16 registers, vectorized loads) is the next lever there.
+- Batched mHC partials: 2.5x at the kernel; the serving arm sits inside
+  the noise band. Needs a 5-repeat paired A/B, or the kernel share is
+  smaller at these batch sizes than in the profiled step (the Triton
+  SIMT transition path serves T <= 64 at the MoE site).
+- Cold prefill (clean compile cache): 31K/62K/124K/249K/435K/559K/621K
+  prompt tokens all answer correctly with no '!' garbage; the earlier
+  probe's requested lengths tokenized at 2.62 chars/token, so the 900K+
+  regime was not reached - rerun queued (queue23, 700K..1.04M actual).
