@@ -56,26 +56,28 @@ __device__ __forceinline__ void mma_f16_16816(float (&c)[4], const unsigned (&a)
         : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
-// Four packed e4m3 bytes -> two fp16x2 words (b0: bytes 0,1; b1: bytes 2,3), each value * 2^-8.
+// Four packed e4m3 bytes -> two fp16x2 words, each value * 2^-8 (Marlin's
+// sequence, 7 ops per 4 values). Packed byte order per 32-bit word:
+//   byte0 = W[k+8], byte1 = W[k], byte2 = W[k+9], byte3 = W[k+1]
+// so the first pass (high bytes of each half) yields b0 = (W[k], W[k+1]) and
+// the byte-shifted second pass yields b1 = (W[k+8], W[k+9]).
 __device__ __forceinline__ void fp8x4_to_f16x2x2(unsigned p, unsigned& b0, unsigned& b1) {
-    // byte i -> half i: place byte in the high byte of its 16-bit lane, shift right 1 (keeps sign at bit 15? no:
-    // sign lands at bit 14). Do sign separately: mask 0x7F into exp/mant and OR the sign at bit 15.
-    unsigned w0 = ((p & 0x000000FFu) << 8) | ((p & 0x0000FF00u) << 16);   // byte0 -> bits 8..15, byte1 -> bits 24..31
-    unsigned w1 = ((p & 0x00FF0000u) >> 8) | ((p & 0xFF000000u));         // byte2 -> bits 8..15, byte3 -> bits 24..31
-    const unsigned sign0 = w0 & 0x80008000u, sign1 = w1 & 0x80008000u;
-    b0 = ((w0 & 0x7F007F00u) >> 1) | sign0;
-    b1 = ((w1 & 0x7F007F00u) >> 1) | sign1;
+    b0 = (p & 0x80008000u) | ((p & 0x7F007F00u) >> 1);
+    const unsigned q = p << 8;
+    b1 = (q & 0x80008000u) | ((q & 0x7F007F00u) >> 1);
 }
 
-template <int BN, int STAGES, int NW = 4>
+template <int BN, int STAGES, int NW = 4, int WM = 4>
 struct Layout {
     static constexpr int BM = 128;
     static constexpr int THREADS = NW * 32;
-    static constexpr int WN = NW / 4;         // warps along N (4 along M, 32 rows each)
-    static constexpr int MT = 2;              // m16 tiles per warp (32 rows)
+    static constexpr int WN = NW / WM;        // warps along N
+    static constexpr int ROWS = BM / WM;      // rows per warp
+    static constexpr int MT = ROWS / 16;      // m16 tiles per warp
     static constexpr int COLS = BN / WN;      // columns per warp
     static constexpr int NT = COLS / 8;       // n8 tiles per warp
     static_assert(COLS % 32 == 0, "warp columns in quads");
+    static_assert(NW % WM == 0 && ROWS % 16 == 0, "warp grid");
     static constexpr int B_TILE_BYTES = (BK / 16) * (BN / 32) * 512;   // per stage
     static constexpr int A_STAGE_BYTES = BM * LDA * 2;
     static constexpr int SMEM = STAGES * (A_STAGE_BYTES + B_TILE_BYTES);
@@ -83,13 +85,13 @@ struct Layout {
     static_assert((BM * BK / 8) % THREADS == 0, "A chunks per thread");
 };
 
-template <int BN, int STAGES, int NW = 4>
+template <int BN, int STAGES, int NW = 4, int WM = 4>
 __global__ void __launch_bounds__(NW * 32) w8a16_gemm_kernel(
         const __half* __restrict__ x,            // [M, K] fp16 (pre-converted)
         const uint8_t* __restrict__ wp,          // packed fp8, see layout
         float* __restrict__ partial,             // [splits, M, N] fp32 (unscaled)
         int M, int N, int K, int k_slice) {
-    using L = Layout<BN, STAGES, NW>;
+    using L = Layout<BN, STAGES, NW, WM>;
     extern __shared__ __align__(16) unsigned char smem_raw[];
     __half* a_smem = reinterpret_cast<__half*>(smem_raw);                                  // STAGES x BM x LDA
     unsigned char* b_smem = smem_raw + STAGES * L::A_STAGE_BYTES;                          // STAGES x B_TILE_BYTES
@@ -97,8 +99,8 @@ __global__ void __launch_bounds__(NW * 32) w8a16_gemm_kernel(
     const int split = blockIdx.y;
     const int k0 = split * k_slice;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-    const int wm = warp & 3, wn = warp >> 2;
-    const int row_base = wm * 32;
+    const int wm = warp % WM, wn = warp / WM;
+    const int row_base = wm * L::ROWS;
     const int quad_base = wn * (L::COLS / 32);   // this warp's first quad within the tile
     const int KT = K / 16;
 
@@ -246,7 +248,7 @@ __global__ void w8a16_pack_kernel(const uint8_t* __restrict__ w, uint8_t* __rest
     const int n = nq * 32 + q * 8 + (lane >> 2), kb = kt * 16 + (lane & 3) * 2;
     const uint8_t* row = w + size_t(n) * K;
     uint8_t* dst = wp + size_t(idx) * 4;
-    dst[0] = row[kb]; dst[1] = row[kb + 1]; dst[2] = row[kb + 8]; dst[3] = row[kb + 9];
+    dst[0] = row[kb + 8]; dst[1] = row[kb]; dst[2] = row[kb + 9]; dst[3] = row[kb + 1];
 }
 
 // Inverse of the pack for the prefill path: W[N, K] bf16 = fp8 * scale (scale carries 2^8: divide it out).

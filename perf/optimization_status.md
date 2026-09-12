@@ -25937,3 +25937,37 @@ Phases, by value over risk:
   runner could not hide the MoE weight stream behind attention compute;
   it would need SM partitioning (green contexts), which Ampere lacks.
   Micro-batch overlap is dropped from the program.
+- W8A16 CUSTOM KERNEL (operator ask, 2026-09-12): csrc/quixicore/serving/
+  w8a16_gemm_ampere.cuh - fp8 e4m3 weights per-channel scaled, packed once
+  into mma fragment order ([k_tile][n_quad][lane][4 tiles x 4 B], one
+  16 B shared load per lane feeds four n8k16 B fragments), Marlin's 7-op
+  e4m3 -> fp16 relocation with the 2^8 folded into the scale, bf16
+  activations converted once to fp16 and streamed with cp.async, mma
+  m16n8k16 f16, split-K fp32 partials + reduce; pack/dequant kernels; op
+  quixicore w8a16_gemm; linear method QcW8A16LinearMethod (load-time
+  quantization of the checkpoint's bf16 dense layers, decode on the
+  kernel, prefill via dequant + cuBLAS) behind VLLM_QC_DENSE_W8A16 / the
+  glm5_next_dense_w8a16 flag; tests/kernels/test_qc_w8a16.py 113/113.
+  Iterations at 128x4096x6144 (idle A100, cuBLAS bf16 52 us):
+  | variant | gemm us |
+  |---|---|
+  | v1: 32-row warps, in-loop A conversion, 16 LDS.32 per k16 | 85 |
+  | A pre-converted + cp.async | 78 |
+  | quad-packed B (4 LDS.128 per k16), fragments a k-step ahead | 77 |
+  | 8-warp tiles, 4 stages | 78-98 |
+  | Marlin byte order (7 ALU ops per 4 values instead of ~10) | 61 |
+  | 64x64 warp tiles (4 mma per dequantized fragment) | 54.3 (+9 reduce) |
+  | last-CTA serial split-K reduction | 126 (few tiles reduce alone) |
+  | fp32 atomic accumulation | 96 (same-address contention) |
+  Nsight on the 64x64 variant: tensor pipe 37% busy, 1.7 warps per
+  scheduler, dominant stall "wait" (fixed-latency mma chain), instruction
+  mix per warp per k16: 16 HMMA + ~44 ALU/IMAD + 6 loads. Mid shapes
+  (N = 512-2048) stay at 0.7-0.87x cuBLAS; the reduce kernel's partial
+  traffic (2 x splits x M x N x 4 B, bandwidth-bound) costs 6-10 us.
+  VERDICT: parity with cuBLAS on the widest shape, slower on the rest -
+  the halved weight bytes do not pay because the kernel is tensor-issue
+  bound at M=128 with <= 8 warps per SM, exactly cuBLAS's regime. Not
+  wired into serving (a numerics change with no decode gain; the 1.25
+  GB/rank memory saving alone is not worth it). The remaining known
+  step is a stream-K work split (no partial traffic, whole tiles
+  written in-CTA) plus deeper register pipelining - CUTLASS-grade work.

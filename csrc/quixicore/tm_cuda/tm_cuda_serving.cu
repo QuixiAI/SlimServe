@@ -1572,18 +1572,18 @@ static torch::Tensor py_w8a16_pack(torch::Tensor w_fp8) {
         reinterpret_cast<const uint8_t*>(w_fp8.data_ptr()), out.data_ptr<uint8_t>(), N, K);
     return out;
 }
-template <int BN, int STAGES, int NW = 4>
+template <int BN, int STAGES, int NW = 4, int WM = 4>
 static void launch_w8a16(const __half* x, const uint8_t* wp, float* partial, int M, int N, int K,
                          int splits, int k_slice) {
-    using L = tms::w8a16::Layout<BN, STAGES, NW>;
+    using L = tms::w8a16::Layout<BN, STAGES, NW, WM>;
     static bool attr_set = false;
     if (!attr_set) {
-        cudaFuncSetAttribute(tms::w8a16::w8a16_gemm_kernel<BN, STAGES, NW>,
+        cudaFuncSetAttribute(tms::w8a16::w8a16_gemm_kernel<BN, STAGES, NW, WM>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, L::SMEM);
         attr_set = true;
     }
     const dim3 grid((N + BN - 1) / BN, splits);
-    tms::w8a16::w8a16_gemm_kernel<BN, STAGES, NW><<<grid, L::THREADS, L::SMEM, stream()>>>(x, wp, partial, M, N, K, k_slice);
+    tms::w8a16::w8a16_gemm_kernel<BN, STAGES, NW, WM><<<grid, L::THREADS, L::SMEM, stream()>>>(x, wp, partial, M, N, K, k_slice);
 }
 static torch::Tensor py_w8a16_gemm(torch::Tensor x, torch::Tensor wp, torch::Tensor scale,
                                    c10::optional<torch::Tensor> bias, int64_t N, int64_t target_ctas, int64_t cfg) {
@@ -1593,7 +1593,7 @@ static torch::Tensor py_w8a16_gemm(torch::Tensor x, torch::Tensor wp, torch::Ten
     const int M = x.size(0), K = x.size(1);
     TORCH_CHECK(M >= 1 && M <= 128 && K % 64 == 0 && N % 32 == 0, "M <= 128, K % 64, N % 32");
     TORCH_CHECK(wp.numel() == int64_t(N) * K, "packed weight size");
-    const int BN = (cfg == 1 || cfg == 3) ? 64 : (cfg == 6 ? 256 : 128);
+    const int BN = (cfg == 1) ? 64 : 128;
     const int n_tiles = (N + BN - 1) / BN;
     const int k_steps = K / tms::w8a16::BK;
     int want = std::max(1, int((target_ctas + n_tiles - 1) / n_tiles));
@@ -1610,13 +1610,10 @@ static torch::Tensor py_w8a16_gemm(torch::Tensor x, torch::Tensor wp, torch::Ten
     }
     const auto* xp = reinterpret_cast<const __half*>(x16.data_ptr());
     float* pp = partial.data_ptr<float>();
-    if (cfg == 1) launch_w8a16<64, 3>(xp, wp.data_ptr<uint8_t>(), pp, M, N, K, splits, k_slice);
-    else if (cfg == 2) launch_w8a16<128, 3>(xp, wp.data_ptr<uint8_t>(), pp, M, N, K, splits, k_slice);
-    else if (cfg == 3) launch_w8a16<64, 4>(xp, wp.data_ptr<uint8_t>(), pp, M, N, K, splits, k_slice);
-    else if (cfg == 4) launch_w8a16<128, 3, 8>(xp, wp.data_ptr<uint8_t>(), pp, M, N, K, splits, k_slice);
-    else if (cfg == 5) launch_w8a16<128, 2, 8>(xp, wp.data_ptr<uint8_t>(), pp, M, N, K, splits, k_slice);
-    else if (cfg == 6) launch_w8a16<256, 2, 8>(xp, wp.data_ptr<uint8_t>(), pp, M, N, K, splits, k_slice);
-    else launch_w8a16<128, 2>(xp, wp.data_ptr<uint8_t>(), pp, M, N, K, splits, k_slice);
+    if (cfg == 1) launch_w8a16<64, 3, 4, 2>(xp, wp.data_ptr<uint8_t>(), pp, M, N, K, splits, k_slice);
+    else if (cfg == 2) launch_w8a16<128, 3, 4, 2>(xp, wp.data_ptr<uint8_t>(), pp, M, N, K, splits, k_slice);
+    else if (cfg == 3) launch_w8a16<128, 2, 4, 4>(xp, wp.data_ptr<uint8_t>(), pp, M, N, K, splits, k_slice);
+    else launch_w8a16<128, 2, 4, 2>(xp, wp.data_ptr<uint8_t>(), pp, M, N, K, splits, k_slice);
     const __nv_bfloat16* bp_ = nullptr;
     if (bias.has_value()) { CK(bias.value()); bp_ = reinterpret_cast<const __nv_bfloat16*>(bias->data_ptr()); }
     const int MN = M * N;
