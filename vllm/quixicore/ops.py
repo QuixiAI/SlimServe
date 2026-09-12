@@ -1839,6 +1839,30 @@ class quixicore_ops:
         )
 
     @staticmethod
+    @cache
+    def has_topk_sample() -> bool:
+        return quixicore_ops.is_available() and hasattr(_qc(), "topk_sample")
+
+    @staticmethod
+    def topk_sample(
+        logits: torch.Tensor,
+        top_k: torch.Tensor,
+        top_p: torch.Tensor | None,
+        expanded_idx_mapping: torch.Tensor,
+        seeds: torch.Tensor,
+        pos: torch.Tensor,
+        use_fp64: bool,
+    ) -> torch.Tensor:
+        """Fused top-k (<= 32, all ties kept) / top-p / Gumbel-max sampling.
+
+        The noise is the sampler's own (seed, pos, token)-keyed Philox
+        stream, so a seeded request draws what v2_gumbel_sample would.
+        Returns int64 token ids [B]."""
+        return _qc().topk_sample(
+            logits, top_k, top_p, expanded_idx_mapping, seeds, pos, use_fp64
+        )
+
+    @staticmethod
     def v2_topk_log_softmax(
         out: torch.Tensor, logits: torch.Tensor, topk_ids: torch.Tensor
     ) -> None:

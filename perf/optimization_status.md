@@ -25889,3 +25889,76 @@ Decision: FP8 KDA retained without reservation. Raw:
 - Raw: `perf/results/2026-09-12/p1-mhctriton-pass{1,2,3}/`, gates
   `p1-mhctriton-gate{1..4}.json`, trace
   `~/.local/scratch/slimserve-glm53/profile-state-p1-mhctriton/`.
+
+### Phase 3, arm 1: DFlash2 draft length k=3 and k=5 on the tuned tree
+
+- Setup: the registered DFlash2 drafter (`--spec`, block 8, greedy draft,
+  standard rejection sampling) on the p1-mhctriton tree, prose harness
+  1000/300 at temperature 1.0 / top_p 0.95 / top_k 20, three passes; the
+  no-spec reference is p1-mhctriton 157.6 / 519.6 / 688.8.
+- k=3 (p3-dflash2-k3): c1 172.7 / 211.3 / 180.5, c8 464.7 / 469.7 / 462.4,
+  c16 653.1 / 635.4 / 629.4; medians 180.5 / 464.7 / 635.4 = +14.5 / -10.6 /
+  -7.8 %. Accepted per draft call (accepted / drafts): c1 0.82 / 1.29 /
+  0.94, c8 0.83 / 0.79 / 0.80, c16 0.97 / 0.95 / 0.92; per drafted token
+  27-43 % at c1, ~27 % at c8, ~32 % at c16.
+- k=5 (p3-dflash2-k5): c1 161.9 / 148.9 / 175.2, c8 412.5 / 434.1 / 417.6,
+  c16 353.8 / 355.9 / 310.4; medians 161.9 / 417.6 / 353.8 = +2.7 / -19.6 /
+  -48.6 %. Accepted per draft call at c1 0.93 / 0.80 / 1.11: two more
+  drafted tokens buy about 0.1 more accepted token while the verify grows
+  from 4 to 6 rows per request.
+- Reading: with a greedy draft the V2 rejection test accepts a token with
+  probability p_target(draft argmax) (`v2_rejection_k`, draft_logprob 0), so
+  at temperature 1.0 the acceptance is capped by the target's own
+  peakedness, not by draft quality; the drafter's extra tokens only add
+  verify rows. k=3 is the only length that pays at c1; every length loses
+  at c8/c16 on this harness, so the record needs a per-batch schedule (k=3
+  small batch, 0 above) unless the sampling-method arms below lift the
+  acceptance. Phase 0's k=7 (153.6 / 330.9 / 340.3 on the untuned tree) is
+  consistent.
+- Canaries pass on both arms (text, tool call, image); `exact: true` on
+  all runs.
+- Raw: `perf/results/2026-09-12/p3-dflash2-k{3,5}-pass{1,2,3}/` (acceptance
+  in each `c*-1000-300.log` `spec_decode_*` fields), logs
+  `~/.local/scratch/slimserve-glm53/serve-logs/ab-p3-dflash2-k{3,5}.out`.
+
+### Item 10: fused top-k / top-p / Gumbel-max sampler (`topk_sample`) - RETAINED
+
+- Hypothesis: the no-spec sampler ran the Triton Qrita top-k/top-p mask
+  (`_topk_topp_kernel`, 124-189 us per step in the p1 traces) and then the
+  Gumbel argmax (`v2_gumbel_sample_k` + reduction, ~39 us): two full passes
+  over the 154,880-wide fp32 logits plus the mask write-back. The salvaged
+  Codex sampler (`topk_sample.cuh`, four launches: per-partition radix top-32
+  candidates, global k-th value with every omitted tie accounted for, nucleus
+  cutoff in fp64, then a full-vocabulary exponential race over the retained
+  tokens) does the mask and the draw without materializing the mask. Ported
+  with the noise generated inline from the sampler's own (seed, pos, token)
+  Philox stream (`tt_rand_nz` / `tt_rand64_nz`), so seeded requests draw the
+  same uniforms the Gumbel path does; the race score p / E with
+  E = -log(1 - U) orders tokens exactly as logit + G with G = -log E.
+  Eligibility (`vllm/v1/worker/gpu/sample/topk_sample.py`): every request in
+  the batch with 1 <= top_k <= 32, no greedy row, fp32 CUDA logits, no
+  processed-logprobs consumer; anything else keeps the Triton mask + Gumbel
+  path. Kill switch `SLIMSERVE_TOPK_SAMPLE=0`.
+- Parity: `tests/kernels/test_quixicore_topk_sample.py` (18 tests): the
+  sampled id is always inside the torch top-k/top-p mask, >= 99 % row
+  agreement with mask-then-`gumbel_sample` under the same seeds at V =
+  154,880 and V = 2053, fp32 and fp64, top_p none / 0.95 / 0.3; k = 1 is the
+  argmax; all ties at the k-th value retained, nucleus drops the low-id half
+  of a uniform row; -inf masks; NaN rows and -1 request slots return in-range
+  ids; the eligibility rules.
+- Microbench (GPU 0, V = 154,880, top_k 20 / top_p 0.95, 200 iterations,
+  excluding the fp32 copy): mask + Gumbel 117.5 / 146.5 / 153.8 us at B = 1
+  / 8 / 16 against 20.0 / 21.5 / 29.4 us fused (5.9x / 6.8x / 5.2x).
+- Result (p2-topksample, on top of item 9, no-spec): c1 160.4 / 160.9 /
+  160.7, c8 526.2 / 527.6 / 528.8, c16 701.0 / 691.1 / 699.9; medians 160.7
+  / 527.6 / 699.9 = +2.0 / +1.5 / +1.6 % over p1-mhctriton; cumulative over
+  Phase 0 +41.8 / +17.5 / +14.5 %. `exact: true` on all nine runs, canaries
+  pass (text, tool, image). No state label for this arm (the boot's shutdown
+  summary was lost to a harness edit made while it ran; the three passes and
+  their JSON are intact).
+- Decision: retained. Spec-mode steps do not use it (the V2 rejection sampler
+  samples through its own Gumbel kernels and applies no top-k/top-p), so it
+  counts on the no-spec path and on any batch-size range a schedule leaves
+  at k = 0.
+- Raw: `perf/results/2026-09-12/p2-topksample-pass{1,2,3}/`, microbench
+  `~/.local/scratch/slimserve-glm53/bench_topk_sample.py`.
