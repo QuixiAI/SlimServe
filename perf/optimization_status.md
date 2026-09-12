@@ -25736,3 +25736,28 @@ arm (queue17).
   layout streams each replica's active set independently; at c64 that
   is 2 x 564 MB vs one TP8 stream of ~210 x 13.5 / 8 = 354 MB, which TP8
   loses back on everything else), or fewer distinct experts per step.
+- Dense bf16 GEMMs at M=128 (2026-09-12): 7.6 ms of the 49 ms c64 step
+  (154 x 128x64-tile launches at 16 us, 68 x 128x128 at 42 us, plus
+  64x64 and split-K reduce kernels). cuBLAS microbench at the per-rank
+  shapes (A100, weights TB/s): M=128 4096x6144 0.93, 4096x2048 0.59,
+  4096x1536 0.49, 1536x4096 0.65, 4096x512 0.26; M=32 is 1.3-1.4 on the
+  wide shapes. CUBLAS_WORKSPACE_CONFIG variants change nothing. The ROCm
+  path routes 10-128-token GEMMs to a split-K skinny kernel (wvSplitKrc);
+  CUDA has no equivalent. Wrote csrc/quixicore/serving/
+  skinny_gemm_ampere.cuh (mma.sync m16n8k16, cp.async 3-stage, split-K
+  fp32 partials + reduce; op quixicore skinny_gemm; tests/kernels/
+  test_quixicore_skinny_gemm.py 54 pass). Result: correct and MORE
+  accurate than cuBLAS (whose bf16 split-K reduction leaves ~0.4 abs
+  error on ~300-scale outputs at K=4096 - vLLM leaves PyTorch's
+  allow_bf16_reduced_precision_reduction at its default) but not faster:
+  77 us vs 52 at 128x4096x6144, parity at 1536-wide N. Ablations: no-mma
+  77 us (loads are the limit), weights-only 48 us (1.04 TB/s),
+  activations-only 53 us (each N tile re-reads the 1 MB activation slice
+  from L2: 96 MB), compute-only 39 us; tile sweep (BN 64/128, 4/8 warps,
+  2-4 stages) within 15%. PARKED as a standalone op (not on the serving
+  path): the design that could win needs fragment-permuted activations
+  held in registers, 256-wide N tiles (4x less L2 re-read) and an 8-deep
+  weight pipeline - potential ~2.5-3 ms per c64 step (5-6%). Nsight
+  Compute is blocked on this box (ERR_NVGPUCTRPERM); enabling
+  NVreg_RestrictProfilingToAdminUsers=0 would make the next attempt far
+  cheaper.

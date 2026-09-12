@@ -2,6 +2,7 @@
 // kernels (kernels/serving/*_kernels.cuh). Registered into the _C module by
 // init_serving(m), called from tm_cuda_ext.cu's PYBIND11_MODULE.
 #include "kda_decode_kernels.cuh"
+#include "skinny_gemm_ampere.cuh"
 #include "kv_cache_kernels.cuh"
 #include "paged_attn_v2_kernels.cuh"
 #include "rope_kv_kernels.cuh"
@@ -1542,6 +1543,67 @@ static torch::Tensor py_mla_decode_bf16_sparse_nope(torch::Tensor q, torch::Tens
 // KDA single-token decode recurrence (GLM-5.3 KDA layers): see
 // serving/kda_decode_kernels.cuh. Returns out [N, H, V] bf16; state updated
 // in place for state_indices[n] > 0 (rows with index <= 0 write zeros).
+// Skinny bf16 GEMM (M <= 128): Y = X . W^T (+ bias), split-K partials + reduce.
+template <int BM, int BN, int NW, int STAGES>
+static void launch_skinny(const __nv_bfloat16* x, const __nv_bfloat16* w, float* partial,
+                          int M, int N, int K, int splits, int k_slice) {
+    using L = tms::skinny::Layout<BM, BN, NW, STAGES>;
+    static bool attr_set = false;
+    if (!attr_set) {
+        cudaFuncSetAttribute(tms::skinny::skinny_gemm_bf16_kernel<BM, BN, NW, STAGES>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, L::SMEM);
+        attr_set = true;
+    }
+    const dim3 grid((N + BN - 1) / BN, splits);
+    tms::skinny::skinny_gemm_bf16_kernel<BM, BN, NW, STAGES><<<grid, L::THREADS, L::SMEM, stream()>>>(
+        x, w, partial, M, N, K, k_slice);
+}
+static torch::Tensor py_skinny_gemm(torch::Tensor x, torch::Tensor w,
+                                    c10::optional<torch::Tensor> bias, int64_t target_ctas, int64_t cfg) {
+    CK(x); CK(w);
+    TORCH_CHECK(x.scalar_type() == torch::kBFloat16 && w.scalar_type() == torch::kBFloat16, "bf16 only");
+    TORCH_CHECK(x.dim() == 2 && w.dim() == 2 && x.size(1) == w.size(1), "x [M,K], w [N,K]");
+    const int M = x.size(0), K = x.size(1), N = w.size(0);
+    TORCH_CHECK(M >= 1 && M <= 128, "skinny GEMM handles M <= 128");
+    TORCH_CHECK(K % tms::skinny::BK == 0 && N % 16 == 0, "K % 64 == 0, N % 16 == 0");
+    // cfg (tile sweep, all within 15% of each other, none beating cuBLAS):
+    // 0 = BN64/4 warps/3 stages, 1 = BN128/8 warps/3 stages, 2 = BN64/4 warps/4 stages,
+    // 3 = BN128/8 warps/2 stages, 4 = BN64/8 warps/3 stages
+    const int BN = (cfg == 1 || cfg == 3) ? 128 : 64;
+    const int n_tiles = (N + BN - 1) / BN;
+    const int k_steps = K / tms::skinny::BK;
+    int want = std::max(1, int((target_ctas + n_tiles - 1) / n_tiles));
+    int splits = 1;
+    for (int d = 1; d <= k_steps; ++d) if (k_steps % d == 0 && d <= want) splits = d;
+    const int k_slice = K / splits;
+    auto partial = torch::empty({splits, M, N}, x.options().dtype(torch::kFloat32));
+    auto out = torch::empty({M, N}, x.options());
+    const auto* xp = reinterpret_cast<const __nv_bfloat16*>(x.data_ptr());
+    const auto* wp = reinterpret_cast<const __nv_bfloat16*>(w.data_ptr());
+    float* pp = partial.data_ptr<float>();
+    TORCH_CHECK(M > 64 || cfg == 0, "only cfg 0 below M=65 for now");
+    switch (cfg) {
+        case 1: launch_skinny<128, 128, 8, 3>(xp, wp, pp, M, N, K, splits, k_slice); break;
+        case 2: launch_skinny<128, 64, 4, 4>(xp, wp, pp, M, N, K, splits, k_slice); break;
+        case 3: launch_skinny<128, 128, 8, 2>(xp, wp, pp, M, N, K, splits, k_slice); break;
+        case 4: launch_skinny<128, 64, 8, 3>(xp, wp, pp, M, N, K, splits, k_slice); break;
+        default:
+            if (M > 64)      launch_skinny<128, 64, 4, 3>(xp, wp, pp, M, N, K, splits, k_slice);
+            else if (M > 32) launch_skinny<64, 64, 4, 3>(xp, wp, pp, M, N, K, splits, k_slice);
+            else if (M > 16) launch_skinny<32, 64, 4, 3>(xp, wp, pp, M, N, K, splits, k_slice);
+            else             launch_skinny<16, 64, 4, 3>(xp, wp, pp, M, N, K, splits, k_slice);
+    }
+    const __nv_bfloat16* bp_ = nullptr;
+    if (bias.has_value()) {
+        CK(bias.value()); TORCH_CHECK(bias->scalar_type() == torch::kBFloat16 && bias->numel() == N, "bias [N] bf16");
+        bp_ = reinterpret_cast<const __nv_bfloat16*>(bias->data_ptr());
+    }
+    const int MN = M * N;
+    const int threads = 256, blocks = (MN / 2 + threads - 1) / threads;
+    tms::skinny::skinny_reduce_kernel<<<blocks, threads, 0, stream()>>>(
+        pp, bp_, reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), MN, N, splits);
+    return out;
+}
 static torch::Tensor py_kda_decode(torch::Tensor mixed_qkv, torch::Tensor raw_g,
         torch::Tensor raw_beta, torch::Tensor A_log, torch::Tensor dt_bias,
         torch::Tensor state, torch::Tensor state_indices, double scale,
@@ -2356,6 +2418,8 @@ void init_serving(py::module_& m) {
           py::arg("topk_length"), py::arg("block_size"), py::arg("scale"),
           py::arg("partition_size") = 0,
           py::arg("page_stride_bytes") = 0);
+    m.def("skinny_gemm", &py_skinny_gemm, py::arg("x"), py::arg("w"), py::arg("bias") = py::none(),
+          py::arg("target_ctas") = 256, py::arg("cfg") = 0, "Skinny bf16 GEMM (M <= 128): x [M,K] . w [N,K]^T + bias, split-K");
     m.def("kda_decode", &py_kda_decode, py::arg("mixed_qkv"), py::arg("raw_g"),
           py::arg("raw_beta"), py::arg("A_log"), py::arg("dt_bias"), py::arg("state"),
           py::arg("state_indices"), py::arg("scale"), py::arg("lower_bound"),
