@@ -25599,3 +25599,17 @@ arm (queue17).
   operator 2026-09-10): the record is flipped in the working tree and
   its gate set runs now (queue31: canaries + exact x3, tier acceptance
   under verify, WildChat leg) before the commit.
+- mHC transition tail: `finalize_apply_pre_mix_rms_norm` fuses the
+  finalize (warp 0) and the pre-mix RMS norm into one 1024-thread block
+  per token (the pair ran 32-thread and 256-thread blocks, occupancy-
+  bound at T=32). Bit-identical to the two-kernel path on all four
+  outputs (a first build read the input residual instead of the mixed
+  one - caught by the batched-partials parity, fixed). Op time at
+  T=16/32/64/128: 39.0/48.9/68.6/115.1 -> 31.7/41.7/61.2/108.4 us
+  (-15% at T=32, ~0.7 ms/step at 90 sites). KEPT, default on
+  (QC_MHC_FUSED_NORM=0 restores the pair).
+- 8-token split-output partials (QC_MHC_PARTIALS_TT=8): T=16 36.2 vs
+  39.0 us, T=32 52.2 vs 48.9, T=64 68.5 vs 68.6, T=128 101.0 vs 115.1
+  - no gain at the record's batch, +12% only at T=128. REJECTED as
+  default; kept env-gated as a documented diagnostic for larger
+  verify batches.

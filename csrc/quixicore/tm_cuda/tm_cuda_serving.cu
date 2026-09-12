@@ -315,6 +315,29 @@ static void launch_dsv4_mhc_partials_batched(
         const __nv_bfloat16* x, const __nv_bfloat16* residual,
         const float* post, const float* comb, torch::Tensor fn,
         __nv_bfloat16* residual_out, float* partial, int hidden_size, int tokens) {
+    static const int tt_env = [] {
+        const char* v = std::getenv("QC_MHC_PARTIALS_TT");
+        return v ? std::atoi(v) : 4;
+    }();
+    if (tt_env == 8) {
+        // Experimental: 8-token tiles with the outputs split across the two
+        // block halves (partials_batched_split); same per-token arithmetic.
+        constexpr int TT8 = 8;
+        const dim3 grid8(dsv4_mhc::SPLITS, (tokens + TT8 - 1) / TT8);
+        if (fn.scalar_type() == torch::kHalf) {
+            dsv4_mhc::partials_batched_split<NOUT, TT8, half>
+                <<<grid8, dsv4_mhc::THREADS, 0, stream()>>>(
+                    x, residual, post, comb,
+                    reinterpret_cast<const half*>(fn.data_ptr()), residual_out,
+                    partial, hidden_size, tokens);
+        } else {
+            dsv4_mhc::partials_batched_split<NOUT, TT8, float>
+                <<<grid8, dsv4_mhc::THREADS, 0, stream()>>>(
+                    x, residual, post, comb, fp(fn), residual_out, partial,
+                    hidden_size, tokens);
+        }
+        return;
+    }
     constexpr int TT = 4;
     const dim3 grid(dsv4_mhc::SPLITS, (tokens + TT - 1) / TT);
     if (fn.scalar_type() == torch::kHalf) {
@@ -440,6 +463,23 @@ py_dsv4_mhc_fused_post_pre(
         launch_dsv4_mhc_partials<dsv4_mhc::MIXES, true>(
             bp(x), bp(residual), fp(post_mix), fp(comb_mix), fn,
             bpm(residual_out), fpm(partial), H, dim3(dsv4_mhc::SPLITS, T));
+    }
+    static const bool fused_norm = [] {
+        const char* v = std::getenv("QC_MHC_FUSED_NORM");
+        return !(v && v[0] == '0');
+    }();
+    if (norm_weight && fused_norm && H == 4096) {
+        TORCH_CHECK(norm_weight->is_cuda() && norm_weight->is_contiguous() &&
+                    norm_weight->scalar_type() == torch::kBFloat16 &&
+                    norm_weight->numel() == H,
+                    "fused DSV4 mHC RMSNorm expects a 4096-element bf16 weight");
+        dsv4_mhc::finalize_apply_pre_mix_rms_norm<dsv4_mhc::MIXES + 1, 1024>
+            <<<T, 1024, 0, stream()>>>(
+                fpm(partial), fp(hc_scale), fp(hc_base), fpm(next_post),
+                fpm(next_comb), bp(residual_out), bp(*norm_weight), bpm(layer_input),
+                H, float(rms_eps), float(pre_eps), float(sinkhorn_eps),
+                float(post_multiplier), int(sinkhorn_repeat), float(norm_eps));
+        return {residual_out, next_post, next_comb, layer_input};
     }
     dsv4_mhc::finalize_pre_mix<<<T, 32, 0, stream()>>>(
         fpm(partial), fp(hc_scale), fp(hc_base), fpm(next_post),
