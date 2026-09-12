@@ -25737,3 +25737,40 @@ launches-per-step of the profiled round. Baseline for the phase: p0-nospec
   `p1-fp8kda-gate{1,2}.json`, trace
   `~/.local/scratch/slimserve-glm53/profile-state-p1-fp8kda/`; sidecar
   build log `~/.local/scratch/slimserve-glm53/serve-logs/swapset-build-4b.out`.
+
+### Item 4b, extended quality gate - CLEAN
+
+Eight gate.py runs per arm on fresh boots, same tree: dense-only sidecar
+(`SLIMSERVE_FP8_SWAPSET=fp8-swapset-dense`, p1-gate-dense) mean text
+logprob -2.456, sd 0.017 (-2.448 / -2.464 / -2.451 / -2.456 / -2.445 /
+-2.435 / -2.450 / -2.497); dense + KDA (p1-part boot) mean -2.447, sd 0.015
+(-2.462 / -2.428 / -2.431 / -2.447 / -2.447 / -2.467 / -2.464 / -2.430). No
+quality cost resolvable at the gate's noise (per-run sd ~0.016, so a pair
+of runs cannot see less than ~0.03; the -2.407..-2.478 band from two Phase
+0 runs is narrower than the real spread, one dense-arm run fell outside it).
+Decision: FP8 KDA retained without reservation. Raw:
+`perf/results/2026-09-12/p1-gate-dense-gate{1..8}.json`,
+`p1-part-gate{1..8}.json`.
+
+### Item 5: sparse MLA decode, 32/64-token partitions with the channel reducer - RETAINED
+
+- Hypothesis: the partitioned NoPE sparse decode reduced its P partials
+  with one warp per (head, token) walking P x 512 floats serially, so the
+  128-token partition (17 per 2048-wide list) was the compromise between
+  parallelism in the walk and cost in the reduce. `paged_attention_reduce_channels`
+  (one thread per latent channel, weights once per block) was already in the
+  tree for DSV4 but not launched by the NoPE bindings; with it the reduce is
+  flat in P, and small partitions expose more warps at decode: 32 tokens at
+  B <= 8, 64 at B <= 16, the 128 default above (prefill chunks). Salvage
+  table item 5: +3.7 % c1.
+- Result (p1-part, on top of 4b): c1 146.4 / 149.5 / 149.3, c8 504.2 /
+  500.8 / 501.3, c16 678.4 / 672.3 / 677.6; medians 149.3 / 501.3 / 677.6 =
+  +3.2 / +0.0 / +1.0 % over p1-fp8kda; cumulative over Phase 0 +31.8 / +11.6
+  / +10.9 %. `exact: true` on all nine runs. State: in-step idle 0.175 ms,
+  kernel busy 5.64 ms (5.79 before), 1554 launches/step. Gates: the eight
+  runs above (mean -2.447). Canaries text / tool / image pass.
+  `tests/kernels/test_quixicore_sparse_mla_bf16.py` now covers partitions
+  32 and 64 (71 passed).
+- Decision: retained (both NoPE bindings, bf16 and fp8 cache).
+- Raw: `perf/results/2026-09-12/p1-part-pass{1,2,3}/`, trace
+  `~/.local/scratch/slimserve-glm53/profile-state-p1-part/`.

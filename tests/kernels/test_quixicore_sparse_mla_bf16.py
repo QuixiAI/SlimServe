@@ -52,7 +52,7 @@ def _reference(q, kv, idx, value_width):
 
 
 @pytest.mark.parametrize("heads", [8, 16])
-@pytest.mark.parametrize("partition_size", [0, 256, 128])
+@pytest.mark.parametrize("partition_size", [0, 256, 128, 64, 32])
 def test_nope_512_matches_reference(heads, partition_size):
     q, kv, bt, idx, tlen = _inputs(512, heads)
     out = qc.mla_decode_bf16_sparse_nope(

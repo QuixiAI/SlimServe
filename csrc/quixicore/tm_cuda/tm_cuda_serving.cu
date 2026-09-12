@@ -1501,7 +1501,10 @@ static torch::Tensor py_mla_decode_bf16_sparse_nope(torch::Tensor q, torch::Tens
         topk_length.data_ptr<int>(), max_topk, nullptr,
         tmp.data_ptr<float>(), ml.data_ptr<float>(), es.data_ptr<float>(),
         int(block_size), int(bt.size(1)), float(scale), H, P, int(partition_size), 1.0f, nullptr, 0, int(page_stride_bytes));
-    paged_attention_reduce<__nv_bfloat16, 512><<<dim3(H, B), 32, 0, stream()>>>(
+    // One thread per latent channel, partition weights once per block: the
+    // one-warp reducer walked P x 512 partials serially per (head, token),
+    // which is what made small partitions (many P) lose at decode.
+    paged_attention_reduce_channels<__nv_bfloat16, 512><<<dim3(H, B), 512, size_t(P) * sizeof(float), stream()>>>(
         tmp.data_ptr<float>(), ml.data_ptr<float>(), es.data_ptr<float>(), bpm(out), H, P);
     return out;
 }
@@ -1540,7 +1543,10 @@ static torch::Tensor py_mla_decode_fp8_sparse_nope(torch::Tensor q, torch::Tenso
         tmp.data_ptr<float>(), ml.data_ptr<float>(), es.data_ptr<float>(),
         int(block_size), int(bt.size(1)), float(scale), H, P, int(partition_size),
         float(kv_scale), nullptr, 0, int(page_stride_bytes));
-    paged_attention_reduce<__nv_bfloat16, 512><<<dim3(H, B), 32, 0, stream()>>>(
+    // One thread per latent channel, partition weights once per block: the
+    // one-warp reducer walked P x 512 partials serially per (head, token),
+    // which is what made small partitions (many P) lose at decode.
+    paged_attention_reduce_channels<__nv_bfloat16, 512><<<dim3(H, B), 512, size_t(P) * sizeof(float), stream()>>>(
         tmp.data_ptr<float>(), ml.data_ptr<float>(), es.data_ptr<float>(), bpm(out), H, P);
     return out;
 }

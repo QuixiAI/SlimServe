@@ -106,10 +106,21 @@ def _bf16_partition(q: torch.Tensor, idx: torch.Tensor) -> int:
     already B x H warps wide, so partition only while the scratch is small.
     """
     B, H = q.shape[0], q.shape[1]
-    P = (idx.shape[1] + _BF16_PARTITION - 1) // _BF16_PARTITION
+    # Decode sizes by batch (rtx6000, glm53f-nvfp4-4, with the channel
+    # reducer): one warp per (head, token, partition) walks its partition
+    # serially, so at small B the 2048-wide list wants 32-token partitions;
+    # at B >= 16 the per-head re-reads of the shared latent dominate and 64
+    # is best. Prefill chunks and larger batches keep the 128 default.
+    if B <= 8:
+        size = 32
+    elif B <= 16:
+        size = 64
+    else:
+        size = _BF16_PARTITION
+    P = (idx.shape[1] + size - 1) // size
     if B * H * P * 512 * 4 > _BF16_PARTITION_SCRATCH_CAP:
         return 0
-    return _BF16_PARTITION
+    return size
 
 
 class QuixiCoreMLASparseBackend(AttentionBackend):
