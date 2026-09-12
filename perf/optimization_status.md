@@ -25772,3 +25772,23 @@ arm (queue17).
   rule (consistent but small; the all-reduce is 7% of the step, so even
   a free one-shot could not exceed ~4%). The GLM-5.3 path cannot use the
   fused all-reduce + add + RMS norm: its residual is the mHC transition.
+- Skinny GEMM v2 attempt (2026-09-12): activations held in registers from
+  a fragment-permuted copy (one 16 B L2 load per lane per m16k16 tile,
+  double-buffered a stage ahead) with a weights-only 6-8 stage cp.async
+  pipeline: 122 us at 128x4096x6144 (0.41 TB/s), 34-60 us at the
+  1536-4096-wide shapes vs cuBLAS 18-22 - worse than v1 everywhere;
+  parity fine. REJECTED and removed; v1 stays as the parked scaffold.
+  Conclusion for this pass: the dense GEMM lever needs hardware counters
+  (Nsight Compute is blocked on this box) to iterate on; not pursued
+  further blind.
+- PASS SUMMARY (2026-09-12, glm53f-nvfp4-8, per 128-token step at c64
+  after the day's work, ~44 ms): marlin NVFP4 MoE 15 ms at the HBM
+  roofline; dense bf16 GEMMs 7.6 ms (cuBLAS, 0.3-0.9 TB/s; custom
+  kernel attempts lost); KDA spec recurrence 3.5 ms at bandwidth (per-row
+  state stores; deferred-commit runner design is the only lever, ~7%);
+  mHC 3.5 ms (partials 33 us, finalize 10 us); all-reduce 3.3 ms
+  (one-shot +2%, rejected); MLA fp8 decode 1.2 ms; sampling 0.55 ms;
+  MoE aux kernels ~0.8 ms. Kernel-level work ≥ the 3% keep rule is
+  exhausted at this batch; the remaining items are the KDA
+  deferred-commit design (runner + tier interplay) and the skinny GEMM
+  with counters.

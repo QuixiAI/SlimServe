@@ -17,9 +17,12 @@
 // N=6144 (0.65 TB/s). Ablations: no-mma 77 us (loads are the limit), weights
 // only 48 us (1.04 TB/s), activations only 53 us (every N tile re-reads the
 // 1 MB activation slice: 96 MB of L2 traffic), compute only 39 us. Next
-// design if resumed: fragment-permuted activations held in registers, 256-wide
-// N tiles (4x less L2 re-read), 8-stage weight pipeline. Standalone op only;
-// not on the serving path.
+// design if resumed: 256-wide N tiles (4x less L2 re-read) with the activation
+// tile staged once per CTA. TRIED AND REJECTED (2026-09-12): activations in
+// registers from a fragment-permuted copy with an 8-stage weights-only smem
+// pipeline - 122 us at 128x4096x6144 (0.41 TB/s), worse at every shape; the
+// per-lane 16 B L2 fragment loads inside the main loop stall harder than the
+// shared-memory staging. Standalone op only; not on the serving path.
 // Tile: BM x BN over a K slice, BK = 64 per stage, 4 warps. Warps tile the
 // rows (BM = 64/128: 16/32 rows per warp) or, for BM <= 32, the columns.
 // Fragments come from shared memory through ldmatrix; the smem rows carry
