@@ -25866,3 +25866,26 @@ Decision: FP8 KDA retained without reservation. Raw:
   `~/.local/scratch/slimserve-glm53/profile-state-p1-item6/`. Tests:
   `tests/kernels/test_quixicore_glm_route_align.py`,
   `test_quixicore_moe_sum_add.py`, `test_moe_shared_handoff.py`.
+
+### Item 9: split SIMT mHC transition (Triton partials + finalize) on sm_120 - RETAINED
+
+- Hypothesis: on sm_120 every mHC site ran the cooperative dsv4_mhc
+  `fused_pre_transition` kernel (64 blocks, a grid sync): 89 launches x 8.7
+  us = 0.77 ms per c1 step, the largest latency-bound block left after item
+  6. The split Triton transition (`_mhc_partials` 64 x T blocks, then
+  `_mhc_finalize` one block per token) was gated to A100, where it was
+  measured; the math is identical.
+- Result (p1-mhctriton, on top of item 6): c1 157.5 / 157.6 / 157.7, c8
+  519.6 / 520.1 / 517.9, c16 691.3 / 688.8 / 683.7; medians 157.6 / 519.6 /
+  688.8 = +1.9 / +1.7 / +0.9 % over p1-item6; cumulative over Phase 0 +39.1
+  / +15.7 / +12.7 %. `exact: true` on all nine runs. State: wall/step 5.68
+  ms, kernel busy 5.31 ms (-0.12 ms), 1477 launches/step. Trace: partials
+  2.6 us + finalize 4.1 us per transition (6.7 us against 8.7). Gates
+  -2.456 / -2.445 / -2.459 / -2.472 (mean -2.458, same as p1-item6).
+- Decision: retained (`_USE_SPLIT_SIMT`, every CUDA part). The finalize
+  block (sinkhorn plus the 4096-wide mix in 4 warps) at 4.1 us for one token
+  is the next mHC target: an sm_120 kernel doing the transition in about 4 us
+  total would be worth another 0.25 ms per c1 step.
+- Raw: `perf/results/2026-09-12/p1-mhctriton-pass{1,2,3}/`, gates
+  `p1-mhctriton-gate{1..4}.json`, trace
+  `~/.local/scratch/slimserve-glm53/profile-state-p1-mhctriton/`.
