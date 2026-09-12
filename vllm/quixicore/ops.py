@@ -62,6 +62,47 @@ class quixicore_ops:
             return False
 
     # ------------------------------------------------------------------
+    # M <= 16 decode GEMMs (bf16_decode_gemm.cuh, fp8_decode_gemm.cuh)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    @cache
+    def has_decode_gemm() -> bool:
+        return quixicore_ops.is_available() and hasattr(_qc(), "decode_gemm")
+
+    @staticmethod
+    def decode_gemm(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        fp32_out: bool = False,
+    ) -> torch.Tensor:
+        """x[M, K] @ weight[N, K]^T (+ fp32 bias) for M <= 16 on tensor cores,
+        fp32 accumulation; the decode-shaped replacement for cuBLAS on the
+        backbone projections (N in 2048..16384, K a multiple of 128 >= 512)."""
+        return _qc().decode_gemm(x, weight, bias, fp32_out)
+
+    @staticmethod
+    @cache
+    def has_decode_gemm_fp8() -> bool:
+        return quixicore_ops.is_available() and hasattr(_qc(), "decode_gemm_fp8")
+
+    @staticmethod
+    def decode_gemm_fp8(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        scale: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        fp32_out: bool = False,
+    ) -> torch.Tensor:
+        """x[M, K] (bf16) @ dequant(weight)[N, K]^T for M <= 16 on tensor cores,
+        where weight is float8_e4m3fn with fp32 128x128 block scales
+        [ceil(N/128), K/128] and dequant(w) = bf16(scale * w); fp32
+        accumulation (N in 1024..16384, N a multiple of 8, K a multiple of
+        128 >= 512)."""
+        return _qc().decode_gemm_fp8(x, weight, scale, bias, fp32_out)
+
+    # ------------------------------------------------------------------
     # DeepSeek-V4 multi-stream residual mixing (Ampere decode path)
     # ------------------------------------------------------------------
 

@@ -25648,3 +25648,30 @@ launches-per-step of the profiled round. Baseline for the phase: p0-nospec
   32 MiB per layer and stay on NCCL either way.
 - Raw: `perf/results/2026-09-11/p1-car-pass{1,2,3}/`, gates
   `perf/results/2026-09-11/p1-car-gate{1,2}.json`.
+
+### Item 3: bf16 M<=16 tensor-core decode GEMM on the backbone projections - RETAINED
+
+- Hypothesis: cuBLAS runs the decode-shaped bf16 projections (M = 1..16,
+  N 2048..16384, K 512..4096) at 59-89 % of the streaming ceiling and often
+  as two launches (split-K plus reduce); a cp.async-staged mma.sync kernel
+  with fp32 accumulation (`csrc/quixicore/tm_cuda/bf16_decode_gemm.cuh`,
+  `quixicore_decode_linear` custom op in `layers/utils.py`, dispatched from
+  `cuda_unquantized_gemm`) reads each weight once per step at one launch.
+  Salvage table item 6 measured +1.5 % c1 on the Codex tree.
+- Result (p1-dgemm, on top of item 2): c1 122.4 / 124.1 / 124.0, c8 472.0 /
+  472.3 / 470.8, c16 641.9 / 640.4 / 641.4; medians 124.0 / 472.0 / 641.4 =
+  +0.9 / +0.8 / +0.1 % over p1-car. `exact: true` on all nine runs. State:
+  in-step idle 0.177 ms, 1516 launches/step (61 fewer than p1-car: the
+  cuBLAS split-K pairs). Gates -2.442 / -2.418 (band -2.407..-2.478).
+  Canaries: tool and image pass; the text canary hit its 400-token cap
+  still inside the reasoning block (one sample at temperature 1.0; the
+  canary now prints a reasoning excerpt and is re-run on the next boot).
+  Kernel tests `tests/kernels/test_quixicore_decode_gemm{,_fp8}.py` pass on
+  the shipped extension (44 + 45, one two-device test skipped each).
+- Decision: retained. Small, as on the Codex tree; the same pipeline is the
+  FP8 decode GEMM the swap-set (item 4) runs on. `SLIMSERVE_DECODE_GEMM=0`
+  keeps cuBLAS for A/B; the switch and the binding's presence are compile
+  cache factors (`VllmConfig.compute_hash`).
+- Raw: `perf/results/2026-09-11/p1-dgemm-pass{1,2,3}/`, gates
+  `p1-dgemm-gate{1,2}.json`, trace
+  `~/.local/scratch/slimserve-glm53/profile-state-p1-dgemm/`.

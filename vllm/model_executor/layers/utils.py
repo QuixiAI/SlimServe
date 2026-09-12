@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Utility methods for model layers."""
 
+import os
 from collections.abc import Callable
+from functools import cache
 
 import torch
 
@@ -23,8 +25,6 @@ MOE_LAYER_ROUTER_GATE_SUFFIXES = {
     "shared_expert_gate",
     "expert_gate",
 }
-
-
 
 
 def get_token_bin_counts_and_mask(
@@ -92,6 +92,182 @@ def default_unquantized_gemm(
     bias: torch.Tensor | None = None,
 ):
     return torch.nn.functional.linear(x, weight, bias)
+
+
+# QuixiCore bf16 decode GEMM (csrc/quixicore/tm_cuda/bf16_decode_gemm.cuh): the
+# M <= 16 tensor-core kernel that replaces cuBLAS on the backbone projections
+# at decode. The M branch lives inside an opaque custom op so torch.compile
+# traces one graph for every batch size; the shape gate below mirrors the
+# kernel's `supports` (the shapes where it beat cuBLAS at every M).
+# SLIMSERVE_DECODE_GEMM=0 keeps cuBLAS for A/B and diagnosis.
+DECODE_GEMM_MAX_TOKENS = 16
+
+
+@cache
+@torch.compiler.assume_constant_result
+def decode_gemm_enabled() -> bool:
+    # Process-fixed configuration/device: do not trace NVML/driver calls when
+    # this cache is cold during full-graph model compilation.
+    if (
+        os.getenv("SLIMSERVE_DECODE_GEMM", "1") == "0"
+        or not current_platform.is_cuda()
+        or not current_platform.has_device_capability(80)
+    ):
+        return False
+    from vllm.quixicore.ops import quixicore_ops
+
+    return quixicore_ops.has_decode_gemm()
+
+
+def decode_gemm_supports(n: int, k: int) -> bool:
+    return 2048 <= n <= 16384 and k >= 512 and k % 128 == 0
+
+
+def _quixicore_decode_linear_impl(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None
+) -> torch.Tensor:
+    x2 = x.reshape(-1, x.shape[-1])
+    if x2.shape[0] <= DECODE_GEMM_MAX_TOKENS and bias is None:
+        from vllm.quixicore.ops import quixicore_ops
+
+        out = quixicore_ops.decode_gemm(x2.contiguous(), weight)
+        return out.view(*x.shape[:-1], weight.shape[0])
+    return torch.nn.functional.linear(x, weight, bias)
+
+
+def _quixicore_decode_linear_fake(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None
+) -> torch.Tensor:
+    return x.new_empty((*x.shape[:-1], weight.shape[0]))
+
+
+direct_register_custom_op(
+    op_name="quixicore_decode_linear",
+    op_func=_quixicore_decode_linear_impl,
+    fake_impl=_quixicore_decode_linear_fake,
+)
+
+
+def cuda_unquantized_gemm(
+    layer: torch.nn.Module,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+):
+    if (
+        bias is None
+        and decode_gemm_enabled()
+        and x.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and weight.dim() == 2
+        and weight.is_contiguous()
+        and decode_gemm_supports(weight.shape[0], weight.shape[1])
+    ):
+        return torch.ops.vllm.quixicore_decode_linear(x, weight, None)
+    return torch.nn.functional.linear(x, weight, bias)
+
+
+# QuixiCore FP8 block-scaled decode GEMM (csrc/quixicore/tm_cuda/fp8_decode_gemm.cuh):
+# the M <= 16 kernel for block-FP8 linears (compressed-tensors block scheme,
+# e4m3 weights with 128x128 fp32 scales). bf16 activations, the block scale
+# applied in the weight conversion, so the mma multiplies exactly the BF16 a
+# checkpoint dequant stores; one launch instead of activation quant + CUTLASS.
+# Above 16 tokens the op runs the stock CUTLASS w8a8 blockwise path (prefill
+# numerics unchanged). SLIMSERVE_DECODE_GEMM_FP8=0 keeps the stock path for
+# every M.
+@cache
+@torch.compiler.assume_constant_result
+def decode_gemm_fp8_enabled() -> bool:
+    if (
+        os.getenv("SLIMSERVE_DECODE_GEMM_FP8", "1") == "0"
+        or not current_platform.is_cuda()
+        or not current_platform.has_device_capability(80)
+    ):
+        return False
+    from vllm.quixicore.ops import quixicore_ops
+
+    return quixicore_ops.has_decode_gemm_fp8()
+
+
+def decode_gemm_fp8_supports(n: int, k: int) -> bool:
+    return 1024 <= n <= 16384 and n % 8 == 0 and k >= 512 and k % 128 == 0
+
+
+def _cutlass_block_fp8_linear(
+    x2: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor
+) -> torch.Tensor:
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+        per_token_group_quant_fp8,
+    )
+
+    q_input, input_scale = per_token_group_quant_fp8(x2, 128, column_major_scales=True)
+    return ops.cutlass_scaled_mm(
+        q_input,
+        weight.t(),
+        out_dtype=x2.dtype,
+        scale_a=input_scale,
+        scale_b=weight_scale.t(),
+    )
+
+
+def _quixicore_fp8_block_linear_impl(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> torch.Tensor:
+    x2 = x.reshape(-1, x.shape[-1])
+    n = weight.shape[0]
+    if x2.shape[0] <= DECODE_GEMM_MAX_TOKENS and bias is None:
+        from vllm.quixicore.ops import quixicore_ops
+
+        out = quixicore_ops.decode_gemm_fp8(x2.contiguous(), weight, weight_scale)
+        return out.view(*x.shape[:-1], n)
+    out = _cutlass_block_fp8_linear(x2, weight, weight_scale)
+    if bias is not None:
+        out = out + bias
+    return out.view(*x.shape[:-1], n)
+
+
+def _quixicore_fp8_block_linear_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> torch.Tensor:
+    return x.new_empty((*x.shape[:-1], weight.shape[0]))
+
+
+direct_register_custom_op(
+    op_name="quixicore_fp8_block_linear",
+    op_func=_quixicore_fp8_block_linear_impl,
+    fake_impl=_quixicore_fp8_block_linear_fake,
+)
+
+
+def maybe_quixicore_fp8_block_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> torch.Tensor | None:
+    """The block-FP8 linear through the QuixiCore op when the layer qualifies
+    (bf16 input, e4m3 [N, K] weight with fp32 [N/128, K/128] scales, shape
+    inside the kernel's gate), else None so the caller keeps its own path."""
+    if (
+        decode_gemm_fp8_enabled()
+        and x.dtype == torch.bfloat16
+        and weight.dtype == torch.float8_e4m3fn
+        and weight.dim() == 2
+        and weight.is_contiguous()
+        and weight_scale.dtype == torch.float32
+        and weight_scale.is_contiguous()
+        and tuple(weight_scale.shape)
+        == ((weight.shape[0] + 127) // 128, weight.shape[1] // 128)
+        and decode_gemm_fp8_supports(weight.shape[0], weight.shape[1])
+    ):
+        return torch.ops.vllm.quixicore_fp8_block_linear(x, weight, weight_scale, bias)
+    return None
 
 
 def use_aiter_triton_gemm(n, m, k, dtype):
@@ -340,5 +516,7 @@ def dispatch_unquantized_gemm() -> Callable[..., torch.Tensor]:
         return rocm_unquantized_gemm
     elif current_platform.is_cpu():
         return cpu_unquantized_gemm
+    elif current_platform.is_cuda():
+        return cuda_unquantized_gemm
     else:
         return default_unquantized_gemm
