@@ -99,6 +99,64 @@ from vllm.sequence import IntermediateTensors
 
 logger = init_logger(__name__)
 
+F32_OVERRIDES_FILE = "f32-overrides.safetensors"
+F32_OVERRIDES_ENV = "SLIMSERVE_F32_OVERRIDES"
+
+
+def _load_f32_overrides(model_path: str | None) -> dict[str, torch.Tensor]:
+    """Tensors to substitute for the checkpoint's copies, keyed by HF name.
+
+    Some NVFP4 conversions of GLM-5.3-Flash (RedHatAI's, 2026-08) saved the
+    router bias (``mlp.gate.e_score_correction_bias``), the KDA decay
+    tensors (``A_log``, ``dt_bias``) and the mHC base/scale vectors in BF16
+    although the native checkpoint keeps them in F32 and this model holds
+    them as F32 parameters. ``slimserve.f32_overrides`` rebuilds them from
+    the native checkpoint into ``<model>/f32-overrides.safetensors``; when
+    that file is present it wins over the shard copies. Set
+    ``SLIMSERVE_F32_OVERRIDES=0`` to serve the shard copies for an A/B.
+    """
+    import os
+
+    if not model_path or os.environ.get(F32_OVERRIDES_ENV, "1") == "0":
+        return {}
+    path = os.path.join(model_path, F32_OVERRIDES_FILE)
+    if not os.path.isfile(path):
+        return {}
+    from safetensors.torch import load_file
+
+    overrides = load_file(path)
+    bad = [k for k, v in overrides.items() if v.dtype != torch.float32]
+    if bad:
+        raise ValueError(
+            f"{path}: {len(bad)} override tensors are not float32, e.g. {bad[0]}"
+        )
+    logger.info("glm5_next: %d F32 override tensors from %s", len(overrides), path)
+    return overrides
+
+
+def iter_with_f32_overrides(
+    weights: Iterable[tuple[str, torch.Tensor]],
+    overrides: dict[str, torch.Tensor],
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """Yield ``weights`` with any name present in ``overrides`` replaced."""
+    if not overrides:
+        yield from weights
+        return
+    pending = set(overrides)
+    for name, weight in weights:
+        if name in overrides:
+            pending.discard(name)
+            yield name, overrides[name]
+        else:
+            yield name, weight
+    if pending:
+        logger.warning(
+            "glm5_next: %d F32 override tensors never appeared in the "
+            "checkpoint stream, e.g. %s",
+            len(pending),
+            sorted(pending)[0],
+        )
+
 
 class Glm5NextMLAAttention(nn.Module):
     """NoPE MLA for the DeepSeek-sparse-attention layers, sparse through
@@ -586,6 +644,7 @@ class Glm5NextForCausalLM(
         super().__init__()
         config = vllm_config.model_config.hf_config.get_text_config()
         self.config = config
+        self._model_path = vllm_config.model_config.model
         self.model = Glm5NextTextModel(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
@@ -666,6 +725,9 @@ class Glm5NextForCausalLM(
         )
         params_dict = dict(self.named_parameters())
         loaded: set[str] = set()
+        weights = iter_with_f32_overrides(
+            weights, _load_f32_overrides(getattr(self, "_model_path", None))
+        )
         for name, weight in weights:
             # Vision tower and MTP layer: later phases.
             if name.startswith("model.visual."):
