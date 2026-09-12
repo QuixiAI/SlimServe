@@ -1416,6 +1416,43 @@
           ]
         }
       }
+    },
+    "glm53f-gguf": {
+      "title": "GLM-5.3-Flash",
+      "modalities": [
+        "text",
+        "image"
+      ],
+      "repo": "antirez/glm-5.3-flash-gguf",
+      "base_url": "https://huggingface.co/antirez/glm-5.3-flash-gguf/resolve/b2fa29d7a6b410db11221c904973967b80b760f5",
+      "local_dir": "GLM-5.3-Flash-GGUF",
+      "shared": [
+        {
+          "path": "GLM-5.3-Flash-Vision-Encoder.gguf",
+          "bytes": 1127280960,
+          "sha256": "ae23e14c6979e889051b2e4a39351abcdafb161e18e606fae4d8c40095a4bf3a"
+        }
+      ],
+      "quants": {
+        "Q2": {
+          "title": "Q2 (IQ2_XXS gate/up, Q2_K down)",
+          "bytes": 96505816384,
+          "summary": "321B GLM-5.3-Flash with 45 trunk layers, 34 KDA and 11 pooled sparse MLA, plus a separate vision encoder.",
+          "min_memory_bytes": {
+            "metal": 137438953472
+          },
+          "files": [
+            {
+              "path": "GLM-5.3-Flash-Q2.gguf",
+              "bytes": 96505816384,
+              "sha256": "e81fd6241c6e55a64e1e14e47a3eab61a173fa8d7e4b5c1d1848827119705b32"
+            }
+          ],
+          "min_gpus": {
+            "metal": 1
+          }
+        }
+      }
     }
   },
   "platforms": {
