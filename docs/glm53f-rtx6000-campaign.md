@@ -305,11 +305,16 @@ our shape.
 Gates for this campaign (in order of strictness):
 
 1. Floor (mandatory): beat the local B12X control in every cell on our
-   protocol, including a fresh unhandicapped control run in Phase 0 on the
-   newest image.
-2. Target (no speculation): c1 >= 250, c8 >= 700, c16 >= 850, cold 32K
-   TTFT <= 2.0 s, cold 128K TTFT <= 8 s. These are 65-75 % of the physics
-   ceilings in section 3 with the FP8 backbone.
+   protocol. Measured 2026-09-11 on r28.1, unhandicapped, median of three:
+   no speculation 166.5 / 687.9 / 966.8 at c1 / c8 / c16; MTP-3 260.8 /
+   732.1 / 1005.8. Our Phase 0 baseline is 113.3 / 449.2 / 611.0 (0.68 /
+   0.65 / 0.63 of the control) and DFlash2 153.6 / 330.9 / 340.3.
+2. Target (no speculation): c1 >= 250, c8 >= 750, c16 >= 1050, cold 32K
+   TTFT <= 2.0 s, cold 128K TTFT <= 8 s (Phase 0 measured 11.8 s / 124 s;
+   the control does 2.93 s / 14.9 s on the same prompts).
+   The decode targets are 65-75 % of the physics ceilings in section 3
+   with the FP8 backbone; c8 / c16 were raised above the control on
+   2026-09-11.
 3. Target (with the chosen speculator, on the Foundry-like structured
    workload and on prose): c1 >= 320 where acceptance supports it; c8 no
    worse than no-spec (the schedule turns speculation off above the batch
@@ -860,6 +865,20 @@ microbench GB/s and an e2e entry.
   Metal profile `glm53f-q2-1`, added by 291fe6e81 (2026-09-11) with
   `"source": "glm53f-gguf"` that no source defines, plus a missing KV note.
   Upstream breakage, left alone; the PR must not be read as introducing it.
+- Baseline (details in `perf/optimization_status.md` 2026-09-11): no-spec
+  113.3 / 449.2 / 611.0, long 116.9 / 523.7, cold TTFT 11.8 s / 124 s;
+  DFlash2 153.6 / 330.9 / 340.3 (accepts 1.0-1.7 of 7); control r28.1
+  unhandicapped 166.5 / 687.9 / 966.8 and MTP-3 260.8 / 732.1 / 1005.8,
+  control cold TTFT 2.93 s / 14.9 s (ours 4.0x / 8.3x slower).
+  Gates and canaries pass. Decode: cuBLAS M=1 kernels 41 % of an 8.47 ms
+  step, Marlin 13 %, NCCL AR 11.5 %, mHC 9 %; 1583 launches/step. Prefill at
+  32K: `_pooled_logits_kernel` 57 % of 11.58 s (O(L^2), ~17 TFLOP/s), NCCL
+  14 %, sparse MLA via the decode kernel 11 %, mHC partials 7 %.
+- Roadmap adjustment from Phase 0: indexer prefill scoring (compact cache
+  path, SM80-gated at `glm5_next_indexer.py:125`, or a GEMM-form kernel)
+  joins Phase 1; the native NVFP4 expert kernel moves from Phase 4 to Phase 2
+  (the control's c8 / c16 lead is its B12X FP4 expert path plus fp8 KV);
+  speculation stays Phase 3 with the MTP head as the first arm to measure.
 - Environment audit: driver 610.43.02 / CUDA 13.3 (section 10), CPU
   governor schedutil (acpi-cpufreq), GPU power limit 600 W, max SM clock
   3090 MHz, memory clock 14,001 MHz, P2P reads OK on every pair, no NCCL or
@@ -870,7 +889,9 @@ microbench GB/s and an e2e entry.
 
 ```bash
 cd ~/Lazarus/SlimServe && git branch --show-current   # glm53f-rtx6000
-bash ~/.local/scratch/slimserve-glm53/rebuild.sh       # full 12.0f build of this tree (73 min; GPUs idle)
+# Phase 0 done 2026-09-11. Phase 1 item 1 (FP8 backbone + decode GEMMs) starts from
+# the salvage set: ~/.local/scratch/slimserve-glm53/salvage/ ; measure with
+# CANARY=1 GATE=1 STATE=1 PASSES=3 bash ~/.local/scratch/slimserve-glm53/ab.sh <run> -- --no-spec       # full 12.0f build of this tree (73 min; GPUs idle)
 ```
 
 Then Phase 0 items 2-5, in that order, each with its notebook entry.

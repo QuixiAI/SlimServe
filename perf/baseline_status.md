@@ -2545,3 +2545,23 @@ negative-allocation fix 9c24bc5ad): 557 turns, 0 errors, 88/88 recall,
 max context 476,986, 432 tier hits (perf/results/2026-09-11/
 glm53f-leg-dp2/). Owed (running): the 1M-context leg.
 Raw: perf/results/2026-09-11/glm53f-final-dp2/.
+
+## GLM-5.3-Flash NVFP4 on 4x RTX PRO 6000 Blackwell (rtx6000 record), 2026-09-11 Phase 0 baseline
+
+Bring-up baseline of `glm53f-nvfp4-4` / `rtx6000` (branch `glm53f-rtx6000`
+4a1065081: the a100 kernel set built for sm_120f, driver 610.43.02), exact-token
+harness 1000/300, three passes per boot, median; not a record row until the
+campaign's Phase 6. Local B12X control on the same protocol, same day,
+unhandicapped (r28.1 image, native FP4 experts, fp8 KV, PCIe all-reduce).
+
+| arm | c1 | c8 | c16 | c1 1000/2000 | c8 1000/2000 | cold TTFT 32K / 128K |
+|---|---:|---:|---:|---:|---:|---|
+| ours, no speculation | 113.3 | 449.2 | 611.0 | 116.9 | 523.7 | 11.8 s / 124 s |
+| ours, DFlash2 k=7 | 153.6 | 330.9 | 340.3 | | | |
+| control r28.1, no speculation | 166.5 | 687.9 | 966.8 | | | 2.93 s / 14.9 s |
+| control r28.1, MTP-3 | 260.8 | 732.1 | 1005.8 | | | |
+
+Gate: mean text logprob -2.420 / -2.431 (band -2.407..-2.478), needle margins
+positive, canaries text / tool / image pass, exact-token true everywhere.
+Details, attribution and raw paths: `perf/optimization_status.md`, entry
+"2026-09-11: GLM-5.3-Flash NVFP4 on 4x RTX PRO 6000 Blackwell (rtx6000)".

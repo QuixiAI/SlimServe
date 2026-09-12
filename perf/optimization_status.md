@@ -25487,3 +25487,133 @@ arm (queue17).
   (queue18: cold single requests at 200K/500K/800K/900K/1M with a
   planted marker). Also: one 400 at 1,048,065 prompt tokens - the
   harness overshoots the 1,048,576 ceiling by its 512 reply tokens.
+
+## 2026-09-11: GLM-5.3-Flash NVFP4 on 4x RTX PRO 6000 Blackwell (rtx6000): Phase 0 baseline and control
+
+Branch `glm53f-rtx6000` at 4a1065081 (bring-up on upstream 2b355117e): the a100
+kernel set built for `sm_120f`, new `rtx6000` platform and `glm53f-nvfp4-4`
+record, nothing tuned yet. Campaign doc `docs/glm53f-rtx6000-campaign.md`.
+Hardware: tinybox, 4x RTX PRO 6000 Blackwell Workstation (sm_120, 96 GB,
+PCIe 5, no NVLink, PHB pairs 0-1 / 2-3), driver 610.43.02 (CUDA 13.3),
+CUDA 13.0 toolkit build, EPYC 9334, 188 GB, governor schedutil, power limit
+600 W, no NCCL/VLLM env overrides. Profile command:
+`slimserve.cli glm53f-nvfp4-4 --serve --host 127.0.0.1 --port 8000 -y [--no-spec|--spec]`
+(TP4, EP off, Marlin W4A16 experts, QUIXICORE_MLA_SPARSE + force_mqa, block 64,
+bf16 KV, FULL_DECODE_ONLY capture 64, max_num_seqs 16, gpu_memory_utilization
+0.85, prefix caching, thinking budget 2000, no KV tier). KV pool 2,076,238
+tokens (engine adds 10 padding layers, "may waste at most 29.41 %").
+Harness: `benchmarks/benchmark_dsv4_exact.py` on `prompt-source.txt`, exact
+token counts, temperature 1.0 / top_p 0.95 / top_k 20, seed 42, `--repeat-source
+--allow-no-spec`; one 300-token request per pass at c1, 8 and 16 concurrent at
+c8/c16; three passes per boot, median reported; `exact: true` on every run.
+Raw: `perf/results/2026-09-11/{p0-nospec,p0-nospec-long,p0-dflash2,ctl-nospec,ctl-mtp3}-pass*/`;
+traces `~/.local/scratch/slimserve-glm53/profile-{state-p0-nospec,state-p0-dflash2,prefill-p0-32k}/`.
+
+| arm | c1 | c8 | c16 | c1 1000/2000 | c8 1000/2000 | cold TTFT 32K | cold TTFT 128K |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| ours, no speculation | 113.3 | 449.2 | 611.0 | 116.9 | 523.7 | 11.76 s | 124.3 s |
+| ours, DFlash2 k=7 | 153.6 | 330.9 | 340.3 | | | | |
+| control B12X r28.1, no speculation | 166.5 | 687.9 | 966.8 | | | 2.93 s | 14.9 s |
+| control B12X r28.1, MTP-3 | 260.8 | 732.1 | 1005.8 | | | | |
+
+- Ours per pass: no-spec c1 112.0/113.3/113.3, c8 449.2/448.0/450.8, c16
+  614.6/611.0/609.9; long c1 117.1/116.8, c8 524.0/523.4; DFlash2 c1
+  168.8/153.6/148.4, c8 316.6/337.8/330.9, c16 344.2/340.3/333.9. Warm
+  (prefix-cached) TTFT: 32K 0.175 s, 128K 1.18 s. The 32K cold number
+  includes two Triton JITs on the first request (`_zero_kv_blocks_kernel`,
+  `_topk_topp_kernel`); the profiled cold 32K prefill on a warmed server is
+  11.58 s of GPU kernel time, so JIT is not the story.
+- Control: image `voipmonitor/vllm:jovian-judgement-community-20260908-r28.1`
+  (vLLM v0.26.1rc0+glm53.r28.1), checkpoint
+  `local-inference-lab/GLM-5.3-Flash-NVFP4` (modelopt: NVFP4 g16 routed
+  experts, MXFP8 MTP experts, BF16 backbone; same byte class as RedHatAI),
+  TP4, `KV_CACHE_QUANT=fp8_ds_mla`, `CUDAGRAPH_MODE=FULL_AND_PIECEWISE`,
+  `GPU_MEMORY_UTILIZATION=0.93`, MAX_NUM_SEQS 32, batched tokens 4096, run
+  UNHANDICAPPED on the 610 driver (no `NCCL_CUMEM_ENABLE=0`,
+  `NCCL_P2P_DISABLE=1`, `B12X_PCIE_ALLREDUCE=0`). Its stack per its log:
+  `B12X` NvFp4 MoE backend (native sm_120 FP4 experts), fp8_ds_mla KV, B12X
+  PCIe all-reduce (one-shot <= 84 KB, two-shot bf16 <= 768 KB, DMA >= 6 MB),
+  custom fusions norm_quant / act_quant / allreduce_rms, breakable CUDA
+  graphs, FlashInfer sampling, KV pool 4,686,328 tokens. Per pass: no-spec
+  c1 156.0/166.6/166.5, c8 378.8/687.9/688.4, c16 616.4/966.8/967.9 (pass 1
+  is its graph warm-up); MTP-3 c1 214.6/286.3/260.8, c8 732.1/717.5/733.6,
+  c16 1017.6/1005.8/953.2. Old handicapped control for reference: 134.0 /
+  483.7 / 598.6.
+- Control cold TTFT (same probe, same prompts, no speculation): 32K 2.93 s,
+  128K 14.9 s; warm 0.082 s / 0.268 s. Ours is 4.0x / 8.3x slower cold and
+  2.1x / 4.4x slower warm (the warm 128K first token at 1.18 s says our
+  per-step cost at 128K context, not only prefill, needs the Phase 5 look).
+- Gap, ours / control, no speculation: 0.68 / 0.65 / 0.63 at c1 / c8 / c16.
+- SM80-gated features and their sm_120 status on this tree: indexer row
+  sharding (`glm5_next_indexer_row_shard`, gate `is_device_capability((8,0))`
+  at `glm5_next_indexer.py:94`): not enabled, prefill lever to qualify;
+  compact indexer cache (`glm5_next_compact_indexer_cache`, gate at :125):
+  not enabled, first prefill item; sparse tensor-core decode
+  (`glm5_next_sparse_tc_decode`, `quixicore_mla_sparse.py:74`): kernel needs
+  a 99 KB shared-memory retune (fails at 147-163 KB); mHC norm fusion
+  (`glm5_next.py:248` `_fuse_mhc_norm`): off here, the norm runs as a
+  separate kernel (Triton norms 3 % of the step); mHC projection overlap
+  (`glm5_next.py:442`, `sm80=` argument): off; FP32 router GEMV
+  (`gate_linear.py`, SM80 and 288 experts): off, router runs on cuBLAS.
+  Each is a one-line gate plus a parity run to qualify, except the TC decode
+  retune.
+- Quality gates (gate.py, 8 fixed 512+32 slices, prompt logprobs): no-spec
+  mean text logprob -2.420 / -2.431 (two runs, one boot), DFlash2 -2.450 /
+  -2.462; reference band -2.407..-2.478 with 0.02-0.03 boot jitter. Needle
+  margins 12.8-20.4 nats. Canaries text / tool call / image pass on both
+  boots, no U+FFFD.
+- Speculation: DFlash2 accepts 1.0-1.7 of its 7 drafted tokens per step on
+  this prose workload (acceptance rate 0.14-0.25), which is why c1 gains
+  36 % and c8 / c16 lose 26 % / 44 %. The control's MTP-3 accepts 1.2-1.9 of
+  3 and keeps c8 / c16 above its no-spec numbers. Phase 3 measures the
+  checkpoint's own MTP head and the structured workload before choosing.
+
+State label (no-spec, profiled c1 round, 5 full steps): wall/step 7.579 ms =
+launch latency 12.5 us + span 7.574 ms (busy 7.241 + in-step idle 0.333);
+GPU span 8.47 ms/step, 1583 launches/step. Decode attribution:
+
+| class | ms/step | share | launches/step |
+|---|---:|---:|---:|
+| cuBLAS gemvx (M=1 backbone projections) | 2.11 | 24.4 % | 210 |
+| cuBLAS gemm 16x16 wmma sm80 tiles (one per KDA layer at 34 us: the in_proj weight stream at ~1.5 TB/s, plus 42+10 small ones) | 1.54 | 17.7 % | 90 |
+| Marlin MoE (two launches per MoE layer) | 1.12 | 12.9 % | 84 |
+| NCCL all-reduce ring LL, 10.9 us each | 0.99 | 11.5 % | 91 |
+| mHC transition (`dsv4_mhc::fused_pre_transition`) | 0.78 | 9.0 % | 91 |
+| MoE glue (topk / align / sum / act) | 0.45 | 5.2 % | 222 |
+| sparse MLA decode + reduce | 0.35 | 4.0 % | 22 |
+| Triton norms / adds | 0.26 | 3.0 % | 246 |
+| pooled indexer | 0.20 | 2.3 % | 22 |
+| KDA recurrent + conv | 0.17 | 2.0 % | 68 |
+| lm_head GEMV (200 us, outside the graph) | 0.16 | 1.9 % | 1 |
+| copies, aten elementwise, sampling, other | 0.55 | 6.1 % | 400 |
+
+The cuBLAS M=1 kernels are 41 % of the step and run near bandwidth: the
+decode step is bytes-bound on the BF16 backbone, exactly the doc's Phase 1
+(FP8 backbone, decode GEMMs), with all-reduce, mHC and launch count behind.
+
+Cold 32K prefill attribution (whole trace before the first decode graph,
+11.58 s kernel busy, 13,276 launches, 6 prefill chunks):
+
+| kernel | s | share |
+|---|---:|---:|
+| `_pooled_logits_kernel` (indexer prefill scoring, general non-compact path, 88 launches at 74.5 ms) | 6.56 | 56.6 % |
+| NCCL all-reduce ring LL, 547 at 2.97 ms (67 MB each, 22.6 GB/s algbw) | 1.62 | 14.0 % |
+| `mla_decode_fp8_v<true,false,512,512>` (sparse MLA prefill through the gathered-MQA decode kernel) | 1.24 | 10.7 % |
+| `dsv4_mhc::partials` (mHC prefill) | 0.85 | 7.3 % |
+| Marlin MoE | 0.54 | 4.6 % |
+| cutlass BF16 GEMMs (sm80 tensorop tiles) | 0.36 | 3.1 % |
+| everything else | 0.41 | 3.7 % |
+
+The indexer scoring is O(L^2) at ~17 TFLOP/s (pool keys recomputed per
+query program, no tensor cores) and scales 16x to 128K, which accounts for
+the 124 s. The compact indexer cache path (`cached_pool_logits`, precomputed
+64-wide pool keys) is gated "qualified only on SM80"
+(`glm5_next_indexer.py:125`); qualifying it here, or a GEMM-form scoring
+kernel, is the first prefill item and moves into Phase 1.
+
+Decisions: baseline recorded, no change retained. Phase 1 order: (1) FP8
+backbone + decode GEMM re-land (bytes); (2) custom all-reduce over PCIe
+(`VLLM_CUSTOM_AR_ALLOW_PCIE=1`, upstream disables it on >2 PCIe GPUs); (3)
+indexer prefill scoring; the native NVFP4 expert kernel moves up to Phase 2
+because the control's c8 / c16 lead is mostly its expert path. Test
+classification and upstream breakages: campaign doc section 12.
