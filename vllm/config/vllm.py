@@ -940,6 +940,11 @@ class VllmConfig:
             speculative_config is None
             or not speculative_config.uses_dynamic_speculative_decoding()
             or self.parallel_config.data_parallel_size <= 1
+            # Replicated-MoE data parallelism runs the replicas without any
+            # cross-replica collective or lockstep step (no DP all-gather, no
+            # dummy steps), so each replica may pick its own draft length:
+            # the divergence this guard prevents cannot happen there.
+            or getattr(self.parallel_config, "data_parallel_replicate_moe", False)
             # See _is_draft_model_view: this method mutates the SHARED
             # speculative_config; a view must not.
             or self._is_draft_model_view()

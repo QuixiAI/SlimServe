@@ -25905,3 +25905,18 @@ Phases, by value over risk:
   (quixicore + libtorch_stable); no Python imports anything from
   ~/QuixiCore. The QuixiCore-CUDA repo only receives ports of finished
   kernels and is not a build or runtime dependency.
+- PHASE 1 (2026-09-12, queue40, exact harness, two boots x two runs, raw
+  perf/results/2026-09-10/glm53f-dflash2/shape-*): the engine DISABLES a
+  per-batch-size draft schedule under data parallelism (vllm.py: "Dynamic
+  speculative decoding is not supported with data parallelism ... falling
+  back to static num_speculative_tokens"), so the record has always run a
+  fixed k=3 at every batch size; its [[1,16,3],[17,64,0]] field was inert.
+  Fixed k on the record: k=2 c64 1392/1429/1465/1412, c128 1679/1523/1649/
+  1613 (acceptance 2.10 of 3); k=3 c64 1349/1362/1395/1397, c128 1454/
+  1537/1596/1638 (2.19 of 4); k=4 c64 1195/1237, c128 1420/1344 (2.26 of
+  5). k=2 leads k=3 by 3-4% at both points (inside the 5-10% boot spread
+  at c96/c128 but consistent), k=4 loses 13%. c128 is +12-16% over c64
+  (MoE bytes amortize). Guard relaxed for replicated-MoE DP (replicas
+  never synchronize), so a per-replica dynamic schedule is available
+  again. Decision deferred to the sustained-load metric (queue41 k=3
+  baseline, queue45 k=2).
