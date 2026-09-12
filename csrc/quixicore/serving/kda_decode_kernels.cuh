@@ -189,15 +189,15 @@ __global__ void __launch_bounds__(THREADS) kda_spec_kernel(
     }
     if (tid < len) s_beta[tid] = sigmoidf(float(raw_beta[int64_t(bos + tid) * stride_beta + h]));
     __syncthreads();
-    // L2 norms: warp w < 2*len handles (t = w/2, q or k).
-    if (warp < 2 * len) {
-        const int t = warp >> 1;
-        const float* src = (warp & 1) ? s_k[t] : s_q[t];
+    // L2 norms: pair p = (t = p/2, q or k), warps loop over the 2*len pairs.
+    for (int p = warp; p < 2 * len; p += THREADS / 32) {
+        const int t = p >> 1;
+        const float* src = (p & 1) ? s_k[t] : s_q[t];
         float ss = 0.0f;
 #pragma unroll
         for (int i = 0; i < 4; ++i) { const float x = src[4 * lane + i]; ss += x * x; }
         ss = warp_sum(ss);
-        if (lane == 0) s_inv[warp & 1][t] = rsqrtf(ss + 1e-6f);
+        if (lane == 0) s_inv[p & 1][t] = rsqrtf(ss + 1e-6f);
     }
     __syncthreads();
     // Lane mapping: G lanes share one state row (128 / G columns each), so a
