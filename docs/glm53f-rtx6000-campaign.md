@@ -823,7 +823,50 @@ microbench GB/s and an e2e entry.
    (two sources per quant, loader hooks stay) or cutting the tensors from the
    306 GB native download at first boot.
 
-## 12. Next command
+## 12. Phase 0 log (2026-09-11)
+
+- Build: full `12.0f` rebuild of 4a1065081 (`-gencode arch=compute_120f,code=sm_120f`),
+  406 ninja steps, 73 min under the 120 GB scope (peak host use ~20 GB), all
+  seven extensions rebuilt; `_C_stable_libtorch`, `_moe_C_stable_libtorch`
+  and `_quixicore_C` import. DeepGEMM skipped by the cmake guard (no
+  `tools/build_deepgemm_C.py` on this tree).
+- Kernel tests on GPU 0: `test_quixicore_sparse_mla_bf16.py` 23/23.
+  `tests/glm5_next/`: 911 pass, 24 skip, 58 fail, one collection error.
+  The failures, classified (none blocks the record):
+  - 34 in `test_sparse_tc_candidate` / `test_sparse_tc_workspace`: Triton
+    `OutOfResources`, the sparse tensor-core decode asks 147-163 KB of shared
+    memory against the 99 KB (101,376 B) limit here. Expected: the sm80
+    kernel needs an sm_120 retune; the switch is off on the record.
+  - 5 in `test_sparse_tc_workspace` and 4 in `test_indexer_gather_candidate`:
+    stale tests. The kernel gained `SPLIT`/`FP8` parameters (2b355117e) and
+    the indexer call gained `group=` (c03831133) on 2026-09-11; the tests were
+    last touched 2026-09-10 (ac4cacd37). Upstream, not platform.
+  - 10 in `test_mhc_project_candidate`: one element of 16,384 differs by one
+    bf16 ulp (1.2e-4 abs, 0.5 % rel) against the test's tolerance. Rounding
+    order, not a defect.
+  - 4 in `test_pooled_indexer_parity[length=133]` (the only length that
+    prunes): row 123 selects pool 26 instead of pool 30. Diagnosed with
+    `~/.local/scratch/slimserve-glm53/pool_parity_diag.py`: the kernel's
+    pooled scores deviate from the fp32 reference by up to 0.038 (mean
+    0.012 on scores ~0.9, 1-4 %) over every pool, and the reference's own
+    16th/17th candidates are 0.0006 apart, so the flip is score noise at a
+    near-tie, not a tail-pool rule. Same Triton fp32 code on sm80, so most
+    likely not platform-specific; the precision of `_pooled_logits_kernel`
+    versus the HF reference is a fidelity item for upstream, parked.
+  - Collection error: `test_deepcontext_qualification.py` imports
+    `benchmarks.benchmark_wildchat_deepcontext`, absent on this tree.
+- Registry tests (`tests/slimserve/test_profiles.py`): 63 pass; the 8
+  failures are identical without the rtx6000 record. They come from the
+  Metal profile `glm53f-q2-1`, added by 291fe6e81 (2026-09-11) with
+  `"source": "glm53f-gguf"` that no source defines, plus a missing KV note.
+  Upstream breakage, left alone; the PR must not be read as introducing it.
+- Environment audit: driver 610.43.02 / CUDA 13.3 (section 10), CPU
+  governor schedutil (acpi-cpufreq), GPU power limit 600 W, max SM clock
+  3090 MHz, memory clock 14,001 MHz, P2P reads OK on every pair, no NCCL or
+  VLLM overrides in the shell, systemd user session, or fish config; 188 GB
+  RAM, earlyoom at 8 % free.
+
+## 13. Next command
 
 ```bash
 cd ~/Lazarus/SlimServe && git branch --show-current   # glm53f-rtx6000
