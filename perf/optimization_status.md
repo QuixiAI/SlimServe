@@ -26033,3 +26033,16 @@ Phases, by value over risk:
   covers ~2K keys instead of 16K: prep 1.96 -> 0.22 ms at 512 queries,
   4.85 -> 0.64 ms at 2048 (attention 3.7 / 13.7 ms); tests 5/5. In the
   prefill profile the prep share (6.6%) drops to under 1%.
+- PREFILL CHUNK SIZE (2026-09-13, queue50, record with the prefill kernel,
+  k=2; raw perf/results/2026-09-13/glm53f-chunk-{8192,16384}/): the
+  engine caps scheduled tokens at max_num_batched_tokens minus the draft
+  slots; the record's default 2048 gave 1984-token prefill chunks, ~60
+  rows per active expert, so marlin re-read every expert's weights per
+  64-row m-tile (~0.84 MB of expert weights per prefilled token).
+  | batched tokens | sustained c64 | c128 | exact c64 | pool |
+  | 2048 | 1508 | 1864 | 1453-1490 | 2.97M |
+  | 8192 | 1575 | 1947 | 1626-1632 | 2.72M |
+  | 16384 | 1594 | 1953 | 1672-1698 | 2.33M |
+  Canaries pass on both arms. KEPT 8192 (+4.5% sustained, +11% exact);
+  16384 is +1% more for 14% less pool. Leg + full exact re-measure queued
+  (queue51). Remaining prefill MoE lever is marlin's 64-row m-tile itself.
