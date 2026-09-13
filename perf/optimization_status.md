@@ -26046,3 +26046,45 @@ Phases, by value over risk:
   Canaries pass on both arms. KEPT 8192 (+4.5% sustained, +11% exact);
   16384 is +1% more for 14% less pool. Leg + full exact re-measure queued
   (queue51). Remaining prefill MoE lever is marlin's 64-row m-tile itself.
+- KDA DEFERRED COMMIT, re-evaluated at the record's k=2 (2026-09-13, from
+  the 2026-09-12 measurements, no new GPU time): today's forward stores one
+  state per draft row, so at k=2 (3 rows) it moves 1 read + 3 writes
+  (~100 us at 32 requests, scaling from the 128 us measured at 4 rows);
+  the store-free forward (57 us, issue-bound) plus the commit (55 us,
+  1 read + 1 write) is 112-117 us independent of the row count. NET: a
+  loss at k=2, -9..-13% of the KDA cost only at k>=3. PARKED behind the
+  draft-length arms (queue52: k=3 and per-replica schedules at
+  max_num_seqs 128); wire it only if a k>=3 arm wins the record. The
+  fused next-step commit (2 units) stays rejected: the scheduler hashes
+  and frees the boundary block at the end of the step, so a prefix-cache
+  hit or a tier DMA could read the block before the replay committed it.
+- DP PREFIX AFFINITY (2026-09-13, audit): already in the fork -
+  vllm/v1/engine/dp_prefix_affinity.py PrefixAffinityRouter, default on
+  (VLLM_DP_PREFIX_AFFINITY), cost = prompt tokens - matched blocks x 64 +
+  2048 x (4 waiting + running); hashes at cache_config.block_size (64)
+  while the engine matches at the 1152-token gcd, which only makes the
+  match accounting finer than the reuse. The WildChat leg (client-side
+  sessions, no session header, growing shared prefix) is the workload
+  that exercises it; the sustained random bench has no cross-request
+  prefix. Verification = per-engine prefix hit rate in the leg log.
+- BATCH AMORTIZATION + DRAFT LENGTH at the top end (2026-09-13, queue52,
+  8192-chunk record; sustained output tok/s, raw perf/results/2026-09-13/
+  glm53f-mns*/): c128 was exactly the 64-per-replica cap.
+  | arm | c64 | c128 | c256 | c512 | pool |
+  | max_num_seqs 64 (record) | 1575 | 1947 | - | - | 2.72M |
+  | 128, capture 384 | 1568 | 1952 | 2424 (TPOT 96 ms) | - | 2.56M |
+  | 256, capture 768 | - | 1960 | 2436 | 947 (TPOT 281 ms) | 2.29M |
+  | 128 + [[1,32,3],[33,128,2]] | 1521 | 1927 | 2404 | - | 2.67M |
+  | 128 + [[1,16,4],[17,48,3],[49,128,2]] | 1450 | 1913 | 2385 | - | 2.56M |
+  KEPT max_num_seqs 128 / capture 384 (+24% at c256 for 6% of the pool);
+  256 adds nothing and c512 collapses (not diagnosed: 256 sequences x 3
+  rows = 768-token verify steps). Per-replica draft schedules work under
+  DP (canaries pass) but lose to fixed k=2 at every concurrency: at
+  32 requests per replica the third draft row already costs more than it
+  returns (acceptance 77% at k=2/3, 65% with k=4 rows). Fixed k=3 arm
+  reruns in queue56. KDA deferred commit therefore stays parked.
+- INCIDENT (2026-09-13 05:25): the new NVFP4 prefill MoE path defaulted on
+  while the installed _quixicore_C lacked the op -> the k=3 arm's boot died
+  ("module 'vllm._quixicore_C' has no attribute 'nvfp4_moe_gemm'"). Default
+  is now 0 (off) with a hasattr guard; the .so is installed by queue55 only
+  after the legs, with no server running.

@@ -2968,7 +2968,7 @@
               "glm5_next_sparse_prefill": true
             },
             "enable_expert_parallel": false,
-            "max_num_seqs": 64,
+            "max_num_seqs": 128,
             "block_size": 64,
             "gpu_memory_utilization": 0.95,
             "kv_cache_dtype": "auto",
@@ -2984,7 +2984,7 @@
             },
             "compilation_config": {
               "cudagraph_mode": "FULL_DECODE_ONLY",
-              "max_cudagraph_capture_size": 256
+              "max_cudagraph_capture_size": 384
             },
             "limit_mm_per_prompt": {
               "image": 2
@@ -3026,7 +3026,8 @@
             "DFlash2 speculative decoding ON by default: incoai/GLM-5.3-Flash-DFlash2 (5 SWA layers, block 8, taps at target layers 6/15/25/34/43 = mean of the four mHC streams) drafts a FIXED k=2 per replica (2026-09-12). The earlier per-batch-size schedule [[1,16,3],[17,64,0]] was inert: the engine disables dynamic draft schedules under data parallelism and had fallen back to a fixed k=3; measured under sustained load (vllm bench serve random 1000/300, 640-1280 prompts) k=2 gives c64 1227/1411 and c128 1674/1672 output tok/s against k=3 1140/1157 and 1425/1426 (acceptance 2.10 of 3 rows vs 2.19 of 4: the shorter verify step is worth more than the extra row); k=4 loses 13% on the exact harness. Zero-draft schedule ranges are rejected under replicated-MoE DP (they crashed KV-cache initialization). Rejection sampling verifies every draft, so output content is unaffected. --no-spec restores the non-speculative path.",
             "Record at fixed k=2 (2026-09-12, exact medians of three warmed repeats): c1 128.0 / c8 567.1 / c16 875.6 / c32 1110.0 / c64 1413.8 tok/s (k=3: 127.1 / 497.0 / 843.9 / 1023.3 / 1320.8); canaries pass; WildChat deep-context leg c8 785 turns, 0 errors, 126/126 recall, sessions to 658K tokens (VLLM_KV_TIER_VERIFY=1). Sustained load (vllm bench serve random 1000/300): c64 1227-1411, c128 1672-1674 output tok/s. Raw: perf/results/2026-09-12/glm53f-k2-record/, glm53f-leg-k2/, glm53f-sustained-k2/.",
             "Sparse MLA prefill kernel ON (2026-09-12, glm5_next_sparse_prefill; QuixiCore mla_sparse_prefill_fp8): prefill chunks attend in groups of 4 consecutive queries on tensor cores over the union of their selected 4-token pools with a per-query mask, instead of the per-token decode kernel that took 39% of prefill time. Sustained load (same protocol, one run each): c64 1508 vs 1417 output tok/s, c128 1864 vs 1674 (+6% / +11%); exact medians unchanged within spread; canaries pass. Semantics: a token listed twice by the indexer (the always-selected tail inside a selected pool) counts once. Raw: perf/results/2026-09-12/glm53f-sparse-prefill-{1,0}/.",
-            "max_num_batched_tokens 8192 (2026-09-13): the default 2048 left prefill chunks at 1984 tokens per step (minus the draft slots), so the NVFP4 marlin MoE re-streamed every active expert per 64-row tile at ~0.84 MB of weights per prefilled token. 8192-token chunks (cap 8128) cut that to ~0.5 MB/token: sustained c64 1575 / c128 1947 output tok/s vs 1508 / 1864, exact c64 1626-1632 vs 1453-1490, canaries pass; KV pool 2.72M tokens (2.97M at 2048). 16384 measured +1% more sustained for a 2.33M pool and was not taken. Raw: perf/results/2026-09-13/glm53f-chunk-{8192,16384}/."
+            "max_num_batched_tokens 8192 (2026-09-13): the default 2048 left prefill chunks at 1984 tokens per step (minus the draft slots), so the NVFP4 marlin MoE re-streamed every active expert per 64-row tile at ~0.84 MB of weights per prefilled token. 8192-token chunks (cap 8128) cut that to ~0.5 MB/token: sustained c64 1575 / c128 1947 output tok/s vs 1508 / 1864, exact c64 1626-1632 vs 1453-1490, canaries pass; KV pool 2.72M tokens (2.97M at 2048). 16384 measured +1% more sustained for a 2.33M pool and was not taken. Raw: perf/results/2026-09-13/glm53f-chunk-{8192,16384}/.",
+            "max_num_seqs 128 per replica, cudagraph capture 384 tokens (2026-09-13): sustained c256 2424 output tok/s vs the c128 cap of 1952 at 64/replica (+24%, mean TPOT 96 ms); c64/c128 unchanged (1568/1952), canaries pass, KV pool 2.56M tokens (2.72M at 64). 256/replica measured no better (c256 2436) and collapsed at c512 (947 tok/s, TPOT 281 ms). Draft length stays fixed k=2: per-replica schedules [[1,32,3],[33,128,2]] (c64 1521 / c128 1927 / c256 2404) and [[1,16,4],[17,48,3],[49,128,2]] (1450 / 1913 / 2385, 65% acceptance) both lose to k=2. Raw: perf/results/2026-09-13/glm53f-mns{128,256}/, glm53f-mns128-sched-{a,b}/."
           ],
           "speculative_overrides": {
             "num_speculative_tokens": 2
