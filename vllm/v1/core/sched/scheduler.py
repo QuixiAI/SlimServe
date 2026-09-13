@@ -332,9 +332,11 @@ class Scheduler(SchedulerInterface):
         self.need_mamba_block_aligned_split = (
             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
         )
-        # A finer prefix_match_unit is configured: a mamba partial tail entry
-        # can only be registered by a step ending exactly at the prompt's last
-        # hash boundary, so the split adds that stop.
+        # The hash block is finer than the scheduler block (a finer
+        # prefix_match_unit, or a group whose block the page-size unification
+        # scaled up): a mamba partial tail entry can only be registered by a
+        # step ending exactly at the prompt's last hash boundary, so the split
+        # adds that stop.
         self.mamba_partial_cache_hit = (
             self.need_mamba_block_aligned_split
             and self.hash_block_size < self.block_size

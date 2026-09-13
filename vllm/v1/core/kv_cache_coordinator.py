@@ -618,14 +618,42 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     "full-attention and Mamba groups, got: "
                     f"{type(g.kv_cache_spec).__name__}."
                 )
-        # Partial hash hits are limited to full-attention + mamba ("align")
-        # without context parallelism.
-        self.enable_partial_hash_hits = dcp_world_size == 1 and any(
+        # Partial (hash-granular) hits. A Mamba "align" group only holds
+        # states at chunk ends, which the scheduler steers onto
+        # ``cache_config.block_size`` boundaries. So whenever a prefix-cacheable
+        # group's block is coarser than the hash block - the Mamba block under a
+        # finer ``prefix_match_unit``, or a full-attention group whose block the
+        # page-size unification scaled up (the compact GLM indexer cache sits
+        # at 8x the MLA block) - hits have to be found at hash granularity with
+        # a fine-grained tail in the coarse group. Aligning to the LCM of the
+        # block sizes instead would demand a Mamba state at positions no chunk
+        # ends on, and every prompt not ending on that LCM would miss. Limited
+        # to managers with fine-grained lookup (full attention, Mamba) without
+        # context parallelism.
+        has_mamba_align = any(
             isinstance(g.kv_cache_spec, MambaSpec)
             and g.kv_cache_spec.mamba_cache_mode == "align"
-            and g.kv_cache_spec.block_size > hash_block_size
             for g in kv_cache_config.kv_cache_groups
         )
+        coarse_managers = [
+            manager
+            for manager, group in zip(
+                self.single_type_managers, kv_cache_config.kv_cache_groups
+            )
+            if group.kv_cache_spec.prefix_cacheable
+            and manager.block_size > hash_block_size
+        ]
+        self.enable_partial_hash_hits = (
+            dcp_world_size == 1
+            and has_mamba_align
+            and bool(coarse_managers)
+            and all(m.supports_fine_grained_hash_lookup for m in coarse_managers)
+        )
+        # Sparse-hit managers (sliding window, Mamba under retention) cache
+        # only the blocks a hit can consult, so they must use the same
+        # granularity the hits are found at.
+        for manager in self.single_type_managers:
+            manager.cache_hit_alignment_tokens = self._cache_hit_alignment_tokens
         self.verify_and_split_kv_cache_groups()
 
     @property
