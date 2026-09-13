@@ -26018,3 +26018,12 @@ Phases, by value over risk:
   737 at k=3). Baseline updated: the record's sustained numbers are now
   c64 1508 / c128 1864 output tok/s (from 1140-1157 / 1425 at the start
   of the program: +30% / +31%).
+- PREFILL PROFILE with the sparse prefill kernel (2026-09-13, same load as
+  queue47; raw ~/.local/scratch/glm53/prof-prefill-c32-sp): window 6870
+  -> 5009 ms (-27%); attention 2597 ms (decode kernel) -> 392 ms attn +
+  317 ms prep (3.7x). New shares: marlin MoE 29.8% + 4.7%, mHC partials
+  11.5%, dense 256x128 GEMMs 8.5%, attention 8.2%, NCCL all-reduce 7.4%,
+  prep 6.6%. The prep (bitonic sort of 4 x 2080 token entries per group)
+  is 45% of the attention cost: the index lists are pool-contiguous, so
+  compacting each query's tokens to pool starts before sorting shrinks
+  the sorted set ~8x (next).
