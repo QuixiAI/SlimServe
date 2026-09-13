@@ -120,6 +120,7 @@ static void py_moe_sum_add(torch::Tensor x, torch::Tensor shared, torch::Tensor 
 static torch::Tensor py_decode_gemm(torch::Tensor x, torch::Tensor weight,
                                     c10::optional<torch::Tensor> bias, bool fp32_out) {
     CK(x); CK(weight);
+    TORCH_CHECK(weight.device() == x.device(), "decode_gemm: weight must be on the x device");
     TORCH_CHECK(x.scalar_type() == torch::kBFloat16 && weight.scalar_type() == torch::kBFloat16,
                 "decode_gemm: bf16 x and weight");
     TORCH_CHECK(x.dim() == 2 && weight.dim() == 2 && x.size(1) == weight.size(1),
@@ -129,9 +130,12 @@ static torch::Tensor py_decode_gemm(torch::Tensor x, torch::Tensor weight,
     const float* bias_ptr = nullptr;
     if (bias.has_value()) {
         CK((*bias));
+        TORCH_CHECK(bias->device() == x.device(), "decode_gemm: bias must be on the x device");
         TORCH_CHECK(bias->scalar_type() == torch::kFloat32 && bias->numel() == N, "decode_gemm: fp32 bias [N]");
         bias_ptr = bias->data_ptr<float>();
     }
+    // The launch goes through the current device's stream: make that x's device.
+    const c10::cuda::CUDAGuard guard(x.device());
     auto out = torch::empty({M, N}, x.options().dtype(fp32_out ? torch::kFloat32 : torch::kBFloat16));
     if (fp32_out) decode_gemm::launch_auto(bp(x), bp(weight), bias_ptr, fpm(out), M, N, K, stream());
     else decode_gemm::launch_auto(bp(x), bp(weight), bias_ptr, bpm(out), M, N, K, stream());
@@ -142,6 +146,8 @@ static torch::Tensor py_decode_gemm(torch::Tensor x, torch::Tensor weight,
 static torch::Tensor py_decode_gemm_fp8(torch::Tensor x, torch::Tensor weight, torch::Tensor scale,
                                         c10::optional<torch::Tensor> bias, bool fp32_out) {
     CK(x); CK(weight); CK(scale);
+    TORCH_CHECK(weight.device() == x.device() && scale.device() == x.device(),
+                "decode_gemm_fp8: weight and scale must be on the x device");
     TORCH_CHECK(x.scalar_type() == torch::kBFloat16, "decode_gemm_fp8: bf16 x");
     TORCH_CHECK(weight.scalar_type() == torch::kFloat8_e4m3fn, "decode_gemm_fp8: float8_e4m3fn weight");
     TORCH_CHECK(scale.scalar_type() == torch::kFloat32, "decode_gemm_fp8: fp32 block scales");
@@ -155,9 +161,11 @@ static torch::Tensor py_decode_gemm_fp8(torch::Tensor x, torch::Tensor weight, t
     const float* bias_ptr = nullptr;
     if (bias.has_value()) {
         CK((*bias));
+        TORCH_CHECK(bias->device() == x.device(), "decode_gemm_fp8: bias must be on the x device");
         TORCH_CHECK(bias->scalar_type() == torch::kFloat32 && bias->numel() == N, "decode_gemm_fp8: fp32 bias [N]");
         bias_ptr = bias->data_ptr<float>();
     }
+    const c10::cuda::CUDAGuard guard(x.device());
     auto out = torch::empty({M, N}, x.options().dtype(fp32_out ? torch::kFloat32 : torch::kBFloat16));
     const auto* wp = reinterpret_cast<const uint8_t*>(weight.data_ptr());
     if (fp32_out) decode_gemm_fp8::launch_auto(bp(x), wp, scale.data_ptr<float>(), bias_ptr, fpm(out), M, N, K, stream());

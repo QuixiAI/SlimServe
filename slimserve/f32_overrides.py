@@ -49,10 +49,27 @@ _DTYPES = {
 }
 
 
+def _shards(model_dir: str) -> list[str]:
+    """The checkpoint's own shards: the index's weight map when there is one,
+    else every safetensors file that is not a generated sidecar (the F32
+    overrides and the FP8 swap-set are written into the same directory)."""
+    index = os.path.join(model_dir, "model.safetensors.index.json")
+    if os.path.isfile(index):
+        with open(index) as fh:
+            names = sorted(set(json.load(fh)["weight_map"].values()))
+        return [os.path.join(model_dir, name) for name in names]
+    return sorted(
+        path
+        for path in glob.glob(os.path.join(model_dir, "*.safetensors"))
+        if os.path.basename(path) != OVERRIDES_FILE
+        and not os.path.basename(path).startswith("fp8-swapset")
+    )
+
+
 def _headers(model_dir: str) -> dict[str, tuple[dict, str, int]]:
     """name -> (header entry, shard path, data section offset)."""
     out: dict[str, tuple[dict, str, int]] = {}
-    for shard in sorted(glob.glob(os.path.join(model_dir, "*.safetensors"))):
+    for shard in _shards(model_dir):
         with open(shard, "rb") as fh:
             n = struct.unpack("<Q", fh.read(8))[0]
             header = json.loads(fh.read(n))

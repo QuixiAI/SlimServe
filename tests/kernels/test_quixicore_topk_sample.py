@@ -50,7 +50,7 @@ def _reference(logits, top_k, top_p, idx, seeds, pos, use_fp64):
 def test_matches_mask_then_gumbel(vocab, top_p, use_fp64):
     batch = 16
     total = agree = 0
-    for trial in range(6):
+    for trial in range(7):
         logits, top_k, idx, seeds, pos = _batch(batch, vocab, seed=100 + trial)
         p = None if top_p is None else torch.full((batch,), top_p, device=DEVICE)
         masked, ref = _reference(logits, top_k, p, idx, seeds, pos, use_fp64)

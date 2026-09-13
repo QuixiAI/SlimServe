@@ -12,6 +12,8 @@ import torch
 
 from tests.glm5_next.test_sparse_tc_candidate import reference
 
+pytest.importorskip("vllm._quixicore_C")
+
 
 def make_case(rows, heads, bs, pages, width, seed, gaps):
     torch.manual_seed(seed)

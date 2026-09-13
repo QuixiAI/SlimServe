@@ -64,7 +64,7 @@ def eligible(router, router_logits: torch.Tensor, indices_type) -> bool:
         and router_logits.dim() == 2
         and router_logits.dtype == torch.float32
         and router_logits.is_contiguous()
-        and router_logits.shape[0] <= MAX_TOKENS
+        and 0 < router_logits.shape[0] <= MAX_TOKENS
         and (router_logits.shape[1], router.top_k) in SUPPORTED_SHAPES
         and router.num_expert_group == 1
         and router.topk_group == 1

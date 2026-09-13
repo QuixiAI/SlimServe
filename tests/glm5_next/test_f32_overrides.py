@@ -109,3 +109,31 @@ def test_builder_selects_downcast_tensors_and_skips_mtp_layer(tmp_path):
     assert header[NAME]["dtype"] == "F32"
     restored = _load_f32_overrides(str(conv))
     assert torch.equal(restored[NAME], t)
+
+
+def test_headers_read_the_checkpoint_shards_only(tmp_path):
+    """The sidecars are written next to the shards: a rebuild must not read
+    its own earlier output (its F32 copies would shadow the converted
+    entries and select() would find nothing left to convert)."""
+    import json
+
+    save_file(
+        {NAME: torch.zeros(288, dtype=torch.bfloat16)}, str(tmp_path / "a.safetensors")
+    )
+    save_file(
+        {NAME: torch.zeros(288, dtype=torch.float32)},
+        str(tmp_path / F32_OVERRIDES_FILE),
+    )
+    save_file(
+        {NAME: torch.zeros(288, dtype=torch.float32)},
+        str(tmp_path / "fp8-swapset.safetensors"),
+    )
+    assert f32_overrides._headers(str(tmp_path))[NAME][0]["dtype"] == "BF16"
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {NAME: "a.safetensors"}})
+    )
+    save_file(
+        {NAME: torch.zeros(288, dtype=torch.float32)}, str(tmp_path / "z.safetensors")
+    )
+    assert f32_overrides._shards(str(tmp_path)) == [str(tmp_path / "a.safetensors")]
+    assert f32_overrides._headers(str(tmp_path))[NAME][0]["dtype"] == "BF16"

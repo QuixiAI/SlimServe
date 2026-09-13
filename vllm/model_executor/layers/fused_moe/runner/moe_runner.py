@@ -697,15 +697,17 @@ class MoERunner(MoERunnerInterface):
             if deferred is not None:
                 entry = combine_shared.SharedOutput(topk_ids, *deferred)
                 combine_shared.publish(entry)
-            fused_out = self.routed_experts.forward_modular(
-                x=hidden_states,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                shared_experts=self._shared_experts,
-                shared_experts_input=shared_experts_input,
-                prequant_input=prequant_input,
-            )
-            combine_shared.clear()
+            try:
+                fused_out = self.routed_experts.forward_modular(
+                    x=hidden_states,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    shared_experts=self._shared_experts,
+                    shared_experts_input=shared_experts_input,
+                    prequant_input=prequant_input,
+                )
+            finally:
+                combine_shared.clear()
 
         if deferred is None:
             self._maybe_apply_shared_experts(

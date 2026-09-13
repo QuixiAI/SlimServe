@@ -11,7 +11,9 @@ import torch
 qc = pytest.importorskip("vllm._quixicore_C")
 _NEED = getattr(qc, "mla_sparse_prefill_fp8_smem_bytes", lambda: 0)()
 _HAVE = (
-    torch.cuda.get_device_properties(0).shared_memory_per_block_optin
+    torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).shared_memory_per_block_optin
     if torch.cuda.is_available()
     else 0
 )
