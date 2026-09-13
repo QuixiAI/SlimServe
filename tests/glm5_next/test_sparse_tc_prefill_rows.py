@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Parity gates for the prefill-shaped sparse tensor-core kernel
 (`sparse_tc_nope_rows`): the pure-torch reference, the native SIMT kernel it
-replaces on prefill chunks, and the partitioned tensor-core decode kernel."""
+replaces on prefill chunks, and the partitioned tensor-core decode kernel.
+The native comparison passes the packed-slab page stride, which the SIMT
+kernel does not infer from the view."""
 
 import math
 
@@ -64,7 +66,7 @@ def test_rows_match_reference_and_native(rows, bs, gaps, heads, tile):
         bs,
         scale,
         partition_size=0,
-        page_stride_bytes=0,
+        page_stride_bytes=cache.stride(0) * cache.element_size(),
     )
     torch.testing.assert_close(actual.float(), native.float(), atol=0.004, rtol=0.004)
 
@@ -79,23 +81,6 @@ def test_rows_match_partitioned_tc_and_strided_pages():
     scale = 1 / math.sqrt(256)
     rows_out = sparse_tc_nope_rows(q, cache, table, indices, lengths, scale)
     part_out = sparse_tc_nope(q, cache, table, indices, lengths, scale, split=64)
-    torch.testing.assert_close(
-        rows_out.float(), part_out.float(), atol=0.004, rtol=0.004
-    )
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@torch.no_grad()
-def test_rows_fp8_matches_partitioned_fp8():
-    from vllm.quixicore.sparse_mla_tc import sparse_tc_nope, sparse_tc_nope_rows
-
-    q, cache, table, indices, lengths = make_case(8, 16, 64, 128, 2080, 11, True)
-    fp8 = cache.contiguous().to(torch.float8_e4m3fn).view(torch.uint8)
-    scale = 1 / math.sqrt(256)
-    rows_out = sparse_tc_nope_rows(q, fp8, table, indices, lengths, scale, kv_scale=1.0)
-    part_out = sparse_tc_nope(
-        q, fp8, table, indices, lengths, scale, split=64, kv_scale=1.0
-    )
     torch.testing.assert_close(
         rows_out.float(), part_out.float(), atol=0.004, rtol=0.004
     )

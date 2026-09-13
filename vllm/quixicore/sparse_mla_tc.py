@@ -220,17 +220,16 @@ def _sparse_tc_rows(
     PAGE_STRIDE,
     CACHE_PAGES,
     SCALE,
-    KV_SCALE,
     H: tl.constexpr,
     BS: tl.constexpr,
     MAX_TOPK: tl.constexpr,
     TILE: tl.constexpr,
-    FP8: tl.constexpr,
 ):
     """One program per query token, every head at once, online softmax over
     the token's index list in TILE-wide gathered tiles: no partition scratch,
     so it scales to prefill chunks of thousands of rows. Each gathered tile is
-    read once for all heads (the SIMT kernel walks the list once per head)."""
+    read once for all heads (the SIMT kernel walks the list once per head).
+    bf16 latents only: an fp8 main KV takes the native fp8 prefill kernel."""
     row = tl.program_id(0)
     h, d = tl.arange(0, 16), tl.arange(0, 512)
     count = tl.minimum(tl.load(TLEN + row), MAX_TOPK)
@@ -255,33 +254,14 @@ def _sparse_tc_rows(
         valid = (j < count) & (logical >= 0) & (logical < BT_STRIDE * BS)
         page = tl.load(BT + row.to(tl.int64) * BT_STRIDE + logical // BS, valid, -1)
         valid = valid & (page >= 0) & (page < CACHE_PAGES)
-        if FP8:
-            raw = tl.load(
-                CACHE
-                + page[:, None].to(tl.int64) * PAGE_STRIDE
-                + (logical[:, None] % BS) * 512
-                + d[None, :],
-                valid[:, None],
-                0,
-            ).to(tl.int32)
-            sign = (raw >> 7) & 1
-            exp = (raw >> 3) & 15
-            man = raw & 7
-            normal_bits = (sign << 31) | ((exp + 120) << 23) | (man << 20)
-            normal = normal_bits.to(tl.float32, bitcast=True)
-            sub = tl.where(sign == 1, -1.0, 1.0) * man.to(tl.float32) * 0.001953125
-            val = tl.where(exp == 0, sub, normal)
-            val = tl.where((exp == 15) & (man == 7), 0.0, val)
-            kv = (val * KV_SCALE).to(tl.bfloat16)
-        else:
-            kv = tl.load(
-                CACHE
-                + page[:, None].to(tl.int64) * PAGE_STRIDE
-                + (logical[:, None] % BS) * 512
-                + d[None, :],
-                valid[:, None],
-                0,
-            )
+        kv = tl.load(
+            CACHE
+            + page[:, None].to(tl.int64) * PAGE_STRIDE
+            + (logical[:, None] % BS) * 512
+            + d[None, :],
+            valid[:, None],
+            0,
+        )
         # scores_t[j, h] for the tile's keys j and the heads h.
         scores_t = tl.dot(kv, q_t) * SCALE
         scores_t = tl.where(valid[:, None], scores_t, float("-inf"))
@@ -296,9 +276,7 @@ def _sparse_tc_rows(
         accumulator = tl.dot(tl.trans(high), kv, accumulator)
         accumulator = tl.dot(tl.trans(low), kv, accumulator)
         running_max = new_max
-    result = tl.where(
-        running_sum[:, None] > 0, accumulator / running_sum[:, None], 0.0
-    )
+    result = tl.where(running_sum[:, None] > 0, accumulator / running_sum[:, None], 0.0)
     tl.store(
         OUT + (row.to(tl.int64) * H + h[:, None]) * 512 + d[None, :],
         result.to(tl.bfloat16),
@@ -306,10 +284,8 @@ def _sparse_tc_rows(
     )
 
 
-def sparse_tc_nope_rows(
-    q, cache, block_table, indices, topk_length, scale, *, tile=64, kv_scale=1.0
-):
-    """Prefill-shaped counterpart of `sparse_tc_nope`: same inputs and
+def sparse_tc_nope_rows(q, cache, block_table, indices, topk_length, scale, *, tile=64):
+    """Prefill-shaped counterpart of `sparse_tc_nope` for bf16 latents: same
     numerics (fp32 softmax, split bf16 probabilities), one program per row
     over the whole index list, no partition scratch. `tile` is the gathered
     tile width (32 or 64 rows of the latent)."""
@@ -317,8 +293,7 @@ def sparse_tc_nope_rows(
         raise ValueError("tile must be 32 or 64")
     assert q.ndim == 3 and q.shape[1] in (8, 16) and q.shape[2] == 512
     assert cache.ndim == 3 and cache.shape[2] == 512
-    fp8 = cache.dtype == torch.uint8
-    assert q.dtype == torch.bfloat16 and (fp8 or cache.dtype == torch.bfloat16)
+    assert q.dtype == torch.bfloat16 and cache.dtype == torch.bfloat16
     assert cache.stride()[1:] == (512, 1) and cache.shape[1] > 0
     assert indices.shape[0] == block_table.shape[0] == q.shape[0]
     assert topk_length.shape == (q.shape[0],)
@@ -343,12 +318,10 @@ def sparse_tc_nope_rows(
         cache.stride(0),
         cache.shape[0],
         scale,
-        float(kv_scale),
         heads,
         cache.shape[1],
         indices.shape[1],
         tile,
-        fp8,
         num_warps=4,
         num_stages=1,
     )
