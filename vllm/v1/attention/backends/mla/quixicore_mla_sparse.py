@@ -59,6 +59,8 @@ def _page_stride_bytes(kv_cache: torch.Tensor) -> int:
 
 
 _BF16_PARTITION = 128
+# Gathered-tile width of the prefill-shaped tensor-core kernel (32 or 64).
+_SPARSE_TC_PREFILL_TILE = 64
 _BF16_PARTITION_SCRATCH_CAP = 512 << 20  # bytes of fp32 partials
 
 
@@ -105,6 +107,38 @@ def _sparse_prefill_enabled() -> bool:
             except Exception:
                 _SPARSE_PREFILL = True
     return _SPARSE_PREFILL
+
+
+def _sparse_tc_prefill_option(config, heads):
+    """Opt-in for the prefill-shaped tensor-core kernel (`sparse_tc_nope_rows`)
+    on chunked-prefill steps; decode steps keep their own dispatch."""
+    extra = config.additional_config or {}
+    enabled = extra.get("glm5_next_sparse_tc_prefill", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("glm5_next_sparse_tc_prefill must be a boolean")
+    if enabled:
+        from vllm.platforms import current_platform
+
+        if not (current_platform.is_cuda() and (
+                current_platform.is_device_capability((8, 0))
+                or current_platform.is_device_capability((12, 0)))):
+            raise ValueError(
+                "Sparse tensor-core prefill is qualified on SM80 and SM120 only"
+            )
+        if heads not in (8, 16):
+            raise ValueError(
+                "Sparse tensor-core prefill requires 8 or 16 heads per rank"
+            )
+    return enabled
+
+
+def _sparse_tc_prefill_dispatch(enabled, q, cache, metadata):
+    # Prefill chunks only (their rows are thousands wide; the decode paths are
+    # tuned for latency at <= 32 rows). Shape checks are CPU-only.
+    return (enabled and metadata.num_prefills > 0 and q.shape[0] > 0
+            and q.shape[1] in (8, 16) and q.shape[2] == 512
+            and q.dtype == torch.bfloat16
+            and cache.dtype == torch.bfloat16 and cache.shape[-1] == 512)
 
 
 def _sparse_tc_split(enabled, q, cache, metadata):
@@ -384,6 +418,9 @@ class QuixiCoreMLASparseImpl(MLAAttentionImpl[QuixiCoreMLASparseMetadata]):
         self.kv_lora_rank: int = mla_args["kv_lora_rank"]
         self.softmax_scale = float(scale)
         self._sparse_tc_decode = _sparse_tc_option(get_current_vllm_config(), num_heads)
+        self._sparse_tc_prefill = _sparse_tc_prefill_option(
+            get_current_vllm_config(), num_heads
+        )
         # Host copy of layer._k_scale. Reading it per call would be a D2H sync,
         # which CUDA graph capture rejects; the scale is fixed once weights are
         # loaded, so it is cached on first use during eager warmup.
@@ -459,6 +496,15 @@ class QuixiCoreMLASparseImpl(MLAAttentionImpl[QuixiCoreMLASparseMetadata]):
         tlen = quixicore_ops.sparse_topk_tlen(idx)
 
         if kv_c_and_k_pe_cache.dtype == torch.bfloat16:
+            if _sparse_tc_prefill_dispatch(
+                self._sparse_tc_prefill, q, kv_c_and_k_pe_cache, attn_metadata
+            ):
+                from vllm.quixicore.sparse_mla_tc import sparse_tc_nope_rows
+
+                return sparse_tc_nope_rows(
+                    q, kv_c_and_k_pe_cache, bt, idx, tlen, self.softmax_scale,
+                    tile=_SPARSE_TC_PREFILL_TILE,
+                ), None
             if q.shape[-1] == 512:
                 tc_split = _sparse_tc_split(
                     self._sparse_tc_decode, q, kv_c_and_k_pe_cache, attn_metadata
