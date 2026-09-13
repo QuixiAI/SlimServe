@@ -62,6 +62,94 @@ class quixicore_ops:
             return False
 
     # ------------------------------------------------------------------
+    # Marlin MoE routing and combine (glm_moe_routing.cuh, glm_moe_combine.cuh)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    @cache
+    def has_glm_route_align() -> bool:
+        return quixicore_ops.is_available() and hasattr(_qc(), "glm_route_align")
+
+    @staticmethod
+    def glm_route_align(
+        logits: torch.Tensor,
+        bias: torch.Tensor,
+        topk: int,
+        scoring: int,
+        renormalize: bool,
+        scaling: float,
+        block_size: int,
+        max_padded: int,
+        max_blocks: int,
+    ) -> list[torch.Tensor]:
+        """Fused small-M routing: scored top-k with bias-only selection plus
+        the Marlin block alignment, one launch. Returns [topk_weights,
+        topk_ids, sorted_token_ids, expert_ids, num_tokens_post_padded]."""
+        return _qc().glm_route_align(
+            logits,
+            bias,
+            topk,
+            scoring,
+            renormalize,
+            scaling,
+            block_size,
+            max_padded,
+            max_blocks,
+        )
+
+    @staticmethod
+    @cache
+    def has_moe_sum_add() -> bool:
+        return quixicore_ops.is_available() and hasattr(_qc(), "moe_sum_add")
+
+    @staticmethod
+    def moe_sum_add(x: torch.Tensor, shared: torch.Tensor, out: torch.Tensor) -> None:
+        """out[t] = shared[t] + sum_k x[t, k] (bf16 in/out, fp32 accumulation):
+        the Marlin per-assignment sum and the shared-expert add in one launch."""
+        _qc().moe_sum_add(x, shared, out)
+
+    # ------------------------------------------------------------------
+    # M <= 16 decode GEMMs (bf16_decode_gemm.cuh, fp8_decode_gemm.cuh)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    @cache
+    def has_decode_gemm() -> bool:
+        return quixicore_ops.is_available() and hasattr(_qc(), "decode_gemm")
+
+    @staticmethod
+    def decode_gemm(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        fp32_out: bool = False,
+    ) -> torch.Tensor:
+        """x[M, K] @ weight[N, K]^T (+ fp32 bias) for M <= 16 on tensor cores,
+        fp32 accumulation; the decode-shaped replacement for cuBLAS on the
+        backbone projections (N in 2048..16384, K a multiple of 128 >= 512)."""
+        return _qc().decode_gemm(x, weight, bias, fp32_out)
+
+    @staticmethod
+    @cache
+    def has_decode_gemm_fp8() -> bool:
+        return quixicore_ops.is_available() and hasattr(_qc(), "decode_gemm_fp8")
+
+    @staticmethod
+    def decode_gemm_fp8(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        scale: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        fp32_out: bool = False,
+    ) -> torch.Tensor:
+        """x[M, K] (bf16) @ dequant(weight)[N, K]^T for M <= 16 on tensor cores,
+        where weight is float8_e4m3fn with fp32 128x128 block scales
+        [ceil(N/128), K/128] and dequant(w) = bf16(scale * w); fp32
+        accumulation (N in 1024..16384, N a multiple of 8, K a multiple of
+        128 >= 512)."""
+        return _qc().decode_gemm_fp8(x, weight, scale, bias, fp32_out)
+
+    # ------------------------------------------------------------------
     # DeepSeek-V4 multi-stream residual mixing (Ampere decode path)
     # ------------------------------------------------------------------
 
@@ -1599,6 +1687,15 @@ class quixicore_ops:
         )
 
     @staticmethod
+    @cache
+    def mla_sparse_prefill_fp8_smem_bytes() -> int:
+        """Opt-in shared memory per block the fp8 sparse prefill kernel
+        launches with; 0 from a build that predates the query (the launch
+        itself then reports an unqualified device)."""
+        fn = getattr(_qc(), "mla_sparse_prefill_fp8_smem_bytes", None)
+        return int(fn()) if fn is not None else 0
+
+    @staticmethod
     def mla_sparse_prefill_fp8(
         q: torch.Tensor,
         data: torch.Tensor,
@@ -1615,7 +1712,15 @@ class quixicore_ops:
         of their selected 4-token pools with a per-query mask. Same inputs as
         mla_decode_fp8_sparse_nope; q must be [T, 16, 512] (TP4 heads)."""
         return _qc().mla_sparse_prefill_fp8(
-            q, data, bt, indices, topk_length, block_size, scale, kv_scale, page_stride_bytes
+            q,
+            data,
+            bt,
+            indices,
+            topk_length,
+            block_size,
+            scale,
+            kv_scale,
+            page_stride_bytes,
         )
 
     @staticmethod
@@ -1634,8 +1739,15 @@ class quixicore_ops:
         the CUDA port of fused_recurrent_kda_packed_decode. Updates `state`
         in place for state_indices > 0; returns out [1, N, H, V] bf16."""
         return _qc().kda_decode(
-            mixed_qkv, raw_g, raw_beta, A_log, dt_bias, state, state_indices,
-            scale, 0.0 if lower_bound is None else float(lower_bound),
+            mixed_qkv,
+            raw_g,
+            raw_beta,
+            A_log,
+            dt_bias,
+            state,
+            state_indices,
+            scale,
+            0.0 if lower_bound is None else float(lower_bound),
             lower_bound is not None,
         )
 
@@ -1793,6 +1905,30 @@ class quixicore_ops:
             temperature,
             apply_temperature,
             per_token_col,
+        )
+
+    @staticmethod
+    @cache
+    def has_topk_sample() -> bool:
+        return quixicore_ops.is_available() and hasattr(_qc(), "topk_sample")
+
+    @staticmethod
+    def topk_sample(
+        logits: torch.Tensor,
+        top_k: torch.Tensor,
+        top_p: torch.Tensor | None,
+        expanded_idx_mapping: torch.Tensor,
+        seeds: torch.Tensor,
+        pos: torch.Tensor,
+        use_fp64: bool,
+    ) -> torch.Tensor:
+        """Fused top-k (<= 32, all ties kept) / top-p / Gumbel-max sampling.
+
+        The noise is the sampler's own (seed, pos, token)-keyed Philox
+        stream, so a seeded request draws what v2_gumbel_sample would.
+        Returns int64 token ids [B]."""
+        return _qc().topk_sample(
+            logits, top_k, top_p, expanded_idx_mapping, seeds, pos, use_fp64
         )
 
     @staticmethod

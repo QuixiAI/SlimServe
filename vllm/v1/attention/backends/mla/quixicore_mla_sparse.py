@@ -60,6 +60,8 @@ def _page_stride_bytes(kv_cache: torch.Tensor) -> int:
 
 _BF16_PARTITION = 128
 _BF16_PARTITION_SCRATCH_CAP = 512 << 20  # bytes of fp32 partials
+# Gathered-tile width of the prefill-shaped tensor-core kernel (32 or 64).
+_SPARSE_TC_PREFILL_TILE = 64
 
 
 def _sparse_tc_option(config, heads):
@@ -70,13 +72,16 @@ def _sparse_tc_option(config, heads):
     if enabled:
         from vllm.platforms import current_platform
 
-        if not (current_platform.is_cuda()
-                and current_platform.is_device_capability((8, 0))):
+        if not (
+            current_platform.is_cuda() and current_platform.is_device_capability((8, 0))
+        ):
             raise ValueError("Sparse tensor-core decode is qualified only on SM80")
         if heads not in (8, 16):
             # The Triton kernel tiles 16 query rows per token: 8 heads (TP8)
             # half-masked or 16 heads (TP4) full.
-            raise ValueError("Sparse tensor-core decode requires 8 or 16 heads per rank")
+            raise ValueError(
+                "Sparse tensor-core decode requires 8 or 16 heads per rank"
+            )
         # Speculative batches are ordinary query rows to this path (each row
         # carries its own selected-index list); _sparse_tc_split still bounds
         # the rows per launch and falls back to the native kernel above it.
@@ -88,7 +93,9 @@ _SPARSE_PREFILL: bool | None = None
 
 def _sparse_prefill_enabled() -> bool:
     """Profile flag additional_config.glm5_next_sparse_prefill (default on),
-    env VLLM_QC_SPARSE_PREFILL=0/1 overrides for A/B runs."""
+    env VLLM_QC_SPARSE_PREFILL=0/1 overrides for A/B runs. Off on a device
+    that cannot host the kernel's shared-memory footprint (116 KB per block:
+    sm80 and the data-center parts qualify, sm_120's 99 KB does not)."""
     global _SPARSE_PREFILL
     if _SPARSE_PREFILL is None:
         import os
@@ -104,17 +111,85 @@ def _sparse_prefill_enabled() -> bool:
                 _SPARSE_PREFILL = bool(extra.get("glm5_next_sparse_prefill", True))
             except Exception:
                 _SPARSE_PREFILL = True
+        if _SPARSE_PREFILL and not _sparse_prefill_fits_device():
+            _SPARSE_PREFILL = False
     return _SPARSE_PREFILL
+
+
+def _sparse_prefill_fits_device() -> bool:
+    from vllm.quixicore.ops import quixicore_ops
+
+    need = quixicore_ops.mla_sparse_prefill_fp8_smem_bytes()
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    have = getattr(props, "shared_memory_per_block_optin", 0)
+    if need and have and have < need:
+        logger.warning_once(
+            "fp8 sparse prefill kernel skipped: it needs %d bytes of shared "
+            "memory per block, %s opts in to %d; prefill chunks take the "
+            "per-token decode kernel",
+            need,
+            props.name,
+            have,
+        )
+        return False
+    return True
+
+
+def _sparse_tc_prefill_option(config, heads):
+    """Opt-in for the prefill-shaped tensor-core kernel (`sparse_tc_nope_rows`)
+    on chunked-prefill steps; decode steps keep their own dispatch."""
+    extra = config.additional_config or {}
+    enabled = extra.get("glm5_next_sparse_tc_prefill", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("glm5_next_sparse_tc_prefill must be a boolean")
+    if enabled:
+        from vllm.platforms import current_platform
+
+        if not (
+            current_platform.is_cuda()
+            and (
+                current_platform.is_device_capability((8, 0))
+                or current_platform.is_device_capability((12, 0))
+            )
+        ):
+            raise ValueError(
+                "Sparse tensor-core prefill is qualified on SM80 and SM120 only"
+            )
+        if heads not in (8, 16):
+            raise ValueError(
+                "Sparse tensor-core prefill requires 8 or 16 heads per rank"
+            )
+    return enabled
+
+
+def _sparse_tc_prefill_dispatch(enabled, q, cache, metadata):
+    # Prefill chunks only (their rows are thousands wide; the decode paths are
+    # tuned for latency at <= 32 rows). Shape checks are CPU-only.
+    return (
+        enabled
+        and metadata.num_prefills > 0
+        and q.shape[0] > 0
+        and q.shape[1] in (8, 16)
+        and q.shape[2] == 512
+        and q.dtype == torch.bfloat16
+        and cache.dtype == torch.bfloat16
+        and cache.shape[-1] == 512
+    )
 
 
 def _sparse_tc_split(enabled, q, cache, metadata):
     # Shape/metadata decisions are CPU-only and stable under CUDA graph replay.
     # Prefill and unqualified shapes retain the native bounded-scratch path.
-    if (enabled and metadata.num_prefills == 0 and 0 < q.shape[0] <= 32
-            and q.shape[1] in (8, 16) and q.shape[2] == 512
-            and q.dtype == torch.bfloat16
-            and cache.dtype in (torch.bfloat16, torch.uint8, torch.float8_e4m3fn)
-            and cache.shape[-1] == 512):
+    if (
+        enabled
+        and metadata.num_prefills == 0
+        and 0 < q.shape[0] <= 32
+        and q.shape[1] in (8, 16)
+        and q.shape[2] == 512
+        and q.dtype == torch.bfloat16
+        and cache.dtype in (torch.bfloat16, torch.uint8, torch.float8_e4m3fn)
+        and cache.shape[-1] == 512
+    ):
         return 32 if q.shape[0] < 8 else 128
     return 0
 
@@ -130,10 +205,21 @@ def _bf16_partition(q: torch.Tensor, idx: torch.Tensor) -> int:
     already B x H warps wide, so partition only while the scratch is small.
     """
     B, H = q.shape[0], q.shape[1]
-    P = (idx.shape[1] + _BF16_PARTITION - 1) // _BF16_PARTITION
+    # Decode sizes by batch (rtx6000, glm53f-nvfp4-4, with the channel
+    # reducer): one warp per (head, token, partition) walks its partition
+    # serially, so at small B the 2048-wide list wants 32-token partitions;
+    # at B >= 16 the per-head re-reads of the shared latent dominate and 64
+    # is best. Prefill chunks and larger batches keep the 128 default.
+    if B <= 8:
+        size = 32
+    elif B <= 16:
+        size = 64
+    else:
+        size = _BF16_PARTITION
+    P = (idx.shape[1] + size - 1) // size
     if B * H * P * 512 * 4 > _BF16_PARTITION_SCRATCH_CAP:
         return 0
-    return _BF16_PARTITION
+    return size
 
 
 class QuixiCoreMLASparseBackend(AttentionBackend):
@@ -144,7 +230,10 @@ class QuixiCoreMLASparseBackend(AttentionBackend):
     # fp8 KV cache there -- bf16 is the geometry that actually runs on Ampere.
     # fp8 stays listed for sm89+; forward_mqa dispatches on the cache dtype.
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
-        "auto", "bfloat16", "fp8", "fp8_e4m3",
+        "auto",
+        "bfloat16",
+        "fp8",
+        "fp8_e4m3",
     ]
 
     @staticmethod
@@ -373,6 +462,9 @@ class QuixiCoreMLASparseImpl(MLAAttentionImpl[QuixiCoreMLASparseMetadata]):
         self.kv_lora_rank: int = mla_args["kv_lora_rank"]
         self.softmax_scale = float(scale)
         self._sparse_tc_decode = _sparse_tc_option(get_current_vllm_config(), num_heads)
+        self._sparse_tc_prefill = _sparse_tc_prefill_option(
+            get_current_vllm_config(), num_heads
+        )
         # Host copy of layer._k_scale. Reading it per call would be a D2H sync,
         # which CUDA graph capture rejects; the scale is fixed once weights are
         # loaded, so it is cached on first use during eager warmup.
@@ -435,9 +527,13 @@ class QuixiCoreMLASparseImpl(MLAAttentionImpl[QuixiCoreMLASparseMetadata]):
         # layer computes it and the rest reuse it.
         bt = attn_metadata.bt_per_token
         if bt is None:
-            bt = attn_metadata.block_table.index_select(
-                0, attn_metadata.req_id_per_token[:num_tokens].to(torch.int32)
-            ).to(torch.int32).contiguous()
+            bt = (
+                attn_metadata.block_table.index_select(
+                    0, attn_metadata.req_id_per_token[:num_tokens].to(torch.int32)
+                )
+                .to(torch.int32)
+                .contiguous()
+            )
             attn_metadata.bt_per_token = bt
 
         # Effective length per token, not the constant 2048: at short context
@@ -448,6 +544,20 @@ class QuixiCoreMLASparseImpl(MLAAttentionImpl[QuixiCoreMLASparseMetadata]):
         tlen = quixicore_ops.sparse_topk_tlen(idx)
 
         if kv_c_and_k_pe_cache.dtype == torch.bfloat16:
+            if _sparse_tc_prefill_dispatch(
+                self._sparse_tc_prefill, q, kv_c_and_k_pe_cache, attn_metadata
+            ):
+                from vllm.quixicore.sparse_mla_tc import sparse_tc_nope_rows
+
+                return sparse_tc_nope_rows(
+                    q,
+                    kv_c_and_k_pe_cache,
+                    bt,
+                    idx,
+                    tlen,
+                    self.softmax_scale,
+                    tile=_SPARSE_TC_PREFILL_TILE,
+                ), None
             if q.shape[-1] == 512:
                 tc_split = _sparse_tc_split(
                     self._sparse_tc_decode, q, kv_c_and_k_pe_cache, attn_metadata
@@ -456,8 +566,13 @@ class QuixiCoreMLASparseImpl(MLAAttentionImpl[QuixiCoreMLASparseMetadata]):
                     from vllm.quixicore.sparse_mla_tc import sparse_tc_nope
 
                     return sparse_tc_nope(
-                        q, kv_c_and_k_pe_cache, bt, idx, tlen,
-                        self.softmax_scale, split=tc_split,
+                        q,
+                        kv_c_and_k_pe_cache,
+                        bt,
+                        idx,
+                        tlen,
+                        self.softmax_scale,
+                        split=tc_split,
                     ), None
                 # NoPE MLA (glm5_next): no rope segment, 512-wide latents.
                 # Partitioned (128 -> 17 partitions at the 2080-wide list):
@@ -466,14 +581,24 @@ class QuixiCoreMLASparseImpl(MLAAttentionImpl[QuixiCoreMLASparseMetadata]):
                 # H=8 L=2048: unpartitioned 1138 us, P256 138 us, P128 74 us
                 # per call with the vectorized bf16 row path.
                 return quixicore_ops.mla_decode_bf16_sparse_nope(
-                    q, kv_c_and_k_pe_cache, bt, idx, tlen,
-                    attn_metadata.block_size, self.softmax_scale,
+                    q,
+                    kv_c_and_k_pe_cache,
+                    bt,
+                    idx,
+                    tlen,
+                    attn_metadata.block_size,
+                    self.softmax_scale,
                     partition_size=_bf16_partition(q, idx),
                     page_stride_bytes=_page_stride_bytes(kv_c_and_k_pe_cache),
                 ), None
             return quixicore_ops.mla_decode_bf16_sparse_glm(
-                q, kv_c_and_k_pe_cache, bt, idx, tlen,
-                attn_metadata.block_size, self.softmax_scale,
+                q,
+                kv_c_and_k_pe_cache,
+                bt,
+                idx,
+                tlen,
+                attn_metadata.block_size,
+                self.softmax_scale,
                 partition_size=_bf16_partition(q, idx),
                 page_stride_bytes=_page_stride_bytes(kv_c_and_k_pe_cache),
             ), None
@@ -506,8 +631,13 @@ class QuixiCoreMLASparseImpl(MLAAttentionImpl[QuixiCoreMLASparseMetadata]):
                 page_stride_bytes=_page_stride_bytes(kv_c_and_k_pe_cache),
             )
             _sparse_nan_debug(
-                out, splitq[0].transpose(0, 1), kv_c_and_k_pe_cache, bt, idx,
-                tlen, attn_metadata,
+                out,
+                splitq[0].transpose(0, 1),
+                kv_c_and_k_pe_cache,
+                bt,
+                idx,
+                tlen,
+                attn_metadata,
             )
             return out, None
 
@@ -522,8 +652,14 @@ class QuixiCoreMLASparseImpl(MLAAttentionImpl[QuixiCoreMLASparseMetadata]):
                 and q.shape[1] == 16
             ):
                 return quixicore_ops.mla_sparse_prefill_fp8(
-                    q, kv_c_and_k_pe_cache.view(torch.uint8), bt, idx, tlen,
-                    attn_metadata.block_size, self.softmax_scale, k_scale,
+                    q,
+                    kv_c_and_k_pe_cache.view(torch.uint8),
+                    bt,
+                    idx,
+                    tlen,
+                    attn_metadata.block_size,
+                    self.softmax_scale,
+                    k_scale,
                     _page_stride_bytes(kv_c_and_k_pe_cache),
                 ), None
             tc_split = _sparse_tc_split(
@@ -531,9 +667,16 @@ class QuixiCoreMLASparseImpl(MLAAttentionImpl[QuixiCoreMLASparseMetadata]):
             )
             if tc_split:
                 from vllm.quixicore.sparse_mla_tc import sparse_tc_nope
+
                 return sparse_tc_nope(
-                    q, kv_c_and_k_pe_cache.view(torch.uint8), bt, idx, tlen,
-                    self.softmax_scale, split=tc_split, kv_scale=k_scale,
+                    q,
+                    kv_c_and_k_pe_cache.view(torch.uint8),
+                    bt,
+                    idx,
+                    tlen,
+                    self.softmax_scale,
+                    split=tc_split,
+                    kv_scale=k_scale,
                 ), None
             # NoPE MLA (glm5_next) over an fp8 latent: the NFP8=512
             # instantiation of the bf16 NoPE kernel, same partition heuristic.
@@ -561,8 +704,7 @@ class QuixiCoreMLASparseImpl(MLAAttentionImpl[QuixiCoreMLASparseMetadata]):
             partition_size=256,
             page_stride_bytes=_page_stride_bytes(kv_c_and_k_pe_cache),
         )
-        _sparse_nan_debug(out, q, kv_c_and_k_pe_cache, bt, idx, tlen,
-                          attn_metadata)
+        _sparse_nan_debug(out, q, kv_c_and_k_pe_cache, bt, idx, tlen, attn_metadata)
         return out, None
 
 
@@ -579,8 +721,12 @@ def _sparse_nan_debug(out, q, kv_cache, bt, idx, tlen, attn_metadata) -> None:
     state = _SPARSE_NAN_DEBUG_STATE
     if "on" not in state:
         import os
-        state["on"] = os.getenv(
-            "VLLM_DSV4_SPARSE_NAN_DEBUG", "0").lower() in ("1", "true", "on")
+
+        state["on"] = os.getenv("VLLM_DSV4_SPARSE_NAN_DEBUG", "0").lower() in (
+            "1",
+            "true",
+            "on",
+        )
         state["dumps"] = 0
     if not state["on"] or state["dumps"] >= 6:
         return
@@ -601,7 +747,7 @@ def _sparse_nan_debug(out, q, kv_cache, bt, idx, tlen, attn_metadata) -> None:
         valid = row_idx[row_idx >= 0]
         t = int(tlen[r]) if tlen.numel() > r else -1
         if valid.numel() == 0:
-            return (f"row {r}: q_nan={q_nan} tlen={t} no valid indices")
+            return f"row {r}: q_nan={q_nan} tlen={t} no valid indices"
         blocks = bt[r][(valid // blk).long()]
         flat = blocks.long() * blk + (valid % blk).long()
         gathered = kv_bytes.reshape(-1, entry)[flat]
@@ -610,13 +756,20 @@ def _sparse_nan_debug(out, q, kv_cache, bt, idx, tlen, attn_metadata) -> None:
         per_tok = ((fp8_part == 0x7F) | (fp8_part == 0xFF)).any(dim=-1)
         bad_tokens = int(per_tok.sum())
         worst = valid[per_tok.nonzero().flatten()[:8]].tolist() if bad_tokens else []
-        return (f"row {r}: q_nan={q_nan} tlen={t} n_idx={int(valid.numel())} "
-                f"idx_max={int(valid.max())} nan_bytes={nan_bytes} "
-                f"tokens_with_nan_bytes={bad_tokens}/{int(valid.numel())} "
-                f"first_bad_positions={worst}")
+        return (
+            f"row {r}: q_nan={q_nan} tlen={t} n_idx={int(valid.numel())} "
+            f"idx_max={int(valid.max())} nan_bytes={nan_bytes} "
+            f"tokens_with_nan_bytes={bad_tokens}/{int(valid.numel())} "
+            f"first_bad_positions={worst}"
+        )
 
     reports = [row_report(r) for r in rows[:3]]
     ctl = row_report(control) if control is not None else "no clean row"
     logger.error(
         "SPARSE_NAN_DEBUG dump %d: batch=%d nan_rows=%s | %s | CONTROL %s",
-        state["dumps"], out.shape[0], rows[:8], " | ".join(reports), ctl)
+        state["dumps"],
+        out.shape[0],
+        rows[:8],
+        " | ".join(reports),
+        ctl,
+    )

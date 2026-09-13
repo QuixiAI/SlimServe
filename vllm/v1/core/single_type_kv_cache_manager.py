@@ -77,6 +77,11 @@ class SingleTypeKVCacheManager(ABC):
                 block until the request finishes.
         """
         self.scheduler_block_size = scheduler_block_size
+        # Granularity at which the coordinator reports cache hits: the
+        # scheduler block, or the hash block when it enables partial hits (a
+        # hybrid coordinator sets this after deciding). ``cache_blocks`` keeps
+        # every block a hit at that granularity can consult.
+        self.cache_hit_alignment_tokens = scheduler_block_size
         # The block size for this manager; used for actual block allocation.
         self.block_size = kv_cache_spec.block_size
         self.dcp_world_size = dcp_world_size
@@ -460,7 +465,7 @@ class SingleTypeKVCacheManager(ABC):
         block_mask = self.reachable_block_mask(
             start_block=num_cached_blocks,
             end_block=num_full_blocks,
-            alignment_tokens=self.scheduler_block_size,
+            alignment_tokens=self.cache_hit_alignment_tokens,
             kv_cache_spec=self.kv_cache_spec,
             use_eagle=self.use_eagle,
             retention_interval=retention_interval,

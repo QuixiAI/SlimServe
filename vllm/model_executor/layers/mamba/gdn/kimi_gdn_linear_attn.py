@@ -22,7 +22,10 @@ from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
 )
-from vllm.model_executor.parameter import BasevLLMParameter
+from vllm.model_executor.parameter import (
+    BasevLLMParameter,
+    BlockQuantScaleParameter,
+)
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
@@ -185,6 +188,7 @@ class _KimiGDNMergedColumnParallelLinear(MergedColumnParallelLinear):
         output_sizes: list[int],
         replicated_shard_id: int | tuple[int, ...],
         tp_size: int,
+        padded_shard: tuple[int, int] | None = None,
         **kwargs,
     ) -> None:
         self.replicated_shard_ids = (
@@ -192,10 +196,31 @@ class _KimiGDNMergedColumnParallelLinear(MergedColumnParallelLinear):
             if isinstance(replicated_shard_id, int)
             else replicated_shard_id
         )
+        # (shard id, rows): a replicated shard whose checkpoint tensor has
+        # fewer rows than its slot; the loader zero-pads it (block-quantized
+        # merged weights need every shard to fill whole scale blocks).
+        self.padded_shard = padded_shard
         output_sizes = output_sizes.copy()
         for shard_id in self.replicated_shard_ids:
             output_sizes[shard_id] *= tp_size
         super().__init__(input_size, output_sizes, **kwargs)
+
+    def _pad_shard(
+        self, param: torch.Tensor, loaded_weight: torch.Tensor, loaded_shard_id
+    ) -> torch.Tensor:
+        if self.padded_shard is None or loaded_shard_id != self.padded_shard[0]:
+            return loaded_weight
+        if isinstance(param, BlockQuantScaleParameter) or loaded_weight.dim() < 2:
+            return loaded_weight  # one scale row already covers the block
+        output_dim = getattr(param, "output_dim", 0)
+        short = self.padded_shard[1] - loaded_weight.shape[output_dim]
+        if short <= 0:
+            return loaded_weight
+        pad_shape = list(loaded_weight.shape)
+        pad_shape[output_dim] = short
+        return torch.cat(
+            [loaded_weight, loaded_weight.new_zeros(pad_shape)], dim=output_dim
+        )
 
     def weight_loader(
         self,
@@ -209,6 +234,7 @@ class _KimiGDNMergedColumnParallelLinear(MergedColumnParallelLinear):
             self.tp_rank = 0
             if param_tp_rank is not None:
                 param.tp_rank = 0
+        loaded_weight = self._pad_shard(param, loaded_weight, loaded_shard_id)
         try:
             super().weight_loader(param, loaded_weight, loaded_shard_id)
         finally:
@@ -228,6 +254,7 @@ class _KimiGDNMergedColumnParallelLinear(MergedColumnParallelLinear):
             self.tp_rank = 0
             if param_tp_rank is not None:
                 param.tp_rank = 0
+        loaded_weight = self._pad_shard(param, loaded_weight, loaded_shard_id)
         try:
             super().weight_loader_v2(param, loaded_weight, loaded_shard_id)
         finally:
@@ -264,6 +291,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         vllm_config: VllmConfig,
         prefix: str = "",
         fuse_gate_a: bool = False,
+        beta_block_rows: int | None = None,
     ) -> None:
         super().__init__(config, vllm_config, prefix)
 
@@ -307,11 +335,27 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.in_proj_padding = 0
             if self.fuse_gate_a:
                 in_proj_output_sizes.append(self.head_dim)
+        # Block-quantized merged projection (GLM-5.3-Flash FP8 swap-set): the
+        # beta shard is one row per head, smaller than a 128-row scale block
+        # and unsplittable by the block-scale loader, so it becomes a
+        # replicated whole block of rows (the checkpoint's [num_heads, K]
+        # zero-padded on load) and each rank reads its heads from it. Every
+        # shard of the merged weight then fills whole scale blocks.
+        self.beta_block_rows = beta_block_rows
+        replicated = (4, 5) if self.fuse_gate_a else 4
+        padded_shard = None
+        if beta_block_rows is not None:
+            assert not self.use_full_rank_gate, "whole-block beta: low-rank gate only"
+            assert beta_block_rows >= self.num_heads
+            in_proj_output_sizes[3] = beta_block_rows
+            replicated = (3, 4, 5) if self.fuse_gate_a else (3, 4)
+            padded_shard = (3, beta_block_rows)
         self.in_proj_qkvgfab = _KimiGDNMergedColumnParallelLinear(
             self.hidden_size,
             in_proj_output_sizes,
-            replicated_shard_id=(4, 5) if self.fuse_gate_a else 4,
+            replicated_shard_id=replicated,
             tp_size=self.tp_size,
+            padded_shard=padded_shard,
             bias=False,
             quant_config=self.quant_config,
             prefix=f"{prefix}.in_proj_qkvgfab",
@@ -455,13 +499,17 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         else:
             split_sizes = [
                 3 * self.local_projection_size,
-                self.local_num_heads,
+                self.beta_block_rows or self.local_num_heads,
                 self.head_dim,
             ]
             if self.fuse_gate_a:
                 split_sizes.append(self.head_dim)
             projected = projected_qkvgfab.split(split_sizes, dim=-1)
             mixed_qkv, beta, f_a = projected[:3]
+            if self.beta_block_rows is not None:
+                # Replicated whole-block beta: this rank's heads.
+                start = get_tensor_model_parallel_rank() * self.local_num_heads
+                beta = beta[..., start : start + self.local_num_heads]
             g_a = projected[3] if self.fuse_gate_a else self.g_a_proj(hidden_states)[0]
             if self.use_paired_gate_projection:
                 g1, g_proj_states = torch.ops.vllm.kda_gate_pair(

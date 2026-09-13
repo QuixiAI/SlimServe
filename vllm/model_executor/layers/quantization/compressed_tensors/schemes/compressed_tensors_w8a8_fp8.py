@@ -41,6 +41,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     cutlass_block_fp8_supported,
 )
+from vllm.model_executor.layers.utils import maybe_quixicore_fp8_block_linear
 
 __all__ = ["CompressedTensorsW8A8Fp8"]
 
@@ -204,4 +205,14 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
         x: torch.Tensor | QuantizedActivation,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if self.weight_block_size is not None and isinstance(x, torch.Tensor):
+            # QuixiCore M <= 16 decode GEMM on the block-FP8 weights (bf16
+            # activations, one launch); above 16 tokens the op runs the
+            # CUTLASS blockwise w8a8 GEMM itself (see layers/utils.py). None
+            # when the layer's layout or the platform is not the kernel's.
+            out = maybe_quixicore_fp8_block_linear(
+                x, layer.weight, layer.weight_scale, bias
+            )
+            if out is not None:
+                return out
         return self.fp8_linear.apply_weights(layer, x, bias)

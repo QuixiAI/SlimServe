@@ -26033,3 +26033,954 @@ Phases, by value over risk:
   covers ~2K keys instead of 16K: prep 1.96 -> 0.22 ms at 512 queries,
   4.85 -> 0.64 ms at 2048 (attention 3.7 / 13.7 ms); tests 5/5. In the
   prefill profile the prep share (6.6%) drops to under 1%.
+
+## 2026-09-11: GLM-5.3-Flash NVFP4 on 4x RTX PRO 6000 Blackwell (rtx6000): Phase 0 baseline and control
+
+Branch `glm53f-rtx6000` at 4a1065081 (bring-up on upstream 2b355117e): the a100
+kernel set built for `sm_120f`, new `rtx6000` platform and `glm53f-nvfp4-4`
+record, nothing tuned yet. Campaign doc `docs/glm53f-rtx6000-campaign.md`.
+Hardware: tinybox, 4x RTX PRO 6000 Blackwell Workstation (sm_120, 96 GB,
+PCIe 5, no NVLink, PHB pairs 0-1 / 2-3), driver 610.43.02 (CUDA 13.3),
+CUDA 13.0 toolkit build, EPYC 9334, 188 GB, governor schedutil, power limit
+600 W, no NCCL/VLLM env overrides. Profile command:
+`slimserve.cli glm53f-nvfp4-4 --serve --host 127.0.0.1 --port 8000 -y [--no-spec|--spec]`
+(TP4, EP off, Marlin W4A16 experts, QUIXICORE_MLA_SPARSE + force_mqa, block 64,
+bf16 KV, FULL_DECODE_ONLY capture 64, max_num_seqs 16, gpu_memory_utilization
+0.85, prefix caching, thinking budget 2000, no KV tier). KV pool 2,076,238
+tokens (engine adds 10 padding layers, "may waste at most 29.41 %").
+Harness: `benchmarks/benchmark_dsv4_exact.py` on `prompt-source.txt`, exact
+token counts, temperature 1.0 / top_p 0.95 / top_k 20, seed 42, `--repeat-source
+--allow-no-spec`; one 300-token request per pass at c1, 8 and 16 concurrent at
+c8/c16; three passes per boot, median reported; `exact: true` on every run.
+Raw: `perf/results/2026-09-11/{p0-nospec,p0-nospec-long,p0-dflash2,ctl-nospec,ctl-mtp3}-pass*/`;
+traces `~/.local/scratch/slimserve-glm53/profile-{state-p0-nospec,state-p0-dflash2,prefill-p0-32k}/`.
+
+| arm | c1 | c8 | c16 | c1 1000/2000 | c8 1000/2000 | cold TTFT 32K | cold TTFT 128K |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| ours, no speculation | 113.3 | 449.2 | 611.0 | 116.9 | 523.7 | 11.76 s | 124.3 s |
+| ours, DFlash2 k=7 | 153.6 | 330.9 | 340.3 | | | | |
+| control B12X r28.1, no speculation | 166.5 | 687.9 | 966.8 | | | 2.93 s | 14.9 s |
+| control B12X r28.1, MTP-3 | 260.8 | 732.1 | 1005.8 | | | | |
+
+- Ours per pass: no-spec c1 112.0/113.3/113.3, c8 449.2/448.0/450.8, c16
+  614.6/611.0/609.9; long c1 117.1/116.8, c8 524.0/523.4; DFlash2 c1
+  168.8/153.6/148.4, c8 316.6/337.8/330.9, c16 344.2/340.3/333.9. Warm
+  (prefix-cached) TTFT: 32K 0.175 s, 128K 1.18 s. The 32K cold number
+  includes two Triton JITs on the first request (`_zero_kv_blocks_kernel`,
+  `_topk_topp_kernel`); the profiled cold 32K prefill on a warmed server is
+  11.58 s of GPU kernel time, so JIT is not the story.
+- Control: image `voipmonitor/vllm:jovian-judgement-community-20260908-r28.1`
+  (vLLM v0.26.1rc0+glm53.r28.1), checkpoint
+  `local-inference-lab/GLM-5.3-Flash-NVFP4` (modelopt: NVFP4 g16 routed
+  experts, MXFP8 MTP experts, BF16 backbone; same byte class as RedHatAI),
+  TP4, `KV_CACHE_QUANT=fp8_ds_mla`, `CUDAGRAPH_MODE=FULL_AND_PIECEWISE`,
+  `GPU_MEMORY_UTILIZATION=0.93`, MAX_NUM_SEQS 32, batched tokens 4096, run
+  UNHANDICAPPED on the 610 driver (no `NCCL_CUMEM_ENABLE=0`,
+  `NCCL_P2P_DISABLE=1`, `B12X_PCIE_ALLREDUCE=0`). Its stack per its log:
+  `B12X` NvFp4 MoE backend (native sm_120 FP4 experts), fp8_ds_mla KV, B12X
+  PCIe all-reduce (one-shot <= 84 KB, two-shot bf16 <= 768 KB, DMA >= 6 MB),
+  custom fusions norm_quant / act_quant / allreduce_rms, breakable CUDA
+  graphs, FlashInfer sampling, KV pool 4,686,328 tokens. Per pass: no-spec
+  c1 156.0/166.6/166.5, c8 378.8/687.9/688.4, c16 616.4/966.8/967.9 (pass 1
+  is its graph warm-up); MTP-3 c1 214.6/286.3/260.8, c8 732.1/717.5/733.6,
+  c16 1017.6/1005.8/953.2. Old handicapped control for reference: 134.0 /
+  483.7 / 598.6.
+- Control cold TTFT (same probe, same prompts, no speculation): 32K 2.93 s,
+  128K 14.9 s; warm 0.082 s / 0.268 s. Ours is 4.0x / 8.3x slower cold and
+  2.1x / 4.4x slower warm (the warm 128K first token at 1.18 s says our
+  per-step cost at 128K context, not only prefill, needs the Phase 5 look).
+- Gap, ours / control, no speculation: 0.68 / 0.65 / 0.63 at c1 / c8 / c16.
+- SM80-gated features and their sm_120 status on this tree: indexer row
+  sharding (`glm5_next_indexer_row_shard`, gate `is_device_capability((8,0))`
+  at `glm5_next_indexer.py:94`): not enabled, prefill lever to qualify;
+  compact indexer cache (`glm5_next_compact_indexer_cache`, gate at :125):
+  not enabled, first prefill item; sparse tensor-core decode
+  (`glm5_next_sparse_tc_decode`, `quixicore_mla_sparse.py:74`): kernel needs
+  a 99 KB shared-memory retune (fails at 147-163 KB); mHC norm fusion
+  (`glm5_next.py:248` `_fuse_mhc_norm`): off here, the norm runs as a
+  separate kernel (Triton norms 3 % of the step); mHC projection overlap
+  (`glm5_next.py:442`, `sm80=` argument): off; FP32 router GEMV
+  (`gate_linear.py`, SM80 and 288 experts): off, router runs on cuBLAS.
+  Each is a one-line gate plus a parity run to qualify, except the TC decode
+  retune.
+- Quality gates (gate.py, 8 fixed 512+32 slices, prompt logprobs): no-spec
+  mean text logprob -2.420 / -2.431 (two runs, one boot), DFlash2 -2.450 /
+  -2.462; reference band -2.407..-2.478 with 0.02-0.03 boot jitter. Needle
+  margins 12.8-20.4 nats. Canaries text / tool call / image pass on both
+  boots, no U+FFFD.
+- Speculation: DFlash2 accepts 1.0-1.7 of its 7 drafted tokens per step on
+  this prose workload (acceptance rate 0.14-0.25), which is why c1 gains
+  36 % and c8 / c16 lose 26 % / 44 %. The control's MTP-3 accepts 1.2-1.9 of
+  3 and keeps c8 / c16 above its no-spec numbers. Phase 3 measures the
+  checkpoint's own MTP head and the structured workload before choosing.
+
+State label (no-spec, profiled c1 round, 5 full steps): wall/step 7.579 ms =
+launch latency 12.5 us + span 7.574 ms (busy 7.241 + in-step idle 0.333);
+GPU span 8.47 ms/step, 1583 launches/step. Decode attribution:
+
+| class | ms/step | share | launches/step |
+|---|---:|---:|---:|
+| cuBLAS gemvx (M=1 backbone projections) | 2.11 | 24.4 % | 210 |
+| cuBLAS gemm 16x16 wmma sm80 tiles (one per KDA layer at 34 us: the in_proj weight stream at ~1.5 TB/s, plus 42+10 small ones) | 1.54 | 17.7 % | 90 |
+| Marlin MoE (two launches per MoE layer) | 1.12 | 12.9 % | 84 |
+| NCCL all-reduce ring LL, 10.9 us each | 0.99 | 11.5 % | 91 |
+| mHC transition (`dsv4_mhc::fused_pre_transition`) | 0.78 | 9.0 % | 91 |
+| MoE glue (topk / align / sum / act) | 0.45 | 5.2 % | 222 |
+| sparse MLA decode + reduce | 0.35 | 4.0 % | 22 |
+| Triton norms / adds | 0.26 | 3.0 % | 246 |
+| pooled indexer | 0.20 | 2.3 % | 22 |
+| KDA recurrent + conv | 0.17 | 2.0 % | 68 |
+| lm_head GEMV (200 us, outside the graph) | 0.16 | 1.9 % | 1 |
+| copies, aten elementwise, sampling, other | 0.55 | 6.1 % | 400 |
+
+The cuBLAS M=1 kernels are 41 % of the step and run near bandwidth: the
+decode step is bytes-bound on the BF16 backbone, exactly the doc's Phase 1
+(FP8 backbone, decode GEMMs), with all-reduce, mHC and launch count behind.
+
+Cold 32K prefill attribution (whole trace before the first decode graph,
+11.58 s kernel busy, 13,276 launches, 6 prefill chunks):
+
+| kernel | s | share |
+|---|---:|---:|
+| `_pooled_logits_kernel` (indexer prefill scoring, general non-compact path, 88 launches at 74.5 ms) | 6.56 | 56.6 % |
+| NCCL all-reduce ring LL, 547 at 2.97 ms (67 MB each, 22.6 GB/s algbw) | 1.62 | 14.0 % |
+| `mla_decode_fp8_v<true,false,512,512>` (sparse MLA prefill through the gathered-MQA decode kernel) | 1.24 | 10.7 % |
+| `dsv4_mhc::partials` (mHC prefill) | 0.85 | 7.3 % |
+| Marlin MoE | 0.54 | 4.6 % |
+| cutlass BF16 GEMMs (sm80 tensorop tiles) | 0.36 | 3.1 % |
+| everything else | 0.41 | 3.7 % |
+
+The indexer scoring is O(L^2) at ~17 TFLOP/s (pool keys recomputed per
+query program, no tensor cores) and scales 16x to 128K, which accounts for
+the 124 s. The compact indexer cache path (`cached_pool_logits`, precomputed
+64-wide pool keys) is gated "qualified only on SM80"
+(`glm5_next_indexer.py:125`); qualifying it here, or a GEMM-form scoring
+kernel, is the first prefill item and moves into Phase 1.
+
+Decisions: baseline recorded, no change retained. Phase 1 order: (1) FP8
+backbone + decode GEMM re-land (bytes); (2) custom all-reduce over PCIe
+(`VLLM_CUSTOM_AR_ALLOW_PCIE=1`, upstream disables it on >2 PCIe GPUs); (3)
+indexer prefill scoring; the native NVFP4 expert kernel moves up to Phase 2
+because the control's c8 / c16 lead is mostly its expert path. Test
+classification and upstream breakages: campaign doc section 12.
+
+## 2026-09-11: rtx6000 Phase 1 (decode bytes and overhead), item by item
+
+Same box, harness and profile as the Phase 0 entry; every arm is
+`ab.sh <run> [ENV=..] -- --no-spec` (boot, canaries, three passes of
+c1/c8/c16 1000/300, a profiled c1 round for the state label, two gate.py
+runs), medians reported, like-state checked through the in-step idle and
+launches-per-step of the profiled round. Baseline for the phase: p0-nospec
+113.3 / 449.2 / 611.0 (in-step idle 0.17 ms, 1583 launches/step).
+
+### Item 2: vLLM custom all-reduce over PCIe (`VLLM_CUSTOM_AR_ALLOW_PCIE=1`) - RETAINED
+
+- Hypothesis: NCCL's ring all-reduce costs ~11 us per small reduction on
+  four PCIe-only ranks against ~5 us for vLLM's one-shot custom kernel over
+  peer mappings, and the step has ~90 reductions (mHC transitions plus the
+  attention/MLP TP reductions); the switch exists because vLLM disables the
+  custom kernel on more than two ranks without NVLink. Salvage table item 8
+  measured +11 % c1 on the Codex tree.
+- Result (p1-car): c1 121.3 / 122.9 / 122.9, c8 467.9 / 466.2 / 468.2, c16
+  640.1 / 638.6 / 640.9; medians 122.9 / 468.2 / 640.9 = +8.5 / +4.2 / +4.9 %.
+  `exact: true` on all nine runs. State: in-step idle 0.168 ms, 1577
+  launches/step (fast state, like-for-like). Gates -2.441 / -2.432 (band
+  -2.407..-2.478); canaries not run on this arm (the switch changes no
+  numerics path beyond reduction order). Trace
+  `~/.local/scratch/slimserve-glm53/profile-state-p1-car/`.
+- Decision: retained; `VLLM_CUSTOM_AR_ALLOW_PCIE=1` on the rtx6000 record
+  env with a note. `VLLM_CUSTOM_AR_PCIE_MAX_BYTES` (the two-shot cap,
+  default 8 MiB) is left for the prefill campaign: 4096-token chunks reduce
+  32 MiB per layer and stay on NCCL either way.
+- Raw: `perf/results/2026-09-11/p1-car-pass{1,2,3}/`, gates
+  `perf/results/2026-09-11/p1-car-gate{1,2}.json`.
+
+### Item 3: bf16 M<=16 tensor-core decode GEMM on the backbone projections - RETAINED
+
+- Hypothesis: cuBLAS runs the decode-shaped bf16 projections (M = 1..16,
+  N 2048..16384, K 512..4096) at 59-89 % of the streaming ceiling and often
+  as two launches (split-K plus reduce); a cp.async-staged mma.sync kernel
+  with fp32 accumulation (`csrc/quixicore/tm_cuda/bf16_decode_gemm.cuh`,
+  `quixicore_decode_linear` custom op in `layers/utils.py`, dispatched from
+  `cuda_unquantized_gemm`) reads each weight once per step at one launch.
+  Salvage table item 6 measured +1.5 % c1 on the Codex tree.
+- Result (p1-dgemm, on top of item 2): c1 122.4 / 124.1 / 124.0, c8 472.0 /
+  472.3 / 470.8, c16 641.9 / 640.4 / 641.4; medians 124.0 / 472.0 / 641.4 =
+  +0.9 / +0.8 / +0.1 % over p1-car. `exact: true` on all nine runs. State:
+  in-step idle 0.177 ms, 1516 launches/step (61 fewer than p1-car: the
+  cuBLAS split-K pairs). Gates -2.442 / -2.418 (band -2.407..-2.478).
+  Canaries: tool and image pass; the text canary hit its 400-token cap
+  still inside the reasoning block (one sample at temperature 1.0; the
+  canary now prints a reasoning excerpt and is re-run on the next boot).
+  Kernel tests `tests/kernels/test_quixicore_decode_gemm{,_fp8}.py` pass on
+  the shipped extension (44 + 45, one two-device test skipped each).
+- Decision: retained. Small, as on the Codex tree; the same pipeline is the
+  FP8 decode GEMM the swap-set (item 4) runs on. `SLIMSERVE_DECODE_GEMM=0`
+  keeps cuBLAS for A/B; the switch and the binding's presence are compile
+  cache factors (`VllmConfig.compute_hash`).
+- Raw: `perf/results/2026-09-11/p1-dgemm-pass{1,2,3}/`, gates
+  `p1-dgemm-gate{1,2}.json`, trace
+  `~/.local/scratch/slimserve-glm53/profile-state-p1-dgemm/`.
+
+### Item 4a: FP8 swap-set, native e4m3 block tensors for the dense MLP, shared experts and DSA q_b/o_proj - RETAINED
+
+- Hypothesis: RedHatAI's conversion stores ZAI's own FP8 block-128 tensors
+  (dense MLP of layers 0-2, the 42 shared experts, DSA `q_b_proj` /
+  `o_proj`) as their BF16 dequant, twice the bytes per step;
+  `slimserve.fp8_swapset` reads the FP8 bytes and 128x128 scales from the
+  native shards into `<model>/fp8-swapset.safetensors` (314 tensors, 2.5 GB,
+  dequant bit-identical to the conversion's BF16: 0 elements differ), the
+  loader substitutes them, the manifest's compressed-tensors group makes
+  those 112 modules block-FP8 (and drops them from `ignore`), and the M<=16
+  decode GEMM runs W8A16 on them (CUTLASS w8a8 above 16 tokens, the kernel
+  vLLM selects for the scheme on sm_120). Salvage table item 7: +5.5 % c1.
+- Result (p1-fp8swap, on top of item 3): c1 128.4 / 130.7 / 130.7, c8
+  480.2 / 482.5 / 481.1, c16 651.1 / 652.9 / 649.8; medians 130.7 / 481.1 /
+  651.1 = +5.4 / +1.9 / +1.5 % over p1-dgemm; cumulative over the Phase 0
+  baseline +15.4 / +7.1 / +6.6 %. `exact: true` on all nine runs. State:
+  in-step idle 0.172 ms, kernel busy 6.42 ms (6.76 before), 1558
+  launches/step. Gates -2.410 / -2.428 (band -2.407..-2.478). Canaries
+  text / tool / image pass (text: 207 chars of content after 1427 of
+  reasoning, finish stop).
+- Decision: retained. `SLIMSERVE_FP8_SWAPSET=0` serves the BF16 twins; the
+  manifest digest is a compile-cache factor. The runtime sidecar is the
+  campaign's vehicle; Phase 6 folds these tensors into the hybrid
+  checkpoint the profile will name (campaign doc, section 11).
+- Raw: `perf/results/2026-09-12/p1-fp8swap-pass{1,2,3}/`, gates
+  `p1-fp8swap-gate{1,2}.json`, trace
+  `~/.local/scratch/slimserve-glm53/profile-state-p1-fp8swap/`; sidecar
+  build log `~/.local/scratch/slimserve-glm53/serve-logs/swapset-build-4a.out`.
+
+### Item 4b: FP8 KDA projections (self-quantized, ZAI kept them BF16) - RETAINED, quality gate extended below
+
+- Hypothesis: the 34 KDA layers' merged `in_proj_qkvgfab` (6528 x 4096 per
+  rank) and `o_proj` (4096 x 2048) are the largest BF16 bytes left per step
+  (1.36 GB per rank at TP4); block-128 e4m3 halves them. The merged
+  projection's beta shard is one row per head (16 per rank), smaller than a
+  scale block and unsplittable by the block-scale loader, so the model gives
+  it a replicated whole block (`beta_block_rows=128`, the checkpoint's
+  [64, K] zero-padded on load) and each rank reads its heads from it; the
+  sidecar stores every tensor in its checkpoint shape, so it is
+  tensor-parallel agnostic (the Codex tree's per-rank padded beta layout was
+  TP-bound and is retired). `--self-quant-kda`: 238 tensors, rel Frobenius
+  error 2.6-2.8 %, worst element 3.8 % of absmax. Salvage table item 9:
+  +10.6 % c1, gate -0.014 nats.
+- Result (p1-fp8kda, on top of 4a): c1 141.8 / 144.8 / 144.7, c8 500.2 /
+  501.1 / 501.5, c16 672.2 / 671.2 / 669.7; medians 144.7 / 501.1 / 671.2 =
+  +10.7 / +4.2 / +3.1 % over p1-fp8swap; cumulative over Phase 0 +27.7 /
+  +11.6 / +9.9 %. `exact: true` on all nine runs. State: in-step idle
+  0.174 ms, kernel busy 5.79 ms (6.42 before), 1557 launches/step. Gates
+  -2.437 / -2.467: inside the band (-2.407..-2.478) but the pair's mean is
+  0.027 nats under the 4a boot's, at the size of the boot jitter, so the
+  gate is re-run eight times per arm (dense-only sidecar vs dense+KDA) on
+  fresh boots before the item is called clean; see the next entry. Canaries
+  tool / image pass; the text canary hit its 400-token cap inside a
+  coherent reasoning block ("A hash table is a data structure that stores
+  key-value pairs ..."), the cap is now 1200 tokens.
+- Decision: retained pending the extended gate. `SLIMSERVE_FP8_SWAPSET`
+  now also selects a sidecar by manifest stem for such comparisons.
+- Raw: `perf/results/2026-09-12/p1-fp8kda-pass{1,2,3}/`, gates
+  `p1-fp8kda-gate{1,2}.json`, trace
+  `~/.local/scratch/slimserve-glm53/profile-state-p1-fp8kda/`; sidecar
+  build log `~/.local/scratch/slimserve-glm53/serve-logs/swapset-build-4b.out`.
+
+### Item 4b, extended quality gate - CLEAN
+
+Eight gate.py runs per arm on fresh boots, same tree: dense-only sidecar
+(`SLIMSERVE_FP8_SWAPSET=fp8-swapset-dense`, p1-gate-dense) mean text
+logprob -2.456, sd 0.017 (-2.448 / -2.464 / -2.451 / -2.456 / -2.445 /
+-2.435 / -2.450 / -2.497); dense + KDA (p1-part boot) mean -2.447, sd 0.015
+(-2.462 / -2.428 / -2.431 / -2.447 / -2.447 / -2.467 / -2.464 / -2.430). No
+quality cost resolvable at the gate's noise (per-run sd ~0.016, so a pair
+of runs cannot see less than ~0.03; the -2.407..-2.478 band from two Phase
+0 runs is narrower than the real spread, one dense-arm run fell outside it).
+Decision: FP8 KDA retained without reservation. Raw:
+`perf/results/2026-09-12/p1-gate-dense-gate{1..8}.json`,
+`p1-part-gate{1..8}.json`.
+
+### Item 5: sparse MLA decode, 32/64-token partitions with the channel reducer - RETAINED
+
+- Hypothesis: the partitioned NoPE sparse decode reduced its P partials
+  with one warp per (head, token) walking P x 512 floats serially, so the
+  128-token partition (17 per 2048-wide list) was the compromise between
+  parallelism in the walk and cost in the reduce. `paged_attention_reduce_channels`
+  (one thread per latent channel, weights once per block) was already in the
+  tree for DSV4 but not launched by the NoPE bindings; with it the reduce is
+  flat in P, and small partitions expose more warps at decode: 32 tokens at
+  B <= 8, 64 at B <= 16, the 128 default above (prefill chunks). Salvage
+  table item 5: +3.7 % c1.
+- Result (p1-part, on top of 4b): c1 146.4 / 149.5 / 149.3, c8 504.2 /
+  500.8 / 501.3, c16 678.4 / 672.3 / 677.6; medians 149.3 / 501.3 / 677.6 =
+  +3.2 / +0.0 / +1.0 % over p1-fp8kda; cumulative over Phase 0 +31.8 / +11.6
+  / +10.9 %. `exact: true` on all nine runs. State: in-step idle 0.175 ms,
+  kernel busy 5.64 ms (5.79 before), 1554 launches/step. Gates: the eight
+  runs above (mean -2.447). Canaries text / tool / image pass.
+  `tests/kernels/test_quixicore_sparse_mla_bf16.py` now covers partitions
+  32 and 64 (71 passed).
+- Decision: retained (both NoPE bindings, bf16 and fp8 cache).
+- Raw: `perf/results/2026-09-12/p1-part-pass{1,2,3}/`, trace
+  `~/.local/scratch/slimserve-glm53/profile-state-p1-part/`.
+
+### Item 7a: FP32 router logits through cuBLAS bf16 x bf16 -> fp32 on sm_120 - RETAINED
+
+- Hypothesis: `GateLinear` reserved its cuBLAS bf16-in / fp32-out tier for
+  the GLM-5.3-Flash shape on SM80 only; on sm_120 (no SM90/SM100
+  specialized router kernels) the router ran F.linear in bf16 and cast the
+  logits to fp32 afterwards: a rounding step before expert selection and one
+  more launch per MoE layer. The tier is now taken wherever the specialized
+  kernels are absent.
+- Result (p1-router, on top of item 5): c1 150.6 / 151.1 / 150.8, c8 507.0 /
+  506.2 / 505.7, c16 679.0 / 679.4 / 674.8; medians 150.8 / 506.2 / 679.0 =
+  +1.0 / +1.0 / +0.2 % over p1-part; cumulative over Phase 0 +33.1 / +12.7 /
+  +11.1 %. `exact: true` on all nine runs. State: in-step idle 0.170 ms,
+  kernel busy 5.57 ms, 1516 launches/step (38 fewer: the casts). Gates
+  -2.455 / -2.444 / -2.430 / -2.441 (mean -2.443). Canaries pass.
+- Decision: retained.
+- Raw: `perf/results/2026-09-12/p1-router-pass{1,2,3}/`, gates
+  `p1-router-gate{1..4}.json`, trace
+  `~/.local/scratch/slimserve-glm53/profile-state-p1-router/`.
+
+### Item 7b: fused mHC norm (`_fuse_mhc_norm`) on sm_120 - REJECTED
+
+- Hypothesis: `Glm5NextDecoderLayer` fuses the mHC post/pre norms into the
+  `glm5_mhc_fused_post_pre` kernel on SM80 only; taking the same fusion on
+  sm_120 removes the separate triton norm launches (about 90 per step).
+- Result (p1-mhcnorm, on top of item 7a): c1 142.3 / 142.3 / 142.1, c8
+  491.9 / 492.4 / 491.0, c16 668.6 / 664.6 / 666.4; medians 142.3 / 491.9 /
+  666.4 = -5.6 / -2.8 / -1.9 % against p1-router. `exact: true` on all
+  nine runs. State: 1423 launches/step (93 fewer) but kernel busy 5.90 ms
+  (+0.33 ms): the Ampere-tuned fused kernel runs slower on this part than the
+  norms it replaces. Gates -2.438 / -2.463 / -2.442 / -2.450 (mean -2.448).
+- Decision: rejected, `_fuse_mhc_norm` stays SM80-gated. The mHC transition
+  (0.78 ms/step at c1, 91 launches of about 8.6 us, latency-bound) stays a
+  Phase 2 target for an sm_120-specific kernel rather than the A100 fusion.
+- Raw: `perf/results/2026-09-12/p1-mhcnorm-pass{1,2,3}/`, gates
+  `p1-mhcnorm-gate{1..4}.json`.
+
+### Item 8: FP8 main KV for the 11 sparse-MLA layers (`glm5_next_main_kv_fp8`) - REJECTED FOR NOW
+
+- Hypothesis: FP8 is the official KV cache quantization; the per-layer e4m3
+  main KV for the DSA layers halves the sparse decode's KV bytes (the 2048
+  gathered rows x 576 channels per head group) and the KV footprint.
+- Result (p1-fp8kv, on top of item 7a, the mHC edit reverted first): c1
+  148.3 / 148.2 / 148.2, c8 489.5 / 490.2 / 489.0, c16 650.7 / 649.7 / 650.6;
+  medians 148.2 / 489.5 / 650.6 = -1.7 / -3.3 / -4.2 % against p1-router.
+  `exact: true` on all nine runs. State: kernel busy 5.63 ms (+0.06 ms),
+  1512 launches/step; the loss grows with concurrency, so it sits in the
+  fp8 sparse decode kernel (`mla_decode_fp8_sparse_nope`), which did not get
+  item 5's 32/64-token partition rule (the bf16 path did) and pays the e4m3
+  dequant per gathered row. Gates -2.437 / -2.442 / -2.429 / -2.449 (mean
+  -2.439): no quality cost.
+- Decision: rejected for now; the record keeps the unquantized main KV,
+  which the policy permits. Re-measure once the fp8 sparse decode path gets
+  the partition rule and a fused dequant (Phase 2); the profile should move
+  to FP8 KV when it is at parity, for the footprint.
+- Raw: `perf/results/2026-09-12/p1-fp8kv-pass{1,2,3}/`, gates
+  `p1-fp8kv-gate{1..4}.json`.
+
+### Item 6: fused route+align and shared-expert combine on the Marlin MoE path - RETAINED
+
+- Hypothesis: per MoE layer the decode path spent four launches on routing
+  (grouped_topk 3.5 us, moe_align_block_size 3.0 us, count_and_sort 1.6 us
+  and a fill) and two on the combine (moe_sum 1.2 us, the traced
+  shared + routed add 1.3 us). QuixiCore `glm_route_align` does the sigmoid
+  scores, bias-only top-8, renormalize + scale and the Marlin block alignment
+  in one block for M <= 16; the router publishes the alignment and
+  fused_marlin_moe consumes it (matched on the topk_ids tensor).
+  `moe_sum_add` folds the shared-expert output into the per-assignment sum
+  (fp32 accumulation, one bf16 rounding): the runner launches the shared
+  experts first, still on the aux stream, hands the output to Marlin's
+  moe_sum through `combine_shared`, and the add moves inside a new
+  `moe_forward_folded` op so the traced forward no longer emits it.
+- Result (p1-item6, on top of item 7a): c1 149.9 / 154.7 / 154.7, c8 512.2 /
+  510.9 / 508.8, c16 684.5 / 680.8 / 682.8; medians 154.7 / 510.9 / 682.8 =
+  +2.6 / +0.9 / +0.6 % over p1-router; cumulative over Phase 0 +36.5 /
+  +13.7 / +11.8 %. `exact: true` on all nine runs. State: wall/step 5.75 ms,
+  kernel busy 5.43 ms (-0.14 ms), 1348 launches/step (-168). Trace:
+  route_align_kernel 42/step at 4.7 us, moe_sum_add 42/step at 1.5 us;
+  grouped_topk, moe_align, count_and_sort, moe_sum and the traced add are
+  gone. Gates -2.463 / -2.473 / -2.464 / -2.432 (mean -2.458). Canaries pass.
+- Also seen in the trace (Phase 2 notes): 66 int `fill_` launches per step
+  (six per DSA layer, about 90 us) in the sparse MLA metadata path, and 11
+  cuBLAS bf16 wmma GEMMs of 4.9 us (one per DSA layer, about 54 us).
+- Decision: retained. The diagnosis kill switches (`SLIMSERVE_GLM_ROUTE_ALIGN`,
+  `SLIMSERVE_MOE_COMBINE_SHARED`) came out once the path qualified; the
+  reference paths are the dispatch every other platform takes.
+  The kernel is instantiated for E=288 / top-8 / M <= 16; MTP-3 decode
+  batches beyond 16 tokens take the reference path until a wider variant.
+- Raw: `perf/results/2026-09-12/p1-item6-pass{1,2,3}/`, gates
+  `p1-item6-gate{1..4}.json`, trace
+  `~/.local/scratch/slimserve-glm53/profile-state-p1-item6/`. Tests:
+  `tests/kernels/test_quixicore_glm_route_align.py`,
+  `test_quixicore_moe_sum_add.py`, `test_moe_shared_handoff.py`.
+
+### Item 9: split SIMT mHC transition (Triton partials + finalize) on sm_120 - RETAINED
+
+- Hypothesis: on sm_120 every mHC site ran the cooperative dsv4_mhc
+  `fused_pre_transition` kernel (64 blocks, a grid sync): 89 launches x 8.7
+  us = 0.77 ms per c1 step, the largest latency-bound block left after item
+  6. The split Triton transition (`_mhc_partials` 64 x T blocks, then
+  `_mhc_finalize` one block per token) was gated to A100, where it was
+  measured; the math is identical.
+- Result (p1-mhctriton, on top of item 6): c1 157.5 / 157.6 / 157.7, c8
+  519.6 / 520.1 / 517.9, c16 691.3 / 688.8 / 683.7; medians 157.6 / 519.6 /
+  688.8 = +1.9 / +1.7 / +0.9 % over p1-item6; cumulative over Phase 0 +39.1
+  / +15.7 / +12.7 %. `exact: true` on all nine runs. State: wall/step 5.68
+  ms, kernel busy 5.31 ms (-0.12 ms), 1477 launches/step. Trace: partials
+  2.6 us + finalize 4.1 us per transition (6.7 us against 8.7). Gates
+  -2.456 / -2.445 / -2.459 / -2.472 (mean -2.458, same as p1-item6).
+- Decision: retained (`_USE_SPLIT_SIMT`, every CUDA part). The finalize
+  block (sinkhorn plus the 4096-wide mix in 4 warps) at 4.1 us for one token
+  is the next mHC target: an sm_120 kernel doing the transition in about 4 us
+  total would be worth another 0.25 ms per c1 step.
+- Raw: `perf/results/2026-09-12/p1-mhctriton-pass{1,2,3}/`, gates
+  `p1-mhctriton-gate{1..4}.json`, trace
+  `~/.local/scratch/slimserve-glm53/profile-state-p1-mhctriton/`.
+
+### Phase 3, arm 1: DFlash2 draft length k=3 and k=5 on the tuned tree
+
+- Setup: the registered DFlash2 drafter (`--spec`, block 8, greedy draft,
+  standard rejection sampling) on the p1-mhctriton tree, prose harness
+  1000/300 at temperature 1.0 / top_p 0.95 / top_k 20, three passes; the
+  no-spec reference is p1-mhctriton 157.6 / 519.6 / 688.8.
+- k=3 (p3-dflash2-k3): c1 172.7 / 211.3 / 180.5, c8 464.7 / 469.7 / 462.4,
+  c16 653.1 / 635.4 / 629.4; medians 180.5 / 464.7 / 635.4 = +14.5 / -10.6 /
+  -7.8 %. Accepted per draft call (accepted / drafts): c1 0.82 / 1.29 /
+  0.94, c8 0.83 / 0.79 / 0.80, c16 0.97 / 0.95 / 0.92; per drafted token
+  27-43 % at c1, ~27 % at c8, ~32 % at c16.
+- k=5 (p3-dflash2-k5): c1 161.9 / 148.9 / 175.2, c8 412.5 / 434.1 / 417.6,
+  c16 353.8 / 355.9 / 310.4; medians 161.9 / 417.6 / 353.8 = +2.7 / -19.6 /
+  -48.6 %. Accepted per draft call at c1 0.93 / 0.80 / 1.11: two more
+  drafted tokens buy about 0.1 more accepted token while the verify grows
+  from 4 to 6 rows per request.
+- Reading: with a greedy draft the V2 rejection test accepts a token with
+  probability p_target(draft argmax) (`v2_rejection_k`, draft_logprob 0), so
+  at temperature 1.0 the acceptance is capped by the target's own
+  peakedness, not by draft quality; the drafter's extra tokens only add
+  verify rows. k=3 is the only length that pays at c1; every length loses
+  at c8/c16 on this harness, so the record needs a per-batch schedule (k=3
+  small batch, 0 above) unless the sampling-method arms below lift the
+  acceptance. Phase 0's k=7 (153.6 / 330.9 / 340.3 on the untuned tree) is
+  consistent.
+- Canaries pass on both arms (text, tool call, image); `exact: true` on
+  all runs.
+- Raw: `perf/results/2026-09-12/p3-dflash2-k{3,5}-pass{1,2,3}/` (acceptance
+  in each `c*-1000-300.log` `spec_decode_*` fields), logs
+  `~/.local/scratch/slimserve-glm53/serve-logs/ab-p3-dflash2-k{3,5}.out`.
+
+### Item 10: fused top-k / top-p / Gumbel-max sampler (`topk_sample`) - RETAINED
+
+- Hypothesis: the no-spec sampler ran the Triton Qrita top-k/top-p mask
+  (`_topk_topp_kernel`, 124-189 us per step in the p1 traces) and then the
+  Gumbel argmax (`v2_gumbel_sample_k` + reduction, ~39 us): two full passes
+  over the 154,880-wide fp32 logits plus the mask write-back. The salvaged
+  Codex sampler (`topk_sample.cuh`, four launches: per-partition radix top-32
+  candidates, global k-th value with every omitted tie accounted for, nucleus
+  cutoff in fp64, then a full-vocabulary exponential race over the retained
+  tokens) does the mask and the draw without materializing the mask. Ported
+  with the noise generated inline from the sampler's own (seed, pos, token)
+  Philox stream (`tt_rand_nz` / `tt_rand64_nz`), so seeded requests draw the
+  same uniforms the Gumbel path does; the race score p / E with
+  E = -log(1 - U) orders tokens exactly as logit + G with G = -log E.
+  Eligibility (`vllm/v1/worker/gpu/sample/topk_sample.py`): every request in
+  the batch with 1 <= top_k <= 32, no greedy row, fp32 CUDA logits, no
+  processed-logprobs consumer; anything else keeps the Triton mask + Gumbel
+  path. Kill switch `SLIMSERVE_TOPK_SAMPLE=0`.
+- Parity: `tests/kernels/test_quixicore_topk_sample.py` (18 tests): the
+  sampled id is always inside the torch top-k/top-p mask, >= 99 % row
+  agreement with mask-then-`gumbel_sample` under the same seeds at V =
+  154,880 and V = 2053, fp32 and fp64, top_p none / 0.95 / 0.3; k = 1 is the
+  argmax; all ties at the k-th value retained, nucleus drops the low-id half
+  of a uniform row; -inf masks; NaN rows and -1 request slots return in-range
+  ids; the eligibility rules.
+- Microbench (GPU 0, V = 154,880, top_k 20 / top_p 0.95, 200 iterations,
+  excluding the fp32 copy): mask + Gumbel 117.5 / 146.5 / 153.8 us at B = 1
+  / 8 / 16 against 20.0 / 21.5 / 29.4 us fused (5.9x / 6.8x / 5.2x).
+- Result (p2-topksample, on top of item 9, no-spec): c1 160.4 / 160.9 /
+  160.7, c8 526.2 / 527.6 / 528.8, c16 701.0 / 691.1 / 699.9; medians 160.7
+  / 527.6 / 699.9 = +2.0 / +1.5 / +1.6 % over p1-mhctriton; cumulative over
+  Phase 0 +41.8 / +17.5 / +14.5 %. `exact: true` on all nine runs, canaries
+  pass (text, tool, image). No state label for this arm (the boot's shutdown
+  summary was lost to a harness edit made while it ran; the three passes and
+  their JSON are intact).
+- Decision: retained. Spec-mode steps do not use it (the V2 rejection sampler
+  samples through its own Gumbel kernels and applies no top-k/top-p), so it
+  counts on the no-spec path and on any batch-size range a schedule leaves
+  at k = 0.
+- Raw: `perf/results/2026-09-12/p2-topksample-pass{1,2,3}/`, microbench
+  `~/.local/scratch/slimserve-glm53/bench_topk_sample.py`.
+
+### Phase 3, arm 2: DFlash2 k=3 with probabilistic draft sampling - RETAINED
+
+- Hypothesis: the V2 rejection test with a greedy draft accepts with
+  probability p_target(draft argmax), which at temperature 1.0 is bounded by
+  how peaked the target is; with `draft_sample_method: probabilistic` the
+  draft samples from its own distribution and the test uses the ratio
+  p_target / q_draft, whose expected acceptance is sum_x min(p, q): for a
+  calibrated draft that approaches 1 - TV(p, q) and is far above p(argmax)
+  on flat distributions. DFlash2 caches its K candidate logits per step for
+  this (`_cache_draft_logits_kernel`), so the arm is one engine field.
+- Result (p3-dflash2-k3-prob, on top of item 10, `--spec`): c1 211.3 /
+  245.5 / 182.8, c8 524.5 / 549.2 / 536.2, c16 750.2 / 729.3 / 741.6;
+  medians 211.3 / 536.2 / 741.6 = +31.5 / +1.6 / +6.0 % over no-spec
+  (p2-topksample 160.7 / 527.6 / 699.9) and +17.1 / +15.4 / +16.7 % over
+  the greedy-draft k=3 arm. Accepted per draft call: c1 1.31 / 1.74 / 0.96,
+  c8 1.14 / 1.32 / 1.18 (greedy 0.83 / 0.79 / 0.80), c16 1.46 / 1.35 / 1.41
+  (greedy 0.97 / 0.95 / 0.92); the c1 spread follows the prompt content
+  (each pass draws different prompts). `exact: true` on all nine runs,
+  canaries pass.
+- Decision: retained as the record's speculator setting (k=3,
+  probabilistic draft); every concurrency is at or above no-spec, so no
+  per-batch schedule is needed on the prose harness. The structured Foundry
+  8-wide workload is measured separately below before the record is
+  written. Block verification is the next arm.
+- Raw: `perf/results/2026-09-12/p3-dflash2-k3-prob-pass{1,2,3}/`, log
+  `~/.local/scratch/slimserve-glm53/serve-logs/ab-p3-dflash2-k3-prob.out`.
+
+### Phase 3, arm 3: DFlash2 k=3 with block verification, greedy draft - NEUTRAL
+
+- Hypothesis: `rejection_sample_method: block` (Sun et al.) verifies the
+  draft block jointly and should accept more of the same drafts than the
+  token-by-token test.
+- Result (p3-dflash2-k3-block): c1 179.2 / 152.7 / 203.7, c8 462.5 / 448.2
+  / 448.3, c16 643.7 / 620.8 / 632.5; medians 179.2 / 448.3 / 632.5 against
+  the standard greedy-draft arm 180.5 / 464.7 / 635.4. Accepted per draft
+  call c1 0.92 / 0.61 / 1.21, c8 0.80 / 0.79 / 0.67, c16 1.09 / 0.95 /
+  0.91: the same band as the standard test.
+- Reading: with a greedy draft the proposal distribution is one-hot, so the
+  joint test has nothing beyond the token-by-token test to exploit; block
+  verification can only pay together with probabilistic drafts (arm 4).
+- Raw: `perf/results/2026-09-12/p3-dflash2-k3-block-pass{1,2,3}/`.
+
+### Phase 3, arm 4: DFlash2 k=3, probabilistic draft + block verification - RETAINED (record setting)
+
+- Result (p3-dflash2-k3-probblock): c1 212.5 / 239.0 / 289.6, c8 552.1 /
+  532.0 / 531.2, c16 747.8 / 725.1 / 729.2; medians 239.0 / 532.0 / 729.2
+  against arm 2 (probabilistic, standard test) 211.3 / 536.2 / 741.6.
+  Accepted per draft call c1 1.31 / 1.64 / 2.34, c8 1.33 / 1.12 / 1.18, c16
+  1.39 / 1.29 / 1.33 (arm 2: 1.31 / 1.74 / 0.96, 1.14 / 1.32 / 1.18, 1.46 /
+  1.35 / 1.41). `exact: true` on all nine runs, canaries pass.
+- Reading: with probabilistic drafts, block verification is neutral on this
+  harness: c8 / c16 within the 1-2 % pass spread, and the c1 median moves on
+  one pass whose sampled continuation happened to draft well (211 accepted
+  over 90 calls). Block verification never accepts fewer tokens in
+  expectation than the token-by-token test for the same draft distribution
+  and costs nothing per step, so the record takes it.
+- Decision: the record's speculator is DFlash2 k=3 with
+  `draft_sample_method: probabilistic` and `rejection_sample_method: block`
+  (`spec-winner.json` in the scratch dir drives the Foundry check). Against
+  the Phase 0 baseline (113.3 / 449.2 / 611.0 no-spec, DFlash2 k=7 greedy
+  153.6 / 330.9 / 340.3) the tree now stands at 239.0 / 532.0 / 729.2 with
+  speculation and 160.7 / 527.6 / 699.9 without. The control's MTP-3 row
+  (260.8 / 732.1 / 1005.8) still leads at c8 / c16, where the prefill share
+  of the 1000/300 wall (about a quarter) is the next campaign phase.
+- Not pursued: the checkpoint MTP head. The V1-only adapter measured +6.5 %
+  c1 on A100 and lost prose at temperature 1.0 (campaign doc section 1); a
+  V2 port would need the per-group indexer/MLA block tables of
+  `Glm5NextMTPProposer` inside the generic MTP speculator, and DFlash2 with
+  probabilistic drafts already clears the "c8 >= no-spec" bar.
+- Raw: `perf/results/2026-09-12/p3-dflash2-k3-probblock-pass{1,2,3}/`.
+
+## 2026-09-12: rtx6000 Phase 5 (prefill), item by item
+
+Same box, harness and profile; the arms boot with a temporary edit of the
+rtx6000 record's `additional_config` (restored by `git checkout` after each
+arm), `TTFT=1` adds `ttft_cold.py` (cold and warm 32K / 128K on distinct
+slices of the prompt source) after the benches and gates. Reference on the
+Phase 3 tree, no speculation (p5-ttft-ref): cold TTFT 32K 11.59 s, 128K
+123.8 s; warm 0.175 s / 1.17 s. Decode reference p2-topksample 160.7 /
+527.6 / 699.9.
+
+### Item P1: compact GLM indexer cache (`glm5_next_compact_indexer_cache`) on sm_120 - RETAINED (record setting; its prefix-cache misses are fixed in the follow-up below)
+
+- Hypothesis: the general indexer prefill scoring (`_pooled_logits_kernel`)
+  recomputes every pool key (gate softmax over 4 members, per channel) for
+  every query row: O(L^2) SIMT work, 57 % of a cold 32K prefill and the
+  reason 128K took 124 s. The compact page format (A100 candidate of
+  2026-09-09: 64 bf16 elements per token, completed pool keys plus an 8-row
+  raw ring) scores rows against precomputed keys with one `tl.dot` per
+  16-pool tile (`cached_pool_logits`), at prefill and at decode, and holds
+  a third of the row bytes. The gate at `glm5_next_indexer.py`
+  (`_cache_row_dim`) accepted SM80 only; widened to SM80 and SM120
+  (`_compact_cache_qualified`) after the 116 pool-cache CUDA tests passed on
+  GPU 0.
+- Result (p5-compact, no-spec): c1 160.8 / 164.3 / 164.2, c8 539.5 / 538.2
+  / 538.3, c16 718.9 / 715.6 / 720.2; medians 164.2 / 538.3 / 718.9 = +2.2 /
+  +2.0 / +2.7 % over p2-topksample. Cold TTFT 32K 5.31 s (-54 %), 128K
+  22.0 s (-82 %); prefill now scales close to linearly (4.1x tokens, 4.1x
+  time). KV capacity 2,817,628 tokens against 2,118,065 (+33 %). Gates
+  -2.418 / -2.428 (band mean -2.458, per-run sd 0.016, boots differ up to
+  0.04: at the edge, on the better side; the row-shard arm, a second
+  compact-cache boot, gated -2.472 / -2.482, so the two compact boots
+  straddle the band and the format carries no systematic shift). Canaries
+  pass, `exact: true` on all nine runs.
+- Open: the warm 32K repeat took 5.26 s (a full re-prefill; the reference
+  run's repeat took 0.175 s and its engine log shows the hit) while the
+  warm 128K repeat hit (0.377 s). Prefix caching is a standing requirement
+  (agentic traffic), so the item stays provisional until `prefix_probe.py`
+  (512 / 4096 / 32768 tokens, cold then repeat, engine
+  `prefix_cache_queries/hits` deltas) explains which lengths miss under the
+  compact pages and the cause is fixed.
+- Raw: `perf/results/2026-09-12/p5-compact-pass{1,2,3}/`, gates
+  `p5-compact-gate{1,2}.json`, `~/.local/scratch/slimserve-glm53/serve-logs/
+  ttft-p5-{ttft-ref,compact}.out`.
+
+### Item P2: TP row-sharded indexer decode scoring (`glm5_next_indexer_row_shard`) - REJECTED
+
+- Hypothesis: at c16 the pooled indexer costs 0.37 ms per step (22
+  launches at 17 us); sharding the 16 decode rows over the four ranks (4
+  rows each, `pynccl.all_gather` of the selections) should cut the scoring
+  four-fold. Gate widened alongside the compact cache (same
+  `_compact_cache_qualified`).
+- Result (p5-rowshard, compact cache + row shard, no-spec): c1 161.1 /
+  164.4 / 164.0, c8 540.3 / 537.4 / 537.5, c16 711.9 / 712.6 / 713.8;
+  medians 164.0 / 537.5 / 712.6 against the compact-only arm 164.2 / 538.3 /
+  718.9: c1 / c8 flat, c16 -0.9 %. Gates -2.472 / -2.482, canaries pass.
+- Reading: the per-layer all-gather over PCIe (11 sparse layers) costs at
+  least what the three-quarter scoring cut saves at these row counts; on
+  the A100 TP8 candidate the ratio was different (8 ranks, NVLink).
+- Decision: rejected on rtx6000; the flag stays off in the record, the
+  gate widening stays (harmless, and the prefill variant below reuses the
+  branch).
+- Raw: `perf/results/2026-09-12/p5-rowshard-pass{1,2,3}/`, gates
+  `p5-rowshard-gate{1,2}.json`.
+
+### Item P3: custom all-reduce buffer 64 MiB (`VLLM_CUSTOM_AR_MAX_SIZE_MB=64`) - RETAINED
+
+- Hypothesis: the custom all-reduce's IPC buffer is 8 MiB, so a prefill
+  chunk's [8192, 4096] bf16 reduction (64 MiB) fell back to NCCL's PCIe
+  ring (547 launches at 2.97 ms, 22.6 GB/s algbw, 14 % of the cold 32K
+  prefill), and the c8 / c16 1000-token prefills reduce at 8-16 MiB, just
+  above the cap. Salvaged knob from the Codex tree
+  (`custom_ar_max_size.diff`: `VLLM_CUSTOM_AR_MAX_SIZE_MB`, default 8, so
+  no behavior change unless set); Codex measured c8 +3 %.
+- Result (p5-car64, raw indexer cache, no-spec): c1 157.9 / 161.0 / 160.9,
+  c8 544.6 / 543.5 / 543.2, c16 711.0 / 712.3 / 712.3; medians 160.9 /
+  543.5 / 712.3 = +0.1 / +3.0 / +1.8 % over p2-topksample. Cold TTFT 32K
+  11.14 s (-3.9 % against 11.59), 128K 121.9 s (-1.5 %); warm 0.177 s /
+  1.19 s (prefix hits intact). Gates -2.473 / -2.449, canaries pass,
+  `exact: true` on all nine runs.
+- Reading: the two-shot custom kernel runs a 64 MiB reduction about 28 %
+  faster than NCCL's ring over these PCIe pairs (1.62 s -> ~1.17 s of the
+  32K prefill); the c8 / c16 gain is the 1000-token prefills' reductions.
+  Buffers cost 2 x 64 MiB per rank.
+- Decision: retained; the record's env gets `VLLM_CUSTOM_AR_MAX_SIZE_MB=64`
+  next to `VLLM_CUSTOM_AR_ALLOW_PCIE=1`.
+- Raw: `perf/results/2026-09-12/p5-car64-pass{1,2,3}/`, gates
+  `p5-car64-gate{1,2}.json`, `serve-logs/ttft-p5-car64.out`.
+
+### Item P4: `NCCL_PROTO=Simple` for the prefill reductions - REJECTED
+
+- Hypothesis: the 64 MiB prefill reductions ran NCCL's LL protocol (the
+  trace's `ring LL` kernels); Simple is the large-message protocol.
+- Result (p5-nccl-simple, raw cache, default 8 MiB custom-AR buffer, TTFT
+  only): cold 32K 11.72 s, 128K 124.9 s against 11.59 s / 123.8 s: within
+  noise, slightly worse. With item P3 those reductions no longer reach NCCL.
+- Raw: `~/.local/scratch/slimserve-glm53/serve-logs/ttft-p5-nccl-simple.out`.
+
+### Item P5: TP row-sharded indexer prefill scoring (`glm5_next_indexer_row_shard_prefill`) - REJECTED
+
+- Hypothesis: with the compact cache the prefill scoring
+  (`_cached_pool_logits`, 189 ms of the cold 32K window at 2.15 ms per
+  launch) is the last indexer cost; sharding each prefill chunk's rows
+  over the TP group and all-gathering the selected indices would cut it
+  4x if the all-gather is cheap at prefill widths (it was not at decode,
+  item P2).
+- Result (p5-rowshard-prefill: compact cache + decode shard + prefill
+  shard, no-spec): c1 160.6 / 164.2 / 164.1, c8 539.4 / 539.7 / 537.2,
+  c16 712.7 / 711.8 / 709.6; medians 164.1 / 539.4 / 711.8 against the
+  compact arm's 164.2 / 538.3 / 718.9 (the decode shard's c16 cost
+  again). Cold TTFT 32K 5.258 s against 5.31 s (-1 %, inside the
+  boot-to-boot spread), 128K 21.75 s against 22.0 s (-1 %). Warm 128K
+  0.389 s, warm 32K still a re-prefill (item P1's open point, resolved
+  below). Gates -2.419 / -2.448, canaries pass, `exact: true` on all
+  nine runs.
+- Reading: after the compact cache the prefill scoring is 3.6 % of the
+  cold 32K window; sharding cannot buy more than that and the per-chunk
+  all-gather ate most of it.
+- Decision: rejected; the prefill shard is removed from the tree (the
+  decode shard stays, gated off). The SM120 qualification of the compact
+  cache (`_compact_cache_qualified`) is kept.
+- Raw: `perf/results/2026-09-12/p5-rowshard-prefill-pass{1,2,3}/`, gates
+  `p5-rowshard-prefill-gate{1,2}.json`,
+  `~/.local/scratch/slimserve-glm53/serve-logs/ttft-p5-rowshard-prefill.out`.
+
+### Phase 5 attribution 2: cold 32K prefill with the compact cache (p5-compact-32k)
+
+Same method as the Phase 5 opener (`prof_prefill_long.sh`, TOKENS=32768,
+`prefill_attrib.py` over the rank-0 trace): window 5196.8 ms span,
+5137.5 ms kernel busy, 15,186 launches. This boot predates the record's
+`VLLM_CUSTOM_AR_MAX_SIZE_MB=64` (applied 18:09), so the 8192-token chunk
+reductions still went to NCCL.
+
+| class | ms | share | launches | us/launch |
+| --- | --- | --- | --- | --- |
+| nccl allreduce (`AllReduce_Sum_bf16_RING_LL`) | 1578.0 | 30.7 % | 455 | 3468 |
+| fp8 gemm class, of which `mla_decode_fp8_v<true,false,512,512>` | 1457.1 / 1247.6 | 28.4 % / 24.0 % | 2292 / 55 | 636 / 22,684 |
+| mHC transition (`dsv4_mhc::partials<24>` 855.9) | 937.8 | 18.3 % | 1626 | 577 |
+| marlin moe | 543.2 | 10.6 % | 504 | 1078 |
+| other | 220.1 | 4.3 % | 1700 | 129 |
+| KDA chunked prefill (FLA) | 104.6 | 2.0 % | 1632 | 64 |
+| indexer scoring (`_cached_pool_logits`) | 189.2 | 3.6 % | 88 | 2150 |
+
+- Reading: the indexer scoring fell from 57 % (raw format, O(L^2) pool
+  recompute) to 3.6 %. What is left, in order: the prefill reductions
+  (item P3's custom kernel takes them now; the residual is the PCIe
+  collective itself), the sparse-MLA prefill that runs through the decode
+  kernel (`mla_decode_fp8_v`, 55 launches at 22.7 ms = 24 % of the
+  window: a prefill-shaped kernel that shares K/V tiles across many query
+  rows is the obvious replacement), and the mHC partials (16.5 %).
+- Raw: `~/.local/scratch/slimserve-glm53/profile-prefill-p5-compact-32k/`
+  (four rank traces), `serve-logs/prof-prefill-p5-compact-32k.out`.
+
+### Phase 3, Foundry structured c8 workload: no-spec against the record speculator
+
+- Method: `workload_bench_c8.py --prompts foundry-fanout-prompts.json
+  --chat --temperature 1.0 --top-p 0.95 --concurrency 8 --repeats 2`
+  (eight concurrent agentic prompts with tool schemas and thinking on),
+  aggregate output tok/s and wall time per repeat, same boot as the
+  respective arm.
+- Result: no-spec 387.4 / 421.7 tok/s (73.1 s / 56.9 s wall, 2360-4096
+  output tokens per prompt); DFlash2 k=3 probabilistic + block 399.4 /
+  468.6 tok/s (58.8 s / 49.8 s), accepted tokens per step 1.59 / 1.57.
+- Reading: +3 / +11 % aggregate and -20 / -12 % wall on structured
+  output, where the c8 exact bench (1000/300, random-ish prose) had the
+  speculator at parity (532 against 538). Acceptance on this workload
+  (1.59 per step) is above the exact bench's; the record setting stands.
+- Raw: `~/.local/scratch/slimserve-glm53/serve-logs/workload-p3-foundry-{nospec,spec}.{out,json}`.
+
+### Item P1, follow-up: the compact cache's prefix-cache misses - FIXED (two coordinator defects)
+
+- Diagnosis (CPU reproduction, `tests/v1/core/test_hybrid_partial_hit_alignment.py`,
+  built from the engine's block geometry: the KDA page of 1,085,440 B
+  raises the attention block to 1088 tokens, and the compact indexer's
+  128 B/token page is unified by scaling its block to 8704 tokens; with
+  DFlash2 the page is 1,122,304 B, the blocks 1152 / 9216, plus the
+  drafter's 1152-token sliding-window group):
+  1. `HybridKVCacheCoordinator` demanded hits aligned to the LCM of the
+     group block sizes (8704 / 9216) because its hash-granular "partial
+     hit" mode only switched on when the *Mamba* block exceeded the hash
+     block. Align-mode KDA states exist only at chunk ends, which the
+     scheduler steers onto `cache_config.block_size` (1088) boundaries,
+     so a hit needed a state at a multiple of 8704 that no chunk ended
+     on. 128K hit by coincidence (130,560 = 120 x 1088 = 15 x 8704); 32K
+     (last cacheable position 32,640 = 30 x 1088) and 4K never did.
+     Fix: partial hits switch on whenever any prefix-cacheable group's
+     block is coarser than the hash block and every such manager
+     supports fine-grained lookup (full attention, Mamba). The 8704-token
+     indexer group then serves a hash-aligned partial tail with the
+     existing copy-on-write redirect.
+  2. Under the speculator (DFlash2 counts as EAGLE-like: one block backed
+     off, one hash unit dropped) the drafter's sliding-window manager
+     cached only the tails of `scheduler_block_size` segments (3 of
+     every 8 blocks) while hits were now searched at hash granularity, so
+     it could never confirm a hit and the fixed point collapsed to zero.
+     Fix: every manager caches at the coordinator's hit granularity
+     (`cache_hit_alignment_tokens`, the hash block when partial hits are
+     on). The A100 `glm53f-nvfp4-8` record (compact cache, TP8) had the
+     same geometry, so it was missing the same hits.
+- Tests: the reproduction covers raw / compact x no-spec / DFlash2 at
+  512 / 4096 / 32768 / 131072 tokens (17 cases, 0 hits before the fixes
+  for compact 4K/32K in both modes) plus the private copy-on-write tail;
+  `tests/v1/core` 212 pass.
+- Engine (p5-compactfix-prefix, no-spec, compact, record env): warm 4096
+  0.169 s with 3,264 hits (cold 0.579 s), warm 32768 0.176 s with 32,640
+  hits (cold 4.681 s); 512 cannot hit below one 1088-token block. Cold
+  32K 4.68 s against 5.31 s before the record's 64 MiB custom-AR buffer.
+- Engine, spec mode under fix 2 (p5-fix2-prefix-spec, DFlash2 k=3, compact,
+  record env): warm 4096 0.327 s with 2,304 hits (cold 0.598 s), warm 32768
+  0.360 s with 31,104 hits (cold 4.676 s) - exactly the CPU model's
+  27 x 1152 (the EAGLE-style drop recomputes the last 1152-token block
+  before the prompt's tail). Before fix 2 the same boot geometry gave 0
+  hits at both lengths (p5-compactfix-verify, p5-record-spec).
+- Raw: `~/.local/scratch/slimserve-glm53/serve-logs/probe-boot-p5-compactfix-{prefix,verify}.out`,
+  `queue-f.out`.
+
+### Record arm, spec (p5-record-spec): compact cache + DFlash2 k=3 probabilistic/block + custom AR 64 MiB - RETAINED (record)
+
+- Boot 18:17 (fix 1 in, fix 2 not yet): c1 195.5 / 213.7 / 215.1, c8
+  565.6 / 567.7 / 581.8, c16 784.2 / 783.4 / 771.2; medians 213.7 /
+  567.7 / 783.4. Against arm 4 (same speculator, raw cache, 8 MiB AR:
+  239.0 / 532.0 / 729.2) that is c1 -10.6 %, c8 +6.7 %, c16 +7.4 %.
+  Cold TTFT 32K 4.72 s, 128K 19.8 s; warm 128K 0.656 s, warm 32K still a
+  re-prefill (expected on this boot, see fix 2). Gates -2.462 / -2.473
+  (in band). Canaries pass, `exact: true` on all nine runs.
+- The c1 gap against arm 4 is the spec-mode c1 spread, not a loss: see
+  the isolating arm below (p5-spec-raw-car64), which puts the raw cache
+  under the same speculator and AR buffer at 197.4 and shows arm 4's own
+  passes ran 212.5 / 239.0 / 289.6.
+- Raw: `perf/results/2026-09-12/p5-record-spec-pass{1,2,3}/`, gates
+  `p5-record-spec-gate{1,2}.json`, `serve-logs/ttft-p5-record-spec.out`.
+
+- Correctness of the hash-granular hits (prefix_verify.py: cold request,
+  then the identical prompt warm, top-8 logprobs of the first generated
+  token at the recommended sampling settings): no-spec warm 4096 (3,264
+  hits) max |delta| 0.30, warm 32768 (32,640 hits) 1.19; spec warm 4096
+  (2,304 hits) 1.10, warm 32768 (31,104 hits) 0.94. The same probe with
+  NO hits (the pre-fix-2 spec boot, both requests re-prefilled) gave 1.20
+  / 0.56, so the deltas are the stack's run-to-run noise on far-tail
+  tokens (logprobs -10 to -13, probabilities ~1e-5), not a cache effect:
+  the top-1 token agrees at every length with its logprob within 0.07
+  (4096) and 1e-4 (32768). The second gate of every later arm runs warm
+  (its prompts hit) and is the standing quality check for the reused
+  states. Raw: `serve-logs/probe-boot-p5-{compactfix-verify,fix2-verify-spec,fix2-verify-nospec}.out`.
+
+### Isolating arm, spec + raw indexer cache + custom AR 64 MiB (p5-spec-raw-car64): the compact cache stays on the record
+
+- Question: the record arm's c1 (213.7) sat 10.6 % under arm 4 (239.0;
+  raw cache, 8 MiB AR) while c8/c16 gained 7 %. This arm keeps the record
+  (speculator, 64 MiB AR, fix 1 + fix 2) and only switches
+  `glm5_next_compact_indexer_cache` off, to split the cache from the AR
+  buffer under speculation.
+- Result (boot 18:37, TTFT + 3 passes): c1 193.7 / 197.4 / 201.3, c8
+  550.5 / 563.1 / 569.1, c16 770.5 / 751.4 / 764.4; medians 197.4 /
+  563.1 / 764.4. Cold TTFT 32K 11.15 s, 128K 122.1 s; warm 32K 1.01 s,
+  128K 3.81 s. `exact: true` on all nine runs, canaries pass.
+- Reading: with the raw cache the record's speculator lands BELOW the
+  compact record arm on every axis (c1 -7.6 %, c8 -0.8 %, c16 -2.4 %,
+  cold 32K 2.4x slower, cold 128K 6.2x slower), so neither the compact
+  cache nor the 64 MiB buffer costs c1. The gap to arm 4 is c1 noise
+  under speculation: arm 4's three passes were 212.5 / 239.0 / 289.6 and
+  the record arm's 195.5 / 213.7 / 215.1. A 300-token c1 reply under
+  DFlash2 takes ~1.5 s and its acceptance follows the sampled text, so a
+  three-pass c1 median resolves only >30 % effects in spec mode; c8/c16
+  (pass spread <= 3 %) decide spec arms, c1 is reported, not decided on.
+- The raw-cache prefill numbers reproduce every earlier raw arm (cold 32K
+  11.1-11.7 s, cold 128K 122-125 s on p5-ttft-ref / p5-car64 /
+  p5-nccl-simple); the compact cache is what cut them to 4.7 s / 19.6 s.
+- Decision: the record keeps the compact cache, the 64 MiB AR buffer and
+  DFlash2 k=3 probabilistic/block (`speculative_overrides`); the record
+  arm's PROVISIONAL is cleared.
+- Raw: `perf/results/2026-09-12/p5-spec-raw-car64-pass{1,2,3}/`,
+  `~/.local/scratch/slimserve-glm53/serve-logs/{ab,ttft}-p5-spec-raw-car64.out`.
+
+### Item 8, re-measure after the upstream merge: FP8 main KV (`glm5_next_main_kv_fp8`) with upstream's fp8 sparse prefill kernel - REJECTED (kernel unqualified on sm_120)
+
+- Why again: the merge of upstream/main 9d76a981b brought the A100 record's
+  fp8 main KV pieces: the partition rule for the fp8 sparse decode kernel
+  and `mla_sparse_prefill_fp8` (groups of 4 queries over the union of
+  their pools, tensor cores, default on for fp8 caches). Item 8 had been
+  rejected on decode cost alone (p1-fp8kv: c16 -4.7 %).
+- Arm p6-fp8kv-nospec (boot 18:52, compact cache, 64 MiB AR, flag on):
+  c1 167.0 / 167.0 / 166.8, c8 581.6 / 581.1 / 573.7, c16 769.5 / 776.4 /
+  768.7; cold TTFT 32K 2.91 s, 128K 12.15 s; warm 0.177 s / 0.372 s.
+  `exact: true` on all nine runs - and the gates at -10.32 / -10.46 with
+  needle margins 1.7 / -13.5 and 2.1 / -20.5: the model is answering
+  garbage. Every throughput number of this arm is void.
+- Cause: `sparse_prefill_attn_kernel` asks 116,224 B of opt-in shared
+  memory per block (Q 66.5 KB + K tile 33 KB + score exchange 16 KB); the
+  RTX PRO 6000 opts in to 101,376 B. The binding set the attribute without
+  checking the result and launched without a launch check, so the kernel
+  never ran and the output buffer was returned uninitialised. Upstream's
+  own parity test (`tests/kernels/test_quixicore_sparse_prefill.py`) fails
+  5/5 here.
+- Fix (this branch): the binding now checks `cudaFuncSetAttribute` and the
+  launch (`C10_CUDA_KERNEL_LAUNCH_CHECK`), exposes
+  `mla_sparse_prefill_fp8_smem_bytes()`, and `_sparse_prefill_enabled()`
+  turns the kernel off with a warning on a device whose opt-in limit is
+  below its need, so an fp8 main KV on sm_120 falls back to the per-token
+  decode kernel for prefill instead of serving noise. A native sm_120
+  variant (a 32-row Q tile, 58 KB) is a separate item; with Item 8's decode
+  cost unchanged it is not queued.
+- Decision: FP8 main KV stays off the record; `glm5_next_sparse_prefill`
+  is self-qualifying. The prefill sparse-MLA lever for the bf16 cache is
+  the rows kernel (P6 below).
+- Raw: `perf/results/2026-09-12/p6-fp8kv-nospec-pass{1,2,3}/`, gates
+  `p6-fp8kv-nospec-gate{1,2}.json`, `serve-logs/{ab,ttft}-p6-fp8kv-nospec.out`,
+  `serve-logs/queue-h.out` (the test line).
+
+### Post-merge baseline (p6-merge-base-nospec): upstream/main 9d76a981b merged into the branch
+
+- What the merge brings to this record: the batched warp-split mHC partials
+  (`QC_MHC_PARTIALS_WS`, default on; the T > 1 prefill steps take the
+  batched path), the scheduler's hybrid invalid-block fix, the host-tier
+  hash fix, and the fp8 main KV pieces measured in the entry above. Same
+  record settings as p5-record-nospec (compact cache, 64 MiB AR).
+- Result (boot 18:59, no-spec, TTFT + 2 gates + 3 passes): c1 162.5 /
+  166.0 / 165.7, c8 572.3 / 572.8 / 572.6, c16 767.2 / 764.4 / 765.8;
+  medians 165.7 / 572.6 / 765.8 against p5-record-nospec 163.8 / 555.0 /
+  730.9 (c1 +1.2 %, c8 +3.2 %, c16 +4.8 %). Cold TTFT 32K 4.14 s (from
+  4.70 s, -12 %), 128K 17.2 s (from 19.6 s, -12 %); warm 0.177 s / 0.362 s.
+  Gates -2.469 / -2.452 (in band), canaries pass, `exact: true` on all
+  nine runs.
+- Reading: the prefill gain is upstream's batched mHC partials (Phase 5
+  attribution 2 had the mHC partials at 16.5 % of the cold 32K), the c8/c16
+  gain the same kernel on the verify-sized steps. This is the baseline for
+  the P6 prefill kernel arm below.
+- Raw: `perf/results/2026-09-12/p6-merge-base-nospec-pass{1,2,3}/`, gates
+  `p6-merge-base-nospec-gate{1,2}.json`, `serve-logs/{ab,ttft}-p6-merge-base-nospec.out`.
+
+### Item P6: prefill-shaped sparse MLA tensor-core kernel (`sparse_tc_nope_rows`, `glm5_next_sparse_tc_prefill`) - RETAINED (record setting)
+
+- Baseline: p6-merge-base-nospec above (cold 32K 4.14 s, 128K 17.2 s; c1 /
+  c8 / c16 165.7 / 572.6 / 765.8). Phase 5 attribution 2 had the sparse MLA
+  of the prefill chunks at 24 % of the cold 32K: the per-token SIMT decode
+  kernel (`mla_decode_fp8_v`, one warp per head x token) walking each row's
+  2,080-wide list once per head, 55 launches x 22.7 ms.
+- Hypothesis: one Triton program per query token, all 16 heads at once,
+  online softmax over the row's index list in 32/64-row gathered tiles
+  (each tile read once for every head), the query held transposed [512,
+  16] so the gathered tile is the A operand of both dots and no transposed
+  copy is needed inside sm_120's 99 KB of shared memory; fp32 softmax with
+  split bf16 probabilities (the decode TC kernel's numerics). No partition
+  scratch, so it scales to chunks of thousands of rows. bf16 latents only:
+  an fp8 main KV takes the native fp8 prefill kernel (the fp8 decode branch
+  asked 147 KB of shared memory at tile 64 and duplicated that kernel; it
+  was removed).
+- Correctness: `tests/glm5_next/test_sparse_tc_prefill_rows.py` (17 tests):
+  parity with the pure-torch reference and with the native SIMT kernel at
+  1 / 7 / 64 / 257 rows with growing visible prefixes, -1 gaps and halved
+  lengths, 8 and 16 heads, tile 32 and 64 (atol 0.002 / 0.004), packed-slab
+  page strides against the partitioned decode TC kernel. (The first run of
+  the parity test failed 13/18 against the native kernel: the test had
+  called it with page_stride_bytes=0 on a strided view; the rows kernel
+  matched the reference throughout.) Gates on the arm -2.450 / -2.464 (in
+  band, gate2 warm), canaries pass, `exact: true` on all nine runs.
+- Microbench (GPU 0, 32K context, H=16, 2,080-wide lists, 7,616 rows = the
+  last chunk of a 32K prompt): native SIMT unpartitioned 25.91 ms, rows
+  kernel tile 32 7.85 ms, tile 64 7.05 ms (3.7x), max |delta| vs native
+  0.0002; 1,024 rows: 3.64 ms vs 0.94 ms.
+- Result (p6-tcprefill-nospec, boot 19:06, flag on, no-spec): cold TTFT
+  32K 3.126 s (-24 %), 128K 13.17 s (-23 %); warm 0.197 s / 0.355 s. c1
+  162.6 / 166.2 / 166.2, c8 581.0 / 580.7 / 578.4, c16 776.9 / 774.8 /
+  775.0; medians 166.2 / 580.7 / 775.0 (+0.3 / +1.4 / +1.2 %: the kernel
+  also serves the verify-sized prefill steps of the c8/c16 mix).
+- Decision: retained; `glm5_next_sparse_tc_prefill: true` joins the
+  record's `additional_config` (opt-in like the decode TC switch; the A100
+  records at 8 heads per rank qualify but are not measured here). Dispatch:
+  chunked-prefill steps with 8 or 16 heads, bf16 q and cache, 512-wide
+  latent; decode steps keep their own dispatch. Tile 64.
+- Raw: `perf/results/2026-09-12/p6-tcprefill-nospec-pass{1,2,3}/`, gates
+  `p6-tcprefill-nospec-gate{1,2}.json`, `serve-logs/{ab,ttft}-p6-tcprefill-nospec.out`,
+  `serve-logs/queue-h.out` (microbench lines), `queue-i.out` (17 passed).
+
+### Final record arms (p7-final-nospec, p7-final-spec): the campaign's closing numbers on the final tree
+
+- Tree: 4c1e0a90f (upstream/main 9d76a981b merged; `_quixicore_C` rebuilt
+  with the fp8 sparse prefill checks; the branch cleanup and the P6 flag on
+  the record). Every GPU kernel test of the branch passes on this build
+  (rows 17, sparse MLA bf16 27, route+align 11, shared hand-off 3,
+  moe_sum_add 35, topk_sample 18, decode GEMM 44 + 45, KDA decode 8, mHC
+  batched partials 5; the fp8 sparse prefill test skips with the
+  shared-memory reason).
+- No speculation (boot 19:16): c1 165.9 / 166.2 / 166.3, c8 582.0 / 581.1 / 581.5, c16
+  777.0 / 781.6 / 778.0; medians 166.2 / 581.5 / 778.0. Cold TTFT 32K
+  3.14 s, 128K 13.1 s; warm 0.174 s / 0.354 s. Gates
+  -2.452 / -2.439.
+- DFlash2 k=3 probabilistic/block (boot 19:21, `--spec`): c1 218.0 / 218.9 / 214.2,
+  c8 579.2 / 618.7 / 598.1, c16 862.3 / 839.9 / 848.4; medians 218.0 / 598.1 / 848.4.
+  Cold TTFT 32K 3.16 s, 128K 13.3 s; warm 0.296 s /
+  0.544 s. Gates -2.446 / -2.477 (the warm gate at the band's
+  low edge, -2.478; every other spec gate of the campaign sat inside it).
+- Against the bring-up baseline (113.3 / 449.2 / 611.0, cold 11.8 s /
+  124 s): c1 +47 %, c8 +29 %, c16 +27 % without speculation; +92 % / +33 % /
+  +39 % with it; cold 32K prefill 3.8x faster, 128K 9.4x. Against the
+  unhandicapped B12X control (166.5 / 687.9 / 966.8, MTP-3 260.8 / 732.1 /
+  1005.8, cold 2.93 s / 14.9 s): c1 at parity (no-spec) and 84 % of the
+  control's MTP-3 (spec), c8 85 %, c16 80 % (88 % under speculation), cold
+  32K 1.07x the control's, 128K faster than the control's.
+- Canaries pass on both boots, `exact: true` on all eighteen runs. These
+  two arms are the record rows in `perf/baseline_status.md`.
+- Raw: `perf/results/2026-09-12/p7-final-{nospec,spec}-pass{1,2,3}/`, gates
+  `p7-final-{nospec,spec}-gate{1,2}.json`, `serve-logs/{ab,ttft}-p7-final-*.out`,
+  `serve-logs/queue-j.out` (build and test lines).

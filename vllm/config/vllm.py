@@ -343,15 +343,14 @@ def _v2_runner_kernels_available() -> bool:
     except Exception:
         return False
 
+
 # KV connectors that move KV with ordinary stream-ordered copies and never pin
 # or register GPU memory (no IB memory regions), hence compatible with
 # PyTorch's expandable_segments (VMM) allocator.
 _VMM_SAFE_KV_CONNECTORS = frozenset({"HostTierConnector"})
 
 
-
 @config(config=ConfigDict(arbitrary_types_allowed=True))
-
 class VllmConfig:
     """Dataclass which contains all vllm-related configuration. This
     simplifies passing around the distinct configurations in the codebase.
@@ -557,6 +556,23 @@ class VllmConfig:
             vllm_factors.append(additional_config_hash)
         else:
             vllm_factors.append("None")
+        # The QuixiCore decode-linear custom ops change the traced graph when
+        # the build carries them and their switches are on; a compiled
+        # artifact from one build/setting must not serve another.
+        from vllm.model_executor.layers.utils import (
+            decode_gemm_enabled,
+            decode_gemm_fp8_enabled,
+        )
+
+        vllm_factors.append(
+            f"quixicore_decode_gemm={decode_gemm_enabled()}"
+            f",fp8={decode_gemm_fp8_enabled()}"
+        )
+        from slimserve.fp8_swapset import hash_factor
+
+        vllm_factors.append(
+            hash_factor(self.model_config.model if self.model_config else None)
+        )
         factors.append(vllm_factors)
 
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()[

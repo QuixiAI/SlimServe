@@ -330,7 +330,7 @@ def main(argv: list[str] | None = None) -> int:
     if not machine.known:
         term.die(
             f"unrecognized hardware ({machine.device_name}); "
-            "slimserve runs on MI300X, A100 and Apple Silicon"
+            "slimserve runs on MI300X, A100, RTX 3090, RTX PRO 6000 and Apple Silicon"
         )
 
     if blocked := registry.profile_blocked(profile_id, machine.platform):

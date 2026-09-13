@@ -19,11 +19,12 @@ from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
 
 _HC = 4
-# The new dispatch has been measured on A100 only. Preserve the existing
-# native implementation on other CUDA architectures and on ROCm/Metal.
-_USE_SM80_SIMT = current_platform.is_cuda() and current_platform.is_device_capability(
-    (8, 0)
-)
+# The split SIMT transition (two Triton launches: per-split partials, then
+# the sinkhorn + mix in one block per token) beats the cooperative dsv4_mhc
+# kernel on A100 and on sm_120 (2026-09-12, RTX PRO 6000: 6.7 us against
+# 8.7 us per transition at c1). Every CUDA part takes it for T <= 64; the
+# native kernels remain for larger batches, ROCm and Metal.
+_USE_SPLIT_SIMT = current_platform.is_cuda()
 
 
 def _qc():
@@ -46,7 +47,7 @@ def glm5_mhc_pre(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     T, hc, D = residual.shape
     if (
-        _USE_SM80_SIMT
+        _USE_SPLIT_SIMT
         and 0 < T <= 64
         and hc == 4
         and D == 4096
@@ -121,7 +122,7 @@ def glm5_mhc_fused_post_pre(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     T, hc, D = residual.shape
     if (
-        _USE_SM80_SIMT
+        _USE_SPLIT_SIMT
         and 0 < T <= 64
         and hc == 4
         and D == 4096
