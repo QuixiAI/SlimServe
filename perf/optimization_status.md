@@ -26590,7 +26590,7 @@ Phase 3 tree, no speculation (p5-ttft-ref): cold TTFT 32K 11.59 s, 128K
 123.8 s; warm 0.175 s / 1.17 s. Decode reference p2-topksample 160.7 /
 527.6 / 699.9.
 
-### Item P1: compact GLM indexer cache (`glm5_next_compact_indexer_cache`) on sm_120 - PROVISIONAL (prefix-cache probe pending)
+### Item P1: compact GLM indexer cache (`glm5_next_compact_indexer_cache`) on sm_120 - RETAINED (record setting; its prefix-cache misses are fixed in the follow-up below)
 
 - Hypothesis: the general indexer prefill scoring (`_pooled_logits_kernel`)
   recomputes every pool key (gate softmax over 4 members, per channel) for
@@ -26786,11 +26786,16 @@ reductions still went to NCCL.
   0.169 s with 3,264 hits (cold 0.579 s), warm 32768 0.176 s with 32,640
   hits (cold 4.681 s); 512 cannot hit below one 1088-token block. Cold
   32K 4.68 s against 5.31 s before the record's 64 MiB custom-AR buffer.
-  The spec-mode probe under fix 2 is queued (queue-g).
+- Engine, spec mode under fix 2 (p5-fix2-prefix-spec, DFlash2 k=3, compact,
+  record env): warm 4096 0.327 s with 2,304 hits (cold 0.598 s), warm 32768
+  0.360 s with 31,104 hits (cold 4.676 s) - exactly the CPU model's
+  27 x 1152 (the EAGLE-style drop recomputes the last 1152-token block
+  before the prompt's tail). Before fix 2 the same boot geometry gave 0
+  hits at both lengths (p5-compactfix-verify, p5-record-spec).
 - Raw: `~/.local/scratch/slimserve-glm53/serve-logs/probe-boot-p5-compactfix-{prefix,verify}.out`,
   `queue-f.out`.
 
-### Record arm, spec (p5-record-spec): compact cache + DFlash2 k=3 probabilistic/block + custom AR 64 MiB - PROVISIONAL
+### Record arm, spec (p5-record-spec): compact cache + DFlash2 k=3 probabilistic/block + custom AR 64 MiB - RETAINED (record)
 
 - Boot 18:17 (fix 1 in, fix 2 not yet): c1 195.5 / 213.7 / 215.1, c8
   565.6 / 567.7 / 581.8, c16 784.2 / 783.4 / 771.2; medians 213.7 /
@@ -26799,11 +26804,10 @@ reductions still went to NCCL.
   Cold TTFT 32K 4.72 s, 128K 19.8 s; warm 128K 0.656 s, warm 32K still a
   re-prefill (expected on this boot, see fix 2). Gates -2.462 / -2.473
   (in band). Canaries pass, `exact: true` on all nine runs.
-- Open: the c1 loss is not explained by the no-spec arms (compact was
-  +2 % there); the isolating arm (spec + raw cache + 64 MiB AR,
-  p5-spec-raw-car64) is queued to split the compact cache from the AR
-  buffer under speculation before the record's `additional_config` is
-  final.
+- The c1 gap against arm 4 is the spec-mode c1 spread, not a loss: see
+  the isolating arm below (p5-spec-raw-car64), which puts the raw cache
+  under the same speculator and AR buffer at 197.4 and shows arm 4's own
+  passes ran 212.5 / 239.0 / 289.6.
 - Raw: `perf/results/2026-09-12/p5-record-spec-pass{1,2,3}/`, gates
   `p5-record-spec-gate{1,2}.json`, `serve-logs/ttft-p5-record-spec.out`.
 
@@ -26819,3 +26823,32 @@ reductions still went to NCCL.
   (4096) and 1e-4 (32768). The second gate of every later arm runs warm
   (its prompts hit) and is the standing quality check for the reused
   states. Raw: `serve-logs/probe-boot-p5-{compactfix-verify,fix2-verify-spec,fix2-verify-nospec}.out`.
+
+### Isolating arm, spec + raw indexer cache + custom AR 64 MiB (p5-spec-raw-car64): the compact cache stays on the record
+
+- Question: the record arm's c1 (213.7) sat 10.6 % under arm 4 (239.0;
+  raw cache, 8 MiB AR) while c8/c16 gained 7 %. This arm keeps the record
+  (speculator, 64 MiB AR, fix 1 + fix 2) and only switches
+  `glm5_next_compact_indexer_cache` off, to split the cache from the AR
+  buffer under speculation.
+- Result (boot 18:37, TTFT + 3 passes): c1 193.7 / 197.4 / 201.3, c8
+  550.5 / 563.1 / 569.1, c16 770.5 / 751.4 / 764.4; medians 197.4 /
+  563.1 / 764.4. Cold TTFT 32K 11.15 s, 128K 122.1 s; warm 32K 1.01 s,
+  128K 3.81 s. `exact: true` on all nine runs, canaries pass.
+- Reading: with the raw cache the record's speculator lands BELOW the
+  compact record arm on every axis (c1 -7.6 %, c8 -0.8 %, c16 -2.4 %,
+  cold 32K 2.4x slower, cold 128K 6.2x slower), so neither the compact
+  cache nor the 64 MiB buffer costs c1. The gap to arm 4 is c1 noise
+  under speculation: arm 4's three passes were 212.5 / 239.0 / 289.6 and
+  the record arm's 195.5 / 213.7 / 215.1. A 300-token c1 reply under
+  DFlash2 takes ~1.5 s and its acceptance follows the sampled text, so a
+  three-pass c1 median resolves only >30 % effects in spec mode; c8/c16
+  (pass spread <= 3 %) decide spec arms, c1 is reported, not decided on.
+- The raw-cache prefill numbers reproduce every earlier raw arm (cold 32K
+  11.1-11.7 s, cold 128K 122-125 s on p5-ttft-ref / p5-car64 /
+  p5-nccl-simple); the compact cache is what cut them to 4.7 s / 19.6 s.
+- Decision: the record keeps the compact cache, the 64 MiB AR buffer and
+  DFlash2 k=3 probabilistic/block (`speculative_overrides`); the record
+  arm's PROVISIONAL is cleared.
+- Raw: `perf/results/2026-09-12/p5-spec-raw-car64-pass{1,2,3}/`,
+  `~/.local/scratch/slimserve-glm53/serve-logs/{ab,ttft}-p5-spec-raw-car64.out`.
