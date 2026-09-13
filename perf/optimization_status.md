@@ -26806,3 +26806,16 @@ reductions still went to NCCL.
   final.
 - Raw: `perf/results/2026-09-12/p5-record-spec-pass{1,2,3}/`, gates
   `p5-record-spec-gate{1,2}.json`, `serve-logs/ttft-p5-record-spec.out`.
+
+- Correctness of the hash-granular hits (prefix_verify.py: cold request,
+  then the identical prompt warm, top-8 logprobs of the first generated
+  token at the recommended sampling settings): no-spec warm 4096 (3,264
+  hits) max |delta| 0.30, warm 32768 (32,640 hits) 1.19; spec warm 4096
+  (2,304 hits) 1.10, warm 32768 (31,104 hits) 0.94. The same probe with
+  NO hits (the pre-fix-2 spec boot, both requests re-prefilled) gave 1.20
+  / 0.56, so the deltas are the stack's run-to-run noise on far-tail
+  tokens (logprobs -10 to -13, probabilities ~1e-5), not a cache effect:
+  the top-1 token agrees at every length with its logprob within 0.07
+  (4096) and 1e-4 (32768). The second gate of every later arm runs warm
+  (its prompts hit) and is the standing quality check for the reused
+  states. Raw: `serve-logs/probe-boot-p5-{compactfix-verify,fix2-verify-spec,fix2-verify-nospec}.out`.
