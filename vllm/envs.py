@@ -174,6 +174,8 @@ if TYPE_CHECKING:
     VLLM_DP_PREFIX_AFFINITY: bool = True
     VLLM_DP_PREFIX_AFFINITY_LOAD_TOKENS: int = 2048
     VLLM_DP_PREFIX_AFFINITY_BLOCKS: int = 262144
+    VLLM_DP_PREFIX_AFFINITY_RECENT_WINDOW: int = 64
+    VLLM_DP_PREFIX_AFFINITY_RECENT_PERMILLE: int = 100
     VLLM_USE_STANDALONE_COMPILE: bool = True
     VLLM_ENABLE_PREGRAD_PASSES: bool = True
     VLLM_USE_BREAKABLE_CUDAGRAPH: bool = False
@@ -1416,6 +1418,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_DP_PREFIX_AFFINITY_BLOCKS": lambda: int(
         os.getenv("VLLM_DP_PREFIX_AFFINITY_BLOCKS", "262144")
+    ),
+    # Live-context footprint term of the prefix-affinity router: prompt
+    # tokens routed to each replica over the last WINDOW requests, charged
+    # at PERMILLE/1000 tokens per token (0 disables the term).
+    "VLLM_DP_PREFIX_AFFINITY_RECENT_WINDOW": lambda: int(
+        os.getenv("VLLM_DP_PREFIX_AFFINITY_RECENT_WINDOW", "64")
+    ),
+    "VLLM_DP_PREFIX_AFFINITY_RECENT_PERMILLE": lambda: int(
+        os.getenv("VLLM_DP_PREFIX_AFFINITY_RECENT_PERMILLE", "100")
     ),
     # Rank of the process in the data parallel setting
     "VLLM_DP_RANK": lambda: int(os.getenv("VLLM_DP_RANK", "0")),

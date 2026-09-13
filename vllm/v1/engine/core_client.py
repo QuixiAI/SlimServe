@@ -1470,6 +1470,8 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                 vllm_config.cache_config.block_size,
                 capacity_blocks=envs.VLLM_DP_PREFIX_AFFINITY_BLOCKS,
                 load_tokens=envs.VLLM_DP_PREFIX_AFFINITY_LOAD_TOKENS,
+                recent_window=envs.VLLM_DP_PREFIX_AFFINITY_RECENT_WINDOW,
+                recent_permille=envs.VLLM_DP_PREFIX_AFFINITY_RECENT_PERMILLE,
             )
 
     def get_core_engine_for_request(self, request: EngineCoreRequest) -> EngineIdentity:
