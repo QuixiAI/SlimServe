@@ -26157,3 +26157,25 @@ Phases, by value over risk:
   a mainloop that beats its packed-nibble smem traffic (0.038 B/MAC) at
   higher occupancy, i.e. a CUTLASS-grade multistage pipeline, not a
   shared-dequant tile.
+- PREFILL CHUNK SIZE, DECIDED BY THE LEG (2026-09-13, WildChat deep-context
+  c8, 1.25 h, all with the router fix, max_num_seqs 128; raw
+  perf/results/2026-09-13/glm53f-leg-{2048-router,chunk4096,8192-router}/):
+  | chunk | pool | turns | recall | >=262K ttft50 / e2e50 | offload / restore |
+  | 2048 | 2.82M | 811 | 128/128 | 11.4 s / 50.2 s | 59.8K / 14.1K |
+  | 4096 | 2.79M | 702 | 111/111 | 15.0 s / 68.3 s | 123.0K / 3.3K |
+  | 8192 | 2.56M | 704 | 112/112 | 15.5 s / 65.3 s | 115.8K / 9.6K |
+  (the first 8192 leg, 671 turns with one recall miss, was the unbalanced
+  5/3 routing split - see the router fix.) Random-bench gains of the big
+  chunks (sustained c64 +5%, exact c64 +11%) are real but the production
+  shape loses 13% of its turns above 2048, with the same pool at 4096, so
+  the record goes back to 2048 (explicit). The tier counters are the lead
+  for a fix: above 2048 the host tier restores 4x FEWER blocks and offloads
+  2x MORE, i.e. returning sessions re-prefill history the tier holds. Not
+  a lookup problem (misses 30 vs 207). Top open item: find why restores
+  drop with larger chunks (the aligned-boundary tail-state save with
+  several block boundaries crossed per step is the first suspect), then
+  re-measure 4096 on the leg.
+- DP PREFIX AFFINITY, balance fix VERIFIED on the legs (2026-09-13): 8192
+  leg engines 3.63/3.65 avg running (was 2.71/4.63), restores 9.6K (was
+  20.1K), recall 112/112 (was 105/106), turns 704 (was 671); 2048 leg
+  3.46/3.50, migrated=0 in both. Commit d6af7171b.

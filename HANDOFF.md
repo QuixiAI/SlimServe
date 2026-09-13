@@ -4107,3 +4107,48 @@ TP4 = 36 MLA + 18 indexer + 4 KDA state pages; 106 at TP8 = 68 + 34 + 4.
 - Remaining levers after this program: prefill MoE/mHC/NCCL shares (see the
   with-kernel profile in the notebook), the KDA deferred commit (~2%), the
   W8A16 dense path (parity, gated off), per-replica dynamic draft length.
+
+## 2026-09-13 11:40: batch cap 128, balanced DP routing, chunk-size verdict, prefill GEMM parked
+
+- RECORD glm53f-nvfp4-8: max_num_seqs 128 / capture 384, prefix-affinity
+  router balanced by live-context footprint (single-home credit),
+  max_num_batched_tokens 2048 explicit. Sustained c64 1538 / c128 1921 /
+  c256 2414 (program start 1150 / 1425 / -); exact c1 136 / c8 572 / c16
+  898 / c32 1199 / c64 1531; leg 811 turns / 0 errors / 128/128 recall.
+  Baseline section "2026-09-13: ... record" in perf/baseline_status.md.
+- ROUTER (vllm/v1/engine/dp_prefix_affinity.py, d6af7171b): sticky
+  affinity had frozen a chance 5/3 session split for a whole leg (restores
+  2x on one replica, 845 -> 671 turns, one recall miss). New terms:
+  prompt tokens routed per replica over the last 64 requests x 0.1
+  (VLLM_DP_PREFIX_AFFINITY_RECENT_WINDOW / _RECENT_PERMILLE) and only the
+  longest recorded match is credited. Check on any leg: "Engine 000/001
+  ... Running:" averages in the server log should be within ~0.2.
+- CHUNK SIZE: 4096/8192-token chunks win the random benches (+5%
+  sustained, +11% exact c64) but lose the deep-context leg by 13% of
+  turns with the SAME pool and router; the host tier restores 4x fewer
+  blocks and offloads 2x more above 2048 (misses are not the cause: 30 vs
+  207). TOP OPEN ITEM: find why restores drop with larger chunks (suspect
+  the aligned-boundary tail-state save when a prefill step crosses several
+  block boundaries), then re-run the 4096 leg; if it matches 2048, take
+  4096 (all numbers in the profile note). 4096 is the validated override
+  for short-context high-throughput serving today.
+- PREFILL MoE GEMM (csrc/quixicore/serving/nvfp4_moe_prefill_ampere.cuh,
+  op nvfp4_moe_gemm, hook in fused_marlin_moe behind
+  VLLM_QC_NVFP4_PREFILL_MOE_MIN_ROWS, default 0 = off): reads the Marlin
+  layout in place, shared dequant per tile, four warp/stage configs,
+  parity 14/14. Isolated: w13 -10% vs Marlin, w2 +13..25%; serving A/B at
+  4096 chunks: no gain. PARKED. The notebook has the iteration table and
+  the smem-traffic analysis; Marlin at large M is 8-warp latency-bound
+  with 0.038 B/MAC of smem traffic - beating it needs a multistage
+  CUTLASS-grade mainloop, not a shared-dequant tile.
+- DRAFT LENGTH: per-replica schedules work under DP (guard relaxed, k=0
+  ranges rejected) but every k>=3 arm lost to fixed k=2 at c64-c256;
+  KDA deferred commit stays parked (a loss at k=2, kernels tested).
+- INCIDENTS to not repeat: (1) a new code path defaulting ON before its
+  .so was installed killed an arm's boot; (2) a unit test on GPU 7 while a
+  server booted (memory profiling) killed that boot with a cuBLAS internal
+  error - nothing touches the GPUs while a server boots; (3) `ps | grep |
+  kill` and `pkill -f` on a script name killed my own shell twice - use
+  `pgrep -f "^bash script.sh"` or safekill.
+- Installed vllm/_quixicore_C*.so = build with the parked prefill GEMM
+  (all other ops unchanged).

@@ -2622,3 +2622,35 @@ negative-allocation fix 9c24bc5ad): 557 turns, 0 errors, 88/88 recall,
 max context 476,986, 432 tier hits (perf/results/2026-09-11/
 glm53f-leg-dp2/). Owed (running): the 1M-context leg.
 Raw: perf/results/2026-09-11/glm53f-final-dp2/.
+
+## 2026-09-13: glm53f-nvfp4-8 record - max_num_seqs 128, balanced DP routing, chunk 2048 (A100)
+
+Record = fp8 main KV + mHC warp-split + fixed k=2 + sparse MLA prefill
+kernel (as 2026-09-13 00:10) plus: max_num_seqs 128 per replica with a
+384-token capture (25cbf649c), the DP prefix-affinity router balanced by
+live-context footprint with single-home credit (d6af7171b), and
+max_num_batched_tokens 2048 made explicit after the chunk-size arms.
+Pool 2,846,622 tokens per replica. Through `slimserve --serve`,
+exact-token 1000 in / 300 out, three warmed repeats, medians:
+
+| record | c1 | c8 | c16 | c32 | c64 |
+|---|---|---|---|---|---|
+| glm53f-nvfp4-8 (09-13 final) | 136.4 | 572.3 | 897.7 | 1198.9 | 1530.5 |
+| glm53f-nvfp4-8 (09-13 00:10, sparse prefill) | 128.0 | 567.1 | 875.6 | 1110.0 | 1413.8 |
+| glm53f-nvfp4-8 (09-11, TP4xDP2 flip) | 117.8 | 506.8 | 786.5 | 985.8 | 1158.0 |
+
+Sustained load (`vllm bench serve` random 1000/300 +-20%, 10x concurrency
+prompts, ignore_eos; output tok/s, mean TPOT): c64 1538 (37.7 ms), c128
+1921 (59.6 ms), c256 2414 (95.2 ms). Program start (09-12): c64 1140-1157,
+c128 1425, c256 not servable (64-per-replica cap).
+Gates: text/reasoning/image/tool canaries PASS; WildChat deep-context leg
+at this config (2048 chunks, router fix, max_num_seqs 128): 811 turns /
+0 errors / 128/128 recall / 690K max context, engines balanced at
+3.46/3.50 running, tier restores 14.1K / offloads 59.8K
+(perf/results/2026-09-13/glm53f-leg-2048-router/).
+Measured and NOT taken: chunks 4096/8192 (random bench +5%/+11% but the
+leg loses 13% of its turns above 2048 - tier restores drop 4x; open
+item), max_num_seqs 256 (c256 equal, c512 collapses), per-replica draft
+schedules and fixed k=3 (all below k=2), the QuixiCore NVFP4 prefill MoE
+GEMM (parity, no serving gain; parked off), KDA deferred commit (a loss at
+k=2). Raw: perf/results/2026-09-13/glm53f-record-final/.
