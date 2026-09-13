@@ -25962,3 +25962,162 @@ Decision: FP8 KDA retained without reservation. Raw:
   at k = 0.
 - Raw: `perf/results/2026-09-12/p2-topksample-pass{1,2,3}/`, microbench
   `~/.local/scratch/slimserve-glm53/bench_topk_sample.py`.
+
+### Phase 3, arm 2: DFlash2 k=3 with probabilistic draft sampling - RETAINED
+
+- Hypothesis: the V2 rejection test with a greedy draft accepts with
+  probability p_target(draft argmax), which at temperature 1.0 is bounded by
+  how peaked the target is; with `draft_sample_method: probabilistic` the
+  draft samples from its own distribution and the test uses the ratio
+  p_target / q_draft, whose expected acceptance is sum_x min(p, q): for a
+  calibrated draft that approaches 1 - TV(p, q) and is far above p(argmax)
+  on flat distributions. DFlash2 caches its K candidate logits per step for
+  this (`_cache_draft_logits_kernel`), so the arm is one engine field.
+- Result (p3-dflash2-k3-prob, on top of item 10, `--spec`): c1 211.3 /
+  245.5 / 182.8, c8 524.5 / 549.2 / 536.2, c16 750.2 / 729.3 / 741.6;
+  medians 211.3 / 536.2 / 741.6 = +31.5 / +1.6 / +6.0 % over no-spec
+  (p2-topksample 160.7 / 527.6 / 699.9) and +17.1 / +15.4 / +16.7 % over
+  the greedy-draft k=3 arm. Accepted per draft call: c1 1.31 / 1.74 / 0.96,
+  c8 1.14 / 1.32 / 1.18 (greedy 0.83 / 0.79 / 0.80), c16 1.46 / 1.35 / 1.41
+  (greedy 0.97 / 0.95 / 0.92); the c1 spread follows the prompt content
+  (each pass draws different prompts). `exact: true` on all nine runs,
+  canaries pass.
+- Decision: retained as the record's speculator setting (k=3,
+  probabilistic draft); every concurrency is at or above no-spec, so no
+  per-batch schedule is needed on the prose harness. The structured Foundry
+  8-wide workload is measured separately below before the record is
+  written. Block verification is the next arm.
+- Raw: `perf/results/2026-09-12/p3-dflash2-k3-prob-pass{1,2,3}/`, log
+  `~/.local/scratch/slimserve-glm53/serve-logs/ab-p3-dflash2-k3-prob.out`.
+
+### Phase 3, arm 3: DFlash2 k=3 with block verification, greedy draft - NEUTRAL
+
+- Hypothesis: `rejection_sample_method: block` (Sun et al.) verifies the
+  draft block jointly and should accept more of the same drafts than the
+  token-by-token test.
+- Result (p3-dflash2-k3-block): c1 179.2 / 152.7 / 203.7, c8 462.5 / 448.2
+  / 448.3, c16 643.7 / 620.8 / 632.5; medians 179.2 / 448.3 / 632.5 against
+  the standard greedy-draft arm 180.5 / 464.7 / 635.4. Accepted per draft
+  call c1 0.92 / 0.61 / 1.21, c8 0.80 / 0.79 / 0.67, c16 1.09 / 0.95 /
+  0.91: the same band as the standard test.
+- Reading: with a greedy draft the proposal distribution is one-hot, so the
+  joint test has nothing beyond the token-by-token test to exploit; block
+  verification can only pay together with probabilistic drafts (arm 4).
+- Raw: `perf/results/2026-09-12/p3-dflash2-k3-block-pass{1,2,3}/`.
+
+### Phase 3, arm 4: DFlash2 k=3, probabilistic draft + block verification - RETAINED (record setting)
+
+- Result (p3-dflash2-k3-probblock): c1 212.5 / 239.0 / 289.6, c8 552.1 /
+  532.0 / 531.2, c16 747.8 / 725.1 / 729.2; medians 239.0 / 532.0 / 729.2
+  against arm 2 (probabilistic, standard test) 211.3 / 536.2 / 741.6.
+  Accepted per draft call c1 1.31 / 1.64 / 2.34, c8 1.33 / 1.12 / 1.18, c16
+  1.39 / 1.29 / 1.33 (arm 2: 1.31 / 1.74 / 0.96, 1.14 / 1.32 / 1.18, 1.46 /
+  1.35 / 1.41). `exact: true` on all nine runs, canaries pass.
+- Reading: with probabilistic drafts, block verification is neutral on this
+  harness: c8 / c16 within the 1-2 % pass spread, and the c1 median moves on
+  one pass whose sampled continuation happened to draft well (211 accepted
+  over 90 calls). Block verification never accepts fewer tokens in
+  expectation than the token-by-token test for the same draft distribution
+  and costs nothing per step, so the record takes it.
+- Decision: the record's speculator is DFlash2 k=3 with
+  `draft_sample_method: probabilistic` and `rejection_sample_method: block`
+  (`spec-winner.json` in the scratch dir drives the Foundry check). Against
+  the Phase 0 baseline (113.3 / 449.2 / 611.0 no-spec, DFlash2 k=7 greedy
+  153.6 / 330.9 / 340.3) the tree now stands at 239.0 / 532.0 / 729.2 with
+  speculation and 160.7 / 527.6 / 699.9 without. The control's MTP-3 row
+  (260.8 / 732.1 / 1005.8) still leads at c8 / c16, where the prefill share
+  of the 1000/300 wall (about a quarter) is the next campaign phase.
+- Not pursued: the checkpoint MTP head. The V1-only adapter measured +6.5 %
+  c1 on A100 and lost prose at temperature 1.0 (campaign doc section 1); a
+  V2 port would need the per-group indexer/MLA block tables of
+  `Glm5NextMTPProposer` inside the generic MTP speculator, and DFlash2 with
+  probabilistic drafts already clears the "c8 >= no-spec" bar.
+- Raw: `perf/results/2026-09-12/p3-dflash2-k3-probblock-pass{1,2,3}/`.
+
+## 2026-09-12: rtx6000 Phase 5 (prefill), item by item
+
+Same box, harness and profile; the arms boot with a temporary edit of the
+rtx6000 record's `additional_config` (restored by `git checkout` after each
+arm), `TTFT=1` adds `ttft_cold.py` (cold and warm 32K / 128K on distinct
+slices of the prompt source) after the benches and gates. Reference on the
+Phase 3 tree, no speculation (p5-ttft-ref): cold TTFT 32K 11.59 s, 128K
+123.8 s; warm 0.175 s / 1.17 s. Decode reference p2-topksample 160.7 /
+527.6 / 699.9.
+
+### Item P1: compact GLM indexer cache (`glm5_next_compact_indexer_cache`) on sm_120 - PROVISIONAL (prefix-cache probe pending)
+
+- Hypothesis: the general indexer prefill scoring (`_pooled_logits_kernel`)
+  recomputes every pool key (gate softmax over 4 members, per channel) for
+  every query row: O(L^2) SIMT work, 57 % of a cold 32K prefill and the
+  reason 128K took 124 s. The compact page format (A100 candidate of
+  2026-09-09: 64 bf16 elements per token, completed pool keys plus an 8-row
+  raw ring) scores rows against precomputed keys with one `tl.dot` per
+  16-pool tile (`cached_pool_logits`), at prefill and at decode, and holds
+  a third of the row bytes. The gate at `glm5_next_indexer.py`
+  (`_cache_row_dim`) accepted SM80 only; widened to SM80 and SM120
+  (`_compact_cache_qualified`) after the 116 pool-cache CUDA tests passed on
+  GPU 0.
+- Result (p5-compact, no-spec): c1 160.8 / 164.3 / 164.2, c8 539.5 / 538.2
+  / 538.3, c16 718.9 / 715.6 / 720.2; medians 164.2 / 538.3 / 718.9 = +2.2 /
+  +2.0 / +2.7 % over p2-topksample. Cold TTFT 32K 5.31 s (-54 %), 128K
+  22.0 s (-82 %); prefill now scales close to linearly (4.1x tokens, 4.1x
+  time). KV capacity 2,817,628 tokens against 2,118,065 (+33 %). Gates
+  -2.418 / -2.428 (band mean -2.458, per-run sd 0.016, boots differ up to
+  0.04: at the edge, on the better side; the row-shard arm, a second
+  compact-cache boot, gated -2.472 / -2.482, so the two compact boots
+  straddle the band and the format carries no systematic shift). Canaries
+  pass, `exact: true` on all nine runs.
+- Open: the warm 32K repeat took 5.26 s (a full re-prefill; the reference
+  run's repeat took 0.175 s and its engine log shows the hit) while the
+  warm 128K repeat hit (0.377 s). Prefix caching is a standing requirement
+  (agentic traffic), so the item stays provisional until `prefix_probe.py`
+  (512 / 4096 / 32768 tokens, cold then repeat, engine
+  `prefix_cache_queries/hits` deltas) explains which lengths miss under the
+  compact pages and the cause is fixed.
+- Raw: `perf/results/2026-09-12/p5-compact-pass{1,2,3}/`, gates
+  `p5-compact-gate{1,2}.json`, `~/.local/scratch/slimserve-glm53/serve-logs/
+  ttft-p5-{ttft-ref,compact}.out`.
+
+### Item P2: TP row-sharded indexer decode scoring (`glm5_next_indexer_row_shard`) - REJECTED
+
+- Hypothesis: at c16 the pooled indexer costs 0.37 ms per step (22
+  launches at 17 us); sharding the 16 decode rows over the four ranks (4
+  rows each, `pynccl.all_gather` of the selections) should cut the scoring
+  four-fold. Gate widened alongside the compact cache (same
+  `_compact_cache_qualified`).
+- Result (p5-rowshard, compact cache + row shard, no-spec): c1 161.1 /
+  164.4 / 164.0, c8 540.3 / 537.4 / 537.5, c16 711.9 / 712.6 / 713.8;
+  medians 164.0 / 537.5 / 712.6 against the compact-only arm 164.2 / 538.3 /
+  718.9: c1 / c8 flat, c16 -0.9 %. Gates -2.472 / -2.482, canaries pass.
+- Reading: the per-layer all-gather over PCIe (11 sparse layers) costs at
+  least what the three-quarter scoring cut saves at these row counts; on
+  the A100 TP8 candidate the ratio was different (8 ranks, NVLink).
+- Decision: rejected on rtx6000; the flag stays off in the record, the
+  gate widening stays (harmless, and the prefill variant below reuses the
+  branch).
+- Raw: `perf/results/2026-09-12/p5-rowshard-pass{1,2,3}/`, gates
+  `p5-rowshard-gate{1,2}.json`.
+
+### Item P3: custom all-reduce buffer 64 MiB (`VLLM_CUSTOM_AR_MAX_SIZE_MB=64`) - RETAINED
+
+- Hypothesis: the custom all-reduce's IPC buffer is 8 MiB, so a prefill
+  chunk's [8192, 4096] bf16 reduction (64 MiB) fell back to NCCL's PCIe
+  ring (547 launches at 2.97 ms, 22.6 GB/s algbw, 14 % of the cold 32K
+  prefill), and the c8 / c16 1000-token prefills reduce at 8-16 MiB, just
+  above the cap. Salvaged knob from the Codex tree
+  (`custom_ar_max_size.diff`: `VLLM_CUSTOM_AR_MAX_SIZE_MB`, default 8, so
+  no behavior change unless set); Codex measured c8 +3 %.
+- Result (p5-car64, raw indexer cache, no-spec): c1 157.9 / 161.0 / 160.9,
+  c8 544.6 / 543.5 / 543.2, c16 711.0 / 712.3 / 712.3; medians 160.9 /
+  543.5 / 712.3 = +0.1 / +3.0 / +1.8 % over p2-topksample. Cold TTFT 32K
+  11.14 s (-3.9 % against 11.59), 128K 121.9 s (-1.5 %); warm 0.177 s /
+  1.19 s (prefix hits intact). Gates -2.473 / -2.449, canaries pass,
+  `exact: true` on all nine runs.
+- Reading: the two-shot custom kernel runs a 64 MiB reduction about 28 %
+  faster than NCCL's ring over these PCIe pairs (1.62 s -> ~1.17 s of the
+  32K prefill); the c8 / c16 gain is the 1000-token prefills' reductions.
+  Buffers cost 2 x 64 MiB per rank.
+- Decision: retained; the record's env gets `VLLM_CUSTOM_AR_MAX_SIZE_MB=64`
+  next to `VLLM_CUSTOM_AR_ALLOW_PCIE=1`.
+- Raw: `perf/results/2026-09-12/p5-car64-pass{1,2,3}/`, gates
+  `p5-car64-gate{1,2}.json`, `serve-logs/ttft-p5-car64.out`.
