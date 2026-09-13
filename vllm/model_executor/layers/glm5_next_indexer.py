@@ -66,6 +66,16 @@ _ROW_DIM = 2 * _K_DIM  # [k | gate]
 _POOL_PROGRAMS = 128  # programs per row on the pool axis (stride loop inside)
 
 
+def _compact_cache_qualified() -> bool:
+    # Parts where the compact page format has passed its parity and serving
+    # gates: A100 (2026-09-09) and RTX PRO 6000 Blackwell (2026-09-12,
+    # perf/optimization_status.md Phase 5).
+    return current_platform.is_cuda() and (
+        current_platform.is_device_capability((8, 0))
+        or current_platform.is_device_capability((12, 0))
+    )
+
+
 def _compact_decode_options(vllm_config, heads):
     extra = vllm_config.additional_config or {}
     flags = []
@@ -90,8 +100,7 @@ def _row_shard_option(vllm_config, heads):
         return False
     parallel = vllm_config.parallel_config
     if (
-        not current_platform.is_cuda()
-        or not current_platform.is_device_capability((8, 0))
+        not _compact_cache_qualified()
         or heads != 32
         or parallel.tensor_parallel_size not in (4, 8)
         or parallel.pipeline_parallel_size != 1
@@ -100,8 +109,8 @@ def _row_shard_option(vllm_config, heads):
         # Rows are sharded over the replica's own TP group, so DP replicas
         # are independent; TP4 shards 16/32 rows as 4/8 per rank.
         raise ValueError(
-            "Indexer row sharding requires SM80, TP4 or TP8 with PP1, "
-            "32 indexer heads and the compact cache"
+            "Indexer row sharding requires SM80 or SM120, TP4 or TP8 with "
+            "PP1, 32 indexer heads and the compact cache"
         )
     return True
 
@@ -122,8 +131,8 @@ def _cache_row_dim(vllm_config: VllmConfig, kp: int) -> int:
         raise ValueError("glm5_next_compact_indexer_cache must be a boolean")
     if not enabled:
         return _ROW_DIM
-    if not (current_platform.is_cuda() and current_platform.is_device_capability((8, 0))):
-        raise ValueError("Compact GLM indexer cache is currently qualified only on SM80")
+    if not _compact_cache_qualified():
+        raise ValueError("Compact GLM indexer cache is qualified on SM80 and SM120 only")
     num_spec = (vllm_config.speculative_config.num_speculative_tokens
                 if vllm_config.speculative_config else 0)
     if kp != 4 or num_spec > 5:

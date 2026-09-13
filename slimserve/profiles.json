@@ -2945,10 +2945,14 @@
             "enable_prefix_caching": true,
             "override_generation_config": {
               "thinking_token_budget": 2000
+            },
+            "additional_config": {
+              "glm5_next_compact_indexer_cache": true
             }
           },
           "env": {
-            "VLLM_CUSTOM_AR_ALLOW_PCIE": "1"
+            "VLLM_CUSTOM_AR_ALLOW_PCIE": "1",
+            "VLLM_CUSTOM_AR_MAX_SIZE_MB": "64"
           },
           "notes": [
             "BRING-UP RECORD (2026-09-11): the a100 kernel set built for family cubin 12.0f, on 4x RTX PRO 6000 Blackwell Workstation (sm_120, 96 GB GDDR7, PCIe 5 x16, no NVLink; the four cards pair under two host bridges, GPU0-1 and GPU2-3, with the cross-pair path through the root complex). Every value below is inherited from the a100 record until perf/optimization_status.md records an sm_120 measurement for it; the campaign that replaces them is docs/glm53f-rtx6000-campaign.md.",
@@ -2961,7 +2965,12 @@
             "Speculation: --spec opts in to the source's DFlash2 drafter (cc-by-nc-nd-4.0, fine for self-hosted and internal use); the record ships non-speculative until the campaign measures DFlash2 against the checkpoint's own MTP head on the prose and structured workloads.",
             "Thinking budget: override_generation_config.thinking_token_budget 2000 per request, the fleet convention; thinking, tool calling and prefix caching are the registry serving defaults.",
             "VLLM_CUSTOM_AR_ALLOW_PCIE=1: vLLM's custom all-reduce is switched off by default when more than two ranks lack NVLink; over the PCIe 5 peer path here it replaces NCCL's ring for the small per-layer reductions (one-shot under 512 KB, two-shot under the 8 MiB cap, NCCL above). Measured 2026-09-11, no speculation, three-pass medians: c1 122.9 / c8 468.2 / c16 640.9 tok/s against 113.3 / 449.2 / 611.0 without it (+8.5 / +4.2 / +4.9 %), exact-token bench, quality gate in band. Prefill chunks reduce above the cap and stay on NCCL; VLLM_CUSTOM_AR_PCIE_MAX_BYTES is the prefill campaign's knob."
-          ]
+          ],
+          "speculative_overrides": {
+            "num_speculative_tokens": 3,
+            "draft_sample_method": "probabilistic",
+            "rejection_sample_method": "block"
+          }
         }
       }
     },

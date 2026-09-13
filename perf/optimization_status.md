@@ -26121,3 +26121,142 @@ Phase 3 tree, no speculation (p5-ttft-ref): cold TTFT 32K 11.59 s, 128K
   next to `VLLM_CUSTOM_AR_ALLOW_PCIE=1`.
 - Raw: `perf/results/2026-09-12/p5-car64-pass{1,2,3}/`, gates
   `p5-car64-gate{1,2}.json`, `serve-logs/ttft-p5-car64.out`.
+
+### Item P4: `NCCL_PROTO=Simple` for the prefill reductions - REJECTED
+
+- Hypothesis: the 64 MiB prefill reductions ran NCCL's LL protocol (the
+  trace's `ring LL` kernels); Simple is the large-message protocol.
+- Result (p5-nccl-simple, raw cache, default 8 MiB custom-AR buffer, TTFT
+  only): cold 32K 11.72 s, 128K 124.9 s against 11.59 s / 123.8 s: within
+  noise, slightly worse. With item P3 those reductions no longer reach NCCL.
+- Raw: `~/.local/scratch/slimserve-glm53/serve-logs/ttft-p5-nccl-simple.out`.
+
+### Item P5: TP row-sharded indexer prefill scoring (`glm5_next_indexer_row_shard_prefill`) - REJECTED
+
+- Hypothesis: with the compact cache the prefill scoring
+  (`_cached_pool_logits`, 189 ms of the cold 32K window at 2.15 ms per
+  launch) is the last indexer cost; sharding each prefill chunk's rows
+  over the TP group and all-gathering the selected indices would cut it
+  4x if the all-gather is cheap at prefill widths (it was not at decode,
+  item P2).
+- Result (p5-rowshard-prefill: compact cache + decode shard + prefill
+  shard, no-spec): c1 160.6 / 164.2 / 164.1, c8 539.4 / 539.7 / 537.2,
+  c16 712.7 / 711.8 / 709.6; medians 164.1 / 539.4 / 711.8 against the
+  compact arm's 164.2 / 538.3 / 718.9 (the decode shard's c16 cost
+  again). Cold TTFT 32K 5.258 s against 5.31 s (-1 %, inside the
+  boot-to-boot spread), 128K 21.75 s against 22.0 s (-1 %). Warm 128K
+  0.389 s, warm 32K still a re-prefill (item P1's open point, resolved
+  below). Gates -2.419 / -2.448, canaries pass, `exact: true` on all
+  nine runs.
+- Reading: after the compact cache the prefill scoring is 3.6 % of the
+  cold 32K window; sharding cannot buy more than that and the per-chunk
+  all-gather ate most of it.
+- Decision: rejected; the prefill shard is removed from the tree (the
+  decode shard stays, gated off). The SM120 qualification of the compact
+  cache (`_compact_cache_qualified`) is kept.
+- Raw: `perf/results/2026-09-12/p5-rowshard-prefill-pass{1,2,3}/`, gates
+  `p5-rowshard-prefill-gate{1,2}.json`,
+  `~/.local/scratch/slimserve-glm53/serve-logs/ttft-p5-rowshard-prefill.out`.
+
+### Phase 5 attribution 2: cold 32K prefill with the compact cache (p5-compact-32k)
+
+Same method as the Phase 5 opener (`prof_prefill_long.sh`, TOKENS=32768,
+`prefill_attrib.py` over the rank-0 trace): window 5196.8 ms span,
+5137.5 ms kernel busy, 15,186 launches. This boot predates the record's
+`VLLM_CUSTOM_AR_MAX_SIZE_MB=64` (applied 18:09), so the 8192-token chunk
+reductions still went to NCCL.
+
+| class | ms | share | launches | us/launch |
+| --- | --- | --- | --- | --- |
+| nccl allreduce (`AllReduce_Sum_bf16_RING_LL`) | 1578.0 | 30.7 % | 455 | 3468 |
+| fp8 gemm class, of which `mla_decode_fp8_v<true,false,512,512>` | 1457.1 / 1247.6 | 28.4 % / 24.0 % | 2292 / 55 | 636 / 22,684 |
+| mHC transition (`dsv4_mhc::partials<24>` 855.9) | 937.8 | 18.3 % | 1626 | 577 |
+| marlin moe | 543.2 | 10.6 % | 504 | 1078 |
+| other | 220.1 | 4.3 % | 1700 | 129 |
+| KDA chunked prefill (FLA) | 104.6 | 2.0 % | 1632 | 64 |
+| indexer scoring (`_cached_pool_logits`) | 189.2 | 3.6 % | 88 | 2150 |
+
+- Reading: the indexer scoring fell from 57 % (raw format, O(L^2) pool
+  recompute) to 3.6 %. What is left, in order: the prefill reductions
+  (item P3's custom kernel takes them now; the residual is the PCIe
+  collective itself), the sparse-MLA prefill that runs through the decode
+  kernel (`mla_decode_fp8_v`, 55 launches at 22.7 ms = 24 % of the
+  window: a prefill-shaped kernel that shares K/V tiles across many query
+  rows is the obvious replacement), and the mHC partials (16.5 %).
+- Raw: `~/.local/scratch/slimserve-glm53/profile-prefill-p5-compact-32k/`
+  (four rank traces), `serve-logs/prof-prefill-p5-compact-32k.out`.
+
+### Phase 3, Foundry structured c8 workload: no-spec against the record speculator
+
+- Method: `workload_bench_c8.py --prompts foundry-fanout-prompts.json
+  --chat --temperature 1.0 --top-p 0.95 --concurrency 8 --repeats 2`
+  (eight concurrent agentic prompts with tool schemas and thinking on),
+  aggregate output tok/s and wall time per repeat, same boot as the
+  respective arm.
+- Result: no-spec 387.4 / 421.7 tok/s (73.1 s / 56.9 s wall, 2360-4096
+  output tokens per prompt); DFlash2 k=3 probabilistic + block 399.4 /
+  468.6 tok/s (58.8 s / 49.8 s), accepted tokens per step 1.59 / 1.57.
+- Reading: +3 / +11 % aggregate and -20 / -12 % wall on structured
+  output, where the c8 exact bench (1000/300, random-ish prose) had the
+  speculator at parity (532 against 538). Acceptance on this workload
+  (1.59 per step) is above the exact bench's; the record setting stands.
+- Raw: `~/.local/scratch/slimserve-glm53/serve-logs/workload-p3-foundry-{nospec,spec}.{out,json}`.
+
+### Item P1, follow-up: the compact cache's prefix-cache misses - FIXED (two coordinator defects)
+
+- Diagnosis (CPU reproduction, `tests/v1/core/test_hybrid_partial_hit_alignment.py`,
+  built from the engine's block geometry: the KDA page of 1,085,440 B
+  raises the attention block to 1088 tokens, and the compact indexer's
+  128 B/token page is unified by scaling its block to 8704 tokens; with
+  DFlash2 the page is 1,122,304 B, the blocks 1152 / 9216, plus the
+  drafter's 1152-token sliding-window group):
+  1. `HybridKVCacheCoordinator` demanded hits aligned to the LCM of the
+     group block sizes (8704 / 9216) because its hash-granular "partial
+     hit" mode only switched on when the *Mamba* block exceeded the hash
+     block. Align-mode KDA states exist only at chunk ends, which the
+     scheduler steers onto `cache_config.block_size` (1088) boundaries,
+     so a hit needed a state at a multiple of 8704 that no chunk ended
+     on. 128K hit by coincidence (130,560 = 120 x 1088 = 15 x 8704); 32K
+     (last cacheable position 32,640 = 30 x 1088) and 4K never did.
+     Fix: partial hits switch on whenever any prefix-cacheable group's
+     block is coarser than the hash block and every such manager
+     supports fine-grained lookup (full attention, Mamba). The 8704-token
+     indexer group then serves a hash-aligned partial tail with the
+     existing copy-on-write redirect.
+  2. Under the speculator (DFlash2 counts as EAGLE-like: one block backed
+     off, one hash unit dropped) the drafter's sliding-window manager
+     cached only the tails of `scheduler_block_size` segments (3 of
+     every 8 blocks) while hits were now searched at hash granularity, so
+     it could never confirm a hit and the fixed point collapsed to zero.
+     Fix: every manager caches at the coordinator's hit granularity
+     (`cache_hit_alignment_tokens`, the hash block when partial hits are
+     on). The A100 `glm53f-nvfp4-8` record (compact cache, TP8) had the
+     same geometry, so it was missing the same hits.
+- Tests: the reproduction covers raw / compact x no-spec / DFlash2 at
+  512 / 4096 / 32768 / 131072 tokens (17 cases, 0 hits before the fixes
+  for compact 4K/32K in both modes) plus the private copy-on-write tail;
+  `tests/v1/core` 212 pass.
+- Engine (p5-compactfix-prefix, no-spec, compact, record env): warm 4096
+  0.169 s with 3,264 hits (cold 0.579 s), warm 32768 0.176 s with 32,640
+  hits (cold 4.681 s); 512 cannot hit below one 1088-token block. Cold
+  32K 4.68 s against 5.31 s before the record's 64 MiB custom-AR buffer.
+  The spec-mode probe under fix 2 is queued (queue-g).
+- Raw: `~/.local/scratch/slimserve-glm53/serve-logs/probe-boot-p5-compactfix-{prefix,verify}.out`,
+  `queue-f.out`.
+
+### Record arm, spec (p5-record-spec): compact cache + DFlash2 k=3 probabilistic/block + custom AR 64 MiB - PROVISIONAL
+
+- Boot 18:17 (fix 1 in, fix 2 not yet): c1 195.5 / 213.7 / 215.1, c8
+  565.6 / 567.7 / 581.8, c16 784.2 / 783.4 / 771.2; medians 213.7 /
+  567.7 / 783.4. Against arm 4 (same speculator, raw cache, 8 MiB AR:
+  239.0 / 532.0 / 729.2) that is c1 -10.6 %, c8 +6.7 %, c16 +7.4 %.
+  Cold TTFT 32K 4.72 s, 128K 19.8 s; warm 128K 0.656 s, warm 32K still a
+  re-prefill (expected on this boot, see fix 2). Gates -2.462 / -2.473
+  (in band). Canaries pass, `exact: true` on all nine runs.
+- Open: the c1 loss is not explained by the no-spec arms (compact was
+  +2 % there); the isolating arm (spec + raw cache + 64 MiB AR,
+  p5-spec-raw-car64) is queued to split the compact cache from the AR
+  buffer under speculation before the record's `additional_config` is
+  final.
+- Raw: `perf/results/2026-09-12/p5-record-spec-pass{1,2,3}/`, gates
+  `p5-record-spec-gate{1,2}.json`, `serve-logs/ttft-p5-record-spec.out`.
