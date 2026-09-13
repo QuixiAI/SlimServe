@@ -83,6 +83,30 @@ def _sparse_tc_option(config, heads):
     return enabled
 
 
+_SPARSE_PREFILL: bool | None = None
+
+
+def _sparse_prefill_enabled() -> bool:
+    """Profile flag additional_config.glm5_next_sparse_prefill (default on),
+    env VLLM_QC_SPARSE_PREFILL=0/1 overrides for A/B runs."""
+    global _SPARSE_PREFILL
+    if _SPARSE_PREFILL is None:
+        import os
+
+        env = os.getenv("VLLM_QC_SPARSE_PREFILL")
+        if env is not None:
+            _SPARSE_PREFILL = env == "1"
+        else:
+            try:
+                from vllm.config import get_current_vllm_config
+
+                extra = get_current_vllm_config().additional_config or {}
+                _SPARSE_PREFILL = bool(extra.get("glm5_next_sparse_prefill", True))
+            except Exception:
+                _SPARSE_PREFILL = True
+    return _SPARSE_PREFILL
+
+
 def _sparse_tc_split(enabled, q, cache, metadata):
     # Shape/metadata decisions are CPU-only and stable under CUDA graph replay.
     # Prefill and unqualified shapes retain the native bounded-scratch path.
@@ -499,6 +523,20 @@ class QuixiCoreMLASparseImpl(MLAAttentionImpl[QuixiCoreMLASparseMetadata]):
             return out, None
 
         if q.shape[-1] == 512:
+            # Prefill chunks: groups of 4 consecutive queries attend on tensor
+            # cores over the union of their selected pools (2026-09-12: the
+            # per-token decode kernel was 39% of prefill time). Env-gated
+            # VLLM_QC_SPARSE_PREFILL until the serving gates pass.
+            if (
+                _sparse_prefill_enabled()
+                and attn_metadata.num_prefills > 0
+                and q.shape[1] == 16
+            ):
+                return quixicore_ops.mla_sparse_prefill_fp8(
+                    q, kv_c_and_k_pe_cache.view(torch.uint8), bt, idx, tlen,
+                    attn_metadata.block_size, self.softmax_scale, k_scale,
+                    _page_stride_bytes(kv_c_and_k_pe_cache),
+                ), None
             tc_split = _sparse_tc_split(
                 self._sparse_tc_decode, q, kv_c_and_k_pe_cache, attn_metadata
             )

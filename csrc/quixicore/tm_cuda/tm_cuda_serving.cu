@@ -1,6 +1,10 @@
 // tk_cuda serving/decode bindings: torch wrappers over the validated W4/W5
 // kernels (kernels/serving/*_kernels.cuh). Registered into the _C module by
 // init_serving(m), called from tm_cuda_ext.cu's PYBIND11_MODULE.
+#include "kda_decode_kernels.cuh"
+#include "skinny_gemm_ampere.cuh"
+#include "w8a16_gemm_ampere.cuh"
+#include "mla_sparse_prefill_kernels.cuh"
 #include "kv_cache_kernels.cuh"
 #include "paged_attn_v2_kernels.cuh"
 #include "rope_kv_kernels.cuh"
@@ -432,6 +436,71 @@ static void launch_dsv4_mhc_partials(
     }
 }
 
+// Decode batches (T > 1): tile TT tokens per block so fn is read once per
+// tile (see dsv4_mhc::partials_batched). Same per-token arithmetic order as
+// the per-token kernel, so the partials are bit-identical.
+template <int NOUT>
+static void launch_dsv4_mhc_partials_batched(
+        const __nv_bfloat16* x, const __nv_bfloat16* residual,
+        const float* post, const float* comb, torch::Tensor fn,
+        __nv_bfloat16* residual_out, float* partial, int hidden_size, int tokens) {
+    static const int tt_env = [] {
+        const char* v = std::getenv("QC_MHC_PARTIALS_TT");
+        return v ? std::atoi(v) : 4;
+    }();
+    if (tt_env == 8) {
+        // Experimental: 8-token tiles with the outputs split across the two
+        // block halves (partials_batched_split); same per-token arithmetic.
+        constexpr int TT8 = 8;
+        const dim3 grid8(dsv4_mhc::SPLITS, (tokens + TT8 - 1) / TT8);
+        if (fn.scalar_type() == torch::kHalf) {
+            dsv4_mhc::partials_batched_split<NOUT, TT8, half>
+                <<<grid8, dsv4_mhc::THREADS, 0, stream()>>>(
+                    x, residual, post, comb,
+                    reinterpret_cast<const half*>(fn.data_ptr()), residual_out,
+                    partial, hidden_size, tokens);
+        } else {
+            dsv4_mhc::partials_batched_split<NOUT, TT8, float>
+                <<<grid8, dsv4_mhc::THREADS, 0, stream()>>>(
+                    x, residual, post, comb, fp(fn), residual_out, partial,
+                    hidden_size, tokens);
+        }
+        return;
+    }
+    constexpr int TT = 4;
+    const dim3 grid(dsv4_mhc::SPLITS, (tokens + TT - 1) / TT);
+    static const bool warp_split = [] {
+        const char* v = std::getenv("QC_MHC_PARTIALS_WS");
+        return v == nullptr || std::atoi(v) != 0;   // default on (2026-09-12)
+    }();
+    if (warp_split) {
+        if (fn.scalar_type() == torch::kHalf) {
+            dsv4_mhc::partials_batched_ws<NOUT, TT, half>
+                <<<grid, dsv4_mhc::THREADS, 0, stream()>>>(
+                    x, residual, post, comb,
+                    reinterpret_cast<const half*>(fn.data_ptr()), residual_out,
+                    partial, hidden_size, tokens);
+        } else {
+            dsv4_mhc::partials_batched_ws<NOUT, TT, float>
+                <<<grid, dsv4_mhc::THREADS, 0, stream()>>>(
+                    x, residual, post, comb, fp(fn), residual_out, partial,
+                    hidden_size, tokens);
+        }
+        return;
+    }
+    if (fn.scalar_type() == torch::kHalf) {
+        dsv4_mhc::partials_batched<NOUT, TT, half>
+            <<<grid, dsv4_mhc::THREADS, 0, stream()>>>(
+                x, residual, post, comb,
+                reinterpret_cast<const half*>(fn.data_ptr()), residual_out,
+                partial, hidden_size, tokens);
+    } else {
+        dsv4_mhc::partials_batched<NOUT, TT, float>
+            <<<grid, dsv4_mhc::THREADS, 0, stream()>>>(
+                x, residual, post, comb, fp(fn), residual_out, partial,
+                hidden_size, tokens);
+    }
+}
 static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> py_dsv4_mhc_pre(
         torch::Tensor residual, torch::Tensor fn, torch::Tensor hc_scale,
         torch::Tensor hc_base, double rms_eps, double pre_eps,
@@ -534,9 +603,32 @@ py_dsv4_mhc_fused_post_pre(
         }
         return {residual_out, next_post, next_comb, layer_input};
     }
-    launch_dsv4_mhc_partials<dsv4_mhc::MIXES, true>(
-        bp(x), bp(residual), fp(post_mix), fp(comb_mix), fn,
-        bpm(residual_out), fpm(partial), H, dim3(dsv4_mhc::SPLITS, T));
+    if (T > 1) {
+        launch_dsv4_mhc_partials_batched<dsv4_mhc::MIXES>(
+            bp(x), bp(residual), fp(post_mix), fp(comb_mix), fn,
+            bpm(residual_out), fpm(partial), H, T);
+    } else {
+        launch_dsv4_mhc_partials<dsv4_mhc::MIXES, true>(
+            bp(x), bp(residual), fp(post_mix), fp(comb_mix), fn,
+            bpm(residual_out), fpm(partial), H, dim3(dsv4_mhc::SPLITS, T));
+    }
+    static const bool fused_norm = [] {
+        const char* v = std::getenv("QC_MHC_FUSED_NORM");
+        return !(v && v[0] == '0');
+    }();
+    if (norm_weight && fused_norm && H == 4096) {
+        TORCH_CHECK(norm_weight->is_cuda() && norm_weight->is_contiguous() &&
+                    norm_weight->scalar_type() == torch::kBFloat16 &&
+                    norm_weight->numel() == H,
+                    "fused DSV4 mHC RMSNorm expects a 4096-element bf16 weight");
+        dsv4_mhc::finalize_apply_pre_mix_rms_norm<dsv4_mhc::MIXES + 1, 1024>
+            <<<T, 1024, 0, stream()>>>(
+                fpm(partial), fp(hc_scale), fp(hc_base), fpm(next_post),
+                fpm(next_comb), bp(residual_out), bp(*norm_weight), bpm(layer_input),
+                H, float(rms_eps), float(pre_eps), float(sinkhorn_eps),
+                float(post_multiplier), int(sinkhorn_repeat), float(norm_eps));
+        return {residual_out, next_post, next_comb, layer_input};
+    }
     dsv4_mhc::finalize_pre_mix<<<T, 32, 0, stream()>>>(
         fpm(partial), fp(hc_scale), fp(hc_base), fpm(next_post),
         fpm(next_comb), H, float(rms_eps), float(pre_eps),
@@ -1578,6 +1670,291 @@ static torch::Tensor py_mla_decode_bf16_sparse_nope(torch::Tensor q, torch::Tens
     return out;
 }
 
+// KDA single-token decode recurrence (GLM-5.3 KDA layers): see
+// serving/kda_decode_kernels.cuh. Returns out [N, H, V] bf16; state updated
+// in place for state_indices[n] > 0 (rows with index <= 0 write zeros).
+// Skinny bf16 GEMM (M <= 128): Y = X . W^T (+ bias), split-K partials + reduce.
+template <int BM, int BN, int NW, int STAGES>
+static void launch_skinny(const __nv_bfloat16* x, const __nv_bfloat16* w, float* partial,
+                          int M, int N, int K, int splits, int k_slice) {
+    using L = tms::skinny::Layout<BM, BN, NW, STAGES>;
+    static bool attr_set = false;
+    if (!attr_set) {
+        cudaFuncSetAttribute(tms::skinny::skinny_gemm_bf16_kernel<BM, BN, NW, STAGES>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, L::SMEM);
+        attr_set = true;
+    }
+    const dim3 grid((N + BN - 1) / BN, splits);
+    tms::skinny::skinny_gemm_bf16_kernel<BM, BN, NW, STAGES><<<grid, L::THREADS, L::SMEM, stream()>>>(
+        x, w, partial, M, N, K, k_slice);
+}
+// W8A16 skinny GEMM: fp8 e4m3 weights (fragment-packed) x bf16 activations.
+static torch::Tensor py_w8a16_pack(torch::Tensor w_fp8) {
+    // w_fp8: [N, K] float8_e4m3fn, contiguous. Returns packed uint8 [N*K].
+    CK(w_fp8);
+    TORCH_CHECK(w_fp8.scalar_type() == torch::kFloat8_e4m3fn && w_fp8.dim() == 2, "w [N,K] e4m3");
+    const int N = w_fp8.size(0), K = w_fp8.size(1);
+    TORCH_CHECK(N % 32 == 0 && K % 64 == 0, "N % 32 == 0, K % 64 == 0");
+    auto out = torch::empty({int64_t(N) * K}, w_fp8.options().dtype(torch::kUInt8));
+    const int total = (K / 16) * (N / 32) * 32 * 4;
+    tms::w8a16::w8a16_pack_kernel<<<(total + 255) / 256, 256, 0, stream()>>>(
+        reinterpret_cast<const uint8_t*>(w_fp8.data_ptr()), out.data_ptr<uint8_t>(), N, K);
+    return out;
+}
+template <int BN, int STAGES, int NW = 4, int WM = 4>
+static void launch_w8a16(const __half* x, const uint8_t* wp, float* partial, int M, int N, int K,
+                         int splits, int k_slice) {
+    using L = tms::w8a16::Layout<BN, STAGES, NW, WM>;
+    static bool attr_set = false;
+    if (!attr_set) {
+        cudaFuncSetAttribute(tms::w8a16::w8a16_gemm_kernel<BN, STAGES, NW, WM>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, L::SMEM);
+        attr_set = true;
+    }
+    const dim3 grid((N + BN - 1) / BN, splits);
+    tms::w8a16::w8a16_gemm_kernel<BN, STAGES, NW, WM><<<grid, L::THREADS, L::SMEM, stream()>>>(x, wp, partial, M, N, K, k_slice);
+}
+static torch::Tensor py_w8a16_gemm(torch::Tensor x, torch::Tensor wp, torch::Tensor scale,
+                                   c10::optional<torch::Tensor> bias, int64_t N, int64_t target_ctas, int64_t cfg) {
+    // x [M, K] bf16; wp packed (from w8a16_pack); scale [N] fp32 (per channel, already x 2^8).
+    CK(x); CK(wp); CK(scale);
+    TORCH_CHECK(x.scalar_type() == torch::kBFloat16 && x.dim() == 2, "x [M,K] bf16");
+    const int M = x.size(0), K = x.size(1);
+    TORCH_CHECK(M >= 1 && M <= 128 && K % 64 == 0 && N % 32 == 0, "M <= 128, K % 64, N % 32");
+    TORCH_CHECK(wp.numel() == int64_t(N) * K, "packed weight size");
+    const int BN = (cfg == 1) ? 64 : 128;
+    const int n_tiles = (N + BN - 1) / BN;
+    const int k_steps = K / tms::w8a16::BK;
+    int want = std::max(1, int((target_ctas + n_tiles - 1) / n_tiles));
+    int splits = 1;
+    for (int d = 1; d <= k_steps; ++d) if (k_steps % d == 0 && d <= want) splits = d;
+    const int k_slice = K / splits;
+    auto partial = torch::empty({splits, M, N}, x.options().dtype(torch::kFloat32));
+    auto out = torch::empty({M, N}, x.options());
+    auto x16 = torch::empty({M, K}, x.options().dtype(torch::kHalf));
+    {
+        const int n8 = M * K / 8;
+        tms::w8a16::w8a16_convert_a_kernel<<<(n8 + 255) / 256, 256, 0, stream()>>>(
+            reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), reinterpret_cast<__half*>(x16.data_ptr()), n8);
+    }
+    const auto* xp = reinterpret_cast<const __half*>(x16.data_ptr());
+    float* pp = partial.data_ptr<float>();
+    if (cfg == 1) launch_w8a16<64, 3, 4, 2>(xp, wp.data_ptr<uint8_t>(), pp, M, N, K, splits, k_slice);
+    else if (cfg == 2) launch_w8a16<128, 3, 4, 2>(xp, wp.data_ptr<uint8_t>(), pp, M, N, K, splits, k_slice);
+    else if (cfg == 3) launch_w8a16<128, 2, 4, 4>(xp, wp.data_ptr<uint8_t>(), pp, M, N, K, splits, k_slice);
+    else launch_w8a16<128, 2, 4, 2>(xp, wp.data_ptr<uint8_t>(), pp, M, N, K, splits, k_slice);
+    const __nv_bfloat16* bp_ = nullptr;
+    if (bias.has_value()) { CK(bias.value()); bp_ = reinterpret_cast<const __nv_bfloat16*>(bias->data_ptr()); }
+    const int MN = M * N;
+    tms::w8a16::w8a16_reduce_kernel<<<(MN / 2 + 255) / 256, 256, 0, stream()>>>(
+        pp, scale.data_ptr<float>(), bp_, reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), MN, N, splits);
+    return out;
+}
+static torch::Tensor py_w8a16_dequant(torch::Tensor wp, torch::Tensor scale, int64_t N, int64_t K) {
+    CK(wp); CK(scale);
+    TORCH_CHECK(wp.numel() == N * K && N % 32 == 0 && K % 64 == 0, "packed size");
+    auto out = torch::empty({N, K}, scale.options().dtype(torch::kBFloat16));
+    const int total = int((K / 16) * (N / 32) * 32 * 4);
+    tms::w8a16::w8a16_dequant_kernel<<<(total + 255) / 256, 256, 0, stream()>>>(
+        wp.data_ptr<uint8_t>(), scale.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), int(N), int(K));
+    return out;
+}
+// Sparse NoPE-MLA prefill attention over the fp8 latent (see mla_sparse_prefill_kernels.cuh).
+template <int NLIST>
+static void launch_sparse_prefill_prep(const int* idx, const int* tlen, const int* bt, int T, int W, int maxb,
+                                       int block_size, int* pools, int* qmask, int* counts, int G) {
+    static bool attr_set = false;
+    if (!attr_set) {
+        cudaFuncSetAttribute(tms::sparse_prefill::sparse_prefill_prep_kernel<NLIST>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, NLIST * 4);
+        attr_set = true;
+    }
+    tms::sparse_prefill::sparse_prefill_prep_kernel<NLIST><<<G, tms::sparse_prefill::THREADS, NLIST * 4, stream()>>>(
+        idx, tlen, bt, T, W, maxb, block_size, pools, qmask, counts);
+}
+static torch::Tensor py_mla_sparse_prefill_fp8(torch::Tensor q, torch::Tensor data, torch::Tensor bt,
+                                               torch::Tensor indices, torch::Tensor topk_length,
+                                               int64_t block_size, double scale, double kv_scale,
+                                               int64_t page_stride_bytes) {
+    CK(q); TORCH_CHECK(data.is_cuda() && data.stride(-1) == 1, "data must be a CUDA tensor with unit inner stride");
+    if (page_stride_bytes <= 0) page_stride_bytes = block_size * 512;
+    CK(bt); CK(indices); CK(topk_length);
+    TORCH_CHECK(q.dim() == 3 && q.size(2) == 512 && q.size(1) == 16, "q [T, 16, 512] bf16 (TP4 head count)");
+    TORCH_CHECK(block_size % 4 == 0, "block_size % 4 == 0");
+    using namespace tms::sparse_prefill;
+    const int T = q.size(0), H = q.size(1), W = indices.size(1), maxb = bt.size(1);
+    const int G = (T + GQ - 1) / GQ;
+    auto pools = torch::empty({G, MAXU}, indices.options());
+    auto qmask = torch::zeros({G, GQ, MAXU}, indices.options());
+    auto counts = torch::empty({G}, indices.options());
+    const int need = GQ * W;
+    TORCH_CHECK(need <= 16384 && W <= 4 * (MAXU / GQ), "index width too large for the prep kernel");
+    if (need <= 8192)
+        launch_sparse_prefill_prep<8192>(indices.data_ptr<int>(), topk_length.data_ptr<int>(), bt.data_ptr<int>(), T, W, maxb,
+                                         int(block_size), pools.data_ptr<int>(), qmask.data_ptr<int>(), counts.data_ptr<int>(), G);
+    else
+        launch_sparse_prefill_prep<16384>(indices.data_ptr<int>(), topk_length.data_ptr<int>(), bt.data_ptr<int>(), T, W, maxb,
+                                          int(block_size), pools.data_ptr<int>(), qmask.data_ptr<int>(), counts.data_ptr<int>(), G);
+    auto out = torch::empty({T, H, 512}, q.options());
+    static bool attr_set = false;
+    if (!attr_set) {
+        cudaFuncSetAttribute(sparse_prefill_attn_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_TOTAL);
+        attr_set = true;
+    }
+    const float q_scale = float(scale) * float(kv_scale) * 1.4426950408889634f;
+    sparse_prefill_attn_kernel<<<G, THREADS, SMEM_TOTAL, stream()>>>(
+        bp(q), data.data_ptr<uint8_t>(), pools.data_ptr<int>(), qmask.data_ptr<int>(), counts.data_ptr<int>(),
+        bpm(out), T, H, q_scale, float(kv_scale), int(block_size), page_stride_bytes);
+    return out;
+}
+static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> py_mla_sparse_prefill_prep_debug(
+        torch::Tensor bt, torch::Tensor indices, torch::Tensor topk_length, int64_t block_size) {
+    using namespace tms::sparse_prefill;
+    const int T = indices.size(0), W = indices.size(1), maxb = bt.size(1);
+    const int G = (T + GQ - 1) / GQ;
+    auto pools = torch::full({G, MAXU}, -1, indices.options());
+    auto qmask = torch::zeros({G, GQ, MAXU}, indices.options());
+    auto counts = torch::empty({G}, indices.options());
+    const int need = GQ * W;
+    if (need <= 8192)
+        launch_sparse_prefill_prep<8192>(indices.data_ptr<int>(), topk_length.data_ptr<int>(), bt.data_ptr<int>(), T, W, maxb,
+                                         int(block_size), pools.data_ptr<int>(), qmask.data_ptr<int>(), counts.data_ptr<int>(), G);
+    else
+        launch_sparse_prefill_prep<16384>(indices.data_ptr<int>(), topk_length.data_ptr<int>(), bt.data_ptr<int>(), T, W, maxb,
+                                          int(block_size), pools.data_ptr<int>(), qmask.data_ptr<int>(), counts.data_ptr<int>(), G);
+    return {pools, qmask, counts};
+}
+static torch::Tensor py_skinny_gemm(torch::Tensor x, torch::Tensor w,
+                                    c10::optional<torch::Tensor> bias, int64_t target_ctas, int64_t cfg) {
+    CK(x); CK(w);
+    TORCH_CHECK(x.scalar_type() == torch::kBFloat16 && w.scalar_type() == torch::kBFloat16, "bf16 only");
+    TORCH_CHECK(x.dim() == 2 && w.dim() == 2 && x.size(1) == w.size(1), "x [M,K], w [N,K]");
+    const int M = x.size(0), K = x.size(1), N = w.size(0);
+    TORCH_CHECK(M >= 1 && M <= 128, "skinny GEMM handles M <= 128");
+    TORCH_CHECK(K % tms::skinny::BK == 0 && N % 16 == 0, "K % 64 == 0, N % 16 == 0");
+    // cfg (tile sweep, all within 15% of each other, none beating cuBLAS):
+    // 0 = BN64/4 warps/3 stages, 1 = BN128/8 warps/3 stages, 2 = BN64/4 warps/4 stages,
+    // 3 = BN128/8 warps/2 stages, 4 = BN64/8 warps/3 stages
+    const int BN = (cfg == 1 || cfg == 3 || cfg >= 6) ? 128 : 64;
+    const int n_tiles = (N + BN - 1) / BN;
+    const int k_steps = K / tms::skinny::BK;
+    int want = std::max(1, int((target_ctas + n_tiles - 1) / n_tiles));
+    int splits = 1;
+    for (int d = 1; d <= k_steps; ++d) if (k_steps % d == 0 && d <= want) splits = d;
+    const int k_slice = K / splits;
+    auto partial = torch::empty({splits, M, N}, x.options().dtype(torch::kFloat32));
+    auto out = torch::empty({M, N}, x.options());
+    const auto* xp = reinterpret_cast<const __nv_bfloat16*>(x.data_ptr());
+    const auto* wp = reinterpret_cast<const __nv_bfloat16*>(w.data_ptr());
+    float* pp = partial.data_ptr<float>();
+    TORCH_CHECK(M > 64 || cfg == 0, "only cfg 0 below M=65 for now");
+    switch (cfg) {
+        case 1: launch_skinny<128, 128, 8, 3>(xp, wp, pp, M, N, K, splits, k_slice); break;
+        case 2: launch_skinny<128, 64, 4, 4>(xp, wp, pp, M, N, K, splits, k_slice); break;
+        case 3: launch_skinny<128, 128, 8, 2>(xp, wp, pp, M, N, K, splits, k_slice); break;
+        case 4: launch_skinny<128, 64, 8, 3>(xp, wp, pp, M, N, K, splits, k_slice); break;
+        case 5: launch_skinny<128, 64, 4, 2>(xp, wp, pp, M, N, K, splits, k_slice); break;
+        case 6: launch_skinny<128, 128, 8, 2>(xp, wp, pp, M, N, K, splits, k_slice); break;
+        case 7: launch_skinny<128, 128, 8, 3>(xp, wp, pp, M, N, K, splits, k_slice); break;
+        case 8: launch_skinny<128, 128, 4, 2>(xp, wp, pp, M, N, K, splits, k_slice); break;
+        default:
+            if (M > 64)      launch_skinny<128, 64, 4, 3>(xp, wp, pp, M, N, K, splits, k_slice);
+            else if (M > 32) launch_skinny<64, 64, 4, 3>(xp, wp, pp, M, N, K, splits, k_slice);
+            else if (M > 16) launch_skinny<32, 64, 4, 3>(xp, wp, pp, M, N, K, splits, k_slice);
+            else             launch_skinny<16, 64, 4, 3>(xp, wp, pp, M, N, K, splits, k_slice);
+    }
+    const __nv_bfloat16* bp_ = nullptr;
+    if (bias.has_value()) {
+        CK(bias.value()); TORCH_CHECK(bias->scalar_type() == torch::kBFloat16 && bias->numel() == N, "bias [N] bf16");
+        bp_ = reinterpret_cast<const __nv_bfloat16*>(bias->data_ptr());
+    }
+    const int MN = M * N;
+    const int threads = 256, blocks = (MN / 2 + threads - 1) / threads;
+    tms::skinny::skinny_reduce_kernel<<<blocks, threads, 0, stream()>>>(
+        pp, bp_, reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), MN, N, splits);
+    return out;
+}
+// Speculative-row KDA kernels (see kda_decode_kernels.cuh, kda_spec_kernel).
+template <int MODE>
+static void launch_kda_spec(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor raw_g,
+                            torch::Tensor raw_beta, torch::Tensor A_log, torch::Tensor dt_bias,
+                            torch::Tensor state, torch::Tensor cu_seqlens, torch::Tensor state_indices,
+                            torch::Tensor prev_accepted, c10::optional<torch::Tensor> new_accepted,
+                            c10::optional<torch::Tensor> boundary_row, c10::optional<torch::Tensor> out,
+                            double scale, double lower_bound, bool use_lower_bound) {
+    // q/k/v/g: [1, N, H, D] (token stride may exceed H*D); beta [1, N, H]; state [slots, H, V, K].
+    TORCH_CHECK(q.dim() == 4 && q.size(0) == 1 && q.size(3) == 128 && v.size(3) == 128, "K = V = 128");
+    TORCH_CHECK(q.stride(3) == 1 && q.stride(2) == 128 && k.stride(1) == q.stride(1) && v.stride(1) == q.stride(1), "dense q/k/v heads");
+    TORCH_CHECK(state_indices.dim() == 2 && state_indices.stride(1) == 1 && state_indices.scalar_type() == torch::kInt32, "state_indices [R, S] int32");
+    const int H = q.size(2);
+    const int R = cu_seqlens.numel() - 1;
+    const int* na = new_accepted.has_value() ? new_accepted->data_ptr<int>() : nullptr;
+    const int* br = boundary_row.has_value() ? boundary_row->data_ptr<int>() : nullptr;
+    __nv_bfloat16* op = out.has_value() ? reinterpret_cast<__nv_bfloat16*>(out->data_ptr()) : nullptr;
+    const int64_t stride_out = out.has_value() ? out->stride(1) : 0;
+    const int max_rows = int(state_indices.size(1));   // rows per request <= spec columns
+    TORCH_CHECK(max_rows <= tms::kda::SPEC_MAX_T, "rows per request <= 8");
+#define KDA_SPEC_LAUNCH(TT)                                                                                        \
+    tms::kda::kda_spec_kernel<128, 128, MODE, TT><<<R * H, tms::kda::THREADS, 0, stream()>>>(                      \
+        bp(q), bp(k), bp(v), bp(raw_g), bp(raw_beta), fp(A_log), fp(dt_bias), state.data_ptr<float>(),             \
+        cu_seqlens.data_ptr<int>(), state_indices.data_ptr<int>(), prev_accepted.data_ptr<int>(), na, br, op,     \
+        H, q.stride(1), raw_g.stride(1), raw_beta.stride(1), stride_out, state.stride(0),                          \
+        int(state_indices.stride(0)), float(scale), float(lower_bound), use_lower_bound ? 1 : 0)
+    if (max_rows <= 4) { KDA_SPEC_LAUNCH(4); } else { KDA_SPEC_LAUNCH(8); }
+#undef KDA_SPEC_LAUNCH
+}
+static torch::Tensor py_kda_spec_fwd(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor raw_g,
+                                     torch::Tensor raw_beta, torch::Tensor A_log, torch::Tensor dt_bias,
+                                     torch::Tensor state, torch::Tensor cu_seqlens, torch::Tensor state_indices,
+                                     torch::Tensor prev_accepted, double scale, double lower_bound,
+                                     bool use_lower_bound, bool store_states, c10::optional<torch::Tensor> out) {
+    torch::Tensor o = out.has_value() ? out.value() : torch::empty_like(v);
+    TORCH_CHECK(cu_seqlens.numel() - 1 <= 4096 && v.size(1) / std::max<int64_t>(cu_seqlens.numel() - 1, 1) <= tms::kda::SPEC_MAX_T, "rows per request <= 8");
+    if (store_states)
+        launch_kda_spec<0>(q, k, v, raw_g, raw_beta, A_log, dt_bias, state, cu_seqlens, state_indices, prev_accepted,
+                           c10::nullopt, c10::nullopt, o, scale, lower_bound, use_lower_bound);
+    else
+        launch_kda_spec<1>(q, k, v, raw_g, raw_beta, A_log, dt_bias, state, cu_seqlens, state_indices, prev_accepted,
+                           c10::nullopt, c10::nullopt, o, scale, lower_bound, use_lower_bound);
+    return o;
+}
+static void py_kda_spec_commit(torch::Tensor k, torch::Tensor v, torch::Tensor raw_g, torch::Tensor raw_beta,
+                               torch::Tensor A_log, torch::Tensor dt_bias, torch::Tensor state,
+                               torch::Tensor cu_seqlens, torch::Tensor state_indices, torch::Tensor prev_accepted,
+                               torch::Tensor new_accepted, torch::Tensor boundary_row, double lower_bound,
+                               bool use_lower_bound) {
+    launch_kda_spec<2>(k, k, v, raw_g, raw_beta, A_log, dt_bias, state, cu_seqlens, state_indices, prev_accepted,
+                       new_accepted, boundary_row, c10::nullopt, 1.0, lower_bound, use_lower_bound);
+}
+static torch::Tensor py_kda_decode(torch::Tensor mixed_qkv, torch::Tensor raw_g,
+        torch::Tensor raw_beta, torch::Tensor A_log, torch::Tensor dt_bias,
+        torch::Tensor state, torch::Tensor state_indices, double scale,
+        double lower_bound, bool use_lower_bound) {
+    TORCH_CHECK(mixed_qkv.is_cuda() && mixed_qkv.dim() == 2 && mixed_qkv.stride(1) == 1 &&
+                mixed_qkv.scalar_type() == torch::kBFloat16, "mixed_qkv: [N, C] bf16, unit inner stride");
+    TORCH_CHECK(state.is_cuda() && state.dim() == 4 && state.scalar_type() == torch::kFloat &&
+                state.stride(3) == 1, "state: [cache, H, V, K] fp32");
+    const int N = mixed_qkv.size(0), H = state.size(1), V = state.size(2), K = state.size(3);
+    TORCH_CHECK(K == 128 && V == 128, "kda_decode: K == V == 128 only");
+    TORCH_CHECK(state.stride(1) == int64_t(V) * K && state.stride(2) == K, "state head layout");
+    TORCH_CHECK(raw_g.dim() == 4 && raw_g.size(1) == N && raw_g.size(2) == H && raw_g.size(3) == K &&
+                raw_g.stride(3) == 1 && raw_g.stride(2) == K, "raw_g: [1, N, H, K]");
+    TORCH_CHECK(raw_beta.dim() == 3 && raw_beta.size(1) == N && raw_beta.size(2) == H &&
+                raw_beta.stride(2) == 1, "raw_beta: [1, N, H]");
+    TORCH_CHECK(A_log.numel() == H && A_log.is_contiguous() && A_log.scalar_type() == torch::kFloat, "A_log");
+    TORCH_CHECK(dt_bias.numel() == int64_t(H) * K && dt_bias.is_contiguous() &&
+                dt_bias.scalar_type() == torch::kFloat, "dt_bias");
+    TORCH_CHECK(state_indices.dim() == 1 && state_indices.numel() == N &&
+                state_indices.scalar_type() == torch::kInt && state_indices.is_contiguous(), "state_indices");
+    TORCH_CHECK(mixed_qkv.size(1) >= 2 * H * K + H * V, "packed qkv width");
+    auto out = torch::empty({1, N, H, V}, mixed_qkv.options());
+    if (N == 0) return out;
+    tms::kda::kda_decode_kernel<128, 128><<<N * H, tms::kda::THREADS, 0, stream()>>>(
+        bp(mixed_qkv), bp(raw_g), bp(raw_beta), fp(A_log), fp(dt_bias), fpm(state),
+        state_indices.data_ptr<int>(), bpm(out), H, mixed_qkv.stride(0), raw_g.stride(1),
+        raw_beta.stride(1), state.stride(0), float(scale), float(lower_bound), use_lower_bound ? 1 : 0);
+    return out;
+}
 // GLM-5.3-Flash (glm5_next) fp8 geometry: NoPE latent, q/cache slot are 512
 // fp8 elements (no rope tail), the value is the full 512, one per-tensor
 // kv_scale (vLLM's fp8 MLA layout, SMODE 1). The bf16 NoPE path above is the
@@ -2380,6 +2757,32 @@ void init_serving(py::module_& m) {
           py::arg("topk_length"), py::arg("block_size"), py::arg("scale"),
           py::arg("partition_size") = 0,
           py::arg("page_stride_bytes") = 0);
+    m.def("mla_sparse_prefill_fp8", &py_mla_sparse_prefill_fp8, py::arg("q"), py::arg("data"), py::arg("bt"), py::arg("indices"),
+          py::arg("topk_length"), py::arg("block_size"), py::arg("scale"), py::arg("kv_scale"),
+          py::arg("page_stride_bytes") = 0,
+          "Sparse NoPE-MLA prefill attention (groups of 4 queries over their pool union, fp8 latent)");
+    m.def("mla_sparse_prefill_prep_debug", &py_mla_sparse_prefill_prep_debug);
+    m.def("w8a16_dequant", &py_w8a16_dequant, py::arg("wp"), py::arg("scale"), py::arg("N"), py::arg("K"),
+          "Unpack fp8 weights to bf16 [N,K] (prefill path)");
+    m.def("w8a16_pack", &py_w8a16_pack, py::arg("w_fp8"), "Pack [N,K] e4m3 weights into mma fragment order");
+    m.def("w8a16_gemm", &py_w8a16_gemm, py::arg("x"), py::arg("wp"), py::arg("scale"), py::arg("bias") = py::none(),
+          py::arg("N") = 0, py::arg("target_ctas") = 256, py::arg("cfg") = 0,
+          "W8A16 skinny GEMM (M <= 128): bf16 x . fp8 W^T * scale + bias, split-K");
+    m.def("skinny_gemm", &py_skinny_gemm, py::arg("x"), py::arg("w"), py::arg("bias") = py::none(),
+          py::arg("target_ctas") = 256, py::arg("cfg") = 0, "Skinny bf16 GEMM (M <= 128): x [M,K] . w [N,K]^T + bias, split-K");
+    m.def("kda_spec_fwd", &py_kda_spec_fwd, py::arg("q"), py::arg("k"), py::arg("v"), py::arg("raw_g"),
+          py::arg("raw_beta"), py::arg("A_log"), py::arg("dt_bias"), py::arg("state"), py::arg("cu_seqlens"),
+          py::arg("state_indices"), py::arg("prev_accepted"), py::arg("scale"), py::arg("lower_bound"),
+          py::arg("use_lower_bound"), py::arg("store_states") = true, py::arg("out") = py::none(),
+          "KDA speculative-row forward (K=V=128): outputs, optional per-row state stores");
+    m.def("kda_spec_commit", &py_kda_spec_commit, py::arg("k"), py::arg("v"), py::arg("raw_g"), py::arg("raw_beta"),
+          py::arg("A_log"), py::arg("dt_bias"), py::arg("state"), py::arg("cu_seqlens"), py::arg("state_indices"),
+          py::arg("prev_accepted"), py::arg("new_accepted"), py::arg("boundary_row"), py::arg("lower_bound"),
+          py::arg("use_lower_bound"), "KDA speculative deferred commit: replay accepted rows, store committed/boundary states");
+    m.def("kda_decode", &py_kda_decode, py::arg("mixed_qkv"), py::arg("raw_g"),
+          py::arg("raw_beta"), py::arg("A_log"), py::arg("dt_bias"), py::arg("state"),
+          py::arg("state_indices"), py::arg("scale"), py::arg("lower_bound"),
+          py::arg("use_lower_bound"));
     m.def("mla_decode_fp8_sparse_nope", &py_mla_decode_fp8_sparse_nope, py::arg("q"),
           py::arg("data"), py::arg("block_table"), py::arg("indices"),
           py::arg("topk_length"), py::arg("block_size"), py::arg("scale"),

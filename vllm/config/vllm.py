@@ -959,6 +959,22 @@ class VllmConfig:
             or self._is_draft_model_view()
         ):
             return
+        if getattr(self.parallel_config, "data_parallel_replicate_moe", False):
+            # Replicated-MoE data parallelism runs the replicas without any
+            # cross-replica collective or lockstep step, so each replica may
+            # pick its own draft length. A zero-draft range is NOT supported
+            # here: with k=0 above 16 requests the DP2 GLM-5.3 record died
+            # in KV-cache initialization with a Triton illegal memory
+            # access (2026-09-12); fail at config time instead.
+            schedule = speculative_config.num_speculative_tokens_per_batch_size
+            if any(int(entry[2]) <= 0 for entry in schedule):
+                raise ValueError(
+                    "num_speculative_tokens_per_batch_size ranges with 0 draft "
+                    "tokens are not supported with data-parallel replicated "
+                    "MoE; drop the schedule (fixed num_speculative_tokens) or "
+                    f"give every range at least 1 draft token: {schedule}"
+                )
+            return
 
         logger.warning_once(
             "Dynamic speculative decoding is not supported with data "

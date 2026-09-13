@@ -4030,3 +4030,96 @@ TP4 = 36 MLA + 18 indexer + 4 KDA state pages; 106 at TP8 = 68 + 34 + 4.
   (`should_fuse_dsv4_mhc` is batch-1 only), sampler/launch fusions,
   host-resident main KV for GLM. Record flips (schedule, api2, numa, fp8
   KV) only on measured wins plus the gate set.
+
+## 2026-09-11 23:40: program status
+
+- Profile of the DP2 record at 32 req/replica (notebook): MoE GEMM 39%
+  (at bandwidth), mHC partials 14%, dense GEMMs 12%, KDA 8%, allreduce 6%.
+  Landed: token-batched mHC partials (97f13c4ee, 78 -> 31 us at T=32).
+  Next kernels: KDA recurrent (0.56 TB/s effective, ~2x headroom;
+  vllm/models/kimi_k3/amd/ops/third_party/kda/fused_recurrent.py), then
+  spec at c32 once per-row costs are down.
+- Thinking budget 2000 now on both glm53f records; harness credits recall
+  in reasoning and sends probes a per-request budget.
+- OPEN: cold prefill >= ~900K produced '!' garbage in the 1M leg (both
+  layouts); a cold-prefill probe worker died silently at 200K on a
+  torch.compile cache two concurrent boots had corrupted (cache set
+  aside at ~/.cache/vllm/torch_compile_cache.corrupt-*). Rerun queued
+  (queue22, results in perf/results/2026-09-11/glm53f-coldprefill2/).
+- GPU queue: q19 NUMA arm -> q20 fp8-KV arm + FULL_AND_PIECEWISE arm ->
+  q21 same-day base on the batched-partials tree -> q22 parity test +
+  cold-prefill bisection. Logs ~/.local/scratch/glm53/queue*.log.
+
+## 2026-09-12 12:10: fp8 main KV on the record; mHC warp-split kernel; roofline audit
+
+- RECORD (glm53f-nvfp4-8/a100): TP4 x DP2 replicated MoE + fp8 (e4m3) main
+  NoPE-MLA KV (glm5_next_main_kv_fp8, pool 2.97M tokens) + mHC warp-split
+  partials. Exact medians c1 127.1 / c8 497.0 / c16 843.9 / c32 1023.3 /
+  c64 1320.8 tok/s (perf/baseline_status.md, raw perf/results/2026-09-12/
+  glm53f-mhcws-record/). Gates for the fp8 flip: canaries, eviction-restore
+  6/6 with verify (0/88 mismatched), WildChat leg 737 turns / 0 errors /
+  119/119 recall / 549 restores / 93.4% prefix hits.
+- Fixed on the way (29e6fdf98): the host tier hashed at the smallest
+  attention block while the scheduler hashes at the gcd of every group
+  (fp8 widens MLA blocks to 2304 beside the 1152 KDA block), and the tier
+  index never bound hashes at positions where no attention block completes;
+  the scheduler's invalid-block handler assumed one KV group and killed the
+  engine on the first fail-closed restore. tests/v1/core/
+  test_scheduler_invalid_blocks_hybrid.py, test_host_tier_connector.py.
+- Kernel pass (notebook 2026-09-12): mHC partials warp-split
+  (partials_batched_ws, c8bf2d250): 31 -> 13.6 us at T=32, 98 -> 33 at
+  T=128, serving +12.8% at c64. KDA CUDA decode kernel: env-gated, no lever
+  (Triton at bandwidth from N=32). Roofline audit of the c64 128-token
+  step: marlin NVFP4 MoE at the HBM roofline (167 distinct experts/layer,
+  VLLM_MOE_EXPERT_STATS diagnostic), all-reduce 1stage +2.2% (rejected),
+  dense bf16 GEMMs at 0.3-0.9 TB/s under cuBLAS - skinny split-K GEMM
+  written (skinny_gemm_ampere.cuh, op skinny_gemm, tests 54/54) but load-
+  bound at 0.65 TB/s; parked with the v2 design in the notebook.
+- OPEN: KDA speculative path (1 read + 4 per-row state stores per layer,
+  7% of the step) needs a deferred-commit runner design; the 1M-leg '!'
+  garbage after >= 900K restores in two-session runs is unreproduced;
+  registry tests fail on another session's glm53f-q2-1/metal and
+  glm53f-gguf records (not this record); Nsight Compute is blocked
+  (ERR_NVGPUCTRPERM). QuixiCore-CUDA port of the mHC family and the KDA
+  kernel is grafted (kernels/serving/, tm_cuda_serving.cu) pending its
+  compile check and commit.
+
+## 2026-09-12 21:40: throughput program - record at fixed k=2, sustained metric, closed levers
+
+- RECORD glm53f-nvfp4-8: DFlash2 fixed k=2 (b2cc96fea). Exact c1 128.0 /
+  c8 567.1 / c16 875.6 / c32 1110.0 / c64 1413.8; sustained (vllm bench
+  serve random 1000/300) c64 1227-1411, c128 1672-1674 output tok/s; leg
+  785 turns / 0 errors / 126/126 recall. The per-batch draft schedule was
+  inert under DP (engine falls back to fixed k); k=3 had been running
+  everywhere. Dynamic schedules are now allowed under replicated-MoE DP,
+  zero-draft ranges rejected at config time (they crash KV init).
+- Primary metric is now sustained load: ~/.local/scratch/glm53/sustained.sh
+  <outdir> <conc...> against a running :8400 server (reproducible within
+  2%; the exact harness spreads 5-10% at c96+).
+- Closed by measurement (notebook 2026-09-12): stream overlap of MoE
+  weight streaming with compute (A100 time-slices grid-filling kernels,
+  -2%), fp8 marlin dense weights (slower than cuBLAS), custom W8A16
+  skinny GEMM (cuBLAS parity at best after 4 restructurings; committed,
+  gated off, tests 113/113, kernel csrc/quixicore/serving/
+  w8a16_gemm_ampere.cuh, method vllm/model_executor/layers/quantization/
+  qc_w8a16.py, env VLLM_QC_DENSE_W8A16), k=4 drafts (-13%).
+- NEXT: prefill-step profile (queue47) - continuous prefill is first-order
+  in the sustained metric; then the DP replicas' per-replica dynamic k if
+  the c8 point (4 per replica) prefers a longer draft.
+- Rule re-learned the hard way: never cp the extension .so into vllm/ while
+  any server is booting or running (killed the k=4 arm's boot).
+
+## 2026-09-13 00:10: sparse prefill kernel on the record; program state
+
+- RECORD glm53f-nvfp4-8 = fp8 main KV + mHC warp-split + fixed k=2 +
+  sparse MLA prefill kernel (396300c18). Sustained c64 1508 / c128 1864
+  output tok/s (program start: 1140-1157 / 1425); exact c8 567 / c16 876 /
+  c32 1110 / c64 1414; leg 845 turns / 0 errors / 135/135 recall / 704K.
+- The prefill kernel (csrc/quixicore/serving/mla_sparse_prefill_kernels.cuh,
+  op mla_sparse_prefill_fp8, dispatch in the sparse backend's forward_mqa,
+  flag glm5_next_sparse_prefill / env VLLM_QC_SPARSE_PREFILL) replaced the
+  per-token decode kernel that was 39% of prefill time; groups of 4 queries
+  over the union of their pools; duplicates in the index list count once.
+- Remaining levers after this program: prefill MoE/mHC/NCCL shares (see the
+  with-kernel profile in the notebook), the KDA deferred commit (~2%), the
+  W8A16 dense path (parity, gated off), per-replica dynamic draft length.

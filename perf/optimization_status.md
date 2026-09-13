@@ -25487,6 +25487,552 @@ arm (queue17).
   (queue18: cold single requests at 200K/500K/800K/900K/1M with a
   planted marker). Also: one 400 at 1,048,065 prompt tokens - the
   harness overshoots the 1,048,576 ceiling by its 512 reply tokens.
+- STEADY DECODE STEP at 32 requests per replica (from the profile, one
+  step, 49.3 ms, 1,947 kernels): marlin MoE 19.4 ms (39%; ~170 distinct
+  experts read per step = 1.4 TB/s, i.e. at bandwidth), mHC partials
+  (CUDA `tms::dsv4_mhc::partials`, 89 launches) 7.0 ms (14%), dense bf16
+  GEMMs ~6 ms, KDA recurrent 3.9 ms (34 launches at 0.56 TB/s effective
+  - ~2x headroom), custom allreduce 2.9 ms (6%), mHC pre-mix + finalize
+  1.8 ms, sparse MLA 1.4 ms, sampler 0.7 ms. The whole-window allreduce
+  share (19%) was barrier WAITING in the eager prefill steps (1-stage
+  p50 9 us vs p90 411 us; ranks 2/3 idle 7 ms/step on the host side
+  there), so the fused mHC-allreduce is demoted; prefill-step launch
+  gaps are a separate item (FULL_AND_PIECEWISE arm queued).
+- mHC partials batched (dsv4_mhc::partials_batched<24, TT=4>): the
+  per-token kernel re-read the 1.5 MiB fn matrix per token; the batched
+  kernel reads it once per 4-token tile with the same per-element
+  arithmetic. Microbench at T=32: 31 us vs 78 us in the serving profile
+  (the whole transition op 49 us). residual_out bit-exact; fp32 mixing
+  coefficients within 2e-7 (FMA contraction), normed layer input within
+  one bf16 ulp. Expected ~4 ms of the 49 ms step (~8%). Same-day base
+  arm queued (dp2-base-mhcb) for the serving A/B.
+- Cold-prefill probe attempt 1 died silently on worker 3 during the
+  first 200K prefill (no CUDA error, no OOM); the boot had reloaded a
+  torch.compile cache that two concurrent profile boots wrote at 19:55
+  ("Cubin file saved by TritonBundler not found" warnings). The cache
+  (56 GB) was set aside; the probe reruns on a clean cache (queue22).
+
+## 2026-09-12: A/B results on the DP2 record (c1/c8/c16/c32/c64 medians of two)
+
+| arm | c1 | c8 | c16 | c32 | c64 | note |
+|---|---|---|---|---|---|---|
+| base (09-11 20:30) | 165 | 566 | 848 | 989 | 1200 | acc 2.21 |
+| numa_bind 0000/1111 | 126 | 499 | 830 | 1006 | 1176 | no gain |
+| FULL_AND_PIECEWISE | 139 | 521 | 782 | 1027 | 1176 | decode unchanged; prefill not measured here |
+| fp8 main KV (per-layer) | 150 | 550 | 698 | 873 | 998 | pool 2.94M (1.78x) but -10..-17% at c16+ |
+| base on batched-partials tree | 114 | 544 | 756 | 936 | 1172 | acc 2.17; within noise of base |
+
+- Run-to-run spread at a fixed config is 5-10% at c16/c32 (acceptance
+  1.5-3.2 varies the DFlash gain), so two repeats resolve only >10%.
+- fp8 main KV: capacity win (per-replica pool 1.65M -> 2.94M tokens)
+  but the software e4m3 decode costs more than the halved bytes save at
+  batch on sm80 (the TC kernel runs split 64 on fp8 and the native fp8
+  kernel decodes per element). Not for the record; keep as the capacity
+  option and revisit the fp8 decode kernels (vectorized e4m3 -> bf16 in
+  the native kernel; a smaller-register decode in the TC kernel).
+- KDA decode kernel sweep (microbench, H=16, K=V=128): BV=32/4 warps
+  (the vendored defaults) are best at every N; wider tiles or 8 warps
+  are equal or slower. The 0.56 TB/s effective is the kernel's
+  per-element state update, not a tiling choice; a rewrite (state in
+  bf16 registers, vectorized loads) is the next lever there.
+- Batched mHC partials: 2.5x at the kernel; the serving arm sits inside
+  the noise band. Needs a 5-repeat paired A/B, or the kernel share is
+  smaller at these batch sizes than in the profiled step (the Triton
+  SIMT transition path serves T <= 64 at the MoE site).
+- Cold prefill (clean compile cache): 31K/62K/124K/249K/435K/559K/621K
+  prompt tokens all answer correctly with no '!' garbage; the earlier
+  probe's requested lengths tokenized at 2.62 chars/token, so the 900K+
+  regime was not reached - rerun queued (queue23, 700K..1.04M actual).
+- Kernel pass (QuixiCore handbook loop, 2026-09-12): sparse MLA fp8 NoPE
+  decode. Baseline at B=32 rows x 16 heads x top-2048: native bf16 602 us,
+  native fp8 1206 us, TC bf16 (split 128) 145 us, TC fp8 (split 64) 361
+  us - the fp8 paths are 2-2.5x bf16 while moving half the bytes and
+  neither is byte-bound (bf16 TC: 64 MB in 145 us = 0.44 TB/s), i.e. the
+  decode structure is the cost. (1) VECFP8L: a lane-parallel fp8 row path
+  in the native kernel mirroring VECBF16 (32 indices per round, one
+  16-byte load per lane, 4 rows in flight, kv_scale folded into q and
+  applied once to the accumulator): 1206 -> 982 us (-19%), parity 24/24.
+  (2) Triton TC decode via 16-bit assembly to fp16: 361 -> 1655 us
+  (REJECTED - Triton's int16 path is far slower on sm80; reverted to the
+  int32 assembly, keeping the folded scale). Next: a branchless half2
+  pair decode in the native path (an e4m3 byte is exactly the fp16
+  ((b&0x7F)<<7 | (b&0x80)<<8) x 256, subnormals included) - built and
+  queued for parity + bench. The fp8 opt-in remains a capacity feature
+  (1.78x pool) with a decode cost until fp8 matches bf16.
+- Cold-prefill probe 4 died at boot: the extension rebuild copied the new
+  .so while the workers were importing it (my collision). Probe 5 runs
+  after the pair-decode build (queue27) with the calibrated 6.8
+  chars/token filler (probe 3 covered 271K-403K real tokens: all clean).
+- fp8 NoPE decode, pair decode LANDED (1a524cb69): native fp8 613 us vs
+  native bf16 602 us at B=32 (was 1206), parity 24/24 - fp8 storage now
+  costs nothing at decode on the native kernel and moves half the bytes.
+  Triton TC fp8: the in-kernel per-element scale form stays (361 us at
+  split 64); folding the scale into q/accumulator measured 632 us
+  (REJECTED, Triton codegen), the 16-bit assembly 1655 us (REJECTED).
+  The TC fp8 path remains 2.5x TC bf16, so fp8 serving decode at c<=32
+  routes through TC only when the TC kernel wins; the fp8 arm's
+  -10..-17% needs a re-measure now that the native path is at parity
+  (queued after the tier test). Raw: perf/results/2026-09-12/kernel-bench/.
+- COLD PREFILL at real 704K / 855K / 956K / 1,046K prompt tokens on the
+  DP2 record: all four answer the planted codename correctly, no '!'
+  garbage, e2e 90-324 s (probe 5, calibrated 6.8 chars/token). So a cold
+  single-request prefill to the 1M ceiling is clean; the 1M-leg garbage
+  probes (each right after a tier restore of a >=900K prefix) point at
+  the restore/recompute path at that depth, not at prefill. A forced-
+  eviction tier acceptance at 950K context runs now (queue28,
+  perf/results/2026-09-12/glm53f-tier950k/).
+- TIER ACCEPTANCE AT 950K CONTEXT (DP2 record, forced eviction, byte
+  verify): PASS - 4/4 markers recalled after a 2,044,297-token churn of
+  the 1,669,244-token pool, 576 restores, 2,304 verify batches / 0
+  mismatched, 0 negative-allocation clamps. So a single deep session's
+  eviction + restore at ~950K is clean; the 1M-leg garbage (three probes,
+  each after a >=900K restore in a TWO-session run where the clamp fired)
+  is not reproduced by this shape. Next reproduction: the clamp path
+  (attention groups fully hit locally while a lagging state group missed,
+  then external restore + recompute over the kept blocks), which this run
+  never entered. Raw: perf/results/2026-09-12/glm53f-tier950k/.
+- fp8 main-KV arm RE-MEASURED on the lane-parallel decode (dp2-fp8kv2):
+  c8 553 / c16 746 / c32 978 / c64 1185 (medians of two) vs base 566 /
+  848 / 989 / 1200 - within noise except c16 (-12%, one low repeat);
+  pool 2.94M tokens (1.78x). With the throughput cost gone, fp8 main KV
+  is the policy-preferred cache (FP8 is the official KV quantization,
+  operator 2026-09-10): the record is flipped in the working tree and
+  its gate set runs now (queue31: canaries + exact x3, tier acceptance
+  under verify, WildChat leg) before the commit.
+- mHC transition tail: `finalize_apply_pre_mix_rms_norm` fuses the
+  finalize (warp 0) and the pre-mix RMS norm into one 1024-thread block
+  per token (the pair ran 32-thread and 256-thread blocks, occupancy-
+  bound at T=32). Bit-identical to the two-kernel path on all four
+  outputs (a first build read the input residual instead of the mixed
+  one - caught by the batched-partials parity, fixed). Op time at
+  T=16/32/64/128: 39.0/48.9/68.6/115.1 -> 31.7/41.7/61.2/108.4 us
+  (-15% at T=32, ~0.7 ms/step at 90 sites). KEPT, default on
+  (QC_MHC_FUSED_NORM=0 restores the pair).
+- 8-token split-output partials (QC_MHC_PARTIALS_TT=8): T=16 36.2 vs
+  39.0 us, T=32 52.2 vs 48.9, T=64 68.5 vs 68.6, T=128 101.0 vs 115.1
+  - no gain at the record's batch, +12% only at T=128. REJECTED as
+  default; kept env-gated as a documented diagnostic for larger
+  verify batches.
+- KDA decode recurrence, CUDA port (csrc/quixicore/serving/
+  kda_decode_kernels.cuh, warp-per-state-row with 128-bit lane loads,
+  exact replica of the packed-decode Triton math): parity 8/8 vs the
+  Triton kernel (rtol 2e-3 outputs, 1e-4 state). Microbench H=16,
+  K=V=128: N=16 18.9 vs 28.0 us (-32%), N=32 46.7 vs 45.9, N=64 93.5 vs
+  92.9 - equal at N>=32, i.e. the isolated packed-decode kernel already
+  moves the 64 MB state at ~1.4 TB/s; the 115 us seen in the serving
+  profile was the SPECULATIVE fwd kernel at 4 rows per request (4x the
+  state traffic), not a slow decode kernel. VERDICT: no throughput lever
+  at the record's batch; kept env-gated (KDA_DECODE_CUDA=1) for the small-
+  batch win. The real KDA lever is the spec path's 4x state traffic
+  (one state read/write per draft row) - a fused multi-row update that
+  reads the state once per request is the follow-up.
+- fp8 main-KV GATES: canaries PASS; exact x3 medians c1 142 / c8 489 /
+  c16 778 / c32 975 / c64 1179 (bf16 record 118 / 507 / 787 / 986 /
+  1158; pool 2.97M vs 1.65M). The tier acceptance and the leg both
+  CRASHED the engine: the first fp8 restore failed closed ("58 blocks
+  reported invalid, request released to recompute") and the scheduler's
+  invalid-block handler then died on `(req_block_ids,) = get_block_ids(
+  req_id)` - it assumes a single KV group (a TODO in vLLM), so the
+  fail-closed path never worked on this 14-group model. Two items: (1)
+  generalize _update_requests_with_invalid_blocks to hybrid groups;
+  (2) find why fp8 restores are unstageable. The record flip is on hold
+  (working tree reverted to bf16 until both are fixed).
+- KDA speculative path, traffic analysis (2026-09-12, no GPU needed): the
+  115 us/layer "spec fwd" cost at 32 requests x 4 rows is NOT a slow
+  kernel. fused_recurrent_kda_fwd_kernel keeps the state in registers
+  across the rows, reads it once, but STORES it once per row (per-row
+  state slots so the next step can resume from the accepted row:
+  initial_token = num_accepted - 1). Traffic = 1 read + 4 writes of
+  33.5 MB (H=16, K=V=128 fp32, 32 requests) = 168 MB; 115 us = 1.46 TB/s
+  = A100 bandwidth. The decode kernel is 2x (1 read + 1 write, 46 us).
+  The only lever is fewer state stores: (a) deferred commit - the spec
+  kernel stores nothing, the NEXT step replays the accepted rows from
+  the initial slot (inputs of the previous step's rows retained per
+  state slot, ~1.5 MB/layer) and commits once: 2x traffic, ~46 us, i.e.
+  ~2.3 ms per step x 34 layers, 4-7% at c8-c16 where k=3 runs (per
+  replica batch <= 16). Hazard: every other state consumer (packed
+  decode after a spec->decode transition, align-mode boundary
+  migrations, tier snapshots/DMA of frozen blocks) sees an uncommitted
+  slot between steps, so the commit must run before any of them; (b)
+  reverse-replay from the final state divides by exp(gate) in (0.0067,
+  1) and amplifies fp32 error up to 150x per row - rejected. DEFERRED:
+  (a) is a runner state-machine change, not a kernel change; it needs a
+  design pass with the tier and boundary-migration paths mapped first.
+  Next kernel target comes from a fresh per-kernel profile of the DP2
+  record at c16 and c64 (queue34, after the fp8 gates).
+- fp8 main-KV RECORD FLIP (2026-09-12): after the host-tier hash fix
+  (29e6fdf98) the gates rerun clean - canaries pass; exact medians c1
+  118.4 / c8 559.1 / c16 730.0 / c32 971.6 / c64 1139.3 (bf16 117.8 /
+  506.8 / 786.5 / 985.8 / 1158.0, within spread); eviction-restore
+  acceptance 6/6 after 3.74M-token churn, 88 verify batches 0
+  mismatched; WildChat leg c8 737 turns / 0 errors / 119/119 recall /
+  549 restores / 93.4% prefix hits / 624K max ctx. Pool 2.97M vs 1.67M
+  tokens. glm53f-nvfp4-8/a100 now carries glm5_next_main_kv_fp8: true.
+  Raw: perf/results/2026-09-12/glm53f-fp8-gates2/, glm53f-leg-fp8-2/.
+- PROFILE of the fp8 DP2 record (2026-09-12, torch profiler, per replica;
+  raw ~/.local/scratch/glm53/prof-dp2-c16 and prof-dp2-c64): c16 = 8
+  requests/replica x 4 spec rows = 32-token steps, 26 ms of GPU time per
+  step; c64 = 32 requests/replica x 4 rows (k=3 still active) = 128-token
+  steps, 49 ms per step, 98% kernel-busy, ranks balanced in steady state
+  (all-reduce 3.3 ms/step per rank; the 10 ms/step "waits" seen on three
+  ranks were confined to the ramp/prefill phase). Per 128-token step:
+  marlin NVFP4 MoE 15.0 ms (31%, 79 launches x 191 us), mHC transition
+  partials 7.3 ms (15%, 83 x 88 us) + finalize 1.0 ms, all-reduce 3.3 ms,
+  KDA spec recurrence 3.5 ms (34 x 104 us, bandwidth-bound on per-row
+  state stores), dense bf16 GEMMs ~6 ms, MLA fp8 decode + reduce 1.2 ms.
+  Per 32-token step (c16): marlin 9.4 ms (36%, 105 us/launch), mHC 1.9,
+  KDA 0.9, dense GEMMs 3.5. Only 2 CUDA-graph launches and ~115 eager
+  launches per step: launch overhead is not the limiter at either batch.
+- mHC transition partials, warp-split kernel (partials_batched_ws, default
+  on, QC_MHC_PARTIALS_WS=0 restores partials_batched): the batched kernel
+  kept TT x 24 accumulators + 24 fn values per thread (164 registers ->
+  1 block/SM), so its L2 fn loads ran latency-bound. The new kernel mixes
+  the block's 512 elements once into shared memory, then each warp streams
+  3 of the 24 fn rows over the chunk with 12 accumulators per lane (64
+  registers, 4 blocks/SM). Isolated (A100, hidden 4096): T=4 11.4 -> 8.1
+  us, T=32 31.1 -> 13.6, T=64 50.7 -> 19.9, T=128 97.9 -> 33.4, T=256
+  193 -> 60. Correctness: residual_out bit-exact vs partials_batched at
+  every T; coefficients within 5e-7 (fp32 partial-sum grouping);
+  layer_input 1-ulp bf16 flips; tests/glm5_next/test_mhc_partials_batched
+  5/5. Rejected on measurement: transpose-reduce epilogue (31 shuffles
+  instead of 125: 2x SLOWER - 128 accumulators spilled), 8-token tiles
+  (+15-30% at every T: half the blocks, same per-block latency),
+  load-all-fn-then-compute (79 registers -> 3 blocks/SM, +10%), hoisting
+  the phase-1 activation loads (neutral). Removing either load stream in a
+  diagnostic build only saved 4-6 us at T=128: the remaining ~8 us per
+  block is fixed latency (two syncs, staged coefficients, 12 warp sums)
+  times 2.4 waves. Expected serving effect: ~4.6 ms of 49 ms per c64
+  step (9%), ~1.6 ms of 26 ms per c16 step (6%); serving A/B queued
+  (queue35: WS=1 vs WS=0, c16/c64, two repeats each).
+- mHC warp-split kernel, SERVING A/B (2026-09-12, fp8 DP2 record, exact
+  harness, two repeats per arm, raw perf/results/2026-09-10/glm53f-dflash2/
+  mhc-ws{1,0}-r{1,2}): WS=1 c64 1330.9 / 1292.5 / 1330.6 / 1302.0 vs WS=0
+  1179.2 / 1125.9 / 1159.8 / 1173.9 tok/s -> median 1316 vs 1167, +12.8%;
+  c16 733.9 / 841.9 / 865.2 / 766.9 vs 778.2 / 770.0 / 727.9 / 821.3 ->
+  median 805 vs 774, +4% (inside the c16 spread). KEPT (default on). The
+  c64 gain exceeds the kernel's own 4.6 ms/step estimate; at 32 requests
+  per replica with k=3 the 128-token verify step is now shorter than the
+  drafter+verify cadence needed to keep acceptance up, so the pipeline
+  compounds the kernel saving. New record medians queued (queue36:
+  c1..c64 x3 + canaries on the committed tree).
+- RECORD re-measured with the mHC warp-split kernel (2026-09-12): c1
+  127.1 / c8 497.0 / c16 843.9 / c32 1023.3 / c64 1320.8 tok/s, canaries
+  pass (raw perf/results/2026-09-12/glm53f-mhcws-record/). Baseline and
+  profile note updated.
+- MoE ROUTING HISTOGRAM (2026-09-12, VLLM_MOE_EXPERT_STATS=100 on the
+  record under the exact bench at c16/c64, DP0 rank 0, 42 MoE layers;
+  raw perf/results/2026-09-10/glm53f-dflash2/moe-stats2/server.log):
+  distinct experts per layer per call - <=8-token calls 27.7, 16-token
+  57.9, 32-token (c16 spec steps) 94.6 (68-146 by layer), 128-token (c64
+  spec steps) 167.0 (128-243; layers 3-6 ~240, layers 34-44 ~130-160),
+  prefill chunks (1760 tokens) 246.6. Each expert is 13.5 MB of NVFP4
+  (gate/up [2048,4096] + down [4096,2048] packed + fp8 scales), so a
+  128-token step streams 167 x 13.5 / 4 = 564 MB per rank per layer -
+  336 us at 1.7 TB/s - and the measured marlin_moe time is 191 us x 1.76
+  launches = 336 us per layer. At 32 tokens: 95 experts = 320 MB = 190 us
+  vs 210 us measured. VERDICT: the NVFP4 marlin MoE runs at the HBM
+  roofline at both production batch points; no kernel lever. The lever
+  is expert bytes per token: more tokens per step per replica (the DP2
+  layout streams each replica's active set independently; at c64 that
+  is 2 x 564 MB vs one TP8 stream of ~210 x 13.5 / 8 = 354 MB, which TP8
+  loses back on everything else), or fewer distinct experts per step.
+- Dense bf16 GEMMs at M=128 (2026-09-12): 7.6 ms of the 49 ms c64 step
+  (154 x 128x64-tile launches at 16 us, 68 x 128x128 at 42 us, plus
+  64x64 and split-K reduce kernels). cuBLAS microbench at the per-rank
+  shapes (A100, weights TB/s): M=128 4096x6144 0.93, 4096x2048 0.59,
+  4096x1536 0.49, 1536x4096 0.65, 4096x512 0.26; M=32 is 1.3-1.4 on the
+  wide shapes. CUBLAS_WORKSPACE_CONFIG variants change nothing. The ROCm
+  path routes 10-128-token GEMMs to a split-K skinny kernel (wvSplitKrc);
+  CUDA has no equivalent. Wrote csrc/quixicore/serving/
+  skinny_gemm_ampere.cuh (mma.sync m16n8k16, cp.async 3-stage, split-K
+  fp32 partials + reduce; op quixicore skinny_gemm; tests/kernels/
+  test_quixicore_skinny_gemm.py 54 pass). Result: correct and MORE
+  accurate than cuBLAS (whose bf16 split-K reduction leaves ~0.4 abs
+  error on ~300-scale outputs at K=4096 - vLLM leaves PyTorch's
+  allow_bf16_reduced_precision_reduction at its default) but not faster:
+  77 us vs 52 at 128x4096x6144, parity at 1536-wide N. Ablations: no-mma
+  77 us (loads are the limit), weights-only 48 us (1.04 TB/s),
+  activations-only 53 us (each N tile re-reads the 1 MB activation slice
+  from L2: 96 MB), compute-only 39 us; tile sweep (BN 64/128, 4/8 warps,
+  2-4 stages) within 15%. PARKED as a standalone op (not on the serving
+  path): the design that could win needs fragment-permuted activations
+  held in registers, 256-wide N tiles (4x less L2 re-read) and an 8-deep
+  weight pipeline - potential ~2.5-3 ms per c64 step (5-6%). Nsight
+  Compute is blocked on this box (ERR_NVGPUCTRPERM); enabling
+  NVreg_RestrictProfilingToAdminUsers=0 would make the next attempt far
+  cheaper.
+- Custom all-reduce algorithm A/B (2026-09-12, record, exact harness,
+  two repeats per arm; raw perf/results/2026-09-10/glm53f-dflash2/
+  ar-{1stage,default}-r{1,2}): the 128-token step's 1 MB bf16 message
+  sits above the 512 KB one-shot/two-shot crossover, so the record runs
+  cross_device_reduce_2stage (29 us p50) 90x per step. Forcing
+  VLLM_CUSTOM_ALLREDUCE_ALGO=1stage: c64 1360.7 / 1322.5 / 1359.0 /
+  1365.5 vs default 1338.3 / 1297.7 / 1324.5 / 1344.7 tok/s (median
+  1360 vs 1331, +2.2%); c16 815 vs 806 (+1%). REJECTED under the 3% keep
+  rule (consistent but small; the all-reduce is 7% of the step, so even
+  a free one-shot could not exceed ~4%). The GLM-5.3 path cannot use the
+  fused all-reduce + add + RMS norm: its residual is the mHC transition.
+- Skinny GEMM v2 attempt (2026-09-12): activations held in registers from
+  a fragment-permuted copy (one 16 B L2 load per lane per m16k16 tile,
+  double-buffered a stage ahead) with a weights-only 6-8 stage cp.async
+  pipeline: 122 us at 128x4096x6144 (0.41 TB/s), 34-60 us at the
+  1536-4096-wide shapes vs cuBLAS 18-22 - worse than v1 everywhere;
+  parity fine. REJECTED and removed; v1 stays as the parked scaffold.
+  Conclusion for this pass: the dense GEMM lever needs hardware counters
+  (Nsight Compute is blocked on this box) to iterate on; not pursued
+  further blind.
+- PASS SUMMARY (2026-09-12, glm53f-nvfp4-8, per 128-token step at c64
+  after the day's work, ~44 ms): marlin NVFP4 MoE 15 ms at the HBM
+  roofline; dense bf16 GEMMs 7.6 ms (cuBLAS, 0.3-0.9 TB/s; custom
+  kernel attempts lost); KDA spec recurrence 3.5 ms at bandwidth (per-row
+  state stores; deferred-commit runner design is the only lever, ~7%);
+  mHC 3.5 ms (partials 33 us, finalize 10 us); all-reduce 3.3 ms
+  (one-shot +2%, rejected); MLA fp8 decode 1.2 ms; sampling 0.55 ms;
+  MoE aux kernels ~0.8 ms. Kernel-level work ≥ the 3% keep rule is
+  exhausted at this batch; the remaining items are the KDA
+  deferred-commit design (runner + tier interplay) and the skinny GEMM
+  with counters.
+- PROFILER ENABLED (2026-09-12, operator: NVreg_RestrictProfilingToAdminUsers=0
+  via /etc/modprobe.d/nvidia-profiling.conf + driver reload + initramfs;
+  RmProfilingAdminOnly now 0). First readout, 128x4096x6144 bf16 GEMM:
+  cuBLAS 128x128 kernel 51 us - DRAM 52%, SM 55%, 96 CTAs of 4 warps at
+  246 registers, achieved occupancy 5.7%, 5.3 cycles per issued
+  instruction; skinny v1 77 us - DRAM 35%, 1.8 warps per scheduler with
+  0.27 eligible, 7.6 cycles per issue. Double-buffering the ldmatrix
+  fragments across k16 and a 128x128 / 2-stage tile (cfg 8) brought it to
+  57-60 us (DRAM 46%, SM 46%; stalls per issue: wait 3.2, long scoreboard
+  1.4, MIO throttle 1.0, math-pipe throttle 0.7, LG throttle 0.7, barrier
+  0.6; registers cap it at 2 blocks/SM). Both kernels are issue/latency
+  bound with <= 8 warps per SM; the compute roofline at M=128 is ~21 us
+  and the memory roofline ~30 us, so a CUTLASS-grade mainloop tops out
+  near 30-35 us: ~1.3 ms of the c64 step at best (<3%). DECISION: stop
+  the custom dense GEMM here; the op stays parked with cfg 8 as its best.
+- mHC partials_batched_ws under the profiler (T=128, 36 us): DRAM 9.5%,
+  L2 31%, SM 54%, 27 active warps per SM (42% occupancy), 0.57 issued
+  per scheduler-cycle; stalls per issue: short scoreboard 1.8 (shared
+  loads), wait 1.4, MIO throttle 1.1, math-pipe throttle 1.1, long
+  scoreboard 1.2, barrier 0.9 -> instruction-issue bound (~1500
+  instructions per thread: scalar fn/value/residual loads, bf16
+  conversions, per-token predication). Vectorizing the fn and value loads
+  (float4), the residual loads (bf16x2) and dropping the per-token
+  predicates would cut roughly 40% of the stream: ~33 -> ~22 us at
+  T=128, ~1 ms of the c64 step (about 2%). Below the keep rule on its
+  own; recorded as the next step if the mHC transition is revisited.
+- KDA SPECULATIVE PATH, deferred commit (2026-09-12, operator go-ahead).
+  Contract mapped: with speculation the aligned mamba table is
+  [batch, num_spec + 1] = bt[state_idx + t] per draft row t; the forward
+  reads column prev_accepted - 1 and stores every row's state into its
+  column; the align pre-copy reads column acc - 1 at boundary crossings
+  and the post-copy reads the boundary row's column when a block boundary
+  falls inside the accepted rows (postprocess_mamba_fused_kernel:
+  token_bias = aligned_new_computed - num_tokens_running_state). A commit
+  that runs after sampling and stores only column acc - 1 plus the
+  boundary row's column keeps every consumer valid; a commit fused into
+  the NEXT step's forward (2 traffic units) would break the boundary
+  snapshot the post-copy takes at the end of the step - rejected.
+  Kernels written and parity-tested (tests/kernels/test_kda_spec_cuda.py
+  8/8, bit-exact vs the per-row-store forward on the committed and
+  boundary columns): Triton STORE_STATES=False flag + Triton
+  fused_recurrent_kda_commit; CUDA kda_spec_kernel<MODE> (MODE 0 today's
+  contract, 1 store-free forward, 2 replay-commit), 4 lanes per state row
+  with interleaved 16 B chunks, TT-templated (4/8 rows).
+  Measured (A100, H=16, K=V=128, 32 requests x 4 rows, us):
+  | kernel | time |
+  |---|---|
+  | Triton forward, per-row stores (today) | 128 (ncu: DRAM 60%) |
+  | Triton forward, no stores | 88 (DRAM 21%, SM 50%: issue-bound) |
+  | CUDA forward, per-row stores | 136 |
+  | CUDA forward, no stores | 57-60 (ncu: occupancy 22%, 118 regs, mixed long/short scoreboard) |
+  | CUDA commit, acc=2 / acc=4 | 55 / 66 (1 read + 1 write: 1.2 TB/s) |
+  | no-store forward + commit(acc=2) | 112-117 (-9..-13% vs today) |
+  Rejected variants: one row per warp (127 us, latency-bound on 10
+  shuffles per token per row), 8 rows per warp interleaved (80 -> 57 us
+  with 4-row templating), 4 lanes per row with private 128 B runs (147 us,
+  half-sector loads), forced 80 registers (spills, 64 us).
+  Floor analysis: the recurrence does two 128x128 matrix-vector products
+  and a rank-1 update per token per head (~100M FMAs at 32 requests plus
+  a cross-lane reduction per row per token), so the store-free forward
+  floors near 40-50 us, not at the 24 us memory floor; the deferred
+  commit is therefore worth ~25% of the KDA speculative cost at best
+  (~0.9 ms of the 44 ms c64 step, 2%; ~3.5% at c16) and needs the runner
+  plumbing (per-layer retained inputs, a post-sampling commit launch
+  inside/after the captured graph). DECISION: not wired; kernels kept as
+  tested diagnostics. The only larger lever left on this path is the
+  fused next-step commit (2 units) with the boundary snapshot moved to
+  after the replay, which is an align state-machine redesign.
+
+## 2026-09-12 THROUGHPUT PROGRAM: glm53f-nvfp4-8 to the practical maximum (operator: "world's fastest GLM-5.3-Flash NVFP4 on 8x A100")
+
+Metrics. (1) Registry exact-token medians (1000 in / 300 out, one batch
+of N requests, wall clock incl. prefill and drain) stay the record's
+comparability number. (2) NEW primary target: sustained output tok/s under
+continuous load, `vllm bench serve` random dataset 1000/300, 640 prompts,
+max-concurrency 64 and 128 (steady state dominates; continuous prefill is
+production-like). (3) WildChat deep-context leg tok/s and recall as the
+production-shape check. Note from the record log: during the exact c64
+batch each replica holds only 13-18 running requests at a time (prefill
+ramp, then drain) and the engine's own generation rate reads ~1.8K tok/s
+while the harness reports 1.3K - the exact number is prefill-heavy.
+Phases, by value over risk:
+1. Batch shape and draft length (measurement only): exact c64/c96/c128;
+   k=4 and k=2 at all batch sizes vs the record's k=3 (<=16) / 0 (17-64)
+   schedule (queue40). Then sustained-load baselines at c64/c128.
+2. Dense weight quantization: ~10 GB of bf16 attention/KDA/indexer weights
+   per model (2.5 GB per rank) stream through cuBLAS at 0.3-0.9 TB/s; fp8
+   weight-only marlin (W8A16, online quantization of the bf16 checkpoint
+   weights, the fp8 path vLLM already uses on Ampere) halves the bytes.
+   Quality gates: canaries, recall probes, exact medians; an accuracy
+   decision for the operator.
+3. Micro-batch overlap: the step is ~34% HBM-streaming MoE and ~66%
+   compute-bound kernels at 20-50% DRAM; two half-batches on two streams
+   overlap one's MoE stream with the other's attention/dense compute.
+   Runner + CUDA-graph redesign; design pass first.
+4. Prefill: the record's prompt throughput during the c64 ramp reads
+   4.8-12K tok/s per replica; a prefill-step profile decides whether the
+   indexer/sparse path or the MoE at large M is the limiter.
+- Phase 2 (dense weight quantization) REJECTED by microbench (2026-09-12):
+  fp8 weight-only marlin (W8A16, the path vLLM's Fp8LinearMethod takes on
+  Ampere) vs cuBLAS bf16 at the per-rank dense shapes: M=32 0.27-1.25x
+  (only 4096x6144 wins), M=128 0.39-0.79x - slower everywhere that
+  matters (marlin's tiles are built for M <= 16-64 and 4-bit weights).
+  Halving the dense weight bytes only pays with a purpose-built W8A16
+  kernel for M=32-128, which is the same skinny-GEMM problem already
+  closed today. Raw: ~/.local/scratch/glm53/fp8_marlin_bench.py.
+- Standalone audit (operator directive 2026-09-12): every custom kernel
+  lives under csrc/quixicore/ (serving/*.cuh, tm_cuda/*.cu) and is built
+  by this repo's CMake target _quixicore_C, loaded as vllm._quixicore_C
+  through vllm/quixicore/ops.py; all includes resolve inside csrc/
+  (quixicore + libtorch_stable); no Python imports anything from
+  ~/QuixiCore. The QuixiCore-CUDA repo only receives ports of finished
+  kernels and is not a build or runtime dependency.
+- PHASE 1 (2026-09-12, queue40, exact harness, two boots x two runs, raw
+  perf/results/2026-09-10/glm53f-dflash2/shape-*): the engine DISABLES a
+  per-batch-size draft schedule under data parallelism (vllm.py: "Dynamic
+  speculative decoding is not supported with data parallelism ... falling
+  back to static num_speculative_tokens"), so the record has always run a
+  fixed k=3 at every batch size; its [[1,16,3],[17,64,0]] field was inert.
+  Fixed k on the record: k=2 c64 1392/1429/1465/1412, c128 1679/1523/1649/
+  1613 (acceptance 2.10 of 3); k=3 c64 1349/1362/1395/1397, c128 1454/
+  1537/1596/1638 (2.19 of 4); k=4 c64 1195/1237, c128 1420/1344 (2.26 of
+  5). k=2 leads k=3 by 3-4% at both points (inside the 5-10% boot spread
+  at c96/c128 but consistent), k=4 loses 13%. c128 is +12-16% over c64
+  (MoE bytes amortize). Guard relaxed for replicated-MoE DP (replicas
+  never synchronize), so a per-replica dynamic schedule is available
+  again. Decision deferred to the sustained-load metric (queue41 k=3
+  baseline, queue45 k=2).
+- SUSTAINED-LOAD BASELINE (2026-09-12, queue41, `vllm bench serve` random
+  1000/300 +-20%, 10 x concurrency prompts, ignore_eos, record k=3; raw
+  perf/results/2026-09-12/glm53f-sustained-base/): c64 1139.9 / 1157.4
+  output tok/s (TPOT 51 ms), c128 1424.6 / 1425.8 (TPOT 82 ms).
+  Reproducible within 2% (the exact harness spreads 5-10% at c96+), so
+  this is the program's primary number. c128 gives +25% throughput for
+  +60% per-token latency. Under continuous arrivals the prefill of new
+  prompts runs inside the decode steps, which is the production shape
+  without prefix hits.
+- PHASE 3 premise REJECTED (2026-09-12, queue42, ~/.local/scratch/glm53/
+  overlap_probe.py): a DRAM-bound reduction over 512 MB (328 us, 1.64
+  TB/s) and 24 cuBLAS bf16 GEMMs at M=128 (730 us) on two CUDA streams run
+  in 1070 us against 1045 us serial (ideal overlap 30%). Grid-filling
+  kernels time-slice on A100 rather than co-schedule, so a two-micro-batch
+  runner could not hide the MoE weight stream behind attention compute;
+  it would need SM partitioning (green contexts), which Ampere lacks.
+  Micro-batch overlap is dropped from the program.
+- W8A16 CUSTOM KERNEL (operator ask, 2026-09-12): csrc/quixicore/serving/
+  w8a16_gemm_ampere.cuh - fp8 e4m3 weights per-channel scaled, packed once
+  into mma fragment order ([k_tile][n_quad][lane][4 tiles x 4 B], one
+  16 B shared load per lane feeds four n8k16 B fragments), Marlin's 7-op
+  e4m3 -> fp16 relocation with the 2^8 folded into the scale, bf16
+  activations converted once to fp16 and streamed with cp.async, mma
+  m16n8k16 f16, split-K fp32 partials + reduce; pack/dequant kernels; op
+  quixicore w8a16_gemm; linear method QcW8A16LinearMethod (load-time
+  quantization of the checkpoint's bf16 dense layers, decode on the
+  kernel, prefill via dequant + cuBLAS) behind VLLM_QC_DENSE_W8A16 / the
+  glm5_next_dense_w8a16 flag; tests/kernels/test_qc_w8a16.py 113/113.
+  Iterations at 128x4096x6144 (idle A100, cuBLAS bf16 52 us):
+  | variant | gemm us |
+  |---|---|
+  | v1: 32-row warps, in-loop A conversion, 16 LDS.32 per k16 | 85 |
+  | A pre-converted + cp.async | 78 |
+  | quad-packed B (4 LDS.128 per k16), fragments a k-step ahead | 77 |
+  | 8-warp tiles, 4 stages | 78-98 |
+  | Marlin byte order (7 ALU ops per 4 values instead of ~10) | 61 |
+  | 64x64 warp tiles (4 mma per dequantized fragment) | 54.3 (+9 reduce) |
+  | last-CTA serial split-K reduction | 126 (few tiles reduce alone) |
+  | fp32 atomic accumulation | 96 (same-address contention) |
+  Nsight on the 64x64 variant: tensor pipe 37% busy, 1.7 warps per
+  scheduler, dominant stall "wait" (fixed-latency mma chain), instruction
+  mix per warp per k16: 16 HMMA + ~44 ALU/IMAD + 6 loads. Mid shapes
+  (N = 512-2048) stay at 0.7-0.87x cuBLAS; the reduce kernel's partial
+  traffic (2 x splits x M x N x 4 B, bandwidth-bound) costs 6-10 us.
+  VERDICT: parity with cuBLAS on the widest shape, slower on the rest -
+  the halved weight bytes do not pay because the kernel is tensor-issue
+  bound at M=128 with <= 8 warps per SM, exactly cuBLAS's regime. Not
+  wired into serving (a numerics change with no decode gain; the 1.25
+  GB/rank memory saving alone is not worth it). The remaining known
+  step is a stream-K work split (no partial traffic, whole tiles
+  written in-CTA) plus deeper register pipelining - CUTLASS-grade work.
+- RECORD at fixed k=2 (2026-09-12, queue46): canaries pass; exact medians
+  c1 128.0 / c8 567.1 / c16 875.6 / c32 1110.0 / c64 1413.8 (k=3: 127.1 /
+  497.0 / 843.9 / 1023.3 / 1320.8); WildChat leg 785 turns / 0 errors /
+  126/126 recall / 658K max ctx (k=3 leg: 737 turns). Baseline and
+  profile note updated. The k=2 flip is the day's largest serving gain:
+  +7-14% exact at c8-c64, +17-22% sustained at c64/c128.
+- PREFILL PROFILE (2026-09-12, queue47, 32 requests x ~3K-token prompts,
+  1 output token, torch profiler on DP0 rank 0; raw ~/.local/scratch/
+  glm53/prof-prefill-c32): window 6.9 s, 97% kernel-busy, 19 chunked
+  prefill steps of ~2.5K tokens per replica (~7K tok/s per replica).
+  Shares: sparse MLA attention via the DECODE kernel mla_decode_fp8_v
+  38.9% (209 launches x 12.4 ms: every query token streams its own
+  top-2048 keys, ~1 MB per token per layer), marlin NVFP4 MoE 21.4% +
+  3.4% (75 ms per step), mHC partials 8.3% + finalize 2.8%, dense bf16
+  GEMMs ~10% (256x128 tiles: compute-bound, fine), NCCL all-reduce 5.2%
+  (the 2.5K-token messages go to NCCL, 350 ms), KDA chunk kernels ~2%.
+  TARGET: a prefill-shaped sparse attention kernel (block of queries x
+  union of their selected keys on tensor cores with a per-query mask)
+  replaces the per-token decode kernel; the attention share should drop
+  from 39% to ~10%, i.e. prefill ~1.4x faster, which feeds the sustained
+  metric directly.
+- SPARSE MLA PREFILL KERNEL (2026-09-12): csrc/quixicore/serving/
+  mla_sparse_prefill_kernels.cuh + op mla_sparse_prefill_fp8, dispatched
+  from the sparse backend's MQA forward for chunks with prefill tokens
+  (flag glm5_next_sparse_prefill, env VLLM_QC_SPARSE_PREFILL override).
+  Design: CTA per 4 consecutive queries x 16 local heads (64 rows), the
+  prep kernel sorts the (physical pool, query, token-bit) entries of the
+  4 index lists (bitonic sort in smem, block scan) into a union pool list
+  + 4-bit masks; tiles of 8 pools (32 keys) dequantized e4m3 -> bf16 into
+  smem once and used by Q.K^T (ldmatrix) and P.V (ldmatrix.trans); the
+  warp pair of a query splits the 512-dim reduction and swaps partial
+  scores through smem; FA2 online softmax in fp32, kv_scale folded into
+  q and applied to O. Parity: tests/kernels/test_quixicore_sparse_prefill
+  5/5 vs the torch reference (< 5e-3), sparse decode tests still 23/23.
+  Microbench (worst case, random non-overlapping pools): 1.7-2.0x the
+  decode kernel; real prefill has heavy pool overlap between neighbours.
+  Serving A/B (same protocol, one run per arm, k=2 record): sustained
+  c64 1508 vs 1417 (+6.4%), c128 1864 vs 1674 (+11.3%); exact c8/c16/c64
+  within spread (prefill is one burst there); canaries pass both arms.
+  KEPT (default on). Semantics note: duplicate indices (tail inside a
+  selected pool) count once, twice in the decode kernel. Prefill profile
+  and WildChat leg with it on: queue49.
+- LEG with the sparse prefill kernel (2026-09-13 00:00): 845 turns / 0
+  errors / 135/135 recall / 704K max ctx (785 turns at k=2 without it,
+  737 at k=3). Baseline updated: the record's sustained numbers are now
+  c64 1508 / c128 1864 output tok/s (from 1140-1157 / 1425 at the start
+  of the program: +30% / +31%).
+- PREFILL PROFILE with the sparse prefill kernel (2026-09-13, same load as
+  queue47; raw ~/.local/scratch/glm53/prof-prefill-c32-sp): window 6870
+  -> 5009 ms (-27%); attention 2597 ms (decode kernel) -> 392 ms attn +
+  317 ms prep (3.7x). New shares: marlin MoE 29.8% + 4.7%, mHC partials
+  11.5%, dense 256x128 GEMMs 8.5%, attention 8.2%, NCCL all-reduce 7.4%,
+  prep 6.6%. The prep (bitonic sort of 4 x 2080 token entries per group)
+  is 45% of the attention cost: the index lists are pool-contiguous, so
+  compacting each query's tokens to pool starts before sorting shrinks
+  the sorted set ~8x (next).
+- Sparse prefill prep kernel, run-compaction (2026-09-13): each query's
+  token entries are compacted to pool-run starts (bits gathered by a
+  forward scan) with a block scan before the bitonic sort, so the sort
+  covers ~2K keys instead of 16K: prep 1.96 -> 0.22 ms at 512 queries,
+  4.85 -> 0.64 ms at 2048 (attention 3.7 / 13.7 ms); tests 5/5. In the
+  prefill profile the prep share (6.6%) drops to under 1%.
 
 ## 2026-09-11: GLM-5.3-Flash NVFP4 on 4x RTX PRO 6000 Blackwell (rtx6000): Phase 0 baseline and control
 

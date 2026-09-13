@@ -691,6 +691,8 @@ class MoERunner(MoERunnerInterface):
                 )
             else:
                 topk_weights, topk_ids = preselected
+            if self._expert_stats is not None:
+                self._expert_stats.record(topk_ids)
             if deferred is not None:
                 entry = combine_shared.SharedOutput(topk_ids, *deferred)
                 combine_shared.publish(entry)
@@ -956,6 +958,24 @@ class MoERunner(MoERunnerInterface):
             return shared_output, hidden_states
         else:
             return hidden_states
+
+    @property
+    def _expert_stats(self):
+        st = self.__dict__.get("_expert_stats_obj", False)
+        if st is False:
+            from vllm.model_executor.layers.fused_moe.expert_stats import (
+                make_expert_stats,
+            )
+
+            name = getattr(self.routed_experts, "layer_name", None) or f"runner-{id(self):x}"
+            num_experts = getattr(self.routed_experts, "global_num_experts", 0)
+            try:
+                device = next(p.device for p in self.routed_experts.parameters())
+            except Exception:
+                device = torch.device("cuda")
+            st = make_expert_stats(name, int(num_experts or 0), device)
+            self.__dict__["_expert_stats_obj"] = st
+        return st
 
     def _forward_impl(
         self,
