@@ -2642,3 +2642,28 @@ Gate: mean text logprob -2.420 / -2.431 (band -2.407..-2.478), needle margins
 positive, canaries text / tool / image pass, exact-token true everywhere.
 Details, attribution and raw paths: `perf/optimization_status.md`, entry
 "2026-09-11: GLM-5.3-Flash NVFP4 on 4x RTX PRO 6000 Blackwell (rtx6000)".
+
+## GLM-5.3-Flash NVFP4 on 4x RTX PRO 6000 Blackwell (rtx6000 record), 2026-09-12 campaign record
+
+Record of `glm53f-nvfp4-4` / `rtx6000` at the end of the campaign (branch
+`glm53f-rtx6000` 4c1e0a90f, upstream/main 9d76a981b merged), same protocol as
+the Phase 0 baseline above: exact-token 1000/300, three passes per boot,
+median. Record settings: Marlin NVFP4 experts with the fused route+align and
+folded shared-expert combine, QuixiCore M<=16 decode GEMMs, FP8 swap-set and
+F32 sidecars, compact indexer cache, sparse TC prefill rows kernel, custom
+all-reduce over PCIe with a 64 MiB buffer, DFlash2 k=3 probabilistic/block
+under `--spec`.
+
+| arm | c1 | c8 | c16 | cold TTFT 32K / 128K | warm TTFT 32K / 128K |
+|---|---:|---:|---:|---|---|
+| record, no speculation | 166.2 | 581.5 | 778.0 | 3.14 s / 13.1 s | 0.174 s / 0.354 s |
+| record, DFlash2 k=3 probabilistic + block | 218.0 | 598.1 | 848.4 | 3.16 s / 13.3 s | 0.296 s / 0.544 s |
+| Phase 0 baseline, no speculation | 113.3 | 449.2 | 611.0 | 11.8 s / 124 s | |
+| control r28.1, no speculation | 166.5 | 687.9 | 966.8 | 2.93 s / 14.9 s | |
+| control r28.1, MTP-3 | 260.8 | 732.1 | 1005.8 | | |
+
+Gates: no-spec -2.452 / -2.439, spec -2.446 / -2.477 (band -2.407..-2.478; the second gate of
+each boot runs warm on prefix-cache hits), needle margins positive, canaries
+text / tool / image pass, exact-token true everywhere. Every item behind the
+row: `perf/optimization_status.md` from the 2026-09-11 rtx6000 entry to
+"Item P6"; the campaign index is `docs/glm53f-rtx6000-campaign.md` section 12b.

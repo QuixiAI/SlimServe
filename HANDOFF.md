@@ -4,24 +4,23 @@
 > Metal. Earlier TurboQuant directives and measurements below are historical.
 > See `perf/optimization_status.md` for current validation evidence.
 
-# HANDOFF — GLM-5.3-Flash NVFP4 on 4x RTX PRO 6000 Blackwell (`glm53f-nvfp4-4` / `rtx6000`), branch `glm53f-rtx6000` (opened 2026-09-11, draft for review)
+# HANDOFF — GLM-5.3-Flash NVFP4 on 4x RTX PRO 6000 Blackwell (`glm53f-nvfp4-4` / `rtx6000`), branch `glm53f-rtx6000` (campaign complete 2026-09-12, PR open)
 
-The full regimen, rubric, roadmap and the post-mortem of the previous
-(deleted) sm_120 campaign are in `docs/glm53f-rtx6000-campaign.md`. Read
-that file first; this section is only the pointer and the one-paragraph state.
+The regimen, rubric, the log of every phase and the next command are in
+`docs/glm53f-rtx6000-campaign.md` (section 12b is the log, 13 the next
+command); every measurement is in `perf/optimization_status.md`. This section
+is the pointer and the one-paragraph state.
 
-State: branch cut from upstream/main 2b355117e; no code changes; the `.so`
-files in `vllm/` are stale (built from the deleted branch) and must be rebuilt
-for `12.0f` before any serving. Previous campaign's best on this box (no
-speculation, exact-token 1000/300): c1 162.8 / c8 534.5 / c16 691.0 tok/s
-from a 104.8 / 431.4 / 591.0 bring-up baseline; its retained pieces are
-listed in the campaign doc section 1d with a salvage recommendation awaiting
-the operator's decision. Next command: the Phase 0 native build
-(`~/.local/scratch/slimserve-glm53/rebuild.sh`), then platform + record +
-baseline.
+State: tree 4c1e0a90f (upstream/main 9d76a981b merged). Exact-token 1000/300
+medians, no speculation: c1 166.2 / c8 581.5 / c16 778.0 tok/s from the
+113.3 / 449.2 / 611.0 bring-up baseline; cold TTFT 32K 3.14 s (from 11.8 s),
+128K 13.1 s (from 124 s); warm 0.174 s / 0.354 s. With the record's
+DFlash2 speculator (`--spec`): 218.0 / 598.1 / 848.4. Gates in band, canaries
+pass. Next: the PR's review, then the QuixiCore-CUDA port of the retained
+kernels and the Phase 2 backlog (native sm_120 NVFP4 expert kernel first).
 
 <!--
-Two active campaign handoffs live in this file. They cover different
+The campaign handoffs in this file cover different
 platforms and different hardware, and each is current for its own campaign;
 neither supersedes the other. They met on this file in the 2026-08-28 merge
 of origin/main and were joined rather than reconciled.
@@ -29,6 +28,7 @@ of origin/main and were joined rather than reconciled.
   1. NVFP4-on-Metal campaign (M1 Ultra / M5 Max)  -- section below
   2. MI300X GGUF profile record                   -- second section
   3. GLM-5.3-Flash on 8x A100 (glm53f-*)          -- third section, at EOF
+  4. GLM-5.3-Flash on 4x RTX PRO 6000 (rtx6000)     -- the section above this comment
 -->
 
 # HANDOFF — NVFP4-on-Metal campaign (updated 2026-08-25; CAMPAIGN COMPLETE through UPDATE 55 — PR #12 open, origin/main merged and re-gated bit-exact, QuixiCore-Metal port landed)

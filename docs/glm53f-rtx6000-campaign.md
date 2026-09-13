@@ -1,8 +1,10 @@
 # GLM-5.3-Flash NVFP4 on 4x RTX PRO 6000 Blackwell (sm_120): campaign handoff
 
-Status: DRAFT FOR REVIEW, 2026-09-11. Branch `glm53f-rtx6000`, cut from
-`upstream/main` 2b355117e (QuixiAI/SlimServe, 2026-09-11). No code changes yet.
-This document is the regimen, the rubric and the roadmap for the campaign. The
+Status: CAMPAIGN COMPLETE 2026-09-12 (Phases 0-6; section 12b is the log,
+section 13 the next command). Branch `glm53f-rtx6000`, cut from `upstream/main`
+2b355117e (QuixiAI/SlimServe, 2026-09-11), merged with upstream/main 9d76a981b
+on 2026-09-12. Sections 0-11 are the regimen, rubric and roadmap as written
+before the work; where a result overrides them, the log wins. The
 running notebook is `perf/optimization_status.md`, record rows go in
 `perf/baseline_status.md`, raw logs under `perf/results/YYYY-MM-DD/<run-id>/`.
 
@@ -165,6 +167,9 @@ Exported copies of the KEEP set: `~/.local/scratch/slimserve-glm53/salvage/`
 are deleted; the PR heads remain on GitHub as `refs/pull/{24..28}/head`.
 
 ## 2. Where the tree stands (upstream/main 2b355117e, 2026-09-11)
+
+(As found on 2026-09-11; the branch merged upstream/main 9d76a981b on
+2026-09-12, see section 12b.)
 
 GLM-5.3-Flash on A100 (`glm53f-nvfp4-4` TP4, `glm53f-nvfp4-8` TP4 x DP2 with
 replicated MoE) is an active campaign on the 8x A100 box; its handoff is the
@@ -885,13 +890,47 @@ microbench GB/s and an e2e entry.
   VLLM overrides in the shell, systemd user session, or fish config; 188 GB
   RAM, earlyoom at 8 % free.
 
+## 12b. Phases 1-6 log (2026-09-11 .. 2026-09-12)
+
+Every item below has its notebook entry in `perf/optimization_status.md`
+(hypothesis, correctness, three-pass numbers, decision, raw artifacts); this
+is the index. Numbers are exact-token 1000/300 medians, c1 / c8 / c16 tok/s,
+no speculation unless marked.
+
+Decode (Phases 1-2), cumulative on the 113.3 / 449.2 / 611.0 baseline:
+- Item 2, custom all-reduce over PCIe (`VLLM_CUSTOM_AR_ALLOW_PCIE=1`): 122.9 / 468.2 / 640.9. RETAINED.
+- Item 3, bf16 M<=16 tensor-core decode GEMMs on the backbone: 124.0 / 472.0 / 641.4. RETAINED.
+- Item 4a, FP8 swap-set (native e4m3 block tensors for the dense MLP, shared experts, DSA q_b/o_proj): 130.7 / 481.1 / 651.1. RETAINED.
+- Item 4b, FP8 KDA projections (self-quantized) with the extended quality gate: 144.7 / 501.1 / 671.2. RETAINED.
+- Item 5, sparse MLA decode with 32/64-token partitions and the channel-parallel reducer: 149.3 / 501.3 / 677.6. RETAINED.
+- Item 7a, FP32 router logits through cuBLAS bf16 x bf16 -> fp32: 150.8 / 506.2 / 679.0. RETAINED.
+- Item 7b, fused mHC norm: 142.3 / 491.9 / 666.4. REJECTED.
+- Item 8, FP8 main KV on the 11 sparse-MLA layers: 148.2 / 489.5 / 650.6 (c16 -4.7 %). REJECTED (twice: see Phase 6).
+- Item 6, fused route+align and the shared-expert combine on the Marlin MoE path: 154.7 / 510.9 / 682.8. RETAINED.
+- Item 9, split SIMT mHC transition on every CUDA part: 157.6 / 519.6 / 688.8. RETAINED.
+- Item 10, fused top-k / top-p / Gumbel-max sampler: 160.7 / 527.6 / 699.9. RETAINED.
+- Not attempted (time-boxed out): the native sm_120 NVFP4 expert kernel, a fused KDA decode kernel, the sparse tensor-core decode retune for 99 KB of shared memory.
+
+Speculation (Phase 3, `--spec`, DFlash2 drafter): k=3 vs k=5 (180.5 / 464.7 / 635.4 vs 161.9 / 417.6 / 353.8); k=3 probabilistic draft sampling 211.3 / 536.2 / 741.6 (RETAINED); block verification with greedy drafting NEUTRAL; k=3 probabilistic + block 239.0 / 532.0 / 729.2 (RETAINED, the record's `speculative_overrides`). The checkpoint's MTP head is not served by this tree. Foundry structured c8: no-spec 387.4 / 421.7 vs spec 399.4 / 468.6 tok/s (accepted 1.59 / 1.57 per step). Spec-mode c1 spreads +-20 % between passes (a 300-token reply takes ~1.5 s); c8/c16 decide.
+
+Prefill (Phase 5), cold TTFT 32K / 128K from 11.6 s / 124 s:
+- Item P1, compact GLM indexer cache qualified on sm_120: 5.31 s / 22.0 s, decode +2 %. RETAINED. Its follow-up found and fixed two hybrid KV cache coordinator defects (hash-granular hits when a group's block is coarser than the hash block; every manager caches at the hit granularity): the cache had a 0 % prefix hit rate before, warm 32K now 0.17 s (0.36 s under the speculator).
+- Item P2 / P5, TP row-sharded indexer scoring at decode / prefill: within noise. REJECTED, code removed.
+- Item P3, custom all-reduce buffer 64 MiB (`VLLM_CUSTOM_AR_MAX_SIZE_MB=64`): 4.70 s / 19.6 s with P1, c8 +3 %. RETAINED.
+- Item P4, `NCCL_PROTO=Simple`: within noise. REJECTED.
+- Upstream merge (9d76a981b: batched warp-split mHC partials, scheduler and host-tier fixes, fp8 prefill pieces): 4.14 s / 17.2 s, c8 +3.2 %, c16 +4.8 %.
+- Item P6, prefill-shaped sparse MLA tensor-core rows kernel (`sparse_tc_nope_rows`, bf16 latents): cold 32K 4.14 s -> 3.13 s, 128K 17.2 s -> 13.2 s, decode +0.3 / +1.4 / +1.2 %. On the record (`glm5_next_sparse_tc_prefill`).
+- Item 8 again with upstream's fp8 sparse prefill kernel: gate -10.3, the kernel's 116 KB of shared memory does not fit sm_120's 99 KB and the binding launched it unchecked; the binding now fails loudly and the Python side skips the kernel on such devices. REJECTED.
+
+Final record (2026-09-12, tree 4c1e0a90f): no speculation 166.2 / 581.5 / 778.0, cold TTFT 32K 3.14 s, 128K 13.1 s, warm 0.174 s / 0.354 s; `--spec` 218.0 / 598.1 / 848.4, cold 3.16 s / 13.3 s, warm 0.296 s / 0.544 s. Gates in band, canaries pass. Against the unhandicapped B12X control (166.5 / 687.9 / 966.8, MTP-3 260.8 / 732.1 / 1005.8, cold 2.93 s / 14.9 s): c1 at parity without speculation and ahead with it, c8 at 83 %, c16 at 79 %, cold 32K prefill 1.4x slower (was 4.0x).
+
+Phase 6: failed paths deleted (row sharding, the rows kernel's fp8 branch, the diagnosis kill switches), the diff against upstream/main reviewed for dead code and drift, the branch's own hunks formatted with the pinned ruff, notes on the record rewritten, PR opened against QuixiAI/SlimServe main. The four `tests/slimserve/test_profiles.py` failures predate the branch (the Metal `glm53f-q2-1` record's undefined `glm53f-gguf` source and its KV note).
+
 ## 13. Next command
 
 ```bash
 cd ~/Lazarus/SlimServe && git branch --show-current   # glm53f-rtx6000
-# Phase 0 done 2026-09-11. Phase 1 item 1 (FP8 backbone + decode GEMMs) starts from
-# the salvage set: ~/.local/scratch/slimserve-glm53/salvage/ ; measure with
-# CANARY=1 GATE=1 STATE=1 PASSES=3 bash ~/.local/scratch/slimserve-glm53/ab.sh <run> -- --no-spec       # full 12.0f build of this tree (73 min; GPUs idle)
+gh pr view --web                                       # the open PR; work CodeRabbit's review
 ```
 
-Then Phase 0 items 2-5, in that order, each with its notebook entry.
+After the PR: port the retained kernels to QuixiCore-CUDA (decode GEMMs, route+align, moe_sum_add, topk_sample, the rows kernel), then the Phase 2 backlog on this box in this order: the native sm_120 NVFP4 expert kernel (the control's c8/c16 lead), a 32-row-Q sm_120 variant of the fp8 sparse prefill kernel together with a re-measure of FP8 main KV, the host + NVMe KV tiers with the eviction-restore acceptance, TP2 vs TP4 once.

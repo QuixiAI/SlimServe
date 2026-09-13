@@ -26953,3 +26953,34 @@ reductions still went to NCCL.
 - Raw: `perf/results/2026-09-12/p6-tcprefill-nospec-pass{1,2,3}/`, gates
   `p6-tcprefill-nospec-gate{1,2}.json`, `serve-logs/{ab,ttft}-p6-tcprefill-nospec.out`,
   `serve-logs/queue-h.out` (microbench lines), `queue-i.out` (17 passed).
+
+### Final record arms (p7-final-nospec, p7-final-spec): the campaign's closing numbers on the final tree
+
+- Tree: 4c1e0a90f (upstream/main 9d76a981b merged; `_quixicore_C` rebuilt
+  with the fp8 sparse prefill checks; the branch cleanup and the P6 flag on
+  the record). Every GPU kernel test of the branch passes on this build
+  (rows 17, sparse MLA bf16 27, route+align 11, shared hand-off 3,
+  moe_sum_add 35, topk_sample 18, decode GEMM 44 + 45, KDA decode 8, mHC
+  batched partials 5; the fp8 sparse prefill test skips with the
+  shared-memory reason).
+- No speculation (boot 19:16): c1 165.9 / 166.2 / 166.3, c8 582.0 / 581.1 / 581.5, c16
+  777.0 / 781.6 / 778.0; medians 166.2 / 581.5 / 778.0. Cold TTFT 32K
+  3.14 s, 128K 13.1 s; warm 0.174 s / 0.354 s. Gates
+  -2.452 / -2.439.
+- DFlash2 k=3 probabilistic/block (boot 19:21, `--spec`): c1 218.0 / 218.9 / 214.2,
+  c8 579.2 / 618.7 / 598.1, c16 862.3 / 839.9 / 848.4; medians 218.0 / 598.1 / 848.4.
+  Cold TTFT 32K 3.16 s, 128K 13.3 s; warm 0.296 s /
+  0.544 s. Gates -2.446 / -2.477 (the warm gate at the band's
+  low edge, -2.478; every other spec gate of the campaign sat inside it).
+- Against the bring-up baseline (113.3 / 449.2 / 611.0, cold 11.8 s /
+  124 s): c1 +47 %, c8 +29 %, c16 +27 % without speculation; +92 % / +33 % /
+  +39 % with it; cold 32K prefill 3.8x faster, 128K 9.4x. Against the
+  unhandicapped B12X control (166.5 / 687.9 / 966.8, MTP-3 260.8 / 732.1 /
+  1005.8, cold 2.93 s / 14.9 s): c1 at parity (no-spec) and 84 % of the
+  control's MTP-3 (spec), c8 85 %, c16 80 % (88 % under speculation), cold
+  32K 1.07x the control's, 128K faster than the control's.
+- Canaries pass on both boots, `exact: true` on all eighteen runs. These
+  two arms are the record rows in `perf/baseline_status.md`.
+- Raw: `perf/results/2026-09-12/p7-final-{nospec,spec}-pass{1,2,3}/`, gates
+  `p7-final-{nospec,spec}-gate{1,2}.json`, `serve-logs/{ab,ttft}-p7-final-*.out`,
+  `serve-logs/queue-j.out` (build and test lines).
