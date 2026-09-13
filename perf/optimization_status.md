@@ -26888,3 +26888,68 @@ reductions still went to NCCL.
 - Raw: `perf/results/2026-09-12/p6-fp8kv-nospec-pass{1,2,3}/`, gates
   `p6-fp8kv-nospec-gate{1,2}.json`, `serve-logs/{ab,ttft}-p6-fp8kv-nospec.out`,
   `serve-logs/queue-h.out` (the test line).
+
+### Post-merge baseline (p6-merge-base-nospec): upstream/main 9d76a981b merged into the branch
+
+- What the merge brings to this record: the batched warp-split mHC partials
+  (`QC_MHC_PARTIALS_WS`, default on; the T > 1 prefill steps take the
+  batched path), the scheduler's hybrid invalid-block fix, the host-tier
+  hash fix, and the fp8 main KV pieces measured in the entry above. Same
+  record settings as p5-record-nospec (compact cache, 64 MiB AR).
+- Result (boot 18:59, no-spec, TTFT + 2 gates + 3 passes): c1 162.5 /
+  166.0 / 165.7, c8 572.3 / 572.8 / 572.6, c16 767.2 / 764.4 / 765.8;
+  medians 165.7 / 572.6 / 765.8 against p5-record-nospec 163.8 / 555.0 /
+  730.9 (c1 +1.2 %, c8 +3.2 %, c16 +4.8 %). Cold TTFT 32K 4.14 s (from
+  4.70 s, -12 %), 128K 17.2 s (from 19.6 s, -12 %); warm 0.177 s / 0.362 s.
+  Gates -2.469 / -2.452 (in band), canaries pass, `exact: true` on all
+  nine runs.
+- Reading: the prefill gain is upstream's batched mHC partials (Phase 5
+  attribution 2 had the mHC partials at 16.5 % of the cold 32K), the c8/c16
+  gain the same kernel on the verify-sized steps. This is the baseline for
+  the P6 prefill kernel arm below.
+- Raw: `perf/results/2026-09-12/p6-merge-base-nospec-pass{1,2,3}/`, gates
+  `p6-merge-base-nospec-gate{1,2}.json`, `serve-logs/{ab,ttft}-p6-merge-base-nospec.out`.
+
+### Item P6: prefill-shaped sparse MLA tensor-core kernel (`sparse_tc_nope_rows`, `glm5_next_sparse_tc_prefill`) - RETAINED (record setting)
+
+- Baseline: p6-merge-base-nospec above (cold 32K 4.14 s, 128K 17.2 s; c1 /
+  c8 / c16 165.7 / 572.6 / 765.8). Phase 5 attribution 2 had the sparse MLA
+  of the prefill chunks at 24 % of the cold 32K: the per-token SIMT decode
+  kernel (`mla_decode_fp8_v`, one warp per head x token) walking each row's
+  2,080-wide list once per head, 55 launches x 22.7 ms.
+- Hypothesis: one Triton program per query token, all 16 heads at once,
+  online softmax over the row's index list in 32/64-row gathered tiles
+  (each tile read once for every head), the query held transposed [512,
+  16] so the gathered tile is the A operand of both dots and no transposed
+  copy is needed inside sm_120's 99 KB of shared memory; fp32 softmax with
+  split bf16 probabilities (the decode TC kernel's numerics). No partition
+  scratch, so it scales to chunks of thousands of rows. bf16 latents only:
+  an fp8 main KV takes the native fp8 prefill kernel (the fp8 decode branch
+  asked 147 KB of shared memory at tile 64 and duplicated that kernel; it
+  was removed).
+- Correctness: `tests/glm5_next/test_sparse_tc_prefill_rows.py` (17 tests):
+  parity with the pure-torch reference and with the native SIMT kernel at
+  1 / 7 / 64 / 257 rows with growing visible prefixes, -1 gaps and halved
+  lengths, 8 and 16 heads, tile 32 and 64 (atol 0.002 / 0.004), packed-slab
+  page strides against the partitioned decode TC kernel. (The first run of
+  the parity test failed 13/18 against the native kernel: the test had
+  called it with page_stride_bytes=0 on a strided view; the rows kernel
+  matched the reference throughout.) Gates on the arm -2.450 / -2.464 (in
+  band, gate2 warm), canaries pass, `exact: true` on all nine runs.
+- Microbench (GPU 0, 32K context, H=16, 2,080-wide lists, 7,616 rows = the
+  last chunk of a 32K prompt): native SIMT unpartitioned 25.91 ms, rows
+  kernel tile 32 7.85 ms, tile 64 7.05 ms (3.7x), max |delta| vs native
+  0.0002; 1,024 rows: 3.64 ms vs 0.94 ms.
+- Result (p6-tcprefill-nospec, boot 19:06, flag on, no-spec): cold TTFT
+  32K 3.126 s (-24 %), 128K 13.17 s (-23 %); warm 0.197 s / 0.355 s. c1
+  162.6 / 166.2 / 166.2, c8 581.0 / 580.7 / 578.4, c16 776.9 / 774.8 /
+  775.0; medians 166.2 / 580.7 / 775.0 (+0.3 / +1.4 / +1.2 %: the kernel
+  also serves the verify-sized prefill steps of the c8/c16 mix).
+- Decision: retained; `glm5_next_sparse_tc_prefill: true` joins the
+  record's `additional_config` (opt-in like the decode TC switch; the A100
+  records at 8 heads per rank qualify but are not measured here). Dispatch:
+  chunked-prefill steps with 8 or 16 heads, bf16 q and cache, 512-wide
+  latent; decode steps keep their own dispatch. Tile 64.
+- Raw: `perf/results/2026-09-12/p6-tcprefill-nospec-pass{1,2,3}/`, gates
+  `p6-tcprefill-nospec-gate{1,2}.json`, `serve-logs/{ab,ttft}-p6-tcprefill-nospec.out`,
+  `serve-logs/queue-h.out` (microbench lines), `queue-i.out` (17 passed).
