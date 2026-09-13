@@ -1599,6 +1599,31 @@ class quixicore_ops:
         )
 
     @staticmethod
+    def nvfp4_moe_gemm(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        s: torch.Tensor,
+        g: torch.Tensor,
+        sorted_ids: torch.Tensor,
+        expert_ids: torch.Tensor,
+        num_post_padded: torch.Tensor,
+        topk_weights: torch.Tensor | None,
+        c: torch.Tensor,
+        top_k: int,
+        mul_topk: bool,
+        stages: int = 3,
+    ) -> torch.Tensor:
+        """Grouped NVFP4 MoE GEMM over the Marlin-packed expert weights for
+        prefill-sized batches: 128 x 128 x 64 tiles, one shared dequant per
+        tile stage, Marlin's numerics. Alignment must come from
+        moe_align_block_size at block 128; c is [M * top_k, N] indexed by the
+        sorted id, with mul_topk folding topk_weights[sid] into the row scale
+        (the w2 contract)."""
+        return _qc().nvfp4_moe_gemm(
+            a, b, s, g, sorted_ids, expert_ids, num_post_padded, topk_weights, c, top_k, mul_topk, stages
+        )
+
+    @staticmethod
     def mla_sparse_prefill_fp8(
         q: torch.Tensor,
         data: torch.Tensor,

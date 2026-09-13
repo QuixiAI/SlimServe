@@ -26088,3 +26088,34 @@ Phases, by value over risk:
   ("module 'vllm._quixicore_C' has no attribute 'nvfp4_moe_gemm'"). Default
   is now 0 (off) with a hasattr guard; the .so is installed by queue55 only
   after the legs, with no server running.
+- PREFILL MoE GEMM, ncu on Marlin at the 8128-token per-rank shape
+  (2026-09-13, E=288 top-8, K=4096, N=512 per rank; raw perf/results/
+  2026-09-13/marlin-moe-prefill/): w13 4.59 ms = 109 TFLOP/s (35% of
+  peak): tensor pipe 54.5% of active cycles, DRAM 17%, L2 hit 74%,
+  255 registers, 12% occupancy (8 warps/SM), ALU 31% / FMA 18% / LSU 20%;
+  w2 (K=512) 3.87 ms = 22% of peak: tensor 34%, L2 hit 81%. So Marlin at
+  large M is latency-bound at 8 warps with the split-K reduce dominating
+  w2, not bandwidth- or dequant-bound. Forcing thread configs through the
+  op ({64,256}, {64,128} x blocks/SM) moves it <= 7%, within spread.
+  KERNEL: csrc/quixicore/serving/nvfp4_moe_prefill_ampere.cuh
+  (nvfp4_moe_gemm, op vllm._quixicore_C.nvfp4_moe_gemm, wrapper
+  quixicore_ops.nvfp4_moe_gemm): reads the Marlin-packed experts in place
+  (layout per tests/glm5_next/test_nvfp4_marlin_layout.py), CTA tile
+  128x128x64, 8 warps (4 M x 2 N, warp tile 32x64), bf16 mma.m16n8k16;
+  per stage the 256 threads dequantize the packed tile ONCE into
+  fragment-major bf16 smem (each thread converts the int4 of words one
+  Marlin lane owns into the four scaled B fragments), so 128 rows share a
+  dequant and each warp streams its fragments with one 16 B LDS per n16
+  block per k16. Numerics are Marlin's (e2m1 bit trick x 2^-126, e4m3
+  scale x sf x 2^7 in bf16, fp32 global scale gs x 2^119 / sf and the
+  topk weight in the epilogue), only the fp32 summation order differs.
+  142 registers (3 stages, 1 CTA/SM) / 128 (2 stages, 2 CTAs/SM), no
+  spills. Alignment at block 128 via moe_align_block_size; hooked into
+  fused_marlin_moe (env VLLM_QC_NVFP4_PREFILL_MOE_MIN_ROWS = average
+  sorted rows per expert to switch, default 0 = off until the serving
+  A/B; _STAGES = 3). Parity vs Marlin's own GEMMs on identical packed
+  weights and vs the fused path: tests/kernels/test_qc_nvfp4_moe_prefill.py
+  8/8 (max rel 3-5e-3 = bf16 output rounding; w2's mean 1.9e-3 is Marlin
+  multiplying the topk weight in bf16 where this kernel does it in fp32).
+  Isolated timing at E=288 and the serving A/B are queued (queue55, after
+  the legs; the .so install needs an idle box).

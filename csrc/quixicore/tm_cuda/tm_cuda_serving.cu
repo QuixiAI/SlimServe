@@ -4,6 +4,7 @@
 #include "kda_decode_kernels.cuh"
 #include "skinny_gemm_ampere.cuh"
 #include "w8a16_gemm_ampere.cuh"
+#include "nvfp4_moe_prefill_ampere.cuh"
 #include "mla_sparse_prefill_kernels.cuh"
 #include "kv_cache_kernels.cuh"
 #include "paged_attn_v2_kernels.cuh"
@@ -1586,6 +1587,62 @@ static void launch_w8a16(const __half* x, const uint8_t* wp, float* partial, int
     const dim3 grid((N + BN - 1) / BN, splits);
     tms::w8a16::w8a16_gemm_kernel<BN, STAGES, NW, WM><<<grid, L::THREADS, L::SMEM, stream()>>>(x, wp, partial, M, N, K, k_slice);
 }
+// NVFP4 MoE grouped GEMM for prefill chunks (see nvfp4_moe_prefill_ampere.cuh).
+template <int STAGES>
+static void launch_nvfp4_moe(const __nv_bfloat16* a, int lda, const int32_t* b, const uint8_t* s, const float* g,
+                             const int32_t* ids, const int32_t* eids, const int32_t* npp, const float* tw,
+                             __nv_bfloat16* c, int ldc, int M_topk, int top_k, int N, int K, int mul_topk,
+                             int max_blocks) {
+    constexpr int SMEM = tms::nvfp4moe::smem_bytes<STAGES>();
+    static bool attr_set = false;
+    if (!attr_set) {
+        cudaFuncSetAttribute(tms::nvfp4moe::nvfp4_moe_gemm_kernel<STAGES>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+        attr_set = true;
+    }
+    const dim3 grid(N / tms::nvfp4moe::BN, max_blocks);
+    tms::nvfp4moe::nvfp4_moe_gemm_kernel<STAGES><<<grid, tms::nvfp4moe::THREADS, SMEM, stream()>>>(
+        a, lda, b, s, g, ids, eids, npp, tw, c, ldc, M_topk, top_k, N, K, mul_topk);
+}
+static torch::Tensor py_nvfp4_moe_gemm(torch::Tensor a, torch::Tensor b, torch::Tensor s, torch::Tensor g,
+                                       torch::Tensor sorted_ids, torch::Tensor expert_ids,
+                                       torch::Tensor num_post_padded, c10::optional<torch::Tensor> topk_weights,
+                                       torch::Tensor c, int64_t top_k, bool mul_topk, int64_t stages) {
+    // a [rows, K] bf16 (row stride = lda); b int32 [E, K/16, 2N]; s uint8 [E, K/16, N]; g fp32 [E];
+    // sorted_ids/expert_ids from moe_align_block_size at block 128; c [M_topk, N] bf16.
+    CK(b); CK(s); CK(g); CK(sorted_ids); CK(expert_ids); CK(num_post_padded); CK(c);
+    TORCH_CHECK(a.is_cuda() && a.dim() == 2 && a.stride(1) == 1 && a.scalar_type() == torch::kBFloat16, "a [rows,K] bf16");
+    TORCH_CHECK(b.dim() == 3 && b.scalar_type() == torch::kInt32 && s.dim() == 3 && s.scalar_type() == torch::kUInt8, "b int32 [E,K/16,2N], s uint8 [E,K/16,N]");
+    const int E = b.size(0), K = int(b.size(1)) * 16, N = int(b.size(2)) / 2;
+    TORCH_CHECK(s.size(0) == E && s.size(1) == K / 16 && s.size(2) == N, "scales shape");
+    TORCH_CHECK(g.numel() == E && g.scalar_type() == torch::kFloat32, "global scale [E] fp32");
+    TORCH_CHECK(a.size(1) == K && K % tms::nvfp4moe::BK == 0 && N % tms::nvfp4moe::BN == 0, "K % 64, N % 128");
+    TORCH_CHECK(c.dim() == 2 && c.size(1) == N && c.scalar_type() == torch::kBFloat16, "c [M_topk, N] bf16");
+    TORCH_CHECK(sorted_ids.scalar_type() == torch::kInt32 && expert_ids.scalar_type() == torch::kInt32 &&
+                num_post_padded.scalar_type() == torch::kInt32, "int32 alignment tensors");
+    const int M_topk = c.size(0);
+    const float* tw = nullptr;
+    if (mul_topk) {
+        TORCH_CHECK(topk_weights.has_value(), "topk_weights required with mul_topk");
+        CK(topk_weights.value()); TORCH_CHECK(topk_weights->scalar_type() == torch::kFloat32 && topk_weights->numel() >= M_topk, "topk_weights fp32");
+        tw = fp(topk_weights.value());
+    }
+    // moe_align_block_size pads sorted_ids to M*topk + E*(block-1); the kernel
+    // only touches blocks below num_post_padded (a multiple of 128).
+    const int max_blocks = int((sorted_ids.numel() + tms::nvfp4moe::BM - 1) / tms::nvfp4moe::BM);
+    TORCH_CHECK(expert_ids.numel() >= max_blocks, "expert_ids per 128-row block");
+    if (stages == 2)
+        launch_nvfp4_moe<2>(bp(a), int(a.stride(0)), b.data_ptr<int32_t>(), s.data_ptr<uint8_t>(), fp(g),
+                            sorted_ids.data_ptr<int32_t>(), expert_ids.data_ptr<int32_t>(), num_post_padded.data_ptr<int32_t>(),
+                            tw, reinterpret_cast<__nv_bfloat16*>(c.data_ptr()), int(c.stride(0)), M_topk, int(top_k), N, K,
+                            mul_topk ? 1 : 0, max_blocks);
+    else
+        launch_nvfp4_moe<3>(bp(a), int(a.stride(0)), b.data_ptr<int32_t>(), s.data_ptr<uint8_t>(), fp(g),
+                            sorted_ids.data_ptr<int32_t>(), expert_ids.data_ptr<int32_t>(), num_post_padded.data_ptr<int32_t>(),
+                            tw, reinterpret_cast<__nv_bfloat16*>(c.data_ptr()), int(c.stride(0)), M_topk, int(top_k), N, K,
+                            mul_topk ? 1 : 0, max_blocks);
+    return c;
+}
 static torch::Tensor py_w8a16_gemm(torch::Tensor x, torch::Tensor wp, torch::Tensor scale,
                                    c10::optional<torch::Tensor> bias, int64_t N, int64_t target_ctas, int64_t cfg) {
     // x [M, K] bf16; wp packed (from w8a16_pack); scale [N] fp32 (per channel, already x 2^8).
@@ -2617,6 +2674,10 @@ void init_serving(py::module_& m) {
           py::arg("page_stride_bytes") = 0,
           "Sparse NoPE-MLA prefill attention (groups of 4 queries over their pool union, fp8 latent)");
     m.def("mla_sparse_prefill_prep_debug", &py_mla_sparse_prefill_prep_debug);
+    m.def("nvfp4_moe_gemm", &py_nvfp4_moe_gemm, py::arg("a"), py::arg("b"), py::arg("s"), py::arg("g"), py::arg("sorted_ids"),
+          py::arg("expert_ids"), py::arg("num_post_padded"), py::arg("topk_weights") = py::none(), py::arg("c"),
+          py::arg("top_k"), py::arg("mul_topk"), py::arg("stages") = 3,
+          "NVFP4 grouped MoE GEMM over Marlin-packed experts for prefill chunks (128-row blocks)");
     m.def("w8a16_dequant", &py_w8a16_dequant, py::arg("wp"), py::arg("scale"), py::arg("N"), py::arg("K"),
           "Unpack fp8 weights to bf16 [N,K] (prefill path)");
     m.def("w8a16_pack", &py_w8a16_pack, py::arg("w_fp8"), "Pack [N,K] e4m3 weights into mma fragment order");
