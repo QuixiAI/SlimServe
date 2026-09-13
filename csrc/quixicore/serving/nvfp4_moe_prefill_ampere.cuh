@@ -39,12 +39,6 @@
 namespace tms::nvfp4moe {
 
 constexpr int BM = 128, BN = 128, BK = 64;
-constexpr int THREADS = 256;
-constexpr int WM = 4, WN = 2;            // warp grid
-constexpr int WROWS = BM / WM;           // 32 rows per warp
-constexpr int WCOLS = BN / WN;           // 64 cols per warp
-constexpr int MT = WROWS / 16;           // 2 m16 tiles per warp
-constexpr int NT = WCOLS / 8;            // 8 n8 tiles per warp
 constexpr int LDA = BK + 8;              // bf16 elements per A smem row (144 B)
 constexpr int A_STAGE_BYTES = BM * LDA * 2;                 // 18432
 constexpr int BF_STAGE_BYTES = (BK / 16) * (BN / 16) * 32 * 16;  // 16384 (4 kt x 8 j x 32 lanes x 16 B)
@@ -52,8 +46,24 @@ constexpr int BR_STAGE_BYTES = (BK / 16) * (BN / 64) * 128 * 4;  // 4096 packed 
 constexpr int S_STAGE_BYTES = (BK / 16) * BN;                     // 512 scale bytes
 constexpr int STAGE_BYTES = A_STAGE_BYTES + BF_STAGE_BYTES + BR_STAGE_BYTES + S_STAGE_BYTES;
 constexpr int META_BYTES = BM * 4 + BM * 4;                      // sorted ids + row scales
+constexpr int DQ_ITEMS = (BK / 16) * (BN / 64) * 32;              // 256 int4s per stage
 template <int STAGES>
 constexpr int smem_bytes() { return STAGES * STAGE_BYTES + META_BYTES; }
+
+// Warp layout: WM x WN warps, warp tile (BM/WM) x (BN/WN).
+//   <4,2>: 8 warps, 32x64 warp tiles (64 accumulators)   - 128-142 registers
+//   <2,2>: 4 warps, 64x64 warp tiles (128 accumulators)  - half the smem
+//          bytes per MAC (A 2 KB + B 2 KB per 64K MAC), Marlin's warp shape
+template <int WM, int WN>
+struct Warps {
+    static constexpr int THREADS = WM * WN * 32;
+    static constexpr int WROWS = BM / WM;
+    static constexpr int WCOLS = BN / WN;
+    static constexpr int MT = WROWS / 16;
+    static constexpr int NT = WCOLS / 8;
+    static_assert(BM % WM == 0 && BN % WN == 0 && WROWS % 16 == 0 && WCOLS % 16 == 0, "warp grid");
+    static_assert((BM * BK / 8) % THREADS == 0 && DQ_ITEMS % THREADS == 0, "chunks per thread");
+};
 
 __device__ __forceinline__ void cp_async_16(void* smem, const void* gmem, bool pred) {
     const unsigned s = static_cast<unsigned>(__cvta_generic_to_shared(smem));
@@ -112,13 +122,15 @@ __device__ __forceinline__ unsigned bf16_bcast(unsigned packed, int half) {
 //   expert_ids int32 per 128-row block, num_post_padded int32[1]
 //   C [M_topk][ldc] bf16 (row = sorted id); mul_topk folds topk_weights[sid]
 //   into the row scale (Marlin's w2 contract).
-template <int STAGES>
-__global__ void __launch_bounds__(THREADS, STAGES == 2 ? 2 : 1) nvfp4_moe_gemm_kernel(
+template <int STAGES, int WM, int WN>
+__global__ void __launch_bounds__(Warps<WM, WN>::THREADS, STAGES == 2 ? 2 : 1) nvfp4_moe_gemm_kernel(
         const __nv_bfloat16* __restrict__ A, int lda,
         const int32_t* __restrict__ B, const uint8_t* __restrict__ S, const float* __restrict__ G,
         const int32_t* __restrict__ sorted_ids, const int32_t* __restrict__ expert_ids,
         const int32_t* __restrict__ num_post_padded, const float* __restrict__ topk_weights,
         __nv_bfloat16* __restrict__ C, int ldc, int M_topk, int top_k, int N, int K, int mul_topk) {
+    using W = Warps<WM, WN>;
+    constexpr int THREADS = W::THREADS, WROWS = W::WROWS, WCOLS = W::WCOLS, MT = W::MT, NT = W::NT;
     extern __shared__ __align__(16) unsigned char smem_raw[];
     const int blk = blockIdx.y;
     if (blk * BM >= num_post_padded[0]) return;
@@ -135,13 +147,13 @@ __global__ void __launch_bounds__(THREADS, STAGES == 2 ? 2 : 1) nvfp4_moe_gemm_k
     const int wm = warp % WM, wn = warp / WM;
     const int n0 = blockIdx.x * BN;
     const float gs = G[e];
-    if (tid < BM) {
-        const int sid = sorted_ids[blk * BM + tid];
+    for (int r = tid; r < BM; r += THREADS) {
+        const int sid = sorted_ids[blk * BM + r];
         const bool ok = sid < M_topk;
-        ids_smem[tid] = ok ? sid : -1;
+        ids_smem[r] = ok ? sid : -1;
         float rsc = gs;
         if (mul_topk && ok) rsc *= topk_weights[sid];
-        rs_smem[tid] = rsc;
+        rs_smem[r] = rsc;
     }
     __syncthreads();
 
@@ -161,10 +173,12 @@ __global__ void __launch_bounds__(THREADS, STAGES == 2 ? 2 : 1) nvfp4_moe_gemm_k
             const __nv_bfloat16* src = A + (ok ? size_t(sid / top_k) * lda : 0) + kk + c8;
             cp_async_16(as + r * LDA + c8, src, ok);
         }
-        {
-            const int kt = tid >> 6, nt = (tid >> 5) & 1, L = tid & 31;
+#pragma unroll
+        for (int i = 0; i < DQ_ITEMS / THREADS; ++i) {
+            const int c = tid + i * THREADS;
+            const int kt = c >> 6, nt = (c >> 5) & 1, L = c & 31;
             const int32_t* src = Be + ((size_t(kk / 16 + kt) * NQ64) + (n0 / 64 + nt)) * 128 + 4 * L;
-            cp_async_16(br_smem + s * BR_STAGE_BYTES + tid * 16, src, true);
+            cp_async_16(br_smem + s * BR_STAGE_BYTES + c * 16, src, true);
         }
         if (tid < 32) {
             const int kt = tid >> 3, off = (tid & 7) * 16;
@@ -174,8 +188,11 @@ __global__ void __launch_bounds__(THREADS, STAGES == 2 ? 2 : 1) nvfp4_moe_gemm_k
     };
     // Dequantize the staged packed tile into fragment-major bf16 fragments.
     auto dequant_stage = [&](int s) {
-        const int kt = tid >> 6, nt = (tid >> 5) & 1, L = tid & 31;
-        const uint4 w = *reinterpret_cast<const uint4*>(br_smem + s * BR_STAGE_BYTES + tid * 16);
+#pragma unroll
+      for (int it = 0; it < DQ_ITEMS / THREADS; ++it) {
+        const int c = tid + it * THREADS;
+        const int kt = c >> 6, nt = (c >> 5) & 1, L = c & 31;
+        const uint4 w = *reinterpret_cast<const uint4*>(br_smem + s * BR_STAGE_BYTES + c * 16);
         const uint2 sw = *reinterpret_cast<const uint2*>(s_smem + s * S_STAGE_BYTES + kt * BN + 64 * nt + 8 * (L >> 2));
         unsigned fs[4];
         dequant_e4m3_scales_bf16(sw.x, fs[0], fs[1]);
@@ -192,6 +209,7 @@ __global__ void __launch_bounds__(THREADS, STAGES == 2 ? 2 : 1) nvfp4_moe_gemm_k
             b10 = bf16x2_mul(b10, s1); b11 = bf16x2_mul(b11, s1);
             dst[j * 32] = make_uint4(b00, b01, b10, b11);
         }
+      }
     };
 
     float acc[MT][NT][4];

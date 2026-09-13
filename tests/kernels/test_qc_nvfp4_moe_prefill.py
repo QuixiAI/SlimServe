@@ -56,7 +56,7 @@ def _close(out, ref, rel_max=2e-2, mean_rel=3e-3):
 
 
 @pytest.mark.parametrize("M", [37, 500, 2048])
-@pytest.mark.parametrize("stages", [3, 2])
+@pytest.mark.parametrize("stages", [2, 3, 4, 5])
 def test_direct_gemms_match_marlin(weights, M, stages):
     import vllm._custom_ops as ops
     from vllm.quixicore.ops import quixicore_ops

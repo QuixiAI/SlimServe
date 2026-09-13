@@ -69,7 +69,7 @@ def _qc_nvfp4_prefill_rows_threshold() -> int:
 
 
 def _qc_nvfp4_prefill_stages() -> int:
-    return int(os.getenv("VLLM_QC_NVFP4_PREFILL_MOE_STAGES", "3"))
+    return int(os.getenv("VLLM_QC_NVFP4_PREFILL_MOE_STAGES", "2"))
 
 
 def _qc_nvfp4_prefill_applicable(

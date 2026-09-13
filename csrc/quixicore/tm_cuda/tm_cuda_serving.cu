@@ -1588,20 +1588,21 @@ static void launch_w8a16(const __half* x, const uint8_t* wp, float* partial, int
     tms::w8a16::w8a16_gemm_kernel<BN, STAGES, NW, WM><<<grid, L::THREADS, L::SMEM, stream()>>>(x, wp, partial, M, N, K, k_slice);
 }
 // NVFP4 MoE grouped GEMM for prefill chunks (see nvfp4_moe_prefill_ampere.cuh).
-template <int STAGES>
+template <int STAGES, int WM, int WN>
 static void launch_nvfp4_moe(const __nv_bfloat16* a, int lda, const int32_t* b, const uint8_t* s, const float* g,
                              const int32_t* ids, const int32_t* eids, const int32_t* npp, const float* tw,
                              __nv_bfloat16* c, int ldc, int M_topk, int top_k, int N, int K, int mul_topk,
                              int max_blocks) {
     constexpr int SMEM = tms::nvfp4moe::smem_bytes<STAGES>();
+    constexpr int THREADS = tms::nvfp4moe::Warps<WM, WN>::THREADS;
     static bool attr_set = false;
     if (!attr_set) {
-        cudaFuncSetAttribute(tms::nvfp4moe::nvfp4_moe_gemm_kernel<STAGES>,
+        cudaFuncSetAttribute(tms::nvfp4moe::nvfp4_moe_gemm_kernel<STAGES, WM, WN>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
         attr_set = true;
     }
     const dim3 grid(N / tms::nvfp4moe::BN, max_blocks);
-    tms::nvfp4moe::nvfp4_moe_gemm_kernel<STAGES><<<grid, tms::nvfp4moe::THREADS, SMEM, stream()>>>(
+    tms::nvfp4moe::nvfp4_moe_gemm_kernel<STAGES, WM, WN><<<grid, THREADS, SMEM, stream()>>>(
         a, lda, b, s, g, ids, eids, npp, tw, c, ldc, M_topk, top_k, N, K, mul_topk);
 }
 static torch::Tensor py_nvfp4_moe_gemm(torch::Tensor a, torch::Tensor b, torch::Tensor s, torch::Tensor g,
@@ -1631,16 +1632,21 @@ static torch::Tensor py_nvfp4_moe_gemm(torch::Tensor a, torch::Tensor b, torch::
     // only touches blocks below num_post_padded (a multiple of 128).
     const int max_blocks = int((sorted_ids.numel() + tms::nvfp4moe::BM - 1) / tms::nvfp4moe::BM);
     TORCH_CHECK(expert_ids.numel() >= max_blocks, "expert_ids per 128-row block");
-    if (stages == 2)
-        launch_nvfp4_moe<2>(bp(a), int(a.stride(0)), b.data_ptr<int32_t>(), s.data_ptr<uint8_t>(), fp(g),
-                            sorted_ids.data_ptr<int32_t>(), expert_ids.data_ptr<int32_t>(), num_post_padded.data_ptr<int32_t>(),
-                            tw, reinterpret_cast<__nv_bfloat16*>(c.data_ptr()), int(c.stride(0)), M_topk, int(top_k), N, K,
-                            mul_topk ? 1 : 0, max_blocks);
-    else
-        launch_nvfp4_moe<3>(bp(a), int(a.stride(0)), b.data_ptr<int32_t>(), s.data_ptr<uint8_t>(), fp(g),
-                            sorted_ids.data_ptr<int32_t>(), expert_ids.data_ptr<int32_t>(), num_post_padded.data_ptr<int32_t>(),
-                            tw, reinterpret_cast<__nv_bfloat16*>(c.data_ptr()), int(c.stride(0)), M_topk, int(top_k), N, K,
-                            mul_topk ? 1 : 0, max_blocks);
+    // cfg (the "stages" arg): 2 = 2 stages, 8 warps of 32x64 (2 CTAs/SM); 3 = 3 stages, 8 warps (1 CTA/SM);
+    //                         4 = 2 stages, 4 warps of 64x64 (2 CTAs/SM); 5 = 3 stages, 4 warps of 64x64.
+#define QC_NVFP4_LAUNCH(ST, WM_, WN_)                                                                              \
+    launch_nvfp4_moe<ST, WM_, WN_>(bp(a), int(a.stride(0)), b.data_ptr<int32_t>(), s.data_ptr<uint8_t>(), fp(g),   \
+                                   sorted_ids.data_ptr<int32_t>(), expert_ids.data_ptr<int32_t>(),                 \
+                                   num_post_padded.data_ptr<int32_t>(), tw,                                        \
+                                   reinterpret_cast<__nv_bfloat16*>(c.data_ptr()), int(c.stride(0)), M_topk,       \
+                                   int(top_k), N, K, mul_topk ? 1 : 0, max_blocks)
+    switch (stages) {
+        case 3: QC_NVFP4_LAUNCH(3, 4, 2); break;
+        case 4: QC_NVFP4_LAUNCH(2, 2, 2); break;
+        case 5: QC_NVFP4_LAUNCH(3, 2, 2); break;
+        default: QC_NVFP4_LAUNCH(2, 4, 2); break;
+    }
+#undef QC_NVFP4_LAUNCH
     return c;
 }
 static torch::Tensor py_w8a16_gemm(torch::Tensor x, torch::Tensor wp, torch::Tensor scale,

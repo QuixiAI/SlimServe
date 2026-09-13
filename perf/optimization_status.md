@@ -26119,3 +26119,41 @@ Phases, by value over risk:
   multiplying the topk weight in bf16 where this kernel does it in fp32).
   Isolated timing at E=288 and the serving A/B are queued (queue55, after
   the legs; the .so install needs an idle box).
+- k=3 FIXED ARM DROPPED (2026-09-13): its rerun died at boot
+  (CUBLAS_STATUS_INTERNAL_ERROR in the worker) while a kernel parity test
+  ran on GPU 7 during the server's memory profiling - my test, not the
+  arm; rule: nothing else touches the GPUs while a server boots. Not
+  rerun: schedule [[1,32,3],[33,128,2]] already measured k=3 at 32
+  requests/replica below k=2 (c64 1521 vs 1568), and fixed k=3 at 64 per
+  replica adds a third verify row to a bandwidth-bound 192-token step.
+- NVFP4 PREFILL MoE GEMM, iterations (E=288, M=8128 per rank, us; raw
+  perf/results/2026-09-13/marlin-moe-prefill/qc_timing*.txt):
+  | variant | w13 | w2 |
+  | Marlin | 4591-4709 | 3483-3985 |
+  | v1: 8 warps 32x64, 3 stages (1 CTA/SM), 2 barriers/stage | 6690 | 3999 |
+  | v1: same, 2 stages (2 CTAs/SM) | 4982 | 2987 |
+  | v2 pipelined dequant (1 barrier/stage), BK64 1 CTA/SM | 5845 | 4095 |
+  | v2 pipelined, BK32 3 CTAs/SM (80 regs) | 7827 | 4692 |
+  The pipelined loop lost everywhere, so the barriers were not the bound:
+  pre-dequantized bf16 fragments cost 4x the shared-memory reads of
+  Marlin's packed nibbles, and at 32x64 warp tiles the mainloop reads
+  ~0.09 B per MAC (A 1 KB + B 2 KB per 32K MAC) against the SM's 128 B/cycle
+  for 1024 MAC/cycle - three quarters of the smem bandwidth before bank
+  effects. v3 restores the v1 loop and adds 64x64 warp tiles (4 warps,
+  216-228 registers, 2 CTAs/SM; 0.0625 B/MAC) - timing queued (queue57).
+  Serving A/B of v1 (default config unclear at boot) at 4096-token chunks:
+  on 1553/1929 vs off 1551/1951 sustained, exact c64 1601/1499 vs
+  1637/1622 - no gain; the w2-only win (-25% isolated) would be ~1% of
+  sustained, below the keep rule.
+  v3 (2026-09-13 09:37, idle box): Marlin w13 3853 / w2 3452; cfg 2
+  (8 warps 32x64, 2 stages) 4245 / 3000; cfg 4 (4 warps 64x64, 2 stages)
+  4717 / 3147; 3-stage variants 5970-7364 / 4085-4621. The 64x64 warp
+  tile did not help, and Marlin's own w13 time spans 3853-4709 across
+  three idle-box runs, so the kernel's -10% (w13) / +13..25% (w2) sit
+  inside the environment's spread. DECISION: PARKED - kept in the tree
+  parity-tested (14/14) and gated off (VLLM_QC_NVFP4_PREFILL_MOE_MIN_ROWS=0
+  default); the serving A/B showed no gain. Lesson for the next attempt:
+  Marlin's large-M weakness is not dequant or barriers; a real win needs
+  a mainloop that beats its packed-nibble smem traffic (0.038 B/MAC) at
+  higher occupancy, i.e. a CUTLASS-grade multistage pipeline, not a
+  shared-dequant tile.
