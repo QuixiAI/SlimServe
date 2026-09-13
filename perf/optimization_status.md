@@ -26027,3 +26027,9 @@ Phases, by value over risk:
   is 45% of the attention cost: the index lists are pool-contiguous, so
   compacting each query's tokens to pool starts before sorting shrinks
   the sorted set ~8x (next).
+- Sparse prefill prep kernel, run-compaction (2026-09-13): each query's
+  token entries are compacted to pool-run starts (bits gathered by a
+  forward scan) with a block scan before the bitonic sort, so the sort
+  covers ~2K keys instead of 16K: prep 1.96 -> 0.22 ms at 512 queries,
+  4.85 -> 0.64 ms at 2048 (attention 3.7 / 13.7 ms); tests 5/5. In the
+  prefill profile the prep share (6.6%) drops to under 1%.

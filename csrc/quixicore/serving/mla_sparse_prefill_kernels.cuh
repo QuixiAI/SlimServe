@@ -55,28 +55,86 @@ __global__ void __launch_bounds__(THREADS) sparse_prefill_prep_kernel(
     const int nq = min(GQ, T - t0);
     extern __shared__ unsigned keys_smem[];   // NLIST
     const int tid = threadIdx.x;
-    // 1. gather keys
-    for (int e = tid; e < NLIST; e += THREADS) {
-        const int q = e / W, j = e - q * W;
-        unsigned key = 0xFFFFFFFFu;   // sentinel sorts last
-        if (q < nq && j < topk_len[t0 + q]) {
-            const int idx = indices[(size_t)(t0 + q) * W + j];
-            if (idx >= 0) {
-                const int blk = idx / block_size, off = idx - blk * block_size;
-                if (blk < max_blocks) {
-                    const int phys = bt[(size_t)(t0 + q) * max_blocks + blk] * block_size + off;
-                    const int pool = phys >> 2;          // 4-slot pools (block_size % 4 == 0)
-                    key = (unsigned(pool) << 6) | (unsigned(q) << 4) | (1u << (phys & 3));
+    // 1. gather keys, compacted to pool RUNS: the indexer lists a pool's 4
+    //    tokens consecutively, so an entry emits a key only when it starts a
+    //    run (its pool differs from the previous entry's); the run's token
+    //    bits are gathered by scanning forward. Scattered lists degrade to
+    //    one key per token (still correct). Keys are compacted with a block
+    //    scan so the sort covers only the emitted keys.
+    __shared__ int s_scan0[THREADS];
+    __shared__ int s_nkeys;
+    if (tid == 0) s_nkeys = 0;
+    __syncthreads();
+    const int total_entries = GQ * W;
+    for (int chunk = 0; chunk < total_entries; chunk += THREADS) {
+        const int e = chunk + tid;
+        unsigned key = 0xFFFFFFFFu;
+        bool emit = false;
+        if (e < total_entries) {
+            const int q = e / W, j = e - q * W;
+            if (q < nq && j < topk_len[t0 + q]) {
+                const int idx = indices[(size_t)(t0 + q) * W + j];
+                if (idx >= 0) {
+                    const int blk = idx / block_size, off = idx - blk * block_size;
+                    if (blk < max_blocks) {
+                        const int phys = bt[(size_t)(t0 + q) * max_blocks + blk] * block_size + off;
+                        const int pool = phys >> 2;
+                        bool start = true;
+                        if (j > 0) {
+                            const int pidx = indices[(size_t)(t0 + q) * W + j - 1];
+                            if (pidx >= 0) {
+                                const int pblk = pidx / block_size, poff = pidx - pblk * block_size;
+                                if (pblk < max_blocks) {
+                                    const int pphys = bt[(size_t)(t0 + q) * max_blocks + pblk] * block_size + poff;
+                                    start = (pphys >> 2) != pool;
+                                }
+                            }
+                        }
+                        if (start) {
+                            unsigned bits = 1u << (phys & 3);
+                            for (int k = 1; k < 4 && j + k < topk_len[t0 + q]; ++k) {
+                                const int nidx = indices[(size_t)(t0 + q) * W + j + k];
+                                if (nidx < 0) break;
+                                const int nblk = nidx / block_size, noff = nidx - nblk * block_size;
+                                if (nblk >= max_blocks) break;
+                                const int nphys = bt[(size_t)(t0 + q) * max_blocks + nblk] * block_size + noff;
+                                if ((nphys >> 2) != pool) break;
+                                bits |= 1u << (nphys & 3);
+                            }
+                            key = (unsigned(pool) << 6) | (unsigned(q) << 4) | bits;
+                            emit = true;
+                        }
+                    }
                 }
             }
         }
-        keys_smem[e] = key;
+        // compact
+        s_scan0[tid] = emit ? 1 : 0;
+        __syncthreads();
+        for (int off = 1; off < THREADS; off <<= 1) {
+            const int add = (tid >= off) ? s_scan0[tid - off] : 0;
+            __syncthreads();
+            s_scan0[tid] += add;
+            __syncthreads();
+        }
+        if (emit) {
+            const int pos = s_nkeys + s_scan0[tid] - 1;
+            if (pos < NLIST) keys_smem[pos] = key;
+        }
+        __syncthreads();
+        if (tid == THREADS - 1) s_nkeys += s_scan0[tid];
+        __syncthreads();
     }
+    const int nkeys = min(s_nkeys, NLIST);
+    // sort size: smallest power of two >= nkeys (sentinel-filled)
+    int nsort = 1;
+    while (nsort < nkeys) nsort <<= 1;
+    for (int i = nkeys + tid; i < nsort; i += THREADS) keys_smem[i] = 0xFFFFFFFFu;
     __syncthreads();
-    // 2. bitonic sort (NLIST power of two)
-    for (int k = 2; k <= NLIST; k <<= 1) {
+    // 2. bitonic sort over nsort
+    for (int k = 2; k <= nsort; k <<= 1) {
         for (int j = k >> 1; j > 0; j >>= 1) {
-            for (int i = tid; i < NLIST; i += THREADS) {
+            for (int i = tid; i < nsort; i += THREADS) {
                 const int ixj = i ^ j;
                 if (ixj > i) {
                     const unsigned a = keys_smem[i], b = keys_smem[ixj];
@@ -94,9 +152,9 @@ __global__ void __launch_bounds__(THREADS) sparse_prefill_prep_kernel(
     __shared__ int s_base;
     if (tid == 0) s_base = 0;
     __syncthreads();
-    for (int chunk = 0; chunk < NLIST; chunk += THREADS) {
+    for (int chunk = 0; chunk < nsort; chunk += THREADS) {
         const int i = chunk + tid;
-        const unsigned key = keys_smem[i];
+        const unsigned key = (i < nsort) ? keys_smem[i] : 0xFFFFFFFFu;
         const bool valid = key != 0xFFFFFFFFu;
         const unsigned pool = key >> 6;
         const bool start = valid && (i == 0 || (keys_smem[i - 1] >> 6) != pool);
