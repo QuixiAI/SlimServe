@@ -88,7 +88,7 @@ def test_ties_kept_and_nucleus_drops_low_ids():
     top_k = torch.full((batch,), 4, device=DEVICE, dtype=torch.int32)
     idx = torch.arange(batch, device=DEVICE, dtype=torch.int32)
     seeds = torch.arange(batch, device=DEVICE, dtype=torch.int64) * 7919
-    lows = highs = 0
+    lows = 0
     for pos_base in range(64):
         pos = torch.full((batch,), pos_base, device=DEVICE, dtype=torch.int64)
         out = quixicore_ops.topk_sample(logits, top_k, None, idx, seeds, pos, False)
@@ -97,7 +97,6 @@ def test_ties_kept_and_nucleus_drops_low_ids():
         p = torch.full((batch,), 0.5, device=DEVICE)
         out = quixicore_ops.topk_sample(logits, top_k, p, idx, seeds, pos, False)
         assert bool((out >= vocab // 2).all()), "nucleus kept a low-id tie"
-        highs += 1
     assert lows > 0, "top-k without top-p should reach the low-id ties too"
 
 

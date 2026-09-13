@@ -120,7 +120,9 @@ def mamba_aligned_chunk(cfg: Config, request: Request, start: int, num_new: int)
         else 0
     )
     stops = [
-        next_boundary if start % block != 0 and next_boundary <= last_cache_position else 0,
+        next_boundary
+        if start % block != 0 and next_boundary <= last_cache_position
+        else 0,
         last_cache_position,
         tail_boundary
         if last_cache_position < tail_boundary < request.num_prompt_tokens
@@ -141,7 +143,10 @@ def run_request(cfg: Config, manager: KVCacheManager, request: Request, decode_s
         if not first:
             manager.new_step_starts()
         num_new = mamba_aligned_chunk(
-            cfg, request, num_computed, min(cfg.budget, request.num_tokens - num_computed)
+            cfg,
+            request,
+            num_computed,
+            min(cfg.budget, request.num_tokens - num_computed),
         )
         assert num_new > 0, (num_computed, request.num_tokens)
         if first:
@@ -155,14 +160,19 @@ def run_request(cfg: Config, manager: KVCacheManager, request: Request, decode_s
             request.num_computed_tokens = num_hit
             first = False
         else:
-            blocks = manager.allocate_slots(request, num_new, num_lookahead_tokens=lookahead)
+            blocks = manager.allocate_slots(
+                request, num_new, num_lookahead_tokens=lookahead
+            )
         assert blocks is not None
         num_computed += num_new
         request.num_computed_tokens = num_computed
     for step in range(decode_steps):
         request.append_output_token_ids(7 + step)
         manager.new_step_starts()
-        assert manager.allocate_slots(request, 1, num_lookahead_tokens=lookahead) is not None
+        assert (
+            manager.allocate_slots(request, 1, num_lookahead_tokens=lookahead)
+            is not None
+        )
         request.num_computed_tokens += 1
     return num_hit
 

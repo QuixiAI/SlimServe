@@ -172,9 +172,11 @@ def cuda_unquantized_gemm(
 # e4m3 weights with 128x128 fp32 scales). bf16 activations, the block scale
 # applied in the weight conversion, so the mma multiplies exactly the BF16 a
 # checkpoint dequant stores; one launch instead of activation quant + CUTLASS.
-# Above 16 tokens the op runs the stock CUTLASS w8a8 blockwise path (prefill
-# numerics unchanged). SLIMSERVE_DECODE_GEMM_FP8=0 keeps the stock path for
-# every M.
+# Above 16 tokens the op runs the CUTLASS blockwise w8a8 GEMM itself
+# (per-token-group activation quant + cutlass_scaled_mm, the kernel the
+# compressed-tensors block scheme selects on sm_120): the op is opaque to the
+# compiler, so the scheme's own kernel object is out of reach inside it.
+# SLIMSERVE_DECODE_GEMM_FP8=0 keeps the scheme's path for every M.
 @cache
 @torch.compiler.assume_constant_result
 def decode_gemm_fp8_enabled() -> bool:

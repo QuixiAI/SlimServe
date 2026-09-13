@@ -31,7 +31,6 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     process_fp8_weight_tensor_strategy,
     validate_fp8_block_shape,
 )
-from vllm.model_executor.layers.utils import maybe_quixicore_fp8_block_linear
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
     create_fp8_quant_key,
@@ -42,6 +41,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     cutlass_block_fp8_supported,
 )
+from vllm.model_executor.layers.utils import maybe_quixicore_fp8_block_linear
 
 __all__ = ["CompressedTensorsW8A8Fp8"]
 
@@ -208,8 +208,8 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
         if self.weight_block_size is not None and isinstance(x, torch.Tensor):
             # QuixiCore M <= 16 decode GEMM on the block-FP8 weights (bf16
             # activations, one launch); above 16 tokens the op runs the
-            # CUTLASS w8a8 path this scheme selects. None when the layer's
-            # layout or the platform is not the kernel's.
+            # CUTLASS blockwise w8a8 GEMM itself (see layers/utils.py). None
+            # when the layer's layout or the platform is not the kernel's.
             out = maybe_quixicore_fp8_block_linear(
                 x, layer.weight, layer.weight_scale, bias
             )

@@ -8,6 +8,20 @@ from vllm.triton_utils import triton
 from vllm.utils.math_utils import round_up
 
 
+def moe_align_block_size_geometry(
+    numel: int, num_experts: int, block_size: int, pad_sorted_ids: bool = False
+) -> tuple[int, int]:
+    """(max_num_tokens_padded, max_num_m_blocks): the sizes of the sorted-ids
+    and expert-ids buffers moe_align_block_size fills for `numel` assignments
+    (tokens x top_k)."""
+    max_num_tokens_padded = numel + num_experts * (block_size - 1)
+    if pad_sorted_ids:
+        max_num_tokens_padded = round_up(max_num_tokens_padded, block_size)
+    if numel < num_experts:
+        max_num_tokens_padded = min(numel * block_size, max_num_tokens_padded)
+    return max_num_tokens_padded, triton.cdiv(max_num_tokens_padded, block_size)
+
+
 def moe_align_block_size(
     topk_ids: torch.Tensor,
     block_size: int,
@@ -71,17 +85,12 @@ def moe_align_block_size(
     - The padding ensures that the total number of tokens is now divisible
         by block_size for proper block matrix operations.
     """
-    max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
-    if pad_sorted_ids:
-        max_num_tokens_padded = round_up(max_num_tokens_padded, block_size)
-    if topk_ids.numel() < num_experts:
-        max_num_tokens_padded = min(
-            topk_ids.numel() * block_size, max_num_tokens_padded
-        )
+    max_num_tokens_padded, max_num_m_blocks = moe_align_block_size_geometry(
+        topk_ids.numel(), num_experts, block_size, pad_sorted_ids
+    )
     sorted_ids = torch.empty(
         (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
     )
-    max_num_m_blocks = triton.cdiv(max_num_tokens_padded, block_size)
     expert_ids = torch.empty(
         (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
     )

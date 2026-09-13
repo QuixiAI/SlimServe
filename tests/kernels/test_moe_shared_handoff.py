@@ -39,17 +39,19 @@ def test_shared_output_entry_matches_its_batch_and_reports_the_fold():
     assert combine_shared.consume(ids) is None
 
 
-def test_marlin_block_size_and_geometry_mirror_the_reference():
+def test_block_size_and_geometry_match_moe_align_block_size():
+    from vllm.model_executor.layers.fused_moe.experts.marlin_moe import (
+        marlin_moe_block_size_m,
+    )
     from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
         moe_align_block_size,
+        moe_align_block_size_geometry,
     )
 
     for tokens in (1, 4, 16):
-        block = glm_route_align.marlin_block_size_m(tokens, 8, 288)
+        block = marlin_moe_block_size_m(tokens, 8, 288, None)
         assert block == 8
-        max_padded, max_blocks = glm_route_align.alignment_geometry(
-            tokens, 8, 288, block
-        )
+        max_padded, max_blocks = moe_align_block_size_geometry(tokens * 8, 288, block)
         if torch.cuda.is_available():
             ids = torch.randint(0, 288, (tokens, 8), dtype=torch.int32, device="cuda")
             sorted_ids, expert_ids, _ = moe_align_block_size(ids, block, 288)

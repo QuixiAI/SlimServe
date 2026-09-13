@@ -14,6 +14,9 @@ from dataclasses import dataclass
 
 import torch
 
+from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
+    moe_align_block_size_geometry,
+)
 from vllm.platforms import current_platform
 from vllm.quixicore.ops import quixicore_ops
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -53,25 +56,6 @@ def consume(topk_ids: torch.Tensor) -> RoutingAlignment | None:
     return None
 
 
-def marlin_block_size_m(num_tokens: int, topk: int, num_experts: int) -> int:
-    """Mirror of fused_marlin_moe's block size selection for bf16 inputs."""
-    for block_size_m in [8, 16, 32, 48, 64]:
-        if num_tokens * topk / num_experts / block_size_m < 0.9:
-            break
-    return block_size_m
-
-
-def alignment_geometry(
-    num_tokens: int, topk: int, num_experts: int, block_size: int
-) -> tuple[int, int]:
-    """Mirror of moe_align_block_size's buffer sizes (pad_sorted_ids=False)."""
-    numel = num_tokens * topk
-    max_padded = numel + num_experts * (block_size - 1)
-    if numel < num_experts:
-        max_padded = min(numel * block_size, max_padded)
-    return max_padded, (max_padded + block_size - 1) // block_size
-
-
 def eligible(router, router_logits: torch.Tensor, indices_type) -> bool:
     bias = router.e_score_correction_bias
     return (
@@ -96,9 +80,15 @@ def eligible(router, router_logits: torch.Tensor, indices_type) -> bool:
 
 def route(router, router_logits: torch.Tensor):
     num_tokens, num_experts = router_logits.shape
-    block_size = marlin_block_size_m(num_tokens, router.top_k, num_experts)
-    max_padded, max_blocks = alignment_geometry(
-        num_tokens, router.top_k, num_experts, block_size
+    # fused_marlin_moe's block size for this batch (bf16 activations) and
+    # moe_align_block_size's buffer geometry, from their own definitions.
+    from vllm.model_executor.layers.fused_moe.experts.marlin_moe import (
+        marlin_moe_block_size_m,
+    )
+
+    block_size = marlin_moe_block_size_m(num_tokens, router.top_k, num_experts, None)
+    max_padded, max_blocks = moe_align_block_size_geometry(
+        num_tokens * router.top_k, num_experts, block_size
     )
     weights, ids, sorted_ids, expert_ids, post_pad = torch.ops.vllm.glm_route_align(
         router_logits,

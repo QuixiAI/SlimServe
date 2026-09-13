@@ -99,7 +99,6 @@ from vllm.sequence import IntermediateTensors
 
 logger = init_logger(__name__)
 
-F32_OVERRIDES_FILE = "f32-overrides.safetensors"
 F32_OVERRIDES_ENV = "SLIMSERVE_F32_OVERRIDES"
 
 
@@ -117,9 +116,11 @@ def _load_f32_overrides(model_path: str | None) -> dict[str, torch.Tensor]:
     """
     import os
 
+    from slimserve.f32_overrides import OVERRIDES_FILE
+
     if not model_path or os.environ.get(F32_OVERRIDES_ENV, "1") == "0":
         return {}
-    path = os.path.join(model_path, F32_OVERRIDES_FILE)
+    path = os.path.join(model_path, OVERRIDES_FILE)
     if not os.path.isfile(path):
         return {}
     from safetensors.torch import load_file
@@ -837,7 +838,7 @@ class Glm5NextForCausalLM(
         )
         params_dict = dict(self.named_parameters())
         loaded: set[str] = set()
-        model_path = getattr(self, "_model_path", None)
+        model_path = self._model_path
         weights = iter_with_overrides(weights, _load_f32_overrides(model_path))
         fp8_weights, fp8_scales = _load_fp8_swapset(model_path)
         weights = iter_with_overrides(weights, fp8_weights, fp8_scales, strict=True)

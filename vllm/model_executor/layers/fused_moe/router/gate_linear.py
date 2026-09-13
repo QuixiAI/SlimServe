@@ -94,7 +94,7 @@ class GateLinear(ReplicatedLinear):
         # none of the SM90/SM100 specialized kernels); rounding to BF16 and
         # then casting back loses information (and adds a copy) before
         # expert selection.
-        self._glm5_next_ampere_router_shape = (
+        self._glm5_next_cublas_router_shape = (
             not bias
             and current_platform.is_cuda()
             and not can_use_specialized_kernels
@@ -141,7 +141,7 @@ class GateLinear(ReplicatedLinear):
 
         # cuBLAS bf16→fp32 eligibility
         self.allow_cublas_router_gemm = (
-            (self.allow_specialized_router_gemm or self._glm5_next_ampere_router_shape)
+            (self.allow_specialized_router_gemm or self._glm5_next_cublas_router_shape)
             and self.weight.dtype == torch.bfloat16
             and self.out_dtype == torch.float32
         )
@@ -178,7 +178,7 @@ class GateLinear(ReplicatedLinear):
             not self.allow_cublas_router_gemm
             and (
                 self.allow_specialized_router_gemm
-                or self._glm5_next_ampere_router_shape
+                or self._glm5_next_cublas_router_shape
             )
             and out_dtype == torch.float32
         ):
@@ -264,17 +264,13 @@ class GateLinear(ReplicatedLinear):
 _FP32_ROUTER_GEMM_MAX_TOKENS = GateLinear.FP32_MAX_TOKENS
 
 
-def dsv4_ampere_router_gemm_impl(
-    x: torch.Tensor, weight: torch.Tensor
-) -> torch.Tensor:
+def dsv4_ampere_router_gemm_impl(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     from vllm.quixicore.ops import quixicore_ops
 
     return quixicore_ops.dsv4_router_gemm(x, weight)
 
 
-def dsv4_ampere_router_gemm_fake(
-    x: torch.Tensor, weight: torch.Tensor
-) -> torch.Tensor:
+def dsv4_ampere_router_gemm_fake(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return x.new_empty((x.shape[0], weight.shape[0]), dtype=torch.float32)
 
 

@@ -63,6 +63,21 @@ from vllm.scalar_type import ScalarType, scalar_types
 from vllm.utils.torch_utils import current_stream
 
 
+def marlin_moe_block_size_m(
+    num_tokens: int, topk: int, num_experts: int, input_dtype: torch.dtype | None
+) -> int:
+    """The M block size fused_marlin_moe aligns `num_tokens` (valid tokens per
+    rank) with: the smallest of 8..64 that leaves the expert blocks under 90 %
+    full, at least 16 for 8-bit activations."""
+    # TODO: tune this further for specific models
+    for block_size_m in [8, 16, 32, 48, 64]:
+        if num_tokens * topk / num_experts / block_size_m < 0.9:
+            break
+    if input_dtype is not None and input_dtype.itemsize == 1:
+        block_size_m = max(block_size_m, 16)
+    return block_size_m
+
+
 def _fused_marlin_moe(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -329,14 +344,7 @@ def fused_marlin_moe(
         # Set M to estimated valid tokens per rank
         M = math.ceil(M * E / global_num_experts)
 
-    # M block size selection logic
-    # TODO: tune this further for specific models
-    for block_size_m in [8, 16, 32, 48, 64]:
-        if M * topk / E / block_size_m < 0.9:
-            break
-
-    if input_dtype is not None and input_dtype.itemsize == 1:
-        block_size_m = max(block_size_m, 16)
+    block_size_m = marlin_moe_block_size_m(M, topk, E, input_dtype)
 
     alignment = glm_route_align.consume(topk_ids)
     if (

@@ -64,7 +64,7 @@ __global__ __launch_bounds__(THREADS) void moe_sum_add_kernel(
     }
 }
 
-// Host-side launch shared by the native binding and the dev build.
+// Host-side launch behind the native binding (tm_cuda_serving.cu).
 inline void launch_moe_sum_add(__nv_bfloat16* out, const __nv_bfloat16* x,
                                const __nv_bfloat16* shared, int64_t num_tokens,
                                int d, int topk, cudaStream_t stream) {

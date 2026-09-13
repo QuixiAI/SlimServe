@@ -8,9 +8,9 @@ import torch
 from safetensors.torch import save_file
 
 from slimserve import f32_overrides
+from slimserve.f32_overrides import OVERRIDES_FILE as F32_OVERRIDES_FILE
 from vllm.model_executor.models.glm5_next import (
     F32_OVERRIDES_ENV,
-    F32_OVERRIDES_FILE,
     _load_f32_overrides,
     iter_with_overrides,
 )

@@ -2772,9 +2772,7 @@ class Scheduler(SchedulerInterface):
                     req_num_computed_tokens + block_size - 1
                 ) // block_size
                 group_marked = False
-                for idx, block_id in zip(
-                    range(req_num_computed_blocks), req_block_ids
-                ):
+                for idx, block_id in zip(range(req_num_computed_blocks), req_block_ids):
                     if block_id not in invalid_block_ids:
                         continue
 

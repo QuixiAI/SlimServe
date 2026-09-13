@@ -323,12 +323,14 @@ def build(
     return out_path
 
 
-def _manifest(model_path: str | None) -> dict | None:
-    path = manifest_path(model_path)
-    if path is None:
-        return None
+def _read_manifest(path: str) -> dict:
     with open(path) as fh:
         return json.load(fh)
+
+
+def _manifest(model_path: str | None) -> dict | None:
+    path = manifest_path(model_path)
+    return None if path is None else _read_manifest(path)
 
 
 def beta_block_rows(model_path: str | None, module: str) -> int | None:
@@ -353,8 +355,7 @@ def apply_config_group(model_path: str | None, hf_quant_config: dict | None) -> 
         return False
     if hf_quant_config.get("quant_method") != "compressed-tensors":
         raise ValueError(f"{path}: the swap-set needs a compressed-tensors model")
-    with open(path) as fh:
-        manifest = json.load(fh)
+    manifest = _read_manifest(path)
     groups = hf_quant_config.setdefault("config_groups", {})
     groups[GROUP_NAME] = manifest["config_group"]
     # The conversion lists the swapped modules under ``ignore`` (they were

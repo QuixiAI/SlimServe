@@ -18,6 +18,7 @@ import torch
 
 MAX_TOKENS = 16
 
+
 @dataclass
 class SharedOutput:
     topk_ids: torch.Tensor

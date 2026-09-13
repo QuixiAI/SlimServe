@@ -140,12 +140,7 @@ class SharedExperts(torch.nn.Module):
 
         # Run shared experts in parallel on a separate stream.
         with torch.cuda.stream(self._stream):
-            if prequant_input is None:
-                output = self._layer(shared_experts_input)
-            else:
-                output = self._layer(
-                    shared_experts_input, prequant_input=prequant_input
-                )
+            output = self._run_layer(shared_experts_input, prequant_input)
         current_stream().wait_stream(self._stream)
 
         return output

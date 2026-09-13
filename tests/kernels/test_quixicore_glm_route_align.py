@@ -17,8 +17,12 @@ if not torch.cuda.is_available():
 if not qc.has_glm_route_align():
     pytest.skip("QuixiCore build without glm_route_align", allow_module_level=True)
 
+from vllm.model_executor.layers.fused_moe.experts.marlin_moe import (  # noqa: E402
+    marlin_moe_block_size_m,
+)
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import (  # noqa: E402
     moe_align_block_size,
+    moe_align_block_size_geometry,
 )
 from vllm.model_executor.layers.fused_moe.router import glm_route_align  # noqa: E402
 from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import (  # noqa: E402
@@ -48,10 +52,8 @@ def test_glm_route_align_matches_router_and_alignment(tokens):
     logits = (torch.randn(tokens, E, device=DEV) * 2).float()
     bias = (torch.randn(E, device=DEV) * 0.5).float()
     hidden = torch.randn(tokens, H, device=DEV, dtype=torch.bfloat16)
-    block_size = glm_route_align.marlin_block_size_m(tokens, K, E)
-    max_padded, max_blocks = glm_route_align.alignment_geometry(
-        tokens, K, E, block_size
-    )
+    block_size = marlin_moe_block_size_m(tokens, K, E, None)
+    max_padded, max_blocks = moe_align_block_size_geometry(tokens * K, E, block_size)
 
     w, ids, sorted_ids, expert_ids, post_pad = torch.ops.vllm.glm_route_align(
         logits,
@@ -120,10 +122,8 @@ def test_glm_route_align_is_total_on_non_finite_logits(tokens):
     padding, the tails filled, every assignment placed exactly once in a block
     of its own expert. The ids of a NaN token are meaningless but bounded."""
     bias = (torch.randn(E, device=DEV) * 0.5).float()
-    block_size = glm_route_align.marlin_block_size_m(tokens, K, E)
-    max_padded, max_blocks = glm_route_align.alignment_geometry(
-        tokens, K, E, block_size
-    )
+    block_size = marlin_moe_block_size_m(tokens, K, E, None)
+    max_padded, max_blocks = moe_align_block_size_geometry(tokens * K, E, block_size)
     numel = tokens * K
     for name, logits in _non_finite_cases(tokens).items():
         w, ids, sorted_ids, expert_ids, post_pad = torch.ops.vllm.glm_route_align(
@@ -163,7 +163,7 @@ def test_glm_route_align_is_total_on_non_finite_logits(tokens):
 def test_glm_route_align_rejects_unsupported_shapes():
     logits = torch.zeros(17, E, device=DEV)
     bias = torch.zeros(E, device=DEV)
-    max_padded, max_blocks = glm_route_align.alignment_geometry(17, K, E, 8)
+    max_padded, max_blocks = moe_align_block_size_geometry(17 * K, E, 8)
     with pytest.raises(RuntimeError, match=r"handles 1\.\.16 tokens"):
         torch.ops.vllm.glm_route_align(
             logits, bias, K, 0, True, SCALE, 8, max_padded, max_blocks

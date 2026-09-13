@@ -199,8 +199,9 @@ def _moe_forward_shared_fake(
     return shared_out, fused_out
 
 
-# NOTE: `moe_forward` and `moe_forward_shared` being opaque custom ops is a
-# load-bearing assumption for the MoE-LoRA dual-stream path.
+# NOTE: `moe_forward`, `moe_forward_shared` and `moe_forward_folded` being
+# opaque custom ops is a load-bearing assumption for the MoE-LoRA dual-stream
+# path.
 direct_register_custom_op(
     op_name="moe_forward",
     op_func=_moe_forward,
@@ -681,6 +682,7 @@ class MoERunner(MoERunnerInterface):
                 input_ids=input_ids,
             )
         else:
+            # Modular kernels: select experts first, then call routed_experts
             if preselected is None:
                 topk_weights, topk_ids = self.router.select_experts(
                     hidden_states=hidden_states,
@@ -966,7 +968,10 @@ class MoERunner(MoERunnerInterface):
                 make_expert_stats,
             )
 
-            name = getattr(self.routed_experts, "layer_name", None) or f"runner-{id(self):x}"
+            name = (
+                getattr(self.routed_experts, "layer_name", None)
+                or f"runner-{id(self):x}"
+            )
             num_experts = getattr(self.routed_experts, "global_num_experts", 0)
             try:
                 device = next(p.device for p in self.routed_experts.parameters())
@@ -1001,9 +1006,7 @@ class MoERunner(MoERunnerInterface):
         self.routed_experts._ensure_moe_quant_config_init()
 
         # Sync aux and main stream for shared expert multi-stream overlap.
-        self._maybe_sync_shared_experts_stream(
-            shared_experts_input, prequant_input
-        )
+        self._maybe_sync_shared_experts_stream(shared_experts_input, prequant_input)
 
         # If the Runner holds the gate, apply it after the stream sync,
         # so it can run overlapped with the
@@ -1019,8 +1022,7 @@ class MoERunner(MoERunnerInterface):
         )
         use_ampere_hash_router = (
             not owned_precomputed_router
-            and
-            os.getenv("VLLM_DSV4_HASH_ROUTER", "1").lower()
+            and os.getenv("VLLM_DSV4_HASH_ROUTER", "1").lower()
             not in {"0", "false", "off", "no"}
             and self.gate is not None
             and getattr(self.gate, "allow_dsv4_ampere_router_gemm", False)
