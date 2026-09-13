@@ -26403,8 +26403,9 @@ Decision: FP8 KDA retained without reservation. Raw:
 - Also seen in the trace (Phase 2 notes): 66 int `fill_` launches per step
   (six per DSA layer, about 90 us) in the sparse MLA metadata path, and 11
   cuBLAS bf16 wmma GEMMs of 4.9 us (one per DSA layer, about 54 us).
-- Decision: retained. Kill-switches `SLIMSERVE_GLM_ROUTE_ALIGN=0` and
-  `SLIMSERVE_MOE_COMBINE_SHARED=0` keep the reference paths for diagnosis.
+- Decision: retained. The diagnosis kill switches (`SLIMSERVE_GLM_ROUTE_ALIGN`,
+  `SLIMSERVE_MOE_COMBINE_SHARED`) came out once the path qualified; the
+  reference paths are the dispatch every other platform takes.
   The kernel is instantiated for E=288 / top-8 / M <= 16; MTP-3 decode
   batches beyond 16 tokens take the reference path until a wider variant.
 - Raw: `perf/results/2026-09-12/p1-item6-pass{1,2,3}/`, gates
@@ -26852,3 +26853,38 @@ reductions still went to NCCL.
   arm's PROVISIONAL is cleared.
 - Raw: `perf/results/2026-09-12/p5-spec-raw-car64-pass{1,2,3}/`,
   `~/.local/scratch/slimserve-glm53/serve-logs/{ab,ttft}-p5-spec-raw-car64.out`.
+
+### Item 8, re-measure after the upstream merge: FP8 main KV (`glm5_next_main_kv_fp8`) with upstream's fp8 sparse prefill kernel - REJECTED (kernel unqualified on sm_120)
+
+- Why again: the merge of upstream/main 9d76a981b brought the A100 record's
+  fp8 main KV pieces: the partition rule for the fp8 sparse decode kernel
+  and `mla_sparse_prefill_fp8` (groups of 4 queries over the union of
+  their pools, tensor cores, default on for fp8 caches). Item 8 had been
+  rejected on decode cost alone (p1-fp8kv: c16 -4.7 %).
+- Arm p6-fp8kv-nospec (boot 18:52, compact cache, 64 MiB AR, flag on):
+  c1 167.0 / 167.0 / 166.8, c8 581.6 / 581.1 / 573.7, c16 769.5 / 776.4 /
+  768.7; cold TTFT 32K 2.91 s, 128K 12.15 s; warm 0.177 s / 0.372 s.
+  `exact: true` on all nine runs - and the gates at -10.32 / -10.46 with
+  needle margins 1.7 / -13.5 and 2.1 / -20.5: the model is answering
+  garbage. Every throughput number of this arm is void.
+- Cause: `sparse_prefill_attn_kernel` asks 116,224 B of opt-in shared
+  memory per block (Q 66.5 KB + K tile 33 KB + score exchange 16 KB); the
+  RTX PRO 6000 opts in to 101,376 B. The binding set the attribute without
+  checking the result and launched without a launch check, so the kernel
+  never ran and the output buffer was returned uninitialised. Upstream's
+  own parity test (`tests/kernels/test_quixicore_sparse_prefill.py`) fails
+  5/5 here.
+- Fix (this branch): the binding now checks `cudaFuncSetAttribute` and the
+  launch (`C10_CUDA_KERNEL_LAUNCH_CHECK`), exposes
+  `mla_sparse_prefill_fp8_smem_bytes()`, and `_sparse_prefill_enabled()`
+  turns the kernel off with a warning on a device whose opt-in limit is
+  below its need, so an fp8 main KV on sm_120 falls back to the per-token
+  decode kernel for prefill instead of serving noise. A native sm_120
+  variant (a 32-row Q tile, 58 KB) is a separate item; with Item 8's decode
+  cost unchanged it is not queued.
+- Decision: FP8 main KV stays off the record; `glm5_next_sparse_prefill`
+  is self-qualifying. The prefill sparse-MLA lever for the bf16 cache is
+  the rows kernel (P6 below).
+- Raw: `perf/results/2026-09-12/p6-fp8kv-nospec-pass{1,2,3}/`, gates
+  `p6-fp8kv-nospec-gate{1,2}.json`, `serve-logs/{ab,ttft}-p6-fp8kv-nospec.out`,
+  `serve-logs/queue-h.out` (the test line).

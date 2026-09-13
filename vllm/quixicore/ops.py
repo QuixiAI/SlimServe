@@ -62,7 +62,7 @@ class quixicore_ops:
             return False
 
     # ------------------------------------------------------------------
-    # M <= 16 decode GEMMs (bf16_decode_gemm.cuh, fp8_decode_gemm.cuh)
+    # Marlin MoE routing and combine (glm_moe_routing.cuh, glm_moe_combine.cuh)
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -107,6 +107,10 @@ class quixicore_ops:
         """out[t] = shared[t] + sum_k x[t, k] (bf16 in/out, fp32 accumulation):
         the Marlin per-assignment sum and the shared-expert add in one launch."""
         _qc().moe_sum_add(x, shared, out)
+
+    # ------------------------------------------------------------------
+    # M <= 16 decode GEMMs (bf16_decode_gemm.cuh, fp8_decode_gemm.cuh)
+    # ------------------------------------------------------------------
 
     @staticmethod
     @cache
@@ -1683,6 +1687,15 @@ class quixicore_ops:
         )
 
     @staticmethod
+    @cache
+    def mla_sparse_prefill_fp8_smem_bytes() -> int:
+        """Opt-in shared memory per block the fp8 sparse prefill kernel
+        launches with; 0 from a build that predates the query (the launch
+        itself then reports an unqualified device)."""
+        fn = getattr(_qc(), "mla_sparse_prefill_fp8_smem_bytes", None)
+        return int(fn()) if fn is not None else 0
+
+    @staticmethod
     def mla_sparse_prefill_fp8(
         q: torch.Tensor,
         data: torch.Tensor,
@@ -1699,7 +1712,15 @@ class quixicore_ops:
         of their selected 4-token pools with a per-query mask. Same inputs as
         mla_decode_fp8_sparse_nope; q must be [T, 16, 512] (TP4 heads)."""
         return _qc().mla_sparse_prefill_fp8(
-            q, data, bt, indices, topk_length, block_size, scale, kv_scale, page_stride_bytes
+            q,
+            data,
+            bt,
+            indices,
+            topk_length,
+            block_size,
+            scale,
+            kv_scale,
+            page_stride_bytes,
         )
 
     @staticmethod
@@ -1718,8 +1739,15 @@ class quixicore_ops:
         the CUDA port of fused_recurrent_kda_packed_decode. Updates `state`
         in place for state_indices > 0; returns out [1, N, H, V] bf16."""
         return _qc().kda_decode(
-            mixed_qkv, raw_g, raw_beta, A_log, dt_bias, state, state_indices,
-            scale, 0.0 if lower_bound is None else float(lower_bound),
+            mixed_qkv,
+            raw_g,
+            raw_beta,
+            A_log,
+            dt_bias,
+            state,
+            state_indices,
+            scale,
+            0.0 if lower_bound is None else float(lower_bound),
             lower_bound is not None,
         )
 

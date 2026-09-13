@@ -46,10 +46,7 @@ static __nv_bfloat16* bpm(torch::Tensor& t) { return reinterpret_cast<__nv_bfloa
 static const float* fp(const torch::Tensor& t) { return t.data_ptr<float>(); }
 static float* fpm(torch::Tensor& t) { return t.data_ptr<float>(); }
 
-// ---- M <= 16 decode GEMMs (bf16_decode_gemm.cuh, fp8_decode_gemm.cuh) ----
-// The backbone projections at decode: x[M, K] @ weight[N, K]^T (+ fp32 bias),
-// fp32 accumulation, bf16 or fp32 output. `supports` is the shape gate the
-// kernels were tuned for (N in 2048..16384 / 1024..16384, K % 128 == 0).
+// ---- Marlin MoE routing and combine (glm_moe_routing.cuh, glm_moe_combine.cuh) ----
 static std::vector<torch::Tensor> py_glm_route_align(
         torch::Tensor logits, torch::Tensor bias, int64_t topk, int64_t scoring,
         bool renormalize, double scaling, int64_t block_size, int64_t max_padded,
@@ -116,6 +113,10 @@ static void py_moe_sum_add(torch::Tensor x, torch::Tensor shared, torch::Tensor 
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+// ---- M <= 16 decode GEMMs (bf16_decode_gemm.cuh, fp8_decode_gemm.cuh) ----
+// The backbone projections at decode: x[M, K] @ weight[N, K]^T (+ fp32 bias),
+// fp32 accumulation, bf16 or fp32 output. `supports` is the shape gate the
+// kernels were tuned for (N in 2048..16384 / 1024..16384, K % 128 == 0).
 static torch::Tensor py_decode_gemm(torch::Tensor x, torch::Tensor weight,
                                     c10::optional<torch::Tensor> bias, bool fp32_out) {
     CK(x); CK(weight);
@@ -1798,13 +1799,22 @@ static torch::Tensor py_mla_sparse_prefill_fp8(torch::Tensor q, torch::Tensor da
     auto out = torch::empty({T, H, 512}, q.options());
     static bool attr_set = false;
     if (!attr_set) {
-        cudaFuncSetAttribute(sparse_prefill_attn_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_TOTAL);
+        // The attention kernel needs SMEM_TOTAL bytes of opt-in shared memory
+        // (116 KB: 163 KB on sm80, 227 KB on sm90/sm100, but 99 KB on sm_120).
+        // An unchecked failure here left the launch below failing silently and
+        // `out` uninitialised on RTX PRO 6000 (2026-09-12).
+        const cudaError_t err = cudaFuncSetAttribute(
+            sparse_prefill_attn_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_TOTAL);
+        TORCH_CHECK(err == cudaSuccess, "mla_sparse_prefill_fp8 needs ", SMEM_TOTAL,
+                    " bytes of shared memory per block, which this device does not opt in to (",
+                    cudaGetErrorString(err), "); qualify the device with mla_sparse_prefill_fp8_smem_bytes()");
         attr_set = true;
     }
     const float q_scale = float(scale) * float(kv_scale) * 1.4426950408889634f;
     sparse_prefill_attn_kernel<<<G, THREADS, SMEM_TOTAL, stream()>>>(
         bp(q), data.data_ptr<uint8_t>(), pools.data_ptr<int>(), qmask.data_ptr<int>(), counts.data_ptr<int>(),
         bpm(out), T, H, q_scale, float(kv_scale), int(block_size), page_stride_bytes);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }
 static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> py_mla_sparse_prefill_prep_debug(
@@ -2761,6 +2771,8 @@ void init_serving(py::module_& m) {
           py::arg("topk_length"), py::arg("block_size"), py::arg("scale"), py::arg("kv_scale"),
           py::arg("page_stride_bytes") = 0,
           "Sparse NoPE-MLA prefill attention (groups of 4 queries over their pool union, fp8 latent)");
+    m.def("mla_sparse_prefill_fp8_smem_bytes", []() { return int64_t(tms::sparse_prefill::SMEM_TOTAL); },
+          "opt-in shared memory per block the fp8 sparse prefill kernel launches with");
     m.def("mla_sparse_prefill_prep_debug", &py_mla_sparse_prefill_prep_debug);
     m.def("w8a16_dequant", &py_w8a16_dequant, py::arg("wp"), py::arg("scale"), py::arg("N"), py::arg("K"),
           "Unpack fp8 weights to bf16 [N,K] (prefill path)");
