@@ -2411,7 +2411,25 @@ graph capture for the hybrid GDN+MTP decode, Gemma-aware fused norm+quant.
   `glm53f-tp8-handoff-baseline/` (c16 after CPU isolation). Repeat spreads,
   commands, traces and correctness details are in the optimization notebook.
 
-## GLM-5.3-Flash NVFP4 glm53f-nvfp4-8 - fixed k=2 record, 2026-09-12 (current)
+## GLM-5.3-Flash NVFP4 glm53f-nvfp4-8 - sparse prefill kernel record, 2026-09-12 (current)
+- Same configuration as the fixed k=2 record below plus the sparse MLA
+  prefill kernel (additional_config glm5_next_sparse_prefill: prefill
+  chunks attend in groups of 4 queries on tensor cores over the union of
+  their selected pools instead of the per-token decode kernel).
+- Sustained load (`vllm bench serve` random 1000/300 +-20%, 10 x
+  concurrency prompts, ignore_eos), same-protocol A/B on the k=2 tree:
+  | | c64 | c128 |
+  | prefill kernel on | 1508 (TPOT 38 ms) | 1864 (61 ms) |
+  | off | 1417 (41 ms) | 1674 (68 ms) |
+- Exact-token medians unchanged within spread (the harness prefills in
+  one burst): c8 564-630 / c16 851-877 / c64 1453-1490 in the A/B arms
+  against the k=2 record's 567 / 876 / 1414. Canaries pass; WildChat
+  deep-context leg c8: 845 turns, 0 errors, 135/135 recall, sessions to
+  704K tokens with VLLM_KV_TIER_VERIFY=1 (785 turns before the kernel).
+  Raw: perf/results/2026-09-12/glm53f-sparse-prefill-{1,0}/,
+  glm53f-leg-sparse-prefill/.
+
+## GLM-5.3-Flash NVFP4 glm53f-nvfp4-8 - fixed k=2 record, 2026-09-12
 - Same configuration as the mHC warp-split record below with the DFlash2
   draft length fixed at k=2 (the per-batch schedule had been inert under
   data parallelism, leaving a fixed k=3). Sustained load (`vllm bench

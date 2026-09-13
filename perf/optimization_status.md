@@ -26013,3 +26013,8 @@ Phases, by value over risk:
   KEPT (default on). Semantics note: duplicate indices (tail inside a
   selected pool) count once, twice in the decode kernel. Prefill profile
   and WildChat leg with it on: queue49.
+- LEG with the sparse prefill kernel (2026-09-13 00:00): 845 turns / 0
+  errors / 135/135 recall / 704K max ctx (785 turns at k=2 without it,
+  737 at k=3). Baseline updated: the record's sustained numbers are now
+  c64 1508 / c128 1864 output tok/s (from 1140-1157 / 1425 at the start
+  of the program: +30% / +31%).

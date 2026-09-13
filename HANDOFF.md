@@ -4092,3 +4092,18 @@ TP4 = 36 MLA + 18 indexer + 4 KDA state pages; 106 at TP8 = 68 + 34 + 4.
   the c8 point (4 per replica) prefers a longer draft.
 - Rule re-learned the hard way: never cp the extension .so into vllm/ while
   any server is booting or running (killed the k=4 arm's boot).
+
+## 2026-09-13 00:10: sparse prefill kernel on the record; program state
+
+- RECORD glm53f-nvfp4-8 = fp8 main KV + mHC warp-split + fixed k=2 +
+  sparse MLA prefill kernel (396300c18). Sustained c64 1508 / c128 1864
+  output tok/s (program start: 1140-1157 / 1425); exact c8 567 / c16 876 /
+  c32 1110 / c64 1414; leg 845 turns / 0 errors / 135/135 recall / 704K.
+- The prefill kernel (csrc/quixicore/serving/mla_sparse_prefill_kernels.cuh,
+  op mla_sparse_prefill_fp8, dispatch in the sparse backend's forward_mqa,
+  flag glm5_next_sparse_prefill / env VLLM_QC_SPARSE_PREFILL) replaced the
+  per-token decode kernel that was 39% of prefill time; groups of 4 queries
+  over the union of their pools; duplicates in the index list count once.
+- Remaining levers after this program: prefill MoE/mHC/NCCL shares (see the
+  with-kernel profile in the notebook), the KDA deferred commit (~2%), the
+  W8A16 dense path (parity, gated off), per-replica dynamic draft length.
