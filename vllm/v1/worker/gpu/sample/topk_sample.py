@@ -7,11 +7,8 @@ op replaces the Triton top-k/top-p mask pass over the full vocabulary plus the
 Gumbel argmax pass. It keeps every tie at the k-th value, orders the nucleus
 ascending by (logit, id), and draws the same (seed, pos, token)-keyed Philox
 noise as ``gumbel_sample``, so seeded requests stay reproducible.
-
-``SLIMSERVE_TOPK_SAMPLE=0`` forces the Triton mask + Gumbel path back on.
 """
 
-import os
 from functools import cache
 
 import numpy as np
@@ -26,8 +23,6 @@ MIN_VOCAB = 512
 
 @cache
 def enabled() -> bool:
-    if os.getenv("SLIMSERVE_TOPK_SAMPLE", "1") == "0":
-        return False
     from vllm.v1.worker.gpu.sample.gumbel import _use_native_sample_kernels
 
     if not _use_native_sample_kernels():

@@ -359,8 +359,7 @@ class MoERunner(MoERunnerInterface):
         add that the traced forward would otherwise apply."""
         assert self._shared_experts is not None
         return (
-            combine_shared.enabled()
-            and current_platform.is_cuda()
+            current_platform.is_cuda()
             and not self._shared_experts.enable_dbo
             and self.routed_scaling_factor == 1.0
             and self.routed_input_transform is None

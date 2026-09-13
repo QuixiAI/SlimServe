@@ -12,21 +12,11 @@ identity of the batch's ``topk_ids`` tensor so a stale publication can never
 be folded into another batch, and the runner clears the slot after every
 forward whether or not it was consumed."""
 
-import os
 from dataclasses import dataclass
 
 import torch
 
 MAX_TOKENS = 16
-
-# Kill-switch for performance diagnosis: SLIMSERVE_MOE_COMBINE_SHARED=0 keeps
-# moe_sum + the runner's add on every batch.
-_ENABLED = os.getenv("SLIMSERVE_MOE_COMBINE_SHARED", "1") != "0"
-
-
-def enabled() -> bool:
-    return _ENABLED
-
 
 @dataclass
 class SharedOutput:
