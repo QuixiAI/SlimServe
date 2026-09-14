@@ -9,6 +9,7 @@ import argparse
 import base64
 import io
 import json
+import os
 import subprocess
 import sys
 import time
@@ -62,10 +63,15 @@ def main():
             seed=42,
         )
         body.update(kwargs)
+        headers = {"Content-Type": "application/json"}
+        # Same key variable as benchmark_dsv4_exact.py, for servers started
+        # with an API key.
+        if api_key := os.environ.get("SLIMSERVE_BENCH_API_KEY"):
+            headers["Authorization"] = f"Bearer {api_key}"
         request = urllib.request.Request(
             args.base_url + "/v1/chat/completions",
             json.dumps(body).encode(),
-            {"Content-Type": "application/json"},
+            headers,
         )
         with urllib.request.urlopen(request, timeout=600) as response:
             responses[name] = json.load(response)
