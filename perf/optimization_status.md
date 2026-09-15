@@ -29058,3 +29058,57 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   own - the per-run range today was 226 to 358 tok/s.
 - Raw: `perf/results/2026-09-15/d18-c1-k{3,2}-pass{1,2,3}/`, gates
   `d18-c1-k{3,2}-gate1.json`, chain `serve-logs/d18-chain.out`.
+
+### Acceptance audit, part 5 (closing): the latent cache format is not the gap either, and the draft head's weights do load - the 0.04 per draft is unattributed
+
+- Last named hypothesis after part 4: the control serves its MLA latents
+  as per-token-scaled `fp8_ds_mla` and accepts 0.723 per draft; we serve
+  BF16 latents and accept 0.690. This tree has an fp8 (e4m3) main KV for
+  the sparse MLA layers (`glm5_next_main_kv_fp8`), rejected earlier on
+  decode cost, and correct since the prefill kernel disqualifies itself on
+  this card (it needs 116,224 B of shared memory against the 101,376 B the
+  card opts into) and falls back instead of serving noise.
+- Arm (c8 probe, k=1, three seeds, the record's drafter and draft cut; the
+  only variable is the latent dtype of the sparse attention layers):
+
+  | arm | latents | tokens/step | per draft | c8 tok/s (12) | gate |
+  |---|---|---|---|---|---|
+  | acc-k1-marlin (part 4) | BF16 | 1.690 | 0.690 | 769.9 | -2.461 |
+  | acc-k1-fp8kv | fp8 e4m3 | 1.687 | 0.687 | 746.2 | -2.431 |
+  | control (part 3) | fp8_ds_mla | 1.723 | 0.723 | 774.1 | -2.573 |
+
+  Boot logs the fp8 path (`glm5_next: sparse MLA layers use fp8 (e4m3)
+  main KV`) and the prefill kernel's skip; canaries pass, gates in band.
+- The loading hypothesis, checked statically: a draft head with a silently
+  unloaded parameter would lose acceptance and nothing else, which is
+  exactly this symptom. It is not that. The MTP shard holds 1,753 tensors
+  (eh_proj, enorm, hnorm, the two layernorms, 288 experts x 3 weights and
+  scales, the shared experts, the gate and its correction bias, the full
+  attention block, the seven indexer tensors and `shared_head.norm`); the
+  draft model is built through `get_model`, whose loader RAISES on any
+  parameter it did not initialize from the checkpoint, and every boot of
+  this campaign has passed that check.
+- Closing statement of the audit. Excluded, each on its own arm or its own
+  code reading: the FP8 swap-set, the verification rule (block =
+  standard), index sharing, the draft cache dtype, the native sampler
+  kernels, the draft expert kernel, the hidden-state handoff, the routing
+  kernel, the indexer (at these prompt lengths every row is attended, so
+  it cannot select differently), the target's expert quantization (part 4:
+  native W4A4 accepts 0.681 against Marlin's 0.690), the target's latent
+  precision (this part), and unloaded draft weights. Two directions also
+  rule out a simple precision story: our latents are the HIGHER-precision
+  pair and accept no more, and moving the experts to the control's own
+  kernel library moves acceptance by less than the probe's noise.
+- What it is worth, for whoever picks it up: 0.033 per draft at k=1 -
+  about 5 % of the tokens per step, ~6 % at c1 and ~3 % at c8 in
+  throughput. What is left to look at is the draft head's own arithmetic
+  against a reference forward (the head is bf16 on a W4A16 target here and
+  bf16 on a W4A4 target there, so its inputs differ in ways neither arm
+  isolates), and the control's `fp8_ds_mla` per-token scaling, which is a
+  different cache format from our per-tensor e4m3 rather than a different
+  precision.
+- Decision: the audit is closed as unattributed and bounded. FP8 main KV
+  stays off the record (it costs 3 % at c8 here and 4.7 % at c16 in the
+  earlier arm, and buys no acceptance).
+- Raw: `perf/results/2026-09-15/acc-k1-fp8kv-pass{1,2,3}/`, gate
+  `acc-k1-fp8kv-gate1.json`, chain `serve-logs/acc8-chain.out`.
