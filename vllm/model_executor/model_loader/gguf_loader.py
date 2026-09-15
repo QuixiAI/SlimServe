@@ -62,6 +62,7 @@ class GGUFModelLoader(BaseModelLoader):
         from vllm.model_executor.model_loader.gguf_adapters import (
             Deepseek4GGUFAdapter,
             DFlashGGUFAdapter,
+            Glm5NextGGUFAdapter,
             GlmDsaGGUFAdapter,
             KimiK3DSparkGGUFAdapter,
             KimiK3GGUFAdapter,
@@ -110,6 +111,8 @@ class GGUFModelLoader(BaseModelLoader):
             adapter_cls = KimiK3GGUFAdapter
         elif architecture == "glm-dsa":
             adapter_cls = GlmDsaGGUFAdapter
+        elif architecture == "glm5-next":
+            adapter_cls = Glm5NextGGUFAdapter
         elif architecture == "qwen35":
             adapter_cls = Qwen35GGUFAdapter
         else:

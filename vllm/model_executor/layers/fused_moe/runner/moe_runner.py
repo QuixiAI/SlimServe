@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Callable, Iterable
 from contextlib import nullcontext
-import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -54,8 +54,63 @@ from vllm.utils.torch_utils import (
     LayerName,
     direct_register_custom_op,
 )
+from vllm.v1.worker.metal_phaseprof import phase as _qc_phase
 
 logger = init_logger(__name__)
+
+_METAL_ROUTER_REGION: bool | None = None
+
+
+def _metal_router_region_ok(
+    runner, hidden_states: torch.Tensor, router_logits: torch.Tensor,
+    shared_experts_input: torch.Tensor | None,
+) -> bool:
+    """W26b: whether to open the Metal concurrent region before the router
+    kernel. Requires the opt-in flag, the Metal single-group router kernel
+    for these logits (the torch chain would run inside the region) and a
+    quant method that takes the shared||routed region on this call."""
+    global _METAL_ROUTER_REGION
+    if _METAL_ROUTER_REGION is None:
+        _METAL_ROUTER_REGION = (
+            current_platform.is_metal()
+            and os.environ.get("VLLM_METAL_MOE_ROUTER_OVERLAP", "0") == "1"
+        )
+    if not _METAL_ROUTER_REGION:
+        return False
+    region_ok = getattr(runner._quant_method, "metal_region_ok", None)
+    if region_ok is None or runner._shared_experts is None:
+        return False
+    router = runner.router
+    if getattr(router, "_routing_replay_out", None) is not None:
+        return False
+    from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import (
+        GroupedTopKRouter,
+        _metal_router_ok,
+    )
+
+    if not isinstance(router, GroupedTopKRouter):
+        return False
+    num_experts = router_logits.shape[-1]
+    if router.num_expert_group and (
+        num_experts <= router.num_expert_group
+        or num_experts % router.num_expert_group
+    ):
+        return False
+    if not _metal_router_ok(
+        router_logits, router.top_k, router.num_expert_group,
+        router.topk_group, router.scoring_func,
+    ):
+        return False
+    from vllm.quixicore import quixicore_ops
+
+    if quixicore_ops.concurrent_active():
+        return False
+    return bool(
+        region_ok(
+            runner.routed_experts, hidden_states, runner._shared_experts,
+            shared_experts_input,
+        )
+    )
 
 
 def register_layer_for_moe_forward_op(
@@ -606,9 +661,19 @@ class MoERunner(MoERunnerInterface):
         via the router, and the actual fused MoE computation. Returns
         (shared_expert_output, fused_expert_output).
         """
-        self._maybe_apply_shared_experts(
-            shared_experts_input, SharedExpertsOrder.NO_OVERLAP, prequant_input
-        )
+        with _qc_phase("moe_shared"):
+            self._maybe_apply_shared_experts(
+                shared_experts_input, SharedExpertsOrder.NO_OVERLAP, prequant_input
+            )
+        if self._shared_experts is not None:
+            # The quant method may fold `shared + routed` into its epilogue
+            # only when nothing else touches the routed output alone
+            # afterwards (see FusedMoE.forward's identity check).
+            self._shared_experts.accumulate_ok = (
+                self.routed_scaling_factor == 1.0
+                and not self.defer_shared_expert_add
+                and self.routed_output_transform is None
+            )
 
         if self.routed_experts.quant_method.is_monolithic:
             # Monolithic kernels: pass router_logits to routed_experts
@@ -619,24 +684,41 @@ class MoERunner(MoERunnerInterface):
             )
         else:
             # Modular kernels: select experts first, then call routed_experts
-            if preselected is None:
-                topk_weights, topk_ids = self.router.select_experts(
-                    hidden_states=hidden_states,
-                    router_logits=router_logits,
-                    topk_indices_dtype=self._quant_method.topk_indices_dtype,
-                    input_ids=input_ids,
-                )
-            else:
-                topk_weights, topk_ids = preselected
-
-            fused_out = self.routed_experts.forward_modular(
-                x=hidden_states,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                shared_experts=self._shared_experts,
-                shared_experts_input=shared_experts_input,
-                prequant_input=prequant_input,
+            # W26b (VLLM_METAL_MOE_ROUTER_OVERLAP=1, the glm53f-q2-1 env
+            # block): open the layer's concurrent region already around the
+            # Metal router kernel so it overlaps the shared-expert pair
+            # GEMV; the quant method joins and closes the region.
+            region = preselected is None and _metal_router_region_ok(
+                self, hidden_states, router_logits, shared_experts_input
             )
+            if region:
+                from vllm.quixicore import quixicore_ops
+
+                quixicore_ops.concurrent_begin()
+            try:
+                if preselected is None:
+                    with _qc_phase("moe_router"):
+                        topk_weights, topk_ids = self.router.select_experts(
+                            hidden_states=hidden_states,
+                            router_logits=router_logits,
+                            topk_indices_dtype=self._quant_method.topk_indices_dtype,
+                            input_ids=input_ids,
+                        )
+                else:
+                    topk_weights, topk_ids = preselected
+
+                with _qc_phase("moe_routed"):
+                    fused_out = self.routed_experts.forward_modular(
+                        x=hidden_states,
+                        topk_weights=topk_weights,
+                        topk_ids=topk_ids,
+                        shared_experts=self._shared_experts,
+                        shared_experts_input=shared_experts_input,
+                        prequant_input=prequant_input,
+                    )
+            finally:
+                if region:
+                    quixicore_ops.concurrent_end()
 
         self._maybe_apply_shared_experts(
             shared_experts_input,
@@ -792,9 +874,12 @@ class MoERunner(MoERunnerInterface):
             assert self.moe_config.skip_final_all_reduce
             assert og_hidden_dim_post_xform is None
             return shared_output, fused_output
-        if shared_output is not None:
+        if shared_output is not None and fused_output is not shared_output:
             result = shared_output + fused_output
         else:
+            # fused_output is shared_output when the quant method
+            # accumulated the routed result into the shared-expert output
+            # (Metal GGUF q2_K sum kernel); the add already happened.
             result = fused_output
 
         result = self._maybe_reduce_final_output(

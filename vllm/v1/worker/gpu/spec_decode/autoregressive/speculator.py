@@ -586,6 +586,18 @@ def prepare_prefill_inputs(
     max_num_reqs,
 ) -> torch.Tensor:
     num_reqs = input_batch.num_reqs
+    if _use_native_inputs(last_token_indices):
+        return _prepare_prefill_inputs_native(
+            last_token_indices,
+            current_draft_step,
+            input_buffers,
+            input_batch,
+            num_sampled,
+            num_rejected,
+            last_sampled,
+            next_prefill_tokens,
+            max_num_reqs,
+        )
     _prepare_prefill_inputs_kernel[(num_reqs,)](
         last_token_indices,
         current_draft_step,
@@ -669,6 +681,17 @@ def prepare_decode_inputs(
     advance_draft_positions: bool = True,
 ):
     num_reqs = draft_tokens.shape[0]
+    if _use_native_inputs(draft_tokens):
+        _prepare_decode_inputs_native(
+            draft_tokens,
+            target_seq_lens,
+            num_rejected,
+            input_buffers,
+            max_model_len,
+            max_num_reqs,
+            advance_draft_positions,
+        )
+        return
     _prepare_decode_inputs_kernel[(num_reqs + 1,)](
         draft_tokens,
         draft_tokens.stride(0),
@@ -765,6 +788,19 @@ def update_draft_inputs(
     advance_draft_positions: bool = True,
 ):
     _, hidden_size = hidden_states.shape
+    if _use_native_inputs(draft_tokens):
+        _update_draft_inputs_native(
+            draft_tokens,
+            current_draft_step,
+            hidden_states,
+            output_draft_tokens,
+            next_input_hidden_states,
+            input_buffers,
+            num_reqs,
+            max_model_len,
+            advance_draft_positions,
+        )
+        return
     _update_draft_inputs_kernel[(num_reqs,)](
         output_draft_tokens,
         output_draft_tokens.stride(0),
@@ -783,3 +819,116 @@ def update_draft_inputs(
         BLOCK_SIZE=1024,
         ADVANCE_DRAFT_POSITIONS=advance_draft_positions,
     )
+
+
+# ---------------------------------------------------------------------------
+# Torch-native input preparation (Metal). The Triton kernels above cannot run
+# on MPS; these reproduce them with a handful of whole-batch tensor ops and no
+# host sync (every scalar that the kernels read from device memory stays a
+# device tensor here too). Semantics match the kernels for every element a
+# later stage reads; padding slots past the live requests are filled the same
+# way the kernels fill them.
+# ---------------------------------------------------------------------------
+
+
+def _use_native_inputs(t: torch.Tensor) -> bool:
+    return t.device.type == "mps"
+
+
+def _prepare_prefill_inputs_native(
+    last_token_indices: torch.Tensor,
+    current_draft_step: torch.Tensor,
+    input_buffers: InputBuffers,
+    input_batch: InputBatch,
+    num_sampled: torch.Tensor,
+    num_rejected: torch.Tensor,
+    last_sampled: torch.Tensor,
+    next_prefill_tokens: torch.Tensor,
+    max_num_reqs: int,
+) -> torch.Tensor:
+    num_reqs = input_batch.num_reqs
+    num_tokens = input_batch.num_tokens
+    qsl = input_batch.query_start_loc[: num_reqs + 1]
+    idx_mapping = input_batch.idx_mapping[:num_reqs]
+
+    # Shift the target input ids left by one over the whole batch. At a
+    # request boundary this drops the next request's first token into the
+    # previous request's final slot; that slot is either the request's last
+    # live position (rewritten with next_token below) or a rejected-token
+    # pad the drafter's output is never read from.
+    draft_ids = input_buffers.input_ids
+    if num_tokens > 1:
+        draft_ids[: num_tokens - 1].copy_(input_batch.input_ids[1:num_tokens])
+    input_buffers.positions[:num_tokens].copy_(input_batch.positions[:num_tokens])
+
+    last = qsl[1:] - num_rejected[:num_reqs].to(qsl.dtype) - 1
+    last_token_indices[:num_reqs].copy_(last)
+    next_token = torch.where(
+        num_sampled[:num_reqs] > 0,
+        last_sampled[idx_mapping],
+        next_prefill_tokens[idx_mapping],
+    ).to(draft_ids.dtype)
+    draft_ids[last.to(torch.int64)] = next_token
+
+    input_buffers.query_start_loc[: num_reqs + 1].copy_(qsl)
+    if num_reqs + 1 < max_num_reqs + 1:
+        input_buffers.query_start_loc[num_reqs + 1 :].copy_(
+            qsl[num_reqs].expand(max_num_reqs - num_reqs)
+        )
+    input_buffers.seq_lens[:num_reqs].copy_(input_batch.seq_lens[:num_reqs])
+    input_buffers.seq_lens[num_reqs:].zero_()
+    last_token_indices[num_reqs:].zero_()
+    current_draft_step.zero_()
+    return last_token_indices
+
+
+def _prepare_decode_inputs_native(
+    draft_tokens: torch.Tensor,
+    target_seq_lens: torch.Tensor,
+    num_rejected: torch.Tensor,
+    input_buffers: InputBuffers,
+    max_model_len: int,
+    max_num_reqs: int,
+    advance_draft_positions: bool,
+) -> None:
+    num_reqs = draft_tokens.shape[0]
+    input_buffers.input_ids[:num_reqs].copy_(draft_tokens)
+    qsl = input_buffers.query_start_loc
+    torch.arange(max_num_reqs + 1, dtype=qsl.dtype, device=qsl.device, out=qsl)
+    qsl.clamp_(max=num_reqs)
+    input_buffers.seq_lens[num_reqs:].zero_()
+    if advance_draft_positions:
+        pos = input_buffers.positions[:num_reqs]
+        pos.add_(1).clamp_(max=max_model_len - 1)
+        seq = input_buffers.seq_lens[:num_reqs]
+        seq.copy_(target_seq_lens[:num_reqs] - num_rejected[:num_reqs].to(seq.dtype))
+        seq.add_(1).clamp_(max=max_model_len)
+
+
+def _update_draft_inputs_native(
+    draft_tokens: torch.Tensor,
+    current_draft_step: torch.Tensor,
+    hidden_states: torch.Tensor,
+    output_draft_tokens: torch.Tensor,
+    next_input_hidden_states: torch.Tensor,
+    input_buffers: InputBuffers,
+    num_reqs: int,
+    max_model_len: int,
+    advance_draft_positions: bool,
+) -> None:
+    # output_draft_tokens[r, step] = draft_tokens[r] without reading the step
+    # back to the host.
+    step_col = current_draft_step.to(torch.int64).reshape(1, 1).expand(num_reqs, 1)
+    output_draft_tokens[:num_reqs].scatter_(
+        1, step_col, draft_tokens.to(output_draft_tokens.dtype).reshape(num_reqs, 1)
+    )
+    # The kernel skips the remaining updates on the final step; doing them
+    # unconditionally is harmless (the next propose rewrites every buffer
+    # they touch before anything reads it) and avoids a host sync.
+    input_buffers.input_ids[:num_reqs].copy_(draft_tokens)
+    next_input_hidden_states[:num_reqs].copy_(hidden_states[:num_reqs])
+    if advance_draft_positions:
+        pos = input_buffers.positions[:num_reqs]
+        pos.add_(1).clamp_(max=max_model_len - 1)
+        seq = input_buffers.seq_lens[:num_reqs]
+        seq.add_(1).clamp_(max=max_model_len)

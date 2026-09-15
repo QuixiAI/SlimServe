@@ -448,7 +448,14 @@ def _reshape_kv_cache(
             attn_groups, kv_caches, kernel_block_sizes, cache_dtype
         )
 
-    if has_attn and kv_cache_config is not None:
+    # Hybrid attention/mamba models were just restrided to page-local
+    # blocks-first storage for every K/V-first view above, so the mixed
+    # encoder-decoder alignment (which would restride the blocks-first
+    # views back toward K/V-first storage, and asserts a (blocks, 2, ...)
+    # shape an MLA latent cache does not have) must not run on them: a
+    # dense-attention drafter (DFlash2's qwen3-class layers) sharing the
+    # allocation with the target's sparse-MLA latent pages hit that assert.
+    if has_attn and kv_cache_config is not None and not has_mamba:
         _align_mixed_attention_kv_cache_views(
             attn_groups=attn_groups,
             kv_caches=kv_caches,

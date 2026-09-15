@@ -24,15 +24,26 @@ token; top-k runs on the existing per-row top-k kernels in POOL units;
 a second Triton kernel expands pools to tokens and appends the tail into
 ``topk_indices_buffer``. The whole forward is one custom op so it stays
 opaque to torch.compile and captures into decode CUDA graphs.
+
+On Apple Metal (mps tensors; see ``_use_native_producer``) the same op body
+runs a torch-native producer (``_insert_rows_native`` /
+``_pooled_select_native``): fixed-shape
+pool tiles gathered through the block table, the identical pool-softmax /
+relu / head-weight arithmetic, ``torch.topk`` over pools, and a torch
+expansion that writes the same ``[expanded pools | tail | -1 pad]`` row
+layout the Triton ``_expand_topk_kernel`` produces. No host readback, no
+boolean-mask compaction, no data-dependent shapes.
 """
 
 from __future__ import annotations
+
+import os
 
 import torch
 from torch import nn
 
 from vllm import _custom_ops as ops
-from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
+from vllm.config import CacheConfig, VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.glm5_next_indexer_workspace import (
@@ -57,8 +68,20 @@ from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerMetadata,
 )
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
+from vllm.v1.worker.metal_phaseprof import phase as _qc_phase
 
 logger = init_logger(__name__)
+
+
+def glm5_next_device() -> torch.device:
+    """Device for the model's step buffers (top-k index buffer, decode
+    logits workspace). CUDA/ROCm keep ``cuda:<current>`` exactly as before;
+    other platforms (Metal ``mps``, CPU) use their platform device type."""
+    device_type = current_platform.device_type
+    if device_type == "cuda":
+        return torch.device("cuda", torch.cuda.current_device())
+    return torch.device(device_type)
+
 
 # Row layout of the cached indexer state.
 _K_DIM = 128
@@ -321,6 +344,369 @@ def _expand_topk_kernel(
         cm = (c >= pad0) & (c < OUT_W)
         tl.store(out_ptr + r.to(tl.int64) * OUT_W + c, tl.full((256,), -1, tl.int32), mask=cm)
 
+# ------------------------------------------------- native (Metal / CPU) producer
+#
+# Everything below is the torch-only counterpart of the three Triton kernels
+# above, used whenever the tensors are not on a CUDA/ROCm device. Contract:
+# fixed-shape tiles sized from python-int metadata, gathers through the
+# block table, no ``.item()``/``nonzero``/boolean compaction, no host copies.
+
+# Byte budget for one gathered pool tile ([bt_rows, P, KP, ROW] bf16) and the
+# number of query rows scored per tile; both bound the fp32 intermediates.
+_NATIVE_TILE_BYTES = 32 << 20
+_NATIVE_ROW_CHUNK = 256
+# MPS index kernels have been observed to fold element offsets into signed
+# 32-bit integers for strided sources (see metal_attn.py's range gather);
+# a page cache spanning more elements than that is gathered window by
+# window with the tensor's own (64-bit) storage offset doing the addressing.
+_INDEX32_LIMIT = 2**31 - 1
+
+
+def _use_native_producer(t: torch.Tensor) -> bool:
+    """Whether the torch-native producer serves this call.
+
+    MPS tensors always (Triton does not target Metal). ``VLLM_METAL_GLM_INDEXER``
+    mirrors ``VLLM_METAL_KDA``: ``native`` forces the torch path on any
+    device (CPU parity tests), ``0`` pins the Triton route. CPU tensors
+    otherwise keep the Triton route, which the CUDA unit tests drive with
+    mocked kernels."""
+    flag = os.environ.get("VLLM_METAL_GLM_INDEXER", "1").strip().lower()
+    if flag == "native":
+        return True
+    if flag in ("0", "false", "off"):
+        return False
+    return t.device.type == "mps"
+
+
+def _cache_extent(cache: torch.Tensor) -> int:
+    """Elements spanned by a [num_blocks, BS, ROW] page view (pages may be
+    strided by the packed cross-layer slab)."""
+    if cache.shape[0] == 0:
+        return 0
+    return (cache.shape[0] - 1) * cache.stride(0) + cache.shape[1] * cache.shape[2]
+
+
+def _gather_cache_rows(
+    cache: torch.Tensor, blk: torch.Tensor, off: torch.Tensor
+) -> torch.Tensor:
+    """rows[...] = cache[blk[...], off[...]] (int64 indices, any leading
+    shape). Windowed when the page view exceeds the 32-bit offset range."""
+    if cache.device.type != "mps" or _cache_extent(cache) <= _INDEX32_LIMIT:
+        return cache[blk, off]
+    win = max(1, _INDEX32_LIMIT // max(1, cache.stride(0)))
+    out = torch.zeros(
+        (*blk.shape, cache.shape[2]), dtype=cache.dtype, device=cache.device
+    )
+    for b0 in range(0, cache.shape[0], win):
+        b1 = min(cache.shape[0], b0 + win)
+        inwin = (blk >= b0) & (blk < b1)
+        local = torch.where(inwin, blk - b0, 0)
+        out = torch.where(inwin[..., None], cache[b0:b1][local, off], out)
+    return out
+
+
+def _scatter_cache_rows(
+    cache: torch.Tensor, blk: torch.Tensor, off: torch.Tensor, vals: torch.Tensor
+) -> None:
+    """cache[blk[t], off[t]] = vals[t]. Windowed like the gather when the
+    page view exceeds the 32-bit offset range; rows outside a window
+    rewrite the window's row 0 with its own contents (no valid row ever
+    targets block 0, the KV manager's null block)."""
+    if cache.device.type != "mps" or _cache_extent(cache) <= _INDEX32_LIMIT:
+        cache[blk, off] = vals
+        return
+    win = max(1, _INDEX32_LIMIT // max(1, cache.stride(0)))
+    for b0 in range(0, cache.shape[0], win):
+        b1 = min(cache.shape[0], b0 + win)
+        sub = cache[b0:b1]
+        inwin = (blk >= b0) & (blk < b1)
+        local = torch.where(inwin, blk - b0, 0)
+        loff = torch.where(inwin, off, 0)
+        sub[local, loff] = torch.where(inwin[:, None], vals, sub[0, 0][None, :])
+
+
+_METAL_IDX: bool | None = None
+
+
+def _metal_indexer_kernels() -> bool:
+    """quixicore Metal indexer kernels (pool logits, top-k expand, paged row
+    insert). VLLM_METAL_INDEXER_KERNEL=0 pins the torch producer."""
+    global _METAL_IDX
+    if _METAL_IDX is None:
+        _METAL_IDX = False
+        if current_platform.is_metal() and os.environ.get(
+            "VLLM_METAL_INDEXER_KERNEL", "1"
+        ) != "0":
+            try:
+                from vllm.quixicore import quixicore_ops
+
+                _METAL_IDX = quixicore_ops.is_available() and (
+                    quixicore_ops.has("glm5_indexer_pool_logits")
+                )
+            except Exception:
+                _METAL_IDX = False
+    return _METAL_IDX
+
+
+def _insert_rows_native(
+    packed: torch.Tensor, cache: torch.Tensor, slot_mapping: torch.Tensor
+) -> None:
+    """Torch counterpart of ``_insert_rows_kernel``: cache[slot[t]] = src[t]
+    for slot[t] >= 0, slots resolved as (slot // BS, slot % BS). PAD rows
+    (slot -1) land on block 0 row 0, the KV manager's null block that no
+    request reads (the same convention as metal_attn's cache update);
+    a data-dependent mask would need a host sync."""
+    if packed.shape[0] == 0:
+        return
+    if (
+        _metal_indexer_kernels()
+        and cache.device.type == "mps"
+        and cache.dim() == 3
+        and cache.stride(2) == 1
+        and cache.stride(1) == cache.shape[2]
+    ):
+        from vllm.quixicore import quixicore_ops
+
+        rows = packed if packed.dtype == cache.dtype else packed.to(cache.dtype)
+        slots = slot_mapping
+        if slots.dtype not in (torch.int32, torch.int64):
+            slots = slots.to(torch.int64)
+        quixicore_ops.paged_row_insert(rows, cache, slots.contiguous())
+        return
+    bs = cache.shape[1]
+    slot = slot_mapping.to(torch.int64).clamp_min(0)
+    blk = torch.div(slot, bs, rounding_mode="floor")
+    off = slot - blk * bs
+    _scatter_cache_rows(cache, blk, off, packed.to(cache.dtype))
+
+
+def _pool_keys_native(
+    cache: torch.Tensor,
+    block_table: torch.Tensor,
+    block_size: int,
+    ape: torch.Tensor,
+    kp: int,
+    p0: int,
+    p1: int,
+) -> torch.Tensor:
+    """Pool keys for pools [p0, p1) of every block-table row, [B, P, D]
+    fp32, rounded through bf16 exactly where the Triton kernel feeds them
+    to its bf16 dot. Pools past a row's context read whatever their
+    (clamped) block-table entry points at; the caller masks them."""
+    D = ape.shape[1]
+    dev = cache.device
+    B = block_table.shape[0]
+    P = p1 - p0
+    tok = torch.arange(p0, p1, device=dev)[:, None] * kp + torch.arange(
+        kp, device=dev
+    )[None, :]  # [P, KP]
+    col = torch.div(tok, block_size, rounding_mode="floor").clamp_(
+        max=max(block_table.shape[1] - 1, 0)
+    )
+    blk = (
+        block_table.to(torch.int64)
+        .index_select(1, col.reshape(-1))
+        .view(B, P, kp)
+        .clamp_(0, cache.shape[0] - 1)
+    )
+    off = torch.remainder(tok, block_size)[None].expand(B, P, kp)
+    rows = _gather_cache_rows(cache, blk, off)  # [B, P, KP, ROW]
+    k = rows[..., :D].float()
+    g = rows[..., D:].float() + ape[None, None, :, :]
+    probs = torch.softmax(g, dim=2)
+    return (probs * k).sum(dim=2).to(torch.bfloat16).float()
+
+
+_METAL_INDEXER_IDENTITY: bool | None = None
+_IDENTITY_ARANGE: dict[tuple[str, int], torch.Tensor] = {}
+
+
+def _metal_indexer_identity() -> bool:
+    """VLLM_METAL_INDEXER_IDENTITY=1 (glm53f-q2-1): below the selection
+    limit the pooled top-k is the identity; skip scoring it."""
+    global _METAL_INDEXER_IDENTITY
+    if _METAL_INDEXER_IDENTITY is None:
+        _METAL_INDEXER_IDENTITY = (
+            os.environ.get("VLLM_METAL_INDEXER_IDENTITY", "0") == "1"
+        )
+    return _METAL_INDEXER_IDENTITY
+
+
+def _identity_arange(dev: torch.device, n: int) -> torch.Tensor:
+    key = (str(dev), n)
+    t = _IDENTITY_ARANGE.get(key)
+    if t is None:
+        t = torch.arange(n, dtype=torch.int32, device=dev)
+        _IDENTITY_ARANGE[key] = t
+    return t
+
+
+def _pooled_select_native(
+    q: torch.Tensor,           # [R, H, D] bf16
+    weights: torch.Tensor,     # [R, H] fp32 (already * n_heads^-0.5)
+    ape: torch.Tensor,         # [KP, D] fp32
+    cache: torch.Tensor,       # [num_blocks, BS, ROW] bf16 (pages may be strided)
+    block_table: torch.Tensor, # [rows_bt, stride] int
+    row_req: torch.Tensor,     # [R] block-table row per query row
+    visible: torch.Tensor,     # [R] visible tokens per query row
+    block_size: int,
+    softmax_scale: float,
+    ksel: int,
+    topk_out: torch.Tensor,    # [R, OUT_W] int32
+    kp: int,
+    pool_bound: int,
+    tlen_out: torch.Tensor | None = None,  # [R] int32 valid prefix length
+) -> None:
+    """Native pooled logits + top-k pools + expansion. ``pool_bound`` is a
+    python-int bound on every row's pool count (batch max_seq_len // kp).
+    ``tlen_out`` receives each row's valid prefix length (the sparse decode
+    kernel stops its scan there)."""
+    R, H, D = q.shape
+    assert cache.shape[-1] == _ROW_DIM, "native GLM indexer serves the 256-wide row"
+    dev = q.device
+    pool_bound = max(1, pool_bound)
+    if (
+        _metal_indexer_kernels()
+        and dev.type == "mps"
+        and kp == 4
+        and D == 128
+        and H <= 64
+        and q.dtype in (torch.bfloat16, torch.float16)
+        and cache.dtype == q.dtype
+        and cache.stride(2) == 1
+        and cache.stride(1) == _ROW_DIM
+        and block_size % 4 == 0
+    ):
+        # Metal: pool logits in one launch, torch top-k (sorted, so valid
+        # pools come first), expand + tail in one launch.
+        from vllm.quixicore import quixicore_ops
+
+        vis = visible if visible.dtype == torch.int32 else visible.to(torch.int32)
+        if pool_bound <= ksel and _metal_indexer_identity():
+            # Every pool of every row fits the selection (context below
+            # index_topk): the top-k is the identity, so skip the pool
+            # logits and the torch top-k chain and emit each row's pools in
+            # position order (valid prefix, then -1). Same selected SET as
+            # the scored path; only the list order differs, which the
+            # sparse decode kernel's fp32 partition merge sees as rounding
+            # (W16c precedent). Opt-in per profile
+            # (VLLM_METAL_INDEXER_IDENTITY=1, the glm53f-q2-1 env block).
+            if quixicore_ops.has("glm5_indexer_expand_identity"):
+                quixicore_ops.glm5_indexer_expand_identity(
+                    vis.contiguous(), topk_out, kp, ksel, tlen_out
+                )
+                return
+            n_pools = torch.div(vis, kp, rounding_mode="floor")
+            ar = _identity_arange(dev, ksel)
+            sel = torch.where(
+                ar[None, :] < n_pools[:, None], ar[None, :].expand(R, ksel), -1
+            )
+            quixicore_ops.glm5_indexer_expand_topk(
+                sel.contiguous(), vis.contiguous(), topk_out, kp, tlen_out
+            )
+            return
+        bt = block_table if block_table.dtype == torch.int32 else block_table.to(
+            torch.int32
+        )
+        rr = row_req if row_req.dtype == torch.int32 else row_req.to(torch.int32)
+        logits = quixicore_ops.glm5_indexer_pool_logits(
+            q.contiguous(), weights.contiguous(), ape.contiguous(), cache,
+            bt.contiguous(), rr.contiguous(), vis.contiguous(), pool_bound,
+            block_size, softmax_scale,
+        )
+        tk = min(ksel, pool_bound)
+        vals, idx = torch.topk(logits, tk, dim=-1, sorted=True)
+        sel = idx.to(torch.int32).masked_fill(vals == float("-inf"), -1)
+        if tk < ksel:
+            sel = torch.nn.functional.pad(sel, (0, ksel - tk), value=-1)
+        quixicore_ops.glm5_indexer_expand_topk(
+            sel.contiguous(), vis.contiguous(), topk_out, kp, tlen_out
+        )
+        return
+    n_pools = torch.div(visible.to(torch.int64), kp, rounding_mode="floor")
+    row_req64 = row_req.to(torch.int64)
+    qf = q.float()
+    tile = _NATIVE_TILE_BYTES // max(
+        1, block_table.shape[0] * kp * cache.shape[-1] * cache.element_size()
+    )
+    tile = max(64, min(2048, tile))
+
+    best_vals = torch.full((R, ksel), float("-inf"), dtype=torch.float32, device=dev)
+    best_idx = torch.full((R, ksel), -1, dtype=torch.int64, device=dev)
+    for p0 in range(0, pool_bound, tile):
+        p1 = min(p0 + tile, pool_bound)
+        with _qc_phase("idx_pool_keys"):
+            pk = _pool_keys_native(cache, block_table, block_size, ape, kp, p0, p1)
+        pcol = torch.arange(p0, p1, device=dev)
+        chunk_vals, chunk_idx = [], []
+        for r0 in range(0, R, _NATIVE_ROW_CHUNK):
+            r1 = min(r0 + _NATIVE_ROW_CHUNK, R)
+            pk_rows = pk.index_select(0, row_req64[r0:r1])  # [r, P, D]
+            scores = torch.einsum("rpd,rhd->rph", pk_rows, qf[r0:r1])
+            scores = torch.relu(scores * softmax_scale)
+            logits = (scores * weights[r0:r1, None, :]).sum(dim=-1)  # [r, P]
+            logits = logits.masked_fill(
+                pcol[None, :] >= n_pools[r0:r1, None], float("-inf")
+            )
+            tk = min(ksel, p1 - p0)
+            vals, idx = torch.topk(logits, tk, dim=-1)
+            chunk_vals.append(vals)
+            chunk_idx.append(idx + p0)
+        vals = torch.cat(chunk_vals, dim=0)
+        idx = torch.cat(chunk_idx, dim=0)
+        merged_vals, keep = torch.topk(
+            torch.cat((best_vals, vals), dim=1), ksel, dim=1
+        )
+        best_idx = torch.cat((best_idx, idx), dim=1).gather(1, keep)
+        best_vals = merged_vals
+    sel = best_idx.masked_fill(best_vals == float("-inf"), -1)
+    with _qc_phase("idx_expand"):
+        _expand_topk_native(sel, visible, topk_out, kp, ksel, tlen_out)
+
+
+def _expand_topk_native(
+    sel: torch.Tensor,      # [R, KSEL] pool indices (-1 invalid), valid first
+    visible: torch.Tensor,  # [R]
+    out: torch.Tensor,      # [R, OUT_W] int32
+    kp: int,
+    ksel: int,
+    tlen_out: torch.Tensor | None = None,
+) -> None:
+    """Torch counterpart of ``_expand_topk_kernel``: expanded pools, then
+    the incomplete tail pool's tokens right after the last valid pool,
+    then -1 padding (see that kernel for why the tail is not parked at a
+    fixed column)."""
+    R, out_w = out.shape
+    dev = out.device
+    assert ksel * kp + kp - 2 < out_w, "top-k output row too narrow for tail"
+    vis = visible.to(torch.int64)
+    n_pools = torch.div(vis, kp, rounding_mode="floor")
+    tail_count = vis - n_pools * kp
+    tail_start = n_pools * kp
+    n_sel = n_pools.clamp(max=ksel)
+    pool = sel.to(torch.int64)
+    ok = (pool >= 0) & (pool < n_pools[:, None])
+    m = torch.arange(kp, device=dev)
+    tokens = torch.where(ok[:, :, None], pool[:, :, None] * kp + m, -1)
+    out.fill_(-1)
+    out[:, : ksel * kp] = tokens.reshape(R, ksel * kp).to(out.dtype)
+    # Tail slots n_sel*kp .. n_sel*kp+kp-1, exactly the kernel's store
+    # (it also overwrites slot n_sel, which a real top-k leaves at -1).
+    # The last slot is always -1 (tail_count <= kp-1); it is skipped only
+    # when it would fall off the row, where the kernel masks its store.
+    nt = kp if ksel * kp + kp - 1 < out_w else kp - 1
+    if nt > 0:
+        mt = m[:nt]
+        tcol = n_sel[:, None] * kp + mt[None, :]
+        tval = torch.where(
+            mt[None, :] < tail_count[:, None], tail_start[:, None] + mt[None, :], -1
+        )
+        out.scatter_(1, tcol, tval.to(out.dtype))
+    if tlen_out is not None:
+        # Same bound the Metal expand kernel writes: every valid entry is
+        # below n_sel * kp + min(tail_count, nt).
+        tlen_out[:R] = (n_sel * kp + tail_count.clamp(max=nt)).to(tlen_out.dtype)
+
 
 # --------------------------------------------------------------------- core op
 
@@ -363,7 +749,9 @@ def _pooled_topk(
     if cache.shape[-1] == POOL_CACHE_HEAD_DIM:
         assert kp == 4 and D == 128 and softmax_scale == 128**-0.5
         if adaptive_score and R <= 64:
-            from vllm.model_executor.layers.glm5_next_pool_score import adaptive_pool_logits
+            from vllm.model_executor.layers.glm5_next_pool_score import (
+                adaptive_pool_logits,
+            )
 
             adaptive_pool_logits(q, weights, cache, block_table, row_req, visible, logits)
         else:
@@ -388,10 +776,20 @@ def _pooled_topk(
 def _pooled_select(
     q, weights, ape, cache, block_table, row_req, visible, logits,
     max_pools, block_size, softmax_scale, ksel, topk_out, kp,
-    adaptive_score=False, row_shard=False,
+    adaptive_score=False, row_shard=False, pool_bound=None, tlen_out=None,
 ) -> None:
     R = q.shape[0]
     if R == 0:
+        return
+    if _use_native_producer(q):
+        # Metal (mps): torch-native producer, same outputs.
+        assert not row_shard and not adaptive_score
+        _pooled_select_native(
+            q, weights, ape, cache, block_table, row_req, visible,
+            block_size, softmax_scale, ksel, topk_out, kp,
+            max_pools if pool_bound is None else min(max_pools, pool_bound),
+            tlen_out,
+        )
         return
     if row_shard:
         from vllm.distributed import get_tp_group
@@ -443,6 +841,7 @@ def glm5_next_pooled_indexer(
     ksel: int,
     kp: int,
     softmax_scale: float,
+    topk_len_buffer: torch.Tensor,
     adaptive_score: bool = False,
     singleton_fused_update: bool = False,
     row_shard_decode: bool = False,
@@ -469,12 +868,18 @@ def glm5_next_pooled_indexer(
     if row_dim == POOL_CACHE_HEAD_DIM:
         update_pool_cache(packed[:num_tokens], md.slot_mapping, ape, cache,
                           singleton_fused=singleton_fused_update)
+    elif _use_native_producer(q):
+        with _qc_phase("idx_insert"):
+            _insert_rows_native(packed[:num_tokens], cache, md.slot_mapping)
     else:
         _insert_rows_kernel[(triton.cdiv(num_tokens, BLOCK_T),)](
             packed[:num_tokens], cache, md.slot_mapping, num_tokens, cache.stride(0),
             BLOCK_SIZE=block_size, ROW=_ROW_DIM, BLOCK_T=BLOCK_T,
         )
     topk_indices_buffer[: q.shape[0]] = -1
+    # Valid prefix length per row (Metal native producer writes the exact
+    # bound; anything left unwritten keeps the full padded width).
+    topk_len_buffer[: q.shape[0]] = topk_indices_buffer.shape[1]
 
     # 2) prefill chunks.
     if md.num_prefills > 0:
@@ -495,6 +900,7 @@ def glm5_next_pooled_indexer(
                 ape, cache, chunk.block_table, row_req, visible, logits,
                 max_pools, block_size, softmax_scale, ksel,
                 topk_indices_buffer[chunk.token_start:chunk.token_end], kp,
+                tlen_out=topk_len_buffer[chunk.token_start:chunk.token_end],
             )
 
     # 3) decode rows (fixed-size workspace: CUDA-graph safe).
@@ -522,12 +928,20 @@ def glm5_next_pooled_indexer(
             topk_indices_buffer[:R], kp,
             adaptive_score=adaptive_score,
             row_shard=_row_shard_dispatch(row_shard_decode, R, md.num_prefills, next_n),
+            tlen_out=topk_len_buffer[:R],
+            # Native path only: the batch's longest context (CPU metadata)
+            # bounds the pool tiles; the Triton kernel strides by `visible`.
+            pool_bound=(
+                max(1, md.max_seq_len // kp)
+                if getattr(md, "max_seq_len", None) is not None
+                else None
+            ),
         )
 
 
 def glm5_next_pooled_indexer_fake(
     q, packed, weights, ape, k_cache_prefix, kv_cache, topk_indices_buffer,
-    decode_logits, max_pools_total, ksel, kp, softmax_scale,
+    decode_logits, max_pools_total, ksel, kp, softmax_scale, topk_len_buffer,
     adaptive_score=False, singleton_fused_update=False, row_shard_decode=False,
 ) -> None:
     return None
@@ -536,7 +950,9 @@ def glm5_next_pooled_indexer_fake(
 direct_register_custom_op(
     op_name="glm5_next_pooled_indexer",
     op_func=glm5_next_pooled_indexer,
-    mutates_args=["kv_cache", "topk_indices_buffer", "decode_logits"],
+    mutates_args=[
+        "kv_cache", "topk_indices_buffer", "decode_logits", "topk_len_buffer"
+    ],
     fake_impl=glm5_next_pooled_indexer_fake,
 )
 
@@ -574,6 +990,14 @@ class Glm5NextPooledIndexer(nn.Module):
         self.softmax_scale = self.head_dim**-0.5
         self.n_head_scale = self.n_heads**-0.5
         self.topk_indices_buffer = topk_indices_buffer
+        # Per-row valid prefix length of the expanded top-k row (written
+        # beside the indices; the sparse decode stops scanning there).
+        self.topk_len_buffer = torch.full(
+            (topk_indices_buffer.shape[0],),
+            self.topk_tokens,
+            dtype=torch.int32,
+            device=topk_indices_buffer.device,
+        )
 
         self.wq_b = ReplicatedLinear(
             config.q_lora_rank, self.n_heads * self.head_dim, bias=False,
@@ -609,7 +1033,7 @@ class Glm5NextPooledIndexer(nn.Module):
             else 0
         )
         decode_rows = sched.max_num_seqs * (1 + num_spec)
-        device = torch.device("cuda", torch.cuda.current_device())
+        device = glm5_next_device()
         if workspace is None:
             self.decode_logits = torch.empty(
                 (decode_rows, self.max_pools_total), dtype=torch.float32, device=device
@@ -619,6 +1043,61 @@ class Glm5NextPooledIndexer(nn.Module):
                 decode_rows, self.max_pools_total, device
             )
         self._ape_f32: torch.Tensor | None = None
+        # Metal: one [k | gate | weights] linear over hidden_states plus the
+        # glm5_indexer_pack kernel replace wk + gate + weights_proj and their
+        # float/layer_norm/to/cat/mul glue (built lazily after weight load).
+        self._fused_kgw: torch.Tensor | None = None
+        self._k_norm_f32: tuple[torch.Tensor, torch.Tensor] | None = None
+
+    def _metal_pack_inputs(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if (
+            hidden_states.device.type != "mps"
+            or hidden_states.dtype not in (torch.bfloat16, torch.float16)
+            or not _metal_indexer_kernels()
+            or os.getenv("VLLM_METAL_INDEXER_PACK", "1") == "0"
+        ):
+            return None
+        from vllm.quixicore import quixicore_ops
+
+        if self._fused_kgw is None or self._fused_kgw.device != hidden_states.device:
+            if not quixicore_ops.has("glm5_indexer_pack"):
+                return None
+            self._fused_kgw = (
+                torch.cat(
+                    [
+                        self.wk.weight.to(hidden_states.dtype),
+                        self.index_kpool_compress_gate.to(hidden_states.dtype),
+                        self.weights_proj.weight.to(hidden_states.dtype),
+                    ],
+                    dim=0,
+                )
+                .contiguous()
+                .to(hidden_states.device)
+            )
+            self._k_norm_f32 = (
+                self.k_norm.weight.detach().float().contiguous(),
+                self.k_norm.bias.detach().float().contiguous(),
+            )
+        fused = torch.nn.functional.linear(hidden_states, self._fused_kgw)
+        T = fused.shape[0]
+        packed = torch.empty(
+            (T, 2 * self.head_dim), dtype=fused.dtype, device=fused.device
+        )
+        weights = torch.empty((T, self.n_heads), dtype=torch.float32, device=fused.device)
+        norm_w, norm_b = self._k_norm_f32
+        quixicore_ops.glm5_indexer_pack(
+            fused,
+            norm_w,
+            norm_b,
+            packed,
+            weights,
+            self.head_dim,
+            self.k_norm.eps,
+            self.n_head_scale,
+        )
+        return packed, weights
 
     def forward(
         self,
@@ -627,39 +1106,47 @@ class Glm5NextPooledIndexer(nn.Module):
         positions: torch.Tensor,
         rotary_emb=None,
     ) -> torch.Tensor:
-        q, _ = self.wq_b(qr)
+        with _qc_phase("idx_wq_b"):
+            q, _ = self.wq_b(qr)
         q = q.view(-1, self.n_heads, self.head_dim).to(torch.bfloat16)
-        k, _ = self.wk(hidden_states)
-        k = torch.nn.functional.layer_norm(
-            k.float(),
-            (self.head_dim,),
-            self.k_norm.weight.float(),
-            self.k_norm.bias.float(),
-            self.k_norm.eps,
-        ).to(torch.bfloat16)
-        gate = torch.nn.functional.linear(
-            hidden_states, self.index_kpool_compress_gate.to(hidden_states.dtype)
-        ).to(torch.bfloat16)
-        packed = torch.cat([k, gate], dim=-1).contiguous()
-        weights, _ = self.weights_proj(hidden_states)
-        weights = (weights.float() * self.n_head_scale).contiguous()
+        with _qc_phase("idx_wk"):
+            fused_pack = self._metal_pack_inputs(hidden_states)
+        if fused_pack is not None:
+            packed, weights = fused_pack
+        else:
+            k, _ = self.wk(hidden_states)
+            k = torch.nn.functional.layer_norm(
+                k.float(),
+                (self.head_dim,),
+                self.k_norm.weight.float(),
+                self.k_norm.bias.float(),
+                self.k_norm.eps,
+            ).to(torch.bfloat16)
+            gate = torch.nn.functional.linear(
+                hidden_states, self.index_kpool_compress_gate.to(hidden_states.dtype)
+            ).to(torch.bfloat16)
+            packed = torch.cat([k, gate], dim=-1).contiguous()
+            weights, _ = self.weights_proj(hidden_states)
+            weights = (weights.float() * self.n_head_scale).contiguous()
         if self._ape_f32 is None or self._ape_f32.device != q.device:
             self._ape_f32 = self.index_kpool_compress_ape.float().contiguous()
-        torch.ops.vllm.glm5_next_pooled_indexer(
-            q.contiguous(),
-            packed,
-            weights,
-            self._ape_f32,
-            self.k_cache.prefix,
-            self.k_cache.kv_cache,
-            self.topk_indices_buffer,
-            self.decode_logits,
-            self.max_pools_total,
-            self.ksel,
-            self.kp,
-            self.softmax_scale,
-            self.adaptive_score,
-            self.singleton_fused_update,
-            self.row_shard_decode,
-        )
+        with _qc_phase("idx_op"):
+            torch.ops.vllm.glm5_next_pooled_indexer(
+                q.contiguous(),
+                packed,
+                weights,
+                self._ape_f32,
+                self.k_cache.prefix,
+                self.k_cache.kv_cache,
+                self.topk_indices_buffer,
+                self.decode_logits,
+                self.max_pools_total,
+                self.ksel,
+                self.kp,
+                self.softmax_scale,
+                self.topk_len_buffer,
+                self.adaptive_score,
+                self.singleton_fused_update,
+                self.row_shard_decode,
+            )
         return self.topk_indices_buffer
