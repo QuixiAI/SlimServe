@@ -283,6 +283,11 @@ set off1 full 33.60 / first64 34.36 / last64 37.04 / last256 32.45, m2 64
 7dd30ea193a6, off1-2000 393882a2ddaf 34.23 tok/s (58.4 s incl. prefill),
 2500x64 1d7d58486dc7.** ds4 MTP bar 22.52: +52% on its own gate workload,
 +44..77% on non-degenerate text, +77% on the loop probe.
+**MERGED BUILD (2026-09-14 23:22, main 02fb15fc1 merged, measurement twins
+stripped, PR #30, `w26-shard/merged_k1/`): loop probe 40.02 tok/s at 2.000
+tok/cycle; accept set 32.50-40.00; tf 29/32, 62/64 (0.0830); needles 4/4;
+gates 7dd30ea193a6 / 393882a2ddaf 34.27 tok/s / 1d7d58486dc7 - bit-identical
+to the Session 4 final pins.**
 
 - Decode ~3.0 tok/s (329 ms/step, streaming probe 3.04 x2). Prefill
   ~50-55 t/s (1000 tok ~18 s; 2500 tok ~50 s) - the KDA prefill is the

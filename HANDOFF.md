@@ -15,7 +15,7 @@ merge of origin/main and were joined rather than reconciled.
   3. GLM-5.3-Flash on 8x A100 (glm53f-*)          -- fourth section, at EOF
 -->
 
-# HANDOFF — GLM-5.3-Flash Q2 on Metal (`glm53f-q2-1`), campaign plan 2026-09-10 (PLAN; nothing run on this model yet)
+# HANDOFF — GLM-5.3-Flash Q2 on Metal (`glm53f-q2-1`), campaign plan 2026-09-10 and status log (PR #30 open, 2026-09-14)
 
 Read this first when resuming the campaign. Companion documents:
 `perf/perf.md` (method), `perf/metal_m1ultra_campaign_v2.md` and
@@ -1498,6 +1498,35 @@ upstream; drift check against the port branch).
   M=2 route. W17 (q4_K M=1 vector loads): no gain, kernel is at its
   compute floor like the experts (`w17-q4k/`).
 
+- 2026-09-14 (late): **PRE-PR CLEANUP DONE, MAIN MERGED, PR #30 OPEN**
+  (`perf/optimization_status.md` 2026-09-14 cleanup entry has the full
+  ledger). Stripped: the W15/W17/W20 twins and their VLLM_QC_*_VARIANT
+  hooks, the router-pair kernel, `qc_tgload_bench`, the MLA heads-per-group
+  twin, `concurrent_enabled`, `_glm_trace.py`; two stale tests fixed.
+  Cleaned build: kernels bit-exact, 362 tests. Four commits (Eric Hartford)
+  on `glm53f-metal-campaign`, then main 02fb15fc1 merged (328035d39): the
+  measured record replaces main's placeholder on its `glm53f-gguf` source
+  (text modality until the Metal vision path is qualified, DFlash2 as the
+  source drafter, glm47 parsers); the W26b router region stays closed when
+  main's expert-stats histogram is on. Merged build: 365 tests, kernels
+  bit-exact, verify chain `w26-shard/merged_k1/` - probe 40.02 tok/s at
+  2.000 tok/cycle, accept set 32.50-40.00, tf 29/32 + 62/64, needles 4/4,
+  ALL PINS HELD (7dd30ea193a6 / 393882a2ddaf 34.27 tok/s / 1d7d58486dc7).
+  Pushed to QuixiAI/SlimServe `glm53f-metal-campaign`, PR #30 against main.
+  NOT in the PR: the tracked metallib (this box builds metal3.1; the
+  maintainer rebuilds with cmake/metal.cmake). STILL OPEN after the PR: the
+  QuixiCore-Metal port (`~/Code/QuixiCore-Metal` branch
+  `glm53f-metal-campaign-port` predates the strip - re-sync from these
+  sources), vision on Metal for this model (source modality flips to
+  text+image with it), the native 1048576 context (needs a ~12 GiB latent
+  pool per request), an fp8 latent path for the Metal sparse-MLA kernels,
+  the Qwen HEAD-side re-pin. Next step-time levers (~1% each): fuse the two
+  paged_row_insert dispatches per MLA layer with the identity expand; the
+  drafter / sampling torch glue (~1.3 ms); rms_norm into the following
+  GEMV's staging. Harness note: the model boot pins ~100 GiB and the
+  harness kills background task trees at that point - boot the server
+  detached (Popen start_new_session, `scratchpad/boot_detached.py` pattern)
+  and run the verify steps as foreground calls.
 
 # HANDOFF — NVFP4-on-Metal campaign (updated 2026-08-25; CAMPAIGN COMPLETE through UPDATE 55 — PR #12 open, origin/main merged and re-gated bit-exact, QuixiCore-Metal port landed)
 

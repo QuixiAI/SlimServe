@@ -1,5 +1,84 @@
 # SlimServe Optimization Status
 
+## 2026-09-14 - GLM-5.3-Flash Q2 on Metal: pre-PR cleanup, merge of main, merged-build verify, PR #30
+
+- Baseline: the Session 4 final build (`w26-shard/final_k1/`: loop probe
+  39.96 tok/s at 2.000 tok/cycle, off1-2000 34.23 tok/s, pins 7dd30ea193a6 /
+  393882a2ddaf / 1d7d58486dc7).
+- Cleanup (marker-matched strip, every block asserted gone): the unused
+  `qgemv_q8_0_nr_pair_swiglu_router` kernel + host op + ops.py wrapper; the
+  W17 `qgemv_q4k_nr_x` and W16d `qgemv_q4k_nr_mb_x` twins with their
+  VLLM_QC_Q4K_VARIANT / VLLM_QC_Q4K_MB_VARIANT hooks (launchers back to the
+  upstream form plus the W22 output row stride); the W20 pair-LUT /
+  register-LUT / lean kernels and the `qc_tgload_bench` probe; the W15
+  iq2_xxs `_x` / `_ilp2` / `_ref` and q2_K `_sum_x` / `_sum_sp` / `_ref` twins
+  with VLLM_QC_MOE_IQ2_VARIANT / VLLM_QC_MOE_Q2K_VARIANT; the sparse-MLA
+  heads-per-group twin (`mla_sparse_latent_partition_h`, VLLM_QC_MLA_HPG:
+  2 neutral, 4/8 spill 4-20x slower); the never-called `concurrent_enabled`
+  / VLLM_METAL_CONCURRENT wrapper; the DIAGNOSTIC `_glm_trace.py` and its
+  speculator hooks. qgemv.metal 4884 -> 2950 lines (upstream 2371). Kept:
+  the documented, bounded q8_0 NR geometry knob, `kda_recur_prefill` (the
+  kda_recur test harness, so documented), every kill switch.
+- Correctness on the cleaned build: kernels_test ALL EXACT; texbench
+  production vs texture kernel bit-exact at T=1/2/4 and the pre-strip vs
+  post-strip production kernel bit-exact (`w26-shard/cleanup_exact.log`);
+  the campaign suites 362 passed after two stale tests were fixed
+  (`test_glm5_next_indexer_native` called the op without `topk_len_buffer`,
+  stale since W16c; the routing smoke asserted no mHC norm fusion on Metal,
+  stale since the fused epilogue landed) (`cleanup_pytest2.log`). ruff:
+  no new findings (the 16 remaining are upstream's, same rules at shifted
+  lines).
+- Commits (author Eric Hartford, no trailers): e798309fa kernels +
+  binding, d7e97180e serving path, 5e2d9df65 profile + CLI + tests,
+  544cdc52d notebook / handoff. The tracked metallib is NOT committed: this
+  box's macOS 15 toolchain produces a metal3.1 library, which would drop the
+  M5 tensor-ops kernels the Qwen profiles use; upstream's metal4.0 binary
+  stays and the PR asks for a cmake/metal.cmake rebuild on merge.
+- Merge of origin/main 02fb15fc1 (76 commits since the 55fdb54bd base) as
+  328035d39. Conflicts, resolved semantically: profiles.json - main had
+  registered the `glm53f-gguf` source (pinned revision, shared vision
+  encoder) and a placeholder `glm53f-q2-1`; the measured record now sits on
+  that source and the campaign's `glm53f-q2` source is dropped; the source
+  declares text modality until the Metal vision path is qualified (the
+  registry rejects language_model_only on a vision source) and carries the
+  DFlash2 drafter entry the registry test requires; parsers glm47/glm47 like
+  the A100 glm53f records (the profile test and the GGUF parser-defaults
+  test follow). moe_runner - main records the MoE expert-stats histogram
+  right after the router; a torch op, so the W26b router region stays
+  closed when it is on. glm5_next_indexer - main's `row_group` (grouped
+  pool scoring for CUDA verify rows) beside our `tlen_out` / `pool_bound`;
+  the Metal path returns before it. The notebook keeps both sides.
+  `~/models/GLM-5.3-Flash-GGUF -> antirez-glm-5.3-flash-gguf` symlink for
+  the new local_dir.
+- Merged build (`build_merged.log`, rebuilt from the merged sources):
+  kernels_test exact, texbench bit-exact, 365 passed (`merged_tests.log`).
+  Verify chain `merged_k1/` (the server booted detached from the harness,
+  which kills background task trees once the model pins memory; steps run
+  in the foreground): loop probe 39.20 (64 tokens) / 40.03 / 40.02 (600)
+  tok/s at 2.000 tok/cycle; accept set off1 full 33.67 / first64 34.44 /
+  last64 37.13 / last256 32.50, m2 64/1000/2000 40.00 / 37.62 / 35.62 -
+  chunk counts identical to final_k1; tf short 29/32, tf long 62/64 mean
+  0.0830; needles 4/4 (6.3 / 18.9 / 31.0 / 60.4 s); gates 8tok
+  7dd30ea193a6, off1-2000 393882a2ddaf 34.27 tok/s (58.4 s), 2500x64
+  1d7d58486dc7 (13.9 s). ALL PINS HELD on the merged build.
+- Other-profile scope on the merged tree, by code path: every campaign
+  feature reads an env opt-in whose default is off (VLLM_METAL_ASYNC_SCHED,
+  VLLM_QC_Q8_NR, KV_META, MAMBA_LB, MOE_ROUTER, MOE_FOLD, SHEXP_PAIR,
+  KDA_GATE_DUAL, MOE_OVERLAP, INDEXER_IDENTITY, MLA_DUAL_NORM, MOE_IQ2_TEX,
+  SHARD_OVERLAP, MOE_ROUTER_OVERLAP - all `"0"` defaults, only the
+  glm53f-q2-1 env block sets them); the stripped launchers are back to the
+  upstream text on the paths DSV4 takes (q4_K NR, iq2_xxs swiglu without
+  the texture route, q2_K sum). The DSV4 / Qwen anchor re-gates stand from
+  the Session 3 build (`2026-09-12/dsv4-regate-r4`, `qwen-regate`).
+- Decision: PR #30 opened against QuixiAI/SlimServe main from
+  `glm53f-metal-campaign` (`perf/results/2026-09-14/PR_DESCRIPTION.md`).
+  Open items carried in the record's notes: text only, 131072 of the
+  native context, f16 latent pages, metallib rebuild. The codex (GPT-6
+  Astra) review was not run: the CLI's ChatGPT token is revoked on this box.
+- Raw artifacts: `perf/results/2026-09-14/glm53f-q2-w26-shard/
+  {cleanup_exact.log, cleanup_pytest2.log, build_merged.log,
+  merged_tests.log, merged_k1/}`.
+
 ## 2026-09-14 - GLM-5.3-Flash Q2 on Metal M1 Ultra: W23 K=2 is economically dead (3rd verify row = ~14 ms of expert bytes); W24 ROOT CAUSE of the weak nextn drafter - its sparse attention read a never-written top-k buffer (attention output ZERO on every extend/decode row); one-line re-pointing fix; W24a/b/c, W25 (iq2_xxs codebook through the TEXTURE UNIT, -23% on the expert kernel, bit-exact) and W26/W26b concurrency: loop probe 34.5 -> 39.9 tok/s (+15.8%), off1-2000 gate 34.23 tok/s, all pins held
 
 - Baseline: W22 final build, K=1 MTP (probe ~34.5 tok/s, off1-2000 gate
