@@ -1552,6 +1552,180 @@ upstream; drift check against the port branch).
   tok/s against c=1 40.0 says batching buys almost nothing yet, which is
   the obvious next campaign after this PR lands.
 
+# HANDOFF — GLM-5.3-Flash Q2 on Metal: CONCURRENT SERVING (campaign plan 2026-09-15)
+
+Read this with the campaign section above it (same profile, same worktree,
+same discipline); that one took single-stream decode and prefill past ds4
+and is on PR #30. This one finishes the job. The profile record is gated
+`in-progress` until it does.
+
+## Mission
+
+Make `glm53f-q2-1` serve concurrent requests at a throughput worth having,
+pin concurrent exact-token gates for it, then flip the record to
+`supported`. Single-stream performance must not regress and the three
+existing gate shas must stay bit-identical.
+
+Operator judgement, 2026-09-15: a profile whose batching buys nothing is
+not finished work, whatever its single-stream numbers say. This is also
+the repo's own standard - CLAUDE.md puts concurrent workloads under
+correctness requirements, and treats flat scaling as evidence of a wrong
+design rather than a local bug.
+
+## State on arrival
+
+- Branch `glm53f-metal-campaign` in worktree `~/Code/slimserve/SlimServe-glm53f`,
+  8 commits ahead of `origin/main`, open as PR #30 (QuixiAI/SlimServe),
+  reviewed by CodeRabbit (2 rounds) and Astra/codex GPT-6 (1 round), every
+  finding fixed. HEAD e975d30aa. Branch from here; rebase onto main when
+  #30 lands.
+- Single-stream, on the final build: loop probe 39.96 tok/s at 2.000
+  tok/cycle, off1-2000 gate 34.28 tok/s, prefill 237-258 t/s, needles 4/4,
+  teacher-forced vs ds4 29/32 and 62/64. ds4 on the same box: 22.52 tok/s
+  decode with MTP, 143 t/s prefill.
+- Gate pins (must hold): 8tok `7dd30ea193a6`, off1-2000 `393882a2ddaf`,
+  2500x64 `1d7d58486dc7`. `perf/results/2026-09-11/glm53f-q2-baseline/gate.sh <outdir>`.
+- Concurrency WORKS but does not SCALE. It was dead until 2026-09-15 (the
+  drafter's torch prefill prep crashed every multi-request step); that fix
+  is in e975d30aa with the ledger in `perf/optimization_status.md`.
+
+## The measurement you inherit, and its caveat
+
+`perf/results/2026-09-14/concurrency_check.py <N> <max_tokens>` against a
+live server, from `perf/results/2026-09-14/glm53f-q2-w26-shard/astra1b_k1/concurrency.log`:
+
+| concurrency | aggregate tok/s | per-request decode |
+| --- | --- | --- |
+| 1 (decode probe) | 40.0 | 40.0 |
+| 2 | 27.8 | ~14 |
+| 3 | 33.7 | ~11 |
+| 6 | 41.2 | ~7.1 |
+
+CAVEAT, read it before optimizing anything: that script measures completion
+tokens over wall clock INCLUDING each request's prefill and the scheduler
+ramp, over a short 96-token window, so the low-concurrency rows are
+depressed by TTFT and are not comparable to the c=1 decode probe. Do not
+quote them as a scaling curve. They are a smoke test.
+
+What they do support, because it survives the caveat: at c=6 each request
+decodes at ~7.1 tok/s where one alone gets 40, so the step time grew ~6x
+for 6x the rows. With the K=1 MTP drafter every request contributes 2 rows
+per step, so c=6 is 12 rows in ~291 ms against 2 rows in 48.3 ms. That is
+linear. Essentially nothing amortizes across rows.
+
+FIRST TASK: replace that smoke test with a real measurement before
+touching a kernel. `benchmarks/benchmark_dsv4_exact.py` already takes
+`--concurrency 1..128`, builds that many DISTINCT prompts at strided
+offsets, returns a per-request sha list, and reports `exact` only when
+every request returned the expected token counts. So the existing gate
+protocol extends to concurrency directly - see `gate.sh` for the invocation
+and copy it. Measure with output tokens long enough (>= 300) that prefill
+stops dominating, and record per-request decode alongside aggregate.
+
+## Where to look, in order
+
+1. **The routed MoE expert kernels, almost certainly the whole story.**
+   They dispatch one threadgroup row per (token, route) pair -
+   `grid.y = tokens * topk` in `launch_qgemv_moe_mr_swiglu` and
+   `launch_qgemv_moe_mr_q2k_sum` (`csrc/quixicore/metal/kernels/common/tk_launch.h`).
+   Every row reads its experts' weights for itself, so expert bytes scale
+   linearly with rows in flight and nothing is shared. At the last trace
+   with per-kernel attribution (W16, `perf/results/2026-09-14/glm53f-q2-w16-timeline/k1/budget.txt`)
+   routed MoE was 20.8 ms of a 56.0 ms step, the largest single block, and
+   it is the block that cannot amortize in the current form.
+   The grouping machinery already exists for the prefill path:
+   `launch_moe_mm_map0` builds per-expert slot lists (`ids (E, tokens)`,
+   counts `tpe (E)`) for the tile GEMM `ggml_moe_mm_id`. But that route is
+   gated at `VLLM_QC_MOE_MM_MIN_TOKENS` (default 32,
+   `vllm/model_executor/layers/quantization/gguf/fused_moe.py`), and a K=1
+   step at the record's `max_num_seqs` of 8 is 16 rows - below the
+   threshold, so decode never takes it. The lever is an expert-grouped
+   decode route: sort rows by expert, read each expert's weights once for
+   all its rows. Start from the GLM 5.2 Ampere path (route/align,
+   expert-contiguous gather, grouped GEMM, grouped SwiGLU, finalize) that
+   CLAUDE.md points at, rather than inventing one. Measure the crossover
+   honestly: at small row counts the gather may cost more than it saves.
+2. **The dense projection batch kernels' row caps.** The q8_0 NR batch
+   kernel covers M 2..4 and the q4_K NR twin 2/4/8-row chunks; above those
+   the host loops or chunks, losing weight-stationarity. `_metal_shard_region_ok`
+   in `vllm/model_executor/layers/quantization/gguf/linear.py` documents
+   the exact limits (it was written to keep the concurrent region off the
+   routes that cannot write strided output). c=8 at K=1 is 16 rows, past
+   every cap. Widening the instantiated row counts is mechanical work with
+   a real payoff if the MoE stops dominating.
+3. **The record's own sizing.** `max_num_seqs` 8 and
+   `max_num_batched_tokens` 4288 were chosen for the single-stream
+   bring-up (4288 is the Mamba align-mode block, and align mode requires
+   the batch cap to be at least one block - do not lower it blindly). The
+   8 GiB KV pool was sized for two full-context requests, not for many
+   concurrent ones. Re-sizing is part of the campaign, with the memory
+   arithmetic redone: weights are 89.9 GiB of a ~115 GiB working set.
+4. **Sparse MLA decode and the pooled indexer at higher row counts.** Both
+   were only ever measured at 1-2 rows.
+
+## Profiling gotcha you will hit immediately
+
+The final build runs 77 concurrent-dispatch regions per step, and the
+xctrace encoder-level fit can no longer attribute cost to individual
+kernels inside them - `final_trace/budget.txt` shows everything collapsed
+into one `qc_concurrent` row at 159.9% share. To get per-kernel attribution
+back, boot with the region flags off (`VLLM_METAL_MOE_OVERLAP=0`,
+`VLLM_METAL_SHARD_OVERLAP=0`, `VLLM_METAL_MOE_ROUTER_OVERLAP=0`), profile,
+then re-enable. The trace harness is
+`perf/results/2026-09-14/glm53f-q2-w24-fix/chain_kp2.sh` with
+`parse_intervals.py`.
+
+## Gates and discipline
+
+- The three single-stream gate shas must stay bit-identical, or roll only
+  on a deliberate numerics change recorded with its teacher-forced and
+  needle check, exactly as the campaign section above did it.
+- The c=1 decode probe must not regress:
+  `perf/results/2026-09-11/glm53f-q2-w9-mtp/decode_probe_spec.py 600`.
+- Add concurrent exact-token gates (see FIRST TASK) and pin them. They are
+  the artifact that lets the record flip to `supported`.
+- Keep `concurrency_check.py` as the cheap smoke check after every build:
+  it is what catches a crash like the drafter one.
+- Every retained or rejected change gets a notebook entry in
+  `perf/optimization_status.md` with baseline, hypothesis, correctness,
+  throughput, decision and raw artifact path; pins go to
+  `perf/baseline_status.md`; raw logs under `perf/results/YYYY-MM-DD/<run>/`.
+- Other profiles: every campaign feature is opt-in through this profile's
+  env block and defaults to off. Keep it that way, and answer "does this
+  reach another profile" by reading the code path, never by booting.
+
+## Definition of done
+
+1. A concurrent exact-token gate set exists, passes, and is pinned.
+2. Batching earns its keep. Proposed bar, adjust with the operator: at
+   least 2x the c=1 aggregate at c=4 and 3x at c=8. Perfect scaling is not
+   available - top-8 of 288 experts means concurrent rows touch mostly
+   different experts - but linear step growth is a design problem, not a
+   ceiling.
+3. Single-stream gates and probe unchanged.
+4. The record's `status` / `status_reason` / `status_detail` come off, its
+   notes state the concurrent numbers, and the PR description carries them.
+
+## Mechanics
+
+- Python: `PYTHONPATH=<worktree> ~/Code/slimserve/SlimServe/.venv/bin/python`.
+  Lint `uvx ruff check`. Shell is fish: quote globs, prefer script files
+  over heredocs (zsh/fish glob errors abort whole commands).
+- Build: `bash perf/results/2026-09-14/build.sh` (metallib at `-std=metal3.1`
+  for this macOS 15 box, then the extension, ~40 s). NEVER rebuild while a
+  server runs. NEVER commit `vllm/quixicore_metal.metallib`: upstream's is
+  a metal4.0 binary carrying the M5 tensor-ops kernels this box cannot
+  build, and the PR asks the maintainer to regenerate it.
+- Boot: `python perf/results/2026-09-14/boot_detached.py <outdir>`, then
+  poll `/health`. Boot takes ~3 min. It must be DETACHED: the agent harness
+  kills background task trees once the model pins ~100 GiB, which will kill
+  a server started as a background task. Run the verification steps as
+  foreground calls instead, each under ~10 minutes.
+- The user has standing authorization to kill any local server when the
+  campaign needs the memory; no need to ask.
+- Commits: Eric Hartford is the sole author, no co-author or assistance
+  trailers. Commit only when the user asks.
+
 # HANDOFF — NVFP4-on-Metal campaign (updated 2026-08-25; CAMPAIGN COMPLETE through UPDATE 55 — PR #12 open, origin/main merged and re-gated bit-exact, QuixiCore-Metal port landed)
 
 ## Mission

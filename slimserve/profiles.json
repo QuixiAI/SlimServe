@@ -3050,8 +3050,11 @@
       "title": "GLM-5.3-Flash Q2 on one Mac",
       "source": "glm53f-gguf",
       "gpus": 1,
-      "summary": "GLM-5.3-Flash Q2 (antirez's GGUF: IQ2_XXS gate/up + Q2_K down experts) resident on one 128 GiB Apple Silicon machine, text only, 131072-token context, the GGUF's own nextn block as the K=1 MTP drafter. M1 Ultra: decode 34-40 tok/s, prefill 237-258 t/s; ds4 on the same box 22.5 / 143.",
+      "summary": "GLM-5.3-Flash Q2 (antirez's GGUF: IQ2_XXS gate/up + Q2_K down experts) resident on one 128 GiB Apple Silicon machine, text only, 131072-token context, the GGUF's own nextn block as the K=1 MTP drafter. M1 Ultra single-stream: decode 34-40 tok/s, prefill 237-258 t/s; ds4 on the same box 22.5 / 143. Concurrent serving is not qualified yet.",
       "speculative": true,
+      "status": "in-progress",
+      "status_reason": "single-stream serving is qualified, concurrent serving is not: batching buys almost nothing on this record",
+      "status_detail": "Every exact-token gate on this profile is concurrency 1, and they all pass bit-identically (8tok 7dd30ea193a6, off1-2000 393882a2ddaf, 2500x64 1d7d58486dc7) at 34-40 tok/s decode and 237-258 t/s prefill, beating ds4 on the same box by ~1.5x and ~1.8x. Concurrent serving runs but does not scale: the GPU step time grows linearly with the number of rows in flight, so six concurrent requests aggregate 41.2 tok/s against 40.0 for one. The record stays gated until concurrent exact-token gates exist and batching earns its keep; the plan is the batching campaign section of HANDOFF.md. SLIMSERVE_SERVE_IN_PROGRESS=1 boots it meanwhile.",
       "variants": {
         "metal": {
           "platform": "metal",
@@ -3117,6 +3120,7 @@
             "Vision deferred (language_model_only): the companion GLM-5.3-Flash-Vision-Encoder.gguf is registered with the source but not loaded; the Metal vision path for this model is not qualified. Open item.",
             "max_model_len 131072 of the GGUF's 1048576: the 8 GiB pool holds two full 131072-token requests; the native context needs a ~12 GiB latent pool for one request plus its indexer pools and is not yet qualified on this box. Open item.",
             "kv_cache_dtype auto: the 11 sparse-MLA layers hold f16 latent pages (the exact-token pins were taken with them); an fp8 latent path for the Metal sparse-MLA kernels is not built. FP8 is the fleet policy. Open item.",
+            "CONCURRENCY IS THE BLOCKER (2026-09-15): multi-request serving works but does not scale - the step time grows linearly with rows in flight (c=1 40.0, c=2 27.8, c=3 33.7, c=6 41.2 tok/s aggregate, and per-request decode falls from 40 to ~7 tok/s at c=6). max_num_seqs 8 and max_num_batched_tokens 4288 were sized for the single-stream bring-up, never for batching. Until a concurrent gate set exists and passes, this record is bring-up only.",
             "Chat-template defaults mirror the A100 glm53f records: reasoning_effort low, thinking on, glm47 reasoning and tool-call parsers, EOS set {154820, 154827, 154829}."
           ]
         }
