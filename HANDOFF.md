@@ -1575,9 +1575,9 @@ design rather than a local bug.
 ## State on arrival
 
 - Branch `glm53f-metal-campaign` in worktree `~/Code/slimserve/SlimServe-glm53f`,
-  8 commits ahead of `origin/main`, open as PR #30 (QuixiAI/SlimServe),
+  9 commits ahead of `origin/main`, open as PR #30 (QuixiAI/SlimServe),
   reviewed by CodeRabbit (2 rounds) and Astra/codex GPT-6 (1 round), every
-  finding fixed. HEAD e975d30aa. Branch from here; rebase onto main when
+  finding fixed. HEAD 3d56db4c8. Branch from here; rebase onto main when
   #30 lands.
 - Single-stream, on the final build: loop probe 39.96 tok/s at 2.000
   tok/cycle, off1-2000 gate 34.28 tok/s, prefill 237-258 t/s, needles 4/4,
