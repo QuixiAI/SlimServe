@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -13,6 +14,7 @@ from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.worker.gpu.attn_utils import (
     build_attn_metadata,
     init_attn_backend,
@@ -20,13 +22,53 @@ from vllm.v1.worker.gpu.attn_utils import (
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
-from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+from vllm.v1.worker.gpu.sample import topk_sample
+from vllm.v1.worker.gpu.sample.gumbel import apply_temperature, gumbel_sample
+from vllm.v1.worker.gpu.sample.states import SamplingStates
 from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
 
 
+def mask_draft_logits(
+    logits: torch.Tensor,
+    idx_mapping: torch.Tensor,
+    temperature: torch.Tensor,
+    top_k: torch.Tensor | None,
+    top_p: torch.Tensor | None,
+    native: bool,
+) -> torch.Tensor:
+    """The draft's logits tempered and cut to the request's top-k / top-p the
+    way the verifier cuts the target's: a fresh FP32 row set, -inf outside the
+    cutoff. `top_k` / `top_p` are the per-request states ([max_num_reqs]), or
+    None where no request in the batch sets them; `native` says every row's
+    top-k fits the native cutoff kernel. Padded rows (index -1) borrow row 0's
+    state; their draw is discarded downstream."""
+    rows = idx_mapping.clamp_min(0)
+    logits = torch.empty_like(logits, dtype=torch.float32).copy_(logits)
+    apply_temperature(logits, rows, temperature)
+    gather = rows.to(torch.int64)
+    k = None if top_k is None else top_k[gather]
+    p = None if top_p is None else top_p[gather]
+    if (
+        native
+        and k is not None
+        and topk_sample.mask_enabled()
+        and logits.shape[1] >= topk_sample.MIN_VOCAB
+    ):
+        topk_sample.mask(logits, k, p)
+        return logits
+    return apply_top_k_top_p(logits, k, p)
+
+
 class BaseSpeculator(ABC):
+    # The verifier's per-request sampling states; a drafter that draws under
+    # the request's top-k / top-p reads them here (bound by the runner).
+    sampling_states: SamplingStates | None = None
+
+    def bind_sampling_states(self, states: SamplingStates) -> None:
+        self.sampling_states = states
+
     @abstractmethod
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         pass
@@ -126,6 +168,11 @@ class DraftModelSpeculator(BaseSpeculator):
             self.max_num_reqs, dtype=torch.float32, device=device
         )
         self.seeds = torch.zeros(self.max_num_reqs, dtype=torch.int64, device=device)
+        # draft_top_k_top_p: the batch's cutoff state for the current propose
+        # (native cutoff usable, any top-k, any top-p); None when the draw is
+        # temperature-only.
+        self.draft_top_k_top_p = self.speculative_config.draft_top_k_top_p
+        self._draft_mask: tuple[bool, bool, bool] | None = None
         self.draft_tokens = torch.zeros(
             self.max_num_reqs,
             self.num_speculative_steps,
@@ -320,20 +367,46 @@ class DraftModelSpeculator(BaseSpeculator):
     ) -> torch.Tensor:
         if draft_logits is not None:
             logits = self.model.compute_logits(hidden_states)  # type: ignore[operator]
-            # NOTE(woosuk): We must add 1 to the positions to match the Gumbel noise
-            # used for draft and target sampling.
+            apply_temp = True
+            if self._draft_mask is not None:
+                # Under the request's cutoffs the temperature is applied here,
+                # before the cut (top-p reads the tempered distribution).
+                logits = self._mask_draft_logits(logits, idx_mapping, temperature)
+                apply_temp = False
+            # The drafted token's position (positions + 1) keys its draw; the
+            # drafting salt keeps that stream disjoint from the target's
+            # verification and resample draws at the same position.
             return gumbel_sample(
                 logits,
                 idx_mapping,
                 temperature,
                 seeds,
                 positions + 1,
-                apply_temperature=True,
+                apply_temperature=apply_temp,
                 output_processed_logits=draft_logits,
                 output_processed_logits_col=draft_step,
                 use_fp64=self.use_fp64_gumbel,
+                is_drafting=True,
             )
         return self._greedy_sample_draft(hidden_states)
+
+    def _mask_draft_logits(
+        self,
+        logits: torch.Tensor,
+        idx_mapping: torch.Tensor,
+        temperature: torch.Tensor,
+    ) -> torch.Tensor:
+        assert self._draft_mask is not None and self.sampling_states is not None
+        native, do_top_k, do_top_p = self._draft_mask
+        states = self.sampling_states
+        return mask_draft_logits(
+            logits,
+            idx_mapping,
+            temperature,
+            states.top_k.gpu if do_top_k else None,
+            states.top_p.gpu if do_top_p else None,
+            native,
+        )
 
     def _copy_request_inputs(
         self,
@@ -344,6 +417,8 @@ class DraftModelSpeculator(BaseSpeculator):
         temperature: torch.Tensor,
         # [max_num_reqs]
         seeds: torch.Tensor,
+        # [num_reqs], the CPU copy of idx_mapping
+        idx_mapping_np: np.ndarray | None = None,
     ) -> None:
         # Copy temperature, seeds, and idx mapping to the pre-allocated buffers.
         # NOTE(woosuk): For draft sampling, we only consider the temperature
@@ -351,6 +426,8 @@ class DraftModelSpeculator(BaseSpeculator):
         # for simplicity and performance.
         # While this may slightly degrade the acceptance rate, it does not
         # affect the output distribution after rejection sampling.
+        # (draft_top_k_top_p opts back in: the batch's cutoffs are noted here
+        # and applied to the draft's logits in sample_draft.)
         self.temperature.copy_(temperature)
         self.seeds.copy_(seeds)
         self.idx_mapping[:num_reqs].copy_(idx_mapping)
@@ -358,3 +435,17 @@ class DraftModelSpeculator(BaseSpeculator):
             # idx_mapping for CG padded requests points to -1, which is ignored
             # during sampling to prevent writing stale values to draft logits.
             self.idx_mapping[num_reqs:].fill_(-1)
+        self._draft_mask = None
+        states = self.sampling_states
+        if (
+            self.draft_top_k_top_p
+            and self.draft_logits is not None
+            and states is not None
+            and idx_mapping_np is not None
+        ):
+            top_k = states.top_k.np[idx_mapping_np]
+            do_top_k = bool(np.any(top_k != states.vocab_size))
+            do_top_p = bool(np.any(states.top_p.np[idx_mapping_np] != 1.0))
+            if do_top_k or do_top_p:
+                native = bool(np.all((top_k >= 1) & (top_k <= topk_sample.MAX_TOP_K)))
+                self._draft_mask = (native, do_top_k, do_top_p)

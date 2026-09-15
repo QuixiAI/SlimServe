@@ -263,7 +263,13 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 ),
             )
 
-        if self.world_size > 1 and current_platform.is_cuda():
+        if (
+            self.world_size > 1
+            and current_platform.is_cuda()
+            and "tp" in self.unique_name
+        ):
+            # Only the tensor-parallel group all-reduces activations; the
+            # ring pins an IPC buffer of VLLM_B12X_DMA_AR_MAX_MB per rank.
             self.dma_ar_comm = maybe_create_b12x_dma_all_reduce(
                 self.cpu_group, self.device
             )

@@ -107,9 +107,17 @@ class FixFunctionalizationPass(VllmInductorPass):
                 self.defunctionalize(graph, node, mutated_args)
             elif at_target == torch.ops._C.cutlass_scaled_mm.default:
                 # (out!, a, b, a_scales, b_scales, bias?) -> (): the FP8
-                # online-quant linear of a `quantization: fp8` drafter.
+                # online-quant linear of a `quantization: fp8` drafter. The
+                # `out` argument cannot travel as a kwarg (see
+                # insert_defunctionalized), so the call is rebuilt in schema
+                # order.
                 mutated_args = {1: "out"}
-                self.defunctionalize(graph, node, mutated_args)
+                self.defunctionalize(
+                    graph,
+                    node,
+                    mutated_args,
+                    args=("out", "a", "b", "a_scales", "b_scales", "bias"),
+                )
             elif (
                 at_target == torch.ops._C.dynamic_per_token_scaled_fp8_quant.default
             ):

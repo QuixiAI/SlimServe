@@ -798,7 +798,10 @@ py_dsv4_mhc_fused_post_pre(
         float* nps = fpm(next_post) + int64_t(t0) * HC;
         float* ncs = fpm(next_comb) + int64_t(t0) * HC * HC;
         __nv_bfloat16* lis = bpm(layer_input) + int64_t(t0) * H;
-        if (n > 1) {
+        // Both batched kernels cover exactly SPLITS x THREADS x 2 = 16384
+        // flats (four streams of hidden 4096); any other width takes the
+        // per-token kernel, which strides over the whole row.
+        if (n > 1 && H == 4096) {
             launch_dsv4_mhc_partials_batched<dsv4_mhc::MIXES>(
                 xs, rs, ps, cs, fn, ros, parts, H, n);
         } else {

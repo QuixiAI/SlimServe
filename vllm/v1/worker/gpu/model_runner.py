@@ -403,6 +403,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.speculative_config,
                     self.device,
                 )
+            if self.speculator is not None:
+                # A drafter drawing under the request's top-k / top-p reads
+                # the states the verifier masks the target with.
+                self.speculator.bind_sampling_states(self.sampler.sampling_states)
             self.prompt_logprobs_worker = PromptLogprobsWorker(
                 self.max_num_reqs,
                 logprobs_mode=self.model_config.logprobs_mode,

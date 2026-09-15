@@ -192,6 +192,11 @@ class BlockPool:
         # knows its own tokens, so it discovers a stored tail through this
         # index and confirms it by hashing the same run of its own tokens.
         self.tail_entries_by_root: dict[BlockHash | None, dict[int, BlockHash]] = {}
+        # Each tail hash's (root, tail length) and the number of its cached
+        # (hash, group) entries: eviction or promotion of the last one drops
+        # the index entry (see _drop_tail_entries).
+        self.tail_entry_owner: dict[BlockHash, tuple[BlockHash | None, int]] = {}
+        self.tail_entry_refs: dict[BlockHash, int] = {}
 
         # To represent a placeholder block with block_id=0.
         # The ref_cnt of null_block is not maintained, needs special care to
@@ -306,6 +311,7 @@ class BlockPool:
                 )
                 if not keep_partial_entries:
                     removed_hashes = self._remove_cached_block_hashes(blk)
+                    self._drop_tail_entries(removed_hashes)
                     self._emit_block_removed_events(removed_hashes)
             self._insert_block_hash(
                 block_hash_with_group_id,
@@ -528,8 +534,9 @@ class BlockPool:
             and block.block_hash_num_tokens < num_tokens
         ):
             removed_hashes = self._remove_cached_block_hashes(block)
+            self._drop_tail_entries(removed_hashes)
             self._emit_block_removed_events(removed_hashes)
-        self._insert_block_hash(
+        inserted = self._insert_block_hash(
             block_hash_with_group_id,
             block,
             num_tokens=num_tokens,
@@ -540,9 +547,14 @@ class BlockPool:
                 request, num_tokens
             )
         if is_tail:
-            self.tail_entries_by_root.setdefault(parent_hash, {})[
-                num_tokens - block_start
-            ] = block_hash
+            tail_len = num_tokens - block_start
+            tails = self.tail_entries_by_root.setdefault(parent_hash, {})
+            tails[tail_len] = block_hash
+            if inserted:
+                self.tail_entry_owner[block_hash] = (parent_hash, tail_len)
+                self.tail_entry_refs[block_hash] = (
+                    self.tail_entry_refs.get(block_hash, 0) + 1
+                )
         if emit_event:
             parent_block_hash = (
                 maybe_convert_block_hash(parent_hash)
@@ -646,6 +658,8 @@ class BlockPool:
                     del tails[tail_len]
                     if not tails:
                         del self.tail_entries_by_root[root_hash]
+                    self.tail_entry_owner.pop(tail_hash, None)
+                    self.tail_entry_refs.pop(tail_hash, None)
                 continue
             return cached, tail_len
         return None
@@ -671,6 +685,26 @@ class BlockPool:
         block.reset_hash()
         return removed_hashes
 
+    def _drop_tail_entries(self, removed_hashes: list[BlockHashWithGroupId]) -> None:
+        """Forget the tail entries whose last cached (hash, group) entry is in
+        ``removed_hashes``. A tail re-registered under the same (root, length)
+        with different tokens keeps its newer hash."""
+        for key in removed_hashes:
+            tail_hash = get_block_hash(key)
+            refs = self.tail_entry_refs.get(tail_hash)
+            if refs is None:
+                continue
+            if refs > 1:
+                self.tail_entry_refs[tail_hash] = refs - 1
+                continue
+            del self.tail_entry_refs[tail_hash]
+            root_hash, tail_len = self.tail_entry_owner.pop(tail_hash)
+            tails = self.tail_entries_by_root.get(root_hash)
+            if tails is not None and tails.get(tail_len) == tail_hash:
+                del tails[tail_len]
+                if not tails:
+                    del self.tail_entries_by_root[root_hash]
+
     def _emit_block_removed_events(
         self,
         block_hashes: list[BlockHashWithGroupId],
@@ -691,14 +725,15 @@ class BlockPool:
         block_hash_with_group_id: BlockHashWithGroupId,
         block: KVCacheBlock,
         num_tokens: int | None,
-    ) -> None:
+    ) -> bool:
+        """Cache ``block`` under the hash; False when it already was."""
         if block.block_hash == block_hash_with_group_id:
-            return
+            return False
 
         if self.cached_block_hash_to_block.contain(
             block_hash_with_group_id, block.block_id
         ):
-            return
+            return False
 
         if block.block_hash is None:
             block.set_block_hash(block_hash_with_group_id, num_tokens=num_tokens)
@@ -707,6 +742,7 @@ class BlockPool:
                 block_hash_with_group_id
             )
         self.cached_block_hash_to_block.insert(block_hash_with_group_id, block)
+        return True
 
     def move_block_hashes(
         self,
@@ -785,6 +821,7 @@ class BlockPool:
             # The block doesn't have hash, eviction is not needed
             return False
 
+        self._drop_tail_entries(evicted_hashes)
         self._emit_block_removed_events(evicted_hashes)
         return True
 
@@ -892,6 +929,8 @@ class BlockPool:
         # Remove all hashes so that no new blocks will hit.
         self.cached_block_hash_to_block = BlockHashToBlockMap()
         self.tail_entries_by_root.clear()
+        self.tail_entry_owner.clear()
+        self.tail_entry_refs.clear()
         self.cached_block_hashes_by_block.clear()
 
         # Remove all hashes from all blocks.

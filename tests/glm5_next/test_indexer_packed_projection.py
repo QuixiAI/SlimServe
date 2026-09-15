@@ -10,6 +10,7 @@ from vllm.model_executor.layers.glm5_next_indexer import (
     apply_packed_indexer_projection,
     packed_indexer_projection,
 )
+from vllm.quixicore.ops import quixicore_ops
 
 HIDDEN, HEAD_DIM, N_HEADS = 4096, 128, 32
 
@@ -36,7 +37,10 @@ def test_packing_order_and_refusals():
     assert packed_indexer_projection(wk, torch.randn(HEAD_DIM, 512), wp) is None
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not quixicore_ops.is_available(),
+    reason="needs a CUDA device with the QuixiCore extension (the router GEMV)",
+)
 @pytest.mark.parametrize("tokens", [1, 4, 8, 9, 64])
 def test_packed_projection_matches_the_separate_projections(tokens):
     torch.manual_seed(0)

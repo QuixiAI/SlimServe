@@ -36,6 +36,7 @@ from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_utils import (
     get_request_block_hasher,
     init_none_hash,
+    make_block_hash_with_group_id,
     prompt_tail_boundary,
 )
 from vllm.v1.kv_cache_interface import (
@@ -77,7 +78,7 @@ class Config:
         self.budget = 8160 if spec else 8192
 
 
-def make_manager(cfg: Config) -> KVCacheManager:
+def make_manager(cfg: Config, num_blocks: int = 2048) -> KVCacheManager:
     page = cfg.block * 1024
     mla = MLAAttentionSpec(
         block_size=cfg.block, num_kv_heads=1, head_size=512, dtype=torch.bfloat16
@@ -112,7 +113,9 @@ def make_manager(cfg: Config) -> KVCacheManager:
         )
         groups.append(KVCacheGroupSpec(["draft_swa"], drafter))
     assert len({g.kv_cache_spec.page_size_bytes for g in groups}) == 1
-    config = KVCacheConfig(num_blocks=2048, kv_cache_tensors=[], kv_cache_groups=groups)
+    config = KVCacheConfig(
+        num_blocks=num_blocks, kv_cache_tensors=[], kv_cache_groups=groups
+    )
     return KVCacheManager(
         kv_cache_config=config,
         max_model_len=1 << 20,
@@ -362,6 +365,63 @@ def test_the_tail_index_forgets_evicted_entries():
     assert sum(len(t) for t in pool.tail_entries_by_root.values()) == 1
     assert manager.reset_prefix_cache()
     assert not pool.tail_entries_by_root
+    again = make_request("again", 1000, hasher)
+    assert run_request(cfg, manager, again) == 0
+    manager.free(again)
+
+
+def test_the_tail_index_forgets_entries_whose_blocks_were_recycled():
+    """Eviction drops a tail entry with its last cached block: the index
+    holds only tails that can still hit, not one entry per request served."""
+    cfg = Config(spec=False, match_unit=64)
+    hasher = make_hasher(cfg)
+    manager = make_manager(cfg, num_blocks=8)
+    pool = manager.block_pool
+    groups = range(len(manager.kv_cache_config.kv_cache_groups))
+
+    def cached_tails() -> set:
+        return {
+            tail_hash
+            for tails in pool.tail_entries_by_root.values()
+            for tail_hash in tails.values()
+        }
+
+    def each_tail_has_a_block() -> bool:
+        return all(
+            any(
+                pool.cached_block_hash_to_block.get_one_block(
+                    make_block_hash_with_group_id(tail_hash, group_id)
+                )
+                for group_id in groups
+            )
+            for tail_hash in cached_tails()
+        )
+
+    def serve_and_release(request: Request) -> None:
+        run_request(cfg, manager, request)
+        manager.free(request)
+        _, retained = manager.take_kv_cache_block_copies()
+        manager.free_blocks(retained)
+
+    source = make_request("source", 1000, hasher)
+    serve_and_release(source)
+    (source_tail,) = cached_tails()
+    assert set(pool.tail_entry_refs) == {source_tail}
+    # Enough unrelated prompts, each with its own tail, to recycle every
+    # block the source's tail lives on.
+    for i in range(4):
+        other = Request(
+            request_id=f"other{i}",
+            prompt_token_ids=[(31 * i + 17 * j) % 1000 for j in range(1000)],
+            sampling_params=SamplingParams(max_tokens=16),
+            pooling_params=None,
+            block_hasher=hasher,
+        )
+        serve_and_release(other)
+        assert each_tail_has_a_block()
+    assert source_tail not in cached_tails()
+    assert set(pool.tail_entry_refs) == set(pool.tail_entry_owner) == cached_tails()
+    assert len(cached_tails()) < 5
     again = make_request("again", 1000, hasher)
     assert run_request(cfg, manager, again) == 0
     manager.free(again)

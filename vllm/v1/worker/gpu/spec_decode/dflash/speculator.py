@@ -76,11 +76,10 @@ class DFlashSpeculator(DraftModelSpeculator):
         # Multimodal inputs not currently supported.
         self.supports_mm_inputs = False
 
-        # Each request emits exactly (bonus + N mask) query tokens per step.
-        self.num_query_per_req = 1 + self.num_speculative_steps
-        # A speculative decode row hands the drafter its verify width of
+        # Each request emits exactly (bonus + N mask) query tokens per step,
+        # and a speculative decode row hands the drafter that same width of
         # target tokens (bonus + N drafts); prefill chunks hand it any count.
-        self.num_target_per_req = 1 + self.num_speculative_steps
+        self.num_query_per_req = 1 + self.num_speculative_steps
 
         self.parallel_drafting_token_id = get_parallel_drafting_token_id(
             self.draft_model_config.hf_config
@@ -133,7 +132,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.query_cudagraph_manager: DFlashCudaGraphManager | None = None
         # Context K/V precompute + query forward in one graph, for batches
         # whose every request is a speculative decode row (the context
-        # width is then fixed at num_reqs * num_target_per_req).
+        # width is then fixed at num_reqs * num_query_per_req).
         self.step_cudagraph_manager: DFlashCudaGraphManager | None = None
         self.draft_kv_cache_group_id: int = -1
 
@@ -399,11 +398,11 @@ class DFlashSpeculator(DraftModelSpeculator):
     ) -> None:
         """Context K/V precompute followed by the query forward, for a
         batch of speculative decode rows: num_reqs rows of exactly
-        num_target_per_req target tokens each, so the context width is a
+        num_query_per_req target tokens each, so the context width is a
         function of the (padded) request count and the whole step records
         into one graph. Rows past the real request count carry PAD context
         slots, so their K/V is computed and dropped."""
-        num_context_tokens = num_reqs * self.num_target_per_req
+        num_context_tokens = num_reqs * self.num_query_per_req
         self.model.precompute_and_store_context_kv(  # type: ignore[operator]
             self.hidden_states[:num_context_tokens],
             self.context_positions[:num_context_tokens],
@@ -509,6 +508,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             input_batch.idx_mapping,
             temperature,
             seeds,
+            input_batch.idx_mapping_np,
         )
 
         if dummy_run and skip_attn_for_dummy_run:
@@ -563,16 +563,16 @@ class DFlashSpeculator(DraftModelSpeculator):
 
         # The context K/V precompute runs inside the step graph when every
         # request is a speculative decode row (context width num_reqs *
-        # num_target_per_req, fixed per graph); a prefill chunk gives the
+        # num_query_per_req, fixed per graph); a prefill chunk gives the
         # context a per-step shape, so it runs eagerly ahead of the query
         # graph. Dummy runs keep the eager path with no cache write, since
         # their block tables are placeholders.
         use_step_graph = (
             not dummy_run
             and self.step_cudagraph_manager is not None
-            and num_target_tokens == num_reqs * self.num_target_per_req
+            and num_target_tokens == num_reqs * self.num_query_per_req
             and int(input_batch.num_scheduled_tokens[:num_reqs].max())
-            == self.num_target_per_req
+            == self.num_query_per_req
         )
         if not use_step_graph:
             self.model.precompute_and_store_context_kv(  # type: ignore[operator]
@@ -605,7 +605,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             # The graph writes num_reqs_padded rows of context: PAD the slots
             # of the rows past the real request count.
             self._context_slot_mappings[
-                :, num_target_tokens : num_reqs_padded * self.num_target_per_req
+                :, num_target_tokens : num_reqs_padded * self.num_query_per_req
             ].fill_(PAD_SLOT_ID)
 
         # Rebuild the draft attention metadata even when replaying the FULL
