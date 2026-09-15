@@ -3,17 +3,19 @@
 import itertools
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import ClassVar
 
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
+    BlockHash,
     BlockHashList,
     BlockHashListWithBlockSize,
     BlockHashWithGroupId,
     KVCacheBlock,
+    prompt_tail_boundary,
     resolve_block_hashes,
 )
 from vllm.v1.kv_cache_interface import (
@@ -35,6 +37,10 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
 
+# Hashes the looking-up request's own first ``n`` tokens (``None`` when it
+# cannot), so a stored prompt tail can be confirmed against its tokens.
+PrefixHasher = Callable[[int], BlockHash | None]
+
 
 logger = init_logger(__name__)
 
@@ -46,6 +52,14 @@ class SingleTypeKVCacheManager(ABC):
     """
 
     supports_fine_grained_hash_lookup: ClassVar[bool] = False
+    # Whether a block's partial (prompt-tail) prefix-cache entry stays valid
+    # after the block fills: true for append-only caches, false where a block
+    # holds a single state (Mamba).
+    keeps_partial_entries_on_fill: ClassVar[bool] = False
+    # Whether the prompt's partial tail sits on the replay boundary
+    # (``num_prompt_tokens - 1``) rather than its last hash boundary; set by
+    # the hybrid coordinator (see ``prompt_tail_boundary``).
+    prompt_tail_replay: bool = False
 
     def __init__(
         self,
@@ -479,9 +493,44 @@ class SingleTypeKVCacheManager(ABC):
             block_size=self.block_size,
             kv_cache_group_id=self.kv_cache_group_id,
             block_mask=block_mask,
+            keep_partial_entries=self.keeps_partial_entries_on_fill,
         )
 
         self.num_cached_block[request.request_id] = num_full_blocks
+
+    def _cache_partial_tail_block(
+        self,
+        request: Request,
+        num_tokens: int,
+    ) -> None:
+        """Cache the prompt tail when it ends inside a cache block.
+
+        Only the prompt's tail boundary (``prompt_tail_boundary``) is
+        registered as a partial prefix-cache entry, by the chunk that ends
+        there; intermediate hash boundaries inside the same cache block are
+        intentionally skipped.
+        """
+        boundary_tokens = prompt_tail_boundary(
+            request.num_prompt_tokens,
+            self.block_pool.hash_block_size,
+            self.prompt_tail_replay,
+        )
+        if boundary_tokens <= 0 or boundary_tokens != num_tokens:
+            return
+        if boundary_tokens % self.block_size == 0:
+            return
+
+        blocks = self.req_to_blocks[request.request_id]
+        block_idx = boundary_tokens // self.block_size
+        if block_idx >= len(blocks):
+            return
+        self.block_pool.cache_partial_block(
+            request=request,
+            block=blocks[block_idx],
+            num_tokens=boundary_tokens,
+            kv_cache_group_id=self.kv_cache_group_id,
+            block_size=self.block_size,
+        )
 
     @classmethod
     def reachable_block_mask(
@@ -562,6 +611,7 @@ class SingleTypeKVCacheManager(ABC):
         alignment_tokens: int,
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
+        hash_prefix: PrefixHasher | None = None,
     ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
         """
         Get the longest cache hit prefix of the blocks that is not longer than
@@ -682,8 +732,71 @@ class SingleTypeKVCacheManager(ABC):
         return None
 
 
+def _find_prompt_tail(
+    block_pool: BlockPool,
+    block_hashes: list[BlockHash],
+    unit_idx: int,
+    hash_block_size: int,
+    max_tail_len: int,
+    hash_prefix: PrefixHasher,
+    kv_cache_group_ids: list[int],
+) -> tuple[list[KVCacheBlock], int] | None:
+    """The longest cached prompt tail starting at hash unit ``unit_idx`` that
+    the request's tokens reproduce (see ``BlockPool.find_tail_entry``)."""
+    if max_tail_len <= 0:
+        return None
+    root_hash = block_hashes[unit_idx - 1] if unit_idx > 0 else None
+    tail_start = unit_idx * hash_block_size
+    return block_pool.find_tail_entry(
+        root_hash,
+        max_tail_len,
+        lambda tail_len: hash_prefix(tail_start + tail_len),
+        kv_cache_group_ids,
+    )
+
+
+def _find_partial_block_hit(
+    block_pool: BlockPool,
+    block_hashes: list[BlockHash],
+    first_unit_idx: int,
+    max_unit_idx: int,
+    hash_block_size: int,
+    max_length: int,
+    hash_prefix: PrefixHasher | None,
+    kv_cache_group_ids: list[int],
+) -> tuple[list[KVCacheBlock], int, int, bool] | None:
+    """The longest cached hit rooted at a hash unit in
+    ``first_unit_idx..max_unit_idx``: the boundaries are probed high-to-low,
+    the prompt tail rooted at each boundary before the boundary itself (a
+    tail ends inside the following unit, so ``max_unit_idx`` is probed for a
+    tail only). Returns (blocks per group, hit length, unit index, whether
+    the hit is a prompt tail); None when nothing in the range is cached."""
+    for unit_idx in range(max_unit_idx, first_unit_idx - 1, -1):
+        if hash_prefix is not None:
+            tail_start = unit_idx * hash_block_size
+            tail = _find_prompt_tail(
+                block_pool,
+                block_hashes,
+                unit_idx,
+                hash_block_size,
+                min(max_length - tail_start, hash_block_size - 1),
+                hash_prefix,
+                kv_cache_group_ids,
+            )
+            if tail is not None:
+                cached, tail_len = tail
+                return cached, tail_start + tail_len, unit_idx, True
+        if unit_idx == max_unit_idx:
+            continue
+        cached = block_pool.get_cached_block(block_hashes[unit_idx], kv_cache_group_ids)
+        if cached:
+            return cached, (unit_idx + 1) * hash_block_size, unit_idx, False
+    return None
+
+
 class FullAttentionManager(SingleTypeKVCacheManager):
     supports_fine_grained_hash_lookup: ClassVar[bool] = True
+    keeps_partial_entries_on_fill: ClassVar[bool] = True
 
     @classmethod
     def find_longest_cache_hit(
@@ -697,6 +810,7 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         alignment_tokens: int,
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
+        hash_prefix: PrefixHasher | None = None,
     ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
         assert isinstance(
             kv_cache_spec, FullAttentionSpec | ChunkedLocalAttentionSpec
@@ -745,7 +859,10 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         hit_length = len(computed_blocks[0]) * block_size
 
         # Phase 2 (fine-grained only): extend into the first non-full block by
-        # probing its interior hash boundaries high-to-low (longest hit first).
+        # probing its interior hash boundaries high-to-low (longest hit first),
+        # with the prompt tails rooted at each boundary tried before the
+        # boundary itself (a tail ends inside the following hash unit).
+        tail_hit = False
         if fine_grained:
             assert isinstance(block_hashes, list)
             scale_factor = block_size // alignment_tokens
@@ -755,27 +872,34 @@ class FullAttentionManager(SingleTypeKVCacheManager):
                 max_length // alignment_tokens,
                 len(block_hashes),
             )
-            for fine_idx in range(max_partial_idx - 1, first_partial_idx - 1, -1):
-                cached_tail = block_pool.get_cached_block(
-                    block_hashes[fine_idx], kv_cache_group_ids
-                )
-                if not cached_tail:
-                    continue
-                for computed, cached in zip(computed_blocks, cached_tail):
+            hit = _find_partial_block_hit(
+                block_pool,
+                block_hashes,
+                first_partial_idx,
+                max_partial_idx,
+                alignment_tokens,
+                max_length,
+                hash_prefix,
+                kv_cache_group_ids,
+            )
+            if hit is not None:
+                cached_hit, hit_length, _, tail_hit = hit
+                for computed, cached in zip(computed_blocks, cached_hit):
                     computed.append(cached)
-                hit_length = (fine_idx + 1) * alignment_tokens
-                break
 
         # Eagle needs the tokens right before the generation point recomputed:
         # drop one hash unit when fine-grained (the tail block's KV is
         # append-only, so it still covers the reduced length), else one cache
-        # block.
-        if drop_eagle_block and hit_length > 0:
+        # block. A prompt tail is exact: the drafter's context for it is
+        # complete, so it keeps its full length.
+        if drop_eagle_block and hit_length > 0 and not tail_hit:
             hit_length -= min(alignment_tokens, block_size)
         # Round down to the alignment; a no-op when fine-grained (hits land on
-        # hash boundaries by construction) and when alignment_tokens ==
-        # block_size. Then trim blocks past the new tail.
-        hit_length -= hit_length % alignment_tokens
+        # hash boundaries by construction, except a prompt tail, which is
+        # exact) and when alignment_tokens == block_size. Then trim blocks
+        # past the new tail.
+        if not tail_hit:
+            hit_length -= hit_length % alignment_tokens
         num_blocks = cdiv(hit_length, block_size)
         for computed in computed_blocks:
             del computed[num_blocks:]
@@ -792,36 +916,6 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         if self.block_size == hash_block_size:
             return
         self._cache_partial_tail_block(request, num_tokens)
-
-    def _cache_partial_tail_block(
-        self,
-        request: Request,
-        num_tokens: int,
-    ) -> None:
-        """Cache the prompt tail when it ends inside a cache block.
-
-        Only the final prompt hash boundary is registered as a partial
-        prefix-cache entry; intermediate hash boundaries inside the same cache
-        block are intentionally skipped.
-        """
-        hash_block_size = self.block_pool.hash_block_size
-        boundary_tokens = request.num_prompt_tokens // hash_block_size * hash_block_size
-        if boundary_tokens == 0 or boundary_tokens > num_tokens:
-            return
-        if boundary_tokens % self.block_size == 0:
-            return
-
-        blocks = self.req_to_blocks[request.request_id]
-        block_idx = boundary_tokens // self.block_size
-        if block_idx >= len(blocks):
-            return
-        self.block_pool.cache_partial_block(
-            request=request,
-            block=blocks[block_idx],
-            num_tokens=boundary_tokens,
-            kv_cache_group_id=self.kv_cache_group_id,
-            block_size=self.block_size,
-        )
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         blocks = self.req_to_blocks[running_request_id]
@@ -881,6 +975,9 @@ class RSWAManager(FullAttentionManager):
 
 
 class SlidingWindowManager(SingleTypeKVCacheManager):
+    supports_fine_grained_hash_lookup: ClassVar[bool] = True
+    keeps_partial_entries_on_fill: ClassVar[bool] = True
+
     def __init__(self, kv_cache_spec: SlidingWindowSpec, **kwargs) -> None:
         super().__init__(kv_cache_spec, **kwargs)
         self.sliding_window = kv_cache_spec.sliding_window
@@ -910,27 +1007,46 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         alignment_tokens: int,
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
+        hash_prefix: PrefixHasher | None = None,
     ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
         assert isinstance(kv_cache_spec, SlidingWindowSpec), (
             "SlidingWindowManager can only be used for sliding window groups"
         )
         assert dcp_world_size == 1, "DCP not support sliding window attn now."
         assert pcp_world_size == 1, "PCP not support sliding window attn now."
-        # Fine-grained partial hits are not supported for sliding window now
-        assert alignment_tokens % kv_cache_spec.block_size == 0, (
-            "SlidingWindowManager does not support fine-grained (partial) cache hits"
-        )
+        block_size = kv_cache_spec.block_size
         block_hashes = resolve_block_hashes(
             block_hashes,
             block_pool.hash_block_size,
-            kv_cache_spec.block_size,
+            block_size,
             supports_fine_grained_hash_lookup=cls.supports_fine_grained_hash_lookup,
             alignment_tokens=alignment_tokens,
         )
+        # Fine-grained mode (alignment_tokens == hash_block_size < block_size):
+        # the hit may end at any hash boundary inside a block, or at a prompt
+        # tail; the window then needs the preceding blocks as full blocks and
+        # the last one as a partial entry. Eagle drops one hash unit, which
+        # keeps the block set, so the window needs no extra block.
+        fine_grained = (
+            alignment_tokens < block_size and block_size % alignment_tokens == 0
+        )
+        if fine_grained:
+            assert isinstance(block_hashes, list)
+            full_block_hashes: BlockHashList = BlockHashListWithBlockSize(
+                block_hashes, alignment_tokens, block_size
+            )
+        else:
+            assert alignment_tokens % block_size == 0, (
+                "SlidingWindowManager needs the hit alignment to be a multiple "
+                "of its block size unless it is the hash block size"
+            )
+            full_block_hashes = block_hashes
 
         # The number of contiguous blocks needed for a prefix cache hit.
         sliding_window_contiguous_blocks = cls._contiguous_blocks_for_hit(
-            kv_cache_spec.sliding_window, kv_cache_spec.block_size, drop_eagle_block
+            kv_cache_spec.sliding_window,
+            block_size,
+            drop_eagle_block and not fine_grained,
         )
 
         # TODO: reduce i by sliding_window_contiguous_blocks when cache miss, to
@@ -938,22 +1054,25 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         # O(max_num_blocks / sliding_window_contiguous_blocks +
         # sliding_window_contiguous_blocks),
         # which is good for low cache hit rate scenarios.
-        max_num_blocks = max_length // kv_cache_spec.block_size
+        max_num_blocks = max_length // block_size
         computed_blocks: tuple[list[KVCacheBlock], ...] = tuple(
             [block_pool.null_block] * max_num_blocks
             for _ in range(len(kv_cache_group_ids))
         )
-        block_size = kv_cache_spec.block_size
         num_contiguous_blocks = 0
         match_found = False
         # Search from right to left and early stop when a match is found.
         for i in range(max_num_blocks - 1, -1, -1):
             if cached_block := block_pool.get_cached_block(
-                block_hashes[i], kv_cache_group_ids
+                full_block_hashes[i], kv_cache_group_ids
             ):
                 # Skip prefix matching check if the block is not aligned with
                 # `alignment_tokens`.
-                if num_contiguous_blocks == 0 and block_size != alignment_tokens:
+                if (
+                    num_contiguous_blocks == 0
+                    and not fine_grained
+                    and block_size != alignment_tokens
+                ):
                     post_pop_blocks = i if drop_eagle_block else i + 1
                     if (post_pop_blocks * block_size) % alignment_tokens != 0:
                         continue
@@ -977,25 +1096,78 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
             for computed in computed_blocks:
                 del computed[num_contiguous_blocks:]
             while (
-                block_size != alignment_tokens  # Faster for common case.
+                not fine_grained
+                and block_size != alignment_tokens  # Faster for common case.
                 and len(computed_blocks[0]) * block_size % alignment_tokens != 0
             ):
                 for computed in computed_blocks:
                     computed.pop()
-        if drop_eagle_block and computed_blocks[0]:
-            for computed in computed_blocks:
-                computed.pop()
-            # Re-align after eagle pop: the pop may break the alignment
-            # when block_size != alignment_tokens (hybrid models with
-            # different page sizes, e.g. Gemma4).
-            while (
-                block_size != alignment_tokens
-                and len(computed_blocks[0]) * block_size % alignment_tokens != 0
-            ):
+
+        if not fine_grained:
+            if drop_eagle_block and computed_blocks[0]:
                 for computed in computed_blocks:
                     computed.pop()
+                # Re-align after eagle pop: the pop may break the alignment
+                # when block_size != alignment_tokens (hybrid models with
+                # different page sizes, e.g. Gemma4).
+                while (
+                    block_size != alignment_tokens
+                    and len(computed_blocks[0]) * block_size % alignment_tokens != 0
+                ):
+                    for computed in computed_blocks:
+                        computed.pop()
+            hit_length = len(computed_blocks[0]) * block_size
+            return computed_blocks, hit_length
+
+        # Fine-grained: extend into the block after the matched run. The run
+        # (or the prefix from block 0) already covers the window for a hit
+        # ending anywhere inside that block, so probe its interior hash
+        # boundaries high-to-low, prompt tails rooted at each boundary first.
+        assert isinstance(block_hashes, list)
         hit_length = len(computed_blocks[0]) * block_size
+        tail_hit = False
+        scale_factor = block_size // alignment_tokens
+        first_partial_idx = len(computed_blocks[0]) * scale_factor
+        max_partial_idx = min(
+            first_partial_idx + scale_factor - 1,
+            max_length // alignment_tokens,
+            len(block_hashes),
+        )
+        hit = _find_partial_block_hit(
+            block_pool,
+            block_hashes,
+            first_partial_idx,
+            max_partial_idx,
+            alignment_tokens,
+            max_length,
+            hash_prefix,
+            kv_cache_group_ids,
+        )
+        if hit is not None:
+            cached_hit, hit_length, _, tail_hit = hit
+            for computed, cached in zip(computed_blocks, cached_hit):
+                computed.append(cached)
+
+        # Eagle recomputes the tokens right before the generation point: drop
+        # one hash unit (the partial block still covers the reduced length).
+        # A prompt tail is exact: the drafter's context for it is complete.
+        if drop_eagle_block and hit_length > 0 and not tail_hit:
+            hit_length -= alignment_tokens
+        num_blocks = cdiv(hit_length, block_size)
+        for computed in computed_blocks:
+            del computed[num_blocks:]
         return computed_blocks, hit_length
+
+    def cache_blocks(
+        self,
+        request: Request,
+        num_tokens: int,
+        retention_interval: int | None = None,
+    ) -> None:
+        super().cache_blocks(request, num_tokens, retention_interval=retention_interval)
+        if self.block_size == self.block_pool.hash_block_size:
+            return
+        self._cache_partial_tail_block(request, num_tokens)
 
     @classmethod
     def reachable_block_mask(
@@ -1012,19 +1184,28 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         if alignment_tokens is None:
             # Fast path: when the coordinator imposes no alignment constraint.
             return None
-        assert alignment_tokens % kv_cache_spec.block_size == 0
-
         block_size = kv_cache_spec.block_size
+        # Fine-grained hits (hash-unit alignment inside a block) can end in
+        # any block, so every block is reachable under dense retention; EAGLE
+        # then drops one hash unit, which keeps the block set (no peek block).
+        fine_grained = alignment_tokens < block_size
+        if fine_grained:
+            assert block_size % alignment_tokens == 0
+            if retention_interval is None:
+                return None
+        else:
+            assert alignment_tokens % block_size == 0
+
         # Contiguous blocks a hit needs at a boundary (incl. the EAGLE peek).
         need = cls._contiguous_blocks_for_hit(
             window_size=kv_cache_spec.sliding_window,
             block_size=block_size,
-            use_eagle=use_eagle,
+            use_eagle=use_eagle and not fine_grained,
         )
         # The matched run's right edge sits on the aligned boundary block when
         # EAGLE peeks one block past it (shift=1), otherwise on the last block
         # before the boundary (shift=0).
-        shift = 1 if use_eagle else 0
+        shift = 1 if use_eagle and not fine_grained else 0
 
         mask = [False] * (end_block - start_block)
 
@@ -1052,8 +1233,13 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         # the ``need``-block tail ending on each boundary explicitly.
         if retention_interval is not None:
             for boundary_tokens in reachable_boundaries:
-                aligned = boundary_tokens // alignment_tokens * alignment_tokens
-                end = aligned // block_size + shift
+                if fine_grained:
+                    # The hit ends inside the block holding the boundary's
+                    # last token; that block and the window before it.
+                    end = max(boundary_tokens - 1, 0) // block_size + 1
+                else:
+                    aligned = boundary_tokens // alignment_tokens * alignment_tokens
+                    end = aligned // block_size + shift
                 for j in range(max(start_block, end - need), min(end_block, end)):
                     mask[j - start_block] = True
 
@@ -1149,6 +1335,7 @@ class CircularBufferManager(FullAttentionManager):
         alignment_tokens: int,
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
+        hash_prefix: PrefixHasher | None = None,
     ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
         return tuple([] for _ in kv_cache_group_ids), 0
 
@@ -1201,6 +1388,7 @@ class ChunkedLocalAttentionManager(SingleTypeKVCacheManager):
         alignment_tokens: int,
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
+        hash_prefix: PrefixHasher | None = None,
     ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
         """
         For chunked local attention, we need to find the longest cache hit
@@ -1375,6 +1563,7 @@ class MambaManager(SingleTypeKVCacheManager):
         alignment_tokens: int,
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
+        hash_prefix: PrefixHasher | None = None,
     ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
         assert isinstance(kv_cache_spec, MambaSpec), (
             "MambaManager can only be used for mamba groups"
@@ -1401,18 +1590,24 @@ class MambaManager(SingleTypeKVCacheManager):
             max_num_partial_units = min(
                 max_length // hash_block_size, len(block_hashes)
             )
-            for fine_idx in range(max_num_partial_units - 1, -1, -1):
-                num_tokens = (fine_idx + 1) * hash_block_size
-                block_hash = block_hashes[fine_idx]
-                if cached_block := block_pool.get_cached_block(
-                    block_hash, kv_cache_group_ids
-                ):
-                    block_idx = fine_idx // scale_factor
-                    for computed, cached in zip(computed_blocks, cached_block):
-                        computed.extend([block_pool.null_block] * block_idx)
-                        computed.append(cached)
-                    hit_length = num_tokens
-                    break
+            # A prompt tail rooted at a hash boundary ends inside the next
+            # unit, so it is tried before that boundary (longest hit first).
+            hit = _find_partial_block_hit(
+                block_pool,
+                block_hashes,
+                0,
+                max_num_partial_units,
+                hash_block_size,
+                max_length,
+                hash_prefix,
+                kv_cache_group_ids,
+            )
+            if hit is not None:
+                cached_block, hit_length, fine_idx, _ = hit
+                block_idx = fine_idx // scale_factor
+                for computed, cached in zip(computed_blocks, cached_block):
+                    computed.extend([block_pool.null_block] * block_idx)
+                    computed.append(cached)
             return computed_blocks, hit_length
 
         max_num_blocks = max_length // block_size
@@ -1808,12 +2003,10 @@ class MambaManager(SingleTypeKVCacheManager):
             return None
         if num_tokens % self.block_size == 0:
             return None
-        if num_tokens % hash_block_size != 0:
-            return None
-        latest_prompt_hash_boundary = (
-            request.num_prompt_tokens // hash_block_size
-        ) * hash_block_size
-        if num_tokens != latest_prompt_hash_boundary:
+        boundary_tokens = prompt_tail_boundary(
+            request.num_prompt_tokens, hash_block_size, self.prompt_tail_replay
+        )
+        if boundary_tokens <= 0 or num_tokens != boundary_tokens:
             return None
 
         block_idx = num_tokens // self.block_size
@@ -1887,6 +2080,7 @@ class CrossAttentionManager(SingleTypeKVCacheManager):
         alignment_tokens: int,
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
+        hash_prefix: PrefixHasher | None = None,
     ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
         assert isinstance(kv_cache_spec, CrossAttentionSpec), (
             "CrossAttentionManager can only be used for cross-attention groups"

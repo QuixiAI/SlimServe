@@ -33,7 +33,10 @@ from torch import nn
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+)
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.model_executor.layers.fused_moe import (
@@ -56,6 +59,9 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
 )
 import vllm.model_executor.layers.glm5_next_mhc_ops  # noqa: F401  (registers torch.ops.vllm.glm5_mhc_*)
+from vllm.model_executor.layers.glm5_next_mhc_ar import (  # registers the op
+    mhc_allreduce_fusion_enabled,
+)
 from vllm.model_executor.layers.glm5_next_mhc_project import (
     plain_bf16_projection,
     prepare_router_projection,
@@ -223,6 +229,7 @@ class Glm5NextMLAAttention(nn.Module):
         prefix: str = "",
         topk_indices_buffer: torch.Tensor | None = None,
         indexer_workspace: Glm5NextIndexerWorkspace | None = None,
+        reduce_results: bool = True,
     ) -> None:
         super().__init__()
         cache_config = vllm_config.cache_config
@@ -278,6 +285,7 @@ class Glm5NextMLAAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
+            reduce_results=reduce_results,
         )
 
         assert topk_indices_buffer is not None
@@ -338,6 +346,11 @@ class Glm5NextDecoderLayer(nn.Module):
     checkpoint's ``hc_{attn,ffn}_{fn,base,scale}`` names.
     """
 
+    # Class default so a partially constructed layer (tests/glm5_next/
+    # test_mhc_dispatch.py builds one without __init__) dispatches the
+    # unfused sites; __init__ sets the configured value.
+    _fuse_mhc_allreduce: bool = False
+
     def __init__(
         self,
         config,
@@ -347,16 +360,27 @@ class Glm5NextDecoderLayer(nn.Module):
         indexer_workspace: Glm5NextIndexerWorkspace | None = None,
         mhc_stream_key: str = "",
         enable_router_projection: bool = False,
+        fuse_mhc_allreduce: bool = False,
     ) -> None:
         super().__init__()
         quant_config = vllm_config.quant_config
         self.layer_idx = int(prefix.rsplit(".", 1)[1])
         self.hidden_size = config.hidden_size
         self.rms_norm_eps = config.rms_norm_eps
-        self._fuse_mhc_norm = (
-            current_platform.is_cuda() and current_platform.is_device_capability((8, 0))
+        # The RMSNorm rides inside the mHC transition's finalize (the split
+        # Triton finalize and the cooperative kernel both carry it) on the
+        # measured CUDA parts: sm_80 and sm_120 (Item D4, +1.5 % c1).
+        self._fuse_mhc_norm = current_platform.is_cuda() and (
+            current_platform.is_device_capability((8, 0))
+            or current_platform.is_device_capability_family(120)
         )
         self.is_linear = config.layer_types[self.layer_idx] == "linear_attention"
+        # Each transition site reduces its producer's TP partial inside the
+        # transition launch (glm5_next_mhc_ar); the producers then keep
+        # their partials instead of all-reducing them. The model evaluates
+        # the option once and hands it to every layer.
+        self._fuse_mhc_allreduce = fuse_mhc_allreduce
+        reduce_results = not fuse_mhc_allreduce
 
         if self.is_linear:
             from slimserve.fp8_swapset import beta_block_rows
@@ -370,6 +394,7 @@ class Glm5NextDecoderLayer(nn.Module):
                     vllm_config.model_config.model,
                     f"{prefix}.self_attn.in_proj_qkvgfab",
                 ),
+                reduce_results=reduce_results,
             )
         else:
             self.self_attn = Glm5NextMLAAttention(
@@ -378,6 +403,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 prefix=f"{prefix}.self_attn",
                 topk_indices_buffer=topk_indices_buffer,
                 indexer_workspace=indexer_workspace,
+                reduce_results=reduce_results,
             )
 
         if config.mlp_layer_types[self.layer_idx] == "sparse":
@@ -385,15 +411,22 @@ class Glm5NextDecoderLayer(nn.Module):
                 config=config,
                 parallel_config=vllm_config.parallel_config,
                 quant_config=quant_config,
+                reduce_results=reduce_results,
                 prefix=f"{prefix}.mlp",
             )
+            if self._fuse_mhc_allreduce:
+                # The deferred all-reduce request must have been honored,
+                # otherwise the fused transition double-reduces.
+                assert self.mlp.experts.moe_config.skip_final_all_reduce
         else:
             self.mlp = DeepseekV2MLP(
                 hidden_size=self.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
+                reduce_results=reduce_results,
                 prefix=f"{prefix}.mlp",
+                swiglu_limit=getattr(config, "swiglu_limit", None),
             )
 
         self.input_layernorm = RMSNorm(self.hidden_size, config.rms_norm_eps)
@@ -419,15 +452,22 @@ class Glm5NextDecoderLayer(nn.Module):
         self.hc_ffn_scale = _p(3)
 
         self._mhc_stream_key = mhc_stream_key
+        # The projection overlaps route a site through the plain transition
+        # (glm5_mhc_project_runtime wraps glm5_mhc_fused_post_pre) with a
+        # reduced x; under the all-reduce fusion the site's x is a TP
+        # partial that only glm5_mhc_ar_transition reduces, so both stay
+        # off there.
         self._overlap_kda = (
             bool(mhc_stream_key)
             and self._fuse_mhc_norm
+            and not self._fuse_mhc_allreduce
             and self.is_linear
             and plain_bf16_projection(self.self_attn.in_proj_qkvgfab)
         )
         self._overlap_router = (
             bool(mhc_stream_key)
             and self._fuse_mhc_norm
+            and not self._fuse_mhc_allreduce
             and enable_router_projection
             and isinstance(self.mlp, DeepseekV2MoE)
             and prepare_router_projection(self.mlp)
@@ -449,7 +489,13 @@ class Glm5NextDecoderLayer(nn.Module):
         return residual, post_mix, res_mix, x
 
     def _site_fused(self, x, residual, post_mix, res_mix, fn, scale, base, norm_weight):
-        return torch.ops.vllm.glm5_mhc_fused_post_pre(
+        # With the all-reduce fusion x is the producer's TP partial.
+        transition = (
+            torch.ops.vllm.glm5_mhc_ar_transition
+            if self._fuse_mhc_allreduce
+            else torch.ops.vllm.glm5_mhc_fused_post_pre
+        )
+        return transition(
             x,
             residual,
             post_mix,
@@ -623,6 +669,11 @@ class Glm5NextTextModel(nn.Module):
         enable_router_projection = router_projection_enabled(
             vllm_config.additional_config
         )
+        # With the fused transitions every layer output is a TP partial; the
+        # taps and the final head read it reduced.
+        self._fuse_mhc_allreduce = mhc_allreduce_fusion_enabled(
+            vllm_config.additional_config
+        )
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: Glm5NextDecoderLayer(
@@ -633,6 +684,7 @@ class Glm5NextTextModel(nn.Module):
                 indexer_workspace=self.indexer_workspace,
                 mhc_stream_key=mhc_stream_key,
                 enable_router_projection=enable_router_projection,
+                fuse_mhc_allreduce=self._fuse_mhc_allreduce,
             ),
             prefix=maybe_prefix(prefix, "layers"),
         )
@@ -647,6 +699,7 @@ class Glm5NextTextModel(nn.Module):
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states"], config.hidden_size
         )
+        self._decode_plans_ready = False
         # EAGLE-3 / DFlash convention: a value v in this tuple captures the
         # completed output of layer v - 1 (set_eagle3_aux_hidden_state_layers
         # passes the drafter's target_layer_ids + 1).
@@ -654,6 +707,23 @@ class Glm5NextTextModel(nn.Module):
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
+
+    def prepare_decode_plans(self) -> None:
+        """Post-load, pre-compile setup that needs the processed weights:
+        the pooled indexer's packed projection. Called by the top-level
+        forward (outside the compiled region)."""
+        if self._decode_plans_ready:
+            return
+        self._decode_plans_ready = True
+        for i in range(self.start_layer, self.end_layer):
+            indexer = getattr(self.layers[i].self_attn, "indexer", None)
+            if indexer is not None and hasattr(indexer, "build_packed_projection"):
+                indexer.build_packed_projection()
+
+    def _reduced(self, x: torch.Tensor) -> torch.Tensor:
+        if self._fuse_mhc_allreduce:
+            return tensor_model_parallel_all_reduce(x)
+        return x
 
     def forward(
         self,
@@ -683,10 +753,14 @@ class Glm5NextTextModel(nn.Module):
                 # transition would consume); the drafters were trained on
                 # its hc_contract, the mean over the streams (SGLang PR
                 # 36708, sglang.kernels.ops.layernorm.mhc.hc_contract).
-                taps = torch.ops.vllm.glm5_mhc_post(x, residual, post_mix, res_mix)
+                taps = torch.ops.vllm.glm5_mhc_post(
+                    self._reduced(x), residual, post_mix, res_mix
+                )
                 aux_hidden_states.append(taps.mean(dim=1))
         assert layer is not None
-        streams = torch.ops.vllm.glm5_mhc_post(x, residual, post_mix, res_mix)
+        streams = torch.ops.vllm.glm5_mhc_post(
+            self._reduced(x), residual, post_mix, res_mix
+        )
         # HyperHead: unweighted mean over the streams (reference; DSV4's
         # weighted head does not apply).
         hidden_states = streams.mean(dim=1)
@@ -822,6 +896,7 @@ class Glm5NextForCausalLM(
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
+        self.model.prepare_decode_plans()
         return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -1196,9 +1271,9 @@ class Glm5NextForConditionalGeneration(
     ) -> torch.Tensor | IntermediateTensors:
         if intermediate_tensors is not None:
             inputs_embeds = None
-        return self.language_model.model(
-            input_ids, positions, intermediate_tensors, inputs_embeds
-        )
+        text_model = self.language_model.model
+        text_model.prepare_decode_plans()
+        return text_model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)

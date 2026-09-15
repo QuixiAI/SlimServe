@@ -77,4 +77,4 @@ def test_fp32_logits_and_graph_replay(tokens, deferred):
 def test_dispatch_stays_narrow(deferred, experts, bias):
     gate = make_gate(deferred=deferred, experts=experts, bias=bias)
     assert not gate.allow_cublas_router_gemm
-    assert gate.allow_dsv4_ampere_router_gemm == (experts == 256 and not bias)
+    assert gate.allow_dsv4_ampere_router_gemm == (experts in (256, 288) and not bias)

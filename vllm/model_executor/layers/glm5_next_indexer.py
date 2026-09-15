@@ -43,7 +43,8 @@ from vllm.model_executor.layers.glm5_next_pool_cache import (
     cached_pool_logits,
     update_pool_cache,
 )
-from vllm.model_executor.layers.linear import ReplicatedLinear
+import vllm.model_executor.layers.fused_moe.router.gate_linear  # noqa: F401  (registers torch.ops.vllm.dsv4_ampere_router_gemm)
+from vllm.model_executor.layers.linear import ReplicatedLinear, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
 )
@@ -688,6 +689,44 @@ direct_register_custom_op(
 # --------------------------------------------------------------------- module
 
 
+def packed_indexer_projection(
+    wk: nn.Module, gate: torch.Tensor, weights_proj: nn.Module
+) -> torch.Tensor | None:
+    """[wk | gate | weights_proj] rows as one contiguous bf16 [N, hidden]
+    weight, or None when a row set is not a plain bf16 projection (a
+    quantized wk / weights_proj keeps the separate path)."""
+    rows = []
+    for module in (wk, weights_proj):
+        weight = getattr(module, "weight", None)
+        if (
+            getattr(module, "quant_method", None) is not None
+            and not isinstance(module.quant_method, UnquantizedLinearMethod)
+        ) or not isinstance(weight, torch.Tensor):
+            return None
+        if weight.dtype != torch.bfloat16 or weight.dim() != 2:
+            return None
+        rows.append(weight.data)
+    if gate.dim() != 2 or gate.shape[1] != rows[0].shape[1]:
+        return None
+    rows.insert(1, gate.data.to(torch.bfloat16))
+    return torch.cat(rows, dim=0).contiguous()
+
+
+def apply_packed_indexer_projection(
+    hidden_states: torch.Tensor, packed_kw: torch.Tensor, head_dim: int, n_heads: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """One fp32-accumulating projection over the packed rows -> (k fp32
+    [T, head_dim], gate bf16 [T, head_dim], weights fp32 [T, n_heads])."""
+    if hidden_states.dtype == torch.bfloat16 and hidden_states.shape[-1] == 4096:
+        # The router GEMV (historical dsv4_ampere name, gate_linear.py):
+        # any bf16 [T, 4096] x [N, 4096] fp32-out projection at decode.
+        out = torch.ops.vllm.dsv4_ampere_router_gemm(hidden_states, packed_kw)
+    else:
+        out = torch.mm(hidden_states, packed_kw.T.to(hidden_states.dtype)).float()
+    k, gate, weights = out.split([head_dim, head_dim, n_heads], dim=-1)
+    return k, gate.to(torch.bfloat16), weights
+
+
 class Glm5NextPooledIndexer(nn.Module):
     def __init__(
         self,
@@ -774,6 +813,25 @@ class Glm5NextPooledIndexer(nn.Module):
                 decode_rows, self.max_pools_total, device
             )
         self._ape_f32: torch.Tensor | None = None
+        # wk | compress gate | weights_proj packed as one [2 * head_dim +
+        # n_heads, hidden] bf16 projection (build_packed_projection): the
+        # three separate small-N GEMMs cost 28 us per layer at decode, the
+        # 128 + 128 + 32 = 288-row projection is one router-shaped GEMV.
+        # The source rows stay resident (about 25 MB per rank over the
+        # model): the separate path still reads them and a weight reload
+        # rewrites them, so the pack is a copy, not an alias.
+        self.packed_kw: torch.Tensor | None = None
+
+    def build_packed_projection(self) -> None:
+        """Pack wk, the pool-compress gate and weights_proj into one bf16
+        projection once the weights are loaded (unquantized rows only)."""
+        if self.packed_kw is not None:
+            return
+        packed = packed_indexer_projection(
+            self.wk, self.index_kpool_compress_gate, self.weights_proj
+        )
+        if packed is not None:
+            self.packed_kw = packed
 
     def forward(
         self,
@@ -784,20 +842,25 @@ class Glm5NextPooledIndexer(nn.Module):
     ) -> torch.Tensor:
         q, _ = self.wq_b(qr)
         q = q.view(-1, self.n_heads, self.head_dim).to(torch.bfloat16)
-        k, _ = self.wk(hidden_states)
+        if self.packed_kw is not None:
+            k, gate, weights = apply_packed_indexer_projection(
+                hidden_states, self.packed_kw, self.head_dim, self.n_heads
+            )
+        else:
+            k = self.wk(hidden_states)[0].float()
+            gate = torch.nn.functional.linear(
+                hidden_states, self.index_kpool_compress_gate.to(hidden_states.dtype)
+            ).to(torch.bfloat16)
+            weights = self.weights_proj(hidden_states)[0].float()
         k = torch.nn.functional.layer_norm(
-            k.float(),
+            k,
             (self.head_dim,),
             self.k_norm.weight.float(),
             self.k_norm.bias.float(),
             self.k_norm.eps,
         ).to(torch.bfloat16)
-        gate = torch.nn.functional.linear(
-            hidden_states, self.index_kpool_compress_gate.to(hidden_states.dtype)
-        ).to(torch.bfloat16)
         packed = torch.cat([k, gate], dim=-1).contiguous()
-        weights, _ = self.weights_proj(hidden_states)
-        weights = (weights.float() * self.n_head_scale).contiguous()
+        weights = (weights * self.n_head_scale).contiguous()
         if self._ape_f32 is None or self._ape_f32.device != q.device:
             self._ape_f32 = self.index_kpool_compress_ape.float().contiguous()
         torch.ops.vllm.glm5_next_pooled_indexer(

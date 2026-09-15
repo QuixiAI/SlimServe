@@ -80,6 +80,33 @@ class Glm5NextMTPLayer(DeepSeekMultiTokenPredictorLayer):
         self.shared_head = SharedHead(config, prefix, vllm_config.quant_config)
         self.mtp_block = Glm5NextMTPBlock(vllm_config, prefix, topk_indices_buffer)
 
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        previous_hidden_states: torch.Tensor,
+        inputs_embeds: torch.Tensor | None = None,
+        spec_step_index: int = 0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # DeepSeek's layer zeroes the embedding at absolute position 0; GLM's
+        # head was trained without that mask (the reference implementation
+        # concatenates enorm(embeds) and hnorm(previous) unconditionally).
+        assert inputs_embeds is not None
+        hidden_states = self.eh_proj(
+            torch.cat(
+                [self.enorm(inputs_embeds), self.hnorm(previous_hidden_states)],
+                dim=-1,
+            )
+        )
+        hidden_states, residual = self.mtp_block(
+            positions=positions, hidden_states=hidden_states, residual=None
+        )
+        hidden_states = residual + hidden_states  # pre-final-norm (logits hidden)
+        # Recycle the post-final-norm hidden into the next draft step;
+        # compute_logits applies shared_head (== final norm) to the pre-norm
+        # element, so logits and the recycle each get exactly one final norm.
+        return hidden_states, self.shared_head(hidden_states)
+
 
 class Glm5NextMultiTokenPredictor(DeepSeekMultiTokenPredictor):
     def __init__(self, *, vllm_config, prefix=""):

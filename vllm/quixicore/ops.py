@@ -157,6 +157,72 @@ class quixicore_ops:
     def dsv4_router_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         return _qc().dsv4_router_gemm(x, weight)
 
+    # ------------------------------------------------------------------
+    # GLM mHC transition fused with the custom all-reduce
+    # (quixicore/serving/glm5_mhc_allreduce.cuh); `fa` is the custom
+    # all-reduce handle the stable extension's init_custom_ar returned.
+    # ------------------------------------------------------------------
+    @staticmethod
+    def has_glm5_mhc_allreduce() -> bool:
+        return quixicore_ops.is_available() and hasattr(_qc(), "glm5_mhc_allreduce")
+
+    @staticmethod
+    def glm5_mhc_allreduce(
+        fa: int,
+        inp: torch.Tensor,
+        residual: torch.Tensor,
+        post_mix: torch.Tensor,
+        comb_mix: torch.Tensor,
+        fn: torch.Tensor,
+        residual_out: torch.Tensor,
+        partial: torch.Tensor,
+        arrivals: torch.Tensor,
+        scale: torch.Tensor,
+        base: torch.Tensor,
+        next_post: torch.Tensor,
+        next_comb: torch.Tensor,
+        layer_input: torch.Tensor,
+        norm_weight: torch.Tensor | None,
+        rms_eps: float,
+        hc_eps: float,
+        post_multiplier: float,
+        sinkhorn_repeat: int,
+        norm_eps: float,
+        reg_buffer: int,
+        reg_buffer_sz_bytes: int,
+    ) -> None:
+        _qc().glm5_mhc_allreduce(
+            fa,
+            inp,
+            residual,
+            post_mix,
+            comb_mix,
+            fn,
+            residual_out,
+            partial,
+            arrivals,
+            scale,
+            base,
+            next_post,
+            next_comb,
+            layer_input,
+            norm_weight,
+            rms_eps,
+            hc_eps,
+            post_multiplier,
+            sinkhorn_repeat,
+            norm_eps,
+            reg_buffer,
+            reg_buffer_sz_bytes,
+        )
+
+    @staticmethod
+    def glm5_mhc_join(fa: int) -> None:
+        """Order the current stream behind the last fused transition's
+        deferred sinkhorn (the next site's comb coefficients); no-op when
+        nothing is pending."""
+        _qc().glm5_mhc_join(fa)
+
     @staticmethod
     def dsv4_hash_router(
         x: torch.Tensor,
@@ -1930,6 +1996,21 @@ class quixicore_ops:
         return _qc().topk_sample(
             logits, top_k, top_p, expanded_idx_mapping, seeds, pos, use_fp64
         )
+
+    @staticmethod
+    @cache
+    def has_topk_topp_mask() -> bool:
+        return quixicore_ops.is_available() and hasattr(_qc(), "topk_topp_mask")
+
+    @staticmethod
+    def topk_topp_mask(
+        logits: torch.Tensor,
+        top_k: torch.Tensor,
+        top_p: torch.Tensor | None,
+    ) -> None:
+        """In-place top-k (<= 32, all ties kept) / top-p mask over fp32
+        [B, V] logits: -inf over every token topk_sample would not draw."""
+        _qc().topk_topp_mask(logits, top_k, top_p)
 
     @staticmethod
     def v2_topk_log_softmax(

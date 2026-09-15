@@ -6,6 +6,7 @@ import torch
 from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
+from vllm.v1.worker.gpu.sample import topk_sample
 from vllm.v1.worker.gpu.sample.gumbel import apply_temperature
 from vllm.v1.worker.gpu.sample.min_p import apply_min_p
 
@@ -108,6 +109,14 @@ class SamplingStates:
     ) -> torch.Tensor:
         top_k, top_p = self.get_top_k_top_p(expanded_idx_mapping, idx_mapping_np)
         if top_k is None and top_p is None:
+            return logits
+        if top_k is not None and topk_sample.mask_eligible(
+            self, idx_mapping_np, logits
+        ):
+            # The native candidate-window cutoff and an in-place mask pass:
+            # the Triton mask kernel radix-selects the whole vocabulary per
+            # row (~150 us at four rows), the native passes take ~15 us.
+            topk_sample.mask(logits, top_k, top_p)
             return logits
         return apply_top_k_top_p(logits, top_k, top_p)
 

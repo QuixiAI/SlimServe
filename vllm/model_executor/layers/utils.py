@@ -272,6 +272,81 @@ def maybe_quixicore_fp8_block_linear(
     return None
 
 
+# The same decode GEMM on channel-scaled FP8 weights (compressed-tensors
+# channel strategy: e4m3 [N, K] with one fp32 scale per row, dynamic per-token
+# activations): at M <= 16 the kernel multiplies bf16 activations by
+# bf16(scale[n] * W[n][k]) in one launch (the LM head: a 38720-row vocabulary
+# shard at TP4); above 16 tokens the op runs the scheme's own per-token
+# activation quant + CUTLASS w8a8 GEMM.
+def _cutlass_channel_fp8_linear(
+    x2: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor
+) -> torch.Tensor:
+    q_input, input_scale = ops.scaled_fp8_quant(x2, use_per_token_if_dynamic=True)
+    return ops.cutlass_scaled_mm(
+        q_input,
+        weight.t(),
+        out_dtype=x2.dtype,
+        scale_a=input_scale,
+        scale_b=weight_scale.reshape(1, -1),
+    )
+
+
+def _quixicore_fp8_channel_linear_impl(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> torch.Tensor:
+    x2 = x.reshape(-1, x.shape[-1])
+    n = weight.shape[0]
+    if x2.shape[0] <= DECODE_GEMM_MAX_TOKENS and bias is None:
+        from vllm.quixicore.ops import quixicore_ops
+
+        out = quixicore_ops.decode_gemm_fp8(x2.contiguous(), weight, weight_scale)
+        return out.view(*x.shape[:-1], n)
+    out = _cutlass_channel_fp8_linear(x2, weight, weight_scale)
+    if bias is not None:
+        out = out + bias
+    return out.view(*x.shape[:-1], n)
+
+
+direct_register_custom_op(
+    op_name="quixicore_fp8_channel_linear",
+    op_func=_quixicore_fp8_channel_linear_impl,
+    fake_impl=_quixicore_fp8_block_linear_fake,
+)
+
+
+def maybe_quixicore_fp8_channel_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> torch.Tensor | None:
+    """The channel-FP8 linear through the QuixiCore op when the layer
+    qualifies (bf16 input, e4m3 [N, K] weight - the scheme keeps the [K, N]
+    view, its transpose is the contiguous [N, K] storage - with an fp32
+    [N, 1] scale, shape inside the kernel's gate), else None."""
+    if not (
+        decode_gemm_fp8_enabled()
+        and x.dtype == torch.bfloat16
+        and weight.dtype == torch.float8_e4m3fn
+        and weight.dim() == 2
+        and weight_scale.dtype == torch.float32
+        and weight_scale.numel() == weight.shape[1]
+    ):
+        return None
+    weight_nk = weight.t()
+    if not (
+        weight_nk.is_contiguous()
+        and decode_gemm_fp8_supports(weight_nk.shape[0], weight_nk.shape[1])
+    ):
+        return None
+    return torch.ops.vllm.quixicore_fp8_channel_linear(
+        x, weight_nk, weight_scale.reshape(-1, 1).contiguous(), bias
+    )
+
+
 def use_aiter_triton_gemm(n, m, k, dtype):
     if (
         not rocm_aiter_ops.is_triton_gemm_enabled()

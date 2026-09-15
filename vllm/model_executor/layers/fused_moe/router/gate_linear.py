@@ -78,13 +78,23 @@ class GateLinear(ReplicatedLinear):
         )
         self.out_dtype = out_dtype
 
+        # The QuixiCore bf16 -> fp32 router GEMV (one block per expert row,
+        # 1..8 tokens): DSV4's 256 experts on A100, GLM-5.3-Flash's 288 on
+        # A100 and sm_120 (where cuBLAS runs it as a tensor-core GEMM plus a
+        # split-K reduce, 6 us per layer at decode). The dsv4_/_ampere names
+        # are historical (the kernel was written for DSV4 on A100); the op
+        # also serves the GLM pooled indexer's packed projection
+        # (glm5_next_indexer.py).
         self._dsv4_ampere_router_shape = (
             not bias
             and current_platform.is_cuda()
-            and current_platform.is_device_capability((8, 0))
+            and (
+                current_platform.is_device_capability((8, 0))
+                or current_platform.is_device_capability_family(120)
+            )
             and self.weight.dtype == torch.bfloat16
             and input_size == 4096
-            and output_size == 256
+            and output_size in (256, 288)
         )
         self.allow_dsv4_ampere_router_gemm = (
             self._dsv4_ampere_router_shape and out_dtype == torch.float32
@@ -199,12 +209,11 @@ class GateLinear(ReplicatedLinear):
     def forward(
         self, x: torch.Tensor
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
-        # Tier 1: native decode router for DeepSeek-V4 on A100.
-        if (
-            self.allow_dsv4_ampere_router_gemm
-            and x.shape[0] <= 8
-            and x.dtype == torch.bfloat16
-        ):
+        # Tier 1: the QuixiCore decode router GEMV (DSV4 on A100; GLM-5.3-Flash
+        # on A100 and sm_120). The 1..8-token branch lives inside the custom op
+        # (larger batches take cuBLAS there) so torch.compile does not
+        # specialize the graph on the token count.
+        if self.allow_dsv4_ampere_router_gemm and x.dtype == torch.bfloat16:
             output = torch.ops.vllm.dsv4_ampere_router_gemm(x, self.weight)
             return output, None
 
@@ -265,9 +274,11 @@ _FP32_ROUTER_GEMM_MAX_TOKENS = GateLinear.FP32_MAX_TOKENS
 
 
 def dsv4_ampere_router_gemm_impl(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    from vllm.quixicore.ops import quixicore_ops
+    if x.shape[0] <= 8:
+        from vllm.quixicore.ops import quixicore_ops
 
-    return quixicore_ops.dsv4_router_gemm(x, weight)
+        return quixicore_ops.dsv4_router_gemm(x, weight)
+    return torch.mm(x, weight.T, out_dtype=torch.float32)
 
 
 def dsv4_ampere_router_gemm_fake(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:

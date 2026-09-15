@@ -48,7 +48,7 @@ from vllm.distributed import (
     tensor_model_parallel_reduce_scatter,
 )
 from vllm.logger import init_logger
-from vllm.model_executor.layers.activation import SiluAndMul
+from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.attention import Attention, RSWAAttention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.fused_moe import (
@@ -231,6 +231,14 @@ class DeepseekAttention(nn.Module):
         return output
 
 
+def silu_and_mul(swiglu_limit: float | None) -> nn.Module:
+    """SwiGLU, clamped when the checkpoint sets ``swiglu_limit`` (GLM-5.3:
+    gate capped at the limit, up clamped to +-limit before silu(gate) * up)."""
+    if swiglu_limit is None:
+        return SiluAndMul()
+    return SiluAndMulWithClamp(swiglu_limit)
+
+
 class DeepseekV2MLP(nn.Module):
     def __init__(
         self,
@@ -241,6 +249,7 @@ class DeepseekV2MLP(nn.Module):
         reduce_results: bool = True,
         is_sequence_parallel=False,
         prefix: str = "",
+        swiglu_limit: float | None = None,
     ) -> None:
         super().__init__()
 
@@ -269,7 +278,7 @@ class DeepseekV2MLP(nn.Module):
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
-        self.act_fn = SiluAndMul()
+        self.act_fn = silu_and_mul(swiglu_limit)
 
     def forward(self, x):
         gate_up, _ = self.gate_up_proj(x)
@@ -323,6 +332,9 @@ class DeepseekV2MoE(nn.Module):
         self.n_shared_experts: int = config.n_shared_experts
 
         self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
+        # GLM-5.3 clamps the SwiGLU inputs in every expert (checkpoint field
+        # swiglu_limit); DeepSeek configs carry no such field.
+        self.swiglu_limit: float | None = getattr(config, "swiglu_limit", None)
 
         if config.hidden_act != "silu":
             raise ValueError(
@@ -383,6 +395,7 @@ class DeepseekV2MoE(nn.Module):
                 is_sequence_parallel=self.is_sequence_parallel,
                 reduce_results=False,
                 prefix=f"{prefix}.shared_experts",
+                swiglu_limit=self.swiglu_limit,
             )
 
         self.experts = FusedMoE(
@@ -410,6 +423,7 @@ class DeepseekV2MoE(nn.Module):
             if self.is_fusion_moe_shared_experts_enabled
             else None,
             router_logits_dtype=self.gate.out_dtype,
+            swiglu_limit=self.swiglu_limit,
         )
 
         if (

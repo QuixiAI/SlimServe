@@ -228,6 +228,45 @@ static torch::Tensor py_topk_sample(torch::Tensor logits, torch::Tensor top_k,
     return out;
 }
 
+// ---- top-k / top-p mask in place (serving/topk_sample_kernels.cuh passes 1, 2 and the mask pass) ----
+// logits fp32 [B, V] (unit inner stride), top_k int32 [B] in [1, 32], top_p fp32 [B] or none.
+// Writes -inf over every token the cutoff drops; the retained set is the one
+// topk_sample would draw from.
+static void py_topk_topp_mask(torch::Tensor logits, torch::Tensor top_k,
+        c10::optional<torch::Tensor> top_p) {
+    using namespace tmv2s::topk_sample;
+    TORCH_CHECK(logits.is_cuda() && logits.dim() == 2 && logits.scalar_type() == torch::kFloat32 &&
+                logits.stride(1) == 1, "topk_topp_mask: fp32 [B, V] logits with unit inner stride");
+    M6CK(top_k);
+    const int B = logits.size(0), V = logits.size(1);
+    TORCH_CHECK(V >= NB * K, "topk_topp_mask: vocabulary smaller than the candidate window");
+    TORCH_CHECK(top_k.scalar_type() == torch::kInt32 && top_k.numel() == B, "topk_topp_mask: int32 top_k [B]");
+    const float* p_ptr = nullptr;
+    if (top_p.has_value()) {
+        const torch::Tensor& p_t = *top_p;
+        M6CK(p_t);
+        TORCH_CHECK(p_t.scalar_type() == torch::kFloat32 && p_t.numel() == B, "topk_topp_mask: fp32 top_p [B]");
+        p_ptr = p_t.data_ptr<float>();
+    }
+    if (B == 0) return;
+    auto cand_val = torch::empty({B, NB * K}, logits.options());
+    auto cand_idx = torch::empty({B, NB * K}, logits.options().dtype(torch::kInt32));
+    auto thresholds = torch::empty({B, NB}, logits.options());
+    auto omitted = torch::empty({B, NB}, cand_idx.options());
+    auto prefixes = torch::empty({B, NB}, cand_idx.options());
+    auto cutoff_storage = torch::empty({B, int64_t(sizeof(RowCutoff))}, logits.options().dtype(torch::kUInt8));
+    auto* cutoffs = reinterpret_cast<RowCutoff*>(cutoff_storage.data_ptr<uint8_t>());
+    auto s = m6st();
+    candidates_kernel<<<dim3(NB, B), THREADS, 0, s>>>(
+        logits.data_ptr<float>(), logits.stride(0), V, cand_val.data_ptr<float>(), cand_idx.data_ptr<int>(),
+        thresholds.data_ptr<float>(), omitted.data_ptr<int>());
+    cutoff_kernel<<<B, MERGE_THREADS, 0, s>>>(
+        cand_val.data_ptr<float>(), cand_idx.data_ptr<int>(), thresholds.data_ptr<float>(),
+        omitted.data_ptr<int>(), top_k.data_ptr<int>(), p_ptr, cutoffs, prefixes.data_ptr<int>());
+    mask_partitions_kernel<<<dim3(NB, B), SAMPLE_THREADS, 0, s>>>(
+        logits.data_ptr<float>(), logits.stride(0), V, cutoffs, prefixes.data_ptr<int>());
+}
+
 static void py_v2_topk_log_softmax(torch::Tensor out, torch::Tensor logits,
         torch::Tensor topk_ids) {
     const int batch = logits.size(0), V = logits.size(1);
@@ -546,6 +585,9 @@ void init_m6(py::module_& m) {
           py::arg("top_p"), py::arg("expanded_idx_mapping"), py::arg("seeds"),
           py::arg("pos"), py::arg("use_fp64"),
           "Fused top-k (<= 32, ties kept) / top-p / Gumbel-max sampling; int64 ids [B]");
+    m.def("topk_topp_mask", &py_topk_topp_mask, py::arg("logits"), py::arg("top_k"),
+          py::arg("top_p"),
+          "In-place top-k (<= 32, ties kept) / top-p mask: -inf over the dropped tokens");
     m.def("v2_topk_log_softmax", &py_v2_topk_log_softmax);
     m.def("v2_ranks", &py_v2_ranks);
     m.def("v2_fill_logprob_token_ids", &py_v2_fill_logprob_token_ids);

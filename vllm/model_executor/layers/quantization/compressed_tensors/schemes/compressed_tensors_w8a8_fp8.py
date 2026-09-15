@@ -41,7 +41,10 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     cutlass_block_fp8_supported,
 )
-from vllm.model_executor.layers.utils import maybe_quixicore_fp8_block_linear
+from vllm.model_executor.layers.utils import (
+    maybe_quixicore_fp8_block_linear,
+    maybe_quixicore_fp8_channel_linear,
+)
 
 __all__ = ["CompressedTensorsW8A8Fp8"]
 
@@ -211,6 +214,15 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
             # CUTLASS blockwise w8a8 GEMM itself (see layers/utils.py). None
             # when the layer's layout or the platform is not the kernel's.
             out = maybe_quixicore_fp8_block_linear(
+                x, layer.weight, layer.weight_scale, bias
+            )
+            if out is not None:
+                return out
+        elif self.strategy == QuantizationStrategy.CHANNEL and isinstance(
+            x, torch.Tensor
+        ):
+            # The same kernel with one scale per row (the FP8 LM head).
+            out = maybe_quixicore_fp8_channel_linear(
                 x, layer.weight, layer.weight_scale, bias
             )
             if out is not None:

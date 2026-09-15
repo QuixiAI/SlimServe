@@ -192,6 +192,18 @@ def _glm5_mhc_fused_post_pre_fake(
     )
 
 
+def join_glm5_mhc_deferred() -> None:
+    """Order the current stream behind the fused all-reduce transition's
+    deferred sinkhorn (`glm5_next_mhc_ar`), which produces the comb
+    coefficients on a side stream; no-op without the fused path."""
+    from vllm.distributed import get_tp_group
+
+    comm = get_tp_group().device_communicator
+    ca_comm = getattr(comm, "ca_comm", None) if comm is not None else None
+    if ca_comm is not None:
+        ca_comm.join_glm5_mhc()
+
+
 def glm5_mhc_post(
     x: torch.Tensor,
     residual: torch.Tensor,
@@ -199,6 +211,7 @@ def glm5_mhc_post(
     comb_mix: torch.Tensor,
 ) -> torch.Tensor:
     T, hc, D = residual.shape
+    join_glm5_mhc_deferred()
     out = _qc().dsv4_mhc_post(
         x.view(-1, D),
         residual.view(-1, hc, D),

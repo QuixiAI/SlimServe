@@ -149,6 +149,8 @@ if TYPE_CHECKING:
     VLLM_CUSTOM_AR_ALLOW_PCIE: bool = False
     VLLM_CUSTOM_AR_MAX_SIZE_MB: int = 8
     VLLM_CUSTOM_AR_PCIE_MAX_BYTES: int = 0
+    VLLM_B12X_DMA_AR_MIN_MB: int = 0
+    VLLM_B12X_DMA_AR_MAX_MB: int = 128
     VLLM_QWEN4_EXP_SKINNY_GEMM: bool = False
     VLLM_QWEN4_EXP_SKINNY_W8: bool = False
     VLLM_GDN_DECODE_KERNEL: Literal["cuda", "triton"] = "cuda"
@@ -186,6 +188,7 @@ if TYPE_CHECKING:
     VLLM_RAY_EXTRA_ENV_VAR_PREFIXES_TO_COPY: str = ""
     VLLM_RAY_EXTRA_ENV_VARS_TO_COPY: str = ""
     VLLM_MARLIN_USE_ATOMIC_ADD: bool = False
+    VLLM_B12X_MOE_FP4_FORCE_A16: bool = False
     VLLM_MARLIN_INPUT_DTYPE: Literal["int8", "fp8"] | None = None
     VLLM_HUMMING_ONLINE_QUANT_CONFIG: dict[str, Any] | None = None
     VLLM_HUMMING_INPUT_QUANT_CONFIG: dict[str, Any] | None = None
@@ -1303,6 +1306,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_CUSTOM_AR_PCIE_MAX_BYTES": lambda: int(
         os.getenv("VLLM_CUSTOM_AR_PCIE_MAX_BYTES", "0")
     ),
+    # b12x PCIe DMA-ring all-reduce (copy-engine reduce-scatter + all-gather
+    # between peers) for eager messages of at least this many MiB; 0 leaves
+    # it off. On 4x RTX PRO 6000 (PCIe 5, no NVLink) it beats the custom
+    # two-shot kernel from ~24 MiB up: 930 us against 1308 us at 33.6 MB,
+    # 1572 against 2230 at 57.3 MB (prefill chunk reductions; notebook
+    # 2026-09-14). Never taken inside a CUDA graph capture.
+    "VLLM_B12X_DMA_AR_MIN_MB": lambda: int(os.getenv("VLLM_B12X_DMA_AR_MIN_MB", "0")),
+    # Largest message the DMA ring stages (its per-rank scratch is 1.5x
+    # this, allocated per communicator); larger reductions fall through to
+    # the custom kernel or NCCL. 128 MiB covers 16K-token chunks.
+    "VLLM_B12X_DMA_AR_MAX_MB": lambda: int(
+        os.getenv("VLLM_B12X_DMA_AR_MAX_MB", "128")
+    ),
     # Qwen4Exp on SM 8.6: route the bf16 decode projections through the
     # weight-stationary Triton skinny GEMMs (models/qwen4_exp/nvidia/
     # skinny_gemm_sm86.py). Registered here so it is part of the
@@ -1488,6 +1504,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Whether to use atomicAdd reduce in gptq/awq marlin kernel.
     "VLLM_MARLIN_USE_ATOMIC_ADD": lambda: (
         os.environ.get("VLLM_MARLIN_USE_ATOMIC_ADD", "0") == "1"
+    ),
+    # Run the b12x NVFP4 MoE with bf16 activations (inline FP4 weight
+    # dequantization) instead of the checkpoint's FP4 activation recipe.
+    "VLLM_B12X_MOE_FP4_FORCE_A16": lambda: (
+        os.environ.get("VLLM_B12X_MOE_FP4_FORCE_A16", "0") == "1"
     ),
     # The activation dtype for marlin kernel
     "VLLM_MARLIN_INPUT_DTYPE": env_with_choices(

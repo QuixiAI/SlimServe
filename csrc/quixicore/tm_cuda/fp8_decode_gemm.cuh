@@ -60,11 +60,13 @@ struct Cfg {
     static_assert(STAGE_BYTES % 16 == 0 && WROW % 16 == 0, "16-byte aligned stages and rows");
 };
 
-template <int NT, int WARPS, int KCHUNK, int STAGES, typename OutT>
+// CHANNEL: one fp32 scale per weight row ([N]) instead of the 128x128 block
+// scales; each lane keeps the scales of the rows its B fragments cover.
+template <int NT, int WARPS, int KCHUNK, int STAGES, typename OutT, bool CHANNEL = false>
 __global__ void __launch_bounds__(WARPS * 32) fp8_decode_gemm_kernel(
         const __nv_bfloat16* __restrict__ x,     // [M, K]
         const uint8_t* __restrict__ w,           // [N, K] e4m3
-        const float* __restrict__ scale,         // [ceil(N/128), K/128]
+        const float* __restrict__ scale,         // [ceil(N/128), K/128], or [N] when CHANNEL
         const float* __restrict__ bias,          // [N] or nullptr
         OutT* __restrict__ out,                  // [M, N]
         int M, int N, int K) {
@@ -104,6 +106,11 @@ __global__ void __launch_bounds__(WARPS * 32) fp8_decode_gemm_kernel(
     const int mat = lane >> 3, mrow = lane & 7;
     const int a_row = mrow + 8 * (mat & 1), a_col = 8 * (mat >> 1);   // ldmatrix.x4 A addressing
     const int bn = lane >> 2, bk = (lane & 3) * 2;                     // B fragment: row bn of each n8 tile, k pairs bk, bk+8
+    float row_scale[C::NTILES];
+    if constexpr (CHANNEL) {
+#pragma unroll
+        for (int j = 0; j < C::NTILES; ++j) row_scale[j] = __ldg(scale + min(n0 + 8 * j + bn, N - 1));
+    }
 
 #pragma unroll
     for (int c = 0; c < STAGES - 1; ++c) {
@@ -122,7 +129,7 @@ __global__ void __launch_bounds__(WARPS * 32) fp8_decode_gemm_kernel(
         const int s = c % STAGES;
         const uint32_t xs = smem_u32(stage_x(s));
         const unsigned char* ws = stage_w(s);
-        const float sc = __ldg(srow + c);
+        const float sc = CHANNEL ? 0.0f : __ldg(srow + c);
 #pragma unroll
         for (int step = warp; step < C::KSTEPS; step += WARPS) {
             const int k0 = step * 16;
@@ -133,7 +140,8 @@ __global__ void __launch_bounds__(WARPS * 32) fp8_decode_gemm_kernel(
                 const unsigned char* p = ws + (8 * j + bn) * C::WROW + k0 + bk;
                 const uint16_t lo = *reinterpret_cast<const uint16_t*>(p);
                 const uint16_t hi = *reinterpret_cast<const uint16_t*>(p + 8);
-                mma_bf16_16816(acc[j], a, e4m3x2_scaled_to_bf16x2(lo, sc), e4m3x2_scaled_to_bf16x2(hi, sc));
+                const float s = CHANNEL ? row_scale[j] : sc;
+                mma_bf16_16816(acc[j], a, e4m3x2_scaled_to_bf16x2(lo, s), e4m3x2_scaled_to_bf16x2(hi, s));
             }
         }
     }
@@ -165,11 +173,11 @@ __global__ void __launch_bounds__(WARPS * 32) fp8_decode_gemm_kernel(
     }
 }
 
-template <int NT, int WARPS, int KCHUNK, int STAGES, typename OutT>
+template <int NT, int WARPS, int KCHUNK, int STAGES, typename OutT, bool CHANNEL = false>
 static inline void launch(const __nv_bfloat16* x, const uint8_t* w, const float* scale, const float* bias, OutT* out,
                    int M, int N, int K, cudaStream_t stream) {
     using C = Cfg<NT, WARPS, KCHUNK, STAGES>;
-    auto kern = fp8_decode_gemm_kernel<NT, WARPS, KCHUNK, STAGES, OutT>;
+    auto kern = fp8_decode_gemm_kernel<NT, WARPS, KCHUNK, STAGES, OutT, CHANNEL>;
     // The cache belongs to this module's kernel and the current device.
     // An external inline function's GNU_UNIQUE flag can be coalesced across
     // DSOs even though their CUDA kernel handles require separate setup.
@@ -197,16 +205,18 @@ static inline void launch(const __nv_bfloat16* x, const uint8_t* w, const float*
 // bf16 6.8-8.5), but in the serving trace the 4-stage kernel takes 20-23 us next to Marlin where the 8-stage
 // one takes 7-8 us (notebook 2026-09-07, swap-set part 2 follow-up); deeper prefetch keeps more bytes in
 // flight while the SMs are shared. The 16-row branch follows by analogy pending a profiled c16 round.
-template <typename OutT>
+template <typename OutT, bool CHANNEL = false>
 inline void launch_auto(const __nv_bfloat16* x, const uint8_t* w, const float* scale, const float* bias, OutT* out,
                         int M, int N, int K, cudaStream_t stream) {
-    if (N >= 2048) launch<32, 8, 128, 4>(x, w, scale, bias, out, M, N, K, stream);
-    else if (M <= 8) launch<8, 8, 128, 8>(x, w, scale, bias, out, M, N, K, stream);
-    else launch<16, 8, 128, 8>(x, w, scale, bias, out, M, N, K, stream);
+    if (N >= 2048) launch<32, 8, 128, 4, OutT, CHANNEL>(x, w, scale, bias, out, M, N, K, stream);
+    else if (M <= 8) launch<8, 8, 128, 8, OutT, CHANNEL>(x, w, scale, bias, out, M, N, K, stream);
+    else launch<16, 8, 128, 8, OutT, CHANNEL>(x, w, scale, bias, out, M, N, K, stream);
 }
 
+// N up to the vocabulary shard of a channel-scaled LM head (GLM-5.3-Flash at
+// TP4: 38720 rows, 1210 blocks of the 32-row config).
 inline bool supports(int M, int N, int K) {
-    return M >= 1 && M <= MT && K % 128 == 0 && K >= 512 && N % 8 == 0 && N >= 1024 && N <= 16384;
+    return M >= 1 && M <= MT && K % 128 == 0 && K >= 512 && N % 8 == 0 && N >= 1024 && N <= 65536;
 }
 
 }  // namespace tms::decode_gemm_fp8

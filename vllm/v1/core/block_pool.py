@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from typing import Any
 
 from vllm.distributed.kv_events import (
@@ -186,6 +186,12 @@ class BlockPool:
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
         self.cached_block_hashes_by_block: dict[int, set[BlockHashWithGroupId]] = {}
+        # Prompt-tail partial entries (prefixes ending inside a hash block),
+        # indexed by the hash at the hash boundary the tail starts from (None
+        # at the sequence start): {tail length: tail hash}. A lookup only
+        # knows its own tokens, so it discovers a stored tail through this
+        # index and confirms it by hashing the same run of its own tokens.
+        self.tail_entries_by_root: dict[BlockHash | None, dict[int, BlockHash]] = {}
 
         # To represent a placeholder block with block_id=0.
         # The ref_cnt of null_block is not maintained, needs special care to
@@ -235,6 +241,7 @@ class BlockPool:
         block_size: int,
         kv_cache_group_id: int,
         block_mask: list[bool] | None = None,
+        keep_partial_entries: bool = False,
     ) -> None:
         """Cache a list of full blocks for prefix caching.
         This function takes a list of blocks that will have their block hash
@@ -259,6 +266,11 @@ class BlockPool:
                 consults a subset of blocks (e.g. SWA tail-window), so blocks
                 that can never serve a hit stay out of the prefix-cache hash
                 map.
+            keep_partial_entries: Keep a block's partial (prompt-tail) entry
+                alongside the full-block hash instead of promoting it away.
+                Valid for append-only caches (full attention), where the
+                shorter prefix stays intact after the block fills; a Mamba
+                block holds a single state, so it must promote.
         """
         if num_cached_blocks >= num_full_blocks:
             return
@@ -292,8 +304,9 @@ class BlockPool:
                     blk.block_hash_num_tokens is not None
                     and blk.block_hash_num_tokens < num_hash_tokens
                 )
-                removed_hashes = self._remove_cached_block_hashes(blk)
-                self._emit_block_removed_events(removed_hashes)
+                if not keep_partial_entries:
+                    removed_hashes = self._remove_cached_block_hashes(blk)
+                    self._emit_block_removed_events(removed_hashes)
             self._insert_block_hash(
                 block_hash_with_group_id,
                 blk,
@@ -491,8 +504,15 @@ class BlockPool:
         assert block_size > self.hash_block_size
         assert block_size % self.hash_block_size == 0
         assert num_tokens % block_size != 0
-        block_hash = self._get_partial_block_hash(request, num_tokens)
-        num_hash_blocks = num_tokens // self.hash_block_size
+        is_tail = num_tokens % self.hash_block_size != 0
+        if is_tail:
+            # A prompt tail: the prefix ends inside a hash block, so its key
+            # is the request's own chained hash of the tail tokens.
+            block_hash = request.hash_prefix(num_tokens)
+            if block_hash is None:
+                return None
+        else:
+            block_hash = self._get_partial_block_hash(request, num_tokens)
         block_hash_with_group_id = make_block_hash_with_group_id(
             block_hash, kv_cache_group_id
         )
@@ -505,19 +525,25 @@ class BlockPool:
             not already_cached
             and block.block_hash is not None
             and block.block_hash_num_tokens is not None
-            and block.block_hash_num_tokens < num_hash_blocks * self.hash_block_size
+            and block.block_hash_num_tokens < num_tokens
         ):
             removed_hashes = self._remove_cached_block_hashes(block)
             self._emit_block_removed_events(removed_hashes)
         self._insert_block_hash(
             block_hash_with_group_id,
             block,
-            num_tokens=num_hash_blocks * self.hash_block_size,
+            num_tokens=num_tokens,
         )
-        if self.enable_kv_cache_events and not already_cached:
+        emit_event = self.enable_kv_cache_events and not already_cached
+        if is_tail or emit_event:
             parent_hash, block_start = self._get_partial_block_parent_hash_and_start(
                 request, num_tokens
             )
+        if is_tail:
+            self.tail_entries_by_root.setdefault(parent_hash, {})[
+                num_tokens - block_start
+            ] = block_hash
+        if emit_event:
             parent_block_hash = (
                 maybe_convert_block_hash(parent_hash)
                 if parent_hash is not None
@@ -565,12 +591,64 @@ class BlockPool:
         request: Request,
         num_tokens: int,
     ) -> tuple[BlockHash | None, int]:
-        num_hash_blocks = num_tokens // self.hash_block_size
-        parent_hash = (
-            request.block_hashes[num_hash_blocks - 2] if num_hash_blocks > 1 else None
-        )
-        block_start = (num_hash_blocks - 1) * self.hash_block_size
+        """The hash the entry for ``num_tokens`` chains from and the start of
+        the tokens it hashes: the hash unit ending at ``num_tokens`` when that
+        is a hash boundary, else the tail from the boundary below it."""
+        if num_tokens % self.hash_block_size == 0:
+            num_hash_blocks = num_tokens // self.hash_block_size
+            parent_hash = (
+                request.block_hashes[num_hash_blocks - 2]
+                if num_hash_blocks > 1
+                else None
+            )
+            block_start = (num_hash_blocks - 1) * self.hash_block_size
+        else:
+            block_start = num_tokens // self.hash_block_size * self.hash_block_size
+            parent_hash = (
+                request.block_hashes[block_start // self.hash_block_size - 1]
+                if block_start > 0
+                else None
+            )
         return parent_hash, block_start
+
+    def find_tail_entry(
+        self,
+        root_hash: BlockHash | None,
+        max_tail_len: int,
+        hash_tail: Callable[[int], BlockHash | None],
+        kv_cache_group_ids: list[int],
+    ) -> tuple[list[KVCacheBlock], int] | None:
+        """The longest cached prompt tail rooted at ``root_hash`` that the
+        caller's tokens reproduce, at most ``max_tail_len`` tokens long.
+
+        ``hash_tail(tail_len)`` hashes the caller's own tokens of that tail
+        (None when it cannot); a match of the stored hash proves the tokens
+        match. Entries whose blocks are gone for every requested group are
+        dropped from the index. Returns (blocks per group, tail length).
+        """
+        tails = self.tail_entries_by_root.get(root_hash)
+        if not tails:
+            return None
+        for tail_len in sorted(tails, reverse=True):
+            if tail_len > max_tail_len:
+                continue
+            tail_hash = tails[tail_len]
+            if hash_tail(tail_len) != tail_hash:
+                continue
+            cached = self.get_cached_block(tail_hash, kv_cache_group_ids)
+            if cached is None:
+                if not any(
+                    self.cached_block_hash_to_block.get_one_block(
+                        make_block_hash_with_group_id(tail_hash, group_id)
+                    )
+                    for group_id in kv_cache_group_ids
+                ):
+                    del tails[tail_len]
+                    if not tails:
+                        del self.tail_entries_by_root[root_hash]
+                continue
+            return cached, tail_len
+        return None
 
     def _remove_cached_block_hashes(
         self,
@@ -813,6 +891,7 @@ class BlockPool:
 
         # Remove all hashes so that no new blocks will hit.
         self.cached_block_hash_to_block = BlockHashToBlockMap()
+        self.tail_entries_by_root.clear()
         self.cached_block_hashes_by_block.clear()
 
         # Remove all hashes from all blocks.

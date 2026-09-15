@@ -12,11 +12,14 @@ constexpr int THREADS = 128;
 constexpr int HASH_TOPK = 6;
 constexpr int HASH_THREADS = HASH_TOPK * 32;
 
+// One block per expert row (gridDim.x = experts; 256 for DSV4, 288 for
+// GLM-5.3-Flash), fp32 accumulation of the bf16 products for 1..8 tokens.
 template <int TOKENS>
 __global__ __launch_bounds__(THREADS) void bf16_fp32_gemv(
         const __nv_bfloat16* __restrict__ x,
         const __nv_bfloat16* __restrict__ weight,
-        float* __restrict__ output) {
+        float* __restrict__ output,
+        int experts) {
     constexpr int WARPS = THREADS / 32;
     constexpr int VALUES_PER_ITERATION = THREADS * VECTOR_ELEMENTS;
     constexpr int ITERATIONS = HIDDEN / VALUES_PER_ITERATION;
@@ -76,7 +79,7 @@ __global__ __launch_bounds__(THREADS) void bf16_fp32_gemv(
                 value += __shfl_down_sync(0xffffffff, value, offset);
             }
             if (lane == 0) {
-                output[token * EXPERTS + expert] = value;
+                output[token * experts + expert] = value;
             }
         }
     }
@@ -85,22 +88,23 @@ __global__ __launch_bounds__(THREADS) void bf16_fp32_gemv(
 template <int TOKENS>
 inline void launch_tokens(const __nv_bfloat16* x,
                           const __nv_bfloat16* weight, float* output,
-                          cudaStream_t stream) {
-    bf16_fp32_gemv<TOKENS><<<EXPERTS, THREADS, 0, stream>>>(
-        x, weight, output);
+                          int experts, cudaStream_t stream) {
+    bf16_fp32_gemv<TOKENS><<<experts, THREADS, 0, stream>>>(
+        x, weight, output, experts);
 }
 
 inline void launch(const __nv_bfloat16* x, const __nv_bfloat16* weight,
-                   float* output, int tokens, cudaStream_t stream) {
+                   float* output, int tokens, int experts,
+                   cudaStream_t stream) {
     switch (tokens) {
-        case 1: launch_tokens<1>(x, weight, output, stream); break;
-        case 2: launch_tokens<2>(x, weight, output, stream); break;
-        case 3: launch_tokens<3>(x, weight, output, stream); break;
-        case 4: launch_tokens<4>(x, weight, output, stream); break;
-        case 5: launch_tokens<5>(x, weight, output, stream); break;
-        case 6: launch_tokens<6>(x, weight, output, stream); break;
-        case 7: launch_tokens<7>(x, weight, output, stream); break;
-        case 8: launch_tokens<8>(x, weight, output, stream); break;
+        case 1: launch_tokens<1>(x, weight, output, experts, stream); break;
+        case 2: launch_tokens<2>(x, weight, output, experts, stream); break;
+        case 3: launch_tokens<3>(x, weight, output, experts, stream); break;
+        case 4: launch_tokens<4>(x, weight, output, experts, stream); break;
+        case 5: launch_tokens<5>(x, weight, output, experts, stream); break;
+        case 6: launch_tokens<6>(x, weight, output, experts, stream); break;
+        case 7: launch_tokens<7>(x, weight, output, experts, stream); break;
+        case 8: launch_tokens<8>(x, weight, output, experts, stream); break;
     }
 }
 

@@ -439,6 +439,54 @@ __global__ void __launch_bounds__(SAMPLE_THREADS) sample_partitions_kernel(
     }
 }
 
+// Mask pass for callers that need the retained set itself (the rejection
+// sampler verifies drafts against the masked target distribution): every
+// token pass 3 would not race is written -inf in place, under the same
+// retention rule. A row whose cutoff is the no-distribution sentinel (NaN
+// value) is left untouched.
+__global__ void __launch_bounds__(SAMPLE_THREADS) mask_partitions_kernel(
+    float* __restrict__ logits, int64_t row_stride, int V,
+    const RowCutoff* __restrict__ cutoffs, const int* __restrict__ tie_prefix) {
+    constexpr int WARPS = SAMPLE_THREADS / 32;
+    __shared__ int scan[WARPS];
+    const int row = blockIdx.y, part = blockIdx.x, tid = threadIdx.x;
+    const int lane = tid & 31, warp = tid / 32;
+    const int chunk = (V + NB - 1) / NB;
+    const int start = part * chunk, end = min(V, start + chunk);
+    const RowCutoff cutoff = cutoffs[row];
+    if (cutoff.value != cutoff.value) return;
+    float* x = logits + int64_t(row) * row_stride;
+    int preceding = tie_prefix[int64_t(row) * NB + part];
+    for (int base = start; base < end; base += SAMPLE_THREADS) {
+        const int id = base + tid;
+        const bool valid = id < end;
+        const float v = valid ? x[id] : -INFINITY;
+        bool keep = v > cutoff.value ||
+            (v == cutoff.value && (cutoff.drop_ties >= 0 || id >= cutoff.first_id));
+        if (cutoff.drop_ties > 0) {
+            const unsigned eq = __ballot_sync(0xffffffffu, valid && v == cutoff.value);
+            const int local_rank = __popc(eq & ((1u << lane) - 1u));
+            if (lane == 0) scan[warp] = __popc(eq);
+            __syncthreads();
+            if (warp == 0) {
+                int incl = lane < WARPS ? scan[lane] : 0;
+#pragma unroll
+                for (int offset = 1; offset < WARPS; offset <<= 1) {
+                    const int other = __shfl_up_sync(0xffffffffu, incl, offset);
+                    if (lane >= offset) incl += other;
+                }
+                if (lane < WARPS) scan[lane] = incl;
+            }
+            __syncthreads();
+            const int rank = preceding + (warp ? scan[warp - 1] : 0) + local_rank;
+            if (v == cutoff.value && rank < cutoff.drop_ties) keep = false;
+            preceding += scan[WARPS - 1];
+            __syncthreads();
+        }
+        if (valid && !keep) x[id] = -INFINITY;
+    }
+}
+
 template <typename Score>
 __global__ void finish_kernel(const Score* part_score, const int* part_id, int64_t* out) {
     const int row = blockIdx.x, lane = threadIdx.x;

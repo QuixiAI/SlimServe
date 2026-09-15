@@ -14,6 +14,7 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
+    PrefixHasher,
     SingleTypeKVCacheManager,
     get_manager_for_kv_cache_spec,
 )
@@ -89,7 +90,9 @@ class KVCacheCoordinator(ABC):
 
         # Multi-pool packed slab (E5b): each group draws block ids from its
         # pool; pool 0 is the attention-class slab and stays `block_pool`.
-        pool_sizes = list(kv_cache_config.pool_num_blocks) or [kv_cache_config.num_blocks]
+        pool_sizes = list(kv_cache_config.pool_num_blocks) or [
+            kv_cache_config.num_blocks
+        ]
         self.block_pools: list[BlockPool] = [
             BlockPool(
                 num_gpu_blocks=n,
@@ -107,13 +110,19 @@ class KVCacheCoordinator(ABC):
             for i in range(len(kv_cache_config.kv_cache_groups))
         ]
 
-        # KV cache group indices that get the EAGLE last-block drop.
-        self.eagle_group_ids: set[int] = {
-            i for i, g in enumerate(kv_cache_config.kv_cache_groups) if g.is_eagle_group
-        }
-        # Conservatively fall back to flag all groups when no group is flagged.
-        if use_eagle and not self.eagle_group_ids:
-            self.eagle_group_ids = set(range(len(kv_cache_config.kv_cache_groups)))
+        # KV cache group indices that get the EAGLE last-block drop. Off
+        # entirely (``use_eagle`` False) for drafters whose context is complete
+        # at every cached boundary, such as DFlash.
+        self.eagle_group_ids: set[int] = set()
+        if use_eagle:
+            self.eagle_group_ids = {
+                i
+                for i, g in enumerate(kv_cache_config.kv_cache_groups)
+                if g.is_eagle_group
+            }
+            # Conservatively fall back to flag all groups when none is flagged.
+            if not self.eagle_group_ids:
+                self.eagle_group_ids = set(range(len(kv_cache_config.kv_cache_groups)))
 
         self.single_type_managers = tuple(
             get_manager_for_kv_cache_spec(
@@ -406,6 +415,7 @@ class KVCacheCoordinator(ABC):
         self,
         block_hashes: list[BlockHash],
         max_cache_hit_length: int,
+        hash_prefix: PrefixHasher | None = None,
     ) -> tuple[tuple[list[KVCacheBlock], ...], int, int]:
         """Returns the per-group hit blocks, the hit length, and the number of
         ``num_uncached_common_prefix_tokens`` (a shared prefix that a
@@ -461,6 +471,7 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
         self,
         block_hashes: list[BlockHash],
         max_cache_hit_length: int,
+        hash_prefix: PrefixHasher | None = None,
     ) -> tuple[tuple[list[KVCacheBlock], ...], int, int]:
         blocks: tuple[list[KVCacheBlock], ...] = tuple(
             [] for _ in range(self.num_single_type_manager)
@@ -523,6 +534,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
         self,
         block_hashes: list[BlockHash],
         max_cache_hit_length: int,
+        hash_prefix: PrefixHasher | None = None,
     ) -> tuple[tuple[list[KVCacheBlock], ...], int, int]:
         hit_blocks, hit_length = self.single_type_managers[0].find_longest_cache_hit(
             block_hashes=block_hashes,
@@ -649,11 +661,21 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             and bool(coarse_managers)
             and all(m.supports_fine_grained_hash_lookup for m in coarse_managers)
         )
+        # The prompt's partial tail sits on the replay boundary
+        # (``num_prompt_tokens - 1``) when a Mamba "align" group is coarser
+        # than the hash block, so its state can be keyed there: a repeated
+        # prompt then recomputes only its last token, as a decode-shaped
+        # step. EAGLE-style hits drop one hash unit from grid hits only; a
+        # tail hit is exact, since the drafter's context for it is complete.
+        self.prompt_tail_replay = self.enable_partial_hash_hits and any(
+            isinstance(manager.kv_cache_spec, MambaSpec) for manager in coarse_managers
+        )
         # Sparse-hit managers (sliding window, Mamba under retention) cache
         # only the blocks a hit can consult, so they must use the same
         # granularity the hits are found at.
         for manager in self.single_type_managers:
             manager.cache_hit_alignment_tokens = self._cache_hit_alignment_tokens
+            manager.prompt_tail_replay = self.prompt_tail_replay
         self.verify_and_split_kv_cache_groups()
 
     @property
@@ -756,6 +778,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         self,
         block_hashes: list[BlockHash],
         max_cache_hit_length: int,
+        hash_prefix: PrefixHasher | None = None,
     ) -> tuple[tuple[list[KVCacheBlock], ...], int, int]:
         """
         Find the longest cache hit using an iterative fixed-point algorithm.
@@ -768,6 +791,9 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         Args:
             block_hashes: The block hashes of the request.
             max_cache_hit_length: The maximum length of the cache hit.
+            hash_prefix: Hashes the request's own first ``n`` tokens, so the
+                fine-grained managers can confirm a cached prompt tail (a
+                prefix ending inside a hash block) against the tokens.
 
         Returns:
             A tuple containing:
@@ -846,6 +872,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                         if isinstance(spec, FullAttentionSpec)
                         else 1
                     ),
+                    hash_prefix=hash_prefix,
                 )
                 if drop_eagle_block:
                     eagle_verified.add(idx)
@@ -890,6 +917,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         self,
         block_hashes: list[BlockHash],
         max_cache_hit_length: int,
+        hash_prefix: PrefixHasher | None = None,
     ) -> tuple[tuple[list[KVCacheBlock], ...], tuple[int, ...]]:
         """Like find_longest_cache_hit but evaluates each group independently.
 
@@ -910,6 +938,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 kv_cache_spec=spec,
                 drop_eagle_block=use_eagle,
                 alignment_tokens=self._cache_hit_alignment_tokens,
+                hash_prefix=hash_prefix,
             )
             for gid, blks in zip(group_ids, blocks):
                 hit_blocks[gid] = blks

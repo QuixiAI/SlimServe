@@ -30,6 +30,13 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
+#if !defined(USE_ROCM)
+// The custom all-reduce object (created by the stable extension's
+// init_custom_ar, passed here as its handle) and the GLM mHC transition fused
+// with the all-reduce (quixicore/serving/glm5_mhc_allreduce.cuh). After the
+// torch headers: the gguf common header it carries names c10 types.
+#include "custom_all_reduce.cuh"
+#endif
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -155,9 +162,11 @@ static torch::Tensor py_decode_gemm_fp8(torch::Tensor x, torch::Tensor weight, t
                 "decode_gemm_fp8: x [M, K], weight [N, K]");
     const int M = int(x.size(0)), K = int(x.size(1)), N = int(weight.size(0));
     TORCH_CHECK(decode_gemm_fp8::supports(M, N, K), "decode_gemm_fp8: unsupported shape M=", M, " N=", N, " K=", K);
-    TORCH_CHECK(scale.dim() == 2 && scale.size(0) == (N + decode_gemm_fp8::SB - 1) / decode_gemm_fp8::SB
-                    && scale.size(1) == K / decode_gemm_fp8::SB,
-                "decode_gemm_fp8: scale [ceil(N/128), K/128]");
+    // Block scales [ceil(N/128), K/128], or one scale per row ([N] / [N, 1]).
+    const bool channel = scale.numel() == N && (scale.dim() == 1 || (scale.dim() == 2 && scale.size(1) == 1));
+    TORCH_CHECK(channel || (scale.dim() == 2 && scale.size(0) == (N + decode_gemm_fp8::SB - 1) / decode_gemm_fp8::SB
+                    && scale.size(1) == K / decode_gemm_fp8::SB),
+                "decode_gemm_fp8: scale [ceil(N/128), K/128] or [N]");
     const float* bias_ptr = nullptr;
     if (bias.has_value()) {
         CK((*bias));
@@ -168,11 +177,123 @@ static torch::Tensor py_decode_gemm_fp8(torch::Tensor x, torch::Tensor weight, t
     const c10::cuda::CUDAGuard guard(x.device());
     auto out = torch::empty({M, N}, x.options().dtype(fp32_out ? torch::kFloat32 : torch::kBFloat16));
     const auto* wp = reinterpret_cast<const uint8_t*>(weight.data_ptr());
-    if (fp32_out) decode_gemm_fp8::launch_auto(bp(x), wp, scale.data_ptr<float>(), bias_ptr, fpm(out), M, N, K, stream());
-    else decode_gemm_fp8::launch_auto(bp(x), wp, scale.data_ptr<float>(), bias_ptr, bpm(out), M, N, K, stream());
+    const float* sp = scale.data_ptr<float>();
+    if (channel) {
+        if (fp32_out) decode_gemm_fp8::launch_auto<float, true>(bp(x), wp, sp, bias_ptr, fpm(out), M, N, K, stream());
+        else decode_gemm_fp8::launch_auto<__nv_bfloat16, true>(bp(x), wp, sp, bias_ptr, bpm(out), M, N, K, stream());
+    } else if (fp32_out) {
+        decode_gemm_fp8::launch_auto(bp(x), wp, sp, bias_ptr, fpm(out), M, N, K, stream());
+    } else {
+        decode_gemm_fp8::launch_auto(bp(x), wp, sp, bias_ptr, bpm(out), M, N, K, stream());
+    }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }
+
+#if !defined(USE_ROCM)
+// GLM-5.3 decode: the tensor-parallel all-reduce of `inp` ([T, 4096] bf16 TP
+// partial) fused with the mHC transition. With a staging buffer the input is
+// copied there first (eager); otherwise it must be a registered or captured
+// custom all-reduce input, exactly like the stable extension's all_reduce.
+static void py_glm5_mhc_allreduce(
+        int64_t fa, torch::Tensor inp, torch::Tensor residual,
+        torch::Tensor post_mix, torch::Tensor comb_mix, torch::Tensor fn,
+        torch::Tensor residual_out, torch::Tensor partial,
+        torch::Tensor arrivals, torch::Tensor scale, torch::Tensor base,
+        torch::Tensor next_post, torch::Tensor next_comb,
+        torch::Tensor layer_input, c10::optional<torch::Tensor> norm_weight,
+        double rms_eps, double hc_eps, double post_multiplier,
+        int64_t sinkhorn_repeat, double norm_eps, int64_t reg_buffer,
+        int64_t reg_buffer_sz_bytes) {
+    using vllm::glm5_mhc_ar::HC;
+    using vllm::glm5_mhc_ar::HIDDEN;
+    using vllm::glm5_mhc_ar::NBLOCKS;
+    using vllm::glm5_mhc_ar::NOUT;
+    using vllm::glm5_mhc_ar::PARTIAL_STRIDE;
+    auto* comm = reinterpret_cast<vllm::CustomAllreduce*>(fa);
+    TORCH_CHECK(comm != nullptr, "glm5_mhc_allreduce: null custom all-reduce");
+    CK(inp);
+    TORCH_CHECK(inp.dim() == 2 && inp.size(1) == HIDDEN &&
+                    inp.scalar_type() == torch::kBFloat16,
+                "glm5_mhc_allreduce: input must be BF16[T, 4096]");
+    const int64_t tokens = inp.size(0);
+    TORCH_CHECK(tokens >= 1 && tokens <= vllm::glm5_mhc_ar::MAX_TOKENS,
+                "glm5_mhc_allreduce serves 1..64 tokens");
+    auto check = [&](const torch::Tensor& t, torch::ScalarType dtype,
+                     int64_t numel, const char* what) {
+        TORCH_CHECK(t.is_cuda() && t.device() == inp.device() &&
+                        t.is_contiguous() && t.scalar_type() == dtype &&
+                        t.numel() == numel,
+                    "glm5_mhc_allreduce: ", what);
+    };
+    check(residual, torch::kBFloat16, tokens * HC * HIDDEN, "residual BF16[T, 4, 4096]");
+    check(residual_out, torch::kBFloat16, tokens * HC * HIDDEN, "residual_out BF16[T, 4, 4096]");
+    check(layer_input, torch::kBFloat16, tokens * HIDDEN, "layer_input BF16[T, 4096]");
+    check(post_mix, torch::kFloat, tokens * HC, "post_mix F32[T, 4]");
+    check(comb_mix, torch::kFloat, tokens * HC * HC, "comb_mix F32[T, 4, 4]");
+    check(fn, torch::kFloat, NOUT * HC * HIDDEN, "fn F32[24, 16384]");
+    check(scale, torch::kFloat, 3, "scale F32[3]");
+    check(base, torch::kFloat, NOUT, "base F32[24]");
+    check(next_post, torch::kFloat, tokens * HC, "next_post F32[T, 4]");
+    check(next_comb, torch::kFloat, tokens * HC * HC, "next_comb F32[T, 4, 4]");
+    TORCH_CHECK(partial.is_cuda() && partial.is_contiguous() &&
+                    partial.scalar_type() == torch::kFloat &&
+                    partial.numel() >= tokens * NBLOCKS * PARTIAL_STRIDE,
+                "glm5_mhc_allreduce: partial workspace F32[T, 32, 32]");
+    TORCH_CHECK(arrivals.is_cuda() && arrivals.is_contiguous() &&
+                    arrivals.scalar_type() == torch::kInt32 &&
+                    arrivals.numel() >= tokens,
+                "glm5_mhc_allreduce: arrival counters Int32[>= T]");
+    if (norm_weight) {
+        check(*norm_weight, torch::kBFloat16, HIDDEN, "norm weight BF16[4096]");
+    }
+    const c10::cuda::CUDAGuard guard(inp.device());
+    cudaStream_t s = stream();
+    void* input_ptr = reinterpret_cast<void*>(reg_buffer);
+    if (input_ptr != nullptr) {
+        const int64_t bytes = inp.numel() * inp.element_size();
+        TORCH_CHECK(bytes <= reg_buffer_sz_bytes,
+                    "glm5_mhc_allreduce: input exceeds the staging buffer");
+        C10_CUDA_CHECK(cudaMemcpyAsync(input_ptr, inp.data_ptr(), bytes,
+                                       cudaMemcpyDeviceToDevice, s));
+    } else {
+        input_ptr = inp.data_ptr();
+    }
+    auto launch = [&](auto fused_norm_tag) {
+        constexpr bool fused_norm = decltype(fused_norm_tag)::value;
+        comm->allreduce_glm5_mhc<fused_norm>(
+            s, reinterpret_cast<nv_bfloat16*>(input_ptr),
+            reinterpret_cast<const nv_bfloat16*>(residual.data_ptr()),
+            post_mix.data_ptr<float>(), comb_mix.data_ptr<float>(),
+            fn.data_ptr<float>(),
+            reinterpret_cast<nv_bfloat16*>(residual_out.data_ptr()),
+            partial.data_ptr<float>(),
+            reinterpret_cast<unsigned int*>(arrivals.data_ptr<int32_t>()),
+            scale.data_ptr<float>(), base.data_ptr<float>(),
+            next_post.data_ptr<float>(), next_comb.data_ptr<float>(),
+            reinterpret_cast<nv_bfloat16*>(layer_input.data_ptr()),
+            norm_weight ? reinterpret_cast<const nv_bfloat16*>(
+                              norm_weight->data_ptr())
+                        : nullptr,
+            float(rms_eps), float(hc_eps), float(post_multiplier),
+            int(sinkhorn_repeat), float(norm_eps), int(tokens));
+    };
+    if (norm_weight) {
+        launch(std::true_type{});
+    } else {
+        launch(std::false_type{});
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// Join the calling stream with the pending deferred sinkhorn of the last
+// fused transition (no-op when nothing is pending).
+static void py_glm5_mhc_join(int64_t fa) {
+    auto* comm = reinterpret_cast<vllm::CustomAllreduce*>(fa);
+    TORCH_CHECK(comm != nullptr, "glm5_mhc_join: null custom all-reduce");
+    comm->wait_glm5_mhc(stream());
+}
+#endif
 
 static torch::Tensor py_dsv4_router_gemm(torch::Tensor x,
                                          torch::Tensor weight) {
@@ -185,14 +306,12 @@ static torch::Tensor py_dsv4_router_gemm(torch::Tensor x,
     TORCH_CHECK(x.size(0) >= 1 && x.size(0) <= 8 &&
                     x.size(1) == dsv4_router::HIDDEN,
                 "DSV4 router input must have shape [1..8, 4096]");
-    TORCH_CHECK(weight.size(0) == dsv4_router::EXPERTS &&
-                    weight.size(1) == dsv4_router::HIDDEN,
-                "DSV4 router weight must have shape [256, 4096]");
+    TORCH_CHECK(weight.size(0) >= 1 && weight.size(1) == dsv4_router::HIDDEN,
+                "DSV4 router weight must have shape [experts, 4096]");
     auto output = torch::empty(
-        {x.size(0), dsv4_router::EXPERTS},
-        x.options().dtype(torch::kFloat));
+        {x.size(0), weight.size(0)}, x.options().dtype(torch::kFloat));
     dsv4_router::launch(bp(x), bp(weight), fpm(output), int(x.size(0)),
-                        stream());
+                        int(weight.size(0)), stream());
     return output;
 }
 
@@ -453,6 +572,39 @@ static void launch_dsv4_mhc_partials_batched(
         const __nv_bfloat16* x, const __nv_bfloat16* residual,
         const float* post, const float* comb, torch::Tensor fn,
         __nv_bfloat16* residual_out, float* partial, int hidden_size, int tokens) {
+    // Prefill batches: the persistent kernel (fn slice hoisted into
+    // registers, grid-stride over 8-token tiles, two blocks per SM).
+    // QC_MHC_PERSISTENT_MIN_TOKENS (default 128; 0 keeps the tiled kernel
+    // for every batch) is the batch it takes over from: a kernel tuning
+    // knob, not profile environment.
+    static const int persistent_min = [] {
+        const char* v = std::getenv("QC_MHC_PERSISTENT_MIN_TOKENS");
+        return v ? std::atoi(v) : 128;
+    }();
+    if (persistent_min > 0 && tokens >= persistent_min) {
+        constexpr int TTP = 8;
+        static const int tiles_y = [] {
+            int device = 0, sms = 0;
+            cudaGetDevice(&device);
+            cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
+            return std::max(1, (2 * sms) / dsv4_mhc::SPLITS);
+        }();
+        const int ntiles = (tokens + TTP - 1) / TTP;
+        const dim3 grid(dsv4_mhc::SPLITS, std::min(ntiles, tiles_y));
+        if (fn.scalar_type() == torch::kHalf) {
+            dsv4_mhc::partials_batched_persistent<NOUT, TTP, half>
+                <<<grid, dsv4_mhc::THREADS, 0, stream()>>>(
+                    x, residual, post, comb,
+                    reinterpret_cast<const half*>(fn.data_ptr()), residual_out,
+                    partial, hidden_size, tokens);
+        } else {
+            dsv4_mhc::partials_batched_persistent<NOUT, TTP, float>
+                <<<grid, dsv4_mhc::THREADS, 0, stream()>>>(
+                    x, residual, post, comb, fp(fn), residual_out, partial,
+                    hidden_size, tokens);
+        }
+        return;
+    }
     static const int tt_env = [] {
         const char* v = std::getenv("QC_MHC_PARTIALS_TT");
         return v ? std::atoi(v) : 4;
@@ -612,52 +764,72 @@ py_dsv4_mhc_fused_post_pre(
         }
         return {residual_out, next_post, next_comb, layer_input};
     }
-    if (T > 1) {
-        launch_dsv4_mhc_partials_batched<dsv4_mhc::MIXES>(
-            bp(x), bp(residual), fp(post_mix), fp(comb_mix), fn,
-            bpm(residual_out), fpm(partial), H, T);
-    } else {
-        launch_dsv4_mhc_partials<dsv4_mhc::MIXES, true>(
-            bp(x), bp(residual), fp(post_mix), fp(comb_mix), fn,
-            bpm(residual_out), fpm(partial), H, dim3(dsv4_mhc::SPLITS, T));
-    }
     static const bool fused_norm = [] {
         const char* v = std::getenv("QC_MHC_FUSED_NORM");
         return !(v && v[0] == '0');
     }();
-    if (norm_weight && fused_norm && H == 4096) {
-        TORCH_CHECK(norm_weight->is_cuda() && norm_weight->is_contiguous() &&
-                    norm_weight->scalar_type() == torch::kBFloat16 &&
-                    norm_weight->numel() == H,
-                    "fused DSV4 mHC RMSNorm expects a 4096-element bf16 weight");
-        dsv4_mhc::finalize_apply_pre_mix_rms_norm<dsv4_mhc::MIXES + 1, 1024>
-            <<<T, 1024, 0, stream()>>>(
-                fpm(partial), fp(hc_scale), fp(hc_base), fpm(next_post),
-                fpm(next_comb), bp(residual_out), bp(*norm_weight), bpm(layer_input),
-                H, float(rms_eps), float(pre_eps), float(sinkhorn_eps),
-                float(post_multiplier), int(sinkhorn_repeat), float(norm_eps));
-        return {residual_out, next_post, next_comb, layer_input};
-    }
-    dsv4_mhc::finalize_pre_mix<<<T, 32, 0, stream()>>>(
-        fpm(partial), fp(hc_scale), fp(hc_base), fpm(next_post),
-        fpm(next_comb), H, float(rms_eps), float(pre_eps),
-        float(sinkhorn_eps), float(post_multiplier), int(sinkhorn_repeat));
+    // Prefill batches run in token slabs: the partials kernel writes a
+    // slab's residual_out (32 KiB per token) and the apply kernel re-reads
+    // it while it is still in L2 (128 MiB on RTX PRO 6000; a 5461-token
+    // chunk's 175 MiB is not), instead of streaming the whole batch through
+    // each kernel in turn. Every kernel is per-token, so the slabs are
+    // plain pointer offsets. QC_MHC_SLAB_TOKENS (default 2048) is the slab
+    // length: a kernel tuning knob, not profile environment.
+    static const int slab_tokens = [] {
+        const char* v = std::getenv("QC_MHC_SLAB_TOKENS");
+        return v ? std::atoi(v) : 2048;
+    }();
+    const bool fuse_norm = norm_weight && fused_norm && H == 4096;
     if (norm_weight) {
         TORCH_CHECK(norm_weight->is_cuda() && norm_weight->is_contiguous(),
                     "norm_weight must be contiguous CUDA");
         TORCH_CHECK(H == 4096 && norm_weight->scalar_type() == torch::kBFloat16 &&
                     norm_weight->numel() == H,
                     "fused DSV4 mHC RMSNorm expects a 4096-element bf16 weight");
-        dsv4_mhc::apply_pre_mix_rms_norm<dsv4_mhc::MIXES + 1>
-            <<<T, dsv4_mhc::THREADS, 0, stream()>>>(
-                fp(partial), bp(residual_out), bp(*norm_weight),
-                bpm(layer_input), float(norm_eps));
-    } else {
-        dsv4_mhc::apply_pre_mix<dsv4_mhc::MIXES + 1>
-            <<<dim3((H + dsv4_mhc::THREADS - 1) / dsv4_mhc::THREADS, T),
-                dsv4_mhc::THREADS, 0, stream()>>>(
-                fp(partial), bp(residual_out), bpm(layer_input), H);
     }
+    const auto run = [&](int t0, int n) {
+        constexpr int HC = dsv4_mhc::HC, WIDTH = dsv4_mhc::MIXES + 1;
+        const __nv_bfloat16* xs = bp(x) + int64_t(t0) * H;
+        const __nv_bfloat16* rs = bp(residual) + int64_t(t0) * HC * H;
+        const float* ps = fp(post_mix) + int64_t(t0) * HC;
+        const float* cs = fp(comb_mix) + int64_t(t0) * HC * HC;
+        __nv_bfloat16* ros = bpm(residual_out) + int64_t(t0) * HC * H;
+        float* parts = fpm(partial) + int64_t(t0) * dsv4_mhc::SPLITS * WIDTH;
+        float* nps = fpm(next_post) + int64_t(t0) * HC;
+        float* ncs = fpm(next_comb) + int64_t(t0) * HC * HC;
+        __nv_bfloat16* lis = bpm(layer_input) + int64_t(t0) * H;
+        if (n > 1) {
+            launch_dsv4_mhc_partials_batched<dsv4_mhc::MIXES>(
+                xs, rs, ps, cs, fn, ros, parts, H, n);
+        } else {
+            launch_dsv4_mhc_partials<dsv4_mhc::MIXES, true>(
+                xs, rs, ps, cs, fn, ros, parts, H, dim3(dsv4_mhc::SPLITS, n));
+        }
+        if (fuse_norm) {
+            dsv4_mhc::finalize_apply_pre_mix_rms_norm<WIDTH, 1024>
+                <<<n, 1024, 0, stream()>>>(
+                    parts, fp(hc_scale), fp(hc_base), nps, ncs, ros,
+                    bp(*norm_weight), lis, H, float(rms_eps), float(pre_eps),
+                    float(sinkhorn_eps), float(post_multiplier),
+                    int(sinkhorn_repeat), float(norm_eps));
+            return;
+        }
+        dsv4_mhc::finalize_pre_mix<<<n, 32, 0, stream()>>>(
+            parts, fp(hc_scale), fp(hc_base), nps, ncs, H, float(rms_eps),
+            float(pre_eps), float(sinkhorn_eps), float(post_multiplier),
+            int(sinkhorn_repeat));
+        if (norm_weight) {
+            dsv4_mhc::apply_pre_mix_rms_norm<WIDTH>
+                <<<n, dsv4_mhc::THREADS, 0, stream()>>>(
+                    parts, ros, bp(*norm_weight), lis, float(norm_eps));
+        } else {
+            dsv4_mhc::apply_pre_mix<WIDTH>
+                <<<dim3((H + dsv4_mhc::THREADS - 1) / dsv4_mhc::THREADS, n),
+                    dsv4_mhc::THREADS, 0, stream()>>>(parts, ros, lis, H);
+        }
+    };
+    const int slab = (slab_tokens > 0 && T > slab_tokens) ? slab_tokens : T;
+    for (int t0 = 0; t0 < T; t0 += slab) run(t0, std::min(slab, T - t0));
     return {residual_out, next_post, next_comb, layer_input};
 }
 
@@ -2611,6 +2783,23 @@ static void py_turboquant_dequant_kv(torch::Tensor kv_cache, torch::Tensor block
 void init_serving(py::module_& m) {
     m.def("dsv4_router_gemm", &py_dsv4_router_gemm, py::arg("x"),
           py::arg("weight"));
+#if !defined(USE_ROCM)
+    m.def("glm5_mhc_join", &py_glm5_mhc_join, py::arg("fa"),
+          "Order the current stream behind the last fused transition's deferred "
+          "sinkhorn (the next site's comb coefficients)");
+    m.def("glm5_mhc_allreduce", &py_glm5_mhc_allreduce, py::arg("fa"),
+          py::arg("inp"), py::arg("residual"), py::arg("post_mix"),
+          py::arg("comb_mix"), py::arg("fn"), py::arg("residual_out"),
+          py::arg("partial"), py::arg("arrivals"), py::arg("scale"),
+          py::arg("base"), py::arg("next_post"), py::arg("next_comb"),
+          py::arg("layer_input"), py::arg("norm_weight"), py::arg("rms_eps"),
+          py::arg("hc_eps"), py::arg("post_multiplier"),
+          py::arg("sinkhorn_repeat"), py::arg("norm_eps"),
+          py::arg("reg_buffer"), py::arg("reg_buffer_sz_bytes"),
+          "GLM mHC transition fused with the custom all-reduce of the producer's "
+          "TP partial ([T, 4096] bf16, T <= 64): residual_out, next post/comb "
+          "coefficients and the (optionally RMS-normed) layer input in one launch");
+#endif
     m.def("dsv4_hash_router", &py_dsv4_hash_router, py::arg("x"),
           py::arg("weight"), py::arg("input_ids"), py::arg("tid2eid"),
           py::arg("routed_scaling_factor"), py::arg("is_padding") = c10::nullopt);
@@ -2629,8 +2818,8 @@ void init_serving(py::module_& m) {
           "bf16 M<=16 GEMM on tensor cores: x @ weight^T (+ bias), fp32 accumulation");
     m.def("decode_gemm_fp8", &py_decode_gemm_fp8, py::arg("x"), py::arg("weight"), py::arg("scale"),
           py::arg("bias") = py::none(), py::arg("fp32_out") = false,
-          "bf16 x FP8 block-scaled weights (e4m3, 128x128 fp32 scales), M<=16, tensor cores: "
-          "x @ dequant(weight)^T (+ bias), fp32 accumulation");
+          "bf16 x FP8 weights (e4m3 with 128x128 fp32 block scales, or one fp32 scale per row), "
+          "M<=16, tensor cores: x @ dequant(weight)^T (+ bias), fp32 accumulation");
     m.def("fill_short_context_topk_indices",
           &py_fill_short_context_topk_indices, py::arg("output"),
           py::arg("positions"), py::arg("topk"),

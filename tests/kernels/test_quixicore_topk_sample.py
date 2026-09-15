@@ -148,3 +148,51 @@ def test_sampler_eligibility_rules():
     assert not topk_sample.eligible(
         states, k, np.array([0, 1]), logits.to(torch.bfloat16), pos, False
     )
+
+
+@pytest.mark.skipif(
+    not quixicore_ops.has_topk_topp_mask(), reason="topk_topp_mask binding unavailable"
+)
+@pytest.mark.parametrize("vocab", [VOCAB, 2053])
+@pytest.mark.parametrize("top_p", [None, 0.95, 0.3])
+def test_mask_matches_the_torch_mask(vocab, top_p):
+    batch = 16
+    for trial in range(5):
+        logits, top_k, idx, seeds, pos = _batch(batch, vocab, seed=300 + trial)
+        p = None if top_p is None else torch.full((batch,), top_p, device=DEVICE)
+        ref = apply_top_k_top_p_pytorch(logits.clone(), top_k, p)
+        out = logits.clone()
+        quixicore_ops.topk_topp_mask(out, top_k, p)
+        assert torch.equal(out, ref)
+        # The fused sampler draws inside the mask it shares the cutoff with.
+        sampled = quixicore_ops.topk_sample(logits, top_k, p, idx, seeds, pos, False)
+        assert torch.isfinite(out.gather(1, sampled.view(-1, 1))).all()
+
+
+@pytest.mark.skipif(
+    not quixicore_ops.has_topk_topp_mask(), reason="topk_topp_mask binding unavailable"
+)
+def test_mask_keeps_every_tie_at_the_kth_value():
+    batch, vocab = 4, 4096
+    logits = torch.full((batch, vocab), -3.0, device=DEVICE)
+    logits[:, :8] = 5.0
+    logits[:, 100:140] = 2.0  # 40 ties straddle every k in [9, 48]
+    top_k = torch.tensor([8, 9, 20, 32], device=DEVICE, dtype=torch.int32)
+    ref = apply_top_k_top_p_pytorch(logits.clone(), top_k, None)
+    out = logits.clone()
+    quixicore_ops.topk_topp_mask(out, top_k, None)
+    assert torch.equal(out, ref)
+    assert int(torch.isfinite(out[0]).sum()) == 8
+    assert int(torch.isfinite(out[1]).sum()) == 48
+
+
+@pytest.mark.skipif(
+    not quixicore_ops.has_topk_topp_mask(), reason="topk_topp_mask binding unavailable"
+)
+def test_mask_leaves_a_row_without_a_distribution_alone():
+    logits = torch.full((2, 4096), -float("inf"), device=DEVICE)
+    logits[1, 7] = 1.0
+    top_k = torch.tensor([4, 4], device=DEVICE, dtype=torch.int32)
+    out = logits.clone()
+    quixicore_ops.topk_topp_mask(out, top_k, None)
+    assert torch.equal(out, logits)

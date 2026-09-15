@@ -273,6 +273,10 @@ class RejectionSampler:
         num_nans = get_num_nans(logits) if self.sampler.compute_nans else None
 
         draft_sampled = input_batch.input_ids[input_batch.logits_indices]
+        if input_batch.draft_placeholder_mask is not None:
+            # Rows the scheduler padded ahead of the request's first draft
+            # verify as -1: rejected outright, never a residual source.
+            draft_sampled.masked_fill_(input_batch.draft_placeholder_mask, -1)
         pos = input_batch.positions[input_batch.logits_indices]
 
         max_num_logprobs = self.sampler.sampling_states.max_num_logprobs(

@@ -34,6 +34,13 @@ shape, so the sidecar is tensor-parallel agnostic. The merged projection's
 beta shard (``b_proj``, one row per head) is smaller than a scale block, so
 the model gives it a whole replicated block of rows when the manifest lists
 the module (``beta_block_rows``) and each rank reads its heads from it.
+``--self-quant-lm-head`` adds the BF16 ``lm_head`` (154,880 x 4096, 1.27 GB;
+read twice per speculative step: the verify logits and the drafter's
+candidate logits) as per-output-channel e4m3 (row absmax / 448, one F32
+scale per row) with dynamic per-token FP8 activations. Channel scales
+because the vocab shards of a tensor-parallel head (38,720 rows at TP=4)
+do not align to 128-row blocks. It rides in the same sidecar under a
+second config group targeting ``lm_head``.
 Quality is the experiment's gate, not a given.
 
     python -m slimserve.fp8_swapset --native /path/to/GLM-5.3-Flash \\
@@ -58,6 +65,9 @@ SWAPSET_FILE = "fp8-swapset.safetensors"
 MANIFEST_FILE = "fp8-swapset.json"
 SWAPSET_ENV = "SLIMSERVE_FP8_SWAPSET"
 GROUP_NAME = "slimserve_fp8_swapset"
+LM_HEAD_GROUP_NAME = "slimserve_fp8_swapset_lm_head"
+LM_HEAD = "lm_head.weight"
+LM_HEAD_TARGET = r"re:.*lm_head$"
 BLOCK = 128
 
 # Checkpoint module suffix (after ``layers.N.``) -> vLLM module suffix it loads into.
@@ -174,6 +184,30 @@ def quantize_block(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return q.view(rows * BLOCK, k)[:n].contiguous(), scale.view(rows, k // BLOCK)
 
 
+def quantize_channel(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-output-channel e4m3 (row absmax / 448) of a [N, K] weight.
+    Returns (fp8 [N, K], f32 scale [N, 1])."""
+    wf = w.float()
+    amax = wf.abs().amax(dim=1, keepdim=True).clamp(min=1e-12)
+    scale = amax / FP8_MAX
+    q = (wf / scale).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
+    return q.contiguous(), scale.contiguous()
+
+
+def _lm_head_group(template: dict) -> dict:
+    """The lm_head's config group: the block group's schema with channel
+    weight scales and per-token dynamic activations."""
+    group = json.loads(json.dumps(template))
+    group["weights"].update(
+        {"strategy": "channel", "block_structure": None, "group_size": None}
+    )
+    group["input_activations"].update({"strategy": "token", "group_size": None})
+    # By suffix: the multimodal wrapper's head is ``language_model.lm_head``
+    # (the drafter's head is not a compressed-tensors module).
+    group["targets"] = [LM_HEAD_TARGET]
+    return group
+
+
 def targets_for(names: list[str]) -> list[str]:
     """compressed-tensors ``re:`` targets on the vLLM module names, one per
     (module suffix, layer set); explicit layer lists so a KDA ``o_proj``
@@ -227,6 +261,7 @@ def build(
     out: str | None = None,
     skip_layer: int | None = 45,
     self_quant_kda: bool = False,
+    self_quant_lm_head: bool = False,
 ) -> Path:
     native = _headers(native_dir)
     converted = _headers(model_dir)
@@ -236,12 +271,29 @@ def build(
     kda = select_kda(converted, skip_layer) if self_quant_kda else []
     if self_quant_kda and not kda:
         raise SystemExit("--self-quant-kda found no BF16 KDA projections")
+    lm_head = converted.get(LM_HEAD) if self_quant_lm_head else None
+    if self_quant_lm_head and (lm_head is None or lm_head[0]["dtype"] != "BF16"):
+        raise SystemExit("--self-quant-lm-head found no BF16 lm_head.weight")
     group = _fp8_group_template(model_dir)
     group["targets"] = targets_for(names + kda)
     tensors: dict[str, torch.Tensor] = {}
     mismatch: dict[str, list[tuple[int, int]]] = defaultdict(list)
     qerr: dict[str, list[tuple[float, float]]] = defaultdict(list)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if lm_head is not None:
+        w = _read(*lm_head).to(device)
+        q, sc = quantize_channel(w)
+        err = (q.float() * sc - w.float()).cpu()
+        ref = w.float().cpu()
+        qerr["lm_head"].append(
+            (
+                (err.norm() / ref.norm().clamp(min=1e-12)).item(),
+                (err.abs().max() / ref.abs().max().clamp(min=1e-12)).item(),
+            )
+        )
+        tensors[LM_HEAD] = q.cpu()
+        tensors["lm_head.weight_scale"] = sc.cpu()
+        del w, q, sc, err, ref
     for name in kda:
         base = name[: -len(".weight")]
         w = _read(*converted[name]).to(device)
@@ -299,6 +351,10 @@ def build(
     if kda:
         manifest["self_quantized"] = kda
         manifest["beta_block_rows"] = BETA_ROWS
+    if lm_head is not None:
+        manifest["modules"].append("lm_head")
+        manifest["self_quantized"] = manifest.get("self_quantized", []) + [LM_HEAD]
+        manifest["lm_head_config_group"] = _lm_head_group(group)
     manifest_file = out_path.with_suffix(".json")  # same stem as the tensors
     with open(manifest_file, "w") as fh:
         json.dump(manifest, fh, indent=1)
@@ -358,6 +414,8 @@ def apply_config_group(model_path: str | None, hf_quant_config: dict | None) -> 
     manifest = _read_manifest(path)
     groups = hf_quant_config.setdefault("config_groups", {})
     groups[GROUP_NAME] = manifest["config_group"]
+    if "lm_head_config_group" in manifest:
+        groups[LM_HEAD_GROUP_NAME] = manifest["lm_head_config_group"]
     # The conversion lists the swapped modules under ``ignore`` (they were
     # unquantized BF16); the ignore check runs before target matching in
     # vLLM's compressed-tensors config, so they must leave it.
@@ -390,6 +448,11 @@ def main() -> None:
         action="store_true",
         help="also quantize the BF16 KDA projections",
     )
+    ap.add_argument(
+        "--self-quant-lm-head",
+        action="store_true",
+        help="also quantize the BF16 lm_head (per-channel scales)",
+    )
     args = ap.parse_args()
     build(
         args.native,
@@ -397,6 +460,7 @@ def main() -> None:
         args.out,
         args.skip_layer,
         self_quant_kda=args.self_quant_kda,
+        self_quant_lm_head=args.self_quant_lm_head,
     )
 
 

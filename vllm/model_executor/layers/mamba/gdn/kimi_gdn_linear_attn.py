@@ -292,6 +292,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         prefix: str = "",
         fuse_gate_a: bool = False,
         beta_block_rows: int | None = None,
+        reduce_results: bool = True,
     ) -> None:
         super().__init__(config, vllm_config, prefix)
 
@@ -455,6 +456,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             bias=False,
             quant_config=self.quant_config,
             prefix=f"{prefix}.o_proj",
+            reduce_results=reduce_results,
         )
 
         compilation_config = vllm_config.compilation_config

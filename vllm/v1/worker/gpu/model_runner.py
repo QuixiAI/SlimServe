@@ -85,6 +85,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
     ModelCudaGraphManager,
     get_uniform_token_count,
+    uniform_token_count_with_prefills,
 )
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.eplb_utils import EPLBController, step_eplb_after
@@ -1077,6 +1078,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Get the number of draft tokens for each request.
         draft_tokens = scheduler_output.scheduled_spec_decode_tokens
         num_draft_tokens_per_req = None
+        draft_placeholder_mask = None
         if not draft_tokens:
             # No draft token scheduled (common case).
             total_num_draft_tokens = 0
@@ -1107,6 +1109,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cu_num_logits_np[0] = 0
             np.cumsum(num_logits, out=cu_num_logits_np[1:])
             cu_num_logits = async_copy_to_gpu(cu_num_logits_np, device=self.device)
+
+            # The scheduler pads a newcomer whose prompt has one token left to
+            # the batch's speculative width so the step keeps its full
+            # cudagraph, but the speculator has never drafted for that slot:
+            # draft_tokens holds zeros and any draft logits are stale. Mark
+            # those rows so the sampler rejects them all and draws only the
+            # bonus token from the target distribution.
+            placeholder_reqs = (num_draft_tokens_per_req > 0) & ~(
+                self.req_states.has_draft_tokens[idx_mapping_np]
+            )
+            if placeholder_reqs.any():
+                mask_np = np.zeros(total_num_logits, dtype=bool)
+                for req_idx in np.flatnonzero(placeholder_reqs):
+                    mask_np[
+                        cu_num_logits_np[req_idx] + 1 : cu_num_logits_np[req_idx + 1]
+                    ] = True
+                draft_placeholder_mask = async_copy_to_gpu(mask_np, device=self.device)
 
             max_expand_len = self.decode_query_len
             expanded_idx_mapping, expanded_local_pos = expand_idx_mapping(
@@ -1215,6 +1234,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_tokens_after_padding=num_tokens_after_padding,
             num_draft_tokens=total_num_draft_tokens,
             num_draft_tokens_per_req=num_draft_tokens_per_req,
+            draft_placeholder_mask=draft_placeholder_mask,
             query_start_loc=query_start_loc,
             query_start_loc_np=query_start_loc_np,
             seq_lens=seq_lens,
@@ -1596,22 +1616,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         max_query_len = max(scheduler_output.num_scheduled_tokens.values())
         uniform_tok_count = get_uniform_token_count(num_reqs, num_toks, max_query_len)
         if uniform_tok_count is not None and not dummy_run:
-            # Shape alone cannot distinguish a decode batch from one that
-            # contains mid-prefill requests: a fresh 1-token prompt, or a
-            # prompt/tail chunk exactly as wide as a (spec-)decode step,
-            # produces the same token counts. FULL decode graphs replay
-            # capture-time decode kernels, which read sampled-token and
-            # state slots such a request has never written (garbage logits;
-            # occasionally an illegal memory access). Keep those batches on
-            # the non-uniform path.
-            computed_prefill = self.req_states.num_computed_prefill_tokens
-            prefill_len = self.req_states.prefill_len.np
-            idx_of = self.req_states.req_id_to_index
-            for req_id in scheduler_output.num_scheduled_tokens:
-                idx = idx_of[req_id]
-                if computed_prefill[idx] < prefill_len[idx]:
-                    uniform_tok_count = None
-                    break
+            # Mid-prefill requests keep the batch off the FULL decode graph,
+            # except the prompt tail of a prefix-cache replay (see the helper).
+            uniform_tok_count = uniform_token_count_with_prefills(
+                uniform_tok_count,
+                scheduler_output.num_scheduled_tokens,
+                self.req_states.req_id_to_index,
+                self.req_states.num_computed_prefill_tokens,
+                self.req_states.prefill_len.np,
+            )
 
         num_active_loras = 0
         if self.lora_config:
@@ -2026,6 +2039,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     value=-1,
                 )
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+            self.req_states.has_draft_tokens[input_batch.idx_mapping_np] = True
 
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does

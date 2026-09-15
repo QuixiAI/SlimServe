@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """QuixiCore FP8-weight decode GEMM (csrc/quixicore/tm_cuda/fp8_decode_gemm.cuh):
-x (bf16, M <= 16) @ dequant(W)^T with e4m3 weights and 128x128 fp32 block scales,
-where dequant(W) = bf16(scale * W); and the block-FP8 custom op around it."""
+x (bf16, M <= 16) @ dequant(W)^T with e4m3 weights and 128x128 fp32 block scales
+or one fp32 scale per row, where dequant(W) = bf16(scale * W); and the
+block-FP8 custom op around it."""
 
 import pytest
 import torch
@@ -62,6 +63,37 @@ def test_matches_dequantized_reference(n: int, k: int, m: int) -> None:
     assert ((out.float() - ref).abs() / scale).max().item() < 2**-7
 
 
+def channel_quant(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    amax = w.float().abs().amax(dim=1, keepdim=True).clamp(min=1e-12)
+    s = amax / 448.0
+    q = (w.float() / s).clamp(-448, 448)
+    return q.contiguous().to(torch.float8_e4m3fn), s.reshape(-1).contiguous()
+
+
+@pytest.mark.parametrize(
+    "n,k",
+    [
+        (4096, 1536),  # a dense shape, the 32-row config
+        (1024, 4096),  # the 8-row config
+        (38720, 4096),  # GLM-5.3-Flash's TP4 vocabulary shard (the LM head)
+    ],
+)
+@pytest.mark.parametrize("m", [1, 4, 16])
+def test_channel_scales_match_dequantized_reference(n: int, k: int, m: int) -> None:
+    torch.manual_seed(n + k + m)
+    w = (torch.randn(n, k, device=DEV) * 0.02).to(torch.bfloat16)
+    q, s = channel_quant(w)
+    x = torch.randn(m, k, device=DEV, dtype=torch.bfloat16)
+    ref = x.float() @ (q.float() * s[:, None]).to(torch.bfloat16).float().t()
+    out = quixicore_ops.decode_gemm_fp8(x, q, s)
+    assert out.shape == (m, n) and out.dtype == torch.bfloat16
+    scale = ref.abs().amax(dim=1, keepdim=True).clamp(min=1e-6)
+    assert ((out.float() - ref).abs() / scale).max().item() < 2**-7
+    # The [N, 1] layout compressed-tensors keeps for channel scales is the same.
+    out2 = quixicore_ops.decode_gemm_fp8(x, q, s.reshape(n, 1))
+    assert torch.equal(out, out2)
+
+
 def test_bias_and_fp32_output() -> None:
     torch.manual_seed(0)
     n, k, m = 4096, 1536, 5
@@ -101,6 +133,8 @@ def test_rejects_unsupported_shapes_and_dtypes() -> None:
         )
     with pytest.raises(RuntimeError):  # wrong scale shape
         quixicore_ops.decode_gemm_fp8(x, q, s[:, :1].contiguous())
+    with pytest.raises(RuntimeError):  # a per-row scale short of a row
+        quixicore_ops.decode_gemm_fp8(x, q, torch.ones(4095, device=DEV))
     with pytest.raises(RuntimeError):  # bf16 weight
         quixicore_ops.decode_gemm_fp8(x, w, s)
     with pytest.raises(RuntimeError):  # N below the gate
@@ -138,3 +172,32 @@ def test_block_fp8_op_kernel_and_cutlass_branches() -> None:
     assert (
         maybe_quixicore_fp8_block_linear(x3, w, s, None) is None
     )  # bf16 weight: not ours
+
+
+def test_channel_fp8_op_kernel_and_cutlass_branches() -> None:
+    """The channel-scale op takes the kernel at M <= 16 (from the scheme's
+    [K, N] weight view) and the per-token quant + CUTLASS path above."""
+    from vllm.model_executor.layers.utils import (
+        _cutlass_channel_fp8_linear,
+        maybe_quixicore_fp8_channel_linear,
+    )
+
+    torch.manual_seed(2)
+    n, k = 4096, 1536
+    w = (torch.randn(n, k, device=DEV) * 0.02).to(torch.bfloat16)
+    q, s = channel_quant(w)
+    scheme_weight, scheme_scale = q.t(), s.reshape(n, 1)  # as the scheme keeps them
+    wd = (q.float() * s[:, None]).to(torch.bfloat16).float()
+    for m in (1, 16, 17, 200):
+        x = torch.randn(m, k, device=DEV, dtype=torch.bfloat16)
+        out = maybe_quixicore_fp8_channel_linear(x, scheme_weight, scheme_scale, None)
+        assert out is not None and out.shape == (m, n)
+        ref = x.float() @ wd.t()
+        scale = ref.abs().amax(dim=1, keepdim=True).clamp(min=1e-6)
+        if m <= 16:
+            assert ((out.float() - ref).abs() / scale).max().item() < 2**-7
+        else:
+            assert torch.equal(out, _cutlass_channel_fp8_linear(x, q, s.reshape(n, 1)))
+            # W8A8: the per-token e4m3 activations round at 2^-4.
+            assert ((out.float() - ref).abs() / scale).max().item() < 2**-4
+    assert maybe_quixicore_fp8_channel_linear(x, w.t(), scheme_scale, None) is None

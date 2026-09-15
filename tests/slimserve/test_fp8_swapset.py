@@ -124,3 +124,66 @@ def test_manifest_selected_by_environment_stem(tmp_path, monkeypatch):
     )
     monkeypatch.setenv(fp8_swapset.SWAPSET_ENV, "missing")
     assert fp8_swapset.manifest_path(str(tmp_path)) is None
+
+
+def test_channel_quant_round_trip_and_row_scales():
+    w = torch.randn(6, 256) * torch.tensor(
+        [[1.0], [10.0], [0.1], [3.0], [100.0], [1.0]]
+    )
+    q, scale = fp8_swapset.quantize_channel(w)
+    assert q.dtype == torch.float8_e4m3fn and q.shape == w.shape
+    assert scale.shape == (6, 1) and scale.dtype == torch.float32
+    assert torch.allclose(scale[:, 0], w.abs().amax(dim=1) / fp8_swapset.FP8_MAX)
+    d = q.float() * scale
+    assert ((d - w).abs() / w.abs().amax(dim=1, keepdim=True)).max() < 1 / 16
+
+
+def test_lm_head_group_targets_the_head_with_channel_scales(tmp_path):
+    template = {
+        "format": "float-quantized",
+        "weights": {
+            "strategy": "block",
+            "block_structure": [128, 128],
+            "group_size": None,
+            "num_bits": 8,
+            "type": "float",
+        },
+        "input_activations": {
+            "strategy": "group",
+            "group_size": 128,
+            "dynamic": True,
+            "num_bits": 8,
+            "type": "float",
+        },
+        "targets": ["re:.*\\.layers\\.(0)\\.mlp\\.down_proj$"],
+    }
+    group = fp8_swapset._lm_head_group(template)
+    assert group["targets"] == [fp8_swapset.LM_HEAD_TARGET]
+    assert (
+        group["weights"]["strategy"] == "channel"
+        and group["weights"]["block_structure"] is None
+    )
+    assert (
+        group["input_activations"]["strategy"] == "token"
+        and group["input_activations"]["dynamic"]
+    )
+    assert template["weights"]["strategy"] == "block"  # the template is not modified
+    manifest = {
+        "file": fp8_swapset.SWAPSET_FILE,
+        "tensors": ["lm_head.weight", "lm_head.weight_scale"],
+        "modules": ["lm_head"],
+        "config_group": template,
+        "lm_head_config_group": group,
+    }
+    (tmp_path / fp8_swapset.MANIFEST_FILE).write_text(json.dumps(manifest))
+    cfg = {
+        "quant_method": "compressed-tensors",
+        "config_groups": {},
+        "ignore": ["lm_head", "model.visual.blocks.0.attn.qkv"],
+    }
+    assert fp8_swapset.apply_config_group(str(tmp_path), cfg)
+    assert cfg["config_groups"][fp8_swapset.LM_HEAD_GROUP_NAME]["targets"] == [
+        fp8_swapset.LM_HEAD_TARGET
+    ]
+    assert cfg["config_groups"][fp8_swapset.GROUP_NAME] == template
+    assert cfg["ignore"] == ["model.visual.blocks.0.attn.qkv"]

@@ -368,6 +368,11 @@ class SpeculativeConfig:
                 {
                     "n_predict": hf_config.num_nextn_predict_layers,
                     "architectures": ["Glm5NextMTPModel"],
+                    # The draft config's hc_mult is the number of residual
+                    # streams the MTP input carries (the speculator widens
+                    # its hidden buffer by it). GLM's head takes the
+                    # contracted post-norm state, one stream, unlike DSV4.
+                    "hc_mult": 1,
                     # Validate GLM's pooled-tail state before enabling the
                     # ordinary DeepSeek cross-draft index-sharing optimization.
                     "index_share_for_mtp_iteration": False,
