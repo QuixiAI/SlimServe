@@ -28,15 +28,24 @@
 #include <array>
 #include <atomic>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <optional>
 #include <string>
+#include <vector>
 #include <unordered_map>
 #include <unordered_set>
 
 #include <objc/runtime.h>
 
 #include "tk_launch.h"
+
+// W25: the iq2_xxs codebook tables (the generated llama.cpp tables the CUDA
+// kernels stage into __constant__ memory) for the host-side build of the
+// texture-LUT expert kernels' lookup textures.
+#define __constant__ static const
+#include "../quant/quant_tables.cuh"
+#undef __constant__
 
 namespace {
 
@@ -165,6 +174,169 @@ id<MTLComputePipelineState> pipeline(id<MTLDevice> device, NSString* name) {
   return pso;
 }
 
+// ---- W25 texture-buffer lookup tables ---------------------------------------
+//
+// The texture-LUT iq2_xxs expert kernels read their codebook through the
+// texture unit (see qgemv.metal, qgemv_moe_mr_iq2_xxs_swiglu_tex). The
+// tables are built once on the CPU from the generated codebook, uploaded
+// to a shared MTLBuffer and wrapped as a texture_buffer; TorchEncoder::
+// texture(key, slot) binds them. Keys:
+//   iq2xxs_mag     256 x RGBA32Uint   8 unsigned magnitudes (packed halfs)
+std::unordered_map<std::string, id<MTLTexture>> g_lut_textures;
+
+static uint16_t qc_half_bits(float f) { return c10::Half(f).x; }
+
+id<MTLTexture> lut_texture(id<MTLDevice> device, const std::string& key) {
+  auto it = g_lut_textures.find(key);
+  if (it != g_lut_textures.end()) return it->second;
+  std::vector<uint8_t> bytes;
+  MTLPixelFormat fmt;
+  NSUInteger width;
+  if (key == "iq2xxs_mag") {
+    width = 256;
+    bytes.assign(width * 16, 0);
+    for (int code = 0; code < 256; ++code) {
+      const unsigned long long gv = tmq::iq2xxs_grid[code];
+      for (int j = 0; j < 8; ++j) {
+        const uint16_t h =
+            qc_half_bits(static_cast<float>((gv >> (8 * j)) & 0xffULL));
+        std::memcpy(bytes.data() + code * 16 + 2 * j, &h, 2);
+      }
+    }
+    fmt = MTLPixelFormatRGBA32Uint;
+  } else {
+    TORCH_CHECK(false, "quixicore: unknown lookup texture ", key);
+  }
+  id<MTLBuffer> buf = [device newBufferWithBytes:bytes.data()
+                                          length:bytes.size()
+                                         options:MTLResourceStorageModeShared];
+  TORCH_CHECK(buf != nil, "quixicore: LUT buffer allocation failed for ", key);
+  MTLTextureDescriptor* td = [MTLTextureDescriptor
+      textureBufferDescriptorWithPixelFormat:fmt
+                                       width:width
+                             resourceOptions:MTLResourceStorageModeShared
+                                       usage:MTLTextureUsageShaderRead];
+  id<MTLTexture> tex = [buf newTextureWithDescriptor:td
+                                              offset:0
+                                         bytesPerRow:bytes.size()];
+  TORCH_CHECK(tex != nil, "quixicore: LUT texture creation failed for ", key);
+  g_lut_textures[key] = tex;
+  return tex;
+}
+
+// Whether the loaded metallib exposes `name`. The M5 tensor-ops GEMMs
+// (qgemm_sm_t*, MetalPerformancePrimitives matmul2d) only exist when the
+// metallib was compiled with -std=metal4.0 AND the host GPU can load a
+// Metal-4 library; on a macOS 15 / M1-M4 box the library is built with
+// metal3.1 and the __HAVE_TENSOR__ block is compiled out, so every
+// selector that prefers those variants must ask first.
+bool has_kernel(const std::string& name) {
+  @autoreleasepool {
+    id<MTLCommandBuffer> cb = torch::mps::get_command_buffer();
+    id<MTLDevice> dev = cb.device;
+    if (g_library == nil) {
+      TORCH_CHECK(!g_metallib_path.empty(),
+                  "quixicore: metallib path unset; the Python wrapper sets it "
+                  "at import.");
+      NSError* err = nil;
+      NSString* p = [NSString stringWithUTF8String:g_metallib_path.c_str()];
+      g_library = [dev newLibraryWithURL:[NSURL fileURLWithPath:p] error:&err];
+      TORCH_CHECK(g_library != nil, "quixicore: failed to load metallib at ",
+                  g_metallib_path, ": ",
+                  err ? err.localizedDescription.UTF8String : "(no error)");
+    }
+    id<MTLFunction> fn =
+        [g_library newFunctionWithName:[NSString stringWithUTF8String:name.c_str()]];
+    return fn != nil;
+  }
+}
+
+// Cached once per process: the tensor-ops K-quant GEMM family is present.
+bool has_tensor_qgemm() {
+  static int cached = -1;
+  if (cached < 0) cached = has_kernel("qgemm_sm_t2_q4_K") ? 1 : 0;
+  return cached == 1;
+}
+
+// Pre-tensor-ops selection for the K-quant verify band (the rested winners
+// before the M5 kernels landed): paired-plane BK=64 simdgroup for
+// q4_K/q5_K (8-warp above 8192 rows/K), span path for q6_K.
+int qgemm_sm_simdgroup_variant(const std::string& fmt, int rows, int K) {
+  if (fmt == "q4_K" || fmt == "q5_K") return (rows > 8192 || K > 8192) ? 12 : 11;
+  if (fmt == "q6_K") return 10;
+  return 9;
+}
+
+// ---- concurrent regions ---------------------------------------------------
+//
+// Between qc_concurrent_begin() and qc_concurrent_end() every quixicore op
+// is encoded into ONE compute encoder opened with MTLDispatchTypeConcurrent
+// (the llama.cpp ggml-metal / ds4 batch-encoder scheme): dispatches run
+// without the implicit serialization of encoder boundaries, and a
+// MTLBarrierScopeBuffers memory barrier is inserted only when an op's
+// buffers conflict with those of the ops since the last barrier (reads a
+// pending write, or writes a pending read/write - llama.cpp's mem_ranges
+// rule), so independent launches (shared-expert down GEMV beside the
+// routed w13 walk, the KDA in_proj shards) overlap on the GPU. Torch ops
+// must not run inside a region (torch would open a second encoder on the
+// same command buffer); the Python side brackets quixicore-only spans.
+struct QcRange {
+  id<MTLBuffer> buf;
+  NSUInteger off;   // first byte touched (buffer offset)
+  NSUInteger len;   // byte span from off (conservative envelope)
+  // 2-D views (rows > 1, unit column stride): the exact footprint is `rows`
+  // rows of `row_bytes` bytes, `row_stride` bytes apart, so two column
+  // slices of one [M, total] tensor (the KDA in_proj shards) are disjoint.
+  NSUInteger rows;
+  NSUInteger row_stride;
+  NSUInteger row_bytes;
+};
+static id<MTLComputeCommandEncoder> g_cc_enc = nil;
+static id<MTLCommandBuffer> g_cc_cb = nil;
+static bool g_cc_active = false;
+static std::vector<QcRange> g_cc_src, g_cc_dst;   // since the last barrier
+static std::vector<QcRange> g_cur_src, g_cur_dst; // the op being encoded
+static int64_t g_cc_dispatches = 0, g_cc_barriers = 0, g_cc_regions = 0;
+
+static inline bool qc_ranges_overlap(const QcRange& a, const QcRange& b) {
+  if (a.buf != b.buf) return false;
+  if (!(a.off < b.off + b.len && b.off < a.off + a.len)) return false;
+  // Envelopes overlap; refine for two 2-D views on the same row grid
+  // (same row stride, MPS storages start at buffer offset 0): they touch
+  // the same bytes only if both their row and column intervals intersect.
+  if (a.rows > 1 && b.rows > 1 && a.row_stride == b.row_stride &&
+      a.row_stride > 0) {
+    const NSUInteger S = a.row_stride;
+    const NSUInteger ca0 = a.off % S, cb0 = b.off % S;
+    if (ca0 + a.row_bytes <= S && cb0 + b.row_bytes <= S) {
+      const NSUInteger ra0 = a.off / S, rb0 = b.off / S;
+      const bool rows_meet = ra0 < rb0 + b.rows && rb0 < ra0 + a.rows;
+      const bool cols_meet = ca0 < cb0 + b.row_bytes && cb0 < ca0 + a.row_bytes;
+      return rows_meet && cols_meet;
+    }
+  }
+  return true;
+}
+
+// Byte footprint of a (possibly strided) tensor view from its offset.
+static inline QcRange qc_range_of(const at::Tensor& t) {
+  QcRange r{mtl_buffer(t), static_cast<NSUInteger>(byte_offset(t)), 0, 1, 0, 0};
+  if (t.numel() > 0) {
+    int64_t last = 0;
+    for (int64_t d = 0; d < t.dim(); ++d)
+      if (t.size(d) > 1) last += (t.size(d) - 1) * std::abs(t.stride(d));
+    r.len = static_cast<NSUInteger>((last + 1) * t.element_size());
+    r.row_bytes = r.len;
+    if (t.dim() == 2 && t.size(0) > 1 && t.stride(1) == 1 &&
+        t.stride(0) >= t.size(1)) {
+      r.rows = static_cast<NSUInteger>(t.size(0));
+      r.row_stride = static_cast<NSUInteger>(t.stride(0) * t.element_size());
+      r.row_bytes = static_cast<NSUInteger>(t.size(1) * t.element_size());
+    }
+  }
+  return r;
+}
+
 // ---- the encoder adapter tk_launch.h drives ------------------------------
 struct TorchEncoder {
   using in_t = const at::Tensor&;
@@ -180,29 +352,82 @@ struct TorchEncoder {
   }
   void in(const at::Tensor& t, int i) {
     [enc setBuffer:mtl_buffer(t) offset:byte_offset(t) atIndex:i];
+    if (g_cc_active) g_cur_src.push_back(qc_range_of(t));
   }
   void out(const at::Tensor& t, int i) {
     [enc setBuffer:mtl_buffer(t) offset:byte_offset(t) atIndex:i];
+    if (g_cc_active) g_cur_dst.push_back(qc_range_of(t));
+  }
+  // Read-only lookup texture (built once by lut_texture; never written by
+  // a dispatch, so it takes no part in the concurrent-region tracking).
+  void texture(const std::string& key, int i) {
+    [enc setTexture:lut_texture(device, key) atIndex:i];
   }
   template <class T>
   void bytes(const T& v, int i) {
     [enc setBytes:&v length:sizeof(T) atIndex:i];
   }
   void dispatch(int gx, int gy, int gz, int tx, int ty, int tz) {
+    if (g_cc_active) concurrent_fence();
     [enc dispatchThreadgroups:MTLSizeMake(gx, gy, gz)
         threadsPerThreadgroup:MTLSizeMake(tx, ty, tz)];
+  }
+  // Barrier only when this op conflicts with the ops since the last one.
+  void concurrent_fence() {
+    bool conflict = false;
+    for (const auto& r : g_cur_src) {
+      for (const auto& d : g_cc_dst)
+        if (qc_ranges_overlap(r, d)) { conflict = true; break; }
+      if (conflict) break;
+    }
+    if (!conflict) {
+      for (const auto& r : g_cur_dst) {
+        for (const auto& d : g_cc_dst)
+          if (qc_ranges_overlap(r, d)) { conflict = true; break; }
+        if (conflict) break;
+        for (const auto& s : g_cc_src)
+          if (qc_ranges_overlap(r, s)) { conflict = true; break; }
+        if (conflict) break;
+      }
+    }
+    if (conflict) {
+      [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+      g_cc_src.clear();
+      g_cc_dst.clear();
+      ++g_cc_barriers;
+    }
+    g_cc_src.insert(g_cc_src.end(), g_cur_src.begin(), g_cur_src.end());
+    g_cc_dst.insert(g_cc_dst.end(), g_cur_dst.begin(), g_cur_dst.end());
+    g_cur_src.clear();
+    g_cur_dst.clear();
+    ++g_cc_dispatches;
   }
 };
 
 // Encode onto torch's current MPS command buffer. Torch commits it at the next
 // stream sync, so the work is ordered against surrounding torch ops without an
-// explicit wait here.
+// explicit wait here. Inside a concurrent region the op joins the region's
+// encoder (labelled as a debug group) instead of opening its own.
+//
 template <class F>
 void encode(const char* label, F fn) {
   @autoreleasepool {
     id<MTLCommandBuffer> cb = torch::mps::get_command_buffer();
     dispatch_queue_t q = torch::mps::get_dispatch_queue();
     id<MTLDevice> dev = cb.device;
+    if (g_cc_active) {
+      TORCH_CHECK(cb == g_cc_cb,
+                  "quixicore: torch committed the command buffer inside a "
+                  "concurrent region (a torch op ran between "
+                  "qc_concurrent_begin and qc_concurrent_end)");
+      dispatch_sync(q, ^{
+        [g_cc_enc pushDebugGroup:[NSString stringWithUTF8String:label]];
+        TorchEncoder e{g_cc_enc, dev};
+        fn(e);
+        [g_cc_enc popDebugGroup];
+      });
+      return;
+    }
     dispatch_sync(q, ^{
       id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
       // Names the encoder in Metal System Trace GPU intervals.
@@ -212,6 +437,61 @@ void encode(const char* label, F fn) {
       [enc endEncoding];
     });
   }
+}
+
+void qc_concurrent_begin() {
+  TORCH_CHECK(!g_cc_active, "quixicore: concurrent region already open");
+  @autoreleasepool {
+    id<MTLCommandBuffer> cb = torch::mps::get_command_buffer();
+    dispatch_queue_t q = torch::mps::get_dispatch_queue();
+    dispatch_sync(q, ^{
+      g_cc_enc = [cb computeCommandEncoderWithDispatchType:
+                         MTLDispatchTypeConcurrent];
+      g_cc_enc.label = @"qc_concurrent";
+    });
+    g_cc_cb = cb;
+  }
+  g_cc_src.clear();
+  g_cc_dst.clear();
+  g_cur_src.clear();
+  g_cur_dst.clear();
+  g_cc_active = true;
+  ++g_cc_regions;
+}
+
+// Explicit barrier: every dispatch encoded after it waits for every one
+// before it (used to close a routing level so the next ops overlap).
+void qc_concurrent_barrier() {
+  if (!g_cc_active) return;
+  @autoreleasepool {
+    dispatch_queue_t q = torch::mps::get_dispatch_queue();
+    dispatch_sync(q, ^{
+      [g_cc_enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    });
+  }
+  g_cc_src.clear();
+  g_cc_dst.clear();
+  ++g_cc_barriers;
+}
+
+void qc_concurrent_end() {
+  if (!g_cc_active) return;
+  @autoreleasepool {
+    dispatch_queue_t q = torch::mps::get_dispatch_queue();
+    dispatch_sync(q, ^{
+      [g_cc_enc endEncoding];
+    });
+  }
+  g_cc_enc = nil;
+  g_cc_cb = nil;
+  g_cc_active = false;
+}
+
+bool qc_concurrent_active() { return g_cc_active; }
+
+// (regions opened, dispatches encoded inside regions, barriers inserted)
+std::vector<int64_t> qc_concurrent_stats() {
+  return {g_cc_regions, g_cc_dispatches, g_cc_barriers};
 }
 
 template <class F>
@@ -667,7 +947,7 @@ void emit_matvec(TorchEncoder& e, const Proj& p, const at::Tensor& x,
     int variant = 9;
     if (K % 64 == 0) {
       const bool kquant = fmt == "q4_K" || fmt == "q5_K" || fmt == "q6_K";
-      if (kquant && p.rows % 32 == 0) {
+      if (kquant && p.rows % 32 == 0 && has_tensor_qgemm()) {
         // mirror the eager route (quixicore/ops.py): tensor-ops kernels,
         // per-shape 15/16/17 selection (the rested-A/B winner)
         if (p.rows % 64 == 0 && p.rows >= 16384) {
@@ -1806,7 +2086,8 @@ at::Tensor dflash_sample_greedy(const at::Tensor& hidden,
   auto partials = at::empty({4, N, 32}, opt.dtype(at::kFloat));
   auto logits = at::empty({m, N}, opt);
   auto tokens = at::empty({m}, opt.dtype(at::kLong));
-  const int variant = 16;  // wide-N 8-warp tensor kernel
+  // wide-N 8-warp tensor kernel; simdgroup paired-plane fallback without it
+  const int variant = has_tensor_qgemm() ? 16 : qgemm_sm_simdgroup_variant(fmt, N, K);
   encode([&](TorchEncoder& e) {
     tk::launch_muse_xpose32(e, xp, hidden, K, m);
     tk::launch_qgemm_sm(e, partials, lm_w, xp, N, K, variant, fmt);
@@ -3251,17 +3532,120 @@ const char* ggml_type_to_format(int64_t quant_type) {
 }
 
 // Weight-only GEMV: one row of output per simdgroup. `w` holds raw GGUF blocks.
-at::Tensor ggml_mul_mat_vec_a8(const at::Tensor& w, const at::Tensor& x,
-                               int64_t quant_type, int64_t row) {
+// Gate|up pair GEMV with the SwiGLU epilogue fused (q8_0 only, 1..4 rows):
+// x (M, K), w the merged gate|up q8_0 weight with `row` = N rows -> (M, N/2)
+// activation. Per-row sums are bit-identical to ggml_mul_mat_vec_a8's q8_0
+// NR route (NSG = 4) and the epilogue is qc_swiglu's oai_form-0 chain, so
+// the result matches `qc_swiglu(ggml_mul_mat_vec_a8(...))` bit for bit
+// while saving a dispatch and the (M, N) intermediate per call.
+at::Tensor ggml_mul_mat_vec_a8_pair_swiglu(
+    const at::Tensor& w, const at::Tensor& x, int64_t row,
+    const std::optional<double>& clamp_limit) {
   check_mps(w, "w");
   check_mps(x, "x");
   const int N = static_cast<int>(row);
   const int K = static_cast<int>(x.size(-1));
+  const int M = static_cast<int>(x.size(0));
+  const std::string type_name = activation_type_name(x);
+  TORCH_CHECK(x.dim() == 2 && x.is_contiguous(), "x must be contiguous (M, K)");
+  TORCH_CHECK(M >= 1 && M <= 4 && N % 4 == 0 && K % 32 == 0 && K > 512 &&
+                  (type_name == "float16" || type_name == "bfloat16"),
+              "pair_swiglu: needs 1 <= M <= 4, N % 4 == 0, K % 32 == 0, "
+              "K > 512, f16/bf16 activations");
+  TORCH_CHECK(w.dim() == 2 && w.size(0) == N && w.size(1) == (K / 32) * 34,
+              "pair_swiglu: w must be the (N, K/32*34) q8_0 gate|up weight");
+  at::Tensor out = ring_out("gemv_pair_out", {x.size(0), N / 2}, x.options());
+  encode("qc_mmvq_q8_pair_swiglu", [&](TorchEncoder& e) {
+    tk::launch_qgemv_q8_0_nr_pair_swiglu(
+        e, out, w, x, N, K, M, clamp_limit.has_value() ? 1 : 0,
+        clamp_limit.has_value() ? static_cast<float>(*clamp_limit) : 0.0f,
+        type_name);
+  });
+  return out;
+}
 
-  at::Tensor out = ring_out("gemv_out", {x.size(0), N}, x.options());
+// Two independent q8_0 GEMVs in one dispatch (qgemv_dual): (w0 x0, w1 x1)
+// with the same K and 1 <= M <= 4 rows. Each output is bit-identical to
+// ggml_mul_mat_vec_a8's generic walk on that problem (the K <= 512 path
+// the GLM-5.3-Flash KDA f_b / g_b projections take).
+std::vector<at::Tensor> ggml_mul_mat_vec_a8_dual(
+    const at::Tensor& w0, const at::Tensor& x0, const at::Tensor& w1,
+    const at::Tensor& x1, int64_t quant_type, int64_t row0, int64_t row1) {
+  check_mps(w0, "w0");
+  check_mps(x0, "x0");
+  check_mps(w1, "w1");
+  check_mps(x1, "x1");
+  const int N0 = static_cast<int>(row0);
+  const int N1 = static_cast<int>(row1);
+  const int K = static_cast<int>(x0.size(-1));
+  const int M = static_cast<int>(x0.size(0));
+  const std::string fmt = ggml_type_to_format(quant_type);
+  const std::string type_name = activation_type_name(x0);
+  TORCH_CHECK(fmt == "q8_0", "dual GEMV supports q8_0 only, got ", fmt);
+  TORCH_CHECK(x0.dim() == 2 && x1.dim() == 2 && x0.is_contiguous() &&
+                  x1.is_contiguous() && x1.size(0) == M && x1.size(1) == K &&
+                  x1.scalar_type() == x0.scalar_type(),
+              "dual GEMV: x0 and x1 must be contiguous (M, K) of one dtype");
+  TORCH_CHECK(M >= 1 && M <= 4 && K % 32 == 0 &&
+                  (type_name == "float16" || type_name == "bfloat16"),
+              "dual GEMV: needs 1 <= M <= 4, K % 32 == 0, f16/bf16");
+  at::Tensor d0 = ring_out("gemv_dual_out0", {x0.size(0), N0}, x0.options());
+  at::Tensor d1 = ring_out("gemv_dual_out1", {x1.size(0), N1}, x1.options());
+  encode("qc_mmvq_dual", [&](TorchEncoder& e) {
+    tk::launch_qgemv_dual(e, d0, w0, x0, d1, w1, x1, N0, N1, K, M, fmt,
+                          type_name);
+  });
+  return {d0, d1};
+}
+
+at::Tensor ggml_mul_mat_vec_a8(const at::Tensor& w, const at::Tensor& x,
+                               int64_t quant_type, int64_t row,
+                               const std::optional<at::Tensor>& out_opt) {
+  check_mps(w, "w");
+  check_mps(x, "x");
+  const int N = static_cast<int>(row);
+  const int K = static_cast<int>(x.size(-1));
+  const int batch = static_cast<int>(x.size(0));
+
+  // Optional caller output: a column slice of a wider [batch, total] tensor
+  // lets the KDA in_proj's hetero-quant shards (q|k q4_K, v|f|g|beta q8_0)
+  // land side by side without the torch.cat. The batch-1 kernels bind the
+  // selected row by byte offset, so any unit-stride row works; the q8_0 NR
+  // and q4_K NR batch kernels take the output row stride (LDD) and write
+  // the slice in place; every other multi-row kernel assumes a dense
+  // [rows, N] block, so a strided target computes into the ring and copies.
   const std::string fmt = ggml_type_to_format(quant_type);
   const std::string type_name = activation_type_name(x);
-  const int batch = static_cast<int>(x.size(0));
+  at::Tensor out;
+  at::Tensor final_out;
+  bool strided_direct = false;
+  if (out_opt.has_value()) {
+    final_out = *out_opt;
+    check_mps_strided(final_out, "out");
+    TORCH_CHECK(final_out.dim() == 2 && final_out.size(0) == batch &&
+                    final_out.size(1) == N && final_out.stride(1) == 1 &&
+                    final_out.scalar_type() == x.scalar_type(),
+                "out must be [batch, N] with unit column stride in the "
+                "activation dtype, got ",
+                final_out.sizes(), " strides ", final_out.strides());
+    if (batch > 1 && !final_out.is_contiguous()) {
+      strided_direct =
+          tk::q8_0_nr_mb_eligible(fmt, N, K, batch, type_name) ||
+          (fmt == "q4_K" && batch <= 8 &&
+           tk::q4k_nr_mm_route(fmt, N, K, 2, type_name));
+    }
+    out = (batch == 1 || final_out.is_contiguous() || strided_direct)
+              ? final_out
+              : ring_out("gemv_out", {x.size(0), N}, x.options());
+  } else {
+    out = ring_out("gemv_out", {x.size(0), N}, x.options());
+  }
+  const int ldd = strided_direct ? static_cast<int>(final_out.stride(0)) : -1;
+  // A torch copy inside a concurrent region would open a second encoder.
+  TORCH_CHECK(!(g_cc_active && final_out.defined() && !final_out.is_same(out)),
+              "ggml_mul_mat_vec_a8: strided output at batch > 1 needs a "
+              "torch copy on this route (", fmt, ", batch ", batch,
+              "), which is not allowed inside a concurrent region");
 
   // Verify/decode widths 2..8: one weight-stationary launch that reads each
   // weight block once for all rows. Formats limited to the instantiated mb
@@ -3275,10 +3659,22 @@ at::Tensor ggml_mul_mat_vec_a8(const at::Tensor& w, const at::Tensor& x,
       !(K <= 512 && fmt == "q8_0" && type_name == "float16");
   if (mb_ok) {
     auto input = x.contiguous();
-    encode("qc_mmvq_mb", [&](TorchEncoder& e) {
-      tk::launch_qgemv_mb(e, out, w, input, N, K, batch, fmt, type_name);
-    });
-    return out;
+    // q8_0 verify widths first: the llama.cpp-geometry multi-activation
+    // kernel (batch-1 NR numerics per row, ~2x the generic mb walk's
+    // bandwidth at the GLM-5.3-Flash shapes); falls through when the
+    // batch-1 NR route is off for this shape.
+    if (tk::q8_0_nr_mb_eligible(fmt, N, K, batch, type_name)) {
+      encode("qc_mmvq_q8_nr_mb", [&](TorchEncoder& e) {
+        tk::launch_qgemv_q8_0_nr_mb(e, out, w, input, N, K, batch, type_name,
+                                    ldd);
+      });
+    } else {
+      encode("qc_mmvq_mb", [&](TorchEncoder& e) {
+        tk::launch_qgemv_mb(e, out, w, input, N, K, batch, fmt, type_name);
+      });
+    }
+    if (final_out.defined() && !final_out.is_same(out)) final_out.copy_(out);
+    return final_out.defined() ? final_out : out;
   }
 
   // Multi-row blocks ride the weight-stationary qgemv_mm variants so the
@@ -3320,7 +3716,7 @@ at::Tensor ggml_mul_mat_vec_a8(const at::Tensor& w, const at::Tensor& x,
         const at::Tensor x_rows = x.narrow(0, b, chunk);
         const at::Tensor out_rows = out.narrow(0, b, chunk);
         tk::launch_qgemv_mm(e, out_rows, w, x_rows, N, K, chunk, fmt,
-                            type_name);
+                            type_name, ldd);
       } else {
         const at::Tensor x_row = x.select(0, b);
         const at::Tensor out_row = out.select(0, b);
@@ -3329,7 +3725,8 @@ at::Tensor ggml_mul_mat_vec_a8(const at::Tensor& w, const at::Tensor& x,
       b += chunk;
     }
   });
-  return out;
+  if (final_out.defined() && !final_out.is_same(out)) final_out.copy_(out);
+  return final_out.defined() ? final_out : out;
 }
 
 // Compressed-tensors FP8-per-channel W8A16 GEMV (the NVFP4 checkpoint's FP8
@@ -3573,7 +3970,7 @@ at::Tensor ggml_moe_a8_vec_sum(const at::Tensor& x, const at::Tensor& w,
                                const at::Tensor& topk_ids_in,
                                const at::Tensor& topk_w_in, int64_t top_k,
                                int64_t quant_type, int64_t row, int64_t tokens,
-                               const at::Tensor& out, bool soa) {
+                               const at::Tensor& out, bool soa, bool accumulate) {
   check_mps(w, "w");
   check_mps(x, "x");
   check_mps(topk_ids_in, "topk_ids");
@@ -3628,7 +4025,8 @@ at::Tensor ggml_moe_a8_vec_sum(const at::Tensor& x, const at::Tensor& w,
   encode("qc_moe_vec_mr_sum", [&](TorchEncoder& e) {
     tk::launch_qgemv_moe_mr_q2k_sum(e, out, w, input, topk_ids, topk_w, N, K,
                                     num_tokens, topk,
-                                    activation_type_name(input), soa);
+                                    activation_type_name(input), soa,
+                                    accumulate);
   });
   return out;
 }
@@ -3671,9 +4069,9 @@ at::Tensor ggml_moe_mm_id(const at::Tensor& x, const at::Tensor& w,
               "expert stack must be [E, row, K/256*", block_bytes, "] raw ",
               fmt, ", got ", w.sizes());
   const int E = static_cast<int>(w.size(0));
-  TORCH_CHECK(E <= 256,
-              "map0 runs one thread per expert in one threadgroup, E <= 256, "
-              "got ",
+  TORCH_CHECK(E <= 512,
+              "map0 runs one thread per expert in one threadgroup, E <= 512 "
+              "(QC_MOE_MAP0_MAX_E; DSV4 256, GLM-5.3-Flash 288), got ",
               E);
   TORCH_CHECK(top_k == 2 || top_k == 4 || top_k == 6 || top_k == 8,
               "qc_moe_mm_map0 is instantiated for top_k in {2,4,6,8}, got ",
@@ -3821,14 +4219,24 @@ void check_mhc_f32(const at::Tensor& t, const char* name) {
 
 constexpr int kMhcThreads = 256;
 
+// Optional fused RMSNorm weight for the mHC layer-input epilogue: [hidden]
+// in the activation dtype, contiguous.
+static void check_mhc_norm_weight(const std::optional<at::Tensor>& w,
+                                  const at::Tensor& residual, int64_t hidden) {
+  if (!w.has_value()) return;
+  check_mps_strided(*w, "norm_weight");
+  TORCH_CHECK(w->scalar_type() == residual.scalar_type() && w->dim() == 1 &&
+                  w->size(0) == hidden && w->is_contiguous(),
+              "norm_weight must be a contiguous [hidden] vector of the "
+              "activation dtype, got ", w->sizes(), " ", w->scalar_type());
+}
+
 std::tuple<at::Tensor, at::Tensor, at::Tensor> dsv4_mhc_pre(
     const at::Tensor& residual, const at::Tensor& fn,
     const at::Tensor& hc_scale, const at::Tensor& hc_base, double rms_eps,
     double pre_eps, double sinkhorn_eps, double post_multiplier,
     int64_t sinkhorn_repeat, const std::optional<at::Tensor>& norm_weight,
     double norm_eps) {
-  TORCH_CHECK(!norm_weight.has_value(),
-              "quixicore(metal): dsv4_mhc_pre norm fusion is not wired");
   check_mhc_activation(residual, "residual");
   check_mhc_f32(fn, "fn");
   check_mhc_f32(hc_scale, "hc_scale");
@@ -3839,6 +4247,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> dsv4_mhc_pre(
   const auto hidden = residual.size(2);
   TORCH_CHECK(fn.size(0) == 24 && fn.size(1) == 4 * hidden,
               "fn must be [24, 4*hidden], got ", fn.sizes());
+  check_mhc_norm_weight(norm_weight, residual, hidden);
+  const float f_norm_eps = static_cast<float>(norm_eps);
 
   auto opts_f32 = residual.options().dtype(at::kFloat);
   at::Tensor post = ring_out("mhc_post4", {tokens, 4}, opts_f32);
@@ -3875,7 +4285,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> dsv4_mhc_pre(
     }
   });
   encode("qc_dsv4_mhc_pre_fin", [&](TorchEncoder& e) {
-    e.pipeline("dsv4_mhc_pre_finalize_" + activation_type_name(residual));
+    e.pipeline((norm_weight ? "dsv4_mhc_pre_finalize_norm_"
+                            : "dsv4_mhc_pre_finalize_") +
+               activation_type_name(residual));
     e.in(residual, 0);
     e.in(scratch, 1);
     e.in(hc_scale, 2);
@@ -3889,6 +4301,10 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> dsv4_mhc_pre(
     e.bytes(f_sink, 10);
     e.bytes(f_mult, 11);
     e.bytes(repeat, 12);
+    if (norm_weight) {
+      e.in(*norm_weight, 13);
+      e.bytes(f_norm_eps, 14);
+    }
     e.dispatch(static_cast<int>(tokens), 1, 1, kMhcThreads, 1, 1);
   });
   return {post, comb, layer_input};
@@ -3903,9 +4319,6 @@ dsv4_mhc_fused_post_pre(const at::Tensor& x, const at::Tensor& residual,
                         double post_multiplier, int64_t sinkhorn_repeat,
                         const std::optional<at::Tensor>& norm_weight,
                         double norm_eps) {
-  TORCH_CHECK(!norm_weight.has_value(),
-              "quixicore(metal): dsv4_mhc_fused_post_pre norm fusion is not "
-              "wired");
   check_mhc_activation(x, "x");
   check_mhc_activation(residual, "residual");
   check_mhc_f32(post_mix, "post_mix");
@@ -3923,6 +4336,8 @@ dsv4_mhc_fused_post_pre(const at::Tensor& x, const at::Tensor& residual,
               "x must be [tokens, hidden], got ", x.sizes());
   TORCH_CHECK(fn.size(0) == 24 && fn.size(1) == 4 * hidden,
               "fn must be [24, 4*hidden], got ", fn.sizes());
+  check_mhc_norm_weight(norm_weight, residual, hidden);
+  const float f_norm_eps = static_cast<float>(norm_eps);
 
   auto opts_f32 = residual.options().dtype(at::kFloat);
   at::Tensor residual_out = ring_out_like("mhc_resout", residual);
@@ -3930,6 +4345,7 @@ dsv4_mhc_fused_post_pre(const at::Tensor& x, const at::Tensor& residual,
   at::Tensor comb = ring_out("mhcf_comb", {tokens, 4, 4}, opts_f32);
   at::Tensor layer_input =
       ring_out("mhcf_li", {tokens, hidden}, residual.options());
+  at::Tensor scratch = ring_out("mhcf_scratch", {tokens, 25}, opts_f32);
 
   const uint32_t h = static_cast<uint32_t>(hidden);
   const float f_rms = static_cast<float>(rms_eps);
@@ -3937,26 +4353,84 @@ dsv4_mhc_fused_post_pre(const at::Tensor& x, const at::Tensor& residual,
   const float f_sink = static_cast<float>(sinkhorn_eps);
   const float f_mult = static_cast<float>(post_multiplier);
   const int32_t repeat = static_cast<int32_t>(sinkhorn_repeat);
+  const std::string tname = activation_type_name(residual);
 
+  if (!norm_weight) {
+    // No fused norm (dsv4-xxs-1): the one-threadgroup-per-token monolith,
+    // exactly the kernel that profile was gated with.
+    encode("qc_dsv4_mhc_fused_post_pre", [&](TorchEncoder& e) {
+      e.pipeline("dsv4_mhc_fused_post_pre_" + tname);
+      e.in(x, 0);
+      e.in(residual, 1);
+      e.in(post_mix, 2);
+      e.in(comb_mix, 3);
+      e.in(fn, 4);
+      e.in(hc_scale, 5);
+      e.in(hc_base, 6);
+      e.out(residual_out, 7);
+      e.out(post, 8);
+      e.out(comb, 9);
+      e.out(layer_input, 10);
+      e.bytes(h, 11);
+      e.bytes(f_rms, 12);
+      e.bytes(f_pre, 13);
+      e.bytes(f_sink, 14);
+      e.bytes(f_mult, 15);
+      e.bytes(repeat, 16);
+      e.dispatch(static_cast<int>(tokens), 1, 1, kMhcThreads, 1, 1);
+    });
+    return {residual_out, post, comb, layer_input};
+  }
+
+  // GLM norm-fused call: post kernel + the split pre (dots + finalize) in
+  // one encode. The monolith was latency-starved at decode widths (0.73
+  // ms/call at tokens=1 vs 0.09 ms for this sequence, bit-identical
+  // outputs on the GLM shapes).
+  const bool dots_tg = tokens >= 64 && hidden <= 4096;
   encode("qc_dsv4_mhc_fused_post_pre", [&](TorchEncoder& e) {
-    e.pipeline("dsv4_mhc_fused_post_pre_" + activation_type_name(residual));
+    e.pipeline("dsv4_mhc_post_" + tname);
     e.in(x, 0);
     e.in(residual, 1);
     e.in(post_mix, 2);
     e.in(comb_mix, 3);
-    e.in(fn, 4);
-    e.in(hc_scale, 5);
-    e.in(hc_base, 6);
-    e.out(residual_out, 7);
-    e.out(post, 8);
-    e.out(comb, 9);
-    e.out(layer_input, 10);
-    e.bytes(h, 11);
-    e.bytes(f_rms, 12);
-    e.bytes(f_pre, 13);
-    e.bytes(f_sink, 14);
-    e.bytes(f_mult, 15);
-    e.bytes(repeat, 16);
+    e.out(residual_out, 4);
+    e.bytes(h, 5);
+    e.dispatch(static_cast<int>(tokens), 8, 1, kMhcThreads, 1, 1);
+
+    // (A single post-mix+dots pass with 25 simdgroups/token recomputing the
+    // mix was measured slower: 0.239 vs 0.112 ms at T=1, 2026-09-11.)
+    e.pipeline((dots_tg ? "dsv4_mhc_pre_dots_tg_" : "dsv4_mhc_pre_dots_") +
+               tname);
+    e.in(residual_out, 0);
+    e.in(fn, 1);
+    e.out(scratch, 2);
+    e.bytes(h, 3);
+    if (dots_tg) {
+      e.dispatch(static_cast<int>(tokens), 1, 1, kMhcThreads, 1, 1);
+    } else {
+      e.dispatch(static_cast<int>(tokens), 25, 1, 32, 1, 1);
+    }
+
+    e.pipeline((norm_weight ? "dsv4_mhc_pre_finalize_norm_"
+                            : "dsv4_mhc_pre_finalize_") +
+               tname);
+    e.in(residual_out, 0);
+    e.in(scratch, 1);
+    e.in(hc_scale, 2);
+    e.in(hc_base, 3);
+    e.out(post, 4);
+    e.out(comb, 5);
+    e.out(layer_input, 6);
+    e.bytes(h, 7);
+    e.bytes(f_rms, 8);
+    e.bytes(f_pre, 9);
+    e.bytes(f_sink, 10);
+    e.bytes(f_mult, 11);
+    e.bytes(repeat, 12);
+    if (norm_weight) {
+      e.in(*norm_weight, 13);
+      e.bytes(f_norm_eps, 14);
+    }
     e.dispatch(static_cast<int>(tokens), 1, 1, kMhcThreads, 1, 1);
   });
   return {residual_out, post, comb, layer_input};
@@ -4473,6 +4947,50 @@ at::Tensor rms_norm(const at::Tensor& x, const at::Tensor& weight,
   return out.view(x.sizes());
 }
 
+// Two packed segments of one contiguous [T, S] activation (the MLA fused
+// q_a|kv_a projection: q_c = cols [0, d0), kv_c = cols [d0, d0 + d1)), each
+// normed with its own fp32 weight, in one dispatch of grid (T, 2). Per
+// segment it is exactly the qc_rms_norm_w32_strided_* path - bit-exact.
+std::tuple<at::Tensor, at::Tensor> rms_norm_dual(const at::Tensor& x,
+                                                 int64_t d0,
+                                                 const at::Tensor& w0,
+                                                 int64_t d1,
+                                                 const at::Tensor& w1,
+                                                 double epsilon) {
+  check_mps_strided(x, "x");
+  check_mps(w0, "w0");
+  check_mps(w1, "w1");
+  TORCH_CHECK(x.scalar_type() == at::kHalf || x.scalar_type() == at::kBFloat16,
+              "rms_norm_dual: x must be fp16 or bf16, got ", x.scalar_type());
+  TORCH_CHECK(x.dim() == 2 && x.stride(1) == 1 && x.stride(0) >= d0 + d1 &&
+                  x.size(1) >= d0 + d1,
+              "rms_norm_dual: x must be a 2-D row-strided view covering d0 + d1");
+  TORCH_CHECK(w0.scalar_type() == at::kFloat && w1.scalar_type() == at::kFloat &&
+                  w0.is_contiguous() && w1.is_contiguous() && w0.numel() == d0 &&
+                  w1.numel() == d1,
+              "rms_norm_dual: weights must be contiguous fp32 [d0] / [d1]");
+  const auto tokens = x.size(0);
+  at::Tensor y0 = ring_out("rms_dual0", {tokens, d0}, x.options());
+  at::Tensor y1 = ring_out("rms_dual1", {tokens, d1}, x.options());
+  const uint32_t dd0 = static_cast<uint32_t>(d0), dd1 = static_cast<uint32_t>(d1);
+  const float eps = static_cast<float>(epsilon);
+  const uint64_t in_stride = static_cast<uint64_t>(x.stride(0));
+  encode("qc_rms_norm_dual", [&](TorchEncoder& e) {
+    e.pipeline(std::string("qc_rms_norm_w32_dual_") + activation_type_name(x));
+    e.in(x, 0);
+    e.in(w0, 1);
+    e.in(w1, 2);
+    e.out(y0, 3);
+    e.out(y1, 4);
+    e.bytes(dd0, 5);
+    e.bytes(dd1, 6);
+    e.bytes(eps, 7);
+    e.bytes(in_stride, 8);
+    e.dispatch(static_cast<int>(tokens), 2, 1, 256, 1, 1);
+  });
+  return {y0, y1};
+}
+
 // ---- native step tape -----------------------------------------------------
 //
 // One C++ call per decoder layer replaces the Python/torch encode of the
@@ -4656,7 +5174,7 @@ at::Tensor qc_tape_layer_forward(int64_t idx, const at::Tensor& x,
   // fused_wqa_wkv (gguf/linear.py:214 -> ggml_mul_mat_vec_a8) then kv_score
   // (attention.py:544-548: mm + .float()).
   at::Tensor qr_kv =
-      ggml_mul_mat_vec_a8(L.wqa_wkv_qw, h, L.wqa_wkv_qt, L.wqa_wkv_qw.size(0));
+      ggml_mul_mat_vec_a8(L.wqa_wkv_qw, h, L.wqa_wkv_qt, L.wqa_wkv_qw.size(0), std::nullopt);
   at::Tensor kv_score;
   if (L.kind == 0) kv_score = at::mm(h, L.comp_w.t()).to(at::kFloat);
   // qr/kv split + fused_q_kv_rmsnorm (attention.py:444-451,
@@ -4666,7 +5184,7 @@ at::Tensor qc_tape_layer_forward(int64_t idx, const at::Tensor& x,
   at::Tensor kv = rms_norm(qk[1], L.kv_norm_w, L.qk_eps);
   // wq_b + qnorm/RoPE/KV-insert (attention.py:721-723, metal.py:42-61).
   at::Tensor q =
-      ggml_mul_mat_vec_a8(L.wq_b_qw, qr, L.wq_b_qt, L.wq_b_qw.size(0))
+      ggml_mul_mat_vec_a8(L.wq_b_qw, qr, L.wq_b_qt, L.wq_b_qw.size(0), std::nullopt)
           .view({T, L.n_heads, L.head_dim});
   q = deepseek_v4_qnorm_rope_kv_insert(
       q.to(at::kBFloat16).contiguous(), kv.to(at::kBFloat16).contiguous(),
@@ -4698,7 +5216,7 @@ at::Tensor qc_tape_layer_forward(int64_t idx, const at::Tensor& x,
       o_flat.view({T, L.o_groups, (L.n_heads / L.o_groups) * L.head_dim});
   at::Tensor z = at::einsum("tgd,grd->tgr", {grouped, L.wo_a_w}).flatten(1);
   at::Tensor attn_out =
-      ggml_mul_mat_vec_a8(L.wo_b_qw, z, L.wo_b_qt, L.wo_b_qw.size(0));
+      ggml_mul_mat_vec_a8(L.wo_b_qw, z, L.wo_b_qt, L.wo_b_qw.size(0), std::nullopt);
 
   // -- mhc post + pre, ffn side (amd/model.py:1092-1097) --------------------
   at::Tensor x2 = dsv4_mhc_post(attn_out, x, post, comb);
@@ -4718,12 +5236,12 @@ at::Tensor qc_tape_layer_forward(int64_t idx, const at::Tensor& x,
   // shared experts run first (moe_runner.py:609-611; amd/model.py:225-227):
   // gate_up gemv -> qc_swiglu (activation.py:261-282) -> down gemv.
   at::Tensor gu = ggml_mul_mat_vec_a8(L.sh_gateup_qw, h, L.sh_gateup_qt,
-                                      L.sh_gateup_qw.size(0));
+                                      L.sh_gateup_qw.size(0), std::nullopt);
   at::Tensor sh = at::empty({T, gu.size(1) / 2}, gu.options());
   qc_swiglu(gu, sh, L.swiglu_limit, /*oai_form=*/true, /*alpha=*/1.0,
             /*beta=*/0.0);
   sh =
-      ggml_mul_mat_vec_a8(L.sh_down_qw, sh, L.sh_down_qt, L.sh_down_qw.size(0));
+      ggml_mul_mat_vec_a8(L.sh_down_qw, sh, L.sh_down_qt, L.sh_down_qw.size(0), std::nullopt);
   // routing (fused_topk_bias_router.py:305-352, 140-193): topk buffers,
   // pre-softplus, single-dispatch router kernel. Hash layers pass the table
   // + input_ids with bias forced None (fused_topk_bias_router.py:186-192).
@@ -4761,7 +5279,7 @@ at::Tensor qc_tape_layer_forward(int64_t idx, const at::Tensor& x,
       L.top_k <= 8 && L.w2_row % tape_sum_rows == 0) {
     fused = at::empty_like(h);
     ggml_moe_a8_vec_sum(mo, L.w2_qw, topk_ids, topk_w, L.top_k, L.w2_qt,
-                        L.w2_row, T, fused, L.w2_soa);
+                        L.w2_row, T, fused, L.w2_soa, /*accumulate=*/false);
   } else {
     mo = ggml_moe_a8_vec(mo, L.w2_qw, topk_ids, 1, L.w2_qt, L.w2_row,
                          T * L.top_k, L.w2_soa);
@@ -5866,17 +6384,791 @@ at::Tensor ggml_dequantize_fp16(const at::Tensor& w, int64_t quant_type,
 
 }  // namespace
 
+// ---- sparse NoPE-MLA decode over bf16/f16 latent pages (GLM-5.3-Flash) ----
+// q [R, H, LATENT], kv_cache [num_blocks, block_size, LATENT] (any block
+// stride, rows contiguous), block_table [R, cols] i32 (one row per query
+// row), indices [R, W] i32 request-local positions (< 0 pad). Returns
+// [R, H, LATENT] in q's dtype. partitions splits the top-k list for
+// occupancy (0 = auto).
+at::Tensor mla_sparse_latent_decode(const at::Tensor& q,
+                                    const at::Tensor& kv_cache,
+                                    const at::Tensor& block_table,
+                                    const at::Tensor& indices,
+                                    double sm_scale, int64_t partitions,
+                                    const std::optional<at::Tensor>& tlen) {
+  check_mps(q, "q");
+  check_mps_strided(kv_cache, "kv_cache");
+  check_mps_strided(block_table, "block_table");
+  check_mps_strided(indices, "indices");
+  TORCH_CHECK(q.dim() == 3, "q must be [R, H, LATENT], got ", q.sizes());
+  const int R = static_cast<int>(q.size(0));
+  const int H = static_cast<int>(q.size(1));
+  const int latent = static_cast<int>(q.size(2));
+  TORCH_CHECK(latent == 512, "mla_sparse_latent_decode: LATENT 512 only, got ",
+              latent);
+  TORCH_CHECK(kv_cache.dim() == 3 && kv_cache.size(2) == latent &&
+                  kv_cache.stride(2) == 1 && kv_cache.stride(1) == latent &&
+                  kv_cache.scalar_type() == q.scalar_type(),
+              "kv_cache must be [blocks, block_size, LATENT] of q's dtype with "
+              "contiguous rows, got ", kv_cache.sizes());
+  const int block_size = static_cast<int>(kv_cache.size(1));
+  const auto block_stride64 = kv_cache.stride(0);
+  TORCH_CHECK(block_stride64 <= std::numeric_limits<int>::max(),
+              "kv_cache block stride out of range: ", block_stride64);
+  TORCH_CHECK(block_table.scalar_type() == at::kInt && block_table.dim() == 2 &&
+                  block_table.size(0) >= R && block_table.stride(1) == 1,
+              "block_table must be i32 [R, cols]");
+  TORCH_CHECK(indices.scalar_type() == at::kInt && indices.dim() == 2 &&
+                  indices.size(0) >= R && indices.stride(1) == 1,
+              "indices must be i32 [R, W]");
+  const int width = static_cast<int>(indices.size(1));
+  TORCH_CHECK(indices.stride(0) == width,
+              "indices rows must be contiguous, got stride ", indices.stride(0));
+  int P = static_cast<int>(partitions);
+  if (P <= 0) {
+    // ~1024 simdgroups keeps the M1 Ultra's 64 cores fed at batch 1
+    // (R=1, H=64, W=2051: 0.55 ms torch, 0.22 ms at P=8, 0.17 ms at P=16,
+    // flat from 16 to 64 partitions).
+    P = std::max(1, std::min(32, (1024 + R * H - 1) / (R * H)));
+  }
+  P = std::max(1, std::min(P, width));
+  auto fopts = q.options().dtype(at::kFloat);
+  at::Tensor part_acc = ring_out("mla_sl_acc", {R, H, P, (int64_t)latent}, fopts);
+  at::Tensor part_ml = ring_out("mla_sl_ml", {R, H, P, 2}, fopts);
+  at::Tensor out = ring_out("mla_sl_out", {R, H, (int64_t)latent}, q.options());
+  const std::string tname = activation_type_name(q);
+  // Optional per-row valid prefix length (the indexer's expand kernel
+  // writes it): the scan of each row ends there instead of at `width`.
+  const bool has_tlen = tlen.has_value();
+  if (has_tlen) {
+    check_mps_strided(*tlen, "tlen");
+    TORCH_CHECK(tlen->scalar_type() == at::kInt && tlen->dim() == 1 &&
+                    tlen->numel() >= R && tlen->stride(0) == 1,
+                "tlen must be contiguous int32 [R]");
+  }
+  const at::Tensor& tlen_buf = has_tlen ? *tlen : indices;
+  encode("qc_mla_sparse_latent_decode", [&](TorchEncoder& e) {
+    tk::launch_mla_sparse_latent_partition(
+        e, q, kv_cache, block_table, indices, part_acc, part_ml, R, H, latent,
+        block_size, static_cast<int>(block_stride64),
+        static_cast<int>(block_table.stride(0)), static_cast<float>(sm_scale),
+        width, P, static_cast<int>(block_table.size(1)) - 1, tname, tlen_buf,
+        has_tlen ? 1 : 0);
+    tk::launch_mla_sparse_latent_reduce(e, part_acc, part_ml, out, R, H, latent,
+                                        P, tname);
+  });
+  return out;
+}
+
+// ---- KDA (GLM-5.3-Flash / Kimi-Linear) fused serving step --------------------
+// mixed_qkv [T, 3*H*Dk] pre-conv activations, g_logits [T, H*Dk] (f_b output),
+// beta_logits [T, H], conv_state [slots, 3*H*Dk, L] in the activation dtype
+// (any strides, the row is slot-major), ssm_state [slots, H, Dv, Dk] fp32
+// (page-packed pools: contiguous within a slot). Varlen over cu_seqlens with
+// one slot per request; slot <= 0 is the null block (zero output, pool
+// untouched). Returns rmsnorm(y) * norm_weight * sigmoid(z) as [T, H*Dv].
+at::Tensor kda_step(const at::Tensor& mixed_qkv, const at::Tensor& g_logits,
+                    const at::Tensor& beta_logits, const at::Tensor& conv_w,
+                    const at::Tensor& conv_state, const at::Tensor& ssm_state,
+                    const at::Tensor& cu_seqlens, const at::Tensor& slot_mapping,
+                    const at::Tensor& A_log, const at::Tensor& dt_bias,
+                    double lower_bound, bool load_initial,
+                    const at::Tensor& norm_weight, const at::Tensor& z,
+                    double norm_eps, double q_scale, double l2_eps,
+                    const std::optional<at::Tensor>& out_opt,
+                    const std::optional<at::Tensor>& slot_table_opt,
+                    const std::optional<at::Tensor>& num_accepted_opt) {
+  check_mps_strided(mixed_qkv, "mixed_qkv");
+  check_mps_strided(g_logits, "g_logits");
+  check_mps_strided(beta_logits, "beta_logits");
+  check_mps(conv_w, "conv_w");
+  check_mps_strided(conv_state, "conv_state");
+  check_mps_strided(ssm_state, "ssm_state");
+  check_mps(cu_seqlens, "cu_seqlens");
+  check_mps(slot_mapping, "slot_mapping");
+  check_mps(A_log, "A_log");
+  check_mps(norm_weight, "norm_weight");
+  check_mps_strided(z, "z");
+  TORCH_CHECK(ssm_state.scalar_type() == at::kFloat && ssm_state.dim() == 4,
+              "kda_step: ssm_state must be fp32 [slots, H, Dv, Dk]");
+  const int H = static_cast<int>(ssm_state.size(1));
+  const int Dv = static_cast<int>(ssm_state.size(2));
+  const int Dk = static_cast<int>(ssm_state.size(3));
+  TORCH_CHECK(Dk == 128 && Dv == 128,
+              "kda_step is instantiated for Dk == Dv == 128, got ", Dk, "/", Dv);
+  TORCH_CHECK(ssm_state.stride(3) == 1 && ssm_state.stride(2) == Dk &&
+                  ssm_state.stride(1) == (int64_t)Dv * Dk,
+              "kda_step: ssm_state rows must be (H, Dv, Dk) contiguous");
+  const auto ssm_stride64 = ssm_state.stride(0);
+  TORCH_CHECK(ssm_stride64 >= (int64_t)H * Dv * Dk &&
+                  ssm_stride64 <= std::numeric_limits<int>::max(),
+              "kda_step: ssm slot stride out of range: ", ssm_stride64);
+  const int T = static_cast<int>(mixed_qkv.size(0));
+  const int channels = 3 * H * Dk;
+  TORCH_CHECK(mixed_qkv.dim() == 2 && mixed_qkv.size(1) == channels &&
+                  mixed_qkv.stride(1) == 1,
+              "kda_step: mixed_qkv must be [T, 3*H*Dk] with unit column stride");
+  TORCH_CHECK(g_logits.dim() == 2 && g_logits.size(0) == T &&
+                  g_logits.size(1) == (int64_t)H * Dk && g_logits.stride(1) == 1 &&
+                  g_logits.scalar_type() == mixed_qkv.scalar_type(),
+              "kda_step: g_logits must be [T, H*Dk] of the activation dtype");
+  TORCH_CHECK(beta_logits.dim() == 2 && beta_logits.size(0) == T &&
+                  beta_logits.size(1) == H && beta_logits.stride(1) == 1 &&
+                  beta_logits.scalar_type() == mixed_qkv.scalar_type(),
+              "kda_step: beta_logits must be [T, H] of the activation dtype");
+  TORCH_CHECK(conv_w.scalar_type() == at::kFloat && conv_w.dim() == 2 &&
+                  conv_w.size(0) == channels && conv_w.is_contiguous(),
+              "kda_step: conv_w must be contiguous fp32 [3*H*Dk, kernel_size]");
+  const int kernel_size = static_cast<int>(conv_w.size(1));
+  TORCH_CHECK(kernel_size >= 2 && kernel_size <= 8,
+              "kda_step: kernel_size 2..8, got ", kernel_size);
+  TORCH_CHECK(conv_state.dim() == 3 && conv_state.size(1) == channels &&
+                  conv_state.size(2) >= kernel_size - 1 &&
+                  conv_state.scalar_type() == mixed_qkv.scalar_type(),
+              "kda_step: conv_state must be [slots, 3*H*Dk, >= kernel_size-1] "
+              "of the activation dtype, got ", conv_state.sizes());
+  const auto conv_stride64 = conv_state.stride(0);
+  TORCH_CHECK(conv_stride64 <= std::numeric_limits<int>::max() &&
+                  conv_state.stride(1) <= std::numeric_limits<int>::max() &&
+                  conv_state.stride(2) <= std::numeric_limits<int>::max(),
+              "kda_step: conv_state strides out of range");
+  TORCH_CHECK(A_log.scalar_type() == at::kFloat && A_log.numel() == H &&
+                  A_log.is_contiguous(),
+              "kda_step: A_log must be contiguous fp32 [H]");
+  const bool has_dt_bias = dt_bias.defined() && dt_bias.numel() > 0;
+  if (has_dt_bias) {
+    check_mps(dt_bias, "dt_bias");
+    TORCH_CHECK(dt_bias.scalar_type() == at::kFloat &&
+                    dt_bias.numel() == (int64_t)H * Dk,
+                "kda_step: dt_bias must be fp32 [H*Dk]");
+  }
+  TORCH_CHECK(cu_seqlens.scalar_type() == at::kInt, "cu_seqlens must be i32");
+  TORCH_CHECK(slot_mapping.scalar_type() == at::kInt, "slot_mapping must be i32");
+  const int R = static_cast<int>(slot_mapping.size(0));
+  TORCH_CHECK(cu_seqlens.numel() >= R + 1, "cu_seqlens must be [R+1]");
+  // Speculative verify: slot_table [R, num_spec+1] int32 (row r's checkpoint
+  // slots; slot_mapping must be its column 0, the conv slot) + num_accepted
+  // [R] int32. The conv runs in rewind mode and the recurrence resumes from
+  // slot_table[r, num_accepted[r]-1], checkpointing after every token.
+  const bool spec = slot_table_opt.has_value();
+  TORCH_CHECK(spec == num_accepted_opt.has_value(),
+              "kda_step: slot_table and num_accepted go together");
+  int table_stride = 0;
+  if (spec) {
+    check_mps_strided(*slot_table_opt, "slot_table");
+    check_mps(*num_accepted_opt, "num_accepted");
+    TORCH_CHECK(slot_table_opt->scalar_type() == at::kInt &&
+                    slot_table_opt->dim() == 2 && slot_table_opt->size(0) >= R &&
+                    slot_table_opt->stride(1) == 1,
+                "kda_step: slot_table must be int32 [>= R, num_spec+1] with "
+                "unit column stride");
+    TORCH_CHECK(num_accepted_opt->scalar_type() == at::kInt &&
+                    num_accepted_opt->numel() >= R,
+                "kda_step: num_accepted must be int32 [>= R]");
+    table_stride = static_cast<int>(slot_table_opt->stride(0));
+    TORCH_CHECK(conv_state.size(2) >= kernel_size - 2 + slot_table_opt->size(1),
+                "kda_step: conv_state has ", conv_state.size(2),
+                " columns; spec verify needs kernel_size-2+max_query_len");
+  }
+  TORCH_CHECK(norm_weight.numel() == Dv &&
+                  norm_weight.scalar_type() == mixed_qkv.scalar_type(),
+              "kda_step: norm_weight must be [Dv] of the activation dtype");
+  TORCH_CHECK(z.dim() == 2 && z.size(0) == T && z.size(1) == (int64_t)H * Dv &&
+                  z.stride(1) == 1 && z.scalar_type() == mixed_qkv.scalar_type(),
+              "kda_step: z must be [T, H*Dv] of the activation dtype");
+
+  const auto f32 = mixed_qkv.options().dtype(at::kFloat);
+  at::Tensor q = ring_out("kda_q", {T, (int64_t)H * Dk}, f32);
+  at::Tensor k = ring_out("kda_k", {T, (int64_t)H * Dk}, f32);
+  at::Tensor v = ring_out("kda_v", {T, (int64_t)H * Dv}, f32);
+  at::Tensor decay = ring_out("kda_decay", {T, (int64_t)H * Dk}, f32);
+  at::Tensor beta = ring_out("kda_beta", {T, (int64_t)H}, f32);
+  at::Tensor y = ring_out("kda_y", {T, (int64_t)H * Dv}, f32);
+  at::Tensor out;
+  if (out_opt.has_value()) {
+    // Caller-provided destination (the attention output slab), saving the
+    // per-layer copy.
+    out = *out_opt;
+    check_mps_strided(out, "out");
+    TORCH_CHECK(out.scalar_type() == mixed_qkv.scalar_type() && out.dim() == 2 &&
+                    out.size(0) == T && out.size(1) == (int64_t)H * Dv &&
+                    out.is_contiguous(),
+                "kda_step: out must be a contiguous [T, H*Dv] tensor of the "
+                "activation dtype, got ", out.sizes());
+  } else {
+    out = ring_out("kda_out", {T, (int64_t)H * Dv}, mixed_qkv.options());
+  }
+  const at::Tensor& dtb = has_dt_bias ? dt_bias : A_log;  // unread when absent
+  const at::Tensor& nacc = spec ? *num_accepted_opt : cu_seqlens;  // unread
+  const std::string tname = activation_type_name(mixed_qkv);
+  // Prefill parallelism for the prepare kernel: 32-token chunks along grid
+  // y (T bounds the longest request without a host pull); spec mode walks
+  // each request in one chunk.
+  const int prep_chunk = spec ? std::max(T, 1) : 32;
+  const int prep_chunks = spec ? 1 : (T + prep_chunk - 1) / prep_chunk;
+  encode("qc_kda_step", [&](TorchEncoder& e) {
+    tk::launch_kda_fused_prepare(
+        e, mixed_qkv, g_logits, beta_logits, conv_w, conv_state, cu_seqlens,
+        slot_mapping, A_log, dtb, q, k, v, decay, beta, R, H, Dk, Dv,
+        kernel_size, load_initial ? 1 : 0,
+        static_cast<int>(mixed_qkv.stride(0)),
+        static_cast<int>(g_logits.stride(0)),
+        static_cast<int>(beta_logits.stride(0)),
+        static_cast<int>(conv_stride64), static_cast<int>(conv_state.stride(1)),
+        static_cast<int>(conv_state.stride(2)), static_cast<float>(l2_eps),
+        static_cast<float>(q_scale), static_cast<float>(lower_bound),
+        has_dt_bias ? 1 : 0, tname, nacc, spec ? 1 : 0, prep_chunk,
+        prep_chunks);
+    if (spec) {
+      tk::launch_kda_recur_spec(e, q, k, v, decay, beta, ssm_state, cu_seqlens,
+                                *slot_table_opt, nacc, y, R, H, Dv, Dk,
+                                table_stride, static_cast<int>(ssm_stride64));
+    } else {
+      tk::launch_kda_recur(e, q, k, v, decay, beta, ssm_state, cu_seqlens,
+                           slot_mapping, y, R, H, Dv, Dk, load_initial ? 1 : 0,
+                           static_cast<int>(ssm_stride64));
+    }
+    tk::launch_kda_gated_rmsnorm_f32(e, y, z, norm_weight, out, T * H, H, Dv,
+                                     static_cast<int>(z.stride(0)),
+                                     static_cast<float>(norm_eps), tname);
+  });
+  return out;
+}
+
+// MoE router (single expert group): scores + optional bias top-k, weights
+// from the unbiased scores, renormalize, scale. One simdgroup per token.
+// Prefill recurrence only (no conv / gate / norm): the per-channel
+// delta-rule scan of kda_step over already-prepared fp32 rows. q/k [T, H*Dk]
+// (L2-normalized, q pre-scaled), v [T, H*Dv], decay [T, H*Dk] (exp(gate)),
+// beta [T, H] (sigmoid), all fp32 contiguous. One simdgroup per (request,
+// head, Dv row) walks the request's tokens from cu_seqlens; the initial
+// state is ssm_state[slot] when load_initial, the final state is written
+// back to the slot (slot <= 0 = null: zero y, pool untouched). Replaces the
+// torch per-token Python loop of kda_recurrent_prefill_native (34 layers x
+// T steps x 6 MPS ops). Returns y [T, H*Dv] fp32.
+at::Tensor kda_recur_prefill(const at::Tensor& q, const at::Tensor& k,
+                             const at::Tensor& v, const at::Tensor& decay,
+                             const at::Tensor& beta, at::Tensor ssm_state,
+                             const at::Tensor& cu_seqlens,
+                             const at::Tensor& slot_mapping, int64_t Dk,
+                             int64_t Dv, bool load_initial, int64_t rows) {
+  check_mps(q, "q");
+  check_mps(k, "k");
+  check_mps(v, "v");
+  check_mps(decay, "decay");
+  check_mps(beta, "beta");
+  check_mps(ssm_state, "ssm_state");
+  check_mps(cu_seqlens, "cu_seqlens");
+  check_mps(slot_mapping, "slot_mapping");
+  TORCH_CHECK(Dk == 64 || Dk == 128, "kda_recur_prefill: Dk must be 64 or 128");
+  TORCH_CHECK(q.dim() == 2 && q.scalar_type() == at::kFloat && q.is_contiguous(),
+              "kda_recur_prefill: q must be fp32 contiguous [T, H*Dk]");
+  const int64_t T = q.size(0);
+  TORCH_CHECK(q.size(1) % Dk == 0, "kda_recur_prefill: q width must be H*Dk");
+  const int H = static_cast<int>(q.size(1) / Dk);
+  for (const auto* t : {&k, &decay}) {
+    TORCH_CHECK(t->sizes() == q.sizes() && t->scalar_type() == at::kFloat &&
+                    t->is_contiguous(),
+                "kda_recur_prefill: k/decay must match q ([T, H*Dk] fp32)");
+  }
+  TORCH_CHECK(v.dim() == 2 && v.size(0) == T && v.size(1) == (int64_t)H * Dv &&
+                  v.scalar_type() == at::kFloat && v.is_contiguous(),
+              "kda_recur_prefill: v must be fp32 contiguous [T, H*Dv]");
+  TORCH_CHECK(beta.dim() == 2 && beta.size(0) == T && beta.size(1) == H &&
+                  beta.scalar_type() == at::kFloat && beta.is_contiguous(),
+              "kda_recur_prefill: beta must be fp32 contiguous [T, H]");
+  TORCH_CHECK(ssm_state.dim() == 4 && ssm_state.size(1) == H &&
+                  ssm_state.size(2) == Dv && ssm_state.size(3) == Dk &&
+                  ssm_state.scalar_type() == at::kFloat &&
+                  ssm_state.stride(3) == 1 && ssm_state.stride(2) == Dk &&
+                  ssm_state.stride(1) == Dv * Dk,
+              "kda_recur_prefill: ssm_state must be fp32 [slots, H, Dv, Dk] "
+              "with a dense [H, Dv, Dk] page");
+  TORCH_CHECK(cu_seqlens.scalar_type() == at::kInt, "cu_seqlens must be i32");
+  TORCH_CHECK(slot_mapping.scalar_type() == at::kInt, "slot_mapping must be i32");
+  const int R = static_cast<int>(slot_mapping.size(0));
+  TORCH_CHECK(cu_seqlens.numel() >= R + 1, "cu_seqlens must be [R+1]");
+  const auto f32 = q.options();
+  at::Tensor y = ring_out("kda_prefill_y", {T, (int64_t)H * Dv}, f32);
+  const int64_t ssm_stride64 = ssm_state.stride(0);
+  encode("qc_kda_recur_prefill", [&](TorchEncoder& e) {
+    tk::launch_kda_recur(e, q, k, v, decay, beta, ssm_state, cu_seqlens,
+                         slot_mapping, y, R, H, static_cast<int>(Dv),
+                         static_cast<int>(Dk), load_initial ? 1 : 0,
+                         static_cast<int>(ssm_stride64),
+                         static_cast<int>(rows));
+  });
+  return y;
+}
+
+std::tuple<at::Tensor, at::Tensor> moe_router_topk(
+    const at::Tensor& gating_output, const std::optional<at::Tensor>& bias,
+    int64_t topk, bool renormalize, bool softmax, double scale) {
+  check_mps_strided(gating_output, "gating_output");
+  TORCH_CHECK(gating_output.dim() == 2 && gating_output.stride(1) == 1,
+              "gating_output must be [tokens, experts] with contiguous rows, got ",
+              gating_output.sizes());
+  const auto T = gating_output.size(0);
+  const auto E = gating_output.size(1);
+  TORCH_CHECK(E >= 1 && E <= 1024, "moe_router_topk: experts <= 1024, got ", E);
+  TORCH_CHECK(topk >= 1 && topk <= 32 && topk <= E,
+              "moe_router_topk: topk must be in [1, min(32, E)], got ", topk);
+  const auto st = gating_output.scalar_type();
+  TORCH_CHECK(st == at::kFloat || st == at::kBFloat16 || st == at::kHalf,
+              "moe_router_topk: fp32/bf16/f16 logits only");
+  if (bias.has_value()) {
+    check_mps_strided(*bias, "bias");
+    TORCH_CHECK(bias->scalar_type() == at::kFloat && bias->numel() == E &&
+                    bias->is_contiguous(),
+                "bias must be a contiguous fp32 [experts] vector");
+  }
+  auto fopts = gating_output.options().dtype(at::kFloat);
+  at::Tensor out_w = ring_out("router_w", {T, topk}, fopts);
+  at::Tensor out_ids = ring_out("router_ids", {T, topk},
+                                gating_output.options().dtype(at::kInt));
+  if (T == 0) return {out_w, out_ids};
+  const int32_t e_i = static_cast<int32_t>(E), k_i = static_cast<int32_t>(topk);
+  const int32_t stride_i = static_cast<int32_t>(gating_output.stride(0));
+  const int32_t scoring_i = softmax ? 1 : 0;
+  const int32_t has_bias_i = bias.has_value() ? 1 : 0;
+  const int32_t renorm_i = renormalize ? 1 : 0;
+  const float scale_f = static_cast<float>(scale);
+  encode("qc_moe_router_topk", [&](TorchEncoder& e) {
+    e.pipeline("moe_router_topk_" + activation_type_name(gating_output));
+    e.in(gating_output, 0);
+    e.in(bias.has_value() ? *bias : gating_output, 1);
+    e.out(out_w, 2);
+    e.out(out_ids, 3);
+    e.bytes(e_i, 4);
+    e.bytes(k_i, 5);
+    e.bytes(stride_i, 6);
+    e.bytes(scoring_i, 7);
+    e.bytes(has_bias_i, 8);
+    e.bytes(renorm_i, 9);
+    e.bytes(scale_f, 10);
+    e.dispatch(static_cast<int>(T), 1, 1, 32, 1, 1);
+  });
+  return {out_w, out_ids};
+}
+
+// ---- GLM-5.3-Flash pooled indexer + paged row insert ----------------------
+at::Tensor glm5_indexer_pool_logits(
+    const at::Tensor& q, const at::Tensor& w, const at::Tensor& ape,
+    const at::Tensor& cache, const at::Tensor& block_table,
+    const at::Tensor& row_req, const at::Tensor& visible, int64_t max_pools,
+    int64_t block_size, double softmax_scale) {
+  check_mps_strided(q, "q");
+  check_mps_strided(w, "w");
+  check_mps_strided(ape, "ape");
+  check_mps_strided(cache, "cache");
+  check_mps_strided(block_table, "block_table");
+  check_mps_strided(row_req, "row_req");
+  check_mps_strided(visible, "visible");
+  TORCH_CHECK(q.dim() == 3 && q.size(2) == 128 && q.is_contiguous() &&
+                  (q.scalar_type() == at::kBFloat16 || q.scalar_type() == at::kHalf),
+              "q must be a contiguous bf16/f16 [R, H, 128], got ", q.sizes());
+  const auto R = q.size(0), H = q.size(1);
+  TORCH_CHECK(H >= 1 && H <= 64, "indexer heads <= 64, got ", H);
+  TORCH_CHECK(w.scalar_type() == at::kFloat && w.dim() == 2 && w.size(0) == R &&
+                  w.size(1) == H && w.is_contiguous(),
+              "w must be a contiguous fp32 [R, H]");
+  TORCH_CHECK(ape.scalar_type() == at::kFloat && ape.dim() == 2 && ape.size(0) == 4 &&
+                  ape.size(1) == 128 && ape.is_contiguous(),
+              "ape must be a contiguous fp32 [4, 128]");
+  TORCH_CHECK(cache.dim() == 3 && cache.size(2) == 256 && cache.stride(2) == 1 &&
+                  cache.stride(1) == 256 && cache.scalar_type() == q.scalar_type(),
+              "cache must be [blocks, block_size, 256] pages of q's dtype");
+  TORCH_CHECK(block_table.scalar_type() == at::kInt && block_table.dim() == 2 &&
+                  block_table.stride(1) == 1,
+              "block_table must be int32 [rows, max_blocks] with contiguous rows");
+  TORCH_CHECK(row_req.scalar_type() == at::kInt && row_req.numel() == R &&
+                  row_req.is_contiguous(),
+              "row_req must be contiguous int32 [R]");
+  TORCH_CHECK(visible.scalar_type() == at::kInt && visible.numel() == R &&
+                  visible.is_contiguous(),
+              "visible must be contiguous int32 [R]");
+  TORCH_CHECK(max_pools >= 1 && block_size >= 1 && block_size % 4 == 0,
+              "max_pools >= 1, block_size a multiple of the pool size");
+  TORCH_CHECK(cache.stride(0) <= std::numeric_limits<int>::max(),
+              "cache page stride out of int32 range");
+  at::Tensor out = ring_out("idx_logits", {R, max_pools},
+                            q.options().dtype(at::kFloat));
+  const int32_t mp = static_cast<int32_t>(max_pools);
+  const int32_t bts = static_cast<int32_t>(block_table.stride(0));
+  const int32_t ps = static_cast<int32_t>(cache.stride(0));
+  const int32_t bs = static_cast<int32_t>(block_size);
+  const float sc = static_cast<float>(softmax_scale);
+  const int32_t rd = 256, nh = static_cast<int32_t>(H);
+  encode("qc_glm5_indexer_pool_logits", [&](TorchEncoder& e) {
+    e.pipeline("glm5_indexer_pool_logits_" + activation_type_name(q));
+    e.in(q, 0);
+    e.in(w, 1);
+    e.in(ape, 2);
+    e.in(cache, 3);
+    e.in(block_table, 4);
+    e.in(row_req, 5);
+    e.in(visible, 6);
+    e.out(out, 7);
+    e.bytes(mp, 8);
+    e.bytes(bts, 9);
+    e.bytes(ps, 10);
+    e.bytes(bs, 11);
+    e.bytes(sc, 12);
+    e.bytes(rd, 13);
+    e.bytes(nh, 14);
+    e.dispatch(mp, static_cast<int>(R), 1, 32, 1, 1);
+  });
+  return out;
+}
+
+void glm5_indexer_expand_topk(const at::Tensor& sel, const at::Tensor& visible,
+                              at::Tensor& out, int64_t kp,
+                              const std::optional<at::Tensor>& tlen) {
+  check_mps_strided(sel, "sel");
+  check_mps_strided(visible, "visible");
+  check_mps_strided(out, "out");
+  TORCH_CHECK(sel.scalar_type() == at::kInt && sel.dim() == 2 && sel.is_contiguous(),
+              "sel must be contiguous int32 [R, KSEL]");
+  const auto R = sel.size(0), ksel = sel.size(1);
+  TORCH_CHECK(visible.scalar_type() == at::kInt && visible.numel() == R &&
+                  visible.is_contiguous(),
+              "visible must be contiguous int32 [R]");
+  TORCH_CHECK(out.scalar_type() == at::kInt && out.dim() == 2 && out.size(0) == R &&
+                  out.is_contiguous(),
+              "out must be contiguous int32 [R, OUT_W]");
+  const auto out_w = out.size(1);
+  TORCH_CHECK(ksel * kp + kp - 2 < out_w, "top-k output row too narrow for tail");
+  if (R == 0) return;
+  const int32_t ks = static_cast<int32_t>(ksel), ow = static_cast<int32_t>(out_w);
+  const int32_t kpi = static_cast<int32_t>(kp);
+  const bool write_tlen = tlen.has_value();
+  if (write_tlen) {
+    check_mps_strided(*tlen, "tlen");
+    TORCH_CHECK(tlen->scalar_type() == at::kInt && tlen->dim() == 1 &&
+                    tlen->numel() >= R && tlen->stride(0) == 1,
+                "tlen must be contiguous int32 [R]");
+  }
+  at::Tensor tlen_buf = write_tlen ? *tlen : out;
+  encode("qc_glm5_indexer_expand_topk", [&](TorchEncoder& e) {
+    e.pipeline("glm5_indexer_expand_topk");
+    e.in(sel, 0);
+    e.in(visible, 1);
+    e.out(out, 2);
+    e.bytes(ks, 3);
+    e.bytes(ow, 4);
+    e.bytes(kpi, 5);
+    e.out(tlen_buf, 6);
+    e.bytes(write_tlen ? 1 : 0, 7);
+    e.bytes(static_cast<int32_t>(0), 8);
+    e.dispatch(static_cast<int>(R), 1, 1, 256, 1, 1);
+  });
+}
+
+// Identity selection (context below the pooled-selection limit: every pool
+// of every row is selected): the expand kernel derives pool p = p itself, so
+// neither the pool logits nor a top-k are computed. Same output as
+// glm5_indexer_expand_topk fed the identity permutation.
+void glm5_indexer_expand_identity(const at::Tensor& visible, at::Tensor& out,
+                                  int64_t kp, int64_t ksel,
+                                  const std::optional<at::Tensor>& tlen) {
+  check_mps_strided(visible, "visible");
+  check_mps_strided(out, "out");
+  const auto R = visible.numel();
+  TORCH_CHECK(visible.scalar_type() == at::kInt && visible.is_contiguous(),
+              "visible must be contiguous int32 [R]");
+  TORCH_CHECK(out.scalar_type() == at::kInt && out.dim() == 2 && out.size(0) == R &&
+                  out.is_contiguous(),
+              "out must be contiguous int32 [R, OUT_W]");
+  const auto out_w = out.size(1);
+  TORCH_CHECK(ksel * kp + kp - 2 < out_w, "top-k output row too narrow for tail");
+  if (R == 0) return;
+  const int32_t ks = static_cast<int32_t>(ksel), ow = static_cast<int32_t>(out_w);
+  const int32_t kpi = static_cast<int32_t>(kp);
+  const bool write_tlen = tlen.has_value();
+  if (write_tlen) {
+    check_mps_strided(*tlen, "tlen");
+    TORCH_CHECK(tlen->scalar_type() == at::kInt && tlen->dim() == 1 &&
+                    tlen->numel() >= R && tlen->stride(0) == 1,
+                "tlen must be contiguous int32 [R]");
+  }
+  at::Tensor tlen_buf = write_tlen ? *tlen : out;
+  encode("qc_glm5_indexer_expand_identity", [&](TorchEncoder& e) {
+    e.pipeline("glm5_indexer_expand_topk");
+    e.in(visible, 0);  // placeholder for `sel`: never read in identity mode
+    e.in(visible, 1);
+    e.out(out, 2);
+    e.bytes(ks, 3);
+    e.bytes(ow, 4);
+    e.bytes(kpi, 5);
+    e.out(tlen_buf, 6);
+    e.bytes(write_tlen ? 1 : 0, 7);
+    e.bytes(static_cast<int32_t>(1), 8);
+    e.dispatch(static_cast<int>(R), 1, 1, 256, 1, 1);
+  });
+}
+
+void paged_row_insert(const at::Tensor& rows, at::Tensor& cache,
+                      const at::Tensor& slot_mapping) {
+  check_mps_strided(rows, "rows");
+  check_mps_strided(cache, "cache");
+  check_mps_strided(slot_mapping, "slot_mapping");
+  TORCH_CHECK(cache.dim() == 3 && cache.stride(2) == 1 &&
+                  cache.stride(1) == cache.size(2),
+              "cache must be [blocks, block_size, row] pages with contiguous rows");
+  const auto row_dim = cache.size(2);
+  TORCH_CHECK(rows.dim() == 2 && rows.size(1) == row_dim && rows.stride(1) == 1 &&
+                  rows.scalar_type() == cache.scalar_type(),
+              "rows must be [T, row] of the cache dtype with contiguous rows");
+  const auto T = rows.size(0);
+  TORCH_CHECK((slot_mapping.scalar_type() == at::kInt ||
+               slot_mapping.scalar_type() == at::kLong) &&
+                  slot_mapping.numel() >= T && slot_mapping.is_contiguous(),
+              "slot_mapping must be contiguous int32/int64 [>= T]");
+  TORCH_CHECK(cache.stride(0) <= std::numeric_limits<int>::max(),
+              "cache page stride out of int32 range");
+  if (T == 0) return;
+  const int32_t bs = static_cast<int32_t>(cache.size(1));
+  const int32_t ps = static_cast<int32_t>(cache.stride(0));
+  const int32_t rd = static_cast<int32_t>(row_dim);
+  const int32_t rs = static_cast<int32_t>(rows.stride(0));
+  encode("qc_paged_row_insert", [&](TorchEncoder& e) {
+    e.pipeline("paged_row_insert_" + activation_type_name(cache) +
+               (slot_mapping.scalar_type() == at::kLong ? "_i64" : ""));
+    e.in(rows, 0);
+    e.out(cache, 1);
+    e.in(slot_mapping, 2);
+    e.bytes(bs, 3);
+    e.bytes(ps, 4);
+    e.bytes(rd, 5);
+    e.bytes(rs, 6);
+    e.dispatch(static_cast<int>(T), 1, 1, 128, 1, 1);
+  });
+}
+
+
+// ---------------------------------------------------------------------------
+// Runner KV metadata (kv_meta.metal). One launch per step gathers every
+// group's batch block table and computes every group's slot mapping.
+// ---------------------------------------------------------------------------
+void kv_meta_prepare(const at::Tensor& idx_mapping, const at::Tensor& qsl,
+                     const at::Tensor& positions, const at::Tensor& params,
+                     at::Tensor& slots, const std::vector<at::Tensor>& src,
+                     const std::vector<at::Tensor>& dst, int64_t num_reqs,
+                     int64_t num_reqs_padded, int64_t num_tokens,
+                     int64_t num_tokens_padded) {
+  check_mps_strided(idx_mapping, "idx_mapping");
+  check_mps_strided(qsl, "query_start_loc");
+  check_mps_strided(positions, "positions");
+  check_mps_strided(params, "params");
+  check_mps_strided(slots, "slot_mappings");
+  const int64_t groups = static_cast<int64_t>(src.size());
+  TORCH_CHECK(groups >= 1 && groups <= 8 && dst.size() == src.size(),
+              "kv_meta_prepare supports 1..8 KV groups, got ", groups);
+  TORCH_CHECK(idx_mapping.scalar_type() == at::kInt &&
+                  idx_mapping.is_contiguous() &&
+                  idx_mapping.numel() >= num_reqs,
+              "idx_mapping must be contiguous int32 [>= num_reqs]");
+  TORCH_CHECK(qsl.scalar_type() == at::kInt && qsl.is_contiguous() &&
+                  qsl.numel() >= num_reqs + 1,
+              "query_start_loc must be contiguous int32 [>= num_reqs + 1]");
+  TORCH_CHECK((positions.scalar_type() == at::kLong ||
+               positions.scalar_type() == at::kInt) &&
+                  positions.is_contiguous() && positions.numel() >= num_tokens,
+              "positions must be contiguous int32/int64 [>= num_tokens]");
+  TORCH_CHECK(params.scalar_type() == at::kInt && params.is_contiguous() &&
+                  params.numel() >= groups * 8,
+              "params must be contiguous int32 [groups, 8]");
+  TORCH_CHECK(slots.scalar_type() == at::kLong && slots.dim() == 2 &&
+                  slots.size(0) == groups && slots.stride(1) == 1 &&
+                  slots.size(1) >= num_tokens_padded,
+              "slot_mappings must be int64 [groups, >= num_tokens_padded]");
+  for (int64_t g = 0; g < groups; ++g) {
+    check_mps_strided(src[g], "block_table");
+    check_mps_strided(dst[g], "input_block_table");
+    TORCH_CHECK(src[g].scalar_type() == at::kInt && src[g].dim() == 2 &&
+                    src[g].stride(1) == 1 && dst[g].scalar_type() == at::kInt &&
+                    dst[g].dim() == 2 && dst[g].stride(1) == 1 &&
+                    dst[g].size(0) >= num_reqs_padded,
+                "block tables must be int32 [reqs, blocks] with unit column "
+                "stride (group ", g, ")");
+  }
+  if (num_reqs_padded <= 0 && num_tokens_padded <= 0) return;
+  const int32_t nr = static_cast<int32_t>(num_reqs);
+  const int32_t nrp = static_cast<int32_t>(num_reqs_padded);
+  const int32_t nt = static_cast<int32_t>(num_tokens);
+  const int32_t ntp = static_cast<int32_t>(num_tokens_padded);
+  const int32_t ss = static_cast<int32_t>(slots.stride(0));
+  const int chunks = static_cast<int>((num_tokens_padded + 255) / 256);
+  encode("qc_kv_meta_prepare", [&](TorchEncoder& e) {
+    e.pipeline(positions.scalar_type() == at::kLong ? "kv_meta_prepare_i64"
+                                                    : "kv_meta_prepare_i32");
+    e.in(idx_mapping, 0);
+    e.in(qsl, 1);
+    e.in(positions, 2);
+    e.in(params, 3);
+    e.out(slots, 4);
+    for (int g = 0; g < 8; ++g) {
+      const int64_t gi = g < groups ? g : groups - 1;
+      e.in(src[gi], 5 + g);
+      e.out(dst[gi], 13 + g);
+    }
+    e.bytes(nr, 21);
+    e.bytes(nrp, 22);
+    e.bytes(nt, 23);
+    e.bytes(ntp, 24);
+    e.bytes(ss, 25);
+    e.dispatch(static_cast<int>(groups), static_cast<int>(nrp) + chunks, 1,
+               256, 1, 1);
+  });
+}
+
+// "align" mamba cache mode tail-block gather: out[r, j] = block_table[r,
+// max((seq_lens[r] - 1) / block_size, 0) + j] for j < out.size(1).
+void mamba_last_blocks(const at::Tensor& block_table, const at::Tensor& seq_lens,
+                       at::Tensor& out, int64_t block_size) {
+  check_mps_strided(block_table, "block_table");
+  check_mps_strided(seq_lens, "seq_lens");
+  check_mps_strided(out, "out");
+  const auto rows = block_table.size(0);
+  TORCH_CHECK(block_table.scalar_type() == at::kInt && block_table.dim() == 2 &&
+                  block_table.stride(1) == 1,
+              "block_table must be int32 [rows, blocks] with unit column stride");
+  TORCH_CHECK(seq_lens.scalar_type() == at::kInt && seq_lens.is_contiguous() &&
+                  seq_lens.numel() >= rows,
+              "seq_lens must be contiguous int32 [>= rows]");
+  TORCH_CHECK(out.scalar_type() == at::kInt && out.dim() == 2 &&
+                  out.size(0) == rows && out.is_contiguous() &&
+                  out.size(1) <= block_table.size(1),
+              "out must be contiguous int32 [rows, ncols <= blocks]");
+  TORCH_CHECK(block_size > 0, "block_size must be positive");
+  if (rows == 0 || out.size(1) == 0) return;
+  const int32_t bts = static_cast<int32_t>(block_table.stride(0));
+  const int32_t bs = static_cast<int32_t>(block_size);
+  const int32_t nc = static_cast<int32_t>(out.size(1));
+  encode("qc_mamba_last_blocks", [&](TorchEncoder& e) {
+    e.pipeline("mamba_last_blocks");
+    e.in(block_table, 0);
+    e.in(seq_lens, 1);
+    e.out(out, 2);
+    e.bytes(bts, 3);
+    e.bytes(bs, 4);
+    e.bytes(nc, 5);
+    e.dispatch(static_cast<int>(rows), 1, 1, 32, 1, 1);
+  });
+}
+
+// GLM-5.3-Flash indexer pack (glm5_indexer.metal): fused [T, 2D + H]
+// linear output -> packed [T, 2D] (LayerNorm(k) | gate) and fp32 weights
+// [T, H] * scale.
+void glm5_indexer_pack(const at::Tensor& fused, const at::Tensor& norm_w,
+                       const at::Tensor& norm_b, at::Tensor& packed,
+                       at::Tensor& weights, int64_t head_dim, double eps,
+                       double scale) {
+  check_mps_strided(fused, "fused");
+  check_mps_strided(norm_w, "norm_w");
+  check_mps_strided(norm_b, "norm_b");
+  check_mps_strided(packed, "packed");
+  check_mps_strided(weights, "weights");
+  const auto T = fused.size(0);
+  const auto D = head_dim;
+  TORCH_CHECK(D > 0 && D <= 256, "head_dim must be in [1, 256], got ", D);
+  TORCH_CHECK(fused.dim() == 2 && fused.is_contiguous() && fused.size(1) > 2 * D,
+              "fused must be contiguous [T, 2*head_dim + heads], got ",
+              fused.sizes());
+  const auto H = fused.size(1) - 2 * D;
+  TORCH_CHECK(H <= 256, "heads must be <= 256, got ", H);
+  TORCH_CHECK(fused.scalar_type() == at::kBFloat16 ||
+                  fused.scalar_type() == at::kHalf,
+              "fused must be bfloat16/float16");
+  TORCH_CHECK(norm_w.scalar_type() == at::kFloat && norm_w.is_contiguous() &&
+                  norm_w.numel() == D && norm_b.scalar_type() == at::kFloat &&
+                  norm_b.is_contiguous() && norm_b.numel() == D,
+              "norm weight/bias must be contiguous fp32 [head_dim]");
+  TORCH_CHECK(packed.dim() == 2 && packed.size(0) == T && packed.size(1) == 2 * D &&
+                  packed.is_contiguous() &&
+                  packed.scalar_type() == fused.scalar_type(),
+              "packed must be contiguous [T, 2*head_dim] of the fused dtype");
+  TORCH_CHECK(weights.dim() == 2 && weights.size(0) == T && weights.size(1) == H &&
+                  weights.is_contiguous() && weights.scalar_type() == at::kFloat,
+              "weights must be contiguous fp32 [T, heads]");
+  if (T == 0) return;
+  const int32_t d = static_cast<int32_t>(D);
+  const int32_t h = static_cast<int32_t>(H);
+  const float f_eps = static_cast<float>(eps);
+  const float f_scale = static_cast<float>(scale);
+  encode("qc_glm5_indexer_pack", [&](TorchEncoder& e) {
+    e.pipeline("glm5_indexer_pack_" + activation_type_name(fused));
+    e.in(fused, 0);
+    e.in(norm_w, 1);
+    e.in(norm_b, 2);
+    e.out(packed, 3);
+    e.out(weights, 4);
+    e.bytes(d, 5);
+    e.bytes(h, 6);
+    e.bytes(f_eps, 7);
+    e.bytes(f_scale, 8);
+    e.dispatch(static_cast<int>(T), 1, 1, 256, 1, 1);
+  });
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.doc() = "QuixiCore Metal kernels for the Apple Silicon serving path";
 
   m.def("_set_library", &set_library,
         "Point the extension at the compiled quixicore_metal.metallib",
         pybind11::arg("path"));
+  m.def("has_kernel", &has_kernel,
+        "Whether the loaded metallib exposes the named kernel (loads the "
+        "library on first call).",
+        pybind11::arg("name"));
+  m.def("has_tensor_qgemm", &has_tensor_qgemm,
+        "Whether the M5 tensor-ops K-quant GEMM family (qgemm_sm_t*) is "
+        "present in the loaded metallib (cached).");
 
   m.def("cb_census_install", &cb_census_install,
         "Diagnostic: hook the MPS command queue to count command buffers "
         "and accumulate GPU busy time. Idempotent; call from the thread "
         "that owns the MPS stream.");
+  m.def("moe_router_topk", &moe_router_topk,
+        "MoE router: scores (+bias) top-k, unbiased weights, renormalize, "
+        "scale; (weights fp32 [T,K], ids int32 [T,K])",
+        py::arg("gating_output"), py::arg("bias"), py::arg("topk"),
+        py::arg("renormalize"), py::arg("softmax"), py::arg("scale"));
+  m.def("glm5_indexer_pool_logits", &glm5_indexer_pool_logits,
+        "GLM-5.3-Flash pooled indexer logits [R, max_pools] fp32 (-inf past "
+        "the row's visible pools)",
+        py::arg("q"), py::arg("w"), py::arg("ape"), py::arg("cache"),
+        py::arg("block_table"), py::arg("row_req"), py::arg("visible"),
+        py::arg("max_pools"), py::arg("block_size"), py::arg("softmax_scale"));
+  m.def("glm5_indexer_expand_identity", &glm5_indexer_expand_identity,
+        "Identity pooled selection (every pool of every row) expanded to "
+        "tokens + tail into out [R, OUT_W] int32; no logits, no top-k",
+        py::arg("visible"), py::arg("out"), py::arg("kp"), py::arg("ksel"),
+        py::arg("tlen") = std::nullopt);
+  m.def("glm5_indexer_expand_topk", &glm5_indexer_expand_topk,
+        "Expand selected pools (valid first, -1 pad) to tokens + tail into "
+        "out [R, OUT_W] int32",
+        py::arg("sel"), py::arg("visible"), py::arg("out"), py::arg("kp"),
+        py::arg("tlen") = py::none());
+  m.def("paged_row_insert", &paged_row_insert,
+        "cache[slot // BS, slot % BS] = rows[t] (PAD slots < 0 -> block 0 row 0)",
+        py::arg("rows"), py::arg("cache"), py::arg("slot_mapping"));
+  m.def("kv_meta_prepare", &kv_meta_prepare,
+        "One launch: gather every KV group's batch block table and compute "
+        "every group's slot mapping",
+        py::arg("idx_mapping"), py::arg("query_start_loc"), py::arg("positions"),
+        py::arg("params"), py::arg("slot_mappings"), py::arg("block_tables"),
+        py::arg("input_block_tables"), py::arg("num_reqs"),
+        py::arg("num_reqs_padded"), py::arg("num_tokens"),
+        py::arg("num_tokens_padded"));
+  m.def("mamba_last_blocks", &mamba_last_blocks,
+        "out[r, j] = block_table[r, max((seq_lens[r]-1)//bs, 0) + j]",
+        py::arg("block_table"), py::arg("seq_lens"), py::arg("out"),
+        py::arg("block_size"));
+  m.def("glm5_indexer_pack", &glm5_indexer_pack,
+        "Indexer glue: LayerNorm(k) | gate -> packed, weights * scale -> fp32",
+        py::arg("fused"), py::arg("norm_w"), py::arg("norm_b"), py::arg("packed"),
+        py::arg("weights"), py::arg("head_dim"), py::arg("eps"), py::arg("scale"));
   m.def("cb_census_read", &cb_census_read,
         "Diagnostic: (created, completed, gpu_busy_seconds) since install.");
   m.def("residency_pin", &residency_pin,
@@ -6112,6 +7404,41 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "fp32 outputs",
         pybind11::arg("a"), pybind11::arg("b"), pybind11::arg("A_log"),
         pybind11::arg("dt_bias"));
+  m.def("mla_sparse_latent_decode", &mla_sparse_latent_decode,
+        "Sparse NoPE-MLA decode over bf16/f16 latent pages: each query row "
+        "attends indices[row, :] (< 0 pad) via block_table[row, :]; top-k "
+        "list partitioned for occupancy, fp32 online softmax, one rounding.",
+        pybind11::arg("q"), pybind11::arg("kv_cache"),
+        pybind11::arg("block_table"), pybind11::arg("indices"),
+        pybind11::arg("sm_scale"), pybind11::arg("partitions") = 0,
+        pybind11::arg("tlen") = pybind11::none());
+  m.def("kda_recur_prefill", &kda_recur_prefill,
+        "KDA prefill recurrence over prepared fp32 rows (q/k/decay [T, H*Dk], "
+        "v [T, H*Dv], beta [T, H]) against the fp32 [slots, H, Dv, Dk] state "
+        "pool (in place). Returns y [T, H*Dv] fp32. Slot <= 0 = null. rows: value "
+        "rows per simdgroup (0 = VLLM_QC_KDA_RECUR_ROWS default; bit-identical).",
+        pybind11::arg("q"), pybind11::arg("k"), pybind11::arg("v"),
+        pybind11::arg("decay"), pybind11::arg("beta"),
+        pybind11::arg("ssm_state"), pybind11::arg("cu_seqlens"),
+        pybind11::arg("slot_mapping"), pybind11::arg("Dk"), pybind11::arg("Dv"),
+        pybind11::arg("load_initial"), pybind11::arg("rows") = 0);
+  m.def("kda_step", &kda_step,
+        "KDA fused serving step (GLM-5.3-Flash / Kimi-Linear): short conv + "
+        "L2-normalized q/k + per-channel decay gate, per-channel delta-rule "
+        "recurrence over varlen packed tokens against the fp32 [slots, H, Dv, "
+        "Dk] state pool (in place), sigmoid-gated RMSNorm. Slot <= 0 = null.",
+        pybind11::arg("mixed_qkv"), pybind11::arg("g_logits"),
+        pybind11::arg("beta_logits"), pybind11::arg("conv_w"),
+        pybind11::arg("conv_state"), pybind11::arg("ssm_state"),
+        pybind11::arg("cu_seqlens"), pybind11::arg("slot_mapping"),
+        pybind11::arg("A_log"), pybind11::arg("dt_bias"),
+        pybind11::arg("lower_bound"), pybind11::arg("load_initial"),
+        pybind11::arg("norm_weight"), pybind11::arg("z"),
+        pybind11::arg("norm_eps"), pybind11::arg("q_scale"),
+        pybind11::arg("l2_eps"),
+        pybind11::arg("out") = pybind11::none(),
+        pybind11::arg("slot_table") = pybind11::none(),
+        pybind11::arg("num_accepted") = pybind11::none());
   m.def("gdn_recur", &gdn_recur,
         "Gated delta-rule recurrence over varlen packed tokens against the "
         "persistent fp32 [slots, Hv, Dv, Dk] state pool (in-place update)",
@@ -6243,7 +7570,27 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
   m.def("ggml_mul_mat_vec_a8", &ggml_mul_mat_vec_a8,
         "GGUF weight-only GEMV over raw quantized blocks", pybind11::arg("w"),
-        pybind11::arg("x"), pybind11::arg("quant_type"), pybind11::arg("row"));
+        pybind11::arg("x"), pybind11::arg("quant_type"), pybind11::arg("row"),
+        pybind11::arg("out") = pybind11::none());
+  m.def("qc_concurrent_begin", &qc_concurrent_begin,
+        "open a concurrent-dispatch encoder for the following quixicore ops");
+  m.def("qc_concurrent_barrier", &qc_concurrent_barrier,
+        "explicit buffer barrier inside the open concurrent region");
+  m.def("qc_concurrent_end", &qc_concurrent_end,
+        "close the concurrent region (ends its encoder)");
+  m.def("qc_concurrent_active", &qc_concurrent_active,
+        "whether a concurrent region is open");
+  m.def("qc_concurrent_stats", &qc_concurrent_stats,
+        "(regions, dispatches inside regions, barriers inserted)");
+  m.def("ggml_mul_mat_vec_a8_dual", &ggml_mul_mat_vec_a8_dual,
+        "two q8_0 GEMVs (same K, M <= 4) in one dispatch", pybind11::arg("w0"),
+        pybind11::arg("x0"), pybind11::arg("w1"), pybind11::arg("x1"),
+        pybind11::arg("quant_type"), pybind11::arg("row0"),
+        pybind11::arg("row1"));
+  m.def("ggml_mul_mat_vec_a8_pair_swiglu", &ggml_mul_mat_vec_a8_pair_swiglu,
+        "q8_0 gate|up GEMV with the SwiGLU epilogue fused (M <= 4)",
+        pybind11::arg("w"), pybind11::arg("x"), pybind11::arg("row"),
+        pybind11::arg("clamp_limit") = pybind11::none());
 
   m.def("fp8ch_mul_mat_vec", &fp8ch_mul_mat_vec,
         "Compressed-tensors FP8-per-channel W8A16 GEMV (planar e4m3 rows)",
@@ -6278,7 +7625,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("topk_w"), pybind11::arg("top_k"),
         pybind11::arg("quant_type"), pybind11::arg("row"),
         pybind11::arg("tokens"), pybind11::arg("out"),
-        pybind11::arg("soa") = false);
+        pybind11::arg("soa") = false, pybind11::arg("accumulate") = false);
 
   m.def("ggml_moe_mm_id", &ggml_moe_mm_id,
         "MoE tiled GEMM for prefill widths (two-phase map0 + 64x32 simdgroup "
@@ -6328,6 +7675,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("rms_norm", &rms_norm,
         "Weighted RMS norm (vllm ir.ops.rms_norm numerics)", pybind11::arg("x"),
         pybind11::arg("weight"), pybind11::arg("epsilon"));
+  m.def("rms_norm_dual", &rms_norm_dual,
+        "Two packed segments [0,d0) and [d0,d0+d1) of one row-strided input, "
+        "each RMS-normed with its own fp32 weight in one dispatch; returns "
+        "(y0, y1). Per segment bit-exact to rms_norm.",
+        pybind11::arg("x"), pybind11::arg("d0"), pybind11::arg("w0"),
+        pybind11::arg("d1"), pybind11::arg("w1"), pybind11::arg("epsilon"));
 
   m.def("add_rms_norm", &add_rms_norm,
         "Fused residual add + weighted RMS norm: returns (normed, "
