@@ -27500,6 +27500,18 @@ the first arm put its native sm_120 NVFP4 experts on our tree.
   levers are the two lm_head reads (an FP8 channel-wise swapset, ~-200
   us), Marlin's M = 4 efficiency, and an all-reduce + mHC fusion for the
   90 pairs of 8 us launches.
+- CORRECTION (2026-09-15): "60 % of the bandwidth floor" above is wrong,
+  and with it the whole premise of a native expert kernel. It counted
+  2.4 MB per expert per rank, which is gate+up only. An expert's full
+  per-rank footprint is 3.375 MiB: `gate_proj` and `up_proj` are 4.0 MiB
+  packed + 0.5 MiB of E4M3 block scales each and `down_proj` the same,
+  13.5 MiB unsharded over TP4. At M = 4 a layer touches 30 distinct
+  experts of 288 (32 draws), so the pair of launches moves 107.4 MB in
+  69 us = 1556 GB/s. This card reads at 1628 GB/s (measured: a 1 GiB
+  bf16 reduction; 1464 GB/s on a copy). The Marlin expert path is
+  therefore at 96 % of the achievable read bandwidth at decode, with no
+  headroom for any kernel, and the MoE cost is a pure function of the
+  bytes a step's routing touches.
 - Raw: `perf/results/2026-09-14/e6-spec-pass{1,2,3}/`, gates
   `e6-spec-gate{1,2}.json`, `serve-logs/ab-e6-spec.out`.
 
@@ -28889,3 +28901,66 @@ than PyPI 1.3.0), and the FP8 GEMMs.
 - Raw: `perf/results/2026-09-15/z4-record-pass1/`, gate
   `z4-record-gate1.json`, `serve-logs/ab-z4-record.out`, chain
   `serve-logs/z4-chain.out`, boot `serve-logs/serve-20260915-115714.log`.
+
+### Decode roofline audit (2026-09-15): the step is expert-bandwidth-bound, the expert GEMM is at 96 % of the card, and the native expert kernel is dead
+
+- Why: the campaign's standing "next lever" was a native sm_120 NVFP4
+  expert kernel, on the strength of the E6 note that Marlin reads experts
+  at "60 % of the bandwidth floor". That note counted 2.4 MB per expert
+  per rank. Measured from the checkpoint headers, one expert is 13.5 MiB
+  unsharded - `gate_proj` and `up_proj` are 4.0 MiB packed + 0.5 MiB of
+  E4M3 block scales each, `down_proj` the same - so 3.375 MiB per rank at
+  TP4, 1.5x the note's figure.
+- Card ceiling, measured: 1628 GB/s read (a 1 GiB bf16 reduction), 1464
+  GB/s copy. Spec is 1792 GB/s.
+- Checkpoint split: routed experts 178.5 GB, dense backbone 16.8 GB,
+  embed/head/vision 2.5 GB. Decode is almost entirely expert streaming.
+- Expert GEMM: at c1 (M = 4 rows) a layer touches ~30 of 288 experts and
+  its two launches take 69 us, i.e. 107.4 MB at **1556 GB/s = 96 % of the
+  achievable read bandwidth**. At c8 Marlin is 50 % of the step at the
+  same rate (its 8.25 ms/step implies ~86 distinct experts per layer, so
+  real routing is ~17 % more concentrated than uniform). NO KERNEL CAN
+  BEAT THIS; the MoE cost is a pure function of the bytes the routing
+  touches. Item closed before any code was written.
+- Fresh c1 profile of the shipped record (`prof-rec-c1`, 8 steps): GPU
+  90.6 % busy over the trace (9.4 % idle, half of it one warm-up gap), so
+  there is no host stall either. Critical path by union over streams,
+  8.80 ms/step:
+
+  | kernel | ms/step | exclusive | reading |
+  |---|---:|---:|---|
+  | Marlin expert GEMM | 2.153 | 1.345 | at the roofline |
+  | FP8 dense GEMM | 1.987 | 1.075 | 1.45 TB/s on the 25 MB shapes, 0.70 on the 2-4 MB ones |
+  | fused all-reduce + mHC | 1.119 | 1.118 | 89 calls x 12.6 us, all critical path |
+  | cutlass GEMMs | 0.699 | 0.699 | lm_head 4 x 103 us (at the roofline) + 32 x 8.9 us of the drafter's bf16 projections |
+  | KDA / MLA / all-gather / pools | 0.86 | 0.86 | |
+  | MoE glue, sinkhorn, triton | 0.51 | 0.07 | ALREADY hidden under Marlin |
+
+- The MoE glue (route+align 5.2 us, router GEMV 3.3, act_and_mul and
+  moe_sum_add 1.7 each per layer) looks like 0.5 ms/step by kernel time
+  and is 0.07 ms on the critical path: it runs under the Marlin launches.
+  Fusing it would have returned nothing. Same for `sinkhorn_deferred`,
+  which is already on its side stream (0.023 ms exclusive of 0.158).
+- Collective floor (`bench_mhc_ar.py`, world size 4, isolated): at T = 4
+  the pure all-reduce is 5.95 us, the fused all-reduce + transition 13.10,
+  the split all-reduce + Triton pair 15.24. So the fused kernel's 12.6 us
+  in the trace is ~6 us of PCIe floor and ~7 us of transition math, and
+  the fusion is already the better of the two forms below 8 tokens (at
+  T = 16 the split pair wins, 26.9 against 29.7, which is what the record
+  already switches to).
+- Tile sweep of the FP8 decode GEMM (`fp8_nt_sweep.py`, the record's
+  per-rank shapes at M = 4 / 16): the shipped rule (32 rows for N >= 2048)
+  is best on every shape; 16- and 8-row tiles lose 15-40 %. The small
+  shapes (shared gate_up 4.2 MB at 703 GB/s, shared down 2.1 MB at 717)
+  are launch-latency-bound, not tile- or grid-bound - a 188-SM grid
+  argument predicted the opposite and was wrong.
+- Standing conclusion: at c1 the step is 8.80 ms against a ~4.0 ms floor
+  set by the 6.5 GB it must read (4.5 GB experts + ~2 GB dense). The
+  addressable remainder is ~2 ms of exclusive non-streaming work: the
+  transition math (~0.6 ms), the drafter's bf16 projections (0.29 ms),
+  the vocabulary all-gather (0.14 ms) and a tail of 0.1 ms items. A
+  campaign over those is worth perhaps 7-9 % at c1 and 4-6 % at c8, in
+  many small validated steps; there is no single large lever left in
+  decode on this hardware.
+- Raw: `serve-logs/prof-rec-c{1,8}.out`, `profile-spec-rec-c{1,8}/`,
+  `$S/fp8_nt_sweep.py`, `$S/bench_mhc_ar.py`.

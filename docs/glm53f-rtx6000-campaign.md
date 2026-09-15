@@ -1074,10 +1074,13 @@ gh pr view 29 --web                                    # the open PR; CodeRabbit
 slimserve glm53f-nvfp4-4 --serve --spec                # the record with its MTP drafter
 ```
 
-After the PR, in value order: the native sm_120 NVFP4 expert kernel (the
-speculative step at c8 streams ~172 of 288 experts per layer and the Marlin
-path reads them below the card's bandwidth - the one lever that moves every
-shape); the target's quantized numerics, which the acceptance audit leaves
+After the PR, in value order. NOT the native sm_120 NVFP4 expert kernel:
+that item rested on a profile note that counted 2.4 MB per expert per rank
+(gate and up only) when the full per-rank footprint is 3.375 MiB, and with
+the right count the Marlin path moves 107.4 MB per layer in 69 us = 1556
+GB/s against this card's measured 1628 GB/s read ceiling, i.e. 96 % of
+achievable. The expert GEMM is at the memory roofline and no kernel can
+beat it; what remains is the target's quantized numerics, which the acceptance audit leaves
 as the whole remaining draft/target gap (the same MTP head accepts 0.68 per
 draft against our Marlin W4A16 experts + BF16 latents and 0.72 against the
 control's b12x W4A4 + fp8_ds_mla, and the two targets differ by TV 0.19 on
