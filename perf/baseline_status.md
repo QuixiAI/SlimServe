@@ -2667,3 +2667,34 @@ each boot runs warm on prefix-cache hits), needle margins positive, canaries
 text / tool / image pass, exact-token true everywhere. Every item behind the
 row: `perf/optimization_status.md` from the 2026-09-11 rtx6000 entry to
 "Item P6"; the campaign index is `docs/glm53f-rtx6000-campaign.md` section 12b.
+
+## GLM-5.3-Flash NVFP4 on 4x RTX PRO 6000 Blackwell (rtx6000 record), 2026-09-14 closing record
+
+Record of `glm53f-nvfp4-4` / `rtx6000` at the close of the campaign's second
+block (branch `glm53f-rtx6000`, Phase 7 through Item D11), same protocol as
+the 2026-09-12 record above: exact-token 1000/300, three passes per boot,
+median; spec c1 is the five-offset protocol's mean of the three per-pass
+means. Record settings added since 09-12: `prefix_match_unit: 64`, the
+fused all-reduce transition (`glm5_next_mhc_allreduce_fusion`, captured
+decode graphs), the DMA-ring prefill all-reduce with the fp8 all-gather wire
+(`VLLM_B12X_DMA_AR_MIN_MB=24`, `B12X_PCIE_DMA_FP8=ag`), the lm_head FP8
+sidecar (`SLIMSERVE_FP8_SWAPSET=fp8-swapset-lmhead`), the router GEMV, the
+packed indexer projection and fused mHC norm, `swiglu_limit`.
+
+| arm | c1 | c8 | c16 | cold TTFT 32K / 128K | warm TTFT 32K / 128K |
+|---|---:|---:|---:|---|---|
+| record, no speculation | 196.6 | 729.5 | 1014.3 | 2.696 s / 11.226 s | 0.079 s / 0.268 s |
+| record, DFlash2 k=3 probabilistic + block | 265.5 (8.63 ms/step, 2.29 accepted) | 692.5 (2.13-2.21) | 1023.2 (2.28-2.36) | | |
+| alternative, MTP-3 head [[1,4,3],[5,8,1],[9,16,2]] | 272.1 (9.0 ms/step) | 725.4 | 1029.7 | | |
+| 2026-09-12 record, no speculation | 166.2 | 581.5 | 778.0 | 3.14 s / 13.1 s | 0.174 s / 0.354 s |
+| control r28.1, no speculation | 166.5 | 687.9 | 966.8 | 2.93 s / 14.9 s | |
+| control r28.1, MTP-3 | 267.6 (10.0 ms/step, 2.67 accepted) | 732.1 | 1005.8 | | |
+
+Gates: no-spec -2.440 / -2.445, spec -2.440 / -2.452 (band -2.41..-2.47),
+needle margins 12.8-19.6, exact-token true everywhere, 0 of 162 completions
+with the garbage or placeholder signature. The spec c8 / c16 rows of every
+DFlash arm between Item E3 (2026-09-12) and the placeholder fix (2026-09-14)
+were inflated by accepted placeholder drafts and stand only relative to each
+other. Every item behind the row: `perf/optimization_status.md` from
+"2026-09-12: rtx6000 Phase 7" to "Item D11"; the index is
+`docs/glm53f-rtx6000-campaign.md` section 12c.

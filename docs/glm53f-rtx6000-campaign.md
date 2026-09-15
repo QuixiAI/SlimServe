@@ -926,11 +926,95 @@ Final record (2026-09-12, tree 4c1e0a90f): no speculation 166.2 / 581.5 / 778.0,
 
 Phase 6: failed paths deleted (row sharding, the rows kernel's fp8 branch, the diagnosis kill switches), the diff against upstream/main reviewed for dead code and drift, the branch's own hunks formatted with the pinned ruff, notes on the record rewritten, PR opened against QuixiAI/SlimServe main. The four `tests/slimserve/test_profiles.py` failures predate the branch (the Metal `glm53f-q2-1` record's undefined `glm53f-gguf` source and its KV note).
 
+## 12c. Phase 7 and the second decode / prefill blocks (2026-09-12 .. 2026-09-14)
+
+The control (voipmonitor jovian r28.1 on this box, same harness) re-measured
+on 2026-09-12: no speculation 166.5 / 687.9 / 966.8, MTP-3 260.8 / 732.1 /
+1005.8 (five-offset c1 protocol 267.6 at 2.67 accepted per step, 10.0 ms
+per step), cold TTFT 32K 2.93 s, 128K 14.9 s. Every entry is in
+`perf/optimization_status.md` from "2026-09-12: rtx6000 Phase 7" to "Item
+D11"; this is the index (c1 / c8 / c16 tok/s, no speculation unless marked).
+
+Phase 7, the control's decode gap (attribution profiles of both servers, then
+the fixes they pointed at):
+- Item B1, b12x native NVFP4 W4A4 experts at decode: REJECTED (kept for
+  prefill-sized batches only).
+- Item E1, `prefix_match_unit: 64` (hash-granular prefix hits next to the
+  1088-token unified hybrid block): RETAINED. Its follow-up fixed two hybrid
+  KV coordinator defects.
+- Item E2, exact repeats hit P-1 tokens and replay the last token: RETAINED.
+- Item E3, the replayed tail as a promoted decode row on the decode graph,
+  hash-granular hits under speculation: RETAINED (warm TTFT into the
+  control's 30-45 ms range).
+- Item E4, 1-wide decode graphs in the speculative engine and the DFlash
+  context pass inside the drafter's graph: RETAINED.
+- Item E6, native top-k / top-p mask on the verify rows, the drafter's tap
+  projection sharded: RETAINED (spec c1 level with the control).
+
+Second prefill block (cold 32K 3.13 s on the E6 tree):
+- Item P1, persistent partials kernel and token slabs for the mHC transition
+  at prefill: RETAINED (kernel -10 %, TTFT neutral).
+- Item P2, the b12x PCIe DMA-ring all-reduce for prefill-sized messages
+  (`VLLM_B12X_DMA_AR_MIN_MB=24`): RETAINED, cold 32K 3.13 s -> 2.78 s.
+- Item P3, the ring's fp8 all-gather wire (`B12X_PCIE_DMA_FP8=ag`):
+  RETAINED, 2.78 s -> 2.66 s, 128K -5 %.
+- Item P4, bf16 probabilities in the sparse-MLA prefill rows kernel:
+  REJECTED (TTFT neutral).
+
+Second decode block:
+- Item D3, the QuixiCore router GEMV for 288 experts on sm_120: RETAINED
+  (step -1.6 %).
+- Item D1b, the lm_head FP8 channel-wise sidecar (`fp8-swapset-lmhead`):
+  RETAINED (step -1.5 %).
+- Item D4, packed indexer projection and fused mHC norm: RETAINED; the L2
+  weight prefetch: REJECTED in both modes and removed.
+- Item D5, the mHC transition fused into the custom all-reduce
+  (`glm5_next_mhc_allreduce_fusion`, captured decode graphs only): RETAINED
+  (no-spec c1 +4.5 %, spec step -2.8 %). Eager launches of the fused path
+  corrupt later batched steps (mechanism open; the eager path is off).
+- Item D6, the checkpoint's own MTP-3 head on this tree: a split-brain
+  top-k index buffer FIXED; c1 five-offset 276.7 (control +3.4 %), c8 / c16
+  below the control. Served through `speculative_overrides` as the
+  commercially clean alternative.
+- Item D7, the DFlash2 drafter at FP8: REJECTED (step unchanged).
+- Item D9, DFlash2 draft width k = 4 / 5 / 7: REJECTED (k = 3 stays).
+- Item D10, `swiglu_limit` 10.0 in the dense MLP, shared and routed experts:
+  RETAINED (fidelity, throughput neutral).
+- Correctness: a newcomer's spec-width padded tail accepted placeholder
+  drafts ("!!!" prefix) and ran as a prefill chunk: FIXED (placeholder rows
+  verified as -1 in every sampler path, the scheduler padding removed;
+  `tests/kernels/test_rejection_sample_placeholder.py`). Every DFlash spec
+  c8 / c16 reading between E3 and this fix was inflated.
+- Item D11, batch-size draft schedules: REJECTED for the record (nothing
+  beats DFlash2 k=3 beyond the pass spread; the MTP head with
+  [[1,4,3],[5,8,1],[9,16,2]] recorded as the alternative).
+
+Closing arms (z1-final, three passes, 2026-09-14) against the control:
+no speculation 196.6 / 729.5 / 1014.3 (+18 / +6 / +5 %); DFlash2 k=3
+five-offset c1 265.5 (-1 %, at 8.63 ms per step against 10.0), c8 692.5
+(-5 %: 2.13-2.21 accepted per step against the control head's 2.43), c16
+1023.2 (+2 %); cold TTFT 32K 2.70 s (-8 %), 128K 11.2 s (-25 %); warm
+0.079 / 0.268 s. Gates in band, 0 of 162 completions carry the garbage or
+placeholder signature. Cleanup: L2 prefetch and the mHC last-block kernel
+removed, the review's 37 items applied, both extensions rebuilt, the
+cleaned tree re-validated (z3 arms, one pass with gates, canaries, TTFT and
+the Foundry structured c8 workload).
+
 ## 13. Next command
 
 ```bash
 cd ~/Lazarus/SlimServe && git branch --show-current   # glm53f-rtx6000
-gh pr view --web                                       # the open PR; work CodeRabbit's review
+gh pr view 29 --web                                    # the open PR; work CodeRabbit's review
 ```
 
-After the PR: port the retained kernels to QuixiCore-CUDA (decode GEMMs, route+align, moe_sum_add, topk_sample, the rows kernel), then the Phase 2 backlog on this box in this order: the native sm_120 NVFP4 expert kernel (the control's c8/c16 lead), a 32-row-Q sm_120 variant of the fp8 sparse prefill kernel together with a re-measure of FP8 main KV, the host + NVMe KV tiers with the eviction-restore acceptance, TP2 vs TP4 once.
+After the PR, in value order: the native sm_120 NVFP4 expert kernel (the
+speculative step at c8 streams ~172 of 288 experts per layer and the Marlin
+path reads them below the card's bandwidth - the one lever that moves every
+shape); the MTP head's pooled-indexer tail snapshot / restore around the
+draft loop (Item D6's open list: the control accepts 2.67 per step, ours
+2.45); the ~1 ms spec-mode overhead on a k=0 decode step (Item D11) and the
+eager fused-path corruption (Item D5); then the QuixiCore-CUDA port of the
+retained kernels (decode GEMMs, route+align, moe_sum_add, topk_sample, the
+rows kernel, the fused all-reduce transition), a 32-row-Q sm_120 variant of
+the fp8 sparse prefill kernel with a re-measure of FP8 main KV, the host +
+NVMe KV tiers with the eviction-restore acceptance, TP2 vs TP4 once.

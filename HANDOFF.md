@@ -4,20 +4,31 @@
 > Metal. Earlier TurboQuant directives and measurements below are historical.
 > See `perf/optimization_status.md` for current validation evidence.
 
-# HANDOFF — GLM-5.3-Flash NVFP4 on 4x RTX PRO 6000 Blackwell (`glm53f-nvfp4-4` / `rtx6000`), branch `glm53f-rtx6000` (campaign complete 2026-09-12, PR open)
+# HANDOFF — GLM-5.3-Flash NVFP4 on 4x RTX PRO 6000 Blackwell (`glm53f-nvfp4-4` / `rtx6000`), branch `glm53f-rtx6000` (campaign closed 2026-09-14, PR #29 open)
 
 The regimen, rubric, the log of every phase and the next command are in
-`docs/glm53f-rtx6000-campaign.md` (section 12b is the log, 13 the next
-command); every measurement is in `perf/optimization_status.md`. This section
-is the pointer and the one-paragraph state.
+`docs/glm53f-rtx6000-campaign.md` (sections 12b and 12c are the log, 13 the
+next command); every measurement is in `perf/optimization_status.md`. This
+section is the pointer and the one-paragraph state.
 
-State: tree 4c1e0a90f (upstream/main 9d76a981b merged). Exact-token 1000/300
-medians, no speculation: c1 166.2 / c8 581.5 / c16 778.0 tok/s from the
-113.3 / 449.2 / 611.0 bring-up baseline; cold TTFT 32K 3.14 s (from 11.8 s),
-128K 13.1 s (from 124 s); warm 0.174 s / 0.354 s. With the record's
-DFlash2 speculator (`--spec`): 218.0 / 598.1 / 848.4. Gates in band, canaries
-pass. Next: the PR's review, then the QuixiCore-CUDA port of the retained
-kernels and the Phase 2 backlog (native sm_120 NVFP4 expert kernel first).
+State (2026-09-14): exact-token 1000/300 three-pass medians against the
+voipmonitor jovian r28.1 control on the same box. No speculation c1 196.6 /
+c8 729.5 / c16 1014.3 tok/s (control 166.5 / 687.9 / 966.8: +18 / +6 /
++5 %) from the 113.3 / 449.2 / 611.0 bring-up baseline; cold TTFT 32K 2.70 s
+(control 2.93), 128K 11.2 s (control 14.9); warm 0.079 s / 0.268 s. With the
+record's DFlash2 speculator (`--spec`): five-offset c1 265.5 (control's
+MTP-3 267.6; our step 8.63 ms against 10.0, its head accepts more), c8 692.5
+(732.1), c16 1023.2 (1005.8). Gates in band, canaries pass, 0 of 162
+completions carry the garbage or placeholder signature. The cleanup pass
+removed the L2 prefetch and the mHC last-block kernel and applied the
+review's items; both extensions rebuilt and the cleaned tree re-validated.
+Obsolete sidecars on /raid (not deleted, operator's call): in
+/raid/weights/GLM-5.3-Flash-NVFP4/, `fp8-swapset-kda-tp4.{safetensors,json}`
+(6.8 GB), `fp8-swapset-dense.*` (2.4 GB) and `fp8-swapset.*` (6.7 GB) are
+superseded by `fp8-swapset-lmhead.*` (7.3 GB, the record's sidecar). Next:
+PR #29's CodeRabbit review, then the native sm_120 NVFP4 expert kernel (the
+lever for c8 / c16 in both modes) and the MTP head's tail restore (spec c1 /
+c8 acceptance), per campaign doc section 13.
 
 <!--
 The campaign handoffs in this file cover different
