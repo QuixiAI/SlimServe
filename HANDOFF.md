@@ -1577,8 +1577,11 @@ design rather than a local bug.
 - Branch `glm53f-metal-campaign` in worktree `~/Code/slimserve/SlimServe-glm53f`,
   9 commits ahead of `origin/main`, open as PR #30 (QuixiAI/SlimServe),
   reviewed by CodeRabbit (2 rounds) and Astra/codex GPT-6 (1 round), every
-  finding fixed. HEAD 3d56db4c8. Branch from here; rebase onto main when
-  #30 lands.
+  finding fixed. HEAD 3d56db4c8. CONTINUE ON THIS BRANCH AND THIS PR: #30
+  is a DRAFT and stays open until concurrency is fixed, because the
+  operator's call (2026-09-15) is that a profile serving only one request
+  at a time is not a finished feature. Do not open a second PR and do not
+  mark #30 ready until the definition of done below is met.
 - Single-stream, on the final build: loop probe 39.96 tok/s at 2.000
   tok/cycle, off1-2000 gate 34.28 tok/s, prefill 237-258 t/s, needles 4/4,
   teacher-forced vs ds4 29/32 and 62/64. ds4 on the same box: 22.52 tok/s
@@ -1705,6 +1708,9 @@ then re-enable. The trace harness is
 3. Single-stream gates and probe unchanged.
 4. The record's `status` / `status_reason` / `status_detail` come off, its
    notes state the concurrent numbers, and the PR description carries them.
+5. PR #30 comes out of draft (`gh pr ready 30 --repo QuixiAI/SlimServe`),
+   with its title and description updated: the bring-up caveat section goes
+   away and the concurrent numbers join the single-stream table.
 
 ## Mechanics
 
