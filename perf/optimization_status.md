@@ -29015,3 +29015,46 @@ than PyPI 1.3.0), and the FP8 GEMMs.
 - Raw: `perf/results/2026-09-15/acc-k1-{marlin,b12x}-pass{1,2,3}/`, gates
   `acc-k1-{marlin,b12x}-gate1.json`, chains `serve-logs/acc7-chain.out`
   (the failed boot) and `acc7b-chain.out`.
+
+### Item D18: the draft width at c1 (k=2 against the record's k=3, MTP head with the draft cut) - NO CHANGE, the point sits on a flat optimum; and what the c1 measurement's spread does to the margin
+
+- Hypothesis, from the roofline audit: the c1 step is expert-bandwidth-
+  bound, and the draft width sets how many experts a verify step touches
+  (k=3 presents 4 rows and touches ~30 of 288 per layer, k=2 presents 3
+  and touches ~24). A narrower draft buys ~20-25 % of the expert bytes for
+  ~0.3 accepted tokens per step, so the sign is not obvious from either
+  side alone. The record's k=3 at c1 predates both the draft cut and the
+  audit.
+- Paired arms, one chain, same seeds, the five-offset c1 protocol, three
+  passes each, gates and canaries:
+
+  | arm | per-pass means | n | mean | median | sd | tokens/step | per-position |
+  |---|---|---:|---:|---:|---:|---:|---|
+  | d18-c1-k3 (the record) | 266.7 / 280.1 / 290.1 | 15 | 278.9 +- 8.7 | 266.4 | 33.6 | 2.437 | 0.734 / 0.474 / 0.311 |
+  | d18-c1-k2 | 272.8 / 276.6 / 276.8 | 15 | 275.4 +- 5.7 | 275.5 | 22.1 | 2.119 | 0.707 / 0.442 |
+
+  Difference 3.5 tok/s, standard error 10.4: 0.34 standard errors, i.e.
+  level. Gates -2.447 (k=3) and -2.474 (k=2), both in band; canaries pass
+  on both.
+- Reading: the two effects cancel almost exactly. k=2 accepts 13 % fewer
+  tokens per step and runs a step that is 13 % shorter, which is the
+  bandwidth story the audit predicted, and the throughput lands on the
+  same point. The c1 optimum is therefore flat in the draft width, not a
+  peak the record happened to hit: nothing is being left on the table
+  here, and nothing is gained by narrowing. k=2 does have the tighter
+  distribution (sd 22 against 34), which is a latency-predictability
+  argument rather than a throughput one.
+- Decision: NO CHANGE. The record keeps k=3 at batch sizes 1-4; it is the
+  validated width and it is level on the mean.
+- What the spread means for the campaign's c1 claim: pooling every c1 run
+  of the shipped configuration measured on 2026-09-15 (rc3-mtp-mask,
+  z4-record and d18-c1-k3: 35 runs) gives mean 274.1, median 265.1, sd
+  24.8. The comparable statistic against the control's five-offset c1 mean
+  of 267.6 is our mean, so c1 is +2.4 %, but that is ~1.5 standard errors
+  and the median sits just under the control. The honest statement is that
+  c1 is ahead by a couple of percent and that no single arm establishes
+  it; c8 (+5 %) and c16 (+4 %) are several times their spread and are not
+  in any doubt. A single five-offset c1 arm should never be quoted on its
+  own - the per-run range today was 226 to 358 tok/s.
+- Raw: `perf/results/2026-09-15/d18-c1-k{3,2}-pass{1,2,3}/`, gates
+  `d18-c1-k{3,2}-gate1.json`, chain `serve-logs/d18-chain.out`.
