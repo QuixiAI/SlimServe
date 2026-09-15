@@ -170,8 +170,17 @@ behavior:
 
 ## Commit authorship
 
-- Eric Hartford is the sole author. Do not add co-author or assistance
-  trailers, and do not discuss automated assistance in commit messages.
+- Commit as the human running the session, using the repository's configured
+  `user.name` / `user.email`. Never override them and never set
+  `GIT_AUTHOR_*` / `GIT_COMMITTER_*` to a different person: that forges
+  authorship onto commits that person did not write, and unsigned commits
+  give nothing to catch it.
+- The human is the sole author. Do not add yourself as an author or
+  co-author, do not add assistance trailers, and do not discuss automated
+  assistance in commit messages or PR descriptions.
+- This rule has been misread before as "author every commit as the repo
+  owner". It is not. It means: the identity already configured on the
+  machine, and no AI credit lines.
 
 ## Serving policy (standing)
 
