@@ -28964,3 +28964,54 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   decode on this hardware.
 - Raw: `serve-logs/prof-rec-c{1,8}.out`, `profile-spec-rec-c{1,8}/`,
   `$S/fp8_nt_sweep.py`, `$S/bench_mhc_ar.py`.
+
+### Acceptance audit, part 4: the target's expert quantization is NOT the gap either (native W4A4 accepts 0.681 against Marlin W4A16's 0.690)
+
+- The standing hypothesis after part 3 was that the same MTP head accepts
+  0.68 per draft against our Marlin W4A16 experts and 0.72 against the
+  control's native W4A4, because the two targets are different
+  distributions (TV 0.19 on the gate text). Item B1 already ships the
+  native path as an opt-in backend, rejected for decode on speed but
+  correct, so the hypothesis is one arm, not a project. The b12x installed
+  in the venv is byte-identical to the tree inside the control's container
+  (`diff -rq` clean but for `__pycache__`), so this is the control's own
+  expert kernel library over our checkpoint.
+- Protocol: the c8 probe (4 offsets x 3 seeds), the record's drafter and
+  draft cut, k=1 at every batch size, paired the same afternoon. The only
+  variable is the target's expert arithmetic.
+
+  | arm | target experts | tokens/step | per draft | c8 tok/s (12) | gate |
+  |---|---|---|---|---|---|
+  | acc-k1-marlin | Marlin W4A16 (the record) | 1.690 | 0.690 | 769.9 | -2.461 |
+  | acc-k1-b12x | b12x native W4A4 | 1.681 | 0.681 | 677.7 | -2.429 |
+  | control (part 3) | b12x native W4A4, its own tree | 1.723 | 0.723 | 774.1 | -2.573 |
+
+  Canaries text / tool / image PASS on both; `exact: true` throughout.
+- Reading: W4A4 does not raise acceptance here - it is 0.009 lower, i.e.
+  level inside the probe's 3 % spread, and it costs 12 % of c8 throughput
+  (the same rejection Item B1 recorded). So the expert quantization is
+  excluded, and with it the last mechanism the audit could name. The
+  control runs the same head over the same weights with the same expert
+  kernel and still accepts 0.042 more per draft, which now has to come
+  from somewhere other than the experts: the latent cache format (its
+  per-token-scaled `fp8_ds_mla` against our BF16 latents) or the attention
+  and dense path around it. Note the direction that rules out a simple
+  precision story: our latents are the HIGHER-precision pair and accept
+  less, so "closer to the BF16 reference accepts more" is false.
+- Boot finding on the way: a model whose target experts are NVFP4 and
+  whose MTP draft head's experts are FP8 cannot express its choice through
+  one global `moe_backend` - the draft head's FP8 oracle raises
+  ("moe_backend='b12x' is not supported for FP8 MoE") and the boot fails.
+  The arm ran with a staged fallback that leaves the other scheme on its
+  automatic choice with a warning
+  (`$S/stage/patch_fp8_backend_fallback.py`, reverted after the arm). If a
+  mixed-scheme backend choice is ever wanted for serving, the knob needs
+  to be per scheme rather than one name; nothing in the record wants it
+  today.
+- Decision: the audit closes here. Marlin W4A16 stays on the record on
+  throughput, and the 0.04-per-draft acceptance gap is documented as
+  unattributed, bounded by the arms above, and worth about 6 % at c1 to
+  whoever closes it.
+- Raw: `perf/results/2026-09-15/acc-k1-{marlin,b12x}-pass{1,2,3}/`, gates
+  `acc-k1-{marlin,b12x}-gate1.json`, chains `serve-logs/acc7-chain.out`
+  (the failed boot) and `acc7b-chain.out`.

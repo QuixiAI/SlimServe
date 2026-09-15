@@ -1080,12 +1080,28 @@ that item rested on a profile note that counted 2.4 MB per expert per rank
 the right count the Marlin path moves 107.4 MB per layer in 69 us = 1556
 GB/s against this card's measured 1628 GB/s read ceiling, i.e. 96 % of
 achievable. The expert GEMM is at the memory roofline and no kernel can
-beat it; what remains is the target's quantized numerics, which the acceptance audit leaves
+beat it.
+
+What the c1 profile of the shipped record leaves addressable is ~2 ms of
+the 8.80 ms step (the rest is the 6.5 GB it must read): the mHC transition
+math (~0.6 ms/step - 89 fused calls at 12.6 us, of which ~6 us is the PCIe
+all-reduce floor and ~7 us is transition arithmetic), the drafter's bf16
+projections (0.29 ms, 32 cutlass calls at 8.9 us), the vocabulary
+all-gather (0.14 ms) and a tail of 0.1 ms items. That is worth perhaps
+7-9 % at c1 and 4-6 % at c8 in many small validated steps, and it is the
+decode work that remains.
+
+Beside it, and independent of throughput, is the target's quantized numerics, which the acceptance audit leaves
 as the whole remaining draft/target gap (the same MTP head accepts 0.68 per
 draft against our Marlin W4A16 experts + BF16 latents and 0.72 against the
 control's b12x W4A4 + fp8_ds_mla, and the two targets differ by TV 0.19 on
-the gate text) - a W4A4 expert path or an fp8_ds_mla latent cache is the
-experiment, and every point of acceptance is worth ~1.5 % at c1; the ~1 ms spec-mode overhead on a k=0 decode step (Item D11) and the
+the gate text). The expert half of that is now answered and negative: the
+native W4A4 path over the control's own kernel library accepts 0.681 per
+draft against our Marlin W4A16's 0.690, level inside the probe's spread and
+12 % slower (notebook, "Acceptance audit, part 4"), so what is left is the
+latent cache format (its per-token-scaled fp8_ds_mla against our BF16
+latents) or the attention path around it, and every point of acceptance is
+worth ~1.5 % at c1; the ~1 ms spec-mode overhead on a k=0 decode step (Item D11) and the
 eager fused-path corruption (Item D5); then the QuixiCore-CUDA port of the
 retained kernels (decode GEMMs, route+align, moe_sum_add, topk_sample, the
 rows kernel, the fused all-reduce transition), a 32-row-Q sm_120 variant of
