@@ -2698,3 +2698,34 @@ were inflated by accepted placeholder drafts and stand only relative to each
 other. Every item behind the row: `perf/optimization_status.md` from
 "2026-09-12: rtx6000 Phase 7" to "Item D11"; the index is
 `docs/glm53f-rtx6000-campaign.md` section 12c.
+
+## GLM-5.3-Flash NVFP4 on 4x RTX PRO 6000 Blackwell (rtx6000 record), 2026-09-15 final record
+
+Record of `glm53f-nvfp4-4` / `rtx6000` as shipped on branch `glm53f-rtx6000`
+(48c5c8f93), same protocol as the closing record above: exact-token 1000/300,
+three passes per boot; spec c1 is the five-offset protocol's mean over all
+three passes, c8 is offset 0 (its four-offset mean is 773). What changed
+since 09-14: the record's drafter is the checkpoint's own MTP head, resolved
+from the target's own directory (variant `speculator`), with the batch-size
+draft schedule `[[1,4,3],[5,8,1],[9,16,2]]`, probabilistic drafting cut to
+the request's top-k / top-p (`draft_top_k_top_p`) and block verification;
+the drafter's Gumbel noise carries its own salt.
+
+| arm | c1 | c8 | c16 | cold TTFT 32K / 128K | warm TTFT 32K / 128K |
+|---|---:|---:|---:|---|---|
+| record, no speculation | 196.6 | 729.5 | 1014.3 | 2.696 s / 11.226 s | 0.079 s / 0.268 s |
+| record, `--spec` (MTP head, schedule, draft cut) | 270.0 (2.39 accepted/step) | 766.5 (1.67-1.72) | 1046.7 (2.11) | 2.711 s / 11.915 s | 0.087 s / 0.272 s |
+| control r28.1, no speculation | 166.5 | 687.9 | 966.8 | 2.93 s / 14.9 s | |
+| control r28.1, its own MTP-3 | 267.6 | 732.1 | 1005.8 | | |
+| control r28.1, its own MTP at depth 1 (its best c8) | | ~774 | | | |
+
+Against the control: no speculation +18 / +6 / +5 %, with speculation +1 /
++5 / +4 %, cold TTFT -8 % at 32K and -20 to -25 % at 128K; at c8 the record
+matches the control's best configuration of all while beating it elsewhere.
+Structured Foundry c8 workload 545 / 556 tok/s aggregate. Gates -2.480 /
+-2.454 (band), canaries text / tool / image pass, exact-token true
+everywhere. The one open decode gap is acceptance: the same MTP head accepts
+0.68 tokens per draft here and 0.72 in the control's tree, which the audit
+in `perf/optimization_status.md` ("Acceptance audit, part 3") narrows to the
+two trees' target quantization. Every item behind the row: that notebook from
+Item D12 to Item D17; campaign index `docs/glm53f-rtx6000-campaign.md`.

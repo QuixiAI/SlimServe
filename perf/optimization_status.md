@@ -28856,3 +28856,36 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   scratch as the reproducer.
 - Raw: `perf/results/2026-09-15/acc-mtp-k1-t{075,09,115,135}-pass{1,2,3}/`,
   chain `serve-logs/acc6-chain.out`.
+
+### Record validation (z4-record): the record exactly as committed, with no bench overrides at all
+
+- Every arm above set the drafter through `speculative_overrides` with an
+  explicit checkpoint path, so the last thing to check is the record as it
+  ships: `slimserve glm53f-nvfp4-4 --serve --spec` with a clean
+  `slimserve/profiles.json` (the chain refuses to run if it is dirty), the
+  drafter resolved from the variant's own `speculator` entry.
+- Boot: `SpeculativeConfig(method='mtp',
+  model='/raid/weights/GLM-5.3-Flash-NVFP4', num_spec_tokens=3)` with
+  `'draft_top_k_top_p': True` and the batch-size schedule - the draft model
+  is the target's own directory, resolved from `local_dir` under the
+  operator's `SLIMSERVE_CACHE`, so the repo carries no host path. Healthy
+  in 140 s.
+- One full-protocol pass, gate, canaries, TTFT, Foundry workload:
+
+  | shape | z4-record | rc3 (three passes) | control |
+  |---|---|---|---|
+  | c1 five-offset mean | 272.3 [265 / 282 / 284 / 255 / 275] | 263-284 per pass, 270.0 pooled | 267.6 |
+  | c8 offset 0 | 748.5@1.69 | 763-780 | 732.1 |
+  | c8 four-offset mean | 755.5 | 768-777 | 701 (probe), 774 (its depth-1 best) |
+  | c16 | 1006.9@2.08 | 1017-1070 | 1005.8 |
+
+  Cold TTFT 32K 2.700 s, 128K 11.804 s; warm 0.085 / 0.281 s. Foundry
+  structured c8 517 / 565 tok/s. Gate -2.452 (band); canaries text / tool /
+  image PASS; engine e2e mean 2.01 s over 109 requests; `exact: true`
+  everywhere; pooled 1.859 tokens per step.
+- Reading: the shipped record reproduces the candidate arms inside the
+  single-pass spread (c1 at the top of it, c8 and c16 at the bottom), and
+  nothing in the registry path costs throughput. The record stands.
+- Raw: `perf/results/2026-09-15/z4-record-pass1/`, gate
+  `z4-record-gate1.json`, `serve-logs/ab-z4-record.out`, chain
+  `serve-logs/z4-chain.out`, boot `serve-logs/serve-20260915-115714.log`.
