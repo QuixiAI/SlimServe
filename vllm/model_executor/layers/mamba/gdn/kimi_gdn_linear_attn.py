@@ -1181,21 +1181,23 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 cu = m.non_spec_query_start_loc[: num_ns + 1]
                 slots = non_spec_state_indices_tensor[:num_ns]
                 his = m.has_initial_state
-                if his is not None:
-                    # Fresh prefills start from S = 0 / empty ring: zero their
-                    # pool rows once, then every request loads its state.
-                    fresh = (~his[:num_ns].to(torch.bool)) & (slots > 0)
-                    # No host sync (`fresh.any()` cost a 23 ms pipeline
-                    # drain per layer per prefill step): scale the rows of
-                    # every non-spec request by keep = 0/1 instead.
-                    rows = slots.clamp(min=0).to(torch.long)
-                    keep = (~fresh).to(recurrent_state.dtype)
-                    recurrent_state[rows] = recurrent_state[rows] * keep.view(
-                        -1, 1, 1, 1
-                    )
-                    conv_state[rows] = conv_state[rows] * keep.to(
-                        conv_state.dtype
-                    ).view(-1, 1, 1)
+                # Same contract as the Triton prefill path: a fresh prefill
+                # must not resume from a stale pool row.
+                assert his is not None, "prefill requires has_initial_state"
+                # Fresh prefills start from S = 0 / empty ring: zero their
+                # pool rows once, then every request loads its state.
+                fresh = (~his[:num_ns].to(torch.bool)) & (slots > 0)
+                # No host sync (`fresh.any()` cost a 23 ms pipeline
+                # drain per layer per prefill step): scale the rows of
+                # every non-spec request by keep = 0/1 instead.
+                rows = slots.clamp(min=0).to(torch.long)
+                keep = (~fresh).to(recurrent_state.dtype)
+                recurrent_state[rows] = recurrent_state[rows] * keep.view(
+                    -1, 1, 1, 1
+                )
+                conv_state[rows] = conv_state[rows] * keep.to(
+                    conv_state.dtype
+                ).view(-1, 1, 1)
             else:
                 num_ns = T_ns
                 # Decode rows: one shared [0..T] cu per step (the metadata

@@ -122,9 +122,7 @@ def test_grouped_topk_custom_op_dispatch_off_cuda():
         op = GroupedTopk(TOPK, True, 1, 1, "sigmoid", SCALE_F)
     fwd = op._forward_method
     name = getattr(fwd, "__name__", "")
-    assert name in ("forward_mps", "forward_native", "forward_cpu") or (
-        getattr(fwd, "__func__", None) is not None
-    ), name
+    assert name in ("forward_mps", "forward_native", "forward_cpu"), name
 
 
 def _ref_swiglu(x: torch.Tensor, limit: float) -> torch.Tensor:

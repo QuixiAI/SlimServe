@@ -2,8 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Offline plumbing proofs for the GLM-5.3-Flash ``glm5-next`` GGUF.
 
-Runs against a header-only sparse copy of antirez's Q2 file (metadata and
-tensor info only, no tensor data) so nothing here touches weights. Pins:
+Reads only the GGUF header (metadata and tensor info) of antirez's Q2 file,
+so nothing here touches weights: ``SLIMSERVE_GLM53F_GGUF`` names the file,
+else the registry's cache location of the ``glm53f-gguf`` source (what
+``slimserve glm53f-q2-1 -y`` downloads); a header-only sparse copy works too.
+Pins:
 
 * the config derived from ``glm5-next.*`` metadata,
 * the adapter's name map: every tensor in the file is mapped exactly once
@@ -23,6 +26,7 @@ source so the two cannot drift apart silently.
 
 from __future__ import annotations
 
+import os
 import re
 from collections import Counter
 from pathlib import Path
@@ -31,16 +35,27 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-HEADER = Path(
-    "/private/tmp/claude-501/-Users-seangherardi-Code/"
-    "c68e0d45-c4d3-44e3-80c3-00e0c01cb399/scratchpad/glm53q2_head.gguf"
-)
+
+def _gguf_path() -> Path:
+    env = os.environ.get("SLIMSERVE_GLM53F_GGUF")
+    if env:
+        return Path(env).expanduser()
+    from slimserve import registry
+
+    src = registry._registry()["sources"]["glm53f-gguf"]
+    q2 = src["quants"]["Q2"]["files"][0]["path"]
+    return registry.cache_root() / src["local_dir"] / q2
+
+
+HEADER = _gguf_path()
 REPO = Path(__file__).resolve().parents[2]
 CENSUS = REPO / "perf/results/2026-09-10/glm53f-q2-discovery/gguf_header_census.txt"
 MODEL_SRC = REPO / "vllm/model_executor/models/glm5_next.py"
 
 needs_header = pytest.mark.skipif(
-    not HEADER.is_file(), reason="header-only GLM-5.3-Flash GGUF copy not present"
+    not HEADER.is_file(),
+    reason="GLM-5.3-Flash Q2 GGUF not present "
+    "(SLIMSERVE_GLM53F_GGUF or the registry cache)",
 )
 
 F32 = {"F32", "F16", "BF16"}

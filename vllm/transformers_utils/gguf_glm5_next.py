@@ -100,6 +100,11 @@ def _construct(cls, fields: dict[str, Any]):
         return cfg
 
 
+def _optional_int(value: Any) -> int | None:
+    """Token-id keys are optional in GGUF; keep an absent one as None."""
+    return None if value is None else int(value)
+
+
 def text_config_fields_from_gguf(gguf_path: str) -> dict[str, Any]:
     """The text-config dict, straight from ``glm5-next.*`` metadata."""
     r = gguf_reader(str(gguf_path))
@@ -220,8 +225,8 @@ def text_config_fields_from_gguf(gguf_path: str) -> dict[str, Any]:
         # Tokens. eos is the full end-of-generation set (eos/eot/eom), not the
         # single `<|endoftext|>` the model never emits.
         "eos_token_id": stop_token_ids_from_gguf(r),
-        "bos_token_id": int(_field(r, "tokenizer.ggml.bos_token_id")),
-        "pad_token_id": int(_field(r, "tokenizer.ggml.padding_token_id")),
+        "bos_token_id": _optional_int(_field(r, "tokenizer.ggml.bos_token_id")),
+        "pad_token_id": _optional_int(_field(r, "tokenizer.ggml.padding_token_id")),
         **_ARCH_CONSTANTS,
     }
     return fields

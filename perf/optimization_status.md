@@ -78,6 +78,21 @@
 - Raw artifacts: `perf/results/2026-09-14/glm53f-q2-w26-shard/
   {cleanup_exact.log, cleanup_pytest2.log, build_merged.log,
   merged_tests.log, merged_k1/}`.
+- CodeRabbit round 1 on PR #30 (2026-09-15): nine findings fixed - the
+  router kernel is total over NaN (NaN biased scores -> -inf; no mask write
+  at best_i == -1; a row with no finite candidate emits id -1 / weight 0,
+  the sentinel the expert kernels zero; renormalize guards s == 0), the
+  windowed latent scatter parks out-of-window rows with the value the live
+  writer of (b0, 0) carries (duplicate index writes are unordered; new
+  test `test_insert_latent_rows_windowed`), absent GGUF bos/pad ids stay
+  None, the native KDA prefill asserts has_initial_state like the Triton
+  path, and four test hygiene items (dispatch assertion, extension probes,
+  the torch reference forced off the Metal router route, the GGUF fixture
+  path from the registry / SLIMSERVE_GLM53F_GGUF). Skipped: moving the
+  per-wave pins out of baseline_status.md (they are the gate pins
+  perf/perf.md places there). Verify on the fixed kernel (`cr1_k1/`):
+  367 tests, probe 40.01 tok/s at 2.000 tok/cycle, gates 7dd30ea193a6 /
+  393882a2ddaf 34.38 tok/s / 1d7d58486dc7 - pins held.
 
 ## 2026-09-14 - GLM-5.3-Flash Q2 on Metal M1 Ultra: W23 K=2 is economically dead (3rd verify row = ~14 ms of expert bytes); W24 ROOT CAUSE of the weak nextn drafter - its sparse attention read a never-written top-k buffer (attention output ZERO on every extend/decode row); one-line re-pointing fix; W24a/b/c, W25 (iq2_xxs codebook through the TEXTURE UNIT, -23% on the expert kernel, bit-exact) and W26/W26b concurrency: loop probe 34.5 -> 39.9 tok/s (+15.8%), off1-2000 gate 34.23 tok/s, all pins held
 

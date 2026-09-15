@@ -170,6 +170,34 @@ def test_insert_latent_rows(device):
     assert (backing[:, 0] == 2.0).all() and (backing[:, 1] == 2.0).all()
 
 
+@pytest.mark.parametrize("device", DEVICES)
+@torch.no_grad()
+def test_insert_latent_rows_windowed(device, monkeypatch):
+    """The windowed scatter (page view past the 32-bit element range): a
+    live write to a window's first row (b0, 0) must survive the parked
+    out-of-window entries that share that destination."""
+    backing = torch.full((6, 3, BS, DK), 2.0, dtype=torch.bfloat16)
+    cache = backing.to(device)[:, 2]
+    # two blocks per window -> windows [0,2), [2,4), [4,6)
+    monkeypatch.setattr(mm, "_INDEX32_LIMIT", 2 * cache.stride(0))
+    assert mm._page_extent(cache) > mm._INDEX32_LIMIT
+    latent = _rows(6, 7).to(device)
+    slots = torch.tensor(
+        [2 * BS, 5 * BS + 3, 4 * BS, 1 * BS + 2, -1, 3 * BS + 1],
+        dtype=torch.int64, device=device,
+    )
+    mm.insert_latent_rows(cache, latent, slots)
+    full = cache.cpu()
+    for i, s in enumerate(slots.tolist()):
+        if s >= 0:
+            assert torch.equal(full[s // BS, s % BS], latent[i].cpu()), i
+    touched = {(2, 0), (5, 3), (4, 0), (1, 2), (3, 1), (0, 0)}
+    for b in range(6):
+        for t in range(BS):
+            if (b, t) not in touched:
+                assert (full[b, t] == 2.0).all(), (b, t)
+
+
 def _vllm_config(index_topk, kpool, num_spec):
     return SimpleNamespace(
         model_config=SimpleNamespace(

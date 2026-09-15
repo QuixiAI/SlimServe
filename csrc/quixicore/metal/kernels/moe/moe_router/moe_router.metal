@@ -64,7 +64,10 @@ kernel void moe_router_topk(
   }
   for (int i = 0; i < QC_ROUTER_PER_LANE; ++i) {
     const int e = (int)lane + 32 * i;
-    sel[i] = (e < E) ? (has_bias ? score[i] + bias[e] : score[i]) : -INFINITY;
+    const float s = (e < E) ? (has_bias ? score[i] + bias[e] : score[i]) : -INFINITY;
+    // NaN scores (warm-up rows) fall out of the selection: `>` is false for
+    // NaN, which would otherwise leave a lane with no candidate.
+    sel[i] = isnan(s) ? -INFINITY : s;
   }
 
   float w_k = 0.0f;   // lane k holds the k-th selection
@@ -82,12 +85,15 @@ kernel void moe_router_topk(
     const int win_e = simd_min(cand);
     const float win_w = simd_broadcast(
         (best_i >= 0) ? score[best_i] : 0.0f, (ushort)(win_e & 31));
-    if (win_e == best_e) { sel[best_i] = -INFINITY; }
-    if ((int)lane == k) { w_k = win_w; id_k = win_e; }
+    if (best_i >= 0 && win_e == best_e) { sel[best_i] = -INFINITY; }
+    // No finite candidate left on any lane: the negative id the expert
+    // kernels treat as "write zeros", with weight 0.
+    const bool valid = win_e < E;
+    if ((int)lane == k) { w_k = valid ? win_w : 0.0f; id_k = valid ? win_e : -1; }
   }
   if (renormalize) {
     const float s = simd_sum(((int)lane < K) ? w_k : 0.0f);
-    w_k = w_k / s;
+    w_k = (s > 0.0f) ? w_k / s : w_k;
   }
   w_k *= scale;
   if ((int)lane < K) {

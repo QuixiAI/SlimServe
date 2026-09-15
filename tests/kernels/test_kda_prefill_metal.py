@@ -16,7 +16,7 @@ DEV = "mps"
 def _available():
     from vllm.quixicore import quixicore_ops
 
-    return quixicore_ops.is_available() and hasattr(quixicore_ops, "kda_recur_prefill")
+    return quixicore_ops.is_available() and quixicore_ops.has("kda_recur_prefill")
 
 
 @pytest.mark.parametrize("lens", [[7], [1, 5, 3], [64, 1, 130], [300]])

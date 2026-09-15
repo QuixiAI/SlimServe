@@ -121,7 +121,15 @@ def _scatter_rows(
         inwin = (blk >= b0) & (blk < b1)
         local = torch.where(inwin, blk - b0, 0)
         loff = torch.where(inwin, off, 0)
-        sub[local, loff] = torch.where(inwin[:, None], vals, sub[0, 0][None, :])
+        # Out-of-window entries are parked on (b0, 0). Duplicate index
+        # writes land in an undefined order, so every writer of that slot
+        # must agree: if a live entry of this call targets (b0, 0) the parked
+        # rows carry its value, otherwise the row's current contents. Slots
+        # are unique within a call, so the masked sum is that one row. No
+        # host sync.
+        hit = (inwin & (local == 0) & (loff == 0)).to(vals.dtype)
+        park = (vals * hit[:, None]).sum(0) + (1 - hit.sum().clamp(max=1)) * sub[0, 0]
+        sub[local, loff] = torch.where(inwin[:, None], vals, park[None, :])
 
 
 def insert_latent_rows(

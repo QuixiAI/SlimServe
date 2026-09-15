@@ -25,16 +25,23 @@ def _qc():
     "T,E,K", [(1, 288, 8), (7, 288, 8), (64, 256, 6), (3, 1000, 32)]
 )
 @pytest.mark.parametrize("dtype", [torch.float32])
-def test_router_matches_grouped_topk(scoring, with_bias, renorm, T, E, K, dtype):
+def test_router_matches_grouped_topk(
+    scoring, with_bias, renorm, T, E, K, dtype, monkeypatch
+):
     # fp32 logits only (the serving case: GLM routes in fp32). The torch
     # chain on bf16 logits rounds every op to bf16 and picks different
     # experts at near-ties, so the Metal route is gated to fp32 and bf16 is
     # not compared here.
     tol = 2e-6
+    from vllm.model_executor.layers.fused_moe.router import grouped_topk_router
     from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import (
         grouped_topk,
     )
 
+    # The reference is the torch chain: keep grouped_topk off the Metal
+    # route whatever the environment (the flag is cached once computed).
+    monkeypatch.setenv("VLLM_METAL_MOE_ROUTER", "0")
+    monkeypatch.setattr(grouped_topk_router, "_METAL_ROUTER", False)
     qc = _qc()
     torch.manual_seed(0)
     dev = "mps"

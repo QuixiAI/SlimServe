@@ -17,7 +17,9 @@ DEV = "mps"
 def _qc():
     from vllm.quixicore.ops import quixicore_ops
 
-    if not quixicore_ops.has_kernel("kda_recur_spec_d128"):
+    if not quixicore_ops.is_available() or not quixicore_ops.has_kernel(
+        "kda_recur_spec_d128"
+    ):
         pytest.skip("kda spec kernels not built")
     return quixicore_ops
 
