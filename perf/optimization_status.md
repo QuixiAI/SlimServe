@@ -28389,3 +28389,171 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   `perf/results/2026-09-14/z3-{clean-nospec,clean-spec,mtp-sched}-pass1/`,
   `serve-logs/ab-z3-*.out`, `serve-logs/workload-z3-*.json`, chain
   `serve-logs/final-chain.out`.
+
+### Item D12: a BF16 draft head for the MTP layer (m1-mtp-bf16head) - REJECTED, mechanism removed
+
+- Hypothesis: the drafter scores its proposals with the target's lm_head,
+  which on this record is the FP8 swap-set's channel-wise head; the
+  control's MTP draft scores with a BF16 head. A dense BF16 copy of the
+  checkpoint's lm_head for the draft (loaded from the shard the index
+  names) might lift acceptance toward the control's.
+- Arm (MTP-3 head, five-offset c1, two passes, gate): c1 means 256.4 /
+  262.8 [296@2.74 226@2.09 262@2.43 251@2.32 248@2.28 | 284@2.64 289@2.67
+  268@2.47 262@2.41 212@1.95]; pooled 2.375 tokens per step (1737 accepted
+  over 1263 drafts); per-position 0.72 / 0.44 / 0.26; step 9.24 ms (9.19-
+  9.30); gate -2.448.
+- Reading: no acceptance gain - the FP8-head MTP arms pool at 2.35-2.45
+  over the same protocol (z2-mtp-dyn1 c1 draws 2.02-3.04, z3-mtp-sched
+  2.05-2.64) - and the step is 2 % longer (9.24 against 9.03 ms: the BF16
+  head GEMV streams twice the bytes of the FP8 head over the 151K vocab).
+  The target's FP8 head error is shared by a draft that uses the same head,
+  so the two distributions stay correlated; a separate BF16 head only
+  decorrelates them.
+- Decision: REJECTED. The option (`glm5_next_mtp_draft_head`), the shard
+  loader and the sharing guard in `eagle/utils._should_share` were removed
+  before the next arm; the drafter keeps the target's head.
+- Raw: `perf/results/2026-09-14/m1-mtp-bf16head-pass{1,2}/`,
+  `serve-logs/ab-m1-mtp-bf16head.out`, chain `serve-logs/m1-chain.out`.
+
+### Item D13: index sharing across the MTP draft steps (`index_share_for_mtp_iteration`, m2-mtp-share) - the arm ran with the mechanism INACTIVE; re-measured through the config override below
+
+- Mechanism (the control's, and what the checkpoint config declares): the
+  draft's sparse-MLA indexer runs its top-k only on the draft's prefill
+  step; steps 1+ reuse those rows (`skip_topk` on the draft's mla_attn),
+  after the prefill step the rows of each request's last token are
+  compacted to the front of the shared `topk_indices_buffer`. Ours:
+  `Glm5NextMultiTokenPredictor.set_skip_topk` / `compact_topk_indices`,
+  four lifecycle hooks on the autoregressive speculator
+  (`on_prefill_begin/end`, `on_multi_step_decode_begin/end`, called from
+  `capture` and `propose`), and `MTPSpeculator` implementing them when the
+  draft config sets the flag and the model exposes both methods.
+- Arm (BF16 head still on, five-offset c1, two passes, gate): 248.6 /
+  271.4 [247@2.27 285@2.66 265@2.46 244@2.23 202@1.87 | 237@2.18 355@3.33
+  232@2.14 283@2.59 250@2.30]; pooled 2.351; per-position 0.69 / 0.43 /
+  0.27; step 9.24 ms (9.14-9.38); gate -2.439; 0 signatures.
+- Reading, corrected after the arm: the draft config override
+  (`SpeculativeConfig.hf_config_override`) sets
+  `index_share_for_mtp_iteration: False` on the GLM draft config ("validate
+  GLM's pooled-tail state before enabling"), and the speculator reads the
+  flag from that config, so `share_mtp_topk_indices` was False and the
+  hooks never toggled `skip_topk`: m2 is a repeat of m1 (same pooled
+  acceptance and step within noise), not a measurement of the mechanism.
+  The mechanism is switched on without a code change through the record's
+  `speculative_overrides` (`index_share_for_mtp_iteration: true`, which the
+  config plumbs onto the draft config); the acceptance chain 2 below
+  measures it on the c8 probe. The same mechanism was retained on the
+  Qwen3.8-Flash QSA record (+6.1 % at c8, 2026-08 entry).
+- Decision: code kept (the model's declared inference behaviour, inert
+  until the override enables it); verdict with the chain-2 reading.
+- Raw: `perf/results/2026-09-14/m2-mtp-share-pass{1,2}/`,
+  `serve-logs/ab-m2-mtp-share.out`, chain `serve-logs/m2-chain.out`,
+  patch `$S/stage/patch_index_share.py`.
+
+### Acceptance audit, part 1: the control accepts 2.45 tokens per step pooled, not 2.67; its verification rule is standard, ours is block
+
+- The 2.67 quoted for the control's MTP-3 head (Item D11's reading) was
+  the mean of ten five-offset c1 draws; the per-request spread of this
+  protocol is 1.9-3.5 accepted per step (the same prompt at seeds 42 / 43
+  drew 2.18 and 3.52 on the control). Pooled over every 2026-09-14
+  control run (10268 accepted over 7074 drafts, 21222 draft tokens) the
+  control's head accepts 2.45 per step; its per-position log means are
+  0.69 / 0.44 / 0.30. Ours over the same protocol: 2.35-2.45 pooled,
+  0.69 / 0.43 / 0.27. The gap is inside the draw noise of a five-draw
+  mean; whether any of it is real needs a pooled measurement over many
+  prompts, which the acceptance chain below provides.
+- The control serves `draft_sample_method: probabilistic` with
+  `rejection_sample_method: standard` (its non-default args); the record's
+  `--spec` overrides run probabilistic drafts under `block` verification.
+  Both trees carry the same block-verification kernel (Sun et al. 2024,
+  the cumulative joint ratio, the residual-mass acceptance `h`, the
+  backward max over positions) and the same Leviathan rule; ours differs
+  only in the placeholder (-1) handling and the temperature being applied
+  before the draft logits are stored (bit-identical at temperature 1.0).
+  Block verification is at least as long as standard in expectation for
+  the same draft, so a measured shortfall would point at draft quality,
+  not the rule.
+
+### Acceptance audit, part 2: the c8 probe (32 prompts x 3 seeds) - the control accepts 2.38 per step, DFlash2 2.24, the MTP head 2.21; the verification rule is not the difference
+
+- Protocol (`$S/acc_chain.sh`, `acc_summary.py`, `acc_table.py`): the exact
+  bench at c8 on four prompt offsets (0 / 500 / 1000 / 1500 -> 32 distinct
+  1000-token prompts), 300 output tokens, seeds 42 / 43 / 44 (three passes),
+  Prometheus spec counters pooled per arm (~12-13K verify steps, ~38K draft
+  tokens each). The control ran the same shapes and seeds in its container.
+
+  | arm | tokens/step (pooled) | per-draft acceptance | per-position | c8 tok/s (mean of 12) | step |
+  |---|---|---|---|---|---|
+  | control MTP-3 (probabilistic + standard) | 2.378 | 0.459 | 0.668 / 0.404 / 0.240 | 701.4 | 27.1 ms |
+  | ours MTP-3, block | 2.213 | 0.404 | 0.646 / 0.368 / 0.198 | 656.9 | 26.9 ms |
+  | ours MTP-3, standard | 2.214 | 0.405 | - | 645.8 | 27.4 ms |
+  | ours DFlash2 k=3, block (record) | 2.239 | 0.413 | - | 701.2 | 25.5 ms |
+
+  Per shape (tok/s @ tokens/step): control 735@2.44 / 672@2.28 /
+  712@2.46 / 686@2.35 at offsets 0 / 500 / 1000 / 1500; ours MTP block
+  634@2.15 / 644@2.20 / 674@2.26 / 675@2.25; DFlash2 722@2.26 / 685@2.23 /
+  696@2.27 / 703@2.21.
+- Reading: block and standard verification accept the same (2.213 vs
+  2.214), so the rule is not the gap; the same MTP head accepts 7 % fewer
+  tokens per step in our tree than in the control's, spread over every
+  position (position 1 -3 %, conditionals 0.57 / 0.54 against 0.60 /
+  0.59), with the shortfall varying 3-12 % by prompt set. It is draft /
+  target agreement, i.e. numerics somewhere in the drafter's inputs, its
+  own path, or the target's distribution (the FP8 swap-set covers the KDA
+  and dense projections and the head). DFlash2 accepts as much as our MTP
+  head on this set and its step is 1.4 ms shorter, so at c8 on the broad
+  probe the record is level with the control (701 vs 701); the official
+  offset-0 set is where the control's head is strongest (2.44) and the
+  record trails (722 vs 735 here, 692 vs 732-740 in the closing arms).
+- The MTP head's c8 step is 26.9 ms against DFlash2's 25.5: its draft
+  prefill step runs the MTP layer's FP8 experts on all 32 rows (up to 288
+  distinct experts x 6.3 MB per rank) where only 8 rows feed drafts;
+  Item D14 (row selection, the control's prefill-output compaction)
+  addresses that.
+- Next probes (acceptance chain 2): the BF16 twins (`SLIMSERVE_FP8_SWAPSET=0`),
+  index sharing through the config override, k=1 on both trees (the
+  first-position gap in isolation), the control's fidelity gate.
+- Raw: `perf/results/2026-09-14/acc-{mtp-block,mtp-std,dflash,control}-pass{1,2,3}/`,
+  `serve-logs/ab-acc-*.out`, `serve-logs/control-acc.out`,
+  `serve-logs/control-acc-control.log`, chain `serve-logs/acc-chain.out`.
+
+### Item D14: row selection for the MTP drafter's prefill step (the control's prefill-output compaction) - RETAINED (c16 +2-3 %, c1 step -1.3 %, c8 within noise)
+
+- Hypothesis: the draft's prefill step runs the MTP layer on every scheduled
+  row (k+1 per request: 32 at c8, 64 at c16) but only each request's last
+  row feeds a draft; attention must see every row (it owns the layer's
+  latent and pool caches), the experts, norm and head need not. The
+  control selects the tail rows before its MoE (`set_prefill_output_indices`).
+- Implementation (`$S/stage/patch_prefill_compact.py`): `Glm5NextMTP.forward`
+  takes `output_rows`; the block `index_select`s the attention output and
+  the residual after attention, so the shared experts, routed experts,
+  final norm and head run on the selected rows. The speculator passes the
+  request tails (`last_token_indices`) on the prefill step and the
+  identity (`row_identity[:num_tokens]`) on decode steps so the
+  AOT-compiled forward keeps one specialization (guards are off under AOT
+  compile; an optional-tensor argument would have been traced once and
+  then silently misapplied). `_prefill` reads rows `[:num_reqs]` of the
+  compact output instead of gathering by index. Other drafters (DFlash2,
+  EAGLE) are untouched (`selects_output_rows` defaults False).
+- Paired arms (MTP-3 head, block, two seeded passes, gate + canaries):
+
+  | arm | c1 five-offset means | c1 step | c8 (4 offsets) | c16 |
+  |---|---|---|---|---|
+  | d14-mtp-base | 264.2 / 266.5 (draws 2.13-2.80) | 8.98 ms | 656.9 mean (acc-mtp-block, same tree) | 935.7@2.34 / 948.7@2.30 (39.4 ms) |
+  | d14-mtp-rows | 284.3 / 239.2 (draws 1.74-3.00) | 8.86 ms | 653 / 670 per pass, 662 mean | 967.3@2.30 / 957.2@2.29 (38.1 ms) |
+
+  Pooled acceptance unchanged (rows 2.264 over c1/c8/c16; c8 rows
+  2.15-2.38 against 2.15-2.26); gate -2.444 (base -2.475; band); canaries
+  text / tool / image pass on both; recompile of the draft's AOT graph
+  took 5 s. The c1 means swing with the draws (the step, tok/s x
+  accepted, is the stable reading).
+- Reading: the saving is the draft-prefill MoE's rows, 1.3 ms at c16 (64
+  -> 16 rows), 0.1 ms at c1; at c8 (32 -> 8 rows) it is inside the pass
+  spread, so the MTP draft's 26.9 ms c8 step (DFlash2 25.5) is not mainly
+  that MoE. The MTP head stays behind DFlash2 at c8 / c16 (662 / 962
+  against 701 / 1023) on acceptance (2.2-2.3 against 2.24-2.38) and step.
+- Decision: RETAINED (no cost, correctness intact, the control's
+  behaviour). The record's drafter is still DFlash2; the MTP head's
+  standing depends on the acceptance audit.
+- Raw: `perf/results/2026-09-14/d14-mtp-{base,rows}-pass{1,2}/`, gates
+  `d14-mtp-*-gate1.json`, `serve-logs/ab-d14-mtp-*.out`, chain
+  `serve-logs/d14-chain.out`.

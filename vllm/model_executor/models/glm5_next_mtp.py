@@ -19,6 +19,7 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.sequence import IntermediateTensors
 
 from .deepseek_mtp import (
     DeepSeekMTP,
@@ -59,13 +60,18 @@ class Glm5NextMTPBlock(DeepseekV2DecoderLayer):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-    def forward(self, positions, hidden_states, residual=None):
+    def forward(self, positions, hidden_states, residual=None, output_rows=None):
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         hidden_states = self.self_attn(positions, hidden_states)
+        if output_rows is not None:
+            # Attention ran every row (it owns the layer's latent and pool
+            # caches); only the selected rows feed the experts and the head.
+            hidden_states = hidden_states.index_select(0, output_rows)
+            residual = residual.index_select(0, output_rows)
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         return self.mlp(hidden_states), residual
 
@@ -87,6 +93,7 @@ class Glm5NextMTPLayer(DeepSeekMultiTokenPredictorLayer):
         previous_hidden_states: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
         spec_step_index: int = 0,
+        output_rows: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # DeepSeek's layer zeroes the embedding at absolute position 0; GLM's
         # head was trained without that mask (the reference implementation
@@ -99,7 +106,10 @@ class Glm5NextMTPLayer(DeepSeekMultiTokenPredictorLayer):
             )
         )
         hidden_states, residual = self.mtp_block(
-            positions=positions, hidden_states=hidden_states, residual=None
+            positions=positions,
+            hidden_states=hidden_states,
+            residual=None,
+            output_rows=output_rows,
         )
         hidden_states = residual + hidden_states  # pre-final-norm (logits hidden)
         # Recycle the post-final-norm hidden into the next draft step;
@@ -140,9 +150,45 @@ class Glm5NextMultiTokenPredictor(DeepSeekMultiTokenPredictor):
         )
         self.logits_processor = LogitsProcessor(config.vocab_size)
 
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        previous_hidden_states: torch.Tensor,
+        inputs_embeds: torch.Tensor | None = None,
+        spec_step_idx: int = 0,
+        output_rows: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
+        current_step_idx = spec_step_idx % self.num_mtp_layers
+        return self.layers[str(self.mtp_start_layer_idx + current_step_idx)](
+            input_ids,
+            positions,
+            previous_hidden_states,
+            inputs_embeds,
+            current_step_idx,
+            output_rows,
+        )
+
+    def set_skip_topk(self, skip: bool) -> None:
+        """index_share_for_mtp_iteration: steps 1+ reuse step 0's top-k rows."""
+        for layer in self.layers.values():
+            layer.mtp_block.self_attn.mla_attn.skip_topk = skip
+
+    def compact_topk_indices(self, row_ids: torch.Tensor) -> None:
+        """Gather the top-k rows at ``row_ids`` to the front of the buffer."""
+        num_rows = row_ids.numel()
+        self.topk_indices_buffer[:num_rows] = self.topk_indices_buffer[row_ids]
+
 
 @support_torch_compile
 class Glm5NextMTP(DeepSeekMTP):
+    # The speculator passes `output_rows` on every forward (the request
+    # tails on the draft's prefill step, the identity on decode steps), so
+    # the AOT-compiled forward has one specialization.
+    selects_output_rows = True
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         nn.Module.__init__(self)
         self.config = _draft_config(vllm_config)
@@ -151,6 +197,25 @@ class Glm5NextMTP(DeepSeekMTP):
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
         self.set_moe_parameters()
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        spec_step_idx: int = 0,
+        output_rows: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.model(
+            input_ids,
+            positions,
+            hidden_states,
+            inputs_embeds,
+            spec_step_idx,
+            output_rows,
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         params = dict(self.named_parameters())
