@@ -4134,3 +4134,42 @@ TP4 = 36 MLA + 18 indexer + 4 KDA state pages; 106 at TP8 = 68 + 34 + 4.
 - Remaining levers after this program: prefill MoE/mHC/NCCL shares (see the
   with-kernel profile in the notebook), the KDA deferred commit (~2%), the
   W8A16 dense path (parity, gated off), per-replica dynamic draft length.
+
+## 2026-09-15 11:20: the rtx6000 record's drafter switched to the checkpoint's MTP head; the tree is ahead of the control everywhere
+
+- RECORD glm53f-nvfp4-4/rtx6000 now registers the checkpoint's own MTP
+  head as its drafter (variant `speculator`, `local_dir` = the target's,
+  so the draft model is the target's own directory and no host path is in
+  the repo), with the batch-size schedule `[[1,4,3],[5,8,1],[9,16,2]]`,
+  probabilistic drafting cut to the request's top-k / top-p, block
+  verification. DFlash2 (cc-by-nc-nd-4.0) stays the a100 variant's.
+- Exact-token 1000/300, three passes, against the voipmonitor jovian
+  r28.1 control on this box: no speculation 196.6 / 729.5 / 1014.3 vs
+  166.5 / 687.9 / 966.8 (+18 / +6 / +5 %); with speculation 270.0
+  (five-offset c1 mean) / 766.5 / 1046.7 vs 267.6 / 732.1 / 1005.8
+  (+1 / +5 / +4 %), and level at c8 with the control's best-ever
+  configuration (its head at depth 1, ~774); cold TTFT 2.71 s / 11.9 s vs
+  2.93 s / 14.9 s; warm 0.087 / 0.272 s; Foundry structured c8 545 / 556
+  tok/s. Gates in band, canaries pass, every run `exact: true`.
+- Acceptance audit closed (notebook "part 3"): the MTP head accepts 0.68
+  per draft here against 0.72 in the control's tree on the same weights.
+  Excluded: the FP8 swap-set, the verification rule (block = standard),
+  index sharing, the draft cache dtype, the native sampler kernels, the
+  draft expert kernel, the hidden-state handoff, the router, the indexer.
+  What is left is the two targets' quantized numerics (TV 0.19 on the gate
+  text, argmax agreement 74 %, ours the sharper): our Marlin W4A16 experts
+  + BF16 latents against the control's b12x W4A4 + fp8_ds_mla. That is the
+  next experiment and the only remaining decode gap.
+- Adopted from the control: the draft-noise salt (`DRAFT_NOISE_SALT`), an
+  output-bias fix - our draft draw shared its (seed, position) key with
+  the verifier's residual resample.
+- Rejected and removed this block: a BF16 draft head (D12), index sharing
+  on this record (D13, within noise), the draft temperature scale (D17,
+  the request's own temperature is the peak).
+- Harness: chains now gate on `ruff --select F` before any arm (a staged
+  `unique_name` typo cost a 90-minute arm at its boot), and `ab2.sh` /
+  `stop_server.sh` kill by pre-collected PID and wait for the API server
+  (an orphaned arm's pattern kill had killed the next arm's server).
+- NEXT: the sm_120 NVFP4 expert kernel and the target-numerics experiment
+  above; then the ~1 ms k=0 spec-mode overhead and the eager fused-path
+  corruption.

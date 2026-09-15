@@ -979,7 +979,9 @@ Second decode block:
 - Item D7, the DFlash2 drafter at FP8: REJECTED (step unchanged).
 - Item D9, DFlash2 draft width k = 4 / 5 / 7: REJECTED (k = 3 stays).
 - Item D10, `swiglu_limit` 10.0 in the dense MLP, shared and routed experts:
-  RETAINED (fidelity, throughput neutral).
+  RETAINED (fidelity, throughput neutral: 181.4 / 716.6 / 1019.6 against the
+  same kernels without the clamp, the D4 prefetch-off arm's 181.2 / 718.1;
+  raw `perf/results/2026-09-14/s1-swiglu-{nospec,spec}-pass1/`).
 - Correctness: a newcomer's spec-width padded tail accepted placeholder
   drafts ("!!!" prefix) and ran as a prefill chunk: FIXED (placeholder rows
   verified as -1 in every sampler path, the scheduler padding removed;
@@ -1000,19 +1002,87 @@ removed, the review's 37 items applied, both extensions rebuilt, the
 cleaned tree re-validated (z3 arms, one pass with gates, canaries, TTFT and
 the Foundry structured c8 workload).
 
+Post-closing block (2026-09-14 .. 09-15), the MTP drafter and the
+acceptance audit (the control's head accepts more per step than ours; the
+audit hunts the cause in our tree):
+
+- Item D12, a BF16 draft head for the MTP layer: REJECTED (acceptance
+  unchanged; mechanism removed).
+- Item D14, row selection for the MTP drafter's prefill step (the control's
+  prefill-output compaction): RETAINED (c16 +2-3 %, c1 step -1.3 %, c8
+  within noise).
+- Item D13, index sharing across the MTP draft steps
+  (`index_share_for_mtp_iteration`): the first arm ran with the mechanism
+  inactive (the draft config override pinned it off); re-measured through
+  the record's `speculative_overrides` on the c8 probe (+2 %, level
+  acceptance) and the full protocol (c8 +1.5 %, c16 -2 %, tokens/step 2.254
+  against 2.264): within noise. Hooks kept, NOT enabled on the record.
+- Acceptance audit, parts 1-3 (`$S/acc*_chain.sh`, the c8 probe: 4 prompt
+  offsets x 3 seeds, pooled Prometheus counters): the control's shipped
+  MTP-3 accepts 2.38-2.45 tokens per step against our MTP head's 2.21-2.29
+  and DFlash2's 2.24; at depth 1 the control accepts 0.723 per draft, ours
+  0.676 (c8 774 against 751; offset 0: 780 / 775 against 793 / 786 / 793).
+  EXCLUDED as the cause: the verification rule (block = standard), the FP8
+  swap-set, index sharing, the draft KV dtype (the record's target KV is
+  BF16 and the draft inherits it), the native sampler kernels (Triton
+  paths level), the draft expert kernel (Marlin FP8 W8A16 in both), the
+  hidden-state handoff, the router, the indexer. What remains: the two
+  targets differ (TV 0.19 on the gate text, argmax agreement 74 %; ours is
+  the sharper) - the control's b12x W4A4 experts + fp8_ds_mla latents
+  against our Marlin W4A16 + BF16 KV, not settled on this box. Adopted on
+  the way: the control's draft-noise salt (an output-bias fix, not an
+  acceptance lever).
+- Harness incident (2026-09-14 23:33): killing a queued chain that had
+  already started its arm orphaned that arm; its stop's pattern kill hit
+  the next chain's freshly launched server. `ab2.sh` / `stop_server.sh`
+  now kill by pre-collected PID and wait for the API server. The orphaned
+  arm's data (D13 full protocol) was complete and is what the entry above
+  reports.
+- Item D16, the drafter drawing under the request's top-k / top-p
+  (`draft_top_k_top_p`): RETAINED (exact under rejection sampling; +0.008
+  accepted per draft at k=1, +0.03 tokens per step at k=3). The dead-draw
+  share is about 1 %, not the tenth the gate text suggested: the head is
+  far sharper than the target.
+- Item D17, the draft's own temperature (`draft_temperature_scale`):
+  REJECTED, mechanism removed. The scan peaks at the request's own
+  temperature (0.675 / 0.679 / 0.684 / 0.663 / 0.589 per draft at 0.75 /
+  0.9 / 1.0 / 1.15 / 1.35), so the head is correctly temperature-coupled
+  and its shortfall is distribution shape, not sharpness.
+- Item D15, THE RECORD SWITCH: the checkpoint's own MTP head with the
+  batch-size draft schedule [[1,4,3],[5,8,1],[9,16,2]] and the draft cut
+  is now the `rtx6000` variant's registered drafter (the variant carries
+  its own `speculator` whose `local_dir` is the target's, as the qwen38
+  MTP records do, so the draft model is the target's own directory and no
+  host path enters the repo). Three passes, gates, canaries, TTFT and the
+  Foundry workload: c1 270.0 (five-offset mean) / c8 766.5 / c16 1046.7
+  against the control's 267.6 / 732.1 / 1005.8 (+1 / +5 / +4 %), and level
+  at c8 with the control's best configuration of all (its head at depth 1,
+  ~774). The DFlash2 drafter (cc-by-nc-nd-4.0) stays the a100 variant's.
+
+Closing state (2026-09-15) against the voipmonitor jovian r28.1 control:
+no speculation +18 / +6 / +5 % (196.6 / 729.5 / 1014.3 against 166.5 /
+687.9 / 966.8); with speculation +1 / +5 / +4 % (270.0 / 766.5 / 1046.7
+against 267.6 / 732.1 / 1005.8); cold TTFT -8 % at 32K and -20 to -25 % at
+128K (2.71 s / 11.2-11.9 s against 2.93 s / 14.9 s); warm 0.087 / 0.272 s.
+The tree is ahead of the control at every measured shape.
+
 ## 13. Next command
 
 ```bash
 cd ~/Lazarus/SlimServe && git branch --show-current   # glm53f-rtx6000
-gh pr view 29 --web                                    # the open PR; work CodeRabbit's review
+gh pr view 29 --web                                    # the open PR; CodeRabbit's review is answered
+slimserve glm53f-nvfp4-4 --serve --spec                # the record with its MTP drafter
 ```
 
 After the PR, in value order: the native sm_120 NVFP4 expert kernel (the
 speculative step at c8 streams ~172 of 288 experts per layer and the Marlin
 path reads them below the card's bandwidth - the one lever that moves every
-shape); the MTP head's pooled-indexer tail snapshot / restore around the
-draft loop (Item D6's open list: the control accepts 2.67 per step, ours
-2.45); the ~1 ms spec-mode overhead on a k=0 decode step (Item D11) and the
+shape); the target's quantized numerics, which the acceptance audit leaves
+as the whole remaining draft/target gap (the same MTP head accepts 0.68 per
+draft against our Marlin W4A16 experts + BF16 latents and 0.72 against the
+control's b12x W4A4 + fp8_ds_mla, and the two targets differ by TV 0.19 on
+the gate text) - a W4A4 expert path or an fp8_ds_mla latent cache is the
+experiment, and every point of acceptance is worth ~1.5 % at c1; the ~1 ms spec-mode overhead on a k=0 decode step (Item D11) and the
 eager fused-path corruption (Item D5); then the QuixiCore-CUDA port of the
 retained kernels (decode GEMMs, route+align, moe_sum_add, topk_sample, the
 rows kernel, the fused all-reduce transition), a 32-row-Q sm_120 variant of

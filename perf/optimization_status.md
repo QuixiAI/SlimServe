@@ -28193,6 +28193,11 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   expert. This tree never wired it: `DeepseekV2MLP` and the fused-MoE
   activation ran the plain SiLU-gated product, a silent departure from
   the reference numerics on every token.
+- Baseline: the same kernel set without the clamp, the D4 prefetch-off
+  isolation arm (`d4-iso-nopf`, no speculation, c1 181.2 / c8 718.1).
+- Hypothesis: clamping the gate and up projections to the checkpoint's
+  `swiglu_limit` restores the reference numerics at no measurable step
+  cost (the clamp rides in the existing activation kernels).
 - Change: `silu_and_mul(swiglu_limit)` helper in deepseek_v2.py
   (`DeepseekV2MLP(swiglu_limit=)`, `DeepseekV2MoE` hands it to the shared
   experts and `FusedMoE(swiglu_limit=)`), the dense MLP in glm5_next.py.
@@ -28204,6 +28209,9 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   c1 181.2 / c8 718.1; no c16 in that arm): within noise. Gates: mean
   text logprob -2.470 / -2.453 against the D4 levers arm's -2.463 /
   -2.491; needle margins 13.4-17.5 against 13.6-18.0.
+- Raw: `perf/results/2026-09-14/s1-swiglu-{nospec,spec}-pass1/`, gates
+  `s1-swiglu-{nospec,spec}-gate{1,2}.json`; baseline `d4-iso-nopf-pass1/`,
+  `d4-levers-{nospec,spec}-gate{1,2}.json`.
 - Decision: RETAINED as a fidelity fix; no throughput claim.
 
 ### Correctness: a newcomer's padded tail step accepted three placeholder drafts ("!!!" prefix, corrupted context) - FIXED
@@ -28557,3 +28565,294 @@ than PyPI 1.3.0), and the FP8 GEMMs.
 - Raw: `perf/results/2026-09-14/d14-mtp-{base,rows}-pass{1,2}/`, gates
   `d14-mtp-*-gate1.json`, `serve-logs/ab-d14-mtp-*.out`, chain
   `serve-logs/d14-chain.out`.
+
+### Item D13 re-measured: index sharing across the MTP draft steps on the full protocol - within noise (c8 +1.5 %, c16 -2 %, acceptance level); kept as inert hooks, not enabled
+
+- Baseline: d14-mtp-rows (the same tree, MTP-3 head, block, sharing off;
+  two seeded passes, gate, canaries, 2026-09-14).
+- Hypothesis: with the draft's indexer top-k run once per verify step and
+  reused across draft steps 2 and 3 (`index_share_for_mtp_iteration: true`
+  through the record's `speculative_overrides`, the checkpoint's declared
+  inference behaviour), the draft's steps shorten and the drafts see the
+  rows the control's drafter sees, so acceptance and c8 / c16 rise. The
+  c8 probe (acceptance audit, part 3) had read +2 % (674.6 against 656.9)
+  at level acceptance (2.228 against 2.213).
+- Arm (d13-mtp-share; the chain that launched it was killed while the arm
+  was already running, the arm itself completed on its own - the harness
+  incident is recorded in the part-3 entry below; the data is complete):
+
+  | arm | c1 five-offset means (pass 1 / 2) | c8 by offset (0 / 500 / 1000 / 1500, means of 2) | c16 | tokens/step pooled (passes) | per-position |
+  |---|---|---|---|---|---|
+  | d14-mtp-rows | 264.2 / 239.2 | 649 / 650 / 707 / 640 (661) | 962 (967 / 957) | 2.264 | 0.67 / 0.39 / 0.22 |
+  | d13-mtp-share | 251.5 / 263.2 | 633 / 672 / 729 / 657 (673) | 940 (955 / 926) | 2.254 (2.228 / 2.281) | 0.670 / 0.389 / 0.223 |
+
+  Gate -2.4525 (rows -2.444; band); canaries text / tool / image PASS;
+  engine e2e latency mean 2.10 s over 215 requests; 0 signatures.
+- Reading: the draft's indexer top-k on steps 2 and 3 is a small part of
+  the draft step at these batch sizes (the MTP layer runs on 8-16 rows;
+  the top-k over a 1000-token pool is one small kernel per step), so the
+  shortening is inside the pass spread, and the drafts' rows do not
+  change what the head accepts (2.254 against 2.264 pooled, every
+  position level). The +2 % of the c8 probe was one sample of the 3 %
+  arm-to-arm spread (the acc3 no-op arm measured 2.286 on the same
+  config). c16 -2 % (940 against 962) is also inside that spread.
+- Decision: hooks kept (inert without the override, the mechanism the
+  config declares, retained on the Qwen record where it measured +6 %),
+  NOT enabled on the rtx6000 record; the record-candidate arm (rc) runs
+  without it.
+- Raw: `perf/results/2026-09-14/d13-mtp-share-pass{1,2}/`, gate
+  `d13-mtp-share-gate1.json`, `serve-logs/ab-d13-mtp-share.out`;
+  baseline `d14-mtp-rows-pass{1,2}/`.
+
+### Acceptance audit, part 3: the swap-set, index sharing, the draft KV dtype and the native sampler kernels are all excluded; the two targets differ (TV 0.19 on the gate text) and the draft's dead draws are the lever
+
+- Question: the checkpoint's own MTP head accepts 0.723 per draft in the
+  control's tree (k=1, c8 probe) and 0.676 in ours - same head, same
+  weights. Which of our tree's differences costs the 0.047?
+- Arms (the c8 probe of part 2: 4 offsets x 3 seeds, 300 tokens, pooled
+  Prometheus counters; every arm the MTP head with block verification):
+
+  | arm | what changes | tokens/step | per draft | per-position | c8 tok/s (mean of 12) |
+  |---|---|---|---|---|---|
+  | acc-mtp-block (part 2) | reference | 2.213 | 0.404 | 0.646 / 0.368 / 0.198 | 656.9 |
+  | acc-mtp-bf16 | `SLIMSERVE_FP8_SWAPSET=0`: the FP8 KDA / dense / lm_head sidecars off | 2.218 | 0.406 | 0.646 / 0.373 / 0.204 | 629.7 |
+  | acc-mtp-share | `index_share_for_mtp_iteration: true` | 2.228 | 0.409 | 0.647 / 0.368 / 0.199 | 674.6 |
+  | acc-mtp-bf16kv | `kv_cache_dtype: auto` on the draft (a no-op: the draft inherits the target's `auto`, and the record's target KV IS BF16) - a variance sample | 2.286 | 0.429 | 0.661 / 0.398 / 0.223 | 679.0 |
+  | acc-mtp-tri | `VLLM_QC_DISABLE_NATIVE=1`: the Triton top-k/top-p mask, Gumbel and flatten paths | 2.227 | 0.409 | 0.645 / 0.372 / 0.204 | 669.0 |
+  | acc-mtp-k1 | k=1 | 1.676 | 0.676 | 0.679 | 750.8 (offset 0: 793 / 786 / 793) |
+  | acc-mtp-k1-tri | k=1, native sampler kernels off | 1.678 | 0.678 | 0.676 | 744.5 |
+  | acc-control-k1 | the control at MTP depth 1 | 1.723 | 0.723 | 0.742 | 774.1 (offset 0: 780 / 775 / 754) |
+
+  Gates (`gate.py --top 20`, 44,786 positions of the same text on both
+  servers): ours mean text logprob -2.44 / -2.47 (arms), the control -2.57
+  / -2.61; sharpness ours top-1 logprob -0.801, top-5 mass 0.779, top-20
+  mass 0.879, top-20 entropy 1.288, actual-is-top-1 0.530; the control
+  -0.791 / 0.782 / 0.885 / 1.311 / 0.510.
+- Reading, exclusions: the FP8 swap-set (2.218 vs 2.213), the verification
+  rule (part 2), index sharing (2.228; +2 % on this probe, within noise on
+  the full protocol - Item D13 above), the draft KV dtype (there is
+  nothing to change: the record serves the target's KV as BF16 and the
+  draft inherits it), the native sampler kernels (k=1 0.678 vs 0.676, k=3
+  2.227 vs 2.213), the draft expert kernel (Marlin FP8 W8A16 in both
+  trees), the hidden-state handoff (post-final-norm in both), the router
+  (bit-exact unit test), the indexer (the probe's 1,300-token pools are
+  under the top-2048, so every row is attended in both). Calibration: the
+  arm-to-arm spread on this probe is up to 3 % (the no-op arm read 2.286
+  against 2.213 - 2.228), so the 0.047-per-draft gap at k=1 (2.8 % of
+  1.676) is at the edge of what the probe resolves, though it is
+  consistent across every k=1 / k=3 pairing.
+- Reading, what remains: the two targets are not the same distribution.
+  On the gate text the total variation between our top-20 and the
+  control's is 0.186 mean (median 0.159, p90 0.415), the argmax agrees at
+  74 % of positions, and 4.4 % of our top-20 mass sits outside the
+  control's top-20 (5.0 % the other way). Ours is the sharper of the two
+  (top-1 logprob, entropy, actual-is-top-1, mean text logprob all say so).
+  The head was trained against the BF16 model, and whichever quantized
+  target sits closer to it accepts more; that is the control's b12x W4A4
+  experts + fp8_ds_mla latent cache against our Marlin W4A16 + BF16 KV,
+  and it is not settled by these probes (the BF16 model does not fit the
+  box).
+- Finding on the way (adopted): the control salts its drafter's Gumbel
+  noise (`_DRAFT_NOISE_SALT = 1 << 30`, `positions + 1`, `is_drafting`);
+  ours keyed the draft draw at (seed, position + 1) unsalted, the same key
+  the verifier's residual resample uses for that row. Verification is a
+  probability-ratio test, not a Gumbel coupling, so a shared noise vector
+  biases the resample toward the token the noise favoured (an output
+  bias, not an acceptance effect). `$S/stage/patch_draft_salt.py` adds
+  `DRAFT_NOISE_SALT` and `is_drafting=True` on the three draft draws, with
+  `tests/v1/sample/test_gumbel_draft_salt.py` (applied by the rc chain).
+- The lever this leaves (Item D16 below): both trees draw the draft from
+  its full distribution and cut only the target to top-k 20 / top-p 0.95
+  at verification (`_copy_request_inputs`: "ignore ... top_k and top_p, for
+  simplicity and performance"). On the gate text the target's top-20 holds
+  0.88 of its mass, so a draft that matched the target exactly would still
+  waste about a tenth of its draws outside the target's support. Cutting
+  the draft the same way is exact under rejection sampling and is a lever
+  the control does not pull.
+- Raw: `perf/results/2026-09-14/acc-{mtp-bf16,mtp-share,mtp-bf16kv,mtp-tri,mtp-k1,mtp-k1-tri,control-k1}-pass{1,2,3}/`,
+  gates `acc-mtp-bf16-gate1.json`, `acc-mtp-k1-tri-gate1.json`,
+  `acc-control-k1-gate1.json`, `rc-control-gate-gate1.json` (sharpness
+  records); chains `serve-logs/{acc2,acc3,acc4}-chain.out`,
+  `control-acc-k1.out`, `control-rc-gate.out`.
+
+### Item D15: the record candidate - the MTP head with the batch-size schedule [[1,4,3],[5,8,1],[9,16,2]] on the full protocol (rc-mtp-sched) - ahead of the control at c8 / c16, level at c1; the drafter switch waits on D16
+
+- Baseline: the committed record (DFlash2 k=3, z1-final three-pass medians
+  265.5 / 692.5 / 1023.2) and the control (shipped MTP-3 267.6 five-offset
+  / 732.1 / 1005.8; its depth-1 c8 ~774).
+- Hypothesis: at c8 the k=1 verify streams half the experts of k=3 (the
+  acceptance chain 2 probe read 790 at offset 0 against 660-690), at c1
+  k=3 is worth its rows, at c16 k=2 (Item D11's reading); the schedule
+  gives each shape its width, so the one drafter beats DFlash2 at every
+  shape and the control at c8 / c16.
+- Tree: 49f13739a + the CodeRabbit round-2 fixes, the cleanup rename, the
+  draft-noise salt, the mHC width guard (rebuilt), index sharing off.
+  First launch (2026-09-14 23:55) died at boot on the staged DMA-ring
+  hunk's `unique_name` (for `self.unique_name`; ruff had flagged it, the
+  chain did not gate on lint - it does now); relaunched 10:11.
+- Arm (three seeded passes, two gates, canaries, TTFT, Foundry c8):
+
+  | shape | pass 1 | pass 2 | pass 3 | median | control (shipped) | control best |
+  |---|---|---|---|---|---|---|
+  | c1 five-offset mean (tok/s @ accepted/step) | 305.5 [315@2.80 322@2.85 254@2.25 395@3.60 241@2.12] | 257.5 [246@2.17 288@2.56 231@2.03 268@2.35 254@2.21] | 262.8 [222@1.96 308@2.75 258@2.27 245@2.17 281@2.47] | 262.8 | 267.6 | - |
+  | c8 offset 0 | 749.0@1.70 | 760.9@1.69 | 757.1@1.68 | 757.1 | 732.1 | ~774 (depth 1) |
+  | c8 four-offset mean | 764 | 765 | 762 | 764 | 701 (probe) | 774 (probe) |
+  | c16 | 1020.1@2.10 | 1056.8@2.09 | 1020.3@2.09 | 1020.3 | 1005.8 | - |
+
+  Per shape over the three passes: c1 259@2.26 / o2000 261@2.26 / o4000
+  306@2.71 / o6000 248@2.18 / o8000 303@2.58; c8 756@1.69 / o500 778@1.67
+  / o1000 763@1.68 / o1500 758@1.68; c16 1032@2.09. Cold TTFT 32K 2.70 s,
+  128K 11.8 s (control 2.93 / 14.9); warm 0.087 / 0.280 s. Foundry
+  structured c8 480 / 548 tok/s (DFlash2 record 448 / 541; the MTP
+  schedule arm of D11 453 / 556). Gates -2.436 / -2.425 (band; sharpness
+  top-20 mass 0.879, entropy 1.29); canaries text / tool / image PASS;
+  engine e2e mean 1.84 s over 321 requests; every run `exact: true`.
+- Reading: c8 +3.4 % over the control's shipped head and level with its
+  depth-1 best (757 against ~774 at offset 0, 764 against 774 on four
+  offsets: the same k=1 verify, the control's head accepting 0.72 per
+  draft against our 0.68); c16 +1.4 %; c1 level (the five-offset mean
+  swings 257-305 with the draws; the per-shape three-pass figures, 248-306,
+  bracket the control's 267.6). Against the committed DFlash2 record: c8
+  +9 %, c16 level, c1 level. The candidate beats the control's shipped
+  config at every shape but only by the c8 margin the schedule buys; the
+  acceptance shortfall (audit part 3) caps c1 and c16 where k=3 / k=2
+  drafts carry the win.
+- Decision: the drafter switch (the variant carrying the checkpoint's own
+  MTP head as its `speculator`, `$S/stage/patch_record_mtp.py`) waits on
+  Item D16 (the draft cut), measured next on the c8 probe and then on this
+  protocol (rc3).
+- Raw: `perf/results/2026-09-15/rc-mtp-sched-pass{1,2,3}/`, gates
+  `rc-mtp-sched-gate{1,2}.json`, `serve-logs/ab-rc-mtp-sched.out`, chains
+  `serve-logs/rc-chain.out` (the failed boot, `serve-20260914-235449.log`)
+  and `rc2-chain.out`.
+
+### Item D16: the drafter draws under the request's top-k / top-p (`draft_top_k_top_p`) - RETAINED (exact; +1 % accepted per draft at k=1 and k=3, at the edge of the probe's resolution)
+
+- Baseline: the MTP head on the c8 probe, k=1 0.676 / 0.678 per draft
+  (native / Triton sampler paths), k=3 2.213 - 2.228 tokens/step (block,
+  share, Triton arms; the no-op arm's 2.286 marks the spread).
+- Hypothesis: the verifier cuts the target to the request's top-k 20 /
+  top-p 0.95 and the drafter draws from its full distribution (upstream's
+  "ignore top_k and top_p, for simplicity and performance"; the control
+  does the same), so every draw that lands outside the target's cut is
+  rejected outright. On the gate text the target's top-20 holds 0.88 of
+  its mass, so a draft matched to the target would waste up to a tenth of
+  its draws; cutting the draft the same way is exact under rejection
+  sampling (any proposal recovers the target) and should lift acceptance.
+- Implementation (`$S/stage/patch_draft_masks.py`, in-tree):
+  `SpeculativeConfig.draft_top_k_top_p` (requires probabilistic
+  drafting); the runner binds the sampler's `SamplingStates` to the
+  drafter; `_copy_request_inputs` notes the batch's cutoffs from the
+  states' CPU copies (any top-k, any top-p, whether every row's k fits the
+  native cutoff kernel's 1..32); `sample_draft` tempers a fresh FP32 copy
+  of the head's logits, cuts them in place with the native
+  `topk_topp_mask` (or upstream's Triton op when a row's k is wider) and
+  draws with the temperature already applied, so the tempered, cut logits
+  are what the verifier reads as the proposal. `mask_draft_logits` is a
+  module function; `tests/v1/sample/test_draft_sampling_masks.py` checks
+  it against the verifier's own cut ops (native and fallback) and that 50
+  Gumbel draws never leave the cut. DFlash2 has its own candidate path
+  (already a 16-candidate proposal) and is untouched.
+- Arms (c8 probe, three seeds):
+
+  | arm | tokens/step | per draft | per-position | c8 tok/s (12) |
+  |---|---|---|---|---|
+  | acc-mtp-k1 / -tri (no cut) | 1.676 / 1.678 | 0.676 / 0.678 | 0.679 / 0.676 | 750.8 / 744.5 |
+  | acc-mtp-k1-mask | 1.684 (1.687 / 1.681 / 1.684) | 0.684 | 0.683 | 758.0 |
+  | acc-mtp-block / -tri (no cut) | 2.213 / 2.227 | 0.404 / 0.409 | 0.646 / 0.368 / 0.198 | 656.9 / 669.0 |
+  | acc-mtp-mask | 2.245 (2.266 / 2.256 / 2.213) | 0.415 | 0.653 / 0.384 / 0.221 | 680.0 |
+
+  Gate -2.432 (band).
+- Reading: +0.008 per draft at k=1 and +0.03 tokens/step at k=3, every
+  position up a little, both inside the probe's 3 % spread. The dead-draw
+  share on the model's own generations is about 1 %, not the tenth the
+  gate text (natural prose, flatter) suggested: the head is far sharper
+  than the target, so its draws seldom leave the target's cut - the 0.68
+  acceptance is the head putting too much mass on its argmax where the
+  target spreads it (an accept ratio p/q below 1 on the very tokens both
+  rank first). That points at the draft's own temperature (Item D17).
+- Decision: RETAINED, on for the MTP record (exact, a 10 MB copy and one
+  cutoff kernel per draft step, a small consistent gain); the cut is the
+  draft's, not a change to what the verifier accepts.
+- Raw: `perf/results/2026-09-15/acc-mtp-{k1-mask,mask}-pass{1,2,3}/`, gate
+  `acc-mtp-k1-mask-gate1.json`, chain `serve-logs/acc5-chain.out` (the
+  first launch died on its own unit test - the native cutoff row must
+  have k <= 32; relaunched as acc5b into the same log).
+
+### Item D15, second arm (rc3-mtp-mask): the candidate with the draft cut (D16) on - c8 767 / c16 1047 / c1 263 against the control's 732 / 1006 / 268
+
+- The rc2 arm re-run with `draft_top_k_top_p: true` (everything else the
+  same tree and protocol; three seeded passes, two gates, canaries, TTFT,
+  Foundry c8):
+
+  | shape | pass 1 | pass 2 | pass 3 | median | rc2 median | control (shipped) | control best |
+  |---|---|---|---|---|---|---|---|
+  | c1 five-offset mean (tok/s @ accepted/step) | 263.4 [262@2.30 253@2.23 287@2.56 250@2.21 265@2.35] | 262.7 [253@2.24 281@2.49 263@2.32 264@2.32 252@2.20] | 283.5 [261@2.32 296@2.62 271@2.40 291@2.59 298@2.67] | 263.4 | 262.8 | 267.6 | - |
+  | c8 offset 0 | 780.0@1.67 | 762.9@1.69 | 766.5@1.75 | 766.5 | 757.1 | 732.1 | ~774 (depth 1) |
+  | c8 four-offset mean | 773 | 768 | 777 | 773 | 764 | 701 (probe) | 774 (probe) |
+  | c16 | 1046.7@2.12 | 1017.5@2.10 | 1069.5@2.10 | 1046.7 | 1020.3 | 1005.8 | - |
+
+  Per shape over the three passes: c1 272@2.39 / o2000 258@2.28 / o4000
+  277@2.44 / o6000 274@2.42 / o8000 269@2.36 (every offset 258-277: the
+  draws were calmer than rc2's 248-306); c8 770@1.67 / o500 751@1.70 /
+  o1000 770@1.70 / o1500 799@1.72; c16 1045@2.11. Cold TTFT 32K 2.71 s,
+  128K 11.9 s; warm 0.087 / 0.272 s. Foundry structured c8 545 / 556
+  tok/s (rc2 480 / 548). Gates -2.480 / -2.454 (band); canaries PASS;
+  engine e2e mean 1.82 s over 321 requests; `exact: true` throughout.
+- Reading: against the control's shipped configuration c8 +4.7 %, c16
+  +4.1 %, c1 +0.9 % (the five-offset mean over all three passes is 270.0
+  against its 267.6; the per-pass means, 263 / 263 / 284, swing with the
+  draws, so the pooled per-offset figures above are the reading);
+  against its best c8 configuration
+  (depth 1) level, 767 against ~774 at offset 0 and 773 against 774 on
+  the four-offset probe. Against the committed DFlash2 record c8 +11 %,
+  c16 +2 %, c1 level. The cut's +1 % per draft reads as +1-3 % at c8 /
+  c16 here, inside the pass spread but in the same direction as the
+  probe.
+- Decision: this is the record candidate's configuration unless the
+  draft-temperature scan (D17) moves acceptance; the switch itself
+  (`$S/stage/patch_record_mtp.py`) follows that reading.
+- Raw: `perf/results/2026-09-15/rc3-mtp-mask-pass{1,2,3}/`, gates
+  `rc3-mtp-mask-gate{1,2}.json`, `serve-logs/ab-rc3-mtp-mask.out`, chain
+  `serve-logs/rc3-chain.out`.
+
+### Item D17: the draft's own temperature (`draft_temperature_scale`) - REJECTED, mechanism removed (the request's temperature is already the peak)
+
+- Baseline: Item D16's arm, the MTP head at k=1 on the c8 probe with the
+  draft cut on, 0.684 accepted per draft (c8 758.0).
+- Hypothesis: rejection sampling recovers the target distribution from any
+  proposal, so the draft's sharpness costs nothing and only its agreement
+  with the target matters. D16 showed the head is far sharper than the
+  target (its draws almost never leave the target's cut, yet only 0.68 of
+  them survive the ratio test), which reads as too much mass on its own
+  argmax - so a flatter draft should be accepted more often, and the
+  optimum need not be the request's temperature.
+- Implementation (staged, `$S/stage/patch_draft_temp.py`, reverted after
+  the scan): `SpeculativeConfig.draft_temperature_scale` multiplying the
+  drafter's copy of the request temperature in `_copy_request_inputs`
+  (every drafter draws from that buffer, and the verifier reads the
+  tempered logits the draw stores, so one multiply covers the whole path;
+  greedy rows stay at 0).
+- Scan (c8 probe, k=1, three seeds each, the draft cut on):
+
+  | scale | tokens/step | per draft | c8 tok/s (12) |
+  |---|---|---|---|
+  | 0.75 | 1.675 | 0.675 | 748.8 |
+  | 0.90 | 1.679 | 0.679 | 773.3 |
+  | 1.00 (D16) | 1.684 | 0.684 | 758.0 |
+  | 1.15 | 1.663 | 0.663 | 742.6 |
+  | 1.35 | 1.589 | 0.589 | 728.3 |
+
+- Reading: the curve peaks at the request's own temperature and falls off
+  either side, steeply on the flat side (1.35 costs 0.095 per draft, 14 %
+  of the acceptance). So the head is not mis-scaled against this target:
+  its 0.68 is disagreement in the distribution's shape, not its sharpness
+  - consistent with the audit's conclusion that the gap is the target's
+  quantization, not the drafter's sampling. It also says the MTP head is
+  correctly temperature-coupled to the target, which is the property a
+  mis-wired draft head would fail.
+- Decision: REJECTED; the config field and the multiply are removed from
+  the tree (nothing is left gated off). `patch_draft_temp.py` stays in
+  scratch as the reproducer.
+- Raw: `perf/results/2026-09-15/acc-mtp-k1-t{075,09,115,135}-pass{1,2,3}/`,
+  chain `serve-logs/acc6-chain.out`.
