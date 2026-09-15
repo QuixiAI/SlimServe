@@ -2701,6 +2701,83 @@ graph capture for the hybrid GDN+MTP decode, Gemma-aware fused norm+quant.
   `glm53f-tp8-handoff-baseline/` (c16 after CPU isolation). Repeat spreads,
   commands, traces and correctness details are in the optimization notebook.
 
+## GLM-5.3-Flash NVFP4 glm53f-nvfp4-8 - sparse prefill kernel record, 2026-09-12 (current)
+- Same configuration as the fixed k=2 record below plus the sparse MLA
+  prefill kernel (additional_config glm5_next_sparse_prefill: prefill
+  chunks attend in groups of 4 queries on tensor cores over the union of
+  their selected pools instead of the per-token decode kernel).
+- Sustained load (`vllm bench serve` random 1000/300 +-20%, 10 x
+  concurrency prompts, ignore_eos), same-protocol A/B on the k=2 tree:
+  | | c64 | c128 |
+  | prefill kernel on | 1508 (TPOT 38 ms) | 1864 (61 ms) |
+  | off | 1417 (41 ms) | 1674 (68 ms) |
+- Exact-token medians unchanged within spread (the harness prefills in
+  one burst): c8 564-630 / c16 851-877 / c64 1453-1490 in the A/B arms
+  against the k=2 record's 567 / 876 / 1414. Canaries pass; WildChat
+  deep-context leg c8: 845 turns, 0 errors, 135/135 recall, sessions to
+  704K tokens with VLLM_KV_TIER_VERIFY=1 (785 turns before the kernel).
+  Raw: perf/results/2026-09-12/glm53f-sparse-prefill-{1,0}/,
+  glm53f-leg-sparse-prefill/.
+
+## GLM-5.3-Flash NVFP4 glm53f-nvfp4-8 - fixed k=2 record, 2026-09-12
+- Same configuration as the mHC warp-split record below with the DFlash2
+  draft length fixed at k=2 (the per-batch schedule had been inert under
+  data parallelism, leaving a fixed k=3). Sustained load (`vllm bench
+  serve` random 1000/300 +-20%, 10 x concurrency prompts, ignore_eos):
+  | | c64 | c128 |
+  | k=2 | 1227 / 1411 | 1674 / 1672 |
+  | k=3 | 1140 / 1157 | 1425 / 1426 |
+  TPOT k=2 42 / 68 ms vs k=3 51 / 82 ms.
+- Exact-token (1000 in / 300 out, temp 1.0 / top-p 0.95 / top-k 20,
+  three warmed repeats, medians):
+  | c1    | c8    | c16   | c32    | c64    |
+  | 128.0 | 567.1 | 875.6 | 1110.0 | 1413.8 |
+  k=3 record: 127.1 / 497.0 / 843.9 / 1023.3 / 1320.8. Canaries pass;
+  WildChat deep-context leg c8: 785 turns, 0 errors, 126/126 recall,
+  sessions to 658K tokens with VLLM_KV_TIER_VERIFY=1. Raw:
+  perf/results/2026-09-12/glm53f-k2-record/, glm53f-leg-k2/,
+  glm53f-sustained-k2/.
+
+## GLM-5.3-Flash NVFP4 glm53f-nvfp4-8 - mHC warp-split kernel record, 2026-09-12
+- Same configuration as the fp8 main-KV record below plus the warp-split
+  mHC transition partials kernel (csrc/quixicore/serving/mhc_ampere.cuh
+  partials_batched_ws, default on; 31 -> 13.6 us at 32 tokens, 98 -> 33
+  us at 128 tokens, residual bit-exact).
+- Exact-token (1000 in / 300 out, temp 1.0 / top-p 0.95 / top-k 20,
+  three warmed repeats, medians):
+  | c1    | c8    | c16   | c32    | c64    |
+  | 127.1 | 497.0 | 843.9 | 1023.3 | 1320.8 |
+  fp8 record (same day, before the kernel): 118.4 / 559.1 / 730.0 /
+  971.6 / 1139.3. The c64 gain (+16%) matches the dedicated A/B (+12.8%,
+  two repeats per arm); c8 sits inside its 481-589 spread. Canaries pass.
+  Raw: perf/results/2026-09-12/glm53f-mhcws-record/.
+
+## GLM-5.3-Flash NVFP4 glm53f-nvfp4-8 - TP4 x DP2 + fp8 main KV record, 2026-09-12
+- Layout: TP4 x DP2 with replicated MoE (data_parallel_replicate_moe,
+  2026-09-11: each replica keeps the full expert set sharded over its own
+  TP4 group, prefix-affinity DP routing), DFlash2 k=3 per replica for
+  <= 16 running requests, TP4-capable indexer row shard and sparse
+  tensor-core decode on, thinking budget 2000.
+- Main NoPE-MLA KV fp8 (e4m3) per layer (additional_config
+  glm5_next_main_kv_fp8; the KDA state and indexer pools stay
+  unquantized): native fp8 lane-parallel sparse decode and fp8 sparse
+  tensor-core decode at bf16 parity. VRAM pool 2,969,768 tokens (bf16:
+  1,669,244), 2.83x the 1M context per replica.
+- Exact-token (1000 in / 300 out, temp 1.0 / top-p 0.95 / top-k 20,
+  three warmed repeats, medians):
+  | c1    | c8    | c16   | c32   | c64    |
+  | 118.4 | 559.1 | 730.0 | 971.6 | 1139.3 |
+  bf16 DP2 record (2026-09-11): 117.8 / 506.8 / 786.5 / 985.8 / 1158.0;
+  TP8 record (2026-09-10): 153.6 / 495.0 / 687.3 / 879.5 / 1074.5. The
+  fp8 flip is capacity-neutral on throughput (within the run-to-run
+  spread of the three repeats).
+- Gates: text/reasoning/image/tool canaries pass; eviction-restore
+  acceptance 6/6 markers after a 3.74M-token churn with
+  VLLM_KV_TIER_VERIFY=1 (88 verify batches, 0 mismatched); WildChat
+  deep-context leg c8: 737 turns, 0 errors, 119/119 recall probes, 549
+  tier restores, 93.4% prefix hit rate, sessions to 624K tokens. Raw:
+  perf/results/2026-09-12/glm53f-fp8-gates2/ and glm53f-leg-fp8-2/.
+
 ## GLM-5.3-Flash NVFP4 glm53f-nvfp4-8 - V2 runner + DFlash2 speculative record, 2026-09-10
 - Runner: V2 (V1 deprecated 2026-09-10). Speculative by default:
   incoai/GLM-5.3-Flash-DFlash2 (revision bf582e4e) through the V2 DFlash2
@@ -2808,3 +2885,62 @@ graph capture for the hybrid GDN+MTP decode, Gemma-aware fused norm+quant.
 - Expected next moves: MTP speculative decoding (checkpoint ships the
   head), host tier once the packed planner handles KDA+MLA mixed block
   sizes, kernel-level tuning of the pooled-logits path.
+
+## 2026-09-11: glm53f-nvfp4-8 = TP4 x DP2, replicated MoE, DFlash2 (A100)
+
+Record flipped from TP8 (operator 2026-09-10: production is always c8+).
+Two TP4 replicas, each with the full expert set sharded over its own TP
+group (`data_parallel_replicate_moe`; weights 46.28 GiB/rank, pool
+1,653,769 tokens per replica), prefix-affinity DP routing, indexer row
+shard and sparse tensor-core decode on (both TP4-capable since 09-11),
+DFlash2 k=3 with schedule [[1,16,3],[17,64,0]] per replica.
+Exact-token 1000 in / 300 out through `slimserve --serve`, three warmed
+repeats, medians, aggregate tok/s:
+
+| record | c1 | c8 | c16 | c32 | c64 |
+|---|---|---|---|---|---|
+| glm53f-nvfp4-8 TP4xDP2 replicated (09-11) | 117.8 | 506.8 | 786.5 | 985.8 | 1158.0 |
+| glm53f-nvfp4-8 TP8 (09-10, superseded) | 153.6 | 495.0 | 687.3 | 879.5 | 1074.5 |
+
+c8 +2%, c16 +14%, c32 +12%, c64 +8%; c1 -23% (one request runs on a
+TP4 replica; c1 tracks DFlash acceptance 1.5-3.2 per run). Gates at this
+baseline: text/image/tool canaries pass; forced-eviction tier acceptance
+6/6 markers after a 2,155,789-token churn of the 1,653,769-token pool,
+24 hits, VLLM_KV_TIER_VERIFY 96 batches / 0 mismatched, 0 failed-closed.
+WildChat deep-context leg PASS (2026-09-11, tree with the block-pool
+negative-allocation fix 9c24bc5ad): 557 turns, 0 errors, 88/88 recall,
+max context 476,986, 432 tier hits (perf/results/2026-09-11/
+glm53f-leg-dp2/). Owed (running): the 1M-context leg.
+Raw: perf/results/2026-09-11/glm53f-final-dp2/.
+
+## 2026-09-13: glm53f-nvfp4-8 record - max_num_seqs 128, balanced DP routing, chunk 2048 (A100)
+
+Record = fp8 main KV + mHC warp-split + fixed k=2 + sparse MLA prefill
+kernel (as 2026-09-13 00:10) plus: max_num_seqs 128 per replica with a
+384-token capture (25cbf649c), the DP prefix-affinity router balanced by
+live-context footprint with single-home credit (d6af7171b), and
+max_num_batched_tokens 2048 made explicit after the chunk-size arms.
+Pool 2,846,622 tokens per replica. Through `slimserve --serve`,
+exact-token 1000 in / 300 out, three warmed repeats, medians:
+
+| record | c1 | c8 | c16 | c32 | c64 |
+|---|---|---|---|---|---|
+| glm53f-nvfp4-8 (09-13 final) | 136.4 | 572.3 | 897.7 | 1198.9 | 1530.5 |
+| glm53f-nvfp4-8 (09-13 00:10, sparse prefill) | 128.0 | 567.1 | 875.6 | 1110.0 | 1413.8 |
+| glm53f-nvfp4-8 (09-11, TP4xDP2 flip) | 117.8 | 506.8 | 786.5 | 985.8 | 1158.0 |
+
+Sustained load (`vllm bench serve` random 1000/300 +-20%, 10x concurrency
+prompts, ignore_eos; output tok/s, mean TPOT): c64 1538 (37.7 ms), c128
+1921 (59.6 ms), c256 2414 (95.2 ms). Program start (09-12): c64 1140-1157,
+c128 1425, c256 not servable (64-per-replica cap).
+Gates: text/reasoning/image/tool canaries PASS; WildChat deep-context leg
+at this config (2048 chunks, router fix, max_num_seqs 128): 811 turns /
+0 errors / 128/128 recall / 690K max context, engines balanced at
+3.46/3.50 running, tier restores 14.1K / offloads 59.8K
+(perf/results/2026-09-13/glm53f-leg-2048-router/).
+Measured and NOT taken: chunks 4096/8192 (random bench +5%/+11% but the
+leg loses 13% of its turns above 2048 - tier restores drop 4x; open
+item), max_num_seqs 256 (c256 equal, c512 collapses), per-replica draft
+schedules and fixed k=3 (all below k=2), the QuixiCore NVFP4 prefill MoE
+GEMM (parity, no serving gain; parked off), KDA deferred commit (a loss at
+k=2). Raw: perf/results/2026-09-13/glm53f-record-final/.

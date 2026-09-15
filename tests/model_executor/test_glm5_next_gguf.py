@@ -170,7 +170,7 @@ def test_config_parser_dispatch(cfg):
 def test_openai_parser_defaults():
     from vllm.entrypoints.openai.model_parsers import _PARSERS_BY_ARCHITECTURE
 
-    assert _PARSERS_BY_ARCHITECTURE["glm5-next"] == ("glm45", "glm47")
+    assert _PARSERS_BY_ARCHITECTURE["glm5-next"] == ("glm47", "glm47")
     assert _PARSERS_BY_ARCHITECTURE["glm-dsa"] == ("glm45", "glm47")
 
 

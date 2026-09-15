@@ -130,3 +130,69 @@ def test_dp_lb_client_routes_through_the_prefix_router():
     r = req("d", turn1)
     r.data_parallel_rank = 1
     assert client.get_core_engine_for_request(r) == "eng1"
+
+
+def _split(r: PrefixAffinityRouter, sessions: dict[str, list[int]]) -> list[int]:
+    """Engine each session currently homes on (longest recorded match)."""
+    homes = []
+    for toks in sessions.values():
+        h = prompt_block_hashes(toks, BLOCK)
+        m = [r.matched_blocks(e, h) for e in range(r.num_engines)]
+        homes.append(m.index(max(m)))
+    return homes
+
+
+def test_new_conversations_spread_by_recent_footprint():
+    r = PrefixAffinityRouter(2, BLOCK, load_tokens=4)
+    big = _prompt(1000)
+    assert r.choose(big, None, [0, 0])[0] == 0
+    # Equal load, but engine 0 now carries 1000 tokens of live context: a
+    # new conversation goes to engine 1.
+    assert r.choose(_prompt(8, seed=2), None, [0, 0])[0] == 1
+    # The big conversation still follows its prefix (re-prefill would cost
+    # 1000 tokens, the footprint charges 100).
+    eng, matched = r.choose(big + _prompt(8, seed=9), None, [0, 0])
+    assert (eng, matched) == (0, 250)
+    assert r.recent_tokens(0) == 2008 and r.recent_tokens(1) == 8
+
+
+def test_uniform_sessions_rebalance_once_then_stay():
+    r = PrefixAffinityRouter(2, BLOCK, load_tokens=4)
+    ctx = 400
+    sessions = {f"s{i}": _prompt(ctx, seed=10 + i) for i in range(8)}
+    # A chance split of the first turns: five on engine 1, three on engine 0.
+    for name, toks in sessions.items():
+        forced = [10_000, 0] if name < "s5" else [0, 10_000]
+        r.choose(toks, None, forced)
+    assert _split(r, sessions) == [1] * 5 + [0] * 3
+    # Sessions keep turning with balanced request counts; every turn appends
+    # one block so the histories stay distinct chains.
+    for turn in range(24):
+        for name in sessions:
+            sessions[name] = sessions[name] + _prompt(BLOCK, seed=100 + turn)
+            r.choose(sessions[name], None, [0, 0])
+    homes = _split(r, sessions)
+    assert sorted(homes) == [0] * 4 + [1] * 4, homes
+    assert 1 <= r.migrated <= 2, r.stats()
+    migrated = r.migrated
+    for turn in range(24, 48):
+        for name in sessions:
+            sessions[name] = sessions[name] + _prompt(BLOCK, seed=100 + turn)
+            r.choose(sessions[name], None, [0, 0])
+    assert r.migrated == migrated, r.stats()
+    assert sorted(_split(r, sessions)) == [0] * 4 + [1] * 4
+
+
+def test_only_the_longest_match_is_credited():
+    r = PrefixAffinityRouter(2, BLOCK, load_tokens=4, recent_window=0)
+    turn1 = _prompt(40)
+    r.choose(turn1, None, [0, 0])
+    # Forced away by a severe imbalance: engine 1 becomes the home.
+    turn2 = turn1 + _prompt(4, seed=9)
+    assert r.choose(turn2, None, [20, 0])[0] == 1
+    # Engine 0 still remembers the older 10 blocks, but only engine 1 (11
+    # blocks) is credited: with the load reversed the session stays put
+    # unless engine 1 is behind by more than the whole re-prefill.
+    turn3 = turn2 + _prompt(4, seed=8)
+    assert r.choose(turn3, None, [0, 5])[0] == 1
+    assert r.choose(turn3 + _prompt(4, seed=7), None, [0, 20])[0] == 0

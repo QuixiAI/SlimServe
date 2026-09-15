@@ -135,7 +135,11 @@ class CudaGraphManager:
         self._dispatch_stats: Counter[tuple[int, str]] = Counter()
         self._dispatch_calls = 0
 
-        self.dp_size = vllm_config.parallel_config.data_parallel_size
+        self.dp_size = (
+            1
+            if vllm_config.parallel_config.data_parallel_replicate_moe
+            else vllm_config.parallel_config.data_parallel_size
+        )
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
         self.is_first_pp_rank = get_pp_group().is_first_rank
         self.is_last_pp_rank = get_pp_group().is_last_rank

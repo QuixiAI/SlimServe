@@ -828,4 +828,12 @@ if __name__ == "__main__":
     args = parser.parse_args()
     validate_parsed_serve_args(args)
 
-    uvloop.run(run_server(args))
+    if (getattr(args, "api_server_count", None) or 0) > 1:
+        # SlimServe launches this module directly; give it the same
+        # multi-API-server path as `vllm serve` so a data-parallel record
+        # can run one frontend process per replica.
+        from vllm.entrypoints.cli.serve import run_multi_api_server
+
+        run_multi_api_server(args)
+    else:
+        uvloop.run(run_server(args))

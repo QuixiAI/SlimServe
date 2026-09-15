@@ -1470,6 +1470,8 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                 vllm_config.cache_config.block_size,
                 capacity_blocks=envs.VLLM_DP_PREFIX_AFFINITY_BLOCKS,
                 load_tokens=envs.VLLM_DP_PREFIX_AFFINITY_LOAD_TOKENS,
+                recent_window=envs.VLLM_DP_PREFIX_AFFINITY_RECENT_WINDOW,
+                recent_permille=envs.VLLM_DP_PREFIX_AFFINITY_RECENT_PERMILLE,
             )
 
     def get_core_engine_for_request(self, request: EngineCoreRequest) -> EngineIdentity:
@@ -1489,6 +1491,8 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                     [w * 4 + r for w, r in current_counts],
                     self.eng_start_index,
                 )
+                if self.prefix_router.routed % 100 == 0:
+                    logger.info("dp prefix affinity: %s", self.prefix_router.stats())
             else:
                 min_score = sys.maxsize
                 eng_index = 0

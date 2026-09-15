@@ -687,9 +687,16 @@ class MoERunner(MoERunnerInterface):
             # W26b (VLLM_METAL_MOE_ROUTER_OVERLAP=1, the glm53f-q2-1 env
             # block): open the layer's concurrent region already around the
             # Metal router kernel so it overlaps the shared-expert pair
-            # GEMV; the quant method joins and closes the region.
-            region = preselected is None and _metal_router_region_ok(
-                self, hidden_states, router_logits, shared_experts_input
+            # GEMV; the quant method joins and closes the region. The
+            # expert-stats histogram is a torch op, so it keeps the region
+            # closed.
+            expert_stats = self._expert_stats
+            region = (
+                preselected is None
+                and expert_stats is None
+                and _metal_router_region_ok(
+                    self, hidden_states, router_logits, shared_experts_input
+                )
             )
             if region:
                 from vllm.quixicore import quixicore_ops
@@ -706,6 +713,8 @@ class MoERunner(MoERunnerInterface):
                         )
                 else:
                     topk_weights, topk_ids = preselected
+                if expert_stats is not None:
+                    expert_stats.record(topk_ids)
 
                 with _qc_phase("moe_routed"):
                     fused_out = self.routed_experts.forward_modular(
@@ -944,6 +953,24 @@ class MoERunner(MoERunnerInterface):
             return shared_output, hidden_states
         else:
             return hidden_states
+
+    @property
+    def _expert_stats(self):
+        st = self.__dict__.get("_expert_stats_obj", False)
+        if st is False:
+            from vllm.model_executor.layers.fused_moe.expert_stats import (
+                make_expert_stats,
+            )
+
+            name = getattr(self.routed_experts, "layer_name", None) or f"runner-{id(self):x}"
+            num_experts = getattr(self.routed_experts, "global_num_experts", 0)
+            try:
+                device = next(p.device for p in self.routed_experts.parameters())
+            except Exception:
+                device = torch.device("cuda")
+            st = make_expert_stats(name, int(num_experts or 0), device)
+            self.__dict__["_expert_stats_obj"] = st
+        return st
 
     def _forward_impl(
         self,

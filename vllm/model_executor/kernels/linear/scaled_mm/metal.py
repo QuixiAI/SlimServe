@@ -12,9 +12,10 @@ Apply routes:
 - Decode widths (M <= 8): the QuixiCore Metal GEMV `qgemv_fp8ch` over the
   raw checkpoint bytes (planar (N, K) e4m3 rows + per-row float scale).
   VLLM_QC_FP8CH=0 is the kill switch back to the dense matmul.
-- Prefill / larger M: dense matmul against the bf16 weights materialized at
-  load. VLLM_METAL_CT_DEQUANT=call skips materialization (per-call dequant,
-  low-memory bring-up fallback).
+- Prefill / larger M (> 8): planar tiled GEMM (qgemm_fp8ch) reading the raw
+  e4m3 bytes directly - weights stay in native quantized form always
+  (operator directive 2026-09-10). VLLM_METAL_CT_DEQUANT=once is a
+  diagnostic-only escape to the old materialized-bf16 dense path.
 """
 
 import os
@@ -95,7 +96,10 @@ class MetalWFp8A16LinearKernel(FP8ScaledMMLinearKernel):
             raise ValueError(f"MetalFP8W8A16LinearKernel: {why}")
         self.config = c
         self.layer_param_names = layer_param_names
-        self.materialize = os.environ.get("VLLM_METAL_CT_DEQUANT", "once") != "call"
+        # Native (packed weights, no bf16 copy) is the only default;
+        # "once" is the diagnostic-only escape to the old dual-layout
+        # materialized path (kernel-bisection boots).
+        self.materialize = os.environ.get("VLLM_METAL_CT_DEQUANT", "") == "once"
         self.use_gemv = os.environ.get("VLLM_QC_FP8CH", "1") != "0"
         if self.use_gemv and not _gemv_available():
             logger.warning_once(
@@ -119,14 +123,38 @@ class MetalWFp8A16LinearKernel(FP8ScaledMMLinearKernel):
         # the checkpoint's row-major uint8 [N, K] and weight_scale is fp32
         # [N, 1] — exactly the qgemv_fp8ch operand layout.
         n, k = layer.weight.shape  # type: ignore[misc]
-        if self.use_gemv and n % 4 == 0 and k % 16 == 0:
-            # Raw bytes + flat fp32 scale for the GEMV (kept alongside any
-            # materialized dense weight; decode never touches the bf16 copy).
+        native_ok = self.use_gemv and n % 4 == 0 and k % 16 == 0 and k % 32 == 0
+        if native_ok:
+            # Raw bytes + flat fp32 scale: the only resident form. The host
+            # op serves every M natively (GEMV twins <= 8, planar tiled
+            # GEMM above).
             layer.fp8ch_weight = layer.weight.data
             layer.fp8ch_scale = layer.weight_scale.data.reshape(-1).contiguous()  # type: ignore[operator, union-attr]
             layer.metal_fp8ch = True  # type: ignore[assignment]
+            if not self.materialize:
+                # Operator directive: weights stay in native quantized form
+                # always; VLLM_METAL_CT_DEQUANT=once is a diagnostic-only
+                # escape back to the dual-layout path.
+                return
         if not self.materialize:
-            return
+            if not self.use_gemv:
+                raise RuntimeError(
+                    "quixicore(metal): FP8ch native kernels are disabled or "
+                    "missing (VLLM_QC_FP8CH=0 or a stale vllm._quixicore_C - "
+                    "rebuild with: cmake --build "
+                    "build/temp.macosx-11.0-arm64-cpython-312 "
+                    "--target _quixicore_C), and bf16 materialization is not "
+                    "enabled. Set VLLM_METAL_CT_DEQUANT=once only as a "
+                    "diagnostic."
+                )
+            logger.warning(
+                "quixicore(metal): FP8ch layer %s (N=%d, K=%d) misses the "
+                "native-kernel alignment (N %% 4, K %% 32); materializing "
+                "bf16 for THIS layer only.",
+                getattr(layer, "prefix", "?"),
+                n,
+                k,
+            )
         dense = dequant_fp8_channel(
             layer.weight,  # type: ignore[arg-type]
             layer.weight_scale,  # type: ignore[arg-type]
@@ -142,16 +170,14 @@ class MetalWFp8A16LinearKernel(FP8ScaledMMLinearKernel):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         x_2d = x.reshape(-1, x.shape[-1])
-        m = x_2d.shape[0]
         if (
             getattr(layer, "metal_fp8ch", False)
-            and (
-                m <= _GEMV_MAX_ROWS
-                or (self.use_gemv_mb and m % 2 == 0 and m <= _GEMV_MB_MAX_ROWS)
-                or (self.use_gemv_mv and 3 <= m <= _GEMV_MB_MAX_ROWS)
-            )
+            and not getattr(layer, "metal_ct_materialized", False)
             and x.dtype in (torch.bfloat16, torch.float16)
         ):
+            # Native for EVERY M: the host op routes M <= 8 to the GEMV
+            # twins (still governed by the VLLM_QC_FP8CH* knobs) and M > 8
+            # to the planar tiled GEMM. No bf16 weight copy on this path.
             from vllm.quixicore import quixicore_ops
 
             out = quixicore_ops.fp8ch_mul_mat_vec(

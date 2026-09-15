@@ -146,7 +146,7 @@ def test_every_source_declares_its_live_smoke_modalities():
     assert sources["glm52-vision"]["modalities"] == ["text", "image"]
     assert sources["kimi-k3"]["modalities"] == ["text", "image"]
     assert sources["glm53f-nvfp4"]["modalities"] == ["text", "image"]
-    assert sources["glm53f-q2"]["modalities"] == ["text"]
+    assert sources["glm53f-gguf"]["modalities"] == ["text"]
     assert sources["dsv4-flash"]["modalities"] == ["text"]
     assert sources["muse-glimmer"]["modalities"] == ["text", "image"]
     assert sources["qwen38-27b"]["modalities"] == ["text", "image"]
@@ -391,7 +391,7 @@ def test_registry_contains_only_the_supported_model_artifacts():
         "qwen38-flash-next-fp8",
         "qwen38-flash-next-nvfp4",
         "glm53f-nvfp4",
-        "glm53f-q2",
+        "glm53f-gguf",
     }
     glm = data["sources"]["glm52-vision"]
     kimi = data["sources"]["kimi-k3"]
@@ -1143,9 +1143,15 @@ def test_quantized_main_kv_is_an_explicit_validated_choice():
         for platform, record in entry.get("variants", {}).items():
             dtype = record.get("engine", {}).get("kv_cache_dtype", "auto")
             env = record.get("env", {})
-            quantized = dtype not in {"auto", "bfloat16"} or any(
-                env.get(k) == "1"
-                for k in ("VLLM_QWEN4_EXP_TQ_MAIN_KV", "VLLM_QWEN4_EXP_FP8_MAIN_KV")
+            extra = record.get("engine", {}).get("additional_config", {}) or {}
+            quantized = (
+                dtype not in {"auto", "bfloat16"}
+                or any(
+                    env.get(k) == "1"
+                    for k in ("VLLM_QWEN4_EXP_TQ_MAIN_KV", "VLLM_QWEN4_EXP_FP8_MAIN_KV")
+                )
+                # GLM-5.3's per-layer fp8 main KV (sparse MLA layers only).
+                or bool(extra.get("glm5_next_main_kv_fp8", False))
             )
             if not quantized:
                 continue
@@ -1278,3 +1284,39 @@ def test_no_metal_profile_uses_a_host_ram_tier():
             continue
         extra = transfer.get("kv_connector_extra_config", {})
         assert "host_tier_gb_per_rank" not in extra, profile_id
+
+
+def test_glm53f_8_is_tp4_dp2_with_replicated_moe():
+    """Operator 2026-09-10: production is always c8+, so the 8-GPU GLM-5.3
+    record runs two TP4 replicas. Each replica keeps the full expert set
+    (data_parallel_replicate_moe) - the default DP flattens the MoE across
+    all eight ranks and all-gathers every MoE layer across replicas."""
+    plan = resolve("glm53f-nvfp4-8", "a100", 8, None)
+    assert plan.engine["tensor_parallel_size"] == 4
+    assert plan.engine["data_parallel_size"] == 2
+    assert plan.engine["data_parallel_replicate_moe"] is True
+    assert plan.engine["enable_expert_parallel"] is False
+
+
+def test_glm53f_records_carry_a_thinking_budget():
+    """Thinking is always on, so every GLM-5.3 record must bound it: the 1M
+    legs (2026-09-11) showed deep-context probes exhausting max_tokens inside
+    the think block with no budget to close it."""
+    for profile_id in ("glm53f-nvfp4-8", "glm53f-nvfp4-4"):
+        rec = registry._registry()["profiles"][profile_id]["variants"]["a100"]
+        budget = rec["engine"]["override_generation_config"]["thinking_token_budget"]
+        assert 500 <= budget <= 4000, (profile_id, budget)
+
+
+def test_scalar_list_engine_args_render_space_separated():
+    """vLLM's nargs list flags (numa_bind_nodes) take space-separated values;
+    a JSON-rendered list is rejected at parse time (2026-09-11 NUMA arm)."""
+    from dataclasses import replace
+    from slimserve.engine import serve_argv
+
+    plan = resolve("glm53f-nvfp4-8", "a100", 8, None)
+    plan = replace(plan, engine={**plan.engine, "numa_bind_nodes": [0, 0, 1, 1]})
+    argv = serve_argv(plan, "127.0.0.1", 8400)
+    i = argv.index("--numa-bind-nodes")
+    assert argv[i + 1 : i + 5] == ["0", "0", "1", "1"]
+    assert "[0, 0, 1, 1]" not in argv

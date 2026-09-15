@@ -1833,6 +1833,102 @@ class quixicore_ops:
         )
 
     @staticmethod
+    def nvfp4_moe_gemm(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        s: torch.Tensor,
+        g: torch.Tensor,
+        sorted_ids: torch.Tensor,
+        expert_ids: torch.Tensor,
+        num_post_padded: torch.Tensor,
+        topk_weights: torch.Tensor | None,
+        c: torch.Tensor,
+        top_k: int,
+        mul_topk: bool,
+        stages: int = 3,
+    ) -> torch.Tensor:
+        """Grouped NVFP4 MoE GEMM over the Marlin-packed expert weights for
+        prefill-sized batches: 128 x 128 x 64 tiles, one shared dequant per
+        tile stage, Marlin's numerics. Alignment must come from
+        moe_align_block_size at block 128; c is [M * top_k, N] indexed by the
+        sorted id, with mul_topk folding topk_weights[sid] into the row scale
+        (the w2 contract)."""
+        return _qc().nvfp4_moe_gemm(
+            a, b, s, g, sorted_ids, expert_ids, num_post_padded, topk_weights, c, top_k, mul_topk, stages
+        )
+
+    @staticmethod
+    def mla_sparse_prefill_fp8(
+        q: torch.Tensor,
+        data: torch.Tensor,
+        bt: torch.Tensor,
+        indices: torch.Tensor,
+        topk_length: torch.Tensor,
+        block_size: int,
+        scale: float,
+        kv_scale: float,
+        page_stride_bytes: int = 0,
+    ) -> torch.Tensor:
+        """Sparse NoPE-MLA attention for prefill chunks over the fp8 latent:
+        groups of 4 consecutive queries attend on tensor cores over the union
+        of their selected 4-token pools with a per-query mask. Same inputs as
+        mla_decode_fp8_sparse_nope; q must be [T, 16, 512] (TP4 heads)."""
+        return _qc().mla_sparse_prefill_fp8(
+            q, data, bt, indices, topk_length, block_size, scale, kv_scale, page_stride_bytes
+        )
+
+    @staticmethod
+    def kda_decode(
+        mixed_qkv: torch.Tensor,
+        raw_g: torch.Tensor,
+        raw_beta: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        state: torch.Tensor,
+        state_indices: torch.Tensor,
+        scale: float,
+        lower_bound: float | None,
+    ) -> torch.Tensor:
+        """KDA single-token decode recurrence (packed q|k|v per head, K=V=128):
+        the CUDA port of fused_recurrent_kda_packed_decode. Updates `state`
+        in place for state_indices > 0; returns out [1, N, H, V] bf16."""
+        return _qc().kda_decode(
+            mixed_qkv, raw_g, raw_beta, A_log, dt_bias, state, state_indices,
+            scale, 0.0 if lower_bound is None else float(lower_bound),
+            lower_bound is not None,
+        )
+
+    @staticmethod
+    def mla_decode_fp8_sparse_nope(
+        q: torch.Tensor,
+        data: torch.Tensor,
+        block_table: torch.Tensor,
+        indices: torch.Tensor,
+        topk_length: torch.Tensor,
+        block_size: int,
+        scale: float,
+        kv_scale: float = 1.0,
+        partition_size: int = 0,
+        page_stride_bytes: int = 0,
+    ) -> torch.Tensor:
+        """NoPE sparse MLA decode over an fp8 (e4m3) latent cache: 512 fp8
+        per slot, one per-tensor kv_scale (vLLM's fp8 MLA layout). The
+        NFP8=512 instantiation of the bf16 NoPE kernel; sm80 decodes fp8 in
+        software. Returns [tokens, heads, 512]."""
+        return _qc().mla_decode_fp8_sparse_nope(
+            q,
+            data,
+            block_table,
+            indices,
+            topk_length,
+            block_size,
+            scale,
+            kv_scale,
+            partition_size,
+            page_stride_bytes,
+        )
+
+    @staticmethod
     def mla_decode_bf16_sparse_nope(
         q: torch.Tensor,
         kv: torch.Tensor,

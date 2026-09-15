@@ -342,6 +342,11 @@ class SpeculativeConfig:
                     False,
                 )
             )
+        if self.method in ("dflash", "dspark"):
+            # Block drafters draft a fixed block of num_speculative_tokens, so
+            # the drafter's compiled graph is shaped by k: a k=4 artifact
+            # replayed at k=3 fails the inductor stride guard.
+            factors.append(self.num_speculative_tokens)
 
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
         return hash_str

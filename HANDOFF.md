@@ -5462,3 +5462,177 @@ TP4 = 36 MLA + 18 indexer + 4 KDA state pages; 106 at TP8 = 68 + 34 + 4.
   + paired k=3). Logs: queue2.log, matrix-chain.log, k4-chain.log. The 1M
   leg is parked (leg_1m.sh stub; real script leg_1m.real.sh) until the
   block-pool fault is fixed.
+
+## 2026-09-11 12:00: record flipped to TP4 x DP2; block-pool fault fixed
+
+- glm53f-nvfp4-8 = TP4 x DP2 with replicated MoE (9cb3c3c30). Serve-path
+  c1 117.8 / c8 506.8 / c16 786.5 / c32 985.8 / c64 1158.0; canaries and
+  tier acceptance pass (perf/results/2026-09-11/glm53f-final-dp2/).
+- Block-pool leg deaths: negative count into get_new_blocks from
+  allocate_external_computed_blocks (fixed 9c24bc5ad; see notebook).
+- Running (queue10.sh -> queue10.log): DP2 WildChat leg
+  (perf/results/2026-09-11/glm53f-leg-dp2/), then the 1M leg
+  (leg_1m.real.sh dp2-1m). Then queue11: k=3/k=4 arms on the record with
+  the compile-hash fix. Old queue scripts are dead; only queue10/11 run.
+
+## 2026-09-11 20:00: TP4 x DP2 throughput program in flight
+
+- Landed (all on main): multi-API-server entry (ad61a11a8), grouped
+  indexer scoring for speculative rows (043effea6, bit-exact), fp8 main KV
+  for the 512-wide NoPE sparse MLA path incl. the tensor-core Triton
+  decode (7b0323050, parity passed), compile cache keyed by draft block
+  size, harness credits recall in reasoning + flags budget exhaustion.
+- 1M-context legs: both layouts reach 1.04M; every probe miss above 900K
+  was the model exhausting its 1,024-token thinking budget with an empty
+  answer, not lost recall (notebook 2026-09-11).
+- GPU queue (scripts + logs in ~/.local/scratch/glm53/): queue14 = A/B
+  arms dp2-base / dp2-api2 / dp2-numa / dp2-k3-all; queue15 = closing DP2
+  1M leg (dp2-1m-c) with the reasoning-aware harness; queue16 = c32-per-
+  replica torch profile (profile_dp2.sh; its first attempt hung on a bare
+  `wait`, fixed); queue17 = fp8 main-KV arm dp2-fp8kv. Results land in
+  perf/results/2026-09-10/glm53f-dflash2/<arm>/ and
+  perf/results/2026-09-10/glm53f-1m-leg/dp2-1m-c/.
+- Next after the profile: fused marlin MoE (launch list in
+  fused_moe/experts/marlin_moe.py: gemm1, silu_and_mul, gemm2, moe_sum per
+  layer), batched variant of the DSV4 fused mHC allreduce
+  (`should_fuse_dsv4_mhc` is batch-1 only), sampler/launch fusions,
+  host-resident main KV for GLM. Record flips (schedule, api2, numa, fp8
+  KV) only on measured wins plus the gate set.
+
+## 2026-09-11 23:40: program status
+
+- Profile of the DP2 record at 32 req/replica (notebook): MoE GEMM 39%
+  (at bandwidth), mHC partials 14%, dense GEMMs 12%, KDA 8%, allreduce 6%.
+  Landed: token-batched mHC partials (97f13c4ee, 78 -> 31 us at T=32).
+  Next kernels: KDA recurrent (0.56 TB/s effective, ~2x headroom;
+  vllm/models/kimi_k3/amd/ops/third_party/kda/fused_recurrent.py), then
+  spec at c32 once per-row costs are down.
+- Thinking budget 2000 now on both glm53f records; harness credits recall
+  in reasoning and sends probes a per-request budget.
+- OPEN: cold prefill >= ~900K produced '!' garbage in the 1M leg (both
+  layouts); a cold-prefill probe worker died silently at 200K on a
+  torch.compile cache two concurrent boots had corrupted (cache set
+  aside at ~/.cache/vllm/torch_compile_cache.corrupt-*). Rerun queued
+  (queue22, results in perf/results/2026-09-11/glm53f-coldprefill2/).
+- GPU queue: q19 NUMA arm -> q20 fp8-KV arm + FULL_AND_PIECEWISE arm ->
+  q21 same-day base on the batched-partials tree -> q22 parity test +
+  cold-prefill bisection. Logs ~/.local/scratch/glm53/queue*.log.
+
+## 2026-09-12 12:10: fp8 main KV on the record; mHC warp-split kernel; roofline audit
+
+- RECORD (glm53f-nvfp4-8/a100): TP4 x DP2 replicated MoE + fp8 (e4m3) main
+  NoPE-MLA KV (glm5_next_main_kv_fp8, pool 2.97M tokens) + mHC warp-split
+  partials. Exact medians c1 127.1 / c8 497.0 / c16 843.9 / c32 1023.3 /
+  c64 1320.8 tok/s (perf/baseline_status.md, raw perf/results/2026-09-12/
+  glm53f-mhcws-record/). Gates for the fp8 flip: canaries, eviction-restore
+  6/6 with verify (0/88 mismatched), WildChat leg 737 turns / 0 errors /
+  119/119 recall / 549 restores / 93.4% prefix hits.
+- Fixed on the way (29e6fdf98): the host tier hashed at the smallest
+  attention block while the scheduler hashes at the gcd of every group
+  (fp8 widens MLA blocks to 2304 beside the 1152 KDA block), and the tier
+  index never bound hashes at positions where no attention block completes;
+  the scheduler's invalid-block handler assumed one KV group and killed the
+  engine on the first fail-closed restore. tests/v1/core/
+  test_scheduler_invalid_blocks_hybrid.py, test_host_tier_connector.py.
+- Kernel pass (notebook 2026-09-12): mHC partials warp-split
+  (partials_batched_ws, c8bf2d250): 31 -> 13.6 us at T=32, 98 -> 33 at
+  T=128, serving +12.8% at c64. KDA CUDA decode kernel: env-gated, no lever
+  (Triton at bandwidth from N=32). Roofline audit of the c64 128-token
+  step: marlin NVFP4 MoE at the HBM roofline (167 distinct experts/layer,
+  VLLM_MOE_EXPERT_STATS diagnostic), all-reduce 1stage +2.2% (rejected),
+  dense bf16 GEMMs at 0.3-0.9 TB/s under cuBLAS - skinny split-K GEMM
+  written (skinny_gemm_ampere.cuh, op skinny_gemm, tests 54/54) but load-
+  bound at 0.65 TB/s; parked with the v2 design in the notebook.
+- OPEN: KDA speculative path (1 read + 4 per-row state stores per layer,
+  7% of the step) needs a deferred-commit runner design; the 1M-leg '!'
+  garbage after >= 900K restores in two-session runs is unreproduced;
+  registry tests fail on another session's glm53f-q2-1/metal and
+  glm53f-gguf records (not this record); Nsight Compute is blocked
+  (ERR_NVGPUCTRPERM). QuixiCore-CUDA port of the mHC family and the KDA
+  kernel is grafted (kernels/serving/, tm_cuda_serving.cu) pending its
+  compile check and commit.
+
+## 2026-09-12 21:40: throughput program - record at fixed k=2, sustained metric, closed levers
+
+- RECORD glm53f-nvfp4-8: DFlash2 fixed k=2 (b2cc96fea). Exact c1 128.0 /
+  c8 567.1 / c16 875.6 / c32 1110.0 / c64 1413.8; sustained (vllm bench
+  serve random 1000/300) c64 1227-1411, c128 1672-1674 output tok/s; leg
+  785 turns / 0 errors / 126/126 recall. The per-batch draft schedule was
+  inert under DP (engine falls back to fixed k); k=3 had been running
+  everywhere. Dynamic schedules are now allowed under replicated-MoE DP,
+  zero-draft ranges rejected at config time (they crash KV init).
+- Primary metric is now sustained load: ~/.local/scratch/glm53/sustained.sh
+  <outdir> <conc...> against a running :8400 server (reproducible within
+  2%; the exact harness spreads 5-10% at c96+).
+- Closed by measurement (notebook 2026-09-12): stream overlap of MoE
+  weight streaming with compute (A100 time-slices grid-filling kernels,
+  -2%), fp8 marlin dense weights (slower than cuBLAS), custom W8A16
+  skinny GEMM (cuBLAS parity at best after 4 restructurings; committed,
+  gated off, tests 113/113, kernel csrc/quixicore/serving/
+  w8a16_gemm_ampere.cuh, method vllm/model_executor/layers/quantization/
+  qc_w8a16.py, env VLLM_QC_DENSE_W8A16), k=4 drafts (-13%).
+- NEXT: prefill-step profile (queue47) - continuous prefill is first-order
+  in the sustained metric; then the DP replicas' per-replica dynamic k if
+  the c8 point (4 per replica) prefers a longer draft.
+- Rule re-learned the hard way: never cp the extension .so into vllm/ while
+  any server is booting or running (killed the k=4 arm's boot).
+
+## 2026-09-13 00:10: sparse prefill kernel on the record; program state
+
+- RECORD glm53f-nvfp4-8 = fp8 main KV + mHC warp-split + fixed k=2 +
+  sparse MLA prefill kernel (396300c18). Sustained c64 1508 / c128 1864
+  output tok/s (program start: 1140-1157 / 1425); exact c8 567 / c16 876 /
+  c32 1110 / c64 1414; leg 845 turns / 0 errors / 135/135 recall / 704K.
+- The prefill kernel (csrc/quixicore/serving/mla_sparse_prefill_kernels.cuh,
+  op mla_sparse_prefill_fp8, dispatch in the sparse backend's forward_mqa,
+  flag glm5_next_sparse_prefill / env VLLM_QC_SPARSE_PREFILL) replaced the
+  per-token decode kernel that was 39% of prefill time; groups of 4 queries
+  over the union of their pools; duplicates in the index list count once.
+- Remaining levers after this program: prefill MoE/mHC/NCCL shares (see the
+  with-kernel profile in the notebook), the KDA deferred commit (~2%), the
+  W8A16 dense path (parity, gated off), per-replica dynamic draft length.
+
+## 2026-09-13 11:40: batch cap 128, balanced DP routing, chunk-size verdict, prefill GEMM parked
+
+- RECORD glm53f-nvfp4-8: max_num_seqs 128 / capture 384, prefix-affinity
+  router balanced by live-context footprint (single-home credit),
+  max_num_batched_tokens 2048 explicit. Sustained c64 1538 / c128 1921 /
+  c256 2414 (program start 1150 / 1425 / -); exact c1 136 / c8 572 / c16
+  898 / c32 1199 / c64 1531; leg 811 turns / 0 errors / 128/128 recall.
+  Baseline section "2026-09-13: ... record" in perf/baseline_status.md.
+- ROUTER (vllm/v1/engine/dp_prefix_affinity.py, d6af7171b): sticky
+  affinity had frozen a chance 5/3 session split for a whole leg (restores
+  2x on one replica, 845 -> 671 turns, one recall miss). New terms:
+  prompt tokens routed per replica over the last 64 requests x 0.1
+  (VLLM_DP_PREFIX_AFFINITY_RECENT_WINDOW / _RECENT_PERMILLE) and only the
+  longest recorded match is credited. Check on any leg: "Engine 000/001
+  ... Running:" averages in the server log should be within ~0.2.
+- CHUNK SIZE: 4096/8192-token chunks win the random benches (+5%
+  sustained, +11% exact c64) but lose the deep-context leg by 13% of
+  turns with the SAME pool and router; the host tier restores 4x fewer
+  blocks and offloads 2x more above 2048 (misses are not the cause: 30 vs
+  207). TOP OPEN ITEM: find why restores drop with larger chunks (suspect
+  the aligned-boundary tail-state save when a prefill step crosses several
+  block boundaries), then re-run the 4096 leg; if it matches 2048, take
+  4096 (all numbers in the profile note). 4096 is the validated override
+  for short-context high-throughput serving today.
+- PREFILL MoE GEMM (csrc/quixicore/serving/nvfp4_moe_prefill_ampere.cuh,
+  op nvfp4_moe_gemm, hook in fused_marlin_moe behind
+  VLLM_QC_NVFP4_PREFILL_MOE_MIN_ROWS, default 0 = off): reads the Marlin
+  layout in place, shared dequant per tile, four warp/stage configs,
+  parity 14/14. Isolated: w13 -10% vs Marlin, w2 +13..25%; serving A/B at
+  4096 chunks: no gain. PARKED. The notebook has the iteration table and
+  the smem-traffic analysis; Marlin at large M is 8-warp latency-bound
+  with 0.038 B/MAC of smem traffic - beating it needs a multistage
+  CUTLASS-grade mainloop, not a shared-dequant tile.
+- DRAFT LENGTH: per-replica schedules work under DP (guard relaxed, k=0
+  ranges rejected) but every k>=3 arm lost to fixed k=2 at c64-c256;
+  KDA deferred commit stays parked (a loss at k=2, kernels tested).
+- INCIDENTS to not repeat: (1) a new code path defaulting ON before its
+  .so was installed killed an arm's boot; (2) a unit test on GPU 7 while a
+  server booted (memory profiling) killed that boot with a cuBLAS internal
+  error - nothing touches the GPUs while a server boots; (3) `ps | grep |
+  kill` and `pkill -f` on a script name killed my own shell twice - use
+  `pgrep -f "^bash script.sh"` or safekill.
+- Installed vllm/_quixicore_C*.so = build with the parked prefill GEMM
+  (all other ops unchanged).

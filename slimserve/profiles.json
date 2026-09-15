@@ -1417,16 +1417,16 @@
         }
       }
     },
-    "glm53f-q2": {
-      "title": "GLM-5.3-Flash (antirez Q2 GGUF)",
+    "glm53f-gguf": {
+      "title": "GLM-5.3-Flash",
       "modalities": [
         "text"
       ],
       "format": "gguf",
       "repo": "antirez/glm-5.3-flash-gguf",
-      "base_url": "https://huggingface.co/antirez/glm-5.3-flash-gguf/resolve/main",
-      "local_dir": "antirez-glm-5.3-flash-gguf",
-      "shared_note": "Text only for now. antirez's ds4-layout GGUF (general.architecture glm5-next, ds4 tensor names): one 89.88 GiB file. The vision encoder ships as a separate 1.05 GiB sidecar GGUF (GLM-5.3-Flash-Vision-Encoder.gguf) and is not fetched until the Metal text record exists.",
+      "base_url": "https://huggingface.co/antirez/glm-5.3-flash-gguf/resolve/b2fa29d7a6b410db11221c904973967b80b760f5",
+      "local_dir": "GLM-5.3-Flash-GGUF",
+      "shared_note": "Text only until the Metal vision path for this model is qualified: the companion GLM-5.3-Flash-Vision-Encoder.gguf is fetched with the source but not served (the text record runs language_model_only). The GGUF is the ds4 layout (general.architecture glm5-next, ds4 tensor names): one 89.88 GiB file, 45 trunk layers (34 KDA + 11 pooled sparse MLA) and the nextn MTP block. Modalities flip to text+image when an image request is validated on Metal.",
       "speculator": {
         "repo": "incoai/GLM-5.3-Flash-DFlash2",
         "revision": "bf582e4eacc1810f76656d1811693ff6c6737d2a",
@@ -1435,14 +1435,20 @@
           "method": "dflash",
           "num_speculative_tokens": 3
         },
-        "note": "Candidate drafter, not yet measured on Metal for this quant. The campaign measures the GGUF's own MTP block (nextn, layer 45), this DFlash2 drafter, and any other published drafter under the same gate and pins whichever is fastest on the box (HANDOFF.md, GLM-5.3-Flash Q2 on Metal). Shares the target's embed_tokens and lm_head; taps [5, 14, 24, 33, 42] via the EAGLE-3 aux-hidden-state interface glm5_next already implements."
+        "note": "The source-level drafter is the published DFlash2 head (the A100 glm53f records use it). The Metal record overrides it with the GGUF-resident nextn MTP block (speculator model \"target\"): DFlash2 is parked on Metal after a hybrid KV group block-size mismatch on this layout (2026-09-11)."
       },
+      "shared": [
+        {
+          "path": "GLM-5.3-Flash-Vision-Encoder.gguf",
+          "bytes": 1127280960,
+          "sha256": "ae23e14c6979e889051b2e4a39351abcdafb161e18e606fae4d8c40095a4bf3a"
+        }
+      ],
       "quants": {
         "Q2": {
-          "title": "Q2 (IQ2_XXS gate/up + Q2_K down experts, imatrix)",
+          "title": "Q2 (IQ2_XXS gate/up, Q2_K down)",
           "bytes": 96505816384,
-          "summary": "antirez's GLM-5.3-Flash-Q2.gguf: routed experts IQ2_XXS gate/up (49.9 GiB) + Q2_K down (31.8 GiB), the DSV4 0731 expert recipe; KDA q/k Q4_K, KDA v/out and gates Q8_0; sparse-MLA projections, shared experts, dense FFN, embeddings and head Q8_0; indexer, hc_*_fn and nextn.eh_proj BF16; router, norms, convs, dt_bias, a_log F32. 1,412 tensors, 50 KV pairs, source revision 84c6a6aa of zai-org/GLM-5.3-Flash.",
-          "min_gpus": {},
+          "summary": "321B GLM-5.3-Flash with 45 trunk layers, 34 KDA and 11 pooled sparse MLA, plus a separate vision encoder.",
           "min_memory_bytes": {
             "metal": 137438953472
           },
@@ -1452,7 +1458,10 @@
               "bytes": 96505816384,
               "sha256": "e81fd6241c6e55a64e1e14e47a3eab61a173fa8d7e4b5c1d1848827119705b32"
             }
-          ]
+          ],
+          "min_gpus": {
+            "metal": 1
+          }
         }
       }
     }
@@ -1786,14 +1795,16 @@
             "trust_remote_code": true,
             "reasoning_parser": "glm45",
             "tool_call_parser": "glm47",
-            "served_model_name": "GLM-5.2-Vision"
+            "served_model_name": "GLM-5.2-Vision",
+            "kv_cache_dtype": "fp8"
           },
           "notes": [
             "Not yet runnable: this model serves through sparse MLA, and the Metal sparse-MLA kernels do not exist yet. These engine settings are starting points chosen to fit the memory budget, not measured configurations -- unlike every other profile in this file.",
             "Metal has no CUDA-graph equivalent, so graph capture is disabled through compilation_config.",
             "max_num_seqs is deliberately small. Batched serving is the weakest part of every Metal engine surveyed -- ds4 still runs attention and routed experts per session -- so concurrency here is a guess, not a tested ceiling.",
             "Q2_K and Q4_K need a 512 GB Mac Studio. IQ2_XXS is the only quant a 256 GB machine can hold.",
-            "FP8 is the official KV cache quantization. DSpark draft KV uses fp8; earlier draft-cache throughput and sizing measurements require requalification after this change."
+            "FP8 is the official KV cache quantization. DSpark draft KV uses fp8; earlier draft-cache throughput and sizing measurements require requalification after this change.",
+            "kv_cache_dtype fp8 (operator 2026-09-11: FP8 default across the board). NOT yet live-validated: the profile itself is plan-time gated as not-ready on Metal (GLM-shaped sparse MLA unvalidated), so the dtype takes effect at that bring-up and must be validated with it."
           ]
         }
       }
@@ -2474,10 +2485,10 @@
           "default_quant": "NVFP4",
           "engine": {
             "tensor_parallel_size": 1,
-            "max_model_len": 32768,
+            "max_model_len": 262144,
             "max_num_seqs": 8,
             "max_num_batched_tokens": 2048,
-            "kv_cache_memory_bytes": 17179869184,
+            "kv_cache_memory_bytes": 25769803776,
             "compilation_config": {
               "cudagraph_mode": "NONE"
             },
@@ -2515,7 +2526,9 @@
             "The former qwen38-nvfp4-1-df2 twin (canonical minus muse) is retired: it differed only by VLLM_QC_MUSE, which is a kill switch, not a config. Reproduce it with VLLM_QC_MUSE=0 on this profile.",
             "Chat-template defaults: reasoning_effort low (the template ships xhigh, which spends hundreds of thinking tokens on trivial turns) and preserve_thinking explicitly true (the template treats undefined as true; pinned so a template update cannot silently flip it). Per-request values override both.",
             "enable_prefix_caching true is SlimServe policy: every profile states it explicitly; hybrid models otherwise inherit vLLM's silent hybrid default of OFF and pay full history re-prefill every chat turn. Enabled here 2026-08-30; validate on this platform (mamba 'align' cache mode is experimental upstream) at its next live validation pass.",
-            "Vision is enabled with the checkpoint's native vision tower and processor; text and image requests are required for profile validation."
+            "Vision is enabled with the checkpoint's native vision tower and processor; text and image requests are required for profile validation.",
+            "Context raised to the model default 262144 with a 24 GiB KV pool (2026-09-11). Unlocked by the native quantized prefill GEMM (qgemm_nvfp4_planar / qgemm_fp8ch): weights stay in their packed checkpoint form for EVERY batch size - the earlier dual-layout design materialized ~54 GiB of bf16 prefill weights (Model loading took 76.3 GiB) and capped the pool at 18.06 GiB, short of the 20.99 GiB one full-context request needs; the per-call-dequant escape crashed the engine mid-262k-prefill. Packed-only load is ~25 GiB incl. the vision tower. VLLM_METAL_CT_DEQUANT=once remains a diagnostic-only escape back to the materialized path. Validation: float64 kernel oracles, live parity vs the materialized route, and the 262k needle (perf/results/2026-09-11/nvfp4-native-gemm/).",
+            "fp8 main KV is BLOCKED on this record (2026-09-11): with kv_cache_dtype fp8 the model generates as if the prompt were empty on BOTH weight paths (native GEMM and CT_DEQUANT=once), while bfloat16 KV answers correctly - isolation legs in perf/results/2026-09-11/nvfp4-native-gemm/parity_*. The metal_attn SDPA prefill does call kv_cache_gather_range_fp8 with layer scales, so the fault is inside the fp8 scatter/gather or scale application at this profile's geometry (GQA 24/4, head_dim 256, partial rotary; the unit roundtrip only covers dim 64). Reverted to bfloat16 until that bring-up; the FP8-default directive (operator 2026-09-11) applies here as soon as it passes."
           ],
           "speculator": {
             "repo": "z-lab/Qwen3.8-27B-DFlash2",
@@ -2581,7 +2594,8 @@
             "tool_call_parser must be muse_glimmer: tool calls use the model's native ATEM recipient/invoke/parameter envelope, including Responses custom-tool payloads.",
             "This profile retains its qualified unquantized bf16 KV cache. The Metal FP8 backend is used by the DSV4 drafter; this profile's fused decode configuration has not been qualified with FP8 KV.",
             "Performance note (2026-08-15): DFlash speculation (always on) measures 19.9-20.1 tok/s rested on the 256-token greedy essay bench (fused verify step + tensor-ops kernels on the M5 GPU neural accelerators), ahead of plain fused decode (14.4-16.4); long-context (10k, cached decode) 11.0. Acceptance ~1.73/draft. See perf/baseline_status.md. llama.cpp reference on this box: 26.75 plain / 30.8 spec; vendor ExecuTorch 26.6/50.2.",
-            "NVMe KV tier (issue #19): 128 GiB file-backed slots behind the 12 GiB GPU pool; same unified-memory rationale as dsv4-xxs-1. enable_cross_layers_blocks forces the packed slab across the SWA+full groups; a layout mismatch fails loudly at register time. Only the 13 global layers hold deep KV (SWA layers are capped at the 2048 window), so restores are dominated by the global-layer bytes."
+            "NVMe KV tier (issue #19): 128 GiB file-backed slots behind the 12 GiB GPU pool; same unified-memory rationale as dsv4-xxs-1. enable_cross_layers_blocks forces the packed slab across the SWA+full groups; a layout mismatch fails loudly at register time. Only the 13 global layers hold deep KV (SWA layers are capped at the 2048 window), so restores are dominated by the global-layer bytes.",
+            "fp8 main KV is BLOCKED on this record: same 'unsupported dtype Byte' rejection as qwen38-q2kxl-1 from the muse fused decode path (smoke 2026-09-11). Reverted to auto until the kernels accept byte caches; the FP8-default directive then applies here too."
           ]
         }
       }
@@ -2642,7 +2656,8 @@
             "max_model_len 131072 of the model's 262144: matched to the muse profile until the hybrid KV/state manager is measured on Metal.",
             "Chat-template defaults: reasoning_effort low (the template ships xhigh, which spends hundreds of thinking tokens on trivial turns) and preserve_thinking explicitly true (the template treats undefined as true; pinned so a template update cannot silently flip it). Per-request values override both.",
             "enable_prefix_caching true is SlimServe policy: every profile states it explicitly; hybrid models otherwise inherit vLLM's silent hybrid default of OFF and pay full history re-prefill every chat turn. Enabled here 2026-08-30; validate on this platform (mamba 'align' cache mode is experimental upstream) at its next live validation pass.",
-            "NVMe KV tier (issue #19): 128 GiB file-backed slots behind the 12 GiB GPU pool; same unified-memory rationale as dsv4-xxs-1. enable_cross_layers_blocks forces the packed cross-layer slab the connector requires for the hybrid GDN+attention groups (the engine equalizes mamba and attention page sizes at boot, but the group split is not guaranteed to resolve all-uniform); a layout mismatch fails loudly at register time. GDN tail states ride the engine's frozen align-mode boundary snapshots, the contract validated on qwen38fn-fp8-8/rtx3090."
+            "NVMe KV tier (issue #19): 128 GiB file-backed slots behind the 12 GiB GPU pool; same unified-memory rationale as dsv4-xxs-1. enable_cross_layers_blocks forces the packed cross-layer slab the connector requires for the hybrid GDN+attention groups (the engine equalizes mamba and attention page sizes at boot, but the group split is not guaranteed to resolve all-uniform); a layout mismatch fails loudly at register time. GDN tail states ride the engine's frozen align-mode boundary snapshots, the contract validated on qwen38fn-fp8-8/rtx3090.",
+            "fp8 main KV is BLOCKED on this record: the first request dies with 'quixicore(metal): unsupported dtype Byte' - the fused GDN decode / hybrid KV-gather kernels read the cache as bf16 and reject byte storage (smoke 2026-09-11, perf/results/2026-09-11/nvfp4-native-gemm/smoke_qwen38-q2kxl-1.log). Reverted to auto until the QuixiCore hybrid path grows fp8-cache support; the FP8-default directive then applies here too."
           ]
         },
         "mi300x": {
@@ -2915,6 +2930,9 @@
                 "nvme_tier_gb_per_rank": 256,
                 "enable_cross_layers_blocks": "True"
               }
+            },
+            "override_generation_config": {
+              "thinking_token_budget": 2000
             }
           },
           "env": {},
@@ -2927,7 +2945,8 @@
             "moe_backend marlin (top-level and kernel_config, since a non-auto top-level flag overwrites kernel_config): this fork defaults to aiter, which is ROCm-only; Marlin W4A16 is the NVFP4 MoE path on sm80.",
             "reasoning_parser and tool_call_parser glm47: GLM-5.3 uses the GLM-4.7-family thinking and tool-call markup; enable_auto_tool_choice and thinking are the registry serving defaults.",
             "Host KV tier ENABLED (2026-09-03): 72 GiB pinned host RAM per rank (cudaHostRegister-ed at exact size) plus a 256 GiB per-rank NVMe/disk third tier under it (per-rank O_TMPFILE in SLIMSERVE_KV_TIER_DIR - operator environment, never a profile field; on this box the tier directory sits on the 4.9 TB /dev/sda2 filesystem). The layout is the packed cross-layer slab (enable_cross_layers_blocks) over 56 layers: 4 KDA state groups + the MLA and indexer groups. Hybrid page-size unification gives the indexer group (512 B/token) 2176-token blocks beside the MLA group's 1088 (TP4; 576/1152 at TP8), so the connector runs per-group block ratios: the wider group is offloaded/restored only where its block completes and resume boundaries align to the ratios' lcm. Every kernel on this path addresses pages by block stride (no flattening of the packed view). Validation: host tier at TP4 (48 GiB/rank): 6/6 probes hit and restored at block 36 (39,168 tokens), 58 restore ops each, VLLM_KV_TIER_VERIFY 0/58 mismatched; disk tier at TP4 (8 GiB host + 64 GiB disk, restores forced from disk): promotions from NVMe, verify 0/58 mismatched, 0 disk round-trip mismatches, 6/6 recalled after a 1.9M-token churn of a 1.24M-token pool (perf/results/2026-09-03/kvtier-acceptance/glm53-tp4-{host48,disk9}/); the TP8 record validated through slimserve on 2026-09-04 (perf/results/2026-09-04/glm53f-nvfp4-8-tier/).",
-            "Reasoning effort: the GLM-5.3-Flash chat template implements the GLM-5.3 Low / High / Max levels (default Max) from the reasoning_effort chat_template_kwargs; thinking itself stays always-on (serving policy). No server flag is involved."
+            "Reasoning effort: the GLM-5.3-Flash chat template implements the GLM-5.3 Low / High / Max levels (default Max) from the reasoning_effort chat_template_kwargs; thinking itself stays always-on (serving policy). No server flag is involved.",
+            "Thinking budget (2026-09-11): override_generation_config.thinking_token_budget 2000 per request, the fleet convention (qwen38 records); the V2 runner nudges the model to wrap up at 85% of the budget and force-closes the think block at 100%, capped inside the request's max_tokens. Added after the 1M-context legs showed probes at 900K+ spending their whole 1,024-token reply budget thinking with an empty answer: this record had no budget, so nothing ever closed the block."
           ]
         }
       }
@@ -2943,7 +2962,9 @@
           "platform": "a100",
           "default_quant": "NVFP4",
           "engine": {
-            "tensor_parallel_size": 8,
+            "tensor_parallel_size": 4,
+            "data_parallel_size": 2,
+            "data_parallel_replicate_moe": true,
             "additional_config": {
               "glm5_next_compact_indexer_cache": true,
               "glm5_next_shared_indexer_scratch": true,
@@ -2953,10 +2974,12 @@
               "glm5_next_singleton_pool_update": true,
               "glm5_next_adaptive_pool_score": false,
               "glm5_next_sparse_tc_decode": true,
-              "glm5_next_indexer_row_shard": true
+              "glm5_next_indexer_row_shard": true,
+              "glm5_next_main_kv_fp8": true,
+              "glm5_next_sparse_prefill": true
             },
             "enable_expert_parallel": false,
-            "max_num_seqs": 64,
+            "max_num_seqs": 128,
             "block_size": 64,
             "gpu_memory_utilization": 0.95,
             "kv_cache_dtype": "auto",
@@ -2972,7 +2995,7 @@
             },
             "compilation_config": {
               "cudagraph_mode": "FULL_DECODE_ONLY",
-              "max_cudagraph_capture_size": 256
+              "max_cudagraph_capture_size": 384
             },
             "limit_mm_per_prompt": {
               "image": 2
@@ -2989,50 +3012,46 @@
                 "nvme_tier_gb_per_rank": 256,
                 "enable_cross_layers_blocks": "True"
               }
-            }
+            },
+            "override_generation_config": {
+              "thinking_token_budget": 2000
+            },
+            "max_num_batched_tokens": 2048
           },
           "env": {},
           "notes": [
-            "Context comes from config.json (max_position_embeddings 1048576). Main NoPE-MLA KV stays BF16. The compact pooled indexer stores completed BF16 pools plus a page-owned raw tail ring: logical rows are 64 BF16 values instead of the historical raw 256. Together with model-owned shared decode-logits scratch, the measured TP8 pool is 4278924 tokens at 50.72 GiB KV per rank (2026-09-09), enough for 4.08 resident maximum-length contexts.",
+            "Context comes from config.json (max_position_embeddings 1048576). Main NoPE-MLA KV is fp8 (e4m3) per layer on the 11 sparse MLA layers (see the 2026-09-12 note); the KDA state and the indexer pools are unquantized. The compact pooled indexer stores completed BF16 pools plus a page-owned raw tail ring: logical rows are 64 BF16 values instead of the historical raw 256. Together with model-owned shared decode-logits scratch, the measured TP8 pool is 4278924 tokens at 50.72 GiB KV per rank (2026-09-09), enough for 4.08 resident maximum-length contexts.",
             "Current compact TP8 page geometry is MLA 576 tokens and indexer 4608 tokens, ratio8; the September 3 tier notes below describe the historical raw indexer ratio2. Compact-only validation passed 633 long-workload turns, 100/100 recall probes up to 530222 context, and six real disk/host restores with 6600 per-rank operations in aggregate and zero reported mismatches. Shared scratch reclaims 640 MiB/rank and passes replay, text/image/tool canaries and exact-token serving checks; throughput is effectively unchanged. Full 1M-context and subsequent combined-change long qualification remain open.",
-            "Parallelism is by measurement on the 8x A100 matrix (exact-token, perf/results/2026-09-02/glm53-8gpu-matrix/): TP8 83.0 / 343.7 / 447.7 tok/s at c1 / c8 / c16; TP8+EP 75.3 / 331.1 / 430.8; TP4xDP2 67.2 / 382.8 / 527.6; TP4xDP2+EP 51.3 / 317.0 / 480.1; TP4 on four GPUs 73.6 / 282.6 / 369.9. TP8 wins single-stream latency and keeps one prefix cache and one KV pool for agentic traffic; DP2's c8/c16 lead is the TP8 per-rank fixed cost (8-rank allreduce, replicated mHC and indexer) still to be fused away. The record runs TP8, experts sharded.",
             "attention_config backend is explicit: the Ampere MLA priority list carries no dense MLA by design, and the DSA layers must run sparse (index_topk 2048 over 4-token pools) through QUIXICORE_MLA_SPARSE's NoPE (512-wide) kernel; sparse_mla_force_mqa keeps prefill on the same top-k MQA path.",
             "block_size 64 is required by the pooled-indexer cache backend (DSV3.2 indexer metadata, kernel block 64).",
-            "kv_cache_dtype auto is required: this fork defaults the cache to fp8, and no Ampere MLA backend serves fp8 at the 512-wide NoPE head; this is an unquantized cache, while FP8 is the only permitted KV quantization.",
+            "kv_cache_dtype auto stays at the engine level because this fork defaults the whole cache to fp8 and the KDA state / indexer-pool groups must stay bf16/fp32; the main NoPE-MLA KV is quantized per layer instead through additional_config.glm5_next_main_kv_fp8 (2026-09-12), which rewrites only the sparse MLA layers' cache_dtype.",
             "moe_backend marlin (top-level and kernel_config, since a non-auto top-level flag overwrites kernel_config): this fork defaults to aiter, which is ROCm-only; Marlin W4A16 is the NVFP4 MoE path on sm80.",
             "reasoning_parser and tool_call_parser glm47: GLM-5.3 uses the GLM-4.7-family thinking and tool-call markup; enable_auto_tool_choice and thinking are the registry serving defaults.",
             "Host KV tier ENABLED (2026-09-03): 72 GiB pinned host RAM per rank (cudaHostRegister-ed at exact size) plus a 256 GiB per-rank NVMe/disk third tier under it (per-rank O_TMPFILE in SLIMSERVE_KV_TIER_DIR - operator environment, never a profile field; on this box the tier directory sits on the 4.9 TB /dev/sda2 filesystem). The layout is the packed cross-layer slab (enable_cross_layers_blocks) over 56 layers: 4 KDA state groups + the MLA and indexer groups. Hybrid page-size unification gives the indexer group (512 B/token) 2176-token blocks beside the MLA group's 1088 (TP4; 576/1152 at TP8), so the connector runs per-group block ratios: the wider group is offloaded/restored only where its block completes and resume boundaries align to the ratios' lcm. Every kernel on this path addresses pages by block stride (no flattening of the packed view). Validation: host tier at TP4 (48 GiB/rank): 6/6 probes hit and restored at block 36 (39,168 tokens), 58 restore ops each, VLLM_KV_TIER_VERIFY 0/58 mismatched; disk tier at TP4 (8 GiB host + 64 GiB disk, restores forced from disk): promotions from NVMe, verify 0/58 mismatched, 0 disk round-trip mismatches, 6/6 recalled after a 1.9M-token churn of a 1.24M-token pool (perf/results/2026-09-03/kvtier-acceptance/glm53-tp4-{host48,disk9}/); the TP8 record validated through slimserve on 2026-09-04 (perf/results/2026-09-04/glm53f-nvfp4-8-tier/).",
             "Sized to the 8x A100 / 787 GB host box (2026-09-06): gpu_memory_utilization 0.95 (weights 23.6 GiB/rank, the rest of the budget is the VRAM KV pool), max_num_seqs 64 with a matching FULL_DECODE_ONLY capture size, 72 GiB pinned host tier per rank (576 GiB, leaving ~200 GB for prefill staging and page cache) and 256 GiB disk tier per rank (2 TiB on the 4.9 TB /dev/sda2). Three tiers: VRAM pool -> pinned host -> per-rank O_TMPFILE disk, all at the model-default 1,048,576 context.",
             "Reasoning effort: the GLM-5.3-Flash chat template implements the GLM-5.3 Low / High / Max levels (default Max) from the reasoning_effort chat_template_kwargs; thinking itself stays always-on (serving policy). No server flag is involved.",
-            "MTP speculative decoding ON by default (2026-09-10): the checkpoint's one-layer MTP head (layer 45: residual NoPE pooled-MLA + block-128 FP8 MoE) drafts k=3 with the per-batch-size schedule [[1, 16, 3], [17, 64, 0]] (k falls as the decode batch grows, so the verify batch stays inside the graph set); cross-draft index sharing stays off pending state validation. Rejection sampling verifies every draft against the target, so output content is unaffected. --no-spec restores the non-speculative path. Evidence: V2 DFlash2 arms 2026-09-10 (perf/results/2026-09-10/glm53f-dflash2/): static k=3 c1 153-183 / c8 509-515 / c16 678-688 vs non-spec 109.9 / 494.6 / 676.0; k=5 gains 1.6% at c1 for -8% c8; this schedule keeps c32 within 4% and c64 level (891.6 / 1076.1). Per-run c1 tracks acceptance (1.5-3.2 at temperature 1.0); the speculative step rate is 71-75 steps/s (14 ms vs 9.1 plain)."
+            "Parallelism: TP4 x DP2 with replicated MoE (operator 2026-09-10: production is always c8+). vLLM's default DP flattens the MoE tensor-parallel group across DP (each rank holds 1/8 of every expert and every MoE layer all-gathers tokens across replicas in lockstep), which is what made the 2026-09-03 TP4xDP2 arm lose 10% at c1 to standalone TP4; data_parallel_replicate_moe keeps the full expert set on each replica sharded over its own TP4 group (44.9 GiB weights per rank), so the replicas share nothing per step. The DP load balancer routes by prefix affinity (VLLM_DP_PREFIX_AFFINITY, default on) because each replica's prefix cache and KV tiers are private. Measured 2026-09-11 through `slimserve --serve` (exact-token, DFlash2 on, three warmed repeats, medians): c1 117.8 / c8 506.8 / c16 786.5 / c32 985.8 / c64 1158.0 tok/s, text/image/tool canaries pass, forced-eviction tier acceptance 6/6 with VLLM_KV_TIER_VERIFY 96 batches / 0 mismatched (raw: perf/results/2026-09-11/glm53f-final-dp2/); the qualifying arm measured 128.8 / 559.4 / 771.2 / 1012.2 / 1174.6 (perf/results/2026-09-10/glm53f-dflash2/mx-tp4dp2-k2/); TP8 record before the flip: 153.6 / 495.0 / 687.3 / 879.5 / 1074.5. EP loses at every point and stays off.",
+            "Thinking budget (2026-09-11): override_generation_config.thinking_token_budget 2000 per request, the fleet convention (qwen38 records); the V2 runner nudges the model to wrap up at 85% of the budget and force-closes the think block at 100%, capped inside the request's max_tokens. Added after the 1M-context legs showed probes at 900K+ spending their whole 1,024-token reply budget thinking with an empty answer: this record had no budget, so nothing ever closed the block.",
+            "Main KV fp8 (e4m3) ON (2026-09-12, glm5_next_main_kv_fp8; FP8 is the official KV quantization): the 512-wide NoPE latent is stored fp8 with a per-tensor scale and decoded natively by the fp8 lane-parallel sparse decode and the fp8 sparse tensor-core path (bf16-parity kernels, 613 vs 602 us). The MLA blocks widen to 2304 tokens (packed slab, equal page bytes) beside the 1152-token KDA/drafter blocks, so the host tier hashes at the scheduler's 1152-token gcd. VRAM pool 2,969,768 tokens (bf16: 1,669,244; 2.83x the 1M context). Gates: canaries pass; exact medians c1 118.4 / c8 559.1 / c16 730.0 / c32 971.6 / c64 1139.3 tok/s (bf16 record 117.8 / 506.8 / 786.5 / 985.8 / 1158.0, within run-to-run noise); eviction-restore acceptance 6/6 markers after a 3.74M-token churn with VLLM_KV_TIER_VERIFY=1 (88 verify batches, 0 mismatched); WildChat deep-context leg c8 737 turns, 0 errors, 119/119 recall probes, 549 tier restores, 93.4% prefix hit rate, sessions to 624K tokens. Raw: perf/results/2026-09-12/glm53f-fp8-gates2/ and glm53f-leg-fp8-2/.",
+            "mHC transition partials kernel (2026-09-12, QuixiCore partials_batched_ws, default on): the 4-stream residual mix plus 24 pre-mix dot products per token runs warp-split (each warp streams 3 of the 24 fn rows, 64 registers, 4 blocks/SM) instead of one thread per element holding all 96 accumulators - 31 -> 13.6 us at 32 tokens, 98 -> 33 us at 128 tokens, residual bit-exact. Record re-measured on this tree (exact medians of three warmed repeats): c1 127.1 / c8 497.0 / c16 843.9 / c32 1023.3 / c64 1320.8 tok/s (before: 118.4 / 559.1 / 730.0 / 971.6 / 1139.3; c8 is inside its 481-589 spread). Raw: perf/results/2026-09-12/glm53f-mhcws-record/.",
+            "DFlash2 speculative decoding ON by default: incoai/GLM-5.3-Flash-DFlash2 (5 SWA layers, block 8, taps at target layers 6/15/25/34/43 = mean of the four mHC streams) drafts a FIXED k=2 per replica (2026-09-12). The earlier per-batch-size schedule [[1,16,3],[17,64,0]] was inert: the engine disables dynamic draft schedules under data parallelism and had fallen back to a fixed k=3; measured under sustained load (vllm bench serve random 1000/300, 640-1280 prompts) k=2 gives c64 1227/1411 and c128 1674/1672 output tok/s against k=3 1140/1157 and 1425/1426 (acceptance 2.10 of 3 rows vs 2.19 of 4: the shorter verify step is worth more than the extra row); k=4 loses 13% on the exact harness. Zero-draft schedule ranges are rejected under replicated-MoE DP (they crashed KV-cache initialization). Rejection sampling verifies every draft, so output content is unaffected. --no-spec restores the non-speculative path.",
+            "Record at fixed k=2 (2026-09-12, exact medians of three warmed repeats): c1 128.0 / c8 567.1 / c16 875.6 / c32 1110.0 / c64 1413.8 tok/s (k=3: 127.1 / 497.0 / 843.9 / 1023.3 / 1320.8); canaries pass; WildChat deep-context leg c8 785 turns, 0 errors, 126/126 recall, sessions to 658K tokens (VLLM_KV_TIER_VERIFY=1). Sustained load (vllm bench serve random 1000/300): c64 1227-1411, c128 1672-1674 output tok/s. Raw: perf/results/2026-09-12/glm53f-k2-record/, glm53f-leg-k2/, glm53f-sustained-k2/.",
+            "Sparse MLA prefill kernel ON (2026-09-12, glm5_next_sparse_prefill; QuixiCore mla_sparse_prefill_fp8): prefill chunks attend in groups of 4 consecutive queries on tensor cores over the union of their selected 4-token pools with a per-query mask, instead of the per-token decode kernel that took 39% of prefill time. Sustained load (same protocol, one run each): c64 1508 vs 1417 output tok/s, c128 1864 vs 1674 (+6% / +11%); exact medians unchanged within spread; canaries pass. Semantics: a token listed twice by the indexer (the always-selected tail inside a selected pool) counts once. Raw: perf/results/2026-09-12/glm53f-sparse-prefill-{1,0}/.",
+            "max_num_seqs 128 per replica, cudagraph capture 384 tokens (2026-09-13): sustained c256 2424 output tok/s vs the c128 cap of 1952 at 64/replica (+24%, mean TPOT 96 ms); c64/c128 unchanged (1568/1952), canaries pass, KV pool 2.56M tokens (2.72M at 64). 256/replica measured no better (c256 2436) and collapsed at c512 (947 tok/s, TPOT 281 ms). Draft length stays fixed k=2: per-replica schedules [[1,32,3],[33,128,2]] (c64 1521 / c128 1927 / c256 2404) and [[1,16,4],[17,48,3],[49,128,2]] (1450 / 1913 / 2385, 65% acceptance) both lose to k=2. Raw: perf/results/2026-09-13/glm53f-mns{128,256}/, glm53f-mns128-sched-{a,b}/.",
+            "max_num_batched_tokens 2048, explicit (2026-09-13): larger prefill chunks win the random 1000/300 benches (sustained c64/c128/c256 1582/1947/2431 and exact c64 1603 at 4096; 1575/1947 and 1652 at 8192; vs ~1508/1864 and ~1450 at 2048) but lose the production-shape WildChat deep-context leg with the same pool and router: 811 turns at 2048 vs 702 at 4096 and 704 at 8192, TTFT p50 above 262K context 11.4 s vs 15.0/15.5 s, and the host tier restores 4x fewer blocks while offloading 2x more (14.1K/59.8K vs 3.3K/123K) - sessions re-prefill history instead of restoring it. Until that tier interaction is fixed the record serves the agentic shape; 4096 is the validated setting for short-context high-throughput serving (engine override). Raw: perf/results/2026-09-13/glm53f-leg-{2048-router,chunk4096,8192-router}/, glm53f-chunk4096-record/."
           ],
           "speculative_overrides": {
-            "num_speculative_tokens": 3,
-            "num_speculative_tokens_per_batch_size": [
-              [
-                1,
-                16,
-                3
-              ],
-              [
-                17,
-                64,
-                0
-              ]
-            ]
+            "num_speculative_tokens": 2
           }
         }
       }
     },
     "glm53f-q2-1": {
-      "title": "GLM-5.3-Flash antirez Q2 on one Mac",
-      "source": "glm53f-q2",
+      "title": "GLM-5.3-Flash Q2 on one Mac",
+      "source": "glm53f-gguf",
       "gpus": 1,
-      "summary": "Text-only 320B-A18B hybrid (34 KDA linear-attention layers + 11 pooled-indexer NoPE sparse-MLA layers, mHC, 288-expert top-8 MoE) from antirez's Q2 GGUF on a single 128 GiB Apple Silicon machine, sized by unified memory. Bring-up campaign; see HANDOFF.md.",
+      "summary": "GLM-5.3-Flash Q2 (antirez's GGUF: IQ2_XXS gate/up + Q2_K down experts) resident on one 128 GiB Apple Silicon machine, text only, 131072-token context, the GGUF's own nextn block as the K=1 MTP drafter. M1 Ultra: decode 34-40 tok/s, prefill 237-258 t/s; ds4 on the same box 22.5 / 143.",
       "speculative": true,
-      "status": "in-progress",
-      "status_reason": "GLM-5.3-Flash has no Metal serving path yet (KDA core, NoPE sparse MLA, pooled indexer, glm5-next GGUF adapter); bring-up in progress",
-      "status_detail": "The glm5_next model composes layers this fork already serves on CUDA (Kimi KDA, NoPE MLA, DeepseekV2MoE, dsv4_mhc ops), none of which route to Metal. The campaign plan, blocker list and gates live in the first section of HANDOFF.md; the profile flips to supported when the exact-token gates pass on the M1 Ultra.",
       "variants": {
         "metal": {
           "platform": "metal",
@@ -3052,7 +3071,7 @@
             "enable_chunked_prefill": true,
             "trust_remote_code": true,
             "served_model_name": "GLM-5.3-Flash",
-            "reasoning_parser": "glm45",
+            "reasoning_parser": "glm47",
             "tool_call_parser": "glm47",
             "language_model_only": true,
             "default_chat_template_kwargs": {
@@ -3086,17 +3105,19 @@
               "num_speculative_tokens": 1,
               "quantization": "gguf"
             },
-            "note": "The GGUF's own nextn block (blk.45: one sparse-MLA + MoE layer, BF16 eh_proj) as the MTP drafter, loaded from the target file (ds4's MTP recipe: 90.1% accept, 1.90 tok/cycle at K=1). Candidate #1 of the campaign's head-to-head (the source-level DFlash2 drafter is candidate #2); the Metal decode gates decide which one this record pins."
+            "note": "The GGUF's own nextn block (blk.45: one sparse-MLA + MoE layer, BF16 eh_proj) as the MTP drafter, loaded from the target file (ds4's MTP recipe) and fed the post-final-norm hidden state. K=1 measured against no drafter and K=2 (2026-09-11/14): 2.000 tok/cycle on the loop probe, 0.63-0.85 accepted drafts per cycle on prose; K=2 loses because the third verify row costs ~14 ms of expert bytes per step. The DFlash2 candidate is parked (hybrid KV group block-size mismatch)."
           },
           "notes": [
-        "max_num_batched_tokens 4288 = the Mamba align-mode block: the fp32 KDA state page is 4,341,760 B per layer-slot and the MLA latent is 1 KiB/token, so the hybrid aligner sets the attention block to 4288 tokens and align mode requires the batch cap >= one block (first boot 2026-09-11 failed the assert at 2048). One prefill chunk == one block.",
-            "PLAN-STAGE RECORD (2026-09-10): engine settings are the campaign's starting budget, not measured. Weights 89.9 GiB pinned + ~0.4 GiB dequantized kv_b_proj + 8 GiB fixed KV pool + 146 MiB fp32 KDA state per sequence lands total demand near 100 GiB against the ~115 GiB Metal working set of a 128 GiB machine (DSV4 served at ~103).",
+            "max_num_batched_tokens 4288 = the Mamba align-mode block: the fp32 KDA state page is 4,341,760 B per layer-slot and the MLA latent is 1 KiB/token, so the hybrid aligner sets the attention block to 4288 tokens and align mode requires the batch cap >= one block (first boot 2026-09-11 failed the assert at 2048). One prefill chunk == one block.",
+            "MEASURED RECORD (2026-09-14, perf/baseline_status.md): weights 89.9 GiB resident + 8 GiB KV pool + fp32 KDA state + dequantized kv_b lands the footprint near 100 GiB against the ~115 GiB Metal working set. Exact-token gates sha-pinned on the final build (8tok 7dd30ea193a6, off1-2000 393882a2ddaf, 2500x64 1d7d58486dc7): decode loop probe 39.96 tok/s at 2.000 tok/cycle, off1-2000 gate 34.23 tok/s incl. prefill, prose 32.5-39.9 tok/s, prefill 256-258 t/s at 2048 tokens / 237-241 at 2500; needles pass at 1.5k/4k/6.5k/12k; teacher-forced argmax agreement with ds4 29/32 and 62/64. ds4 6289c516 on the same box: decode 22.52 tok/s (--mtp), prefill 143 t/s.",
             "Hybrid layout: 45 text layers, sparse-MLA (NoPE, kv_lora 512, 64 heads x 256) at layers 3,7,...,43, KDA (64 heads x 128, conv 4, per-channel decay, gate_lower_bound -5) everywhere else; only the 11 MLA layers hold paged KV (11 KiB/token f16 latents + 0.7 KiB/token indexer pools). The 8 GiB pool holds two full 131072-token requests with margin.",
             "mamba_ssm_cache_dtype float32: the KDA recurrent state stays fp32 on Metal (bf16 state is a recorded quality hazard on the Qwen GDN path; the A100 records use bfloat16 with different kernels).",
-            "Registered speculator = the GGUF's own nextn MTP block (glm5_next_mtp, K=1), gated 2026-09-11 against no drafter and K=2 (W9: decode probe 31.95 tok/s vs 23.26 without a drafter and 22.9 at K=2; exact-token gates sha-pinned with it). The DFlash2 candidate is parked (hybrid KV group block-size mismatch on this hybrid layout).",
-            "Campaign features are opt-in per profile, and this is the only profile that opts in: VLLM_METAL_ASYNC_SCHED (W8a, decode 18.9 -> 21.9 tok/s; dsv4-xxs-1's DSpark anchor rolls under it), VLLM_QC_Q8_NR (W8b q8_0 NR/mb GEMV, decode 21.9 -> 23.3; not bit-identical to the generic walk), VLLM_METAL_KV_META and VLLM_METAL_MAMBA_LB (W7 single-launch step metadata), VLLM_METAL_MOE_ROUTER (single-dispatch top-k), VLLM_METAL_MOE_FOLD (shared-expert add folded into the q2_K sum kernel). Every other Metal profile runs the code it was gated with (2026-09-12).",
-            "Vision deferred (language_model_only): the sidecar encoder GGUF is not loaded until the text record is pinned.",
-            "Chat-template defaults mirror the A100 glm53f records: reasoning_effort low, thinking on, glm45/glm47 parsers, EOS set {154820, 154827, 154829}."
+            "Registered speculator = the GGUF's own nextn MTP block (glm5_next_mtp, K=1). Gated 2026-09-11 against no drafter (23.3 tok/s) and K=2; the W24 drafter fix (2026-09-14: the draft's sparse attention read never-written top-k buffers) took prose acceptance to 0.63-0.85 drafts per cycle. K=2 re-measured after the fix and rejected.",
+            "Campaign features are opt-in per profile, and this is the only profile that opts in: VLLM_METAL_ASYNC_SCHED (W8a, decode 18.9 -> 21.9 tok/s; dsv4-xxs-1's DSpark anchor rolls under it), VLLM_QC_Q8_NR (W8b q8_0 NR/mb GEMV, 21.9 -> 23.3; not bit-identical to the generic walk), VLLM_METAL_KV_META and VLLM_METAL_MAMBA_LB (W7 single-launch step metadata), VLLM_METAL_MOE_ROUTER (single-dispatch top-k), VLLM_METAL_MOE_FOLD (shared-expert add folded into the q2_K sum kernel), VLLM_METAL_SHEXP_PAIR and VLLM_METAL_KDA_GATE_DUAL (W16 launch fusions), VLLM_METAL_MOE_OVERLAP / VLLM_METAL_SHARD_OVERLAP / VLLM_METAL_MOE_ROUTER_OVERLAP (W24a/W26 concurrent-dispatch regions), VLLM_METAL_INDEXER_IDENTITY (W24b: identity selection below the 2048 selection limit), VLLM_METAL_MLA_DUAL_NORM (W24c), VLLM_METAL_MOE_IQ2_TEX (W25: the iq2_xxs codebook through the texture unit, bit-exact). Every other Metal profile runs the code it was gated with (2026-09-12 scope audit, re-checked 2026-09-14).",
+            "Vision deferred (language_model_only): the companion GLM-5.3-Flash-Vision-Encoder.gguf is registered with the source but not loaded; the Metal vision path for this model is not qualified. Open item.",
+            "max_model_len 131072 of the GGUF's 1048576: the 8 GiB pool holds two full 131072-token requests; the native context needs a ~12 GiB latent pool for one request plus its indexer pools and is not yet qualified on this box. Open item.",
+            "kv_cache_dtype auto: the 11 sparse-MLA layers hold f16 latent pages (the exact-token pins were taken with them); an fp8 latent path for the Metal sparse-MLA kernels is not built. FP8 is the fleet policy. Open item.",
+            "Chat-template defaults mirror the A100 glm53f records: reasoning_effort low, thinking on, glm47 reasoning and tool-call parsers, EOS set {154820, 154827, 154829}."
           ]
         }
       }

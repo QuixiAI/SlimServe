@@ -22,7 +22,7 @@ logger = init_logger(__name__)
 # architecture -> (reasoning parser, tool-call parser)
 _PARSERS_BY_ARCHITECTURE: dict[str, tuple[str, str]] = {
     "glm-dsa": ("glm45", "glm47"),
-    "glm5-next": ("glm45", "glm47"),
+    "glm5-next": ("glm47", "glm47"),
     "deepseek4": ("deepseek_v4", "deepseek_v4"),
     "kimi-k3": ("kimi_k3", "kimi_k3"),
     "muse-glimmer": ("muse_glimmer", "muse_glimmer"),

@@ -659,6 +659,11 @@ class BlockPool:
         Returns:
             A list of new block.
         """
+        if num_blocks < 0:
+            # popleft_n(-k) would silently add k to num_free_blocks without
+            # linking anything - the free-list count/list divergence that
+            # killed the 2026-09-10/11 WildChat legs after ~35 minutes.
+            raise ValueError(f"Cannot get a negative number of blocks ({num_blocks})")
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 

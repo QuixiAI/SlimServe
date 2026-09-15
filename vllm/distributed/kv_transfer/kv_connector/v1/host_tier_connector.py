@@ -379,7 +379,23 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
         attn_block_sizes = {
             g: groups[g].kv_cache_spec.block_size for g in self.attn_groups
         }
-        self.hash_block_size = min(attn_block_sizes.values())
+        # The scheduler hashes at the gcd of every prefix-cacheable group's
+        # block (kv_cache_utils.get_block_sizes) - NOT the smallest attention
+        # block. The two differ as soon as a non-attention group is narrower
+        # than every attention group: fp8 main KV on GLM-5.3-Flash doubles
+        # the MLA blocks to 2304 tokens while the KDA state (and the
+        # drafter's window) stay at 1152, and hashing at 2304 put every
+        # boundary, ratio and state position off by 2x (2026-09-12: the
+        # first fp8 restore failed closed on "no state target").
+        hashing_sizes = [
+            g.kv_cache_spec.block_size
+            for g in groups
+            if getattr(g.kv_cache_spec, "prefix_cacheable", True)
+        ] or [g.kv_cache_spec.block_size for g in groups]
+        requested = getattr(vllm_config.cache_config, "prefix_match_unit", None)
+        self.hash_block_size = (
+            requested if requested is not None else math.gcd(*hashing_sizes)
+        )
         # Hash blocks per KV block for each attention group. Hybrid page-size
         # unification can widen a group's block (GLM-5.3: the 512 B/token
         # indexer group runs 2176-token blocks beside the MLA group's 1088)
@@ -394,8 +410,19 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
                     f"a multiple of the hash block {self.hash_block_size}"
                 )
             self._attn_ratio[attn_gid] = bs_g // self.hash_block_size
+        # Hash blocks per state block: a state group's block table is in
+        # its own block units, so tail positions are ``planned // ratio``.
+        self._state_ratio: dict[int, int] = {}
+        for gid in self.state_groups:
+            bs_g = groups[gid].kv_cache_spec.block_size
+            if bs_g % self.hash_block_size != 0:
+                raise ValueError(
+                    f"host-tier: state group {gid} block {bs_g} is not a "
+                    f"multiple of the hash block {self.hash_block_size}"
+                )
+            self._state_ratio[gid] = bs_g // self.hash_block_size
         self._resume_align = 1
-        for r in self._attn_ratio.values():
+        for r in [*self._attn_ratio.values(), *self._state_ratio.values()]:
             self._resume_align = (
                 self._resume_align * r // math.gcd(self._resume_align, r)
             )
@@ -723,10 +750,10 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
         # that position is the group's single real block.
         zero_blocks: list[tuple[int, int]] = []
         if covered == track.planned_blocks and track.planned_state_slots:
-            state_pos = track.planned_blocks - 1
             for tier_gid, slot in track.planned_state_slots.items():
                 gid = self.state_groups[tier_gid]
                 gb = track.group_blocks[gid]
+                state_pos = track.planned_blocks // self._state_ratio[gid] - 1
                 if state_pos >= len(gb) or gb[state_pos] < 0:
                     logger.warning(
                         "host-tier: no state target for %s group %d pos %d "
@@ -883,6 +910,10 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
             for logical in range(track.staged_upto, n_full):
                 block_hash = request.block_hashes[logical]
                 ops: list[tuple[int, int, int]] = []
+                # Bind the hash even where no group's block completes.
+                self.index.note_hash(
+                    owner, logical, block_hash, supersede=self._partial_resume_ok
+                )
                 for gid in self.attn_groups:
                     ratio = self._attn_ratio[gid]
                     if (logical + 1) % ratio != 0:

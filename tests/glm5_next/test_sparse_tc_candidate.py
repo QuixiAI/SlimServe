@@ -105,3 +105,35 @@ def test_sparse_tc_reference_native_and_changed_graph(
                     assert torch.count_nonzero(actual[row]).item() == 0
     finally:
         torch.backends.cuda.matmul.allow_tf32 = old_tf32
+
+
+# ---- fp8 (e4m3) storage decoded in-kernel (2026-09-11) ----
+
+
+@pytest.mark.parametrize("rows,heads", [(1, 8), (4, 16), (32, 16)])
+@pytest.mark.parametrize("kv_scale", [1.0, 0.5])
+@torch.no_grad()
+def test_sparse_tc_fp8_matches_native_fp8(rows, heads, kv_scale):
+    import math
+
+    from vllm.quixicore import quixicore_ops as qc
+    from vllm.quixicore.sparse_mla_tc import sparse_tc_nope
+
+    torch.manual_seed(7 + rows + heads)
+    bs, pages, max_topk = 576, 40, 2080
+    kv = (torch.randn(pages, bs, 512, device="cuda") * 0.5).to(torch.bfloat16)
+    data = (kv.float() / kv_scale).to(torch.float8_e4m3fn).view(torch.uint8)
+    q = (torch.randn(rows, heads, 512, device="cuda") * 0.2).to(torch.bfloat16)
+    bt = torch.arange(pages, device="cuda", dtype=torch.int32).repeat(rows, 1)
+    idx = torch.full((rows, max_topk), -1, device="cuda", dtype=torch.int32)
+    for r in range(rows):
+        n = int(torch.randint(1, 2048, (1,)))
+        idx[r, :n] = torch.randperm(pages * bs, device="cuda")[:n].to(torch.int32)
+    tlen = qc.sparse_topk_tlen(idx)
+    scale = 1.0 / math.sqrt(512)
+    native = qc.mla_decode_fp8_sparse_nope(
+        q, data.reshape(-1), bt, idx, tlen, bs, scale, kv_scale, 128
+    )
+    tc = sparse_tc_nope(q, data, bt, idx, tlen, scale, split=64, kv_scale=kv_scale)
+    err = (tc.float() - native.float()).abs().max().item() / native.float().abs().max().item()
+    assert err < 5e-3, err
