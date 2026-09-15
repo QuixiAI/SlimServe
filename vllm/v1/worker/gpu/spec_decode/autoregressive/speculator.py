@@ -863,10 +863,13 @@ def _prepare_prefill_inputs_native(
 
     last = qsl[1:] - num_rejected[:num_reqs].to(qsl.dtype) - 1
     last_token_indices[:num_reqs].copy_(last)
+    # Both come from the runner as [max_num_reqs, 1] buffers, which the
+    # Triton kernel reads through a flat pointer: gather flat, or the
+    # trailing dim broadcasts the where to [R, R] once R > 1.
     next_token = torch.where(
         num_sampled[:num_reqs] > 0,
-        last_sampled[idx_mapping],
-        next_prefill_tokens[idx_mapping],
+        last_sampled.reshape(-1)[idx_mapping],
+        next_prefill_tokens.reshape(-1)[idx_mapping],
     ).to(draft_ids.dtype)
     draft_ids[last.to(torch.int64)] = next_token
 

@@ -409,9 +409,11 @@ def _scatter_cache_rows(
     cache: torch.Tensor, blk: torch.Tensor, off: torch.Tensor, vals: torch.Tensor
 ) -> None:
     """cache[blk[t], off[t]] = vals[t]. Windowed like the gather when the
-    page view exceeds the 32-bit offset range; rows outside a window
-    rewrite the window's row 0 with its own contents (no valid row ever
-    targets block 0, the KV manager's null block)."""
+    page view exceeds the 32-bit offset range; rows outside a window are
+    parked on the window's row (b0, 0), which is a live cache row for every
+    window but the first, so the parked writes carry the value of a live
+    write to that row when this call has one (duplicate index writes land
+    in an undefined order; all writers agree). No host sync."""
     if cache.device.type != "mps" or _cache_extent(cache) <= _INDEX32_LIMIT:
         cache[blk, off] = vals
         return
@@ -422,7 +424,9 @@ def _scatter_cache_rows(
         inwin = (blk >= b0) & (blk < b1)
         local = torch.where(inwin, blk - b0, 0)
         loff = torch.where(inwin, off, 0)
-        sub[local, loff] = torch.where(inwin[:, None], vals, sub[0, 0][None, :])
+        hit = (inwin & (local == 0) & (loff == 0)).to(vals.dtype)
+        park = (vals * hit[:, None]).sum(0) + (1 - hit.sum().clamp(max=1)) * sub[0, 0]
+        sub[local, loff] = torch.where(inwin[:, None], vals, park[None, :])
 
 
 _METAL_IDX: bool | None = None

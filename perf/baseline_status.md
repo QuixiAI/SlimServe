@@ -288,6 +288,14 @@ stripped, PR #30, `w26-shard/merged_k1/`): loop probe 40.02 tok/s at 2.000
 tok/cycle; accept set 32.50-40.00; tf 29/32, 62/64 (0.0830); needles 4/4;
 gates 7dd30ea193a6 / 393882a2ddaf 34.27 tok/s / 1d7d58486dc7 - bit-identical
 to the Session 4 final pins.**
+**REVIEW BUILD (2026-09-15, CodeRabbit + Astra rounds applied,
+`w26-shard/astra1b_k1/`): probe 39.96 tok/s at 2.000 tok/cycle; accept set
+32.49-39.97; tf 0.0830; needles 4/4; gates 7dd30ea193a6 / 393882a2ddaf
+34.28 tok/s / 1d7d58486dc7 - pins held. FIRST CONCURRENT NUMBERS on this
+profile: c=2 27.8, c=3 33.7, c=6 41.2 tok/s aggregate (96 tokens each,
+6/6 served, health 200) - multi-request serving with the drafter was dead
+before this round (engine crash), so these are the baseline, not a
+regression point.**
 
 - Decode ~3.0 tok/s (329 ms/step, streaming probe 3.04 x2). Prefill
   ~50-55 t/s (1000 tok ~18 s; 2500 tok ~50 s) - the KDA prefill is the

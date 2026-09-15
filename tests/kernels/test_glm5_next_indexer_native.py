@@ -423,3 +423,32 @@ def test_native_op_prefill_with_cached_prefix_and_decode(device):
 
 if __name__ == "__main__":
     pytest.main([__file__, "-x", "-q"])
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@torch.no_grad()
+def test_scatter_cache_rows_windowed(device, monkeypatch):
+    """Windowed scatter (page view past the 32-bit element range): a live
+    write to a window's first row (b0, 0) survives the parked out-of-window
+    entries that share that destination."""
+    bs, row = 8, 16
+    cache = torch.full((6, bs, row), 2.0, dtype=torch.bfloat16, device=device)
+    monkeypatch.setattr(gi, "_INDEX32_LIMIT", 2 * cache.stride(0))
+    if device == "cpu":
+        # the windowed path is MPS-only; exercise the plain path here
+        assert gi._cache_extent(cache) > gi._INDEX32_LIMIT
+    vals = torch.arange(6 * row, dtype=torch.float32).view(6, row).to(
+        torch.bfloat16
+    ).to(device)
+    blk = torch.tensor([2, 5, 4, 1, 3, 0], dtype=torch.int64, device=device)
+    off = torch.tensor([0, 3, 0, 2, 1, 0], dtype=torch.int64, device=device)
+    gi._scatter_cache_rows(cache, blk, off, vals)
+    full = cache.cpu()
+    for i in range(6):
+        assert torch.equal(full[blk[i], off[i]], vals[i].cpu()), i
+    touched = {(2, 0), (5, 3), (4, 0), (1, 2), (3, 1), (0, 0)}
+    for b in range(6):
+        for t in range(bs):
+            if (b, t) not in touched:
+                assert (full[b, t] == 2.0).all(), (b, t)
+

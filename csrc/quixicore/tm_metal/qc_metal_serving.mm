@@ -6595,12 +6595,19 @@ at::Tensor kda_step(const at::Tensor& mixed_qkv, const at::Tensor& g_logits,
               "kda_step: z must be [T, H*Dv] of the activation dtype");
 
   const auto f32 = mixed_qkv.options().dtype(at::kFloat);
-  at::Tensor q = ring_out("kda_q", {T, (int64_t)H * Dk}, f32);
-  at::Tensor k = ring_out("kda_k", {T, (int64_t)H * Dk}, f32);
-  at::Tensor v = ring_out("kda_v", {T, (int64_t)H * Dv}, f32);
-  at::Tensor decay = ring_out("kda_decay", {T, (int64_t)H * Dk}, f32);
-  at::Tensor beta = ring_out("kda_beta", {T, (int64_t)H}, f32);
-  at::Tensor y = ring_out("kda_y", {T, (int64_t)H * Dv}, f32);
+  // Decode / verify widths ride the pinned rings; prefill widths (every
+  // distinct T would otherwise pin its own 4-deep set) use transient
+  // allocations like the other prefill-width tensors.
+  const auto scratch = [&](const char* tag, at::IntArrayRef sizes,
+                           const at::TensorOptions& o) {
+    return T <= 32 ? ring_out(tag, sizes, o) : at::empty(sizes, o);
+  };
+  at::Tensor q = scratch("kda_q", {T, (int64_t)H * Dk}, f32);
+  at::Tensor k = scratch("kda_k", {T, (int64_t)H * Dk}, f32);
+  at::Tensor v = scratch("kda_v", {T, (int64_t)H * Dv}, f32);
+  at::Tensor decay = scratch("kda_decay", {T, (int64_t)H * Dk}, f32);
+  at::Tensor beta = scratch("kda_beta", {T, (int64_t)H}, f32);
+  at::Tensor y = scratch("kda_y", {T, (int64_t)H * Dv}, f32);
   at::Tensor out;
   if (out_opt.has_value()) {
     // Caller-provided destination (the attention output slab), saving the
@@ -6613,7 +6620,7 @@ at::Tensor kda_step(const at::Tensor& mixed_qkv, const at::Tensor& g_logits,
                 "kda_step: out must be a contiguous [T, H*Dv] tensor of the "
                 "activation dtype, got ", out.sizes());
   } else {
-    out = ring_out("kda_out", {T, (int64_t)H * Dv}, mixed_qkv.options());
+    out = scratch("kda_out", {T, (int64_t)H * Dv}, mixed_qkv.options());
   }
   const at::Tensor& dtb = has_dt_bias ? dt_bias : A_log;  // unread when absent
   const at::Tensor& nacc = spec ? *num_accepted_opt : cu_seqlens;  // unread
@@ -6636,6 +6643,16 @@ at::Tensor kda_step(const at::Tensor& mixed_qkv, const at::Tensor& g_logits,
         static_cast<float>(q_scale), static_cast<float>(lower_bound),
         has_dt_bias ? 1 : 0, tname, nacc, spec ? 1 : 0, prep_chunk,
         prep_chunks);
+    if (!spec && prep_chunks > 1) {
+      // Requests longer than one chunk: their conv history is written here,
+      // after every chunk of the prepare dispatch has read the pool.
+      tk::launch_kda_conv_history_write(
+          e, mixed_qkv, conv_state, cu_seqlens, slot_mapping, R, 3 * H * Dk,
+          kernel_size, static_cast<int>(mixed_qkv.stride(0)),
+          static_cast<int>(conv_stride64),
+          static_cast<int>(conv_state.stride(1)),
+          static_cast<int>(conv_state.stride(2)), prep_chunk, tname);
+    }
     if (spec) {
       tk::launch_kda_recur_spec(e, q, k, v, decay, beta, ssm_state, cu_seqlens,
                                 *slot_table_opt, nacc, y, R, H, Dv, Dk,
@@ -6706,7 +6723,8 @@ at::Tensor kda_recur_prefill(const at::Tensor& q, const at::Tensor& k,
   const int R = static_cast<int>(slot_mapping.size(0));
   TORCH_CHECK(cu_seqlens.numel() >= R + 1, "cu_seqlens must be [R+1]");
   const auto f32 = q.options();
-  at::Tensor y = ring_out("kda_prefill_y", {T, (int64_t)H * Dv}, f32);
+  at::Tensor y = T <= 32 ? ring_out("kda_prefill_y", {T, (int64_t)H * Dv}, f32)
+                         : at::empty({T, (int64_t)H * Dv}, f32);
   const int64_t ssm_stride64 = ssm_state.stride(0);
   encode("qc_kda_recur_prefill", [&](TorchEncoder& e) {
     tk::launch_kda_recur(e, q, k, v, decay, beta, ssm_state, cu_seqlens,

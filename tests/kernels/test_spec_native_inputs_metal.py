@@ -60,7 +60,7 @@ def _ref_prefill(
     return draft_ids, draft_pos, d_qsl, d_seq, last_idx
 
 
-@pytest.mark.parametrize("seed", [0, 1, 2])
+@pytest.mark.parametrize("seed", [0, 1, 2, 3, 4])
 def test_prepare_prefill_inputs_native(seed):
     from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import (
         _prepare_prefill_inputs_native,
@@ -78,8 +78,10 @@ def test_prepare_prefill_inputs_native(seed):
     idx_mapping = torch.randperm(max_num_reqs, generator=g)[:num_reqs].tolist()
     num_rejected = [int(torch.randint(0, q, (1,), generator=g)) for q in qlens]
     num_sampled = [int(torch.randint(0, 2, (1,), generator=g)) for _ in qlens]
-    last_sampled = torch.randint(0, 1000, (max_num_reqs,), generator=g)
-    next_prefill = torch.randint(1000, 2000, (max_num_reqs,), generator=g)
+    # the runner keeps last_sampled_tokens / next_prefill_tokens as
+    # [max_num_reqs, 1]; the kernel reads them flat
+    last_sampled = torch.randint(0, 1000, (max_num_reqs, 1), generator=g)
+    next_prefill = torch.randint(1000, 2000, (max_num_reqs, 1), generator=g)
     target_ids = torch.randint(2000, 3000, (num_tokens,), generator=g)
     target_pos = torch.randint(0, 500, (num_tokens,), generator=g)
 
@@ -89,8 +91,8 @@ def test_prepare_prefill_inputs_native(seed):
         idx_mapping,
         num_sampled,
         num_rejected,
-        last_sampled.tolist(),
-        next_prefill.tolist(),
+        last_sampled.reshape(-1).tolist(),
+        next_prefill.reshape(-1).tolist(),
         target_ids.tolist(),
         target_pos.tolist(),
         max_num_reqs,

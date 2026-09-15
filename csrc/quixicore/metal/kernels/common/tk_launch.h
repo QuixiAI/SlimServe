@@ -1744,6 +1744,35 @@ void launch_kda_fused_prepare(
   e.dispatch(R * 4 * H, chunks, 1, 32, 1, 1);
 }
 
+// Conv history writeback for the requests kda_fused_prepare walked in more
+// than one chunk (their pool rows are read by chunk 0 and must not be
+// written inside that dispatch). channels = 3 * H * Dk conv channels.
+template <class E>
+void launch_kda_conv_history_write(E& e, typename E::in_t qkv,
+                                   typename E::out_t conv_state_pool,
+                                   typename E::in_t cu_seqlens,
+                                   typename E::in_t slot_mapping, int R,
+                                   int channels, int kernel_size,
+                                   int qkv_stride, int conv_state_stride,
+                                   int chan_stride, int col_stride,
+                                   int chunk_tokens,
+                                   const std::string& type_name) {
+  e.pipeline("kda_conv_history_write_" + type_name);
+  e.in(qkv, 0);
+  e.out(conv_state_pool, 1);
+  e.in(cu_seqlens, 2);
+  e.in(slot_mapping, 3);
+  e.bytes(R, 4);
+  e.bytes(channels, 5);
+  e.bytes(kernel_size, 6);
+  e.bytes(qkv_stride, 7);
+  e.bytes(conv_state_stride, 8);
+  e.bytes(chan_stride, 9);
+  e.bytes(col_stride, 10);
+  e.bytes(chunk_tokens, 11);
+  e.dispatch((channels + 255) / 256, R, 1, 256, 1, 1);
+}
+
 // Speculative-verify recurrence: state_pool rows at slot_table[r, *];
 // initial from slot_table[r, num_accepted[r]-1], checkpoint after every
 // timestep to slot_table[r, t].
@@ -6710,15 +6739,19 @@ void launch_qgemv(E& e, typename E::out_t d, typename E::in_t wq,
     if (!ok) g = "2x4";
     return std::make_pair(g[0] - '0', g);
   }();
+  // fp16 has only the 2x4 / 4x2 instantiations: the geometry actually
+  // launched decides both the row divisibility and the dispatch.
+  const bool q8_bf16 = type_name == "bfloat16";
+  const std::string q8_g =
+      (!q8_bf16 && q8_geom.second != "2x4" && q8_geom.second != "4x2")
+          ? std::string("2x4")
+          : q8_geom.second;
   if (fmt == "q8_0" && q8_nr_on && K > 512 && K % 32 == 0 &&
-      N % q8_geom.first == 0 && type_name != "float32") {
-    const bool bf16 = type_name == "bfloat16";
-    std::string name = "qgemv_q8_0_nr_" + q8_geom.second + (bf16 ? "_bfloat16" : "");
-    if (!bf16 && q8_geom.second != "2x4" && q8_geom.second != "4x2") {
-      name = "qgemv_q8_0_nr_2x4";
-    }
-    const int nr = q8_geom.first;
-    const int nsg = name[name.find('x') + 1] - '0';
+      N % (q8_g[0] - '0') == 0 && type_name != "float32") {
+    const std::string name =
+        "qgemv_q8_0_nr_" + q8_g + (q8_bf16 ? "_bfloat16" : "");
+    const int nr = q8_g[0] - '0';
+    const int nsg = q8_g[2] - '0';
     e.pipeline(name);
     e.out(d, 0);
     e.in(wq, 1);

@@ -230,7 +230,12 @@ kernel void kda_fused_prepare(
       }
     }
   }
-  if (spec_mode == 0 && cend == end) {
+  // Pool writeback only when this threadgroup also seeded the history from
+  // the pool (single-chunk request): threadgroups of one dispatch are
+  // unordered, so a later chunk must not overwrite the cells chunk 0 reads.
+  // Multi-chunk requests get their history from kda_conv_history_write,
+  // dispatched after this kernel.
+  if (spec_mode == 0 && cend == end && cstart == start) {
     #pragma clang loop unroll(full)
     for (int i = 0; i < QK_PER_LANE; ++i) {
       const int c = cbase + int(lane) * per_lane + i;
@@ -240,6 +245,63 @@ kernel void kda_fused_prepare(
     }
   }
 }
+
+// Conv history writeback for requests the prepare kernel walked in more
+// than one chunk (end - start > chunk_tokens >= kernel_size - 1): the new
+// history is the request's last kernel_size-1 raw rows, the same values the
+// last chunk holds in registers (bit-identical). One thread per (channel,
+// request); runs after kda_fused_prepare on the same encoder.
+template <typename T>
+kernel void kda_conv_history_write(
+    device const T *qkv [[buffer(0)]],
+    device T *conv_state_pool [[buffer(1)]],
+    device const int *cu_seqlens [[buffer(2)]],
+    device const int *slot_mapping [[buffer(3)]],
+    constant int &num_requests [[buffer(4)]],
+    constant int &channels [[buffer(5)]],
+    constant int &kernel_size [[buffer(6)]],
+    constant int &qkv_stride [[buffer(7)]],
+    constant int &conv_state_stride [[buffer(8)]],
+    constant int &chan_stride [[buffer(9)]],
+    constant int &col_stride [[buffer(10)]],
+    constant int &chunk_tokens [[buffer(11)]],
+    uint2 gid [[thread_position_in_grid]]) {
+  const int c = int(gid.x);
+  const int request = int(gid.y);
+  if (request >= num_requests || c >= channels) {
+    return;
+  }
+  const int start = cu_seqlens[request];
+  const int end = cu_seqlens[request + 1];
+  const long slot = slot_mapping[request];
+  if (slot <= 0 || end - start <= chunk_tokens) {
+    return;
+  }
+  const int hist_len = kernel_size - 1;
+  device T *base = conv_state_pool + slot * (long)conv_state_stride +
+                   (long)c * chan_stride;
+  for (int j = 0; j < hist_len; ++j) {
+    base[(long)j * col_stride] =
+        qkv[(long)(end - hist_len + j) * qkv_stride + c];
+  }
+}
+
+#define instantiate_kda_conv_history_write(type_name, T)                        \
+  template [[host_name("kda_conv_history_write_" #type_name)]] [[kernel]] void   \
+  kda_conv_history_write<T>(                                                     \
+      device const T *qkv [[buffer(0)]], device T *conv_state_pool [[buffer(1)]], \
+      device const int *cu_seqlens [[buffer(2)]],                                \
+      device const int *slot_mapping [[buffer(3)]],                              \
+      constant int &num_requests [[buffer(4)]], constant int &channels [[buffer(5)]], \
+      constant int &kernel_size [[buffer(6)]], constant int &qkv_stride [[buffer(7)]], \
+      constant int &conv_state_stride [[buffer(8)]],                             \
+      constant int &chan_stride [[buffer(9)]], constant int &col_stride [[buffer(10)]], \
+      constant int &chunk_tokens [[buffer(11)]],                                 \
+      uint2 gid [[thread_position_in_grid]]);
+
+instantiate_kda_conv_history_write(bfloat16, bf16)
+instantiate_kda_conv_history_write(float16, half)
+instantiate_kda_conv_history_write(float32, float)
 
 #define instantiate_kda_fused_prepare(type_name, T, DKVAL, DVVAL)                \
   template [[host_name("kda_fused_prepare_" #type_name "_dk" #DKVAL             \

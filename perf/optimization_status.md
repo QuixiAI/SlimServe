@@ -1,5 +1,72 @@
 # SlimServe Optimization Status
 
+## 2026-09-15 - GLM-5.3-Flash Q2 on Metal: Astra (codex GPT-6) review round on PR #30 - a concurrent-serving crash, a conv-history race, unbounded prefill scratch
+
+- Baseline: PR #30 at 277922f31 (CodeRabbit round 1 applied; probe 40.01
+  tok/s, pins 7dd30ea193a6 / 393882a2ddaf / 1d7d58486dc7).
+- Hypothesis: the campaign's gates are all SINGLE-REQUEST and single-shape,
+  so any defect on a multi-request or multi-chunk path is invisible to them.
+  A reviewer reasoning over the code (not the gates) should therefore find
+  real bugs there, and fixing them must leave the gate shas untouched.
+- Findings (5, all accepted):
+  1. [P1] The shard concurrent region admits no torch copy, but its gate
+     (`_metal_hetero_direct_ok`) accepts batches 5..8, where the q8_0 NR
+     batch kernel has no strided-output route and `ggml_mul_mat_vec_a8`
+     falls back to the ring + copy -> TORCH_CHECK, engine dead. Three
+     concurrent K=1 requests reach that width (6 verify rows). Fix: a new
+     `_metal_shard_region_ok` mirrors the native strided-output rule
+     (batch 1 any format; q8_0 NR at M 2..4 with K > 512, K % 32 == 0,
+     N even; q4_K NR chunks at M <= 8 with N % 4 == 0, K % 256 == 0; kill
+     switches respected) and gates the region, not the fusion.
+  2. [P1] `kda_fused_prepare` chunk 0 reads the conv-history cells that the
+     request's LAST chunk writes, in the same dispatch: threadgroups are
+     unordered, so a long prefill could read post-write history (future
+     tokens leaking into early outputs, corrupted recurrent state). Fix:
+     the prepare kernel writes the pool only when one chunk covered the
+     request (`cstart == start`); multi-chunk requests get their history
+     from a new `kda_conv_history_write` dispatched after it, writing the
+     same last kernel_size-1 raw rows (bit-identical by construction, and
+     the 2500-token gate + the 12k needle confirm it).
+  3. [P2] `kda_step`'s six fp32 scratch tensors went through the 4-deep
+     `ring_out` rings, which are keyed by shape: every distinct prefill
+     length pinned its own set (~20 GiB after lengths 9..256 at H=64 D=128).
+     Fix: rings for decode/verify widths (T <= 32), transient allocations
+     above, like the other prefill-width tensors.
+  4. [P2] The indexer's windowed scatter parked out-of-window rows on
+     (b0, 0), a live cache row for every window but the first, with the
+     OLD value - an unordered duplicate write could drop a live update.
+     Same fix as the MLA one from CodeRabbit round 1 (park with the live
+     writer's value when this call has one); new test.
+  5. [P2] The q8_0 NR geometry knob computed `nr` from the REQUESTED
+     geometry while fp16 falls back to the 2x4 kernel: `VLLM_QC_Q8_NR_GEOM=1x4`
+     on fp16 dispatched 2N rows (out-of-bounds), 4x4 left half the output
+     unwritten. Fix: both the row-divisibility guard and the dispatch come
+     from the geometry actually launched.
+- FOUND WHILE VERIFYING (1), the most serious defect of the round: with the
+  region gate fixed, 3 concurrent requests still killed the engine, now in
+  `_prepare_prefill_inputs_native` - "shape mismatch: value tensor of shape
+  [3, 3] cannot be broadcast to indexing result of shape [3]". The runner
+  keeps `last_sampled_tokens` / `next_prefill_tokens` as [max_num_reqs, 1]
+  and the Triton kernel reads them through a flat pointer; the torch
+  replacement gathered them 2-D, so `torch.where` broadcast to [R, R] at
+  R > 1. Every multi-request step with the drafter died. Fix: gather flat.
+  The unit test built its fixtures 1-D, which is why it passed - it now
+  uses the runner's shapes (and fails 3/6 cases with the bug restored).
+  LESSON: a torch replacement for a kernel must be tested with the
+  PRODUCTION buffer shapes, not shapes convenient for the reference.
+- Correctness: 371 tests; kernels bit-exact; tf long 0.0830 (unchanged);
+  needles 4/4; concurrency 2/3/6 requests all served (2/2, 3/3, 6/6, health
+  200 after each; 41.2 tok/s aggregate at c=6), where c=3 was a hard engine
+  death before. Gates BIT-IDENTICAL: 8tok 7dd30ea193a6, off1-2000
+  393882a2ddaf 34.28 tok/s, 2500x64 1d7d58486dc7. Probe 39.96 tok/s at
+  2.000 tok/cycle; accept set 32.49-39.97 - no step-time cost.
+- Decision: ALL KEPT. The concurrency check is now a standing gate for this
+  profile (`concurrency_check.py`), since every exact-token gate is c=1.
+- Raw artifacts: `perf/results/2026-09-14/astra_review.log` (the review),
+  `perf/results/2026-09-14/glm53f-q2-w26-shard/astra1_k1/` (first pass, with
+  the crash in boot.log) and `astra1b_k1/` (concurrency.log, accept.log,
+  needle.log, gates/, tf_long.json).
+
 ## 2026-09-14 - GLM-5.3-Flash Q2 on Metal: pre-PR cleanup, merge of main, merged-build verify, PR #30
 
 - Baseline: the Session 4 final build (`w26-shard/final_k1/`: loop probe
@@ -90,9 +157,16 @@
   the torch reference forced off the Metal router route, the GGUF fixture
   path from the registry / SLIMSERVE_GLM53F_GGUF). Skipped: moving the
   per-wave pins out of baseline_status.md (they are the gate pins
-  perf/perf.md places there). Verify on the fixed kernel (`cr1_k1/`):
-  367 tests, probe 40.01 tok/s at 2.000 tok/cycle, gates 7dd30ea193a6 /
-  393882a2ddaf 34.38 tok/s / 1d7d58486dc7 - pins held.
+  perf/perf.md places there).
+- Hypothesis for the round: each fix is a correctness guard on a path the
+  campaign's single-request gates never exercise (NaN warm-up rows, caches
+  past the 32-bit element range, absent GGUF keys, unbuilt extensions), so
+  none of them may move the gate shas or the step time.
+- Correctness / throughput: confirmed - 367 tests, all three pins held, probe
+  40.01 tok/s at 2.000 tok/cycle, off1-2000 34.38 tok/s.
+- Decision: KEPT (all nine).
+- Raw artifacts: `perf/results/2026-09-14/glm53f-q2-w26-shard/cr1_k1/`
+  (boot.log, gates/, gates.log).
 
 ## 2026-09-14 - GLM-5.3-Flash Q2 on Metal M1 Ultra: W23 K=2 is economically dead (3rd verify row = ~14 ms of expert bytes); W24 ROOT CAUSE of the weak nextn drafter - its sparse attention read a never-written top-k buffer (attention output ZERO on every extend/decode row); one-line re-pointing fix; W24a/b/c, W25 (iq2_xxs codebook through the TEXTURE UNIT, -23% on the expert kernel, bit-exact) and W26/W26b concurrency: loop probe 34.5 -> 39.9 tok/s (+15.8%), off1-2000 gate 34.23 tok/s, all pins held
 

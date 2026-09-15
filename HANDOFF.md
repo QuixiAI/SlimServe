@@ -1528,6 +1528,30 @@ upstream; drift check against the port branch).
   detached (Popen start_new_session, `scratchpad/boot_detached.py` pattern)
   and run the verify steps as foreground calls.
 
+- 2026-09-15: **REVIEW ROUNDS ON PR #30** (CodeRabbit x2, Astra/codex
+  GPT-6 x1; notebook 2026-09-15 entry has the full ledger). 9 + 5 findings
+  fixed, all kept, gates bit-identical throughout. The two that mattered:
+  the KDA in_proj shard concurrent region accepted batches its GEMV route
+  cannot write in place (TORCH_CHECK -> engine death at 3 concurrent
+  requests), and `kda_fused_prepare` wrote the conv history that chunk 0 of
+  the same dispatch reads (a race on long prefills; the writeback for
+  multi-chunk requests is now its own `kda_conv_history_write` dispatch).
+  VERIFYING THOSE EXPOSED A THIRD, WORSE ONE: the drafter's torch prefill
+  prep gathered the runner's [max_num_reqs, 1] buffers 2-D, so every
+  multi-request step with the speculator raised a broadcast error - ALL
+  concurrent serving was dead and no gate saw it (they are all c=1). Fixed;
+  `perf/results/2026-09-14/concurrency_check.py` is now a standing check
+  (c=2/3/6 all served: 27.8 / 33.7 / 41.2 tok/s aggregate). Also fixed:
+  unbounded per-prefill-length KDA scratch rings (~20 GiB), the fp16 q8_0
+  geometry fallback dispatching out of bounds, the indexer + MLA windowed
+  scatters' unordered duplicate writes, a NaN-total router top-k, absent
+  GGUF token ids, the KDA prefill state contract, and six test-hygiene
+  items. Build/verify helpers now live in `perf/results/2026-09-14/`
+  (`build.sh`, `boot_detached.py`, `concurrency_check.py`). NEXT: the
+  concurrent-serving path has never been profiled - c=6 aggregate 41.2
+  tok/s against c=1 40.0 says batching buys almost nothing yet, which is
+  the obvious next campaign after this PR lands.
+
 # HANDOFF — NVFP4-on-Metal campaign (updated 2026-08-25; CAMPAIGN COMPLETE through UPDATE 55 — PR #12 open, origin/main merged and re-gated bit-exact, QuixiCore-Metal port landed)
 
 ## Mission

@@ -276,6 +276,40 @@ def _metal_shard_overlap() -> bool:
     return not quixicore_ops.concurrent_active()
 
 
+def _metal_shard_region_ok(x: torch.Tensor, shards) -> bool:
+    """Whether every shard GEMV writes its column slice in place, so the
+    concurrent region (which admits no torch copy) can hold them. Mirrors
+    ggml_mul_mat_vec_a8's strided-output rule: batch 1 binds rows by offset
+    for any format; the q8_0 NR batch kernel (VLLM_QC_Q8_NR=1) takes an
+    output stride at M 2..4 (K > 512, K % 32 == 0, N even); the q4_K NR batch
+    twin does at 2/4/8-row chunks of any M <= 8 (N % 4 == 0, K % 256 == 0,
+    kill switches off); every other route computes into the ring and
+    copies."""
+    batch, k = x.shape
+    if batch == 1:
+        return True
+    if x.dtype not in (torch.bfloat16, torch.float16):
+        return False
+    q8_nr = os.environ.get("VLLM_QC_Q8_NR") == "1"
+    q4k_nr = (
+        os.environ.get("VLLM_QC_Q4K_NR") != "0"
+        and os.environ.get("VLLM_QC_Q4K_NR_MM") != "0"
+    )
+    for w, t in shards:
+        n = w.shape[0]
+        if t == WeightType.Q8_0:
+            if not (
+                q8_nr and 2 <= batch <= 4 and k > 512 and k % 32 == 0 and n % 2 == 0
+            ):
+                return False
+        elif t == WeightType.Q4_K:
+            if not (q4k_nr and batch <= 8 and n % 4 == 0 and k % 256 == 0):
+                return False
+        else:
+            return False
+    return True
+
+
 def _metal_hetero_direct_ok(x: torch.Tensor, shards) -> bool:
     """Hetero-quant shards (GLM-5.3-Flash KDA in_proj: q|k q4_K + v|f|g|beta
     q8_0) can ride the vector kernel straight into column slices of one
@@ -710,7 +744,14 @@ class GGUFLinearMethod(LinearMethodBase):
                 # region - the ALU-limited q4_K q|k walk overlaps the
                 # bandwidth-bound q8_0 v|f|g|beta GEMV. Same kernels, same
                 # bytes; only the encoder changes (bit-identical).
-                overlap = _metal_shard_overlap() and len(shards) > 1
+                # Only when every shard's route writes the slice in place:
+                # a ring copy inside the region is a TORCH_CHECK (batches
+                # 5..8 on q8_0, 3+ concurrent K=1 requests).
+                overlap = (
+                    _metal_shard_overlap()
+                    and len(shards) > 1
+                    and _metal_shard_region_ok(xc, shards)
+                )
                 if overlap:
                     from vllm.quixicore import quixicore_ops
 
