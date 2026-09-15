@@ -334,11 +334,19 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     if blocked := registry.profile_blocked(profile_id, machine.platform):
-        term.die(
+        message = (
             f"{profile_id} is not ready on "
             f"{registry.platform_title(machine.platform)}: {blocked}. "
             f"{registry.profile_blocked_detail(profile_id, machine.platform)}"
         )
+        # Bring-up campaigns boot a gated record on purpose (the gate is
+        # what keeps users off it until the exact-token gates pass). The
+        # opt-in is an env var, not a flag, so it never lands in a saved
+        # command line by accident.
+        if os.environ.get("SLIMSERVE_SERVE_IN_PROGRESS") == "1":
+            term.warn(f"{message} Continuing: SLIMSERVE_SERVE_IN_PROGRESS=1.")
+        else:
+            term.die(message)
 
     quant = args.quant
     if quant is None and interactive:

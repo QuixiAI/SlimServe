@@ -1416,6 +1416,45 @@
           ]
         }
       }
+    },
+    "glm53f-q2": {
+      "title": "GLM-5.3-Flash (antirez Q2 GGUF)",
+      "modalities": [
+        "text"
+      ],
+      "format": "gguf",
+      "repo": "antirez/glm-5.3-flash-gguf",
+      "base_url": "https://huggingface.co/antirez/glm-5.3-flash-gguf/resolve/main",
+      "local_dir": "antirez-glm-5.3-flash-gguf",
+      "shared_note": "Text only for now. antirez's ds4-layout GGUF (general.architecture glm5-next, ds4 tensor names): one 89.88 GiB file. The vision encoder ships as a separate 1.05 GiB sidecar GGUF (GLM-5.3-Flash-Vision-Encoder.gguf) and is not fetched until the Metal text record exists.",
+      "speculator": {
+        "repo": "incoai/GLM-5.3-Flash-DFlash2",
+        "revision": "bf582e4eacc1810f76656d1811693ff6c6737d2a",
+        "local_dir": "GLM-5.3-Flash-DFlash2",
+        "engine": {
+          "method": "dflash",
+          "num_speculative_tokens": 3
+        },
+        "note": "Candidate drafter, not yet measured on Metal for this quant. The campaign measures the GGUF's own MTP block (nextn, layer 45), this DFlash2 drafter, and any other published drafter under the same gate and pins whichever is fastest on the box (HANDOFF.md, GLM-5.3-Flash Q2 on Metal). Shares the target's embed_tokens and lm_head; taps [5, 14, 24, 33, 42] via the EAGLE-3 aux-hidden-state interface glm5_next already implements."
+      },
+      "quants": {
+        "Q2": {
+          "title": "Q2 (IQ2_XXS gate/up + Q2_K down experts, imatrix)",
+          "bytes": 96505816384,
+          "summary": "antirez's GLM-5.3-Flash-Q2.gguf: routed experts IQ2_XXS gate/up (49.9 GiB) + Q2_K down (31.8 GiB), the DSV4 0731 expert recipe; KDA q/k Q4_K, KDA v/out and gates Q8_0; sparse-MLA projections, shared experts, dense FFN, embeddings and head Q8_0; indexer, hc_*_fn and nextn.eh_proj BF16; router, norms, convs, dt_bias, a_log F32. 1,412 tensors, 50 KV pairs, source revision 84c6a6aa of zai-org/GLM-5.3-Flash.",
+          "min_gpus": {},
+          "min_memory_bytes": {
+            "metal": 137438953472
+          },
+          "files": [
+            {
+              "path": "GLM-5.3-Flash-Q2.gguf",
+              "bytes": 96505816384,
+              "sha256": "e81fd6241c6e55a64e1e14e47a3eab61a173fa8d7e4b5c1d1848827119705b32"
+            }
+          ]
+        }
+      }
     }
   },
   "platforms": {
@@ -2982,6 +3021,83 @@
               ]
             ]
           }
+        }
+      }
+    },
+    "glm53f-q2-1": {
+      "title": "GLM-5.3-Flash antirez Q2 on one Mac",
+      "source": "glm53f-q2",
+      "gpus": 1,
+      "summary": "Text-only 320B-A18B hybrid (34 KDA linear-attention layers + 11 pooled-indexer NoPE sparse-MLA layers, mHC, 288-expert top-8 MoE) from antirez's Q2 GGUF on a single 128 GiB Apple Silicon machine, sized by unified memory. Bring-up campaign; see HANDOFF.md.",
+      "speculative": true,
+      "status": "in-progress",
+      "status_reason": "GLM-5.3-Flash has no Metal serving path yet (KDA core, NoPE sparse MLA, pooled indexer, glm5-next GGUF adapter); bring-up in progress",
+      "status_detail": "The glm5_next model composes layers this fork already serves on CUDA (Kimi KDA, NoPE MLA, DeepseekV2MoE, dsv4_mhc ops), none of which route to Metal. The campaign plan, blocker list and gates live in the first section of HANDOFF.md; the profile flips to supported when the exact-token gates pass on the M1 Ultra.",
+      "variants": {
+        "metal": {
+          "platform": "metal",
+          "default_quant": "Q2",
+          "engine": {
+            "tensor_parallel_size": 1,
+            "max_model_len": 131072,
+            "max_num_seqs": 8,
+            "max_num_batched_tokens": 4288,
+            "kv_cache_memory_bytes": 8589934592,
+            "kv_cache_dtype": "auto",
+            "mamba_ssm_cache_dtype": "float32",
+            "compilation_config": {
+              "cudagraph_mode": "NONE"
+            },
+            "enable_prefix_caching": true,
+            "enable_chunked_prefill": true,
+            "trust_remote_code": true,
+            "served_model_name": "GLM-5.3-Flash",
+            "reasoning_parser": "glm45",
+            "tool_call_parser": "glm47",
+            "language_model_only": true,
+            "default_chat_template_kwargs": {
+              "reasoning_effort": "low",
+              "preserve_thinking": true,
+              "thinking": true,
+              "enable_thinking": true
+            }
+          },
+          "env": {
+            "VLLM_USE_V2_MODEL_RUNNER": "1",
+            "VLLM_METAL_ASYNC_SCHED": "1",
+            "VLLM_QC_Q8_NR": "1",
+            "VLLM_METAL_KV_META": "1",
+            "VLLM_METAL_MAMBA_LB": "1",
+            "VLLM_METAL_MOE_ROUTER": "1",
+            "VLLM_METAL_MOE_FOLD": "1",
+            "VLLM_METAL_SHEXP_PAIR": "1",
+            "VLLM_METAL_KDA_GATE_DUAL": "1",
+            "VLLM_METAL_MOE_OVERLAP": "1",
+            "VLLM_METAL_INDEXER_IDENTITY": "1",
+            "VLLM_METAL_MLA_DUAL_NORM": "1",
+            "VLLM_METAL_MOE_IQ2_TEX": "1",
+            "VLLM_METAL_SHARD_OVERLAP": "1",
+            "VLLM_METAL_MOE_ROUTER_OVERLAP": "1"
+          },
+          "speculator": {
+            "model": "target",
+            "engine": {
+              "method": "glm5_next_mtp",
+              "num_speculative_tokens": 1,
+              "quantization": "gguf"
+            },
+            "note": "The GGUF's own nextn block (blk.45: one sparse-MLA + MoE layer, BF16 eh_proj) as the MTP drafter, loaded from the target file (ds4's MTP recipe: 90.1% accept, 1.90 tok/cycle at K=1). Candidate #1 of the campaign's head-to-head (the source-level DFlash2 drafter is candidate #2); the Metal decode gates decide which one this record pins."
+          },
+          "notes": [
+        "max_num_batched_tokens 4288 = the Mamba align-mode block: the fp32 KDA state page is 4,341,760 B per layer-slot and the MLA latent is 1 KiB/token, so the hybrid aligner sets the attention block to 4288 tokens and align mode requires the batch cap >= one block (first boot 2026-09-11 failed the assert at 2048). One prefill chunk == one block.",
+            "PLAN-STAGE RECORD (2026-09-10): engine settings are the campaign's starting budget, not measured. Weights 89.9 GiB pinned + ~0.4 GiB dequantized kv_b_proj + 8 GiB fixed KV pool + 146 MiB fp32 KDA state per sequence lands total demand near 100 GiB against the ~115 GiB Metal working set of a 128 GiB machine (DSV4 served at ~103).",
+            "Hybrid layout: 45 text layers, sparse-MLA (NoPE, kv_lora 512, 64 heads x 256) at layers 3,7,...,43, KDA (64 heads x 128, conv 4, per-channel decay, gate_lower_bound -5) everywhere else; only the 11 MLA layers hold paged KV (11 KiB/token f16 latents + 0.7 KiB/token indexer pools). The 8 GiB pool holds two full 131072-token requests with margin.",
+            "mamba_ssm_cache_dtype float32: the KDA recurrent state stays fp32 on Metal (bf16 state is a recorded quality hazard on the Qwen GDN path; the A100 records use bfloat16 with different kernels).",
+            "Registered speculator = the GGUF's own nextn MTP block (glm5_next_mtp, K=1), gated 2026-09-11 against no drafter and K=2 (W9: decode probe 31.95 tok/s vs 23.26 without a drafter and 22.9 at K=2; exact-token gates sha-pinned with it). The DFlash2 candidate is parked (hybrid KV group block-size mismatch on this hybrid layout).",
+            "Campaign features are opt-in per profile, and this is the only profile that opts in: VLLM_METAL_ASYNC_SCHED (W8a, decode 18.9 -> 21.9 tok/s; dsv4-xxs-1's DSpark anchor rolls under it), VLLM_QC_Q8_NR (W8b q8_0 NR/mb GEMV, decode 21.9 -> 23.3; not bit-identical to the generic walk), VLLM_METAL_KV_META and VLLM_METAL_MAMBA_LB (W7 single-launch step metadata), VLLM_METAL_MOE_ROUTER (single-dispatch top-k), VLLM_METAL_MOE_FOLD (shared-expert add folded into the q2_K sum kernel). Every other Metal profile runs the code it was gated with (2026-09-12).",
+            "Vision deferred (language_model_only): the sidecar encoder GGUF is not loaded until the text record is pinned.",
+            "Chat-template defaults mirror the A100 glm53f records: reasoning_effort low, thinking on, glm45/glm47 parsers, EOS set {154820, 154827, 154829}."
+          ]
         }
       }
     }
