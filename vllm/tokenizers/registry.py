@@ -263,6 +263,15 @@ def get_tokenizer(
             # `tokenizer.ggml.pre` is "llama4"; the GLM4 split the generic
             # builder applies would shift ids around digits and whitespace.
             tok = build_muse_glimmer_tokenizer_from_gguf(str(tokenizer_name))
+        elif gguf_architecture(str(tokenizer_name)) == "glm5-next":
+            from vllm.transformers_utils.gguf_glm5_next import (
+                build_glm5_next_tokenizer_from_gguf,
+            )
+
+            # Same gpt2/glm4 BPE as GLM-5.2, but the generic builder swaps in
+            # the vendored GLM-5.2-Vision template; GLM-5.3-Flash must keep
+            # the file's own template ([gMASK]<sop>, reasoning-effort line).
+            tok = build_glm5_next_tokenizer_from_gguf(str(tokenizer_name))
         elif gguf_architecture(str(tokenizer_name)) == "qwen35":
             from vllm.transformers_utils.gguf_qwen35 import (
                 build_qwen35_tokenizer_from_gguf,

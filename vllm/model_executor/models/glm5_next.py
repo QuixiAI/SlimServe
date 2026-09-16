@@ -23,21 +23,35 @@ sparse MLA kernel. The MTP head (layer 45) and video inputs are later
 phases.
 """
 
+import os
 from collections.abc import Iterable
-
 from typing import ClassVar, Literal
 
 import dataclasses
 import torch
 from torch import nn
 
+import vllm.model_executor.layers.glm5_next_mhc_ops  # noqa: F401  (registers torch.ops.vllm.glm5_mhc_*)
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
-from vllm.platforms import current_platform
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
+)
+from vllm.model_executor.layers.glm5_next_indexer import (
+    Glm5NextPooledIndexer,
+    glm5_next_device,
+)
+from vllm.model_executor.layers.glm5_next_indexer_workspace import (
+    Glm5NextIndexerWorkspace,
+)
+from vllm.model_executor.layers.glm5_next_mhc_project import (
+    plain_bf16_projection,
+    prepare_router_projection,
+    projection_enabled,
+    register_projection_stream,
+    router_projection_enabled,
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -55,26 +69,9 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
 )
-import vllm.model_executor.layers.glm5_next_mhc_ops  # noqa: F401  (registers torch.ops.vllm.glm5_mhc_*)
-from vllm.model_executor.layers.glm5_next_mhc_project import (
-    plain_bf16_projection,
-    prepare_router_projection,
-    projection_enabled,
-    register_projection_stream,
-    router_projection_enabled,
-)
-from vllm.model_executor.layers.glm5_next_indexer import (
-    Glm5NextPooledIndexer,
-)
-from vllm.model_executor.layers.glm5_next_indexer_workspace import (
-    Glm5NextIndexerWorkspace,
-)
 from vllm.model_executor.layers.mla import (
     MLAModules,
     MultiHeadLatentAttentionWrapper,
-)
-from vllm.model_executor.layers.quantization.base_config import (
-    QuantizationConfig,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -82,22 +79,37 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.models.deepseek_v2 import DeepseekV2MLP, DeepseekV2MoE
 from vllm.model_executor.models.interfaces import (
-    SupportsEagle3,
     HasInnerState,
     IsHybrid,
+    SupportsEagle3,
     SupportsPP,
 )
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
-    PPMissingLayer,
     is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
 )
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
+from vllm.v1.worker.metal_phaseprof import phase as _qc_phase
 
 logger = init_logger(__name__)
+
+
+def _metal_mhc_norm_fusion_available() -> bool:
+    """Metal: the quixicore dsv4_mhc_* kernels carry the RMSNorm of the
+    layer input in their epilogue (one dispatch per mHC site instead of
+    two). VLLM_METAL_MHC_FUSE_NORM=0 pins the separate norm."""
+    if not current_platform.is_metal():
+        return False
+    if os.environ.get("VLLM_METAL_MHC_FUSE_NORM", "1") == "0":
+        return False
+    from vllm.quixicore import quixicore_ops
+
+    return quixicore_ops.is_available() and quixicore_ops.has_kernel(
+        "dsv4_mhc_pre_finalize_norm_bfloat16"
+    )
 
 
 class Glm5NextMLAAttention(nn.Module):
@@ -246,7 +258,7 @@ class Glm5NextDecoderLayer(nn.Module):
         self._fuse_mhc_norm = (
             current_platform.is_cuda()
             and current_platform.is_device_capability((8, 0))
-        )
+        ) or _metal_mhc_norm_fusion_available()
         self.is_linear = (
             config.layer_types[self.layer_idx] == "linear_attention"
         )
@@ -276,6 +288,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
+                swiglu_limit=getattr(config, "swiglu_limit", None),
             )
 
         self.input_layernorm = RMSNorm(self.hidden_size, config.rms_norm_eps)
@@ -342,62 +355,74 @@ class Glm5NextDecoderLayer(nn.Module):
         res_mix: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         projected = None
-        if residual is None:
-            # First layer: x is the expanded [T, hc_mult, D] stream tensor.
-            residual, post_mix, res_mix, x = self._site_pre(
-                x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base,
-                self.input_layernorm.weight,
-            )
-        elif self._overlap_kda:
-            residual, post_mix, res_mix, x, projected = torch.ops.vllm.glm5_mhc_project_runtime(
-                x, residual, post_mix, res_mix,
-                self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base,
-                self.input_layernorm.weight, self.self_attn.in_proj_qkvgfab.weight,
-                self._mhc_stream_key, False,
-                self.rms_norm_eps, self.hc_eps, self.hc_post_alpha,
-                self.hc_sinkhorn_iters, self.rms_norm_eps,
-            )
-        else:
-            residual, post_mix, res_mix, x = self._site_fused(
-                x, residual, post_mix, res_mix,
-                self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base,
-                self.input_layernorm.weight,
-            )
-        # Only the measured SM80 path fuses norm inside the mHC transition.
-        if not self._fuse_mhc_norm:
-            x = self.input_layernorm(x)
-        if self.is_linear:
-            attn_out = torch.empty_like(x)
-            if projected is None:
-                self.self_attn(x, positions, attn_out)
+        with _qc_phase("mhc_attn_site"):
+            if residual is None:
+                # First layer: x is the expanded [T, hc_mult, D] stream tensor.
+                residual, post_mix, res_mix, x = self._site_pre(
+                    x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base,
+                    self.input_layernorm.weight,
+                )
+            elif self._overlap_kda:
+                (
+                    residual, post_mix, res_mix, x, projected
+                ) = torch.ops.vllm.glm5_mhc_project_runtime(
+                    x, residual, post_mix, res_mix,
+                    self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base,
+                    self.input_layernorm.weight, self.self_attn.in_proj_qkvgfab.weight,
+                    self._mhc_stream_key, False,
+                    self.rms_norm_eps, self.hc_eps, self.hc_post_alpha,
+                    self.hc_sinkhorn_iters, self.rms_norm_eps,
+                )
             else:
-                self.self_attn(x, positions, attn_out, projected_qkvgfab=projected)
+                residual, post_mix, res_mix, x = self._site_fused(
+                    x, residual, post_mix, res_mix,
+                    self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base,
+                    self.input_layernorm.weight,
+                )
+            # Only the measured SM80 path fuses norm inside the mHC transition.
+            if not self._fuse_mhc_norm:
+                with _qc_phase("mhc_norm"):
+                    x = self.input_layernorm(x)
+        if self.is_linear:
+            with _qc_phase("kda_attn"):
+                if projected is None:
+                    attn_out = self.self_attn(x, positions, None)
+                else:
+                    attn_out = self.self_attn(
+                        x, positions, None, projected_qkvgfab=projected
+                    )
         else:
-            attn_out = self.self_attn(positions, x)
+            with _qc_phase("mla_attn"):
+                attn_out = self.self_attn(positions, x)
 
 
         router_logits = None
-        if self._overlap_router:
-            residual, post_mix, res_mix, x, router_logits = torch.ops.vllm.glm5_mhc_project_runtime(
-                attn_out, residual, post_mix, res_mix,
-                self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base,
-                self.post_attention_layernorm.weight, self.mlp.gate.weight,
-                self._mhc_stream_key, True,
-                self.rms_norm_eps, self.hc_eps, self.hc_post_alpha,
-                self.hc_sinkhorn_iters, self.rms_norm_eps,
-            )
-        else:
-            residual, post_mix, res_mix, x = self._site_fused(
-                attn_out, residual, post_mix, res_mix,
-                self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base,
-                self.post_attention_layernorm.weight,
-            )
-        if not self._fuse_mhc_norm:
-            x = self.post_attention_layernorm(x)
-        if router_logits is None:
-            x = self.mlp(x)
-        else:
-            x = self.mlp(x, router_logits=router_logits)
+        with _qc_phase("mhc_ffn_site"):
+            if self._overlap_router:
+                (
+                    residual, post_mix, res_mix, x, router_logits
+                ) = torch.ops.vllm.glm5_mhc_project_runtime(
+                    attn_out, residual, post_mix, res_mix,
+                    self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base,
+                    self.post_attention_layernorm.weight, self.mlp.gate.weight,
+                    self._mhc_stream_key, True,
+                    self.rms_norm_eps, self.hc_eps, self.hc_post_alpha,
+                    self.hc_sinkhorn_iters, self.rms_norm_eps,
+                )
+            else:
+                residual, post_mix, res_mix, x = self._site_fused(
+                    attn_out, residual, post_mix, res_mix,
+                    self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base,
+                    self.post_attention_layernorm.weight,
+                )
+            if not self._fuse_mhc_norm:
+                with _qc_phase("mhc_norm"):
+                    x = self.post_attention_layernorm(x)
+        with _qc_phase("moe" if isinstance(self.mlp, DeepseekV2MoE) else "dense_ffn"):
+            if router_logits is None:
+                x = self.mlp(x)
+            else:
+                x = self.mlp(x, router_logits=router_logits)
         return x, residual, post_mix, res_mix
 
 
@@ -427,7 +452,7 @@ class Glm5NextTextModel(nn.Module):
             vllm_config.scheduler_config.max_num_batched_tokens,
             width,
             dtype=torch.int32,
-            device=torch.cuda.current_device(),
+            device=glm5_next_device(),
         )
         self.indexer_workspace = Glm5NextIndexerWorkspace.from_config(
             vllm_config.additional_config
@@ -479,6 +504,7 @@ class Glm5NextTextModel(nn.Module):
         # completed output of layer v - 1 (set_eagle3_aux_hidden_state_layers
         # passes the drafter's target_layer_ids + 1).
         self.aux_hidden_state_layers: tuple[int, ...] = ()
+        self._mtp_target_hidden_states: torch.Tensor | None = None
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -519,6 +545,13 @@ class Glm5NextTextModel(nn.Module):
         # weighted head does not apply).
         hidden_states = streams.mean(dim=1)
         hidden_states = self.norm(hidden_states)
+        # The nextn (MTP) head drafts from the POST-final-norm state (kept
+        # for get_mtp_target_hidden_states). Measured 2026-09-11 on strictly
+        # periodic prompts, K=1 greedy acceptance: post-norm 99-100% (digits
+        # 98.8, sentence 100, abc 95) vs the pre-norm stream mean 77-92%
+        # with the draft emitting <|code_suffix|> at fixed content
+        # positions; ds4 accepts 100% on the same prompts.
+        self._mtp_target_hidden_states = hidden_states
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states
@@ -602,6 +635,12 @@ class Glm5NextForCausalLM(
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
+
+    def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
+        """(T, hidden_size) post-final-norm hidden state from the last
+        forward, the input the nextn MTP head's hnorm expects (the runner
+        slices it to the active token count)."""
+        return getattr(self.model, "_mtp_target_hidden_states", None)
 
     @classmethod
     def get_mamba_state_dtype_from_config(
@@ -744,15 +783,31 @@ class Glm5NextForCausalLM(
 from collections.abc import Mapping, Sequence  # noqa: E402
 from typing import Any  # noqa: E402
 
-from transformers.models.glm5_next import (  # noqa: E402
-    Glm5NextConfig,
-    Glm5NextImageProcessor,
-    Glm5NextProcessor,
-)
-from transformers.models.glm5_next.image_processing_glm5_next import (  # noqa: E402
-    smart_resize as glm5_next_smart_resize,
-)
+try:
+    from transformers.models.glm5_next import (  # noqa: E402
+        Glm5NextConfig,
+        Glm5NextImageProcessor,
+        Glm5NextProcessor,
+    )
+    from transformers.models.glm5_next.image_processing_glm5_next import (  # noqa: E402
+        smart_resize as glm5_next_smart_resize,
+    )
+except ImportError:  # transformers < 5.16.1: no native glm5_next package
+    # Text-only serving from a GGUF still needs this module to import (the
+    # registry, the Metal bring-up smoke). The config comes from the vLLM
+    # stand-in that gguf_glm5_next.py already uses; the HF processors are
+    # unavailable, so image requests fail at processor construction rather
+    # than the whole model failing to import.
+    from vllm.transformers_utils.configs.glm5_next import (  # noqa: E402
+        Glm5NextConfig,
+    )
 
+    Glm5NextImageProcessor = None  # type: ignore[assignment,misc]
+    Glm5NextProcessor = None  # type: ignore[assignment,misc]
+    glm5_next_smart_resize = None  # type: ignore[assignment]
+
+from vllm.config.multimodal import BaseDummyOptions  # noqa: E402
+from vllm.inputs import MultiModalDataDict  # noqa: E402
 from vllm.model_executor.models.glm5_next_vision import (  # noqa: E402
     Glm5NextVisionTransformer,
 )
@@ -774,8 +829,6 @@ from vllm.model_executor.models.utils import (  # noqa: E402
     _merge_multimodal_embeddings,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY  # noqa: E402
-from vllm.config.multimodal import BaseDummyOptions  # noqa: E402
-from vllm.inputs import MultiModalDataDict  # noqa: E402
 from vllm.multimodal.inputs import (  # noqa: E402
     MultiModalFieldConfig,
     MultiModalKwargsItems,
@@ -1023,6 +1076,9 @@ class Glm5NextForConditionalGeneration(
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
+
+    def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
+        return self.language_model.get_mtp_target_hidden_states()
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         text_weights: list[tuple[str, torch.Tensor]] = []

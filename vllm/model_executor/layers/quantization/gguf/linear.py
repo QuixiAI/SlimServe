@@ -7,6 +7,7 @@ import gguf
 import torch
 from gguf import GGMLQuantizationType as WeightType
 
+from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (
     LinearMethodBase,
     register_weight_loader_v2_supported_method,
@@ -35,6 +36,7 @@ from .utils import (
     UNQUANTIZED_TYPES,
 )
 
+logger = init_logger(__name__)
 
 def _cublas_dequant_enabled() -> bool:
     # Metal has no generic GGUF dequant kernel, so the dequant-then-dense route
@@ -247,6 +249,90 @@ def _sm_route_ok(x: torch.Tensor, qweight: torch.Tensor, qweight_type: int) -> b
     return qweight.shape[0] % 16 == 0 and x.shape[1] % 32 == 0
 
 
+_METAL_SHARD_OVERLAP: bool | None = None
+
+
+def _metal_shard_overlap() -> bool:
+    """Concurrent region around the hetero-quant shard GEMVs (W26; opt-in
+    per profile through VLLM_METAL_SHARD_OVERLAP=1). False whenever a
+    region is already open (the ops then simply join it)."""
+    global _METAL_SHARD_OVERLAP
+    if _METAL_SHARD_OVERLAP is None:
+        _METAL_SHARD_OVERLAP = False
+        if (
+            current_platform.is_metal()
+            and os.environ.get("VLLM_METAL_SHARD_OVERLAP", "0") == "1"
+        ):
+            try:
+                from vllm.quixicore import quixicore_ops
+
+                _METAL_SHARD_OVERLAP = quixicore_ops.is_available()
+            except Exception:
+                _METAL_SHARD_OVERLAP = False
+    if not _METAL_SHARD_OVERLAP:
+        return False
+    from vllm.quixicore import quixicore_ops
+
+    return not quixicore_ops.concurrent_active()
+
+
+def _metal_shard_region_ok(x: torch.Tensor, shards) -> bool:
+    """Whether every shard GEMV writes its column slice in place, so the
+    concurrent region (which admits no torch copy) can hold them. Mirrors
+    ggml_mul_mat_vec_a8's strided-output rule: batch 1 binds rows by offset
+    for any format; the q8_0 NR batch kernel (VLLM_QC_Q8_NR=1) takes an
+    output stride at M 2..4 (K > 512, K % 32 == 0, N even); the q4_K NR batch
+    twin does at 2/4/8-row chunks of any M <= 8 (N % 4 == 0, K % 256 == 0,
+    kill switches off); every other route computes into the ring and
+    copies."""
+    batch, k = x.shape
+    if batch == 1:
+        return True
+    if x.dtype not in (torch.bfloat16, torch.float16):
+        return False
+    q8_nr = os.environ.get("VLLM_QC_Q8_NR") == "1"
+    q4k_nr = (
+        os.environ.get("VLLM_QC_Q4K_NR") != "0"
+        and os.environ.get("VLLM_QC_Q4K_NR_MM") != "0"
+    )
+    for w, t in shards:
+        n = w.shape[0]
+        if t == WeightType.Q8_0:
+            if not (
+                q8_nr and 2 <= batch <= 4 and k > 512 and k % 32 == 0 and n % 2 == 0
+            ):
+                return False
+        elif t == WeightType.Q4_K:
+            if not (q4k_nr and batch <= 8 and n % 4 == 0 and k % 256 == 0):
+                return False
+        else:
+            return False
+    return True
+
+
+def _metal_hetero_direct_ok(x: torch.Tensor, shards) -> bool:
+    """Hetero-quant shards (GLM-5.3-Flash KDA in_proj: q|k q4_K + v|f|g|beta
+    q8_0) can ride the vector kernel straight into column slices of one
+    output: Metal, every shard a vector-kernel format within its batch
+    limit, and the output-slice option built."""
+    if not current_platform.is_metal() or x.dim() != 2:
+        return False
+    batch = x.shape[0]
+    if batch == 0 or batch > 8:
+        return False
+    for w, t in shards:
+        if t not in MMVQ_QUANT_TYPES:
+            return False
+        limit = (
+            _imatrix_mmvq_batch_limit(w.shape[0], t)
+            if t in IMATRIX_QUANT_TYPES
+            else _mmvq_batch_limit(w.shape[0], t)
+        )
+        if batch > limit:
+            return False
+    return True
+
+
 def _fused_mul_mat_gguf(
     x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
 ) -> torch.Tensor:
@@ -258,6 +344,11 @@ def _fused_mul_mat_gguf(
         return torch.empty(x.shape[0], qweight.shape[0], dtype=x.dtype, device=x.device)
     if qweight_type in UNQUANTIZED_TYPES:
         return x @ qweight.T
+    if current_platform.is_metal() and not x.is_contiguous():
+        # Every quixicore Metal GEMV/GEMM host entry checks x.is_contiguous().
+        # Split views reach here (GLM-5.3-Flash KDA: f_a/g_a are slices of the
+        # fused qkvgfab projection feeding f_b/g_b); one small copy per call.
+        x = x.contiguous()
     if _sm_route_ok(x, qweight, qweight_type):
         y = ops.ggml_mul_mat_sm(qweight, x, qweight_type, qweight.shape[0])
     elif x.shape[0] <= mmvq_safe and qweight_type in MMVQ_QUANT_TYPES:
@@ -495,10 +586,35 @@ class GGUFLinearMethod(LinearMethodBase):
         if len(set(shard_weight_types)) == 1:
             # Homogeneous: the fused matmul reads the merged buffer directly.
             return
+        # Adjacent shards of one quant type (same row bytes) ride one GEMV:
+        # GLM-5.3-Flash KDA in_proj is q|k (Q4_K) + v|f_a|g_a|beta (Q8_0),
+        # two launches instead of six, bit-identical per row. Only layers
+        # that ask for it (`qc_metal_fused_shards`, set by the KDA merged
+        # projection) take this form; every other hetero-quant layer keeps
+        # the per-shard views it was gated with.
+        fused_shards = getattr(layer, "qc_metal_fused_shards", False)
         shards = []
+        run = None  # [start, end, offset, type]
         for idx, shard_type in zip(shard_id, shard_weight_types):
             start, end, offset = qweight.shard_offset_map[idx]
-            shards.append((qweight[start:end, :offset].contiguous(), shard_type))
+            if (
+                fused_shards
+                and run is not None
+                and run[3] == shard_type
+                and run[2] == offset
+                and run[1] == start
+            ):
+                run[1] = end
+                continue
+            if run is not None:
+                shards.append(
+                    (qweight[run[0] : run[1], : run[2]].contiguous(), run[3])
+                )
+            run = [start, end, offset, shard_type]
+        if run is not None:
+            shards.append(
+                (qweight[run[0] : run[1], : run[2]].contiguous(), run[3])
+            )
         layer._gguf_hetero_shards = shards
         # Keep the parameter object (the shard maps and attribute checks ride
         # on it); drop only its storage.
@@ -604,6 +720,60 @@ class GGUFLinearMethod(LinearMethodBase):
             # `_create_hetero_shard_weights` (doing it here would mutate a
             # parameter inside the traced graph -- see that method).
             shards = layer._gguf_hetero_shards
+            if getattr(layer, "qc_metal_fused_shards", False) and (
+                _metal_hetero_direct_ok(x, shards)
+            ):
+                # Decode widths on Metal: each shard's GEMV writes its column
+                # slice of one [T, N] output (no per-layer torch.cat).
+                logger.info_once(
+                    "quixicore(metal): hetero-quant shard GEMVs write one "
+                    "output (no cat)"
+                )
+                total = sum(w.shape[0] for w, _ in shards)
+                out = torch.empty(
+                    (x.shape[0], total), dtype=x.dtype, device=x.device
+                )
+                xc = x if x.is_contiguous() else x.contiguous()
+                # Decode widths: each shard's GEMV writes its column slice of
+                # one [T, N] output in place (the q8_0/q4_K NR batch kernels
+                # take the output row stride), so there is no per-layer
+                # torch.cat and, at M > 1, no ring copy.
+                # W26 (VLLM_METAL_SHARD_OVERLAP=1, the glm53f-q2-1 env
+                # block): the two shard GEMVs read the same input and write
+                # disjoint column slices, so they share one concurrent
+                # region - the ALU-limited q4_K q|k walk overlaps the
+                # bandwidth-bound q8_0 v|f|g|beta GEMV. Same kernels, same
+                # bytes; only the encoder changes (bit-identical).
+                # Only when every shard's route writes the slice in place:
+                # a ring copy inside the region is a TORCH_CHECK (batches
+                # 5..8 on q8_0, 3+ concurrent K=1 requests).
+                overlap = (
+                    _metal_shard_overlap()
+                    and len(shards) > 1
+                    and _metal_shard_region_ok(xc, shards)
+                )
+                if overlap:
+                    from vllm.quixicore import quixicore_ops
+
+                    quixicore_ops.concurrent_begin()
+                try:
+                    col = 0
+                    for shard_weight, shard_type in shards:
+                        rows = shard_weight.shape[0]
+                        ops.ggml_mul_mat_vec_a8(
+                            shard_weight,
+                            xc,
+                            shard_type,
+                            rows,
+                            out=out[:, col : col + rows],
+                        )
+                        col += rows
+                finally:
+                    if overlap:
+                        quixicore_ops.concurrent_end()
+                if bias is not None:
+                    out.add_(bias)
+                return out
             result = [
                 fused_mul_mat_gguf_op(x, shard_weight, shard_type)
                 for shard_weight, shard_type in shards

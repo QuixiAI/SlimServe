@@ -24,6 +24,7 @@
 # limitations under the License.
 """Inference-only DeepseekV2/DeepseekV3 model."""
 
+import os
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -48,7 +49,7 @@ from vllm.distributed import (
     tensor_model_parallel_reduce_scatter,
 )
 from vllm.logger import init_logger
-from vllm.model_executor.layers.activation import SiluAndMul
+from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.attention import Attention, RSWAAttention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.fused_moe import (
@@ -241,6 +242,7 @@ class DeepseekV2MLP(nn.Module):
         reduce_results: bool = True,
         is_sequence_parallel=False,
         prefix: str = "",
+        swiglu_limit: float | None = None,
     ) -> None:
         super().__init__()
 
@@ -269,13 +271,81 @@ class DeepseekV2MLP(nn.Module):
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
-        self.act_fn = SiluAndMul()
+        # swiglu_limit (GLM-5.3-Flash `glm5-next.swiglu_limit` = 10): the
+        # DSV4-style clamp silu(min(gate, L)) * clamp(up, -L, L) that ds4
+        # applies on the dense, shared and routed FFNs alike. None keeps the
+        # plain SiluAndMul for every DeepSeek config that lacks the field.
+        if swiglu_limit is not None:
+            self.act_fn = SiluAndMulWithClamp(float(swiglu_limit))
+        else:
+            self.act_fn = SiluAndMul()
 
     def forward(self, x):
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
+        act = _metal_pair_swiglu(self, x)
+        if act is None:
+            gate_up, _ = self.gate_up_proj(x)
+            act = self.act_fn(gate_up)
+        x, _ = self.down_proj(act)
         return x
+
+
+def _metal_pair_qweight(mlp: "DeepseekV2MLP", x: torch.Tensor) -> torch.Tensor | None:
+    """The gate_up q8_0 qweight when the Metal pair-SwiGLU dispatch applies
+    to (mlp, x), else None (shape, quant or dtype does not qualify)."""
+    if not _metal_flags()["shexp"] or x.dim() != 2 or not (1 <= x.shape[0] <= 4):
+        return None
+    layer = mlp.gate_up_proj
+    qweight = getattr(layer, "qweight", None)
+    qtype = getattr(layer, "qweight_type", None)
+    if qweight is None or qtype is None:
+        return None
+    # 8 = GGML q8_0; a merged layer may carry per-shard types (hetero merge).
+    shard_types = getattr(qtype, "shard_weight_type", None) or {}
+    if getattr(qtype, "weight_type", None) != 8 or any(
+        t != 8 for t in shard_types.values()
+    ):
+        return None
+    N, K = qweight.shape[0], x.shape[1]
+    if N % 4 or K % 32 or K <= 512 or qweight.shape[1] != (K // 32) * 34:
+        return None
+    if x.dtype not in (torch.bfloat16, torch.float16):
+        return None
+    return qweight
+
+
+def _metal_pair_swiglu(mlp: "DeepseekV2MLP", x: torch.Tensor) -> torch.Tensor | None:
+    """Metal decode fast path for a GGUF q8_0 gate_up projection: one
+    dispatch computes the gate|up GEMV and the SwiGLU (with the module's
+    clamp) instead of the GEMV + qc_swiglu pair, bit-identical to that
+    chain. Opt-in per profile (VLLM_METAL_SHEXP_PAIR=1, the glm53f-q2-1
+    env block); every other profile keeps the two-dispatch chain it was
+    gated with. Returns None when the shape or quant does not qualify."""
+    qweight = _metal_pair_qweight(mlp, x)
+    if qweight is None:
+        return None
+    from vllm.quixicore.ops import quixicore_ops
+
+    limit = getattr(mlp.act_fn, "swiglu_limit", None)
+    return quixicore_ops.ggml_mul_mat_vec_a8_pair_swiglu(
+        qweight, x if x.is_contiguous() else x.contiguous(), qweight.shape[0], limit
+    )
+
+
+# Read lazily (first shared-expert forward), not at import: the model module
+# is imported before the profile env is applied, so an import-time read can
+# miss it. VLLM_METAL_SHEXP_PAIR=1 (glm53f-q2-1) routes the shared-expert and
+# dense-FFN gate|up through the fused pair-SwiGLU dispatch.
+_METAL_SHEXP: bool | None = None
+
+
+def _metal_flags() -> dict[str, bool]:
+    global _METAL_SHEXP
+    if _METAL_SHEXP is None:
+        _METAL_SHEXP = (
+            current_platform.is_metal()
+            and os.environ.get("VLLM_METAL_SHEXP_PAIR", "0") == "1"
+        )
+    return {"shexp": _METAL_SHEXP}
 
 
 def _fused_ar_rms_norm(
@@ -335,6 +405,12 @@ class DeepseekV2MoE(nn.Module):
             config.hidden_size,
             config.n_routed_experts,
             out_dtype=self.router_dtype,
+            # Metal has no fp32-output router GEMM tier: keep the gate weight
+            # in fp32 so an fp32 router dtype means fp32 logits (not a bf16
+            # product widened afterwards).
+            force_fp32_compute=(
+                current_platform.is_metal() and self.router_dtype == torch.float32
+            ),
             prefix=f"{prefix}.gate",
         )
         if getattr(config, "topk_method", None) == "noaux_tc":
@@ -383,10 +459,12 @@ class DeepseekV2MoE(nn.Module):
                 is_sequence_parallel=self.is_sequence_parallel,
                 reduce_results=False,
                 prefix=f"{prefix}.shared_experts",
+                swiglu_limit=getattr(config, "swiglu_limit", None),
             )
 
         self.experts = FusedMoE(
             shared_experts=self.shared_experts,
+            swiglu_limit=getattr(config, "swiglu_limit", None),
             gate=self.gate,
             num_experts=config.n_routed_experts,
             top_k=config.num_experts_per_tok,

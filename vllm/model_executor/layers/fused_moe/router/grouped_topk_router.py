@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from functools import partial
 
 import torch
@@ -8,6 +9,7 @@ from vllm import _custom_ops as ops
 from vllm import envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.distributed.eplb.eplb_state import EplbLayerState
+from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.fused_moe.config import (
     RoutingMethodType,
@@ -109,6 +111,24 @@ def grouped_topk(
 
     assert hidden_states.size(0) == gating_output.size(0), "Number of tokens mismatch"
 
+    if _metal_router_ok(
+        gating_output, topk, num_expert_group, topk_group, scoring_func
+    ):
+        from vllm.quixicore import quixicore_ops
+
+        logger.info_once("quixicore(metal): single-group MoE router kernel active")
+        bias = e_score_correction_bias
+        if bias is not None and bias.dtype != torch.float32:
+            bias = bias.float()
+        return quixicore_ops.moe_router_topk(
+            gating_output,
+            bias,
+            topk,
+            renormalize,
+            scoring_func == "softmax",
+            routed_scaling_factor,
+        )
+
     if scoring_func == "softmax":
         scores = torch.softmax(gating_output, dim=-1)
     elif scoring_func == "sigmoid":
@@ -159,6 +179,52 @@ def grouped_topk(
     if routed_scaling_factor != 1.0:
         topk_weights = topk_weights * routed_scaling_factor
     return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
+
+
+logger = init_logger(__name__)
+
+_METAL_ROUTER: bool | None = None
+
+
+def _metal_router_ok(
+    gating_output: torch.Tensor,
+    topk: int,
+    num_expert_group: int,
+    topk_group: int,
+    scoring_func: str,
+) -> bool:
+    """Metal single-group router kernel (`moe_router_topk`): scores + bias
+    top-k, unbiased weights, renormalize, scale in one dispatch, replacing
+    the ~16-op torch chain. fp32 logits only (the torch chain rounds bf16
+    logits per op and picks different experts at near-ties).
+    Opt-in per profile (VLLM_METAL_MOE_ROUTER=1, the glm53f-q2-1 env
+    block); other MoE profiles keep the torch chain they were gated with."""
+    global _METAL_ROUTER
+    if _METAL_ROUTER is None:
+        _METAL_ROUTER = False
+        if current_platform.is_metal() and os.environ.get(
+            "VLLM_METAL_MOE_ROUTER", "0"
+        ) == "1":
+            try:
+                from vllm.quixicore import quixicore_ops
+
+                _METAL_ROUTER = quixicore_ops.is_available() and (
+                    quixicore_ops.has("moe_router_topk")
+                )
+            except Exception:
+                _METAL_ROUTER = False
+    return (
+        _METAL_ROUTER
+        and gating_output.device.type == "mps"
+        and gating_output.dim() == 2
+        and gating_output.stride(1) == 1
+        and gating_output.shape[1] <= 1024
+        and num_expert_group <= 1
+        and topk_group <= 1
+        and 1 <= topk <= min(32, gating_output.shape[1])
+        and scoring_func in ("sigmoid", "softmax")
+        and gating_output.dtype == torch.float32
+    )
 
 
 # --8<-- [start:grouped_topk]

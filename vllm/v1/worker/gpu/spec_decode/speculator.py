@@ -25,7 +25,6 @@ from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
 
-
 class BaseSpeculator(ABC):
     @abstractmethod
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
@@ -88,10 +87,16 @@ class DraftModelSpeculator(BaseSpeculator):
         # the draft model's hidden size can be different from the target model's
         # hidden size (e.g., Llama 3.3 70B).
         self.hidden_size = self.draft_model_config.get_hidden_size()
-        # Widen for HC-multiplexed residuals (e.g. DeepSeek V4 feeds the MTP
-        # draft the target's pre-hc_head (T, hc_mult * hidden_size) residual).
-        # Non-HC models default to hc_mult=1 and are unaffected.
-        hc_mult = getattr(self.draft_model_config.hf_config, "hc_mult", 1)
+        # Widen for HC-multiplexed residuals: DeepSeek V4 feeds the MTP
+        # draft the target's pre-hc_head (T, hc_mult * hidden_size) residual.
+        # Only that family drafts from the multiplexed stream; GLM-5.3-Flash
+        # also carries hc_mult (mHC, 4 streams) but its nextn head consumes
+        # the hc-combined (T, hidden_size) pre-final-norm state, exactly as
+        # ds4 feeds hnorm. Non-HC models default to hc_mult=1.
+        draft_hf = self.draft_model_config.hf_config
+        hc_mult = getattr(draft_hf, "hc_mult", 1)
+        if getattr(draft_hf, "model_type", "") not in ("deepseek_v4",):
+            hc_mult = 1
         self.hidden_size = self.hidden_size * hc_mult
         self.vocab_size = self.draft_model_config.get_vocab_size()
         self.dtype = vllm_config.model_config.dtype

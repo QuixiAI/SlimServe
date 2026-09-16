@@ -146,6 +146,7 @@ def test_every_source_declares_its_live_smoke_modalities():
     assert sources["glm52-vision"]["modalities"] == ["text", "image"]
     assert sources["kimi-k3"]["modalities"] == ["text", "image"]
     assert sources["glm53f-nvfp4"]["modalities"] == ["text", "image"]
+    assert sources["glm53f-gguf"]["modalities"] == ["text"]
     assert sources["dsv4-flash"]["modalities"] == ["text"]
     assert sources["muse-glimmer"]["modalities"] == ["text", "image"]
     assert sources["qwen38-27b"]["modalities"] == ["text", "image"]
@@ -390,6 +391,7 @@ def test_registry_contains_only_the_supported_model_artifacts():
         "qwen38-flash-next-fp8",
         "qwen38-flash-next-nvfp4",
         "glm53f-nvfp4",
+        "glm53f-gguf",
     }
     glm = data["sources"]["glm52-vision"]
     kimi = data["sources"]["kimi-k3"]

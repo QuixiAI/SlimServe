@@ -1612,6 +1612,17 @@ class SpecDecodeBaseProposer:
             for _, module in self.model.model.named_modules():
                 if hasattr(module, "topk_indices_buffer"):
                     module.topk_indices_buffer = target_buffer
+            # The GLM pooled indexer's per-row valid-prefix buffer travels
+            # with the indices it describes.
+            target_len = None
+            for _, module in target_language_model.model.named_modules():
+                if getattr(module, "topk_len_buffer", None) is not None:
+                    target_len = module.topk_len_buffer
+                    break
+            if target_len is not None:
+                for _, module in self.model.model.named_modules():
+                    if hasattr(module, "topk_len_buffer"):
+                        module.topk_len_buffer = target_len
             logger.info(
                 "Detected MTP model with topk_indices_buffer. "
                 "Sharing target model topk_indices_buffer with the draft model."

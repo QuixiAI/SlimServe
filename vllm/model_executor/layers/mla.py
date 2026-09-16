@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from dataclasses import dataclass
 
 import torch
@@ -8,6 +9,8 @@ from vllm.config import CacheConfig
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.platforms import current_platform
+from vllm.v1.worker.metal_phaseprof import phase as _qc_phase
 
 
 @dataclass
@@ -33,6 +36,58 @@ class MLAModules:
 
 
 # --8<-- [start:multi_head_latent_attention]
+
+
+_METAL_DUAL_NORM: bool | None = None
+
+
+def _metal_dual_norm_ok(mla, qkv_lora: torch.Tensor) -> bool:
+    """Metal (opt-in VLLM_METAL_MLA_DUAL_NORM=1): the q_a and kv_a RMS norms
+    of the fused projection output ride one dual-segment dispatch. Requires
+    plain RMSNorm modules with fp32 (GGUF) weights sharing one epsilon and a
+    row-strided fp16/bf16 [T, S] input covering both segments."""
+    global _METAL_DUAL_NORM
+    if _METAL_DUAL_NORM is None:
+        _METAL_DUAL_NORM = False
+        if (
+            current_platform.is_metal()
+            and os.environ.get("VLLM_METAL_MLA_DUAL_NORM", "0") == "1"
+        ):
+            try:
+                from vllm.quixicore import quixicore_ops
+
+                _METAL_DUAL_NORM = quixicore_ops.is_available() and (
+                    quixicore_ops.has("rms_norm_dual")
+                )
+            except Exception:
+                _METAL_DUAL_NORM = False
+    if not _METAL_DUAL_NORM or qkv_lora.device.type != "mps":
+        return False
+    qn, kn = mla.q_a_layernorm, mla.kv_a_layernorm
+    if type(qn).__name__ != "RMSNorm" or type(kn).__name__ != "RMSNorm":
+        return False
+    wq, wk = getattr(qn, "weight", None), getattr(kn, "weight", None)
+    if wq is None or wk is None:
+        return False
+    if wq.dtype != torch.float32 or wk.dtype != torch.float32:
+        return False
+    eps_q = getattr(qn, "variance_epsilon", None)
+    if eps_q is None or eps_q != getattr(kn, "variance_epsilon", None):
+        return False
+    d0, d1 = mla.q_lora_rank, mla.kv_lora_rank
+    return (
+        qkv_lora.dim() == 2
+        and qkv_lora.dtype in (torch.float16, torch.bfloat16)
+        and qkv_lora.stride(1) == 1
+        and qkv_lora.stride(0) >= d0 + d1
+        and qkv_lora.shape[1] >= d0 + d1
+        and wq.numel() == d0
+        and wk.numel() == d1
+        and wq.is_contiguous()
+        and wk.is_contiguous()
+    )
+
+
 @PluggableLayer.register("multi_head_latent_attention")
 class MultiHeadLatentAttentionWrapper(PluggableLayer):
     """Pluggable MLA layer which allows OOT backends to add
@@ -146,12 +201,30 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
                 "q_b_proj is required when q_lora_rank is not None"
             )
 
-            qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
+            with _qc_phase("mla_qkv_a"):
+                qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
             q_c, kv_lora = qkv_lora.split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
                 dim=-1,
             )
-            q_c = self.q_a_layernorm(q_c)
+            kv_c_pre = None
+            if _metal_dual_norm_ok(self, qkv_lora):
+                # One dispatch norms q_c and kv_c (both slices of qkv_lora)
+                # with their own weights; per segment bit-exact to the two
+                # qc_rms_norm launches it replaces (VLLM_METAL_MLA_DUAL_NORM=1,
+                # the glm53f-q2-1 env block).
+                from vllm.quixicore import quixicore_ops
+
+                q_c, kv_c_pre = quixicore_ops.rms_norm_dual(
+                    qkv_lora,
+                    self.q_lora_rank,
+                    self.q_a_layernorm.weight,
+                    self.kv_lora_rank,
+                    self.kv_a_layernorm.weight,
+                    self.kv_a_layernorm.variance_epsilon,
+                )
+            else:
+                q_c = self.q_a_layernorm(q_c)
             q_proj_layer = self.q_b_proj
             q_proj_input = q_c
         else:
@@ -164,13 +237,17 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
             q_proj_layer = self.q_proj
             q_proj_input = hidden_states
+            kv_c_pre = None
 
         kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        kv_c_normed = self.kv_a_layernorm(kv_c)
+        kv_c_normed = (
+            kv_c_pre if kv_c_pre is not None else self.kv_a_layernorm(kv_c)
+        )
         # Add head dim of 1 to k_pe
         k_pe = k_pe.unsqueeze(1)
 
-        q = q_proj_layer(q_proj_input)[0]
+        with _qc_phase("mla_q_b"):
+            q = q_proj_layer(q_proj_input)[0]
         heads = self.num_heads
         if self.dcp_q_replicate:
             heads *= q_proj_layer.group_size
@@ -182,7 +259,8 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             )
 
         if self.indexer and self.is_sparse and not self.skip_topk:
-            self.indexer(hidden_states, q_c, positions, self.indexer_rope_emb)
+            with _qc_phase("mla_indexer"):
+                self.indexer(hidden_states, q_c, positions, self.indexer_rope_emb)
 
         if llama_4_scaling is not None:
             q *= llama_4_scaling
@@ -191,15 +269,18 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         if self.dcp_q_replicate:
             q_dcp_replicated, q = q, q_proj_layer._local_view(q)
 
-        attn_out = self.mla_attn(
-            q,
-            kv_c_normed,
-            k_pe,
-            output_shape=(hidden_states.shape[0], self.num_heads * self.v_head_dim),
-            q_dcp_replicated=q_dcp_replicated,
-        )
+        with _qc_phase("mla_core"):
+            attn_out = self.mla_attn(
+                q,
+                kv_c_normed,
+                k_pe,
+                output_shape=(hidden_states.shape[0], self.num_heads * self.v_head_dim),
+                q_dcp_replicated=q_dcp_replicated,
+            )
 
         if self.g_proj is not None:
             attn_out = attn_out * self.g_proj(hidden_states)[0].sigmoid()
 
-        return self.o_proj(attn_out)[0]
+        with _qc_phase("mla_o_proj"):
+            out = self.o_proj(attn_out)[0]
+        return out
