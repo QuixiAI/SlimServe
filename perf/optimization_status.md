@@ -29277,3 +29277,99 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   shape. Section 13's ranking of this item should be read down accordingly.
 - Raw: `perf/results/2026-09-15/mhc-token-chunks/mhcar-{base2,chunks,
   chunks-gated}.log`; register screen in the preceding entry.
+
+### The sparse MLA tensor-core decode kernel was never too big for sm_120: only its SPLIT=128 tile was, and qualifying it is +2.2 % at c16 - RETAINED (record setting)
+
+- Baseline. `glm5_next_sparse_tc_decode` has been off on this platform since
+  the Phase 1 survey, on the reading recorded at the top of this notebook:
+  "kernel needs a 99 KB shared-memory retune (fails at 147-163 KB)". The
+  gate in `quixicore_mla_sparse.py` is a hard
+  `is_device_capability((8, 0))` that raises on anything else.
+- What the footprint actually is. The partition kernel's tile is the
+  gathered latents, SPLIT x 512 bf16, plus the 16 x 512 bf16 query rows.
+  Compiled for `cuda:120` through `triton.compile` (no GPU needed, seconds):
+
+  | SPLIT | shared | fits sm_120's 99 KB |
+  |---|---:|---|
+  | 32 | 48.0 KB | yes |
+  | 64 | 80.0 KB | yes |
+  | 128 | 144.0 KB | no (this is the 147,456 B in the error) |
+
+  Two of the three always fitted. The 147-163 KB figure is the SPLIT=128
+  tile and the fp8 branch, not the kernel as such - and
+  `_sparse_tc_split` returned exactly 128 for every batch of eight rows or
+  more, so every shape that mattered asked for the one tile that could not
+  load. The kernel needed no retune; it needed a dispatch that does not ask
+  for it.
+- Change. sm_120 gets its own branch: the 64-wide tile (the larger of the
+  two that fit, and the faster), a 16-row floor, and a 64-row cap. SM80 is
+  untouched - `glm53f-nvfp4-8`/a100 has this switch on and qualified, and
+  its table still reads 32 below eight rows and 128 above. The fp8 branch
+  stays native here: it assembles e4m3 through an int32 intermediate, so
+  its tile is 147 KB even at SPLIT=64, and this record serves bf16 latents.
+- Why a 16-row floor. The tensor-core kernel costs a near-constant ~38 us
+  per call at every row count and list width while the native SIMT path
+  scales with the work, so below the crossover native is still ahead.
+  Microbench (`$S/bench_tc_decode.py`, GPU 0, H=16, us per call, native
+  against SPLIT=64):
+
+  | rows | 512-wide | 1024 | 1536 | 2048 |
+  |---|---|---|---|---|
+  | 1 | 33.8 / 38.3 | 34.0 / 39.3 | 34.5 / 39.2 | 34.8 / 41.7 |
+  | 8 | 34.6 / 38.4 | 38.4 / 38.0 | 42.1 / 38.6 | 45.7 / 38.8 |
+  | 16 | 38.1 / 38.2 | 45.1 / 37.9 | 85.5 / 38.6 | 96.2 / 38.4 |
+  | 32 | 43.4 / 38.4 | 93.7 / 38.4 | 133.4 / 38.8 | 140.7 / 40.0 |
+  | 48 | 80.6 / 38.6 | 129.6 / 38.8 | 171.3 / 45.8 | 217.5 / 55.7 |
+
+  The crossover moves between 8 and 16 rows as the list widens, so 16 is
+  the width-independent safe point. Parity against the native path over the
+  whole sweep is max |delta| 0.001, one bf16 quantum.
+- Rows are batch x (drafts + 1). With the record's schedule
+  `[[1,4,3],[5,8,1],[9,16,2]]` that is 4 at c1 (native, unchanged), 16 at
+  c8 and 48 at c16 - which makes c1 a control channel that the change
+  cannot touch, and its movement between arms measures the harness noise
+  directly.
+- Result, two paired A/Bs on the same box, `--spec`, exact-token:
+
+  | shape | OFF | ON | delta |
+  |---|---:|---:|---:|
+  | c16-1000-300 (pooled, n=8 each) | 1037.2 | 1060.0 | **+2.2 %** |
+  | c8-1000-300 (n=3) | 737.1 | 738.0 | +0.1 % |
+  | c8-32000-300 (n=5, warm-up pass dropped) | 702.3 | 708.5 | +0.9 % |
+  | c1-1000-300 (n=3, native BOTH arms) | 279.9 | 256.9 | -8.2 % (noise) |
+
+  c16 pooled: OFF 1009.0 / 1021.2 / 1024.8 / 1032.4 / 1044.7 / 1049.1 /
+  1056.2 / 1059.8, ON 1038.3 / 1046.0 / 1056.0 / 1060.8 / 1068.0 / 1068.1 /
+  1068.7 / 1073.7. Mann-Whitney U = 55 of 64, p ~ 0.01 one-tailed.
+- **The harness noise, which is the more important result of the night.**
+  c1 runs the native path in both arms and still read -8.2 % between them.
+  Its within-arm spread was 8.4 % (244.5-265.0) and 9.4 % (269.4-295.7).
+  The record's own five-offset c1 samples span 250-287, so this is
+  historical, not new - but it means **a three-pass single-offset c1 arm
+  cannot resolve anything smaller than about 10 %**, and the record's c1
+  270.0 is trustworthy only because it is a five-offset mean over fifteen
+  samples. c16 is the stable shape here (within-arm spread 2.6-3.5 %);
+  future one-factor arms should be read there, or at c1 only through the
+  five-offset protocol.
+- **Why 2.2-3.7x on the kernel is only +2.2 % end to end.** Sparse MLA is
+  11 of 45 layers, and the decode roofline audit above put it in the
+  KDA/MLA/all-gather/pools group at 0.86 ms of which very little is
+  exclusive - it runs under the Marlin and FP8 GEMMs on other streams. At
+  c8-32K the arithmetic predicts 11 x 57.8 us = 0.64 ms of a 19.4 ms step,
+  3.3 %; the measurement says 0.9 %. Shrinking an overlapped kernel does
+  not shorten the step. This is the same lesson as the MoE glue and the
+  mHC transition, and it is now three for three: on this tree, kernel time
+  and step time are only loosely coupled, and every remaining decode
+  candidate should be sized by its EXCLUSIVE critical-path share, not by
+  its kernel time.
+- Correctness: canaries text / tool / image pass on both arms, `exact:
+  true` on all 26 runs, gate -2.4552 (ON) and -2.4521 (OFF), both in the
+  -2.407..-2.478 band, needle margins 13.2-19.0 nats.
+- Decision: RETAINED; `glm5_next_sparse_tc_decode: true` joins the record's
+  `additional_config`. It is never worse than native (the floor keeps the
+  small shapes on the old path), it is clean on every gate, and c16 is the
+  one shape where the record's margin over the control was thinnest.
+- Raw: `perf/results/2026-09-15/mhc-token-chunks/` (the sweep script is
+  `$S/bench_tc_decode.py`), `$S/serve-logs/ab-tcdec-{off,on}.out`,
+  `$S/serve-logs/ab-tcdec2-{off,on}.out`, chains `$S/tcdec-chain.out`,
+  `$S/tcdec-base-chain.out`, `$S/tcdec2-chain.out`.

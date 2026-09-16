@@ -2987,7 +2987,8 @@
             "additional_config": {
               "glm5_next_compact_indexer_cache": true,
               "glm5_next_sparse_tc_prefill": true,
-              "glm5_next_mhc_allreduce_fusion": true
+              "glm5_next_mhc_allreduce_fusion": true,
+              "glm5_next_sparse_tc_decode": true
             }
           },
           "env": {
