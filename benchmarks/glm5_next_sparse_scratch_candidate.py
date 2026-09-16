@@ -58,7 +58,8 @@ class SparseTCWorkspace:
 
 
 def shared_sparse_tc_nope(
-    q, cache, block_table, indices, topk_length, scale, *, split=32, workspace=None
+    q, cache, block_table, indices, topk_length, scale, *, split=32, workspace=None,
+    kv_scale=1.0,
 ):
     from vllm.quixicore.sparse_mla_tc import (
         _sparse_tc_part,
@@ -69,7 +70,7 @@ def shared_sparse_tc_nope(
 
     if workspace is None:
         return sparse_tc_nope(q, cache, block_table, indices, topk_length, scale,
-                              split=split)
+                              split=split, kv_scale=kv_scale)
     assert q.ndim == 3 and q.shape[1:] == (8, 512)
     assert cache.ndim == 3 and cache.shape[2] == 512
     assert q.dtype == cache.dtype == torch.bfloat16
@@ -90,8 +91,8 @@ def shared_sparse_tc_nope(
     _sparse_tc_part[(rows, parts)](
         q, cache, block_table, indices, topk_length,
         partial, maxima, denominators, block_table.stride(0), cache.stride(0),
-        cache.shape[0], scale, heads, cache.shape[1], indices.shape[1], parts,
-        split, num_warps=4, num_stages=1,
+        cache.shape[0], scale, float(kv_scale), heads, cache.shape[1],
+        indices.shape[1], parts, split, False, num_warps=4, num_stages=1,
     )
     _sparse_tc_reduce[(rows, heads, 8)](
         partial, maxima, denominators, out, heads, parts,
