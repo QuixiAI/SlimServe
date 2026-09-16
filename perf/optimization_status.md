@@ -1,5 +1,71 @@
 # SlimServe Optimization Status
 
+## 2026-09-15 - GLM-5.3-Flash Q2 on Metal: concurrent-serving baseline - speculation is a NET LOSS above 2 requests, and long-prompt concurrency scales NEGATIVELY
+
+- Baseline: PR #30 branch at d8981f2bd, profile `glm53f-q2-1`, exact-token
+  harness `benchmarks/benchmark_dsv4_exact.py` at `--concurrency 1/4/8`,
+  200 output tokens, temperature 0, warmup 1, `exact=True` on every run.
+  This replaces the c=2/3/6 smoke numbers from 2026-09-14, which counted
+  each request's prefill inside a 96-token wall clock and are not a
+  scaling curve.
+- Hypothesis: single-stream is the only thing this profile has ever been
+  measured on, so the question is simply what concurrency does, separated
+  into decode-dominated (64-token prompts) and prefill-heavy (1000-token
+  prompts) workloads.
+- RESULT, aggregate output tok/s (`perf/results/2026-09-15/concurrency-baseline/`):
+
+  | arm | c=1 | c=4 | c=8 | c=8 @ 1000-tok prompt |
+  | --- | --- | --- | --- | --- |
+  | record as shipped (MTP K=1) | 28.66 | 32.51 | 49.92 | 14.53 |
+  | booted `--no-spec`          | 23.95 | 49.03 | 45.07 | 24.80 |
+  | dynamic schedule [(1,2,1),(3,8,0)] | 28.88 | 44.04 | 41.65 | 16.69 |
+
+  Also measured on the shipped record at 1000-token prompts: c=1 19.27,
+  c=4 14.13, c=8 14.53 - aggregate throughput FALLS as concurrency rises.
+- Two separate problems, and the review-era assumption that there is one
+  ("batching buys nothing") was wrong:
+  1. SPECULATION IS A NET LOSS AT CONCURRENCY. It wins at c=1 (28.66 vs
+     23.95, +20%) and costs 34% at c=4 (32.51 vs 49.03) and 41% on the
+     long-prompt c=8 case (14.53 vs 24.80). Expected in kind - the drafter
+     trades compute for latency and the GPU is already saturated at batch -
+     but not in size.
+  2. LONG-PROMPT CONCURRENCY SCALES NEGATIVELY, in both arms. Backing
+     prefill out of the c=8 no-spec run: 8000 prefill tokens cost ~64.5 -
+     35.5 = 29 s against 237-258 t/s single-stream, so concurrent prefill
+     runs at roughly a third of its single-stream rate AND blocks decode.
+  3. Even decode-only scaling is weak: no-spec 23.95 -> 49.03 at c=4 is
+     2.0x, and it goes DOWN at c=8 (45.07). max_num_seqs 8 and
+     max_num_batched_tokens 4288 were sized for the single-stream bring-up.
+- Dynamic speculative decoding EXISTS in this fork and works:
+  `speculative_config.num_speculative_tokens_per_batch_size`, a list of
+  inclusive `(range_start, range_end, num_speculative_tokens)` ranges
+  resolved by the scheduler against `max_num_seqs`
+  (`vllm/v1/spec_decode/dynamic/utils.py`); 0 is a legal draft length, and
+  the first range must start at 1. Added `[(1,2,1),(3,8,0)]` to the profile
+  and confirmed from the engine's SpecDecoding metrics that drafted
+  throughput drops from 9.20 tok/s at c=1 to 0.03-0.10 at c>=3, i.e. the
+  schedule fires.
+- BUT IT DOES NOT RECOVER THE NO-SPEC THROUGHPUT: c=4 44.04 vs 49.03,
+  long-prompt c=8 16.69 vs 24.80. So the cost is not the drafting work
+  itself. Suspects, in order, for the next session: a speculator-configured
+  engine reserves lookahead token budget (`max_num_scheduled_tokens is set
+  to 4288 based on the speculative decoding settings`) and sizes its KV /
+  state pools for the draft model, leaving less of the 8 GiB pool for eight
+  1000-token requests - preemption and recompute would explain a gap this
+  large, and the scheduler's preemption counters are the cheapest next
+  measurement. The `AcceptanceThrottle` path (`VLLM_SD_ADAPT_THROTTLE=1`)
+  is a second existing mechanism, untested here.
+- Decision: NOTHING KEPT YET. The dynamic schedule stays in the profile as
+  a measured partial (it is strictly better than the shipped record at c=4:
+  44.04 vs 32.51) but the profile is still gated and the campaign is open.
+  Single-stream is untouched by it: the c=1 arm measures 28.88 against the
+  shipped record's 28.66, and drafting is active there.
+- Raw artifacts: `perf/results/2026-09-15/concurrency-baseline/`
+  (`sweep.sh`, `c{1,4,8}.json`, `shortprompt/`, `nospec/`, `dynsd/`).
+- Method note: `aggregate_output_tps` from this harness INCLUDES each
+  request's prefill, so it is only comparable across arms at the same
+  prompt length, never against the decode probe.
+
 ## 2026-09-15 - GLM-5.3-Flash Q2 on Metal: Astra (codex GPT-6) review round on PR #30 - a concurrent-serving crash, a conv-history race, unbounded prefill scratch
 
 - Baseline: PR #30 at 277922f31 (CodeRabbit round 1 applied; probe 40.01

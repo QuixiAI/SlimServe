@@ -3106,6 +3106,10 @@
             "engine": {
               "method": "glm5_next_mtp",
               "num_speculative_tokens": 1,
+              "num_speculative_tokens_per_batch_size": [
+                [1, 2, 1],
+                [3, 8, 0]
+              ],
               "quantization": "gguf"
             },
             "note": "The GGUF's own nextn block (blk.45: one sparse-MLA + MoE layer, BF16 eh_proj) as the MTP drafter, loaded from the target file (ds4's MTP recipe) and fed the post-final-norm hidden state. K=1 measured against no drafter and K=2 (2026-09-11/14): 2.000 tok/cycle on the loop probe, 0.63-0.85 accepted drafts per cycle on prose; K=2 loses because the third verify row costs ~14 ms of expert bytes per step. The DFlash2 candidate is parked (hybrid KV group block-size mismatch)."
