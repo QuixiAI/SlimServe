@@ -29310,8 +29310,8 @@ than PyPI 1.3.0), and the FP8 GEMMs.
 - Why a 16-row floor. The tensor-core kernel costs a near-constant ~38 us
   per call at every row count and list width while the native SIMT path
   scales with the work, so below the crossover native is still ahead.
-  Microbench (`$S/bench_tc_decode.py`, GPU 0, H=16, us per call, native
-  against SPLIT=64):
+  Microbench (`perf/results/2026-09-15/sparse-tc-sm120/`, GPU 0, H=16,
+  us per call, native against SPLIT=64):
 
   | rows | 512-wide | 1024 | 1536 | 2048 |
   |---|---|---|---|---|
@@ -29324,6 +29324,16 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   The crossover moves between 8 and 16 rows as the list widens, so 16 is
   the width-independent safe point. Parity against the native path over the
   whole sweep is max |delta| 0.001, one bf16 quantum.
+- Why not a width-conditioned floor. The obvious refinement - drop the
+  floor to 8 only when the list is wide, where 8 rows is already 1.07x at
+  1536 and 1.19x at 2048 - is not implementable here. The effective width
+  lives in `tlen`, a device tensor, and the dispatch runs under CUDA-graph
+  capture, where the host cannot read it. The host-side proxy (the
+  profile's `index_topk`) is the ALLOCATED width, not the used one, and at
+  512 wide 8 rows is a 0.90x LOSS (34.7 native against 39.3). It would buy
+  nothing anyway: rows are batch x (drafts + 1), so the served
+  concurrencies land on 4, 16 and 48 and never on 8. The width-independent
+  floor is both the safe answer and the free one.
 - Rows are batch x (drafts + 1). With the record's schedule
   `[[1,4,3],[5,8,1],[9,16,2]]` that is 4 at c1 (native, unchanged), 16 at
   c8 and 48 at c16 - which makes c1 a control channel that the change
@@ -29369,10 +29379,12 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   `additional_config`. It is never worse than native (the floor keeps the
   small shapes on the old path), it is clean on every gate, and c16 is the
   one shape where the record's margin over the control was thinnest.
-- Raw: `perf/results/2026-09-15/mhc-token-chunks/` (the sweep script is
-  `$S/bench_tc_decode.py`), `$S/serve-logs/ab-tcdec-{off,on}.out`,
-  `$S/serve-logs/ab-tcdec2-{off,on}.out`, chains `$S/tcdec-chain.out`,
-  `$S/tcdec-base-chain.out`, `$S/tcdec2-chain.out`.
+- Raw: `perf/results/2026-09-15/sparse-tc-sm120/` - the four-candidate
+  sweep (`bench-tc-decode.log`, script `bench_tc_decode.py`), both A/B
+  pairs (`ab-tcdec-{off,on}.out`, `ab-tcdec2-{off,on}.out`) and their chain
+  logs (`tcdec-chain.out`, `tcdec-base-chain.out`, `tcdec2-chain.out`).
+  Per-pass harness JSON in `perf/results/2026-09-15/tcdec{,2}-{off,on}-pass*/`,
+  canaries in `perf/results/2026-09-15/tcdec-{off,on}-gate1.json`.
 
 ### The partition-free `rows` kernel is NOT the better decode form above 16 rows - REJECTED (it scales with the list; the partitioned one does not)
 
@@ -29405,4 +29417,5 @@ than PyPI 1.3.0), and the FP8 GEMMs.
 - Cost of the test: one microbench run, no arm. Recorded because the
   reasoning ("no scratch must be better") is the kind that looks obviously
   right and is not.
-- Raw: `perf/results/2026-09-15/tc-decode/bench_tc_decode.py` output.
+- Raw: the `row32`/`row64` columns of
+  `perf/results/2026-09-15/sparse-tc-sm120/bench-tc-decode.log`.
