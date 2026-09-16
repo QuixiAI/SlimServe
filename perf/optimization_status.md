@@ -29373,3 +29373,36 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   `$S/bench_tc_decode.py`), `$S/serve-logs/ab-tcdec-{off,on}.out`,
   `$S/serve-logs/ab-tcdec2-{off,on}.out`, chains `$S/tcdec-chain.out`,
   `$S/tcdec-base-chain.out`, `$S/tcdec2-chain.out`.
+
+### The partition-free `rows` kernel is NOT the better decode form above 16 rows - REJECTED (it scales with the list; the partitioned one does not)
+
+- Hypothesis. The partitioned decode kernel is flat at ~39 us per call from
+  1 to 48 rows, and at the high end its cost is the partial buffer it
+  writes and re-reads (rows x parts x H x 512 fp32: 50 MB at 48 rows and a
+  2048-wide list, ~61 us of traffic at the measured 1628 GB/s roofline).
+  Above 16 rows the row dimension already supplies the parallelism that
+  partitioning exists to create, so `sparse_tc_nope_rows` - the
+  prefill-shaped kernel, one program per token over all 16 heads, online
+  softmax, no partition scratch and no reduce launch - should win.
+- Result: it loses, and not marginally. Its cost scales with the list
+  because each program walks the whole thing serially (us per call, H=16,
+  tile 64, against the partitioned SPLIT=64):
+
+  | list width | 512 | 1024 | 1536 | 2048 |
+  |---|---:|---:|---:|---:|
+  | rows kernel (48 rows) | 38.9 | 75.6 | 113.1 | 155.7 |
+  | partitioned (48 rows) | 38.6 | 39.0 | 46.2 | 55.9 |
+
+  Only at a 512-wide list, where there is nothing to walk, are they level.
+  The partitioned kernel's flatness is exactly what partitioning buys: the
+  list is split across `parts` blocks, so widening it adds blocks rather
+  than serial work. The partial traffic is the price, and it is the cheaper
+  side of the trade at every width that matters.
+- Decision: REJECTED. The shipped choice (SPLIT=64 above 16 rows) is
+  confirmed best at every decode shape at or above the floor. The prefill
+  kernel keeps the prefill dispatch, where the row count is in the
+  thousands and the per-program walk is amortized.
+- Cost of the test: one microbench run, no arm. Recorded because the
+  reasoning ("no scratch must be better") is the kind that looks obviously
+  right and is not.
+- Raw: `perf/results/2026-09-15/tc-decode/bench_tc_decode.py` output.
