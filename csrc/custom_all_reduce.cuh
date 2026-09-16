@@ -1273,9 +1273,11 @@ class CustomAllreduce {
     }
     // comb_mix is the previous site's deferred output.
     wait_glm5_mhc(stream);
+    const int mhc_chunks = glm5_mhc_ar::token_chunks(num_tokens);
 #define GLM5_MHC_AR_LAUNCH(NGPU)                                              \
   glm5_mhc_ar::allreduce_transition<NGPU, FUSED_NORM>                        \
-      <<<glm5_mhc_ar::NBLOCKS, glm5_mhc_ar::THREADS, 0, stream>>>(           \
+      <<<glm5_mhc_ar::NBLOCKS * mhc_chunks, glm5_mhc_ar::THREADS, 0,         \
+         stream>>>(                                                           \
           ptrs, sg_, self_sg_, residual, post_mix, comb_mix, fn,             \
           residual_out, partial, arrivals, scale, base, next_post,           \
           next_comb, layer_input, norm_weight, rms_eps, hc_eps,              \

@@ -29203,3 +29203,77 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   contains the printing code, guarded by `getattr(..., None)`.
 - Raw: `perf/results/2026-09-15/mhc-regprobe/ptxas.log`, baseline deltas
   reproduced in `$S/mhcar-base.log`.
+
+### The fused mHC transition splits the token axis across a second grid axis: -13 % of the transition arithmetic at T=4, -17 % at T=8 - RETAINED, and it is 0.05-0.14 ms/step, not the 0.4-0.5 ms section 13 projected
+
+- Baseline. `bench_mhc_ar.py 4 50`, ws4, the fused kernel against the
+  one-shot all-reduce on the same inputs. Subtracting the pure all-reduce
+  from the fused path isolates the transition arithmetic: T=1 2.39 us, T=4
+  6.56 us, T=8 11.81 us, T=64 33.22 us. The near-exact linearity in T
+  (1.35 us/token, 1.05 us intercept) is the per-block token loop, and the
+  preceding entry established there is no register spill to recover.
+- Hypothesis. `NBLOCKS = HIDDEN / THREADS = 32` blocks occupy 32 of this
+  card's 188 SMs because the kernel maps one thread to one hidden dimension,
+  so the token loop is serial on a grid that never fills the machine. The
+  token axis is the free axis: give the grid a second, flat axis of
+  TOKEN_CHUNKS copies of the NBLOCKS dimension blocks, each chunk owning a
+  contiguous token range.
+- Why it fits the existing protocol without touching it. `arrivals[token]`
+  counts NBLOCKS arrivals and the `partial` rows are `[token][block][value]`;
+  a token is still covered by exactly the 32 dimension blocks of its own
+  chunk, so both are unchanged as long as the partial write uses the
+  dimension index rather than the flat `blockIdx.x`. The peer barriers index
+  one signal slot per block by flat `blockIdx.x`, so the product must stay
+  inside `vllm::kMaxBlocks` (64) - which is exactly 2 chunks. The finalize
+  loop strides by `gridDim.x` instead of NBLOCKS so each token is still
+  finalized once, and it already covers the whole hidden dimension
+  (`FIN_VECS * THREADS * VEC == HIDDEN`), so any block can finalize any
+  token. Deadlock safety: 64 blocks at 197 registers and 37.4 KB smem is one
+  block per SM on 188 SMs, so every block is co-resident and neither the
+  peer barrier nor the arrivals spin can starve.
+- Result (ws4, `bench_mhc_ar.py 4 50`, fused us and the arithmetic after
+  subtracting the all-reduce):
+
+  | T | fused before | fused after | arithmetic before | after | delta |
+  |---|---:|---:|---:|---:|---:|
+  | 1 | 9.85 | 10.02 | 2.39 | 2.41 | 1 chunk, unchanged |
+  | 4 | 11.87 | 11.39 | 6.56 | 5.99 | **-9 %** |
+  | 8 | 18.01 | 16.19 | 11.81 | 10.22 | **-13 %** |
+  | 16 | 27.80 | 27.11 | - | - | gated to 1 chunk |
+  | 64 | 66.02 | 65.89 | 33.22 | 33.24 | gated to 1 chunk |
+
+- The gate, and why it is not microbenchmark-fitting. Ungated, the split
+  regressed T=16 (27.80 -> 29.76) and T=64 (66.02 -> 69.27). Each extra
+  chunk re-reads the whole `fn` column - 4096 threads x 96 floats = 1.5 MB
+  per call - because a chunk's blocks load their own dimension's column
+  independently. That is a fixed cost, while the latency it removes shrinks
+  as T grows, so the trade inverts. `token_chunks()` therefore returns 1
+  above `TOKEN_CHUNK_MAX_TOKENS = 8`, which restores the baseline exactly
+  (27.11 / 65.89). The shipped fuse policy already never sends more than 8
+  tokens to this kernel, so the gate is unreachable in production; it is
+  there so the kernel stays monotone if the policy changes.
+- The same doubled `fn` read is why the win is smaller than the loop math
+  predicts. At T=8 the halved loop alone predicts 1.05 + 4 x 1.35 = 6.45 us;
+  measured 10.22. The difference is the extra 1.5 MB and the lower L2 hit
+  rate across twice the blocks.
+- Correctness: `tests/kernels/test_glm5_mhc_allreduce.py` passes at ws2 and
+  ws4 over `TOKENS = (1, 4, 7, 9, 33, 64)`, which covers uneven chunk splits
+  (7, 9, 33) and both chunk counts; the surrounding mHC suite
+  (`test_quixicore_mhc_transition`, `glm5_next/test_mhc_{transition,dispatch,
+  norm,partials_batched,runtime_stream}`) is 201 passed.
+- Decision: RETAINED. It is strictly better inside the fused range, exactly
+  neutral outside it, parity-clean and free.
+- **Honest sizing, against section 13 of the campaign doc.** That section
+  named the transition as the largest addressable decode item at ~0.6 ms of
+  the 8.80 ms c1 step and Phase 2 item 1 targeted -0.4 to -0.5 ms. This
+  delivers 0.57 us x 89 calls = **0.051 ms/step at T=4** (c1 with
+  speculation, 0.58 %) and 1.59 us x 89 = **0.142 ms/step at T=8** (c8
+  without speculation, 1.3 %). Both are below the arm-to-arm spread (~3 %),
+  so **no end-to-end arm was spent on this and no e2e gain is claimed** -
+  the microbenchmark and the parity suite are the whole evidence. The
+  premise behind the 0.4-0.5 ms target was that the token loop was the
+  transition's cost; it is not. The cost is the fixed PCIe all-reduce floor
+  (~5-6 us of the 11-16 us) plus the `fn` read, and neither yields to grid
+  shape. Section 13's ranking of this item should be read down accordingly.
+- Raw: `perf/results/2026-09-15/mhc-token-chunks/mhcar-{base2,chunks,
+  chunks-gated}.log`; register screen in the preceding entry.

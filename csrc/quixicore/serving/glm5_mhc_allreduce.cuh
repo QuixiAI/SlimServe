@@ -58,6 +58,30 @@ constexpr int MAX_TOKENS = 64;
 constexpr int MIX_FLOATS = HC + HC * HC;  // post then comb, per token
 constexpr int MIX_VECS = MIX_FLOATS / 4;  // 16-byte vectors per token
 constexpr int DEFERRED_THREADS = MAX_TOKENS * HC;  // one lane per comb row
+// The transition's serial cost is its per-block token loop, and NBLOCKS
+// dimension blocks occupy 32 of this card's 188 SMs. Above one token the grid
+// therefore carries a second, flat axis: TOKEN_CHUNKS copies of the NBLOCKS
+// dimension blocks, chunk c owning a contiguous token range. Every token is
+// still covered by exactly NBLOCKS blocks, so `arrivals` and the `partial`
+// row layout are unchanged. The flat block index addresses one signal slot
+// per block, so the product must stay inside vllm::kMaxBlocks (64).
+constexpr int TOKEN_CHUNKS = 2;
+static_assert(NBLOCKS * TOKEN_CHUNKS <= 64, "one signal slot per block");
+
+// Chunks for a launch. Splitting the tokens doubles the `fn` column read
+// (each chunk's blocks load their own dimension's column), which is a fixed
+// 1.5 MB per extra chunk; below ~8 tokens the latency it removes is worth
+// more than those bytes, and above it the trade inverts - measured on ws4 as
+// -13 % of the transition arithmetic at T=4 and -17 % at T=8, but +6 % at
+// T=16 and +10 % at T=64. The fuse policy never sends more than
+// GLM5_MHC_FUSE_TOKENS here anyway; this keeps the kernel monotone if it
+// ever does. Never more chunks than tokens, so no launched block owns an
+// empty range and T = 1 keeps today's 32-block grid.
+constexpr int TOKEN_CHUNK_MAX_TOKENS = 8;
+inline int token_chunks(int num_tokens) {
+  if (num_tokens < 2 || num_tokens > TOKEN_CHUNK_MAX_TOKENS) return 1;
+  return num_tokens < TOKEN_CHUNKS ? num_tokens : TOKEN_CHUNKS;
+}
 static_assert(NBLOCKS <= kMaxBlocks, "one signal slot per block");
 static_assert(THREADS % 32 == 0 && PARTIALS <= 32 && NBLOCKS % (THREADS / 32) == 0);
 static_assert(HIDDEN % (THREADS * VEC) == 0, "whole vectors per thread");
@@ -235,7 +259,11 @@ __global__ void __launch_bounds__(THREADS) allreduce_transition(
   const int tid = threadIdx.x;
   const int lane = tid & 31;
   const int warp = tid >> 5;
-  const int dim0 = blockIdx.x * THREADS;
+  // Flat grid: `chunks` copies of the NBLOCKS dimension blocks.
+  const int chunks = gridDim.x / NBLOCKS;
+  const int chunk = blockIdx.x / NBLOCKS;
+  const int dim_block = blockIdx.x - chunk * NBLOCKS;
+  const int dim0 = dim_block * THREADS;
   const int dim = dim0 + tid;
   const RankData peers = *rank_data;
 
@@ -297,16 +325,22 @@ __global__ void __launch_bounds__(THREADS) allreduce_transition(
 
   barrier_at_start<NGPU>(signals, self_signal, rank);
 
-  const int groups = (num_tokens + TOKEN_GROUP - 1) / TOKEN_GROUP;
-  issue_group(0, min(TOKEN_GROUP, num_tokens), 0);
+  // This chunk's contiguous token range.
+  const int per_chunk = (num_tokens + chunks - 1) / chunks;
+  const int tok_begin = min(chunk * per_chunk, num_tokens);
+  const int tok_end = min(tok_begin + per_chunk, num_tokens);
+  const int my_tokens = tok_end - tok_begin;
+
+  const int groups = (my_tokens + TOKEN_GROUP - 1) / TOKEN_GROUP;
+  issue_group(tok_begin, min(TOKEN_GROUP, my_tokens), 0);
   for (int g = 0; g < groups; ++g) {
-    const int token0 = g * TOKEN_GROUP;
-    const int group = min(TOKEN_GROUP, num_tokens - token0);
+    const int token0 = tok_begin + g * TOKEN_GROUP;
+    const int group = min(TOKEN_GROUP, tok_end - token0);
     const int buf = g & 1;
     if (g + 1 < groups) {
       // The other buffer was last read before the previous group's barriers.
       issue_group(token0 + TOKEN_GROUP,
-                  min(TOKEN_GROUP, num_tokens - token0 - TOKEN_GROUP),
+                  min(TOKEN_GROUP, tok_end - token0 - TOKEN_GROUP),
                   buf ^ 1);
       cp_async_wait<1>();
     } else {
@@ -371,7 +405,7 @@ __global__ void __launch_bounds__(THREADS) allreduce_transition(
       for (int source_warp = 0; source_warp < WARPS; ++source_warp) {
         block_sum += warp_partials[t][source_warp][output];
       }
-      partial[((token0 + t) * NBLOCKS + blockIdx.x) * PARTIAL_STRIDE +
+      partial[((token0 + t) * NBLOCKS + dim_block) * PARTIAL_STRIDE +
               output] = block_sum;
     }
     // Publish this block's residual_out slices and partial rows of the
@@ -380,7 +414,7 @@ __global__ void __launch_bounds__(THREADS) allreduce_transition(
     if (tid < group) red_release_gpu_add(arrivals + token0 + tid, 1u);
   }
 
-  for (int token = blockIdx.x; token < num_tokens; token += NBLOCKS) {
+  for (int token = blockIdx.x; token < num_tokens; token += gridDim.x) {
     // The norm weight does not depend on the arrivals: load it while
     // thread 0 waits.
     uint4 weight_packed[FIN_VECS];
