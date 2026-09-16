@@ -73,9 +73,15 @@ def _sparse_tc_option(config, heads):
         from vllm.platforms import current_platform
 
         if not (
-            current_platform.is_cuda() and current_platform.is_device_capability((8, 0))
+            current_platform.is_cuda()
+            and (
+                current_platform.is_device_capability((8, 0))
+                or current_platform.is_device_capability((12, 0))
+            )
         ):
-            raise ValueError("Sparse tensor-core decode is qualified only on SM80")
+            raise ValueError(
+                "Sparse tensor-core decode is qualified on SM80 and sm_120"
+            )
         if heads not in (8, 16):
             # The Triton kernel tiles 16 query rows per token: 8 heads (TP8)
             # half-masked or 16 heads (TP4) full.
@@ -177,19 +183,64 @@ def _sparse_tc_prefill_dispatch(enabled, q, cache, metadata):
     )
 
 
+# sm_120 has 99 KB of shared memory per block against SM80's 164 KB, and the
+# partition tile costs SPLIT x 512 x 2 bytes for the gathered latents plus
+# 16 KB for the queries: 48 KB at SPLIT=32, 80 KB at 64, 144 KB at 128. So the
+# SPLIT=128 the SM80 records use does not load here - which is the whole of
+# what "needs a 99 KB retune" ever meant - while 64 both fits and is the
+# faster of the two that do (rows=32 at a 2048-wide list: 40.0 us against
+# 55.3 us; rows=48: 55.7 against 89.0).
+_SPARSE_TC_SM120_SPLIT = 64
+# Below this row count the native SIMT path is still ahead, because the
+# tensor-core kernel costs a near-constant ~38 us per call at every width
+# while the native one scales with the work. Measured us per call, H=16, the
+# native path against SPLIT=64 (bench_tc_decode.py, 2026-09-15):
+#   rows   1: 34.5 / 39.2   rows  8: 42.1 / 38.6   rows 24:  96.0 / 39.1
+#   rows   4: 38.1 / 38.6   rows 16: 85.5 / 38.6   rows 48: 171.3 / 45.8
+# (1536-wide list; the crossover moves between rows 8 and 16 as the list
+# widens from 512 to 2048, so 16 is the width-independent safe point.)
+_SPARSE_TC_SM120_MIN_ROWS = 16
+# Speculative decode rows are batch x (drafts + 1), so max_num_seqs 16 with a
+# 2-token draft schedule asks for 48. The partition scratch is
+# rows x parts x H x 512 fp32 = 67 MB at the cap, well inside the native
+# path's own 512 MB ceiling.
+_SPARSE_TC_SM120_MAX_ROWS = 64
+
+
+def _sparse_tc_sm120() -> bool:
+    from vllm.platforms import current_platform
+
+    return current_platform.is_cuda() and current_platform.is_device_capability(
+        (12, 0)
+    )
+
+
 def _sparse_tc_split(enabled, q, cache, metadata):
     # Shape/metadata decisions are CPU-only and stable under CUDA graph replay.
     # Prefill and unqualified shapes retain the native bounded-scratch path.
+    sm120 = enabled and _sparse_tc_sm120()
+    max_rows = _SPARSE_TC_SM120_MAX_ROWS if sm120 else 32
     if (
         enabled
         and metadata.num_prefills == 0
-        and 0 < q.shape[0] <= 32
+        and 0 < q.shape[0] <= max_rows
         and q.shape[1] in (8, 16)
         and q.shape[2] == 512
         and q.dtype == torch.bfloat16
         and cache.dtype in (torch.bfloat16, torch.uint8, torch.float8_e4m3fn)
         and cache.shape[-1] == 512
     ):
+        if sm120:
+            # The fp8 branch assembles e4m3 bytes through an int32
+            # intermediate, so its tile is SPLIT x 512 x 4 bytes: 147 KB at
+            # SPLIT=64, over the 99 KB limit. Only the bf16 latents are
+            # qualified here, which is what this record serves (FP8 main KV
+            # stays off - it costs 3 % at c8 and buys no acceptance).
+            if cache.dtype is not torch.bfloat16:
+                return 0
+            if q.shape[0] < _SPARSE_TC_SM120_MIN_ROWS:
+                return 0
+            return _SPARSE_TC_SM120_SPLIT
         return 32 if q.shape[0] < 8 else 128
     return 0
 
