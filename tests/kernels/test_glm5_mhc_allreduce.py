@@ -18,7 +18,7 @@ pytestmark = pytest.mark.skipif(
 
 HIDDEN, HC, MIXES = 4096, 4, 24
 RMS_EPS, HC_EPS, POST_MULT, ITERS, NORM_EPS = 1e-5, 1e-6, 2.0, 20, 1e-5
-TOKENS = (1, 4, 7, 9, 33, 64)  # group and block boundaries of the kernel
+TOKENS = (1, 2, 4, 7, 8, 9, 33, 64)  # group, block and token-chunk boundaries
 
 
 def _free_port() -> int:

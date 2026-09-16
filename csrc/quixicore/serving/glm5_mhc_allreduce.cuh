@@ -64,16 +64,18 @@ constexpr int DEFERRED_THREADS = MAX_TOKENS * HC;  // one lane per comb row
 // dimension blocks, chunk c owning a contiguous token range. Every token is
 // still covered by exactly NBLOCKS blocks, so `arrivals` and the `partial`
 // row layout are unchanged. The flat block index addresses one signal slot
-// per block, so the product must stay inside vllm::kMaxBlocks (64).
+// per block, so the product must stay inside kMaxBlocks.
 constexpr int TOKEN_CHUNKS = 2;
-static_assert(NBLOCKS * TOKEN_CHUNKS <= 64, "one signal slot per block");
+static_assert(NBLOCKS * TOKEN_CHUNKS <= kMaxBlocks, "one signal slot per block");
 
 // Chunks for a launch. Splitting the tokens doubles the `fn` column read
 // (each chunk's blocks load their own dimension's column), which is a fixed
 // 1.5 MB per extra chunk; below ~8 tokens the latency it removes is worth
-// more than those bytes, and above it the trade inverts - measured on ws4 as
-// -13 % of the transition arithmetic at T=4 and -17 % at T=8, but +6 % at
-// T=16 and +10 % at T=64. The fuse policy never sends more than
+// more than those bytes, and above it the trade inverts - chunking every
+// width measured on ws4 as -13 % of the transition arithmetic at T=4 and
+// -17 % at T=8, but +13 % at T=16 and +10 % at T=64. Gated as below, the
+// shipped numbers are -9 % at T=4 and -13 % at T=8 with T=16 and T=64 back
+// on the unchunked baseline. The fuse policy never sends more than
 // GLM5_MHC_FUSE_TOKENS here anyway; this keeps the kernel monotone if it
 // ever does. Never more chunks than tokens, so no launched block owns an
 // empty range and T = 1 keeps today's 32-block grid.
@@ -82,7 +84,6 @@ inline int token_chunks(int num_tokens) {
   if (num_tokens < 2 || num_tokens > TOKEN_CHUNK_MAX_TOKENS) return 1;
   return num_tokens < TOKEN_CHUNKS ? num_tokens : TOKEN_CHUNKS;
 }
-static_assert(NBLOCKS <= kMaxBlocks, "one signal slot per block");
 static_assert(THREADS % 32 == 0 && PARTIALS <= 32 && NBLOCKS % (THREADS / 32) == 0);
 static_assert(HIDDEN % (THREADS * VEC) == 0, "whole vectors per thread");
 static_assert(MIX_FLOATS % 4 == 0 && 32 % HC == 0 && DEFERRED_THREADS <= 1024);

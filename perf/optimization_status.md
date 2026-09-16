@@ -29204,7 +29204,7 @@ than PyPI 1.3.0), and the FP8 GEMMs.
 - Raw: `perf/results/2026-09-15/mhc-regprobe/ptxas.log`, baseline deltas
   reproduced in `$S/mhcar-base.log`.
 
-### The fused mHC transition splits the token axis across a second grid axis: -13 % of the transition arithmetic at T=4, -17 % at T=8 - RETAINED, and it is 0.05-0.14 ms/step, not the 0.4-0.5 ms section 13 projected
+### The fused mHC transition splits the token axis across a second grid axis: -9 % of the transition arithmetic at T=4, -13 % at T=8 as shipped - RETAINED, and it is 0.05-0.14 ms/step, not the 0.4-0.5 ms section 13 projected
 
 - Baseline. `bench_mhc_ar.py 4 50`, ws4, the fused kernel against the
   one-shot all-reduce on the same inputs. Subtracting the pure all-reduce
