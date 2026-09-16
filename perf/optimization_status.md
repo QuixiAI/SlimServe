@@ -29112,3 +29112,94 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   earlier arm, and buys no acceptance).
 - Raw: `perf/results/2026-09-15/acc-k1-fp8kv-pass{1,2,3}/`, gate
   `acc-k1-fp8kv-gate1.json`, chain `serve-logs/acc8-chain.out`.
+
+### The fused mHC transition does not spill: 171/195 registers and zero spill traffic, so the "cut the resident `fn` column" rewrite is not a lever - REJECTED as a hypothesis, and a standalone ptxas probe is retained as the instrument
+
+- Context. Section 13 of `docs/glm53f-rtx6000-campaign.md` names the mHC
+  transition math as the largest of the four addressable items left in
+  decode: ~0.6 ms of the 8.80 ms c1 step, 89 fused calls at 12.6 us each,
+  of which ~6 us is the PCIe all-reduce floor. Subtracting the pure
+  all-reduce path from the fused path in `bench_mhc_ar.py 4 50` isolates
+  the arithmetic: T=1 10.08 - 7.79 = 2.29 us, T=4 11.41 - 4.98 = 6.43 us,
+  T=8 17.86 - 6.20 = 11.66 us, T=16 27.51 - 9.98 = 17.53 us. 6.43 us x 89
+  calls = 0.57 ms/step, which is where the section-13 estimate comes from.
+  (At T=16 the fused arithmetic, 17.53 us, is worse than the split Triton
+  pair's 15.40 us - that is why the shipped fuse policy is T <= 8, and
+  this entry does not change it.)
+- Hypothesis. `allreduce_transition` holds a lot of state per thread: the
+  24-row `fn` column lives in registers across the accumulate loop, and
+  the finalize tail holds `streams_packed[HC][FIN_VECS]` (16 x uint4 = 64
+  registers) plus `mixed_packed`/`weight_packed`. If ptxas were spilling,
+  the fix would be structural and obvious - re-load `fn` per stream inside
+  the loop, or split NOUT into two passes, or re-load `streams_packed` per
+  stream in the pre-mix - and would buy back local-memory traffic.
+- Method. Nsight Compute cannot profile this kernel: kernel replay would
+  deadlock the cross-device `barrier_at_start`/`barrier_at_end`
+  handshakes, and application replay under `mp.spawn` desynchronizes the
+  ranks. A full module rebuild to read a build log costs ~73 minutes. So
+  the register question was answered with a standalone probe instead:
+  `$S/regprobe.cu` includes `c10/util/BFloat16.h` and `c10/util/Half.h`
+  (which `custom_all_reduce.cuh` needs but does not include - it pulls in
+  no torch headers itself) and then `custom_all_reduce.cuh`, and
+  explicitly instantiates the two shipped specializations. Compiled to
+  `/dev/null` with `-Xptxas -v` it prints per-function registers, stack
+  frame, spill stores, spill loads and smem in seconds:
+
+      T=.venv/lib/python3.12/site-packages/torch
+      /usr/local/cuda-13.0/bin/nvcc -std=c++17 -arch=sm_120 -O3 \
+        -Xptxas -v -c -o /dev/null -I csrc -I $T/include \
+        -I $T/include/torch/csrc/api/include $S/regprobe.cu
+
+- Result (CUDA 13.0 V13.0.88, `sm_120`, `-O3`):
+
+  | kernel | registers | stack | spill st / ld | smem |
+  |---|---|---|---|---|
+  | `allreduce_transition<4, false>` | 171 | 64 B | 0 / 0 | 37,364 B |
+  | `allreduce_transition<4, true>` | 195 | 64 B | 0 / 0 | 37,380 B |
+  | `sinkhorn_deferred` | 28 | 0 B | 0 / 0 | - |
+  | `dsv4_tp_input_owned::finalize_attention` | 12 | 0 B | 0 / 0 | - |
+  | `tms::dsv4_mhc::finalize_head_mix` | 39 | 0 B | 0 / 0 | - |
+  | `tms::dsv4_mhc::post` | 32 | 0 B | 0 / 0 | - |
+  | `tms::dsv4_mhc::finalize_pre_mix` | 38 | 0 B | 0 / 0 | 104 B |
+
+  The 64-byte stack frame is not spill: ptxas reports it as "cumulative
+  stack size" with the spill counters at zero, and the same TU's other
+  kernels carry none. The neighbours are listed because they are the
+  control - if the probe were mis-measuring, they would not come out at
+  12-39 registers.
+- Decision: REJECTED as a hypothesis. There is no spill traffic to
+  recover, so neither the `fn`-column restructuring nor the
+  `streams_packed` re-load is justified by this reading. Both remain
+  available as *occupancy* levers, but see the next bullet for why that
+  is a weak argument too.
+- What the numbers do say. At 195 registers x 128 threads = 24,960
+  registers and 37.4 KB smem per block, at most two blocks could co-reside
+  on one SM (65,536 registers, ~100 KB smem). But the launch is
+  `NBLOCKS = HIDDEN / THREADS` = 32 blocks total on a 188-SM card: the
+  kernel occupies ~17 % of the machine with one warp per scheduler and 156
+  SMs idle, so per-SM occupancy is moot and cutting registers would buy
+  nothing. The cost is dependent-instruction latency on a grid that never
+  fills the card. The surviving lever from this reading is therefore grid
+  *shape*, not register pressure - more blocks over fewer hidden dims
+  each - and it is bounded by a tight constraint set already in the
+  source: `kMaxBlocks = 64` (`csrc/custom_all_reduce.cuh:39`) with
+  `static_assert(NBLOCKS <= kMaxBlocks, "one signal slot per block")`;
+  `NBLOCKS % (THREADS / 32) == 0` and `PARTIALS <= 32`;
+  `HIDDEN % (THREADS * VEC) == 0`; the finalize's
+  `BLOCKS_PER_WARP = NBLOCKS / WARPS` (= 8); the arrivals protocol's
+  `while (ld_acquire_gpu(arrivals + token) < unsigned(NBLOCKS)) {}`; and
+  the header's own warning that `PARTIAL_STRIDE`, `NBLOCKS` and the 32
+  lanes of a warp coincide at 32 "by coincidence, not by construction".
+  The smem footprint also scales with `TOKEN_GROUP` (8 at NGPU=4), so a
+  reshape interacts with the double-buffered staging.
+- Retained instrument. `$S/regprobe.cu` plus the command line above is the
+  cheap screen for any register or occupancy question on this kernel or
+  its neighbours in the translation unit: seconds, no module rebuild, no
+  GPU. A candidate grid reshape can be screened with it before anything is
+  built. If per-phase attribution inside the kernel is wanted instead, the
+  `%globaltimer` phase stamps and the `glm5_mhc_allreduce_timeline`
+  binding were never committed (`git log -S` finds nothing in `csrc/`) and
+  would have to be re-written - one rebuild; `bench_mhc_ar.py` already
+  contains the printing code, guarded by `getattr(..., None)`.
+- Raw: `perf/results/2026-09-15/mhc-regprobe/ptxas.log`, baseline deltas
+  reproduced in `$S/mhcar-base.log`.
