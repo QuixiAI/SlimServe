@@ -57,3 +57,18 @@ def test_block_size_and_geometry_match_moe_align_block_size():
             sorted_ids, expert_ids, _ = moe_align_block_size(ids, block, 288)
             assert sorted_ids.numel() == max_padded
             assert expert_ids.numel() == max_blocks
+
+
+def test_shared_experts_discard_drops_an_unconsumed_output_and_tolerates_none():
+    from vllm.model_executor.layers.fused_moe.runner.shared_experts import SharedExperts
+
+    # Only the output slots are exercised; the constructor wants a live MoE
+    # config, so build the module shell and set what discard() touches.
+    se = SharedExperts.__new__(SharedExperts)
+    torch.nn.Module.__init__(se)
+    se.enable_dbo = False
+    se._output = [torch.ones(1), None]
+    se.discard()
+    assert se._output == [None, None]
+    se.discard()
+    assert se._output == [None, None]

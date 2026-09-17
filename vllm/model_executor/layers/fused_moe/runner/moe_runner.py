@@ -710,6 +710,13 @@ class MoERunner(MoERunnerInterface):
                     shared_experts_input=shared_experts_input,
                     prequant_input=prequant_input,
                 )
+            except Exception:
+                # The shared output filled above (deferred or not) was never
+                # consumed; drop it with the published entry so a later batch
+                # does not inherit either.
+                if self._shared_experts is not None:
+                    self._shared_experts.discard()
+                raise
             finally:
                 combine_shared.clear()
 

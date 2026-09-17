@@ -191,6 +191,13 @@ class SharedExperts(torch.nn.Module):
         self._output[self._output_idx] = None
         return output
 
+    def discard(self) -> None:
+        """Drop an unconsumed output: a routed forward that raised after
+        forward() / forward_deferred_join() filled the slot would otherwise
+        leave the next batch tripping over the stale tensor. Safe when the
+        slot is already empty."""
+        self._output[self._output_idx] = None
+
     def forward(
         self,
         shared_experts_input: torch.Tensor,
