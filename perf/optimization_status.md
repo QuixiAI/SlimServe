@@ -26034,6 +26034,153 @@ Phases, by value over risk:
   4.85 -> 0.64 ms at 2048 (attention 3.7 / 13.7 ms); tests 5/5. In the
   prefill profile the prep share (6.6%) drops to under 1%.
 
+- PREFILL CHUNK SIZE (2026-09-13, queue50, record with the prefill kernel,
+  k=2; raw perf/results/2026-09-13/glm53f-chunk-{8192,16384}/): the
+  engine caps scheduled tokens at max_num_batched_tokens minus the draft
+  slots; the record's default 2048 gave 1984-token prefill chunks, ~60
+  rows per active expert, so marlin re-read every expert's weights per
+  64-row m-tile (~0.84 MB of expert weights per prefilled token).
+  | batched tokens | sustained c64 | c128 | exact c64 | pool |
+  | 2048 | 1508 | 1864 | 1453-1490 | 2.97M |
+  | 8192 | 1575 | 1947 | 1626-1632 | 2.72M |
+  | 16384 | 1594 | 1953 | 1672-1698 | 2.33M |
+  Canaries pass on both arms. KEPT 8192 (+4.5% sustained, +11% exact);
+  16384 is +1% more for 14% less pool. Leg + full exact re-measure queued
+  (queue51). Remaining prefill MoE lever is marlin's 64-row m-tile itself.
+- KDA DEFERRED COMMIT, re-evaluated at the record's k=2 (2026-09-13, from
+  the 2026-09-12 measurements, no new GPU time): today's forward stores one
+  state per draft row, so at k=2 (3 rows) it moves 1 read + 3 writes
+  (~100 us at 32 requests, scaling from the 128 us measured at 4 rows);
+  the store-free forward (57 us, issue-bound) plus the commit (55 us,
+  1 read + 1 write) is 112-117 us independent of the row count. NET: a
+  loss at k=2, -9..-13% of the KDA cost only at k>=3. PARKED behind the
+  draft-length arms (queue52: k=3 and per-replica schedules at
+  max_num_seqs 128); wire it only if a k>=3 arm wins the record. The
+  fused next-step commit (2 units) stays rejected: the scheduler hashes
+  and frees the boundary block at the end of the step, so a prefix-cache
+  hit or a tier DMA could read the block before the replay committed it.
+- DP PREFIX AFFINITY (2026-09-13, audit): already in the fork -
+  vllm/v1/engine/dp_prefix_affinity.py PrefixAffinityRouter, default on
+  (VLLM_DP_PREFIX_AFFINITY), cost = prompt tokens - matched blocks x 64 +
+  2048 x (4 waiting + running); hashes at cache_config.block_size (64)
+  while the engine matches at the 1152-token gcd, which only makes the
+  match accounting finer than the reuse. The WildChat leg (client-side
+  sessions, no session header, growing shared prefix) is the workload
+  that exercises it; the sustained random bench has no cross-request
+  prefix. Verification = per-engine prefix hit rate in the leg log.
+- BATCH AMORTIZATION + DRAFT LENGTH at the top end (2026-09-13, queue52,
+  8192-chunk record; sustained output tok/s, raw perf/results/2026-09-13/
+  glm53f-mns*/): c128 was exactly the 64-per-replica cap.
+  | arm | c64 | c128 | c256 | c512 | pool |
+  | max_num_seqs 64 (record) | 1575 | 1947 | - | - | 2.72M |
+  | 128, capture 384 | 1568 | 1952 | 2424 (TPOT 96 ms) | - | 2.56M |
+  | 256, capture 768 | - | 1960 | 2436 | 947 (TPOT 281 ms) | 2.29M |
+  | 128 + [[1,32,3],[33,128,2]] | 1521 | 1927 | 2404 | - | 2.67M |
+  | 128 + [[1,16,4],[17,48,3],[49,128,2]] | 1450 | 1913 | 2385 | - | 2.56M |
+  KEPT max_num_seqs 128 / capture 384 (+24% at c256 for 6% of the pool);
+  256 adds nothing and c512 collapses (not diagnosed: 256 sequences x 3
+  rows = 768-token verify steps). Per-replica draft schedules work under
+  DP (canaries pass) but lose to fixed k=2 at every concurrency: at
+  32 requests per replica the third draft row already costs more than it
+  returns (acceptance 77% at k=2/3, 65% with k=4 rows). Fixed k=3 arm
+  reruns in queue56. KDA deferred commit therefore stays parked.
+- INCIDENT (2026-09-13 05:25): the new NVFP4 prefill MoE path defaulted on
+  while the installed _quixicore_C lacked the op -> the k=3 arm's boot died
+  ("module 'vllm._quixicore_C' has no attribute 'nvfp4_moe_gemm'"). Default
+  is now 0 (off) with a hasattr guard; the .so is installed by queue55 only
+  after the legs, with no server running.
+- PREFILL MoE GEMM, ncu on Marlin at the 8128-token per-rank shape
+  (2026-09-13, E=288 top-8, K=4096, N=512 per rank; raw perf/results/
+  2026-09-13/marlin-moe-prefill/): w13 4.59 ms = 109 TFLOP/s (35% of
+  peak): tensor pipe 54.5% of active cycles, DRAM 17%, L2 hit 74%,
+  255 registers, 12% occupancy (8 warps/SM), ALU 31% / FMA 18% / LSU 20%;
+  w2 (K=512) 3.87 ms = 22% of peak: tensor 34%, L2 hit 81%. So Marlin at
+  large M is latency-bound at 8 warps with the split-K reduce dominating
+  w2, not bandwidth- or dequant-bound. Forcing thread configs through the
+  op ({64,256}, {64,128} x blocks/SM) moves it <= 7%, within spread.
+  KERNEL: csrc/quixicore/serving/nvfp4_moe_prefill_ampere.cuh
+  (nvfp4_moe_gemm, op vllm._quixicore_C.nvfp4_moe_gemm, wrapper
+  quixicore_ops.nvfp4_moe_gemm): reads the Marlin-packed experts in place
+  (layout per tests/glm5_next/test_nvfp4_marlin_layout.py), CTA tile
+  128x128x64, 8 warps (4 M x 2 N, warp tile 32x64), bf16 mma.m16n8k16;
+  per stage the 256 threads dequantize the packed tile ONCE into
+  fragment-major bf16 smem (each thread converts the int4 of words one
+  Marlin lane owns into the four scaled B fragments), so 128 rows share a
+  dequant and each warp streams its fragments with one 16 B LDS per n16
+  block per k16. Numerics are Marlin's (e2m1 bit trick x 2^-126, e4m3
+  scale x sf x 2^7 in bf16, fp32 global scale gs x 2^119 / sf and the
+  topk weight in the epilogue), only the fp32 summation order differs.
+  142 registers (3 stages, 1 CTA/SM) / 128 (2 stages, 2 CTAs/SM), no
+  spills. Alignment at block 128 via moe_align_block_size; hooked into
+  fused_marlin_moe (env VLLM_QC_NVFP4_PREFILL_MOE_MIN_ROWS = average
+  sorted rows per expert to switch, default 0 = off until the serving
+  A/B; _STAGES = 3). Parity vs Marlin's own GEMMs on identical packed
+  weights and vs the fused path: tests/kernels/test_qc_nvfp4_moe_prefill.py
+  8/8 (max rel 3-5e-3 = bf16 output rounding; w2's mean 1.9e-3 is Marlin
+  multiplying the topk weight in bf16 where this kernel does it in fp32).
+  Isolated timing at E=288 and the serving A/B are queued (queue55, after
+  the legs; the .so install needs an idle box).
+- k=3 FIXED ARM DROPPED (2026-09-13): its rerun died at boot
+  (CUBLAS_STATUS_INTERNAL_ERROR in the worker) while a kernel parity test
+  ran on GPU 7 during the server's memory profiling - my test, not the
+  arm; rule: nothing else touches the GPUs while a server boots. Not
+  rerun: schedule [[1,32,3],[33,128,2]] already measured k=3 at 32
+  requests/replica below k=2 (c64 1521 vs 1568), and fixed k=3 at 64 per
+  replica adds a third verify row to a bandwidth-bound 192-token step.
+- NVFP4 PREFILL MoE GEMM, iterations (E=288, M=8128 per rank, us; raw
+  perf/results/2026-09-13/marlin-moe-prefill/qc_timing*.txt):
+  | variant | w13 | w2 |
+  | Marlin | 4591-4709 | 3483-3985 |
+  | v1: 8 warps 32x64, 3 stages (1 CTA/SM), 2 barriers/stage | 6690 | 3999 |
+  | v1: same, 2 stages (2 CTAs/SM) | 4982 | 2987 |
+  | v2 pipelined dequant (1 barrier/stage), BK64 1 CTA/SM | 5845 | 4095 |
+  | v2 pipelined, BK32 3 CTAs/SM (80 regs) | 7827 | 4692 |
+  The pipelined loop lost everywhere, so the barriers were not the bound:
+  pre-dequantized bf16 fragments cost 4x the shared-memory reads of
+  Marlin's packed nibbles, and at 32x64 warp tiles the mainloop reads
+  ~0.09 B per MAC (A 1 KB + B 2 KB per 32K MAC) against the SM's 128 B/cycle
+  for 1024 MAC/cycle - three quarters of the smem bandwidth before bank
+  effects. v3 restores the v1 loop and adds 64x64 warp tiles (4 warps,
+  216-228 registers, 2 CTAs/SM; 0.0625 B/MAC) - timing queued (queue57).
+  Serving A/B of v1 (default config unclear at boot) at 4096-token chunks:
+  on 1553/1929 vs off 1551/1951 sustained, exact c64 1601/1499 vs
+  1637/1622 - no gain; the w2-only win (-25% isolated) would be ~1% of
+  sustained, below the keep rule.
+  v3 (2026-09-13 09:37, idle box): Marlin w13 3853 / w2 3452; cfg 2
+  (8 warps 32x64, 2 stages) 4245 / 3000; cfg 4 (4 warps 64x64, 2 stages)
+  4717 / 3147; 3-stage variants 5970-7364 / 4085-4621. The 64x64 warp
+  tile did not help, and Marlin's own w13 time spans 3853-4709 across
+  three idle-box runs, so the kernel's -10% (w13) / +13..25% (w2) sit
+  inside the environment's spread. DECISION: PARKED - kept in the tree
+  parity-tested (14/14) and gated off (VLLM_QC_NVFP4_PREFILL_MOE_MIN_ROWS=0
+  default); the serving A/B showed no gain. Lesson for the next attempt:
+  Marlin's large-M weakness is not dequant or barriers; a real win needs
+  a mainloop that beats its packed-nibble smem traffic (0.038 B/MAC) at
+  higher occupancy, i.e. a CUTLASS-grade multistage pipeline, not a
+  shared-dequant tile.
+- PREFILL CHUNK SIZE, DECIDED BY THE LEG (2026-09-13, WildChat deep-context
+  c8, 1.25 h, all with the router fix, max_num_seqs 128; raw
+  perf/results/2026-09-13/glm53f-leg-{2048-router,chunk4096,8192-router}/):
+  | chunk | pool | turns | recall | >=262K ttft50 / e2e50 | offload / restore |
+  | 2048 | 2.82M | 811 | 128/128 | 11.4 s / 50.2 s | 59.8K / 14.1K |
+  | 4096 | 2.79M | 702 | 111/111 | 15.0 s / 68.3 s | 123.0K / 3.3K |
+  | 8192 | 2.56M | 704 | 112/112 | 15.5 s / 65.3 s | 115.8K / 9.6K |
+  (the first 8192 leg, 671 turns with one recall miss, was the unbalanced
+  5/3 routing split - see the router fix.) Random-bench gains of the big
+  chunks (sustained c64 +5%, exact c64 +11%) are real but the production
+  shape loses 13% of its turns above 2048, with the same pool at 4096, so
+  the record goes back to 2048 (explicit). The tier counters are the lead
+  for a fix: above 2048 the host tier restores 4x FEWER blocks and offloads
+  2x MORE, i.e. returning sessions re-prefill history the tier holds. Not
+  a lookup problem (misses 30 vs 207). Top open item: find why restores
+  drop with larger chunks (the aligned-boundary tail-state save with
+  several block boundaries crossed per step is the first suspect), then
+  re-measure 4096 on the leg.
+- DP PREFIX AFFINITY, balance fix VERIFIED on the legs (2026-09-13): 8192
+  leg engines 3.63/3.65 avg running (was 2.71/4.63), restores 9.6K (was
+  20.1K), recall 112/112 (was 105/106), turns 704 (was 671); 2048 leg
+  3.46/3.50, migrated=0 in both. Commit d6af7171b.
+
 ## 2026-09-11: GLM-5.3-Flash NVFP4 on 4x RTX PRO 6000 Blackwell (rtx6000): Phase 0 baseline and control
 
 Branch `glm53f-rtx6000` at 4a1065081 (bring-up on upstream 2b355117e): the a100
