@@ -136,6 +136,23 @@ def test_spec_cli_opt_in_keeps_registered_glm_defaults(monkeypatch):
     assert not plan.speculative
 
 
+def test_glm53_profiles_select_glm53_tool_calling_compatibility():
+    cases = (
+        ("glm53f-nvfp4-4", "a100", 4, 0),
+        ("glm53f-nvfp4-8", "a100", 8, 0),
+        ("glm53f-q2-1", "metal", 1, 128 * (1 << 30)),
+    )
+    for profile_id, platform, gpus, memory_bytes in cases:
+        plan = resolve(
+            profile_id,
+            platform,
+            gpus,
+            None,
+            memory_bytes=memory_bytes,
+        )
+        assert plan.env["VLLM_TOOL_CALLING_PROFILE"] == "glm53"
+
+
 def test_spec_cli_flags_are_mutually_exclusive():
     with pytest.raises(SystemExit):
         cli._parser().parse_args(["--spec", "--no-spec"])

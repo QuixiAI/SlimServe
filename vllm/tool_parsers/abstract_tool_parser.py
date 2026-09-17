@@ -32,7 +32,11 @@ from vllm.sampling_params import (
     StructuredOutputsParams,
 )
 from vllm.tokenizers import TokenizerLike
-from vllm.tool_parsers.utils import Tool, get_json_schema_from_tools
+from vllm.tool_parsers.utils import (
+    Tool,
+    get_json_schema_from_tools,
+    named_tool_choice_name,
+)
 from vllm.utils.collection_utils import is_list_of
 from vllm.utils.import_utils import import_from_path
 
@@ -190,11 +194,21 @@ class ToolParser:
             return None
         from vllm.tool_parsers.structural_tag_registry import get_model_structural_tag
 
+        # A named choice is exactly one call. ``parallel_tool_calls=False``
+        # likewise permits at most one call. Responses ``max_tool_calls`` is
+        # deliberately absent here: OpenAI defines that field only for
+        # processed built-in tools, not generated function/custom calls.
+        stop_after_first = (
+            request.parallel_tool_calls is False
+            or named_tool_choice_name(request.tool_choice) is not None
+        )
+
         return get_model_structural_tag(
             model=self.structural_tag_model,
             tools=request.tools,
             tool_choice=request.tool_choice,
             reasoning=reasoning,
+            stop_after_first=stop_after_first,
         )
 
     def extract_tool_calls(
