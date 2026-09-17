@@ -123,3 +123,31 @@ def test_fused_moe_matches_marlin_path(weights, M, monkeypatch):
     monkeypatch.setenv("VLLM_QC_NVFP4_PREFILL_MOE_MIN_ROWS", "1")
     assert M * TOPK >= E  # the threshold admits this batch
     _close(run(), ref)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two CUDA devices")
+def test_every_operand_must_sit_on_the_activation_device(weights):
+    from vllm.quixicore.ops import quixicore_ops
+
+    w13, w13_s, w13_s2, _, _, _ = weights
+    M = 37
+    torch.manual_seed(M)
+    _, tids = _routing(M)
+    sid, eid, npp = moe_align_block_size(tids, 128, E)
+    a = (torch.randn(M, K, device="cuda") * 0.5).to(torch.bfloat16)
+    operands = dict(
+        b=w13, s=w13_s.view(torch.uint8), g=w13_s2, sorted_ids=sid, expert_ids=eid,
+        num_post_padded=npp, c=torch.zeros(M * TOPK, 2 * N, dtype=torch.bfloat16, device="cuda"),
+    )
+
+    def run(moved=None):
+        o = {k: (v.to("cuda:1") if k == moved else v) for k, v in operands.items()}
+        return quixicore_ops.nvfp4_moe_gemm(
+            a, o["b"], o["s"], o["g"], o["sorted_ids"], o["expert_ids"],
+            o["num_post_padded"], None, o["c"], TOPK, False, 2,
+        )
+
+    run()
+    for name in operands:
+        with pytest.raises(RuntimeError, match="must be on a's device"):
+            run(name)

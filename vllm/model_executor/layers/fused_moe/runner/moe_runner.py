@@ -391,6 +391,9 @@ class MoERunner(MoERunnerInterface):
         self.routed_experts._set_moe_config(new_moe_config)
         if self._shared_experts is not None:
             self._shared_experts._set_moe_config(new_moe_config)
+        # The entry is chosen from the config (_fold_shared_static reads
+        # use_ep and the padded hidden dim), so a reconfiguration re-selects it.
+        self._forward_entry = self._select_forward()
 
     def _maybe_fuse_gate_weights(self):
         """Fuse router and shared expert gate weights on first call.
@@ -686,22 +689,25 @@ class MoERunner(MoERunnerInterface):
                 input_ids=input_ids,
             )
         else:
-            # Modular kernels: select experts first, then call routed_experts
-            if preselected is None:
-                topk_weights, topk_ids = self.router.select_experts(
-                    hidden_states=hidden_states,
-                    router_logits=router_logits,
-                    topk_indices_dtype=self._quant_method.topk_indices_dtype,
-                    input_ids=input_ids,
-                )
-            else:
-                topk_weights, topk_ids = preselected
-            if self._expert_stats is not None:
-                self._expert_stats.record(topk_ids)
-            if deferred is not None:
-                entry = combine_shared.SharedOutput(topk_ids, *deferred)
-                combine_shared.publish(entry)
+            # Modular kernels: select experts first, then call routed_experts.
+            # The shared output was filled above (deferred or not), so from
+            # here on anything that raises must drop it, or the next batch
+            # trips over the stale slot.
             try:
+                if preselected is None:
+                    topk_weights, topk_ids = self.router.select_experts(
+                        hidden_states=hidden_states,
+                        router_logits=router_logits,
+                        topk_indices_dtype=self._quant_method.topk_indices_dtype,
+                        input_ids=input_ids,
+                    )
+                else:
+                    topk_weights, topk_ids = preselected
+                if self._expert_stats is not None:
+                    self._expert_stats.record(topk_ids)
+                if deferred is not None:
+                    entry = combine_shared.SharedOutput(topk_ids, *deferred)
+                    combine_shared.publish(entry)
                 fused_out = self.routed_experts.forward_modular(
                     x=hidden_states,
                     topk_weights=topk_weights,
@@ -711,9 +717,8 @@ class MoERunner(MoERunnerInterface):
                     prequant_input=prequant_input,
                 )
             except Exception:
-                # The shared output filled above (deferred or not) was never
-                # consumed; drop it with the published entry so a later batch
-                # does not inherit either.
+                # Never consumed: drop it with the published entry (if any)
+                # so a later batch does not inherit either.
                 if self._shared_experts is not None:
                     self._shared_experts.discard()
                 raise

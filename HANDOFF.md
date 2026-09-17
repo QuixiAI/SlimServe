@@ -4157,7 +4157,7 @@ TP4 = 36 MLA + 18 indexer + 4 KDA state pages; 106 at TP8 = 68 + 34 + 4.
   affinity had frozen a chance 5/3 session split for a whole leg (restores
   2x on one replica, 845 -> 671 turns, one recall miss). New terms:
   prompt tokens routed per replica over the last 64 requests x 0.1
-  (VLLM_DP_PREFIX_AFFINITY_RECENT_WINDOW / _RECENT_PERMILLE) and only the
+  (`VLLM_DP_PREFIX_AFFINITY_RECENT_WINDOW / _RECENT_PERMILLE`) and only the
   longest recorded match is credited. Check on any leg: "Engine 000/001
   ... Running:" averages in the server log should be within ~0.2.
 - CHUNK SIZE: 4096/8192-token chunks win the random benches (+5%

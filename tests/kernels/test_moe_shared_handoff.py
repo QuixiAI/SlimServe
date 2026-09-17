@@ -6,6 +6,9 @@ output (runner -> Marlin moe_sum). Both match on the identity of the batch's
 topk_ids tensor and clear after one consumer, so a stale entry can never be
 applied to another batch."""
 
+from types import SimpleNamespace
+
+import pytest
 import torch
 
 from vllm.model_executor.layers.fused_moe import combine_shared
@@ -72,3 +75,59 @@ def test_shared_experts_discard_drops_an_unconsumed_output_and_tolerates_none():
     assert se._output == [None, None]
     se.discard()
     assert se._output == [None, None]
+
+
+def _runner_shell():
+    """A MoERunner with only the attributes the tests below touch; the
+    constructor wants a live vLLM config and quantized experts."""
+    from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+
+    runner = MoERunner.__new__(MoERunner)
+    torch.nn.Module.__init__(runner)
+    return runner
+
+
+def test_set_moe_config_reselects_the_forward_entry():
+    # Elastic EP reconfigures a live runner; the entry depends on the config
+    # (use_ep and the padded hidden dim decide the fold), so it is re-chosen.
+    runner = _runner_shell()
+    seen: list[object] = []
+    runner.routed_experts = SimpleNamespace(_set_moe_config=seen.append)
+    runner._shared_experts = SimpleNamespace(_set_moe_config=seen.append)
+    runner._forward_entry = "stale"
+    runner._select_forward = lambda: ("fresh", runner.moe_config)
+    cfg = object()
+    runner._set_moe_config(cfg)
+    assert runner.moe_config is cfg
+    assert seen == [cfg, cfg]
+    assert runner._forward_entry == ("fresh", cfg)
+
+
+def test_a_router_failure_after_the_deferred_shared_run_discards_its_output():
+    # forward_deferred_join fills the shared slot before expert selection; a
+    # select_experts that raises must still drop it (and the published entry),
+    # or the next batch asserts on the stale slot.
+    runner = _runner_shell()
+    calls: list[str] = []
+    x = torch.zeros(2, 4)
+    runner._shared_experts = SimpleNamespace(
+        forward_deferred_join=lambda inp, pq: (torch.ones(2, 4), None),
+        discard=lambda: calls.append("discard"),
+    )
+    runner._shared_fold_eligible = lambda *args: True
+    runner.routed_experts = SimpleNamespace(
+        quant_method=SimpleNamespace(is_monolithic=False, topk_indices_dtype=None),
+        forward_modular=lambda **kw: calls.append("forward_modular"),
+    )
+
+    def boom(**kwargs):
+        raise RuntimeError("router failed")
+
+    runner.router = SimpleNamespace(select_experts=boom)
+    runner.__dict__["_expert_stats_obj"] = None  # what the _expert_stats property reads
+    stale_ids = torch.zeros(2, 8, dtype=torch.int32)
+    combine_shared.publish(combine_shared.SharedOutput(stale_ids, x, None))
+    with pytest.raises(RuntimeError, match="router failed"):
+        runner._apply_quant_method(x, torch.zeros(2, 8), x, fold_shared=True)
+    assert calls == ["discard"]
+    assert combine_shared.consume(stale_ids) is None

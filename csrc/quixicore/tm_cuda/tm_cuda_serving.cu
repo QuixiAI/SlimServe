@@ -237,14 +237,16 @@ static void py_glm5_mhc_allreduce(
     check(base, torch::kFloat, NOUT, "base F32[24]");
     check(next_post, torch::kFloat, tokens * HC, "next_post F32[T, 4]");
     check(next_comb, torch::kFloat, tokens * HC * HC, "next_comb F32[T, 4, 4]");
-    TORCH_CHECK(partial.is_cuda() && partial.is_contiguous() &&
+    TORCH_CHECK(partial.is_cuda() && partial.device() == inp.device() &&
+                    partial.is_contiguous() &&
                     partial.scalar_type() == torch::kFloat &&
                     partial.numel() >= tokens * NBLOCKS * PARTIAL_STRIDE,
-                "glm5_mhc_allreduce: partial workspace F32[T, 32, 32]");
-    TORCH_CHECK(arrivals.is_cuda() && arrivals.is_contiguous() &&
+                "glm5_mhc_allreduce: partial workspace F32[T, 32, 32] on the input's device");
+    TORCH_CHECK(arrivals.is_cuda() && arrivals.device() == inp.device() &&
+                    arrivals.is_contiguous() &&
                     arrivals.scalar_type() == torch::kInt32 &&
                     arrivals.numel() >= tokens,
-                "glm5_mhc_allreduce: arrival counters Int32[>= T]");
+                "glm5_mhc_allreduce: arrival counters Int32[>= T] on the input's device");
     if (norm_weight) {
         check(*norm_weight, torch::kBFloat16, HIDDEN, "norm weight BF16[4096]");
     }
@@ -1936,6 +1938,12 @@ static torch::Tensor py_nvfp4_moe_gemm(torch::Tensor a, torch::Tensor b, torch::
     // sorted_ids/expert_ids from moe_align_block_size at block 128; c [M_topk, N] bf16.
     CK(b); CK(s); CK(g); CK(sorted_ids); CK(expert_ids); CK(num_post_padded); CK(c);
     TORCH_CHECK(a.is_cuda() && a.dim() == 2 && a.stride(1) == 1 && a.scalar_type() == torch::kBFloat16, "a [rows,K] bf16");
+    // Every operand is dereferenced by the kernel on a's device and stream.
+    const auto same_device = [&](const torch::Tensor& t, const char* what) {
+        TORCH_CHECK(t.device() == a.device(), "nvfp4_moe_gemm: ", what, " must be on a's device");
+    };
+    same_device(b, "b"); same_device(s, "s"); same_device(g, "g"); same_device(sorted_ids, "sorted_ids");
+    same_device(expert_ids, "expert_ids"); same_device(num_post_padded, "num_post_padded"); same_device(c, "c");
     TORCH_CHECK(b.dim() == 3 && b.scalar_type() == torch::kInt32 && s.dim() == 3 && s.scalar_type() == torch::kUInt8, "b int32 [E,K/16,2N], s uint8 [E,K/16,N]");
     const int E = b.size(0), K = int(b.size(1)) * 16, N = int(b.size(2)) / 2;
     TORCH_CHECK(s.size(0) == E && s.size(1) == K / 16 && s.size(2) == N, "scales shape");
@@ -1949,6 +1957,7 @@ static torch::Tensor py_nvfp4_moe_gemm(torch::Tensor a, torch::Tensor b, torch::
     if (mul_topk) {
         TORCH_CHECK(topk_weights.has_value(), "topk_weights required with mul_topk");
         CK(topk_weights.value()); TORCH_CHECK(topk_weights->scalar_type() == torch::kFloat32 && topk_weights->numel() >= M_topk, "topk_weights fp32");
+        same_device(topk_weights.value(), "topk_weights");
         tw = fp(topk_weights.value());
     }
     // moe_align_block_size pads sorted_ids to M*topk + E*(block-1); the kernel
@@ -1963,6 +1972,7 @@ static torch::Tensor py_nvfp4_moe_gemm(torch::Tensor a, torch::Tensor b, torch::
                                    num_post_padded.data_ptr<int32_t>(), tw,                                        \
                                    reinterpret_cast<__nv_bfloat16*>(c.data_ptr()), int(c.stride(0)), M_topk,       \
                                    int(top_k), N, K, mul_topk ? 1 : 0, max_blocks)
+    const c10::cuda::CUDAGuard guard(a.device());
     switch (stages) {
         case 3: QC_NVFP4_LAUNCH(3, 4, 2); break;
         case 4: QC_NVFP4_LAUNCH(2, 2, 2); break;
