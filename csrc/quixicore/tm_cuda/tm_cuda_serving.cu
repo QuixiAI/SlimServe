@@ -62,6 +62,13 @@ struct SmemOptIn {
     bool pending() const { return !done[slot()]; }
     void mark() { done[slot()] = true; }
 };
+// Every operand of a launch is dereferenced on the first operand's device and
+// current stream: a binding requires that of each operand and selects the
+// device (CUDAGuard) for its allocations and launches, so a tensor from
+// another device is a checked error rather than a foreign pointer.
+static void require_device(const torch::Tensor& ref, const torch::Tensor& t, const char* fn, const char* what) {
+    TORCH_CHECK(t.device() == ref.device(), fn, ": ", what, " must be on the first operand's device (", ref.device(), ")");
+}
 static const half* hp(const torch::Tensor& t) { return reinterpret_cast<const half*>(t.data_ptr()); }
 static half* hpm(torch::Tensor& t) { return reinterpret_cast<half*>(t.data_ptr()); }
 static const __nv_bfloat16* bp(const torch::Tensor& t) { return reinterpret_cast<const __nv_bfloat16*>(t.data_ptr()); }
@@ -316,6 +323,8 @@ static void py_glm5_mhc_join(int64_t fa) {
 static torch::Tensor py_dsv4_router_gemm(torch::Tensor x,
                                          torch::Tensor weight) {
     CK(x); CK(weight);
+    require_device(x, weight, "dsv4_router_gemm", "weight");
+    const c10::cuda::CUDAGuard guard(x.device());
     TORCH_CHECK(x.scalar_type() == torch::kBFloat16 &&
                     weight.scalar_type() == torch::kBFloat16,
                 "DSV4 router requires bf16 input and weight");
@@ -455,6 +464,8 @@ static void py_fill_short_context_topk_indices(
         torch::Tensor output, torch::Tensor positions, int64_t topk,
         int64_t compress_ratio) {
     CK(output); CK(positions);
+    require_device(output, positions, "fill_short_context_topk_indices", "positions");
+    const c10::cuda::CUDAGuard guard(output.device());
     TORCH_CHECK(output.scalar_type() == torch::kInt,
                 "output must be int32");
     TORCH_CHECK(positions.scalar_type() == torch::kLong,
@@ -686,6 +697,11 @@ static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> py_dsv4_mhc_pre(
         double sinkhorn_eps, double post_multiplier, int64_t sinkhorn_repeat,
         c10::optional<torch::Tensor> norm_weight, double norm_eps) {
     CK(residual); CK(fn); CK(hc_scale); CK(hc_base);
+    require_device(residual, fn, "dsv4_mhc_pre", "fn");
+    require_device(residual, hc_scale, "dsv4_mhc_pre", "hc_scale");
+    require_device(residual, hc_base, "dsv4_mhc_pre", "hc_base");
+    if (norm_weight) require_device(residual, *norm_weight, "dsv4_mhc_pre", "norm_weight");
+    const c10::cuda::CUDAGuard guard(residual.device());
     TORCH_CHECK(residual.scalar_type() == torch::kBFloat16, "residual must be bf16");
     TORCH_CHECK(fn.scalar_type() == torch::kFloat32 ||
                 fn.scalar_type() == torch::kFloat16,
@@ -1835,6 +1851,9 @@ static torch::Tensor py_mla_decode_bf16_sparse_nope(torch::Tensor q, torch::Tens
         torch::Tensor bt, torch::Tensor indices, torch::Tensor topk_length,
         int64_t block_size, double scale, int64_t partition_size, int64_t page_stride_bytes) {
     CK(q); TORCH_CHECK(kv.is_cuda() && kv.stride(-1) == 1, "kv must be a CUDA tensor with unit inner stride"); CK(bt); CK(indices); CK(topk_length);
+    require_device(q, kv, "mla_decode_bf16_sparse_nope", "kv"); require_device(q, bt, "mla_decode_bf16_sparse_nope", "bt");
+    require_device(q, indices, "mla_decode_bf16_sparse_nope", "indices"); require_device(q, topk_length, "mla_decode_bf16_sparse_nope", "topk_length");
+    const c10::cuda::CUDAGuard guard(q.device());
     const int B = q.size(0), H = q.size(1);
     TORCH_CHECK(q.size(2) == 512, "NoPE MLA expects q width 512, got ", q.size(2));
     const int max_topk = indices.size(1);
@@ -1900,6 +1919,7 @@ static void launch_skinny(const __nv_bfloat16* x, const __nv_bfloat16* w, float*
 static torch::Tensor py_w8a16_pack(torch::Tensor w_fp8) {
     // w_fp8: [N, K] float8_e4m3fn, contiguous. Returns packed uint8 [N*K].
     CK(w_fp8);
+    const c10::cuda::CUDAGuard guard(w_fp8.device());
     TORCH_CHECK(w_fp8.scalar_type() == torch::kFloat8_e4m3fn && w_fp8.dim() == 2, "w [N,K] e4m3");
     const int N = w_fp8.size(0), K = w_fp8.size(1);
     TORCH_CHECK(N % 32 == 0 && K % 64 == 0, "N % 32 == 0, K % 64 == 0");
@@ -2010,6 +2030,9 @@ static torch::Tensor py_w8a16_gemm(torch::Tensor x, torch::Tensor wp, torch::Ten
                                    c10::optional<torch::Tensor> bias, int64_t N, int64_t target_ctas, int64_t cfg) {
     // x [M, K] bf16; wp packed (from w8a16_pack); scale [N] fp32 (per channel, already x 2^8).
     CK(x); CK(wp); CK(scale);
+    require_device(x, wp, "w8a16_gemm", "wp"); require_device(x, scale, "w8a16_gemm", "scale");
+    if (bias) require_device(x, *bias, "w8a16_gemm", "bias");
+    const c10::cuda::CUDAGuard guard(x.device());
     TORCH_CHECK(x.scalar_type() == torch::kBFloat16 && x.dim() == 2, "x [M,K] bf16");
     const int M = x.size(0), K = x.size(1);
     TORCH_CHECK(M >= 1 && M <= 128 && K % 64 == 0 && N % 32 == 0, "M <= 128, K % 64, N % 32");
@@ -2044,6 +2067,8 @@ static torch::Tensor py_w8a16_gemm(torch::Tensor x, torch::Tensor wp, torch::Ten
 }
 static torch::Tensor py_w8a16_dequant(torch::Tensor wp, torch::Tensor scale, int64_t N, int64_t K) {
     CK(wp); CK(scale);
+    require_device(wp, scale, "w8a16_dequant", "scale");
+    const c10::cuda::CUDAGuard guard(wp.device());
     TORCH_CHECK(wp.numel() == N * K && N % 32 == 0 && K % 64 == 0, "packed size");
     auto out = torch::empty({N, K}, scale.options().dtype(torch::kBFloat16));
     const int total = int((K / 16) * (N / 32) * 32 * 4);
@@ -2074,6 +2099,9 @@ static torch::Tensor py_mla_sparse_prefill_fp8(torch::Tensor q, torch::Tensor da
     CK(q); TORCH_CHECK(data.is_cuda() && data.stride(-1) == 1, "data must be a CUDA tensor with unit inner stride");
     if (page_stride_bytes <= 0) page_stride_bytes = block_size * 512;
     CK(bt); CK(indices); CK(topk_length);
+    require_device(q, data, "mla_sparse_prefill_fp8", "data"); require_device(q, bt, "mla_sparse_prefill_fp8", "bt");
+    require_device(q, indices, "mla_sparse_prefill_fp8", "indices"); require_device(q, topk_length, "mla_sparse_prefill_fp8", "topk_length");
+    const c10::cuda::CUDAGuard guard(q.device());
     TORCH_CHECK(q.dim() == 3 && q.size(2) == 512 && q.size(1) == 16, "q [T, 16, 512] bf16 (TP4 head count)");
     TORCH_CHECK(block_size % 4 == 0, "block_size % 4 == 0");
     using namespace tms::sparse_prefill;
@@ -2113,6 +2141,10 @@ static torch::Tensor py_mla_sparse_prefill_fp8(torch::Tensor q, torch::Tensor da
 }
 static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> py_mla_sparse_prefill_prep_debug(
         torch::Tensor bt, torch::Tensor indices, torch::Tensor topk_length, int64_t block_size) {
+    CK(bt); CK(indices); CK(topk_length);
+    require_device(indices, bt, "mla_sparse_prefill_prep_debug", "bt");
+    require_device(indices, topk_length, "mla_sparse_prefill_prep_debug", "topk_length");
+    const c10::cuda::CUDAGuard guard(indices.device());
     using namespace tms::sparse_prefill;
     const int T = indices.size(0), W = indices.size(1), maxb = bt.size(1);
     const int G = (T + GQ - 1) / GQ;
@@ -2288,6 +2320,9 @@ static torch::Tensor py_mla_decode_fp8_sparse_nope(torch::Tensor q, torch::Tenso
         int64_t block_size, double scale, double kv_scale,
         int64_t partition_size, int64_t page_stride_bytes) {
     CK(q); TORCH_CHECK(data.is_cuda() && data.stride(-1) == 1, "data must be a CUDA tensor with unit inner stride"); CK(bt); CK(indices); CK(topk_length);
+    require_device(q, data, "mla_decode_fp8_sparse_nope", "data"); require_device(q, bt, "mla_decode_fp8_sparse_nope", "bt");
+    require_device(q, indices, "mla_decode_fp8_sparse_nope", "indices"); require_device(q, topk_length, "mla_decode_fp8_sparse_nope", "topk_length");
+    const c10::cuda::CUDAGuard guard(q.device());
     const int B = q.size(0), H = q.size(1);
     TORCH_CHECK(q.size(2) == 512, "NoPE MLA expects q width 512, got ", q.size(2));
     const int max_topk = indices.size(1);
@@ -2891,6 +2926,9 @@ static void py_turboquant_dequant_kv(torch::Tensor kv_cache, torch::Tensor block
         int64_t num_positions, int64_t mse_bits, int64_t kps, int64_t vqb,
         bool key_fp8, bool norm_correction) {
     CK(centroids); CKTQ(kv_cache); CKTQ(block_table); CKTQ(k_out); CKTQ(v_out);
+    require_device(centroids, kv_cache, "turboquant_dequant_kv", "kv_cache"); require_device(centroids, block_table, "turboquant_dequant_kv", "block_table");
+    require_device(centroids, k_out, "turboquant_dequant_kv", "k_out"); require_device(centroids, v_out, "turboquant_dequant_kv", "v_out");
+    const c10::cuda::CUDAGuard guard(centroids.device());
     TORCH_CHECK(kv_cache.stride(3) == 1 && k_out.stride(3) == 1 && v_out.stride(3) == 1,
                 "innermost dims must be contiguous");
     TORCH_CHECK(k_out.scalar_type() == torch::kHalf, "dequant writes fp16");
