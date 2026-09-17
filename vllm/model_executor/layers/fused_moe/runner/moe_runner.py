@@ -362,6 +362,8 @@ class MoERunner(MoERunnerInterface):
         return (
             current_platform.is_cuda()
             and not self._shared_experts.enable_dbo
+            # The caller wants the two outputs apart; the folded op has one.
+            and not self.defer_shared_expert_add
             and self.routed_scaling_factor == 1.0
             and self.routed_input_transform is None
             and self.routed_output_transform is None
@@ -376,6 +378,22 @@ class MoERunner(MoERunnerInterface):
     @property
     def shared_experts(self) -> SharedExperts | None:
         return self._shared_experts
+
+    @property
+    def defer_shared_expert_add(self) -> bool:
+        """Whether forward() hands (shared_output, fused_output) back
+        separately for the caller to reduce (DeepSeek V4's deferred TP
+        reduce) instead of adding them here."""
+        return self._defer_shared_expert_add
+
+    @defer_shared_expert_add.setter
+    def defer_shared_expert_add(self, value: bool) -> None:
+        # Set by the model after construction; the folded op returns one
+        # tensor and could not hand the shared output back, so the entry is
+        # re-selected here (see _fold_shared_static).
+        self._defer_shared_expert_add = bool(value)
+        if "_forward_entry" in self.__dict__:
+            self._forward_entry = self._select_forward()
 
     @property
     def is_internal_router(self) -> bool:

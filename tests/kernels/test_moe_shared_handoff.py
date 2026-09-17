@@ -158,3 +158,33 @@ def test_a_monolithic_forward_that_raises_discards_the_shared_output():
     with pytest.raises(RuntimeError, match="monolithic failed"):
         runner._apply_quant_method(x, torch.zeros(2, 8), x)
     assert calls == ["shared:NO_OVERLAP", "discard"]
+
+
+def test_deferring_the_shared_expert_add_reselects_the_entry_and_excludes_the_fold():
+    # DeepSeek V4 sets defer_shared_expert_add after construction to get
+    # (shared_output, fused_output) back separately; the folded op returns
+    # one tensor, so the flag must re-select the entry and veto the fold.
+    from vllm.platforms import current_platform
+
+    runner = _runner_shell()
+    runner._shared_experts = SimpleNamespace(enable_dbo=False)
+    runner.routed_scaling_factor = 1.0
+    runner.routed_input_transform = None
+    runner.routed_output_transform = None
+    runner.moe_config = SimpleNamespace(
+        is_sequence_parallel=False,
+        moe_parallel_config=SimpleNamespace(use_ep=False),
+        hidden_dim_unpadded=4096,
+        hidden_dim=4096,
+    )
+    runner.defer_shared_expert_add = False  # before the entry exists: no reselect
+    assert "_forward_entry" not in runner.__dict__
+    if current_platform.is_cuda():
+        assert runner._fold_shared_static()
+    selections: list[str] = []
+    runner._select_forward = lambda: selections.append("select") or "entry"
+    runner._forward_entry = "stale"
+    runner.defer_shared_expert_add = True
+    assert not runner._fold_shared_static()
+    assert selections == ["select"]
+    assert runner._forward_entry == "entry"
