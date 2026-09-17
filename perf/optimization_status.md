@@ -27480,6 +27480,9 @@ the first arm put its native sm_120 NVFP4 experts on our tree.
   E2 had only ever been measured with `--no-spec`; the spec arm of the
   final record (p7-final-spec) carried the same 0 % hit rate unnoticed
   because it never re-sent a prompt.
+- Raw: `$S/serve-logs/bench-e2-metrics-p{1,2}-c{1,8,16}-1000-300.out`,
+  `$S/serve-logs/ab-e2-replaytail{,-spec}.out`,
+  `$S/serve-logs/bench-e2-replaytail-pass{1,2}.out`.
 
 ### Item E3: the tail step on the decode graph, and hash-granular hits under speculation - RETAINED
 
@@ -28639,6 +28642,9 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   Block verification is at least as long as standard in expectation for
   the same draft, so a measured shortfall would point at draft quality,
   not the rule.
+- Raw: the control's 2026-09-14 runs,
+  `perf/results/2026-09-14/control-mtp3-offsets-pass{1,2}/` and
+  `perf/results/2026-09-14/acc-control{,-k1}-pass{1,2,3}/`.
 
 ### Acceptance audit, part 2: the c8 probe (32 prompts x 3 seeds) - the control accepts 2.38 per step, DFlash2 2.24, the MTP head 2.21; the verification rule is not the difference
 
