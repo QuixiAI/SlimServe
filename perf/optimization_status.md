@@ -29629,3 +29629,36 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   `perf/results/2026-09-17/d5probe-eager/probes.txt` and
   `d5probe-off/probes.txt`, serve logs `$S/serve-logs/serve-20260917-024756.log`
   (flag on) and `serve-20260917-025458.log` (control).
+
+### Final confirmation at the PR head (2026-09-17): the record re-measured at 68aab5d8d after the review rounds - CONFIRMED, at or above the published numbers at every shape
+
+- Why: the published numbers were measured at 48c5c8f93; since then the
+  sparse-TC decode kernel, the mHC token split, the upstream merge
+  (02fb15fc1) and six CodeRabbit rounds landed (the padded-fold guard, the
+  routed-forward cleanup boundary, the binding device checks, the
+  per-device shared-memory opt-in). The PR should state numbers from the
+  tree it ships.
+- Method: `$S/ab2.sh` at HEAD 68aab5d8d, two arms one after the other:
+  the record with `--spec` (the MTP head drafter, schedule
+  [[1,4,3],[5,8,1],[9,16,2]]), then the record plain. Per arm one boot,
+  then two exact-token passes (seeds 42 and 43) over c1/c8/c16 1000/300;
+  every completion scanned for "usseusse" and the "!!!" prefix.
+- Result (tokens/s, exact=True on all twelve runs), pass1 / pass2:
+  speculative c1 328.7 / 255.4, c8 765.6 / 816.4, c16 1063.2 / 1092.4;
+  plain c1 191.4 / 196.5, c8 734.2 / 730.2, c16 1039.6 / 1031.4.
+  Published (48c5c8f93): speculative 270.0 / 766.5 / 1046.7, plain
+  196.6 / 729.5 / 1014.3. Control (voipmonitor r28.1): MTP-3 267.6 / 732.1
+  / 1005.8, plain 166.5 / 687.9 / 966.8. Health 170 s (spec) and 215 s
+  (plain). 0 of 12 completion files carry garbage or a placeholder.
+- Reading: every shape is at or above the published number; the c1
+  speculative spread across passes (255-329 here, 267-290 before) is the
+  known one - a 300-token single stream whose acceptance run decides the
+  figure - so c1 under speculation stays reported as LEVEL with the control
+  (its five-offset 267.6 sits inside the spread), everything else ahead.
+- Decision: CONFIRMED; the PR body carries these as the head's numbers
+  next to the published ones.
+- Raw: `perf/results/2026-09-17/final-spec-pass{1,2}/`,
+  `final-nospec-pass{1,2}/` (bench JSON and completions), driver logs
+  `$S/serve-logs/ab-final-spec.out` and `ab-final-nospec.out`, serve logs
+  `$S/serve-logs/serve-20260917-102812.log` (spec) and
+  `$S/serve-logs/serve-20260917-103238.log` (plain).

@@ -24,6 +24,12 @@ band, canaries pass, 0 of 162 completions carry the garbage or placeholder
 signature. Two kernels landed after that measurement and were qualified on
 their own arms, not re-folded into it: the sparse-MLA tensor-core decode
 kernel (+2.2 % at c16) and the mHC token-axis split (microbenchmark only).
+Re-measured at the PR head 68aab5d8d on 2026-09-17 (one boot per arm, two
+passes, exact): no speculation c1 191.4 / 196.5, c8 734.2 / 730.2, c16
+1039.6 / 1031.4; with `--spec` c1 328.7 / 255.4, c8 765.6 / 816.4, c16
+1063.2 / 1092.4 - at or above the published numbers at every shape, 0 of
+12 completion files with the garbage or placeholder signature (notebook
+"Final confirmation at the PR head").
 The record's prefill all-reduce path needs the `b12x` package (PyPI,
 Apache-2.0, 1.3.0 validated); without it the DMA ring is skipped with a
 warning and the prefill numbers above do not hold.
@@ -31,7 +37,8 @@ Obsolete sidecars on /raid (not deleted, operator's call): in
 /raid/weights/GLM-5.3-Flash-NVFP4/, `fp8-swapset-kda-tp4.{safetensors,json}`
 (6.8 GB), `fp8-swapset-dense.*` (2.4 GB) and `fp8-swapset.*` (6.7 GB) are
 superseded by `fp8-swapset-lmhead.*` (7.3 GB, the record's sidecar). Next:
-PR #29 through review (merged with upstream main 02fb15fc1 on 2026-09-17);
+PR #29 through review (merged with upstream main 02fb15fc1 on 2026-09-17;
+six CodeRabbit rounds addressed through 68aab5d8d);
 then, per campaign doc section 13, the decode items the roofline audit left
 (the mHC site cost at 16..48 rows, the drafter's bf16 projections, the
 vocabulary all-gather - each worth 1-2 %), the unattributed 0.03-per-draft
