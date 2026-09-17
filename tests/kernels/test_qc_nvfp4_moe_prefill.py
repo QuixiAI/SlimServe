@@ -151,3 +151,29 @@ def test_every_operand_must_sit_on_the_activation_device(weights):
     for name in operands:
         with pytest.raises(RuntimeError, match="must be on a's device"):
             run(name)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two CUDA devices")
+def test_a_second_device_gets_its_own_shared_memory_opt_in(weights):
+    # cudaFuncSetAttribute is per device: after the first launch configured
+    # cuda:0, the same kernel on cuda:1 must be configured there too (a shared
+    # "set once" flag launched it with 80 KB against the 48 KB default).
+    from vllm.quixicore.ops import quixicore_ops
+
+    w13, w13_s, w13_s2, _, _, _ = weights
+    M = 37
+    torch.manual_seed(M)
+    _, tids = _routing(M)
+    sid, eid, npp = moe_align_block_size(tids, 128, E)
+    a = (torch.randn(M, K, device="cuda") * 0.5).to(torch.bfloat16)
+    operands = [a, w13, w13_s.view(torch.uint8), w13_s2, sid, eid, npp]
+
+    def run(device):
+        moved = [t.to(device) for t in operands]
+        c = torch.zeros(M * TOPK, 2 * N, dtype=torch.bfloat16, device=device)
+        return quixicore_ops.nvfp4_moe_gemm(*moved, None, c, TOPK, False, 2)
+
+    first = run("cuda:0")
+    second = run("cuda:1")
+    torch.cuda.synchronize("cuda:1")
+    assert torch.equal(first.cpu(), second.cpu())

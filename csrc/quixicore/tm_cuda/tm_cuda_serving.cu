@@ -39,6 +39,7 @@
 #include "custom_all_reduce.cuh"
 #endif
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdlib>
 
@@ -47,6 +48,20 @@ namespace py = pybind11;
 
 #define CK(x) TORCH_CHECK(x.is_cuda() && x.is_contiguous(), #x " must be contiguous CUDA")
 static cudaStream_t stream() { return at::cuda::getCurrentCUDAStream(); }
+// cudaFuncSetAttribute applies per device, so a launcher's "set once" flag is
+// kept per device index (that of the current stream, where the launch goes):
+// a second device in the process gets its own opt-in before its first launch
+// instead of inheriting the first device's flag and launching unconfigured.
+struct SmemOptIn {
+    std::array<bool, 64> done{};
+    static int slot() {
+        const int dev = int(at::cuda::getCurrentCUDAStream().device_index());
+        TORCH_CHECK(dev >= 0 && dev < 64, "device index ", dev, " out of range for the launch table");
+        return dev;
+    }
+    bool pending() const { return !done[slot()]; }
+    void mark() { done[slot()] = true; }
+};
 static const half* hp(const torch::Tensor& t) { return reinterpret_cast<const half*>(t.data_ptr()); }
 static half* hpm(torch::Tensor& t) { return reinterpret_cast<half*>(t.data_ptr()); }
 static const __nv_bfloat16* bp(const torch::Tensor& t) { return reinterpret_cast<const __nv_bfloat16*>(t.data_ptr()); }
@@ -1865,11 +1880,17 @@ template <int BM, int BN, int NW, int STAGES>
 static void launch_skinny(const __nv_bfloat16* x, const __nv_bfloat16* w, float* partial,
                           int M, int N, int K, int splits, int k_slice) {
     using L = tms::skinny::Layout<BM, BN, NW, STAGES>;
-    static bool attr_set = false;
-    if (!attr_set) {
-        cudaFuncSetAttribute(tms::skinny::skinny_gemm_bf16_kernel<BM, BN, NW, STAGES>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, L::SMEM);
-        attr_set = true;
+    static SmemOptIn opt_in;
+    if (opt_in.pending()) {
+        // The BN128 / 3-stage tiles (cfg 1, 7) need 110,592 B: over sm_120's
+        // 99 KB opt-in, where the unchecked launch failed with "invalid
+        // argument" (RTX PRO 6000, 2026-09-17).
+        const cudaError_t err = cudaFuncSetAttribute(tms::skinny::skinny_gemm_bf16_kernel<BM, BN, NW, STAGES>,
+                                                     cudaFuncAttributeMaxDynamicSharedMemorySize, L::SMEM);
+        TORCH_CHECK(err == cudaSuccess, "skinny_gemm needs ", L::SMEM,
+                    " bytes of shared memory per block for this configuration, which this device does not opt in to (",
+                    cudaGetErrorString(err), "); qualify the device with skinny_gemm_smem_bytes(cfg, M)");
+        opt_in.mark();
     }
     const dim3 grid((N + BN - 1) / BN, splits);
     tms::skinny::skinny_gemm_bf16_kernel<BM, BN, NW, STAGES><<<grid, L::THREADS, L::SMEM, stream()>>>(
@@ -1892,11 +1913,14 @@ template <int BN, int STAGES, int NW = 4, int WM = 4>
 static void launch_w8a16(const __half* x, const uint8_t* wp, float* partial, int M, int N, int K,
                          int splits, int k_slice) {
     using L = tms::w8a16::Layout<BN, STAGES, NW, WM>;
-    static bool attr_set = false;
-    if (!attr_set) {
-        cudaFuncSetAttribute(tms::w8a16::w8a16_gemm_kernel<BN, STAGES, NW, WM>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, L::SMEM);
-        attr_set = true;
+    static SmemOptIn opt_in;
+    if (opt_in.pending()) {
+        const cudaError_t err = cudaFuncSetAttribute(tms::w8a16::w8a16_gemm_kernel<BN, STAGES, NW, WM>,
+                                                     cudaFuncAttributeMaxDynamicSharedMemorySize, L::SMEM);
+        TORCH_CHECK(err == cudaSuccess, "w8a16_gemm needs ", L::SMEM,
+                    " bytes of shared memory per block for this configuration, which this device does not opt in to (",
+                    cudaGetErrorString(err), ")");
+        opt_in.mark();
     }
     const dim3 grid((N + BN - 1) / BN, splits);
     tms::w8a16::w8a16_gemm_kernel<BN, STAGES, NW, WM><<<grid, L::THREADS, L::SMEM, stream()>>>(x, wp, partial, M, N, K, k_slice);
@@ -1909,8 +1933,8 @@ static void launch_nvfp4_moe(const __nv_bfloat16* a, int lda, const int32_t* b, 
                              int max_blocks) {
     constexpr int SMEM = tms::nvfp4moe::smem_bytes<STAGES>();
     constexpr int THREADS = tms::nvfp4moe::Warps<WM, WN>::THREADS;
-    static bool attr_set = false;
-    if (!attr_set) {
+    static SmemOptIn opt_in;
+    if (opt_in.pending()) {
         // Three stages need 119 KB of opt-in shared memory: fine on sm80 and
         // sm90/sm100, over sm_120's 99 KB. Unchecked, the launch below failed
         // with "invalid argument" instead (RTX PRO 6000, 2026-09-17).
@@ -1919,7 +1943,7 @@ static void launch_nvfp4_moe(const __nv_bfloat16* a, int lda, const int32_t* b, 
         TORCH_CHECK(err == cudaSuccess, "nvfp4_moe_gemm needs ", SMEM,
                     " bytes of shared memory per block for this configuration, which this device does not opt in to (",
                     cudaGetErrorString(err), "); qualify the device with nvfp4_moe_gemm_smem_bytes(cfg)");
-        attr_set = true;
+        opt_in.mark();
     }
     const dim3 grid(N / tms::nvfp4moe::BN, max_blocks);
     tms::nvfp4moe::nvfp4_moe_gemm_kernel<STAGES, WM, WN><<<grid, THREADS, SMEM, stream()>>>(
@@ -2031,11 +2055,14 @@ static torch::Tensor py_w8a16_dequant(torch::Tensor wp, torch::Tensor scale, int
 template <int NLIST>
 static void launch_sparse_prefill_prep(const int* idx, const int* tlen, const int* bt, int T, int W, int maxb,
                                        int block_size, int* pools, int* qmask, int* counts, int G) {
-    static bool attr_set = false;
-    if (!attr_set) {
-        cudaFuncSetAttribute(tms::sparse_prefill::sparse_prefill_prep_kernel<NLIST>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, NLIST * 4);
-        attr_set = true;
+    static SmemOptIn opt_in;
+    if (opt_in.pending()) {
+        const cudaError_t err = cudaFuncSetAttribute(tms::sparse_prefill::sparse_prefill_prep_kernel<NLIST>,
+                                                     cudaFuncAttributeMaxDynamicSharedMemorySize, NLIST * 4);
+        TORCH_CHECK(err == cudaSuccess, "mla_sparse_prefill_fp8's prep kernel needs ", NLIST * 4,
+                    " bytes of shared memory per block, which this device does not opt in to (",
+                    cudaGetErrorString(err), ")");
+        opt_in.mark();
     }
     tms::sparse_prefill::sparse_prefill_prep_kernel<NLIST><<<G, tms::sparse_prefill::THREADS, NLIST * 4, stream()>>>(
         idx, tlen, bt, T, W, maxb, block_size, pools, qmask, counts);
@@ -2064,8 +2091,8 @@ static torch::Tensor py_mla_sparse_prefill_fp8(torch::Tensor q, torch::Tensor da
         launch_sparse_prefill_prep<16384>(indices.data_ptr<int>(), topk_length.data_ptr<int>(), bt.data_ptr<int>(), T, W, maxb,
                                           int(block_size), pools.data_ptr<int>(), qmask.data_ptr<int>(), counts.data_ptr<int>(), G);
     auto out = torch::empty({T, H, 512}, q.options());
-    static bool attr_set = false;
-    if (!attr_set) {
+    static SmemOptIn opt_in;
+    if (opt_in.pending()) {
         // The attention kernel needs SMEM_TOTAL bytes of opt-in shared memory
         // (116 KB: 163 KB on sm80, 227 KB on sm90/sm100, but 99 KB on sm_120).
         // An unchecked failure here left the launch below failing silently and
@@ -2075,7 +2102,7 @@ static torch::Tensor py_mla_sparse_prefill_fp8(torch::Tensor q, torch::Tensor da
         TORCH_CHECK(err == cudaSuccess, "mla_sparse_prefill_fp8 needs ", SMEM_TOTAL,
                     " bytes of shared memory per block, which this device does not opt in to (",
                     cudaGetErrorString(err), "); qualify the device with mla_sparse_prefill_fp8_smem_bytes()");
-        attr_set = true;
+        opt_in.mark();
     }
     const float q_scale = float(scale) * float(kv_scale) * 1.4426950408889634f;
     sparse_prefill_attn_kernel<<<G, THREADS, SMEM_TOTAL, stream()>>>(
@@ -2100,6 +2127,24 @@ static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> py_mla_sparse_pre
         launch_sparse_prefill_prep<16384>(indices.data_ptr<int>(), topk_length.data_ptr<int>(), bt.data_ptr<int>(), T, W, maxb,
                                           int(block_size), pools.data_ptr<int>(), qmask.data_ptr<int>(), counts.data_ptr<int>(), G);
     return {pools, qmask, counts};
+}
+// Opt-in shared memory per block the skinny GEMM launches with for (cfg, M):
+// mirrors the dispatch in py_skinny_gemm below.
+static int64_t skinny_gemm_smem_bytes(int64_t cfg, int64_t M) {
+    using namespace tms::skinny;
+    switch (cfg) {
+        case 1: case 7: return Layout<128, 128, 8, 3>::SMEM;
+        case 2: return Layout<128, 64, 4, 4>::SMEM;
+        case 3: case 6: return Layout<128, 128, 8, 2>::SMEM;
+        case 4: return Layout<128, 64, 8, 3>::SMEM;
+        case 5: return Layout<128, 64, 4, 2>::SMEM;
+        case 8: return Layout<128, 128, 4, 2>::SMEM;
+        default:
+            if (M > 64) return Layout<128, 64, 4, 3>::SMEM;
+            if (M > 32) return Layout<64, 64, 4, 3>::SMEM;
+            if (M > 16) return Layout<32, 64, 4, 3>::SMEM;
+            return Layout<16, 64, 4, 3>::SMEM;
+    }
 }
 static torch::Tensor py_skinny_gemm(torch::Tensor x, torch::Tensor w,
                                     c10::optional<torch::Tensor> bias, int64_t target_ctas, int64_t cfg) {
@@ -3070,6 +3115,8 @@ void init_serving(py::module_& m) {
     m.def("w8a16_gemm", &py_w8a16_gemm, py::arg("x"), py::arg("wp"), py::arg("scale"), py::arg("bias") = py::none(),
           py::arg("N") = 0, py::arg("target_ctas") = 256, py::arg("cfg") = 0,
           "W8A16 skinny GEMM (M <= 128): bf16 x . fp8 W^T * scale + bias, split-K");
+    m.def("skinny_gemm_smem_bytes", &skinny_gemm_smem_bytes, py::arg("cfg"), py::arg("M"),
+          "Opt-in shared memory per block skinny_gemm launches with for (cfg, M)");
     m.def("skinny_gemm", &py_skinny_gemm, py::arg("x"), py::arg("w"), py::arg("bias") = py::none(),
           py::arg("target_ctas") = 256, py::arg("cfg") = 0, "Skinny bf16 GEMM (M <= 128): x [M,K] . w [N,K]^T + bias, split-K");
     m.def("kda_spec_fwd", &py_kda_spec_fwd, py::arg("q"), py::arg("k"), py::arg("v"), py::arg("raw_g"),
