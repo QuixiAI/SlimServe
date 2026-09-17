@@ -38,8 +38,9 @@ class B12xDmaAllReduce:
             from b12x.comm.pcie.pcie_dma import PCIeDmaAllReduce
         except ImportError:
             logger.warning(
-                "VLLM_B12X_DMA_AR_MIN_MB is set but b12x is not installed; "
-                "large all-reduces stay on the custom kernel / NCCL."
+                "VLLM_B12X_DMA_AR_MIN_MB is set but b12x is not installed "
+                "(pip install b12x); large all-reduces stay on the custom "
+                "kernel / NCCL."
             )
             return
         try:

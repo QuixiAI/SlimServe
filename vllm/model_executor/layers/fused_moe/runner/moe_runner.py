@@ -367,6 +367,10 @@ class MoERunner(MoERunnerInterface):
             and self.routed_output_transform is None
             and not self.moe_config.is_sequence_parallel
             and not self.moe_config.moe_parallel_config.use_ep
+            # A padded routed hidden dim (TRT-LLM NVFP4 aligns 2688 -> 2816)
+            # is truncated in forward() after the op returns, so the add
+            # would meet a wider fused output than the shared one.
+            and self.moe_config.hidden_dim_unpadded == self.moe_config.hidden_dim
         )
 
     @property
