@@ -29665,3 +29665,79 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   `$S/serve-logs/ab-final-spec.out` and `ab-final-nospec.out`, serve logs
   `$S/serve-logs/serve-20260917-102812.log` (spec) and
   `$S/serve-logs/serve-20260917-103238.log` (plain).
+
+### Whole-step physics floor for the glm53f-nvfp4-4 record (2026-09-17): what the step must read, what it does read, and where the rest goes
+
+- Why: the operator's standard is a decisive margin over the control, not
+  a win. Before spending another arm, the step is accounted against its
+  physical floor from the checkpoint geometry and the measured card
+  (1628 GB/s HBM read, one-shot PCIe all-reduce 6 us at world size 4),
+  so that every remaining lever carries an expected gain.
+- Bytes every step must read per rank (TP4, the fp8 swapset record):
+
+  | stream | per rank per step | note |
+  |---|---:|---|
+  | 34 KDA layers: in_proj_qkvgfab + o_proj (fp8) + f_b/g_b (bf16) | 1188 MB | 34.9 MB per layer; the largest dense stream |
+  | 11 MLA layers: q_a/kv_a + indexer replicated (bf16), q_b/o_proj (fp8), kv_b (bf16) | 695 MB | 63 MB per layer, 32 MB of it replicated on every rank |
+  | 3 dense MLP layers (fp8) | 113 MB | |
+  | 42 shared experts (fp8) | 264 MB | |
+  | 42 routers (bf16, replicated) + mHC params (bf16, replicated) | 170 MB | |
+  | lm_head (fp8) | 159 MB | read twice under speculation |
+  | **dense total** | **2.59 GB = 1.59 ms** | batch-invariant |
+  | routed experts: 3.54 MB per touched expert per rank (NVFP4 + fp8 group scales) | 8 per token, overlapping | c1 8 (0.12 GB/layer... 1.19 GB/step = 0.73 ms); c8 ~57 (8.5 GB = 5.2 ms); c16 ~86-104 (12.8-14.7 GB = 7.9-9.0 ms); c1 spec 4-token verify ~30 (4.5 GB = 2.75 ms); c8 spec 16-token verify: Marlin measured 8.25 ms = 12.8 GB |
+  | KDA state (fp32, read + write) | 2.1 MB per layer per sequence | c1 0.04 ms, c8 0.35 ms, c16 0.70 ms |
+  | MLA latents at 1000 tokens (bf16) | 11 MB per sequence | negligible |
+  | collectives: 90 all-reduces per step at the 6 us PCIe floor | 0.54 ms | + vocab all-gather |
+
+- Floors against the measured steps (exact-token 1000/300, PR head):
+
+  | point | floor ms | floor tok/s | measured ms | measured tok/s | efficiency |
+  |---|---:|---:|---:|---:|---:|
+  | c1 no-spec | 2.9 | ~350 | 5.1 | 196 | 56 % |
+  | c8 no-spec | 7.7 | ~1040 | 10.9 | 734 | 70 % |
+  | c16 no-spec | 10.8-11.9 | ~1350-1480 | 15.5 | 1035 | 72 % |
+  | c1 spec k=3 (2.4 accepted) | 5.2 | ~470 | 7.3 | 329 | 71 % |
+  | c8 spec k=1 (1.72 accepted) | 11.1 | ~1240 | 16.4 (profile) | 839 (profile), 766-816 (bench) | 68 % |
+
+- Where the gap goes (c1 from `prof-rec-c1`, c8 from `prof-rec-c8`):
+  the expert stream is at 96 % of the card and is not in the gap. The gap
+  is (1) the mHC transition sites: 90 x 12.6 us fused at c1 (1.12 ms
+  against a 0.54 ms PCIe floor), 90 x 23.6 us as the split pair at c8/c16
+  (2.1 ms); (2) small-shape dense GEMMs and per-layer glue running at
+  launch latency rather than bandwidth: the KDA layer is 6-7 launches
+  (recurrence 11.5 us, conv 2.8, gate pair 1.9, gated norm 1.4, two
+  cutlass wmma GEMMs for f_b/g_b 3.5 + 2.7, a Triton sigmoid 2.7) = ~27 us
+  per layer x 34 = 0.9 ms where the bytes want 0.05 ms; the shared expert
+  and the 2-4 MB fp8 shapes run at 0.7 TB/s (0.3-0.5 ms excess); (3) the
+  bf16 logits all-gather (145 us per call at 16 rows, 0.3 ms per c8 spec
+  step) and a 0.5-1.0 ms tail of route/align, fills, copies and sampler
+  kernels that are each 1-7 us but number ~400 per step.
+- Levers, expected gain, and cost (all against the measured step):
+
+  | lever | c1 | c8 | c16 | what it takes |
+  |---|---:|---:|---:|---|
+  | A. NVFP4 (W4A16) dense projections through a second sidecar (KDA in_proj/o_proj, MLA q_b/o_proj/kv_b, dense MLP, shared experts: 1.9 GB -> 0.95 GB) | -0.58 ms (+13 %) | -0.58 ms (+5 %) | +4 % | quantizer reusing the swapset tooling (group-16, fp8 scales, same recipe as the experts), a dense W4A16 decode GEMM at M <= 64 (Marlin dense or the skinny path), the logprob canary per module family; the KDA in_proj is the quality risk - fall back to o_proj/q_b/shared-only (-0.3 ms) if it fails the floor |
+  | B. one fused KDA decode kernel per layer (conv update + gates + low-rank f/g + recurrence + gated norm) | -0.5 ms (+10 %) | -0.5 ms (+5 %) | +3 % | one kernel, parity against the six it replaces, graph-captured |
+  | C. fused all-reduce + mHC transition that stays ahead above 8 rows (rows spread over CTAs) | - | -0.9 ms (+8 %) | -0.9 ms (+6 %) | third iteration of the D5 kernel; microbench target 14 us per site at T=16-64 |
+  | D. hide the all-reduce under an L2 prefetch of the next GEMV's weights (128 MB L2; a KDA in_proj slice is 25 MB) | -0.3..0.5 ms (+6-10 %) | -0.3..0.5 ms (+3-5 %) | +2-3 % | side-stream prefetch kernel before each all-reduce, graph-safe ordering; uncertain until measured |
+  | E. top-k-then-gather instead of the full bf16 logits all-gather | -0.1 ms | -0.25 ms (+2 %) | +2 % | small |
+  | F. the 0.04-per-draft acceptance gap (latent cache format is the remaining suspect) | +6 % spec | +3 % spec | +2 % spec | research; unbounded |
+  | G. shared expert folded into the routed Marlin launch (needs A) | -0.2 ms | -0.2 ms | -0.2 ms | comes with A |
+
+- Realistic landing if A-E land (spec figures assume F does not):
+  c1 no-spec ~3.6 ms = 270-285 tok/s (+40 % on ours, +65-70 % on the
+  control's 166); c1 spec ~5.6 ms = 420-450 (+30-35 %; +60 % on the
+  control's 268); c8 no-spec ~8.8 ms = 900-920 (+23 %; +32 % on 688); c8
+  spec ~1000-1050 (+30 % on the control's best 774); c16 ~12.6 ms =
+  1250-1300 (+22 %; +30 % on 967-1006). The literal floors are 350 / 470 /
+  1040 / 1240 / 1400.
+- What cannot move: at c8 and c16 the expert stream is 50-75 % of the
+  floor and already at 96 % of the card, and the control reads the same
+  bytes through the same kind of kernel, so the margin over it at c16 is
+  capped near +45 % at the literal floor and +30 % realistically. The
+  decisive margin lives at c1 and low batch, where the control's bf16
+  dense stream (5 GB per step per rank against our 2.6 GB) and its
+  per-layer latency are the majority of its step.
+- Decision: pursue B, C, E (no quality exposure) and A (canary-gated,
+  the largest single byte lever) in that order, D as an experiment behind
+  them. Each lands as its own qualified arm with the exact bench.
