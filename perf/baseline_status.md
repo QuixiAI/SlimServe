@@ -2654,3 +2654,110 @@ item), max_num_seqs 256 (c256 equal, c512 collapses), per-replica draft
 schedules and fixed k=3 (all below k=2), the QuixiCore NVFP4 prefill MoE
 GEMM (parity, no serving gain; parked off), KDA deferred commit (a loss at
 k=2). Raw: perf/results/2026-09-13/glm53f-record-final/.
+
+## GLM-5.3-Flash NVFP4 on 4x RTX PRO 6000 Blackwell (rtx6000 record), 2026-09-11 Phase 0 baseline
+
+Bring-up baseline of `glm53f-nvfp4-4` / `rtx6000` (branch `glm53f-rtx6000`
+4a1065081: the a100 kernel set built for sm_120f, driver 610.43.02), exact-token
+harness 1000/300, three passes per boot, median; not a record row until the
+campaign's Phase 6. Local B12X control on the same protocol, same day,
+unhandicapped (r28.1 image, native FP4 experts, fp8 KV, PCIe all-reduce).
+
+| arm | c1 | c8 | c16 | c1 1000/2000 | c8 1000/2000 | cold TTFT 32K / 128K |
+|---|---:|---:|---:|---:|---:|---|
+| ours, no speculation | 113.3 | 449.2 | 611.0 | 116.9 | 523.7 | 11.8 s / 124 s |
+| ours, DFlash2 k=7 | 153.6 | 330.9 | 340.3 | | | |
+| control r28.1, no speculation | 166.5 | 687.9 | 966.8 | | | 2.93 s / 14.9 s |
+| control r28.1, MTP-3 | 260.8 | 732.1 | 1005.8 | | | |
+
+Gate: mean text logprob -2.420 / -2.431 (band -2.407..-2.478), needle margins
+positive, canaries text / tool / image pass, exact-token true everywhere.
+Details, attribution and raw paths: `perf/optimization_status.md`, entry
+"2026-09-11: GLM-5.3-Flash NVFP4 on 4x RTX PRO 6000 Blackwell (rtx6000)".
+
+## GLM-5.3-Flash NVFP4 on 4x RTX PRO 6000 Blackwell (rtx6000 record), 2026-09-12 campaign record
+
+Record of `glm53f-nvfp4-4` / `rtx6000` at the end of the campaign (branch
+`glm53f-rtx6000` 4c1e0a90f, upstream/main 9d76a981b merged), same protocol as
+the Phase 0 baseline above: exact-token 1000/300, three passes per boot,
+median. Record settings: Marlin NVFP4 experts with the fused route+align and
+folded shared-expert combine, QuixiCore M<=16 decode GEMMs, FP8 swap-set and
+F32 sidecars, compact indexer cache, sparse TC prefill rows kernel, custom
+all-reduce over PCIe with a 64 MiB buffer, DFlash2 k=3 probabilistic/block
+under `--spec`.
+
+| arm | c1 | c8 | c16 | cold TTFT 32K / 128K | warm TTFT 32K / 128K |
+|---|---:|---:|---:|---|---|
+| record, no speculation | 166.2 | 581.5 | 778.0 | 3.14 s / 13.1 s | 0.174 s / 0.354 s |
+| record, DFlash2 k=3 probabilistic + block | 218.0 | 598.1 | 848.4 | 3.16 s / 13.3 s | 0.296 s / 0.544 s |
+| Phase 0 baseline, no speculation | 113.3 | 449.2 | 611.0 | 11.8 s / 124 s | |
+| control r28.1, no speculation | 166.5 | 687.9 | 966.8 | 2.93 s / 14.9 s | |
+| control r28.1, MTP-3 | 260.8 | 732.1 | 1005.8 | | |
+
+Gates: no-spec -2.452 / -2.439, spec -2.446 / -2.477 (band -2.407..-2.478; the second gate of
+each boot runs warm on prefix-cache hits), needle margins positive, canaries
+text / tool / image pass, exact-token true everywhere. Every item behind the
+row: `perf/optimization_status.md` from the 2026-09-11 rtx6000 entry to
+"Item P6"; the campaign index is `docs/glm53f-rtx6000-campaign.md` section 12b.
+
+## GLM-5.3-Flash NVFP4 on 4x RTX PRO 6000 Blackwell (rtx6000 record), 2026-09-14 closing record
+
+Record of `glm53f-nvfp4-4` / `rtx6000` at the close of the campaign's second
+block (branch `glm53f-rtx6000`, Phase 7 through Item D11), same protocol as
+the 2026-09-12 record above: exact-token 1000/300, three passes per boot,
+median; spec c1 is the five-offset protocol's mean of the three per-pass
+means. Record settings added since 09-12: `prefix_match_unit: 64`, the
+fused all-reduce transition (`glm5_next_mhc_allreduce_fusion`, captured
+decode graphs), the DMA-ring prefill all-reduce with the fp8 all-gather wire
+(`VLLM_B12X_DMA_AR_MIN_MB=24`, `B12X_PCIE_DMA_FP8=ag`), the lm_head FP8
+sidecar (`SLIMSERVE_FP8_SWAPSET=fp8-swapset-lmhead`), the router GEMV, the
+packed indexer projection and fused mHC norm, `swiglu_limit`.
+
+| arm | c1 | c8 | c16 | cold TTFT 32K / 128K | warm TTFT 32K / 128K |
+|---|---:|---:|---:|---|---|
+| record, no speculation | 196.6 | 729.5 | 1014.3 | 2.696 s / 11.226 s | 0.079 s / 0.268 s |
+| record, DFlash2 k=3 probabilistic + block | 265.5 (8.63 ms/step, 2.29 accepted) | 692.5 (2.13-2.21) | 1023.2 (2.28-2.36) | | |
+| alternative, MTP-3 head [[1,4,3],[5,8,1],[9,16,2]] | 272.1 (9.0 ms/step) | 725.4 | 1029.7 | | |
+| 2026-09-12 record, no speculation | 166.2 | 581.5 | 778.0 | 3.14 s / 13.1 s | 0.174 s / 0.354 s |
+| control r28.1, no speculation | 166.5 | 687.9 | 966.8 | 2.93 s / 14.9 s | |
+| control r28.1, MTP-3 | 267.6 (10.0 ms/step, 2.67 accepted) | 732.1 | 1005.8 | | |
+
+Gates: no-spec -2.440 / -2.445, spec -2.440 / -2.452 (band -2.41..-2.47),
+needle margins 12.8-19.6, exact-token true everywhere, 0 of 162 completions
+with the garbage or placeholder signature. The spec c8 / c16 rows of every
+DFlash arm between Item E3 (2026-09-12) and the placeholder fix (2026-09-14)
+were inflated by accepted placeholder drafts and stand only relative to each
+other. Every item behind the row: `perf/optimization_status.md` from
+"2026-09-12: rtx6000 Phase 7" to "Item D11"; the index is
+`docs/glm53f-rtx6000-campaign.md` section 12c.
+
+## GLM-5.3-Flash NVFP4 on 4x RTX PRO 6000 Blackwell (rtx6000 record), 2026-09-15 final record
+
+Record of `glm53f-nvfp4-4` / `rtx6000` as shipped on branch `glm53f-rtx6000`
+(48c5c8f93), same protocol as the closing record above: exact-token 1000/300,
+three passes per boot; spec c1 is the five-offset protocol's mean over all
+three passes, c8 is offset 0 (its four-offset mean is 773). What changed
+since 09-14: the record's drafter is the checkpoint's own MTP head, resolved
+from the target's own directory (variant `speculator`), with the batch-size
+draft schedule `[[1,4,3],[5,8,1],[9,16,2]]`, probabilistic drafting cut to
+the request's top-k / top-p (`draft_top_k_top_p`) and block verification;
+the drafter's Gumbel noise carries its own salt.
+
+| arm | c1 | c8 | c16 | cold TTFT 32K / 128K | warm TTFT 32K / 128K |
+|---|---:|---:|---:|---|---|
+| record, no speculation | 196.6 | 729.5 | 1014.3 | 2.696 s / 11.226 s | 0.079 s / 0.268 s |
+| record, `--spec` (MTP head, schedule, draft cut) | 270.0 (2.39 accepted/step) | 766.5 (1.67-1.72) | 1046.7 (2.11) | 2.711 s / 11.915 s | 0.087 s / 0.272 s |
+| control r28.1, no speculation | 166.5 | 687.9 | 966.8 | 2.93 s / 14.9 s | |
+| control r28.1, its own MTP-3 | 267.6 | 732.1 | 1005.8 | | |
+| control r28.1, its own MTP at depth 1 (its best c8) | | ~774 | | | |
+
+Against the control: no speculation +18 / +6 / +5 %, with speculation +1 /
++5 / +4 %, cold TTFT -8 % at 32K and -20 to -25 % at 128K; at c8 the record
+matches the control's best configuration of all while beating it elsewhere.
+Structured Foundry c8 workload 545 / 556 tok/s aggregate. Gates -2.480 /
+-2.454 (band), canaries text / tool / image pass, exact-token true
+everywhere. The one open decode gap is acceptance: the same MTP head accepts
+0.68 tokens per draft here and 0.72 in the control's tree, which the audit
+in `perf/optimization_status.md` ("Acceptance audit, part 3") narrows to the
+two trees' target quantization. Every item behind the row: that notebook from
+Item D12 to Item D17; campaign index `docs/glm53f-rtx6000-campaign.md`.

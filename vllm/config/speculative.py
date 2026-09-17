@@ -297,6 +297,13 @@ class SpeculativeConfig:
     distribution and uses the full draft logits for the probability ratio test
     during rejection sampling. This comes at the cost of additional GPU memory
     usage."""
+    draft_top_k_top_p: bool = False
+    """Draw the draft under the request's top-k / top-p as well as its
+    temperature. The verifier masks the target with them, so a draw from the
+    unmasked draft distribution that lands outside the target's support is
+    rejected outright; cutting the draft the same way removes those dead draws.
+    Exact: rejection sampling recovers the target distribution from any
+    proposal. Requires draft_sample_method='probabilistic'."""
 
     def compute_hash(self) -> str:
         """
@@ -368,6 +375,11 @@ class SpeculativeConfig:
                 {
                     "n_predict": hf_config.num_nextn_predict_layers,
                     "architectures": ["Glm5NextMTPModel"],
+                    # The draft config's hc_mult is the number of residual
+                    # streams the MTP input carries (the speculator widens
+                    # its hidden buffer by it). GLM's head takes the
+                    # contracted post-norm state, one stream, unlike DSV4.
+                    "hc_mult": 1,
                     # Validate GLM's pooled-tail state before enabling the
                     # ordinary DeepSeek cross-draft index-sharing optimization.
                     "index_share_for_mtp_iteration": False,
@@ -1293,6 +1305,11 @@ class SpeculativeConfig:
                 verification_parallel_config.tensor_parallel_size = 1
             self.draft_model_config.verify_with_parallel_config(
                 verification_parallel_config
+            )
+
+        if self.draft_top_k_top_p and self.draft_sample_method != "probabilistic":
+            raise ValueError(
+                "draft_top_k_top_p requires draft_sample_method='probabilistic'"
             )
 
         if self.index_share_for_mtp_iteration is not None:

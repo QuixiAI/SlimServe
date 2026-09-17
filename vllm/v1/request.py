@@ -201,6 +201,14 @@ class Request:
         # reference cycle (Request -> partial -> Request) that prevents
         # immediate garbage collection via reference counting.
         self._block_hasher: Callable[[Request], list[BlockHash]] | None = block_hasher
+        # The engine's RequestBlockHasher also hashes prompt tails (prefixes
+        # ending inside a hash block); a plain callable hasher does not.
+        self._prefix_hasher: Callable[[Request, int], BlockHash | None] | None = (
+            getattr(block_hasher, "hash_prefix", None)
+        )
+        # Prompt-tail hashes by length: the token ids are append-only, so an
+        # entry never goes stale, and only the probed lengths are memoized.
+        self._prefix_hash_memo: dict[int, BlockHash] = {}
         self.update_block_hashes()
 
         self.skip_reading_prefix_cache = self.get_skip_reading_prefix_cache()
@@ -258,6 +266,19 @@ class Request:
         """Compute block hashes for any new full blocks and append them."""
         if self._block_hasher is not None:
             self.block_hashes.extend(self._block_hasher(self))
+
+    def hash_prefix(self, end: int) -> "BlockHash | None":
+        """The hash of the first ``end`` tokens, including prefixes that end
+        inside a hash block (see ``RequestBlockHasher.hash_prefix``); None when
+        the hasher cannot produce it."""
+        if self._prefix_hasher is None:
+            return None
+        block_hash = self._prefix_hash_memo.get(end)
+        if block_hash is None:
+            block_hash = self._prefix_hasher(self, end)
+            if block_hash is not None:
+                self._prefix_hash_memo[end] = block_hash
+        return block_hash
 
     @property
     def use_structured_output(self) -> bool:

@@ -4,8 +4,51 @@
 > Metal. Earlier TurboQuant directives and measurements below are historical.
 > See `perf/optimization_status.md` for current validation evidence.
 
+# HANDOFF — GLM-5.3-Flash NVFP4 on 4x RTX PRO 6000 Blackwell (`glm53f-nvfp4-4` / `rtx6000`), branch `glm53f-rtx6000` (campaign closed 2026-09-15, PR #29 open)
+
+The regimen, rubric, the log of every phase and the next command are in
+`docs/glm53f-rtx6000-campaign.md` (sections 12b and 12c are the log, 13 the
+next command); every measurement is in `perf/optimization_status.md`. This
+section is the pointer and the one-paragraph state.
+
+State (2026-09-15, the record with the checkpoint's own MTP head as its
+drafter): exact-token 1000/300, three passes, against the voipmonitor jovian
+r28.1 control on the same box. No speculation c1 196.6 / c8 729.5 / c16
+1014.3 tok/s (control 166.5 / 687.9 / 966.8: +18 / +6 / +5 %) from the
+113.3 / 449.2 / 611.0 bring-up baseline. With `--spec`: five-offset c1 270.0
+against the control's MTP-3 267.6 - LEVEL, the c1 pass means spread 267-290 -
+c8 766.5 (732.1, +5 %), c16 1046.7 (1005.8, +4 %), and level at c8 with the
+control's best configuration (its head at depth 1, ~774). Cold TTFT 32K
+2.71 s (control 2.93), 128K 11.9 s (14.9); warm 0.087 / 0.272 s. Gates in
+band, canaries pass, 0 of 162 completions carry the garbage or placeholder
+signature. Two kernels landed after that measurement and were qualified on
+their own arms, not re-folded into it: the sparse-MLA tensor-core decode
+kernel (+2.2 % at c16) and the mHC token-axis split (microbenchmark only).
+Re-measured at the PR head 68aab5d8d on 2026-09-17 (one boot per arm, two
+passes, exact): no speculation c1 191.4 / 196.5, c8 734.2 / 730.2, c16
+1039.6 / 1031.4; with `--spec` c1 328.7 / 255.4, c8 765.6 / 816.4, c16
+1063.2 / 1092.4 - at or above the published numbers at every shape, 0 of
+12 completion files with the garbage or placeholder signature (notebook
+"Final confirmation at the PR head").
+The record's prefill all-reduce path needs the `b12x` package (PyPI,
+Apache-2.0, 1.3.0 validated); without it the DMA ring is skipped with a
+warning and the prefill numbers above do not hold.
+Obsolete sidecars on /raid (not deleted, operator's call): in
+/raid/weights/GLM-5.3-Flash-NVFP4/, `fp8-swapset-kda-tp4.{safetensors,json}`
+(6.8 GB), `fp8-swapset-dense.*` (2.4 GB) and `fp8-swapset.*` (6.7 GB) are
+superseded by `fp8-swapset-lmhead.*` (7.3 GB, the record's sidecar). Next:
+PR #29 through review (merged with upstream main 02fb15fc1 on 2026-09-17;
+six CodeRabbit rounds addressed through 68aab5d8d);
+then, per campaign doc section 13, the decode items the roofline audit left
+(the mHC site cost at 16..48 rows, the drafter's bf16 projections, the
+vocabulary all-gather - each worth 1-2 %), the unattributed 0.03-per-draft
+acceptance gap. The eager fused all-reduce path re-probed clean on
+2026-09-17 (the D5 corruption was the placeholder-draft bug; the graph-only
+gate stays as the measured configuration). NOT the native sm_120 NVFP4
+expert kernel: the expert GEMM already reads at 96 % of the card's bandwidth.
+
 <!--
-Two active campaign handoffs live in this file. They cover different
+The campaign handoffs in this file cover different
 platforms and different hardware, and each is current for its own campaign;
 neither supersedes the other. They met on this file in the 2026-08-28 merge
 of origin/main and were joined rather than reconciled.
@@ -13,6 +56,7 @@ of origin/main and were joined rather than reconciled.
   1. NVFP4-on-Metal campaign (M1 Ultra / M5 Max)  -- section below
   2. MI300X GGUF profile record                   -- second section
   3. GLM-5.3-Flash on 8x A100 (glm53f-*)          -- third section, at EOF
+  4. GLM-5.3-Flash on 4x RTX PRO 6000 (rtx6000)     -- the section above this comment
 -->
 
 # HANDOFF — NVFP4-on-Metal campaign (updated 2026-08-25; CAMPAIGN COMPLETE through UPDATE 55 — PR #12 open, origin/main merged and re-gated bit-exact, QuixiCore-Metal port landed)
@@ -4120,7 +4164,7 @@ TP4 = 36 MLA + 18 indexer + 4 KDA state pages; 106 at TP8 = 68 + 34 + 4.
   affinity had frozen a chance 5/3 session split for a whole leg (restores
   2x on one replica, 845 -> 671 turns, one recall miss). New terms:
   prompt tokens routed per replica over the last 64 requests x 0.1
-  (VLLM_DP_PREFIX_AFFINITY_RECENT_WINDOW / _RECENT_PERMILLE) and only the
+  (`VLLM_DP_PREFIX_AFFINITY_RECENT_WINDOW / _RECENT_PERMILLE`) and only the
   longest recorded match is credited. Check on any leg: "Engine 000/001
   ... Running:" averages in the server log should be within ~0.2.
 - CHUNK SIZE: 4096/8192-token chunks win the random benches (+5%
@@ -4152,3 +4196,44 @@ TP4 = 36 MLA + 18 indexer + 4 KDA state pages; 106 at TP8 = 68 + 34 + 4.
   `pgrep -f "^bash script.sh"` or safekill.
 - Installed vllm/_quixicore_C*.so = build with the parked prefill GEMM
   (all other ops unchanged).
+
+## 2026-09-15 11:20: the rtx6000 record's drafter switched to the checkpoint's MTP head; the tree is ahead of the control at every shape but spec c1, where it is level
+
+- RECORD glm53f-nvfp4-4/rtx6000 now registers the checkpoint's own MTP
+  head as its drafter (variant `speculator`, `local_dir` = the target's,
+  so the draft model is the target's own directory and no host path is in
+  the repo), with the batch-size schedule `[[1,4,3],[5,8,1],[9,16,2]]`,
+  probabilistic drafting cut to the request's top-k / top-p, block
+  verification. DFlash2 (cc-by-nc-nd-4.0) stays the a100 variant's.
+- Exact-token 1000/300, three passes, against the voipmonitor jovian
+  r28.1 control on this box: no speculation 196.6 / 729.5 / 1014.3 vs
+  166.5 / 687.9 / 966.8 (+18 / +6 / +5 %); with speculation 270.0
+  (five-offset c1 mean) / 766.5 / 1046.7 vs 267.6 / 732.1 / 1005.8
+  (+1 / +5 / +4 %), and level at c8 with the control's best-ever
+  configuration (its head at depth 1, ~774); cold TTFT 2.71 s / 11.9 s vs
+  2.93 s / 14.9 s; warm 0.087 / 0.272 s; Foundry structured c8 545 / 556
+  tok/s. Gates in band, canaries pass, every run `exact: true`.
+- Acceptance audit closed (notebook "part 3"): the MTP head accepts 0.68
+  per draft here against 0.72 in the control's tree on the same weights.
+  Excluded: the FP8 swap-set, the verification rule (block = standard),
+  index sharing, the draft cache dtype, the native sampler kernels, the
+  draft expert kernel, the hidden-state handoff, the router, the indexer.
+  What is left is the two targets' quantized numerics (TV 0.19 on the gate
+  text, argmax agreement 74 %, ours the sharper): our Marlin W4A16 experts
+  + BF16 latents against the control's b12x W4A4 + fp8_ds_mla. That is the
+  next experiment and the only remaining decode gap.
+- Adopted from the control: the draft-noise salt (`DRAFT_NOISE_SALT`), an
+  output-bias fix - our draft draw shared its (seed, position) key with
+  the verifier's residual resample.
+- Rejected and removed this block: a BF16 draft head (D12), index sharing
+  on this record (D13, within noise), the draft temperature scale (D17,
+  the request's own temperature is the peak).
+- Harness: chains now gate on `ruff --select F` before any arm (a staged
+  `unique_name` typo cost a 90-minute arm at its boot), and `ab2.sh` /
+  `stop_server.sh` kill by pre-collected PID and wait for the API server
+  (an orphaned arm's pattern kill had killed the next arm's server).
+- NEXT (as written that morning; the decode roofline audit later the same
+  day closed the native expert kernel - Marlin reads the experts at 96 % of
+  the card's bandwidth - and acceptance audit parts 4 and 5 ran the
+  target-numerics experiment and closed it unattributed): the ~1 ms k=0
+  spec-mode overhead and the eager fused-path corruption.

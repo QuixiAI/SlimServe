@@ -1191,7 +1191,8 @@
           "bytes": 197881155500,
           "summary": "RedHatAI's LLM Compressor release of the 169B GLM-5.3-Flash: 42 MoE layers in NVFP4 (group 16), the last expert layer in FP8, attention/KDA/mHC/embeddings/vision in BF16. On Ampere the experts run through the Marlin W4A16 NVFP4 kernels.",
           "min_gpus": {
-            "a100": 4
+            "a100": 4,
+            "rtx6000": 4
           },
           "files": [
             {
@@ -1499,6 +1500,16 @@
         "GeForce driver disables GPU peer-to-peer, so every tensor-parallel collective stages through host memory. Profiles on this platform should prefer expert parallelism and host-offloaded tables over designs that add per-step all-reduces.",
         "SM86 has no FP8 tensor cores; FP8 checkpoints serve through the Marlin W8A16 weight-only kernels."
       ]
+    },
+    "rtx6000": {
+      "title": "NVIDIA RTX PRO 6000 Blackwell",
+      "compute_capability": [
+        12,
+        0
+      ],
+      "vram_bytes": 102642417664,
+      "gate": "gpus",
+      "status": "supported"
     }
   },
   "profiles": {
@@ -2937,6 +2948,105 @@
             "Reasoning effort: the GLM-5.3-Flash chat template implements the GLM-5.3 Low / High / Max levels (default Max) from the reasoning_effort chat_template_kwargs; thinking itself stays always-on (serving policy). No server flag is involved.",
             "Thinking budget (2026-09-11): override_generation_config.thinking_token_budget 2000 per request, the fleet convention (qwen38 records); the V2 runner nudges the model to wrap up at 85% of the budget and force-closes the think block at 100%, capped inside the request's max_tokens. Added after the 1M-context legs showed probes at 900K+ spending their whole 1,024-token reply budget thinking with an empty answer: this record had no budget, so nothing ever closed the block."
           ]
+        },
+        "rtx6000": {
+          "platform": "rtx6000",
+          "default_quant": "NVFP4",
+          "engine": {
+            "tensor_parallel_size": 4,
+            "enable_expert_parallel": false,
+            "max_num_seqs": 16,
+            "block_size": 64,
+            "prefix_match_unit": 64,
+            "gpu_memory_utilization": 0.85,
+            "kv_cache_dtype": "auto",
+            "attention_config": {
+              "backend": "QUIXICORE_MLA_SPARSE",
+              "sparse_mla_force_mqa": true
+            },
+            "moe_backend": "marlin",
+            "linear_backend": "auto",
+            "kernel_config": {
+              "moe_backend": "marlin",
+              "linear_backend": "auto"
+            },
+            "compilation_config": {
+              "cudagraph_mode": "FULL_DECODE_ONLY",
+              "max_cudagraph_capture_size": 64
+            },
+            "limit_mm_per_prompt": {
+              "image": 2
+            },
+            "reasoning_parser": "glm47",
+            "tool_call_parser": "glm47",
+            "served_model_name": "GLM-5.3-Flash",
+            "enable_prefix_caching": true,
+            "override_generation_config": {
+              "thinking_token_budget": 2000
+            },
+            "additional_config": {
+              "glm5_next_compact_indexer_cache": true,
+              "glm5_next_sparse_tc_prefill": true,
+              "glm5_next_mhc_allreduce_fusion": true,
+              "glm5_next_sparse_tc_decode": true
+            }
+          },
+          "env": {
+            "VLLM_CUSTOM_AR_ALLOW_PCIE": "1",
+            "VLLM_CUSTOM_AR_MAX_SIZE_MB": "64",
+            "VLLM_B12X_DMA_AR_MIN_MB": "24",
+            "B12X_PCIE_DMA_FP8": "ag",
+            "SLIMSERVE_FP8_SWAPSET": "fp8-swapset-lmhead"
+          },
+          "notes": [
+            "RECORD (campaign 2026-09-11 .. 2026-09-15, branch glm53f-rtx6000; regimen, rubric and logs in docs/glm53f-rtx6000-campaign.md, every measurement in perf/optimization_status.md): 4x RTX PRO 6000 Blackwell Workstation (sm_120, 96 GB GDDR7, PCIe 5 x16, no NVLink; the cards pair under two host bridges, GPU0-1 and GPU2-3). The a100 kernel set is built for family cubin 12.0f. Exact-token bench 1000/300, three passes (2026-09-15): no speculation c1 196.6 / c8 729.5 / c16 1014.3 tok/s, under the speculator 270.0 (five-offset c1 mean) / 766.5 / 1046.7, from a 113.3 / 449.2 / 611.0 bring-up baseline; cold TTFT 32K 2.71 s (from 11.8 s), 128K 11.2 s without the speculator and 11.9 s with it (from 124 s); warm (prefix-cached) 0.087 s / 0.272 s. Against the voipmonitor jovian r28.1 control on this box (166.5 / 687.9 / 966.8 without speculation, 267.6 / 732.1 / 1005.8 with its own MTP-3 head, cold TTFT 2.93 s / 14.9 s): no speculation +18 / +6 / +5 %, TTFT -8 / -20 %; speculative c1 level (270.0 against 267.6, inside the c1 spread across passes), c8 +5 %, c16 +4 %, and level at c8 with the control's best configuration of all (its head at depth 1, ~774 tok/s) while beating it at c16 and everywhere without speculation.",
+            "Context from config.json (1048576); block_size 64 for the pooled-indexer cache; parsers glm47; TP4 with the experts sharded (enable_expert_parallel off: the a100 expert-parallel arm measured 4-6% slower and the PCIe all-reduce cost was re-measured here, not assumed).",
+            "moe_backend marlin (top-level and kernel_config): NVFP4 experts through Marlin W4A16 compiled for 12.0f, with the QuixiCore fused route+align (one launch for the scored top-k and the Marlin block alignment) and the shared-expert combine folded into the Marlin sum at decode. The sm_120 tensor cores run NVFP4 natively, but the stock CUTLASS and FlashInfer grouped FP4 GEMMs emitted garbage on this card class in vLLM (#54150, cutlass #3096); a native sm_120 expert kernel is closed: the decode roofline audit measured Marlin reading the experts at 1556 GB/s, 96 % of this card's 1628 GB/s, so the MoE cost is the bytes the routing touches and no kernel moves it.",
+            "Backbone at decode: the M<=16 QuixiCore tensor-core GEMMs (bf16 and block-FP8) replace cuBLAS on the dense projections; the FP8 swap-set sidecar (slimserve.fp8_swapset, written next to the checkpoint) serves the native block-FP8 tensors of the modules the conversion left in BF16, including the self-quantized KDA projections; the F32 sidecar (slimserve.f32_overrides) restores the router bias, KDA A_log/dt_bias and mHC base/scale the conversion rounded to BF16. Both sidecars are optional files: the record serves the plain conversion without them.",
+            "attention_config QUIXICORE_MLA_SPARSE with sparse_mla_force_mqa: the QuixiCore sparse NoPE MLA kernels compiled for sm_120 (99 KB of opt-in shared memory per block against 163 KB on sm80): at decode the SIMT kernel with 32/64-token partitions and the channel-parallel reducer below 16 rows and the partitioned tensor-core kernel from 16 rows (additional_config glm5_next_sparse_tc_decode); on prefill chunks the tensor-core rows kernel (additional_config glm5_next_sparse_tc_prefill, one program per query token over its whole index list, no partition scratch).",
+            "kv_cache_dtype auto: an unquantized bf16 main KV. FP8 main KV for the 11 sparse-MLA layers (glm5_next_main_kv_fp8) was measured twice and rejected here: decode cost (-4.7 % c16) and, after the upstream merge, the fp8 sparse prefill kernel needs 116 KB of shared memory per block that sm_120 does not opt in to (the branch makes that kernel self-qualifying). FP8 is the only permitted KV quantization; TurboQuant is prohibited.",
+            "gpu_memory_utilization 0.85: 198 GB of weights over four 96 GB ranks plus the Marlin repack leave ~30 GB per rank of KV at this setting; raised only when a measured boot shows the headroom.",
+            "Host and NVMe KV tiers are not configured on this record yet. This box has 188 GB of host RAM behind earlyoom, so the a100 sizing (72 GiB pinned per rank) does not transfer; the plan is 32 GiB per rank plus a disk tier under SLIMSERVE_KV_TIER_DIR, added only after benchmarks/benchmark_kv_tier_eviction.py with VLLM_KV_TIER_VERIFY=1 passes here.",
+            "Speculation: --spec opts in to this record's drafter, the checkpoint's own MTP head, with the batch-size schedule and the draft cut described above (2026-09-15, three passes: c1 270.0 five-offset mean / c8 766.5 / c16 1046.7 tok/s against 196.6 / 729.5 / 1014.3 without it, and against the control's 267.6 / 732.1 / 1005.8; the structured Foundry c8 workload 545 / 556 tok/s against the DFlash2 record's 448 / 541). Accepted per step: 2.39 at c1 (k=3), 1.67-1.72 at c8 (k=1), 2.11 at c16 (k=2). The head accepts 0.68 per draft here against 0.72 in the control's tree on the same weights - the audit in the notebook excludes the swap-set, the verification rule, index sharing, the draft cache dtype, the sampler kernels, the draft expert kernel, the target's expert quantization (the control's own W4A4 kernels over this checkpoint accept 0.681 against Marlin W4A16's 0.690) and the target's latent precision (fp8 main KV 0.687), and closes unattributed: worth ~6 % at c1 / 3 % at c8 to whoever closes it. The source's DFlash2 drafter measured c1 265.5 / c8 692.5 / c16 1023.2 here and is still the a100 variant's; k=4/5/7 lose, greedy drafting loses everywhere, drafting under a scaled temperature loses, and a schedule that switches drafting off above a batch size costs about 1 ms per step against plain no-spec (open item). Under the speculator the drafter shares the target's prefix-cache hits and its KV dtype.",
+            "Sampling: the V2 runner's fused top-k / top-p / Gumbel-max draw (top_k <= 32, fp32 CUDA logits) on every step; thinking, tool calling and prefix caching are the registry serving defaults; thinking budget override_generation_config.thinking_token_budget 2000 per request (fleet convention).",
+            "env VLLM_CUSTOM_AR_ALLOW_PCIE=1 with VLLM_CUSTOM_AR_MAX_SIZE_MB=64: vLLM's custom all-reduce is switched off by default when more than two ranks lack NVLink; over the PCIe 5 peer path it replaces NCCL's ring (+8.5 % c1, +4 % c8/c16 at the 8 MiB default buffer), and the 64 MiB buffer takes the prefill chunks' [tokens, hidden] reductions off NCCL as well (cold 32K -11 %, c8 +3 %). Two-shot above 512 KB, NCCL above the buffer.",
+            "prefix_match_unit 64 (Item E1): prefix-cache keys every 64 tokens next to block_size 64. The hybrid cache's unified block spans 1088 tokens (the KDA state group's block over the MLA and indexer groups), so without this a prompt hits the cache only in 1088-token steps and every prompt below that length re-prefills in full; with it the branch's partial-hit machinery serves hash-granular hits, and an exact repeat hits P-1 tokens and replays its last token as a one-token decode row (Items E2/E3).",
+            "additional_config glm5_next_compact_indexer_cache (Item P1 of the first prefill block): the GLM indexer keeps its compact per-token key cache instead of the full-width one, qualified on sm_120; it caps the DFlash draft width at 5 tokens.",
+            "additional_config glm5_next_sparse_tc_prefill (Item P6): the prefill-shaped sparse-MLA tensor-core rows kernel (sparse_tc_nope_rows, bf16 latents) for prefill chunks; cold 32K 4.14 s -> 3.13 s, 128K 17.2 s -> 13.2 s at the time, decode unchanged.",
+            "additional_config glm5_next_mhc_allreduce_fusion (Item D5): the mHC transition fused into the custom all-reduce (one launch per site, the next site's comb coefficients normalized on a side stream), taken for decode batches of at most 8 tokens inside captured decode graphs only; eager steps take the split path. No-spec c1 +4.5 %, spec step -2.8 %.",
+            "additional_config glm5_next_sparse_tc_decode: the partitioned tensor-core sparse-MLA kernel (sparse_tc_nope, SPLIT=64; only its SPLIT=128 tile was ever too big for sm_120's 99 KB) for decode batches of 16 to 64 rows on bf16 latents, the SIMT kernel below (it is faster there at every list width). Rows are batch x (drafts + 1), so c1 stays SIMT, c8 and c16 take it: c16 +2.2 % (pooled n=8 per arm), c8 within noise.",
+            "env VLLM_B12X_DMA_AR_MIN_MB=24 with B12X_PCIE_DMA_FP8=ag (Items P2/P3 of the second prefill block): prefill-sized all-reduces (24 MiB and up) take the b12x PCIe DMA ring with an fp8 all-gather wire; the reduce-scatter stays bf16. Cold 32K -11 % then -4.3 %, 128K -5 %. Needs the b12x package (PyPI b12x, Apache-2.0; 1.3.0 validated), which is not a SlimServe requirement: without it the ring is skipped with a warning, these all-reduces stay on the custom kernel, and the prefill numbers above do not hold.",
+            "env SLIMSERVE_FP8_SWAPSET=fp8-swapset-lmhead (Item D1b): the FP8 swap-set sidecar that also carries the lm_head channel-wise FP8 tensors (the head is language_model.lm_head; matched by regex); step -1.5 %. The sidecar is built on first use next to the checkpoint."
+          ],
+          "speculator": {
+            "repo": "RedHatAI/GLM-5.3-Flash-NVFP4",
+            "local_dir": "GLM-5.3-Flash-NVFP4",
+            "engine": {
+              "method": "mtp",
+              "num_speculative_tokens": 3,
+              "num_speculative_tokens_per_batch_size": [
+                [
+                  1,
+                  4,
+                  3
+                ],
+                [
+                  5,
+                  8,
+                  1
+                ],
+                [
+                  9,
+                  16,
+                  2
+                ]
+              ],
+              "draft_sample_method": "probabilistic",
+              "rejection_sample_method": "block",
+              "draft_top_k_top_p": true
+            },
+            "note": "The checkpoint's own MTP head (model_mtp.safetensors, layer 45: FP8 block-128 experts served through the Marlin W8A16 path, BF16 eh_proj / norms / indexer / attention, and no embedding or head of its own - it shares the target's), so the draft model is the target directory itself and nothing extra is downloaded. It is also the commercially clean drafter: the checkpoint's own licence, where the source's registered DFlash2 drafter is cc-by-nc-nd-4.0 (the a100 variant still serves that one). Draft width by batch size: k=3 up to 4 sequences, k=1 from 5 to 8, k=2 from 9 to 16 - a k=3 verify step at c8 streams ~172 of the 288 experts per layer, so a narrower draft wins there and a wider one wins at c1. Probabilistic drafting cut to the request's own top-k / top-p (draft_top_k_top_p: the verifier cuts the target with them, so an uncut draw outside that support is dead; exact under rejection sampling), block verification."
+          }
         }
       }
     },

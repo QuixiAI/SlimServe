@@ -16,6 +16,7 @@ from vllm.model_executor.layers.fused_moe.config import (
 from vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe import (
     rocm_aiter_grouped_topk,
 )
+from vllm.model_executor.layers.fused_moe.router import glm_route_align
 from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
 from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
     fused_topk_bias,
@@ -292,6 +293,10 @@ class GroupedTopKRouter(BaseRouter):
         input_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute routing using grouped top-k."""
+        if glm_route_align.eligible(self, router_logits, indices_type):
+            # One launch: the top-k plus the Marlin block alignment, which
+            # fused_marlin_moe consumes for this batch.
+            return glm_route_align.route(self, router_logits)
 
         def valid_grouping() -> bool:
             # Check if num_experts is greater than num_expert_group

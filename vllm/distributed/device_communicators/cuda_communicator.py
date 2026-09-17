@@ -26,6 +26,10 @@ from vllm.platforms import current_platform
 
 from ..utils import StatelessProcessGroup
 from .aiter_custom_all_reduce import AiterCustomAllreduce
+from .b12x_dma_all_reduce import (
+    B12xDmaAllReduce,
+    maybe_create_b12x_dma_all_reduce,
+)
 from .base_device_communicator import DeviceCommunicatorBase
 
 if TYPE_CHECKING:
@@ -93,6 +97,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self.symm_mem_comm: SymmMemCommunicator | None = None
         self.fi_ar_comm: FlashInferAllReduce | None = None
         self.aiter_ar_comm: AiterCustomAllreduce | None = None
+        self.dma_ar_comm: B12xDmaAllReduce | None = None
         self._comm_init_error: BaseException | None = None
         self._comm_init_thread: threading.Thread | None = None
         self._comm_init_started = False
@@ -252,9 +257,21 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self.ca_comm = CustomAllreduce(
                 group=self.cpu_group,
                 device=self.device,
+                max_size=envs.VLLM_CUSTOM_AR_MAX_SIZE_MB << 20,
                 symm_mem_enabled=(
                     self.symm_mem_comm is not None and not self.symm_mem_comm.disabled
                 ),
+            )
+
+        if (
+            self.world_size > 1
+            and current_platform.is_cuda()
+            and "tp" in self.unique_name
+        ):
+            # Only the tensor-parallel group all-reduces activations; the
+            # ring pins an IPC buffer of VLLM_B12X_DMA_AR_MAX_MB per rank.
+            self.dma_ar_comm = maybe_create_b12x_dma_all_reduce(
+                self.cpu_group, self.device
             )
 
         if (
@@ -418,6 +435,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
             out = aiter_ar_comm.custom_all_reduce(input_)
             assert out is not None
             return out
+        dma_ar_comm = self.dma_ar_comm
+        if dma_ar_comm is not None and dma_ar_comm.should_use(input_):
+            return dma_ar_comm.all_reduce(input_)
         ca_comm = self.ca_comm
         if (
             ca_comm is not None
@@ -679,6 +699,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self.pynccl_comm = None
         if self.ca_comm is not None:
             self.ca_comm = None
+        if self.dma_ar_comm is not None:
+            self.dma_ar_comm.close()
+            self.dma_ar_comm = None
         if self.aiter_ar_comm is not None:
             self.aiter_ar_comm.close()
             self.aiter_ar_comm = None

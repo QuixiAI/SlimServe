@@ -26033,6 +26033,7 @@ Phases, by value over risk:
   covers ~2K keys instead of 16K: prep 1.96 -> 0.22 ms at 512 queries,
   4.85 -> 0.64 ms at 2048 (attention 3.7 / 13.7 ms); tests 5/5. In the
   prefill profile the prep share (6.6%) drops to under 1%.
+
 - PREFILL CHUNK SIZE (2026-09-13, queue50, record with the prefill kernel,
   k=2; raw perf/results/2026-09-13/glm53f-chunk-{8192,16384}/): the
   engine caps scheduled tokens at max_num_batched_tokens minus the draft
@@ -26179,3 +26180,3488 @@ Phases, by value over risk:
   leg engines 3.63/3.65 avg running (was 2.71/4.63), restores 9.6K (was
   20.1K), recall 112/112 (was 105/106), turns 704 (was 671); 2048 leg
   3.46/3.50, migrated=0 in both. Commit d6af7171b.
+
+## 2026-09-11: GLM-5.3-Flash NVFP4 on 4x RTX PRO 6000 Blackwell (rtx6000): Phase 0 baseline and control
+
+Branch `glm53f-rtx6000` at 4a1065081 (bring-up on upstream 2b355117e): the a100
+kernel set built for `sm_120f`, new `rtx6000` platform and `glm53f-nvfp4-4`
+record, nothing tuned yet. Campaign doc `docs/glm53f-rtx6000-campaign.md`.
+Hardware: tinybox, 4x RTX PRO 6000 Blackwell Workstation (sm_120, 96 GB,
+PCIe 5, no NVLink, PHB pairs 0-1 / 2-3), driver 610.43.02 (CUDA 13.3),
+CUDA 13.0 toolkit build, EPYC 9334, 188 GB, governor schedutil, power limit
+600 W, no NCCL/VLLM env overrides. Profile command:
+`slimserve.cli glm53f-nvfp4-4 --serve --host 127.0.0.1 --port 8000 -y [--no-spec|--spec]`
+(TP4, EP off, Marlin W4A16 experts, QUIXICORE_MLA_SPARSE + force_mqa, block 64,
+bf16 KV, FULL_DECODE_ONLY capture 64, max_num_seqs 16, gpu_memory_utilization
+0.85, prefix caching, thinking budget 2000, no KV tier). KV pool 2,076,238
+tokens (engine adds 10 padding layers, "may waste at most 29.41 %").
+Harness: `benchmarks/benchmark_dsv4_exact.py` on `prompt-source.txt`, exact
+token counts, temperature 1.0 / top_p 0.95 / top_k 20, seed 42, `--repeat-source
+--allow-no-spec`; one 300-token request per pass at c1, 8 and 16 concurrent at
+c8/c16; three passes per boot, median reported; `exact: true` on every run.
+Raw: `perf/results/2026-09-11/{p0-nospec,p0-nospec-long,p0-dflash2,ctl-nospec,ctl-mtp3}-pass*/`;
+traces `~/.local/scratch/slimserve-glm53/profile-{state-p0-nospec,state-p0-dflash2,prefill-p0-32k}/`.
+
+| arm | c1 | c8 | c16 | c1 1000/2000 | c8 1000/2000 | cold TTFT 32K | cold TTFT 128K |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| ours, no speculation | 113.3 | 449.2 | 611.0 | 116.9 | 523.7 | 11.76 s | 124.3 s |
+| ours, DFlash2 k=7 | 153.6 | 330.9 | 340.3 | | | | |
+| control B12X r28.1, no speculation | 166.5 | 687.9 | 966.8 | | | 2.93 s | 14.9 s |
+| control B12X r28.1, MTP-3 | 260.8 | 732.1 | 1005.8 | | | | |
+
+- Ours per pass: no-spec c1 112.0/113.3/113.3, c8 449.2/448.0/450.8, c16
+  614.6/611.0/609.9; long c1 117.1/116.8, c8 524.0/523.4; DFlash2 c1
+  168.8/153.6/148.4, c8 316.6/337.8/330.9, c16 344.2/340.3/333.9. Warm
+  (prefix-cached) TTFT: 32K 0.175 s, 128K 1.18 s. The 32K cold number
+  includes two Triton JITs on the first request (`_zero_kv_blocks_kernel`,
+  `_topk_topp_kernel`); the profiled cold 32K prefill on a warmed server is
+  11.58 s of GPU kernel time, so JIT is not the story.
+- Control: image `voipmonitor/vllm:jovian-judgement-community-20260908-r28.1`
+  (vLLM v0.26.1rc0+glm53.r28.1), checkpoint
+  `local-inference-lab/GLM-5.3-Flash-NVFP4` (modelopt: NVFP4 g16 routed
+  experts, MXFP8 MTP experts, BF16 backbone; same byte class as RedHatAI),
+  TP4, `KV_CACHE_QUANT=fp8_ds_mla`, `CUDAGRAPH_MODE=FULL_AND_PIECEWISE`,
+  `GPU_MEMORY_UTILIZATION=0.93`, MAX_NUM_SEQS 32, batched tokens 4096, run
+  UNHANDICAPPED on the 610 driver (no `NCCL_CUMEM_ENABLE=0`,
+  `NCCL_P2P_DISABLE=1`, `B12X_PCIE_ALLREDUCE=0`). Its stack per its log:
+  `B12X` NvFp4 MoE backend (native sm_120 FP4 experts), fp8_ds_mla KV, B12X
+  PCIe all-reduce (one-shot <= 84 KB, two-shot bf16 <= 768 KB, DMA >= 6 MB),
+  custom fusions norm_quant / act_quant / allreduce_rms, breakable CUDA
+  graphs, FlashInfer sampling, KV pool 4,686,328 tokens. Per pass: no-spec
+  c1 156.0/166.6/166.5, c8 378.8/687.9/688.4, c16 616.4/966.8/967.9 (pass 1
+  is its graph warm-up); MTP-3 c1 214.6/286.3/260.8, c8 732.1/717.5/733.6,
+  c16 1017.6/1005.8/953.2. Old handicapped control for reference: 134.0 /
+  483.7 / 598.6.
+- Control cold TTFT (same probe, same prompts, no speculation): 32K 2.93 s,
+  128K 14.9 s; warm 0.082 s / 0.268 s. Ours is 4.0x / 8.3x slower cold and
+  2.1x / 4.4x slower warm (the warm 128K first token at 1.18 s says our
+  per-step cost at 128K context, not only prefill, needs the Phase 5 look).
+- Gap, ours / control, no speculation: 0.68 / 0.65 / 0.63 at c1 / c8 / c16.
+- SM80-gated features and their sm_120 status on this tree: indexer row
+  sharding (`glm5_next_indexer_row_shard`, gate `is_device_capability((8,0))`
+  at `glm5_next_indexer.py:94`): not enabled, prefill lever to qualify;
+  compact indexer cache (`glm5_next_compact_indexer_cache`, gate at :125):
+  not enabled, first prefill item; sparse tensor-core decode
+  (`glm5_next_sparse_tc_decode`, `quixicore_mla_sparse.py:74`): kernel needs
+  a 99 KB shared-memory retune (fails at 147-163 KB); mHC norm fusion
+  (`glm5_next.py:248` `_fuse_mhc_norm`): off here, the norm runs as a
+  separate kernel (Triton norms 3 % of the step); mHC projection overlap
+  (`glm5_next.py:442`, `sm80=` argument): off; FP32 router GEMV
+  (`gate_linear.py`, SM80 and 288 experts): off, router runs on cuBLAS.
+  Each is a one-line gate plus a parity run to qualify, except the TC decode
+  retune.
+- Quality gates (gate.py, 8 fixed 512+32 slices, prompt logprobs): no-spec
+  mean text logprob -2.420 / -2.431 (two runs, one boot), DFlash2 -2.450 /
+  -2.462; reference band -2.407..-2.478 with 0.02-0.03 boot jitter. Needle
+  margins 12.8-20.4 nats. Canaries text / tool call / image pass on both
+  boots, no U+FFFD.
+- Speculation: DFlash2 accepts 1.0-1.7 of its 7 drafted tokens per step on
+  this prose workload (acceptance rate 0.14-0.25), which is why c1 gains
+  36 % and c8 / c16 lose 26 % / 44 %. The control's MTP-3 accepts 1.2-1.9 of
+  3 and keeps c8 / c16 above its no-spec numbers. Phase 3 measures the
+  checkpoint's own MTP head and the structured workload before choosing.
+
+State label (no-spec, profiled c1 round, 5 full steps): wall/step 7.579 ms =
+launch latency 12.5 us + span 7.574 ms (busy 7.241 + in-step idle 0.333);
+GPU span 8.47 ms/step, 1583 launches/step. Decode attribution:
+
+| class | ms/step | share | launches/step |
+|---|---:|---:|---:|
+| cuBLAS gemvx (M=1 backbone projections) | 2.11 | 24.4 % | 210 |
+| cuBLAS gemm 16x16 wmma sm80 tiles (one per KDA layer at 34 us: the in_proj weight stream at ~1.5 TB/s, plus 42+10 small ones) | 1.54 | 17.7 % | 90 |
+| Marlin MoE (two launches per MoE layer) | 1.12 | 12.9 % | 84 |
+| NCCL all-reduce ring LL, 10.9 us each | 0.99 | 11.5 % | 91 |
+| mHC transition (`dsv4_mhc::fused_pre_transition`) | 0.78 | 9.0 % | 91 |
+| MoE glue (topk / align / sum / act) | 0.45 | 5.2 % | 222 |
+| sparse MLA decode + reduce | 0.35 | 4.0 % | 22 |
+| Triton norms / adds | 0.26 | 3.0 % | 246 |
+| pooled indexer | 0.20 | 2.3 % | 22 |
+| KDA recurrent + conv | 0.17 | 2.0 % | 68 |
+| lm_head GEMV (200 us, outside the graph) | 0.16 | 1.9 % | 1 |
+| copies, aten elementwise, sampling, other | 0.55 | 6.1 % | 400 |
+
+The cuBLAS M=1 kernels are 41 % of the step and run near bandwidth: the
+decode step is bytes-bound on the BF16 backbone, exactly the doc's Phase 1
+(FP8 backbone, decode GEMMs), with all-reduce, mHC and launch count behind.
+
+Cold 32K prefill attribution (whole trace before the first decode graph,
+11.58 s kernel busy, 13,276 launches, 6 prefill chunks):
+
+| kernel | s | share |
+|---|---:|---:|
+| `_pooled_logits_kernel` (indexer prefill scoring, general non-compact path, 88 launches at 74.5 ms) | 6.56 | 56.6 % |
+| NCCL all-reduce ring LL, 547 at 2.97 ms (67 MB each, 22.6 GB/s algbw) | 1.62 | 14.0 % |
+| `mla_decode_fp8_v<true,false,512,512>` (sparse MLA prefill through the gathered-MQA decode kernel) | 1.24 | 10.7 % |
+| `dsv4_mhc::partials` (mHC prefill) | 0.85 | 7.3 % |
+| Marlin MoE | 0.54 | 4.6 % |
+| cutlass BF16 GEMMs (sm80 tensorop tiles) | 0.36 | 3.1 % |
+| everything else | 0.41 | 3.7 % |
+
+The indexer scoring is O(L^2) at ~17 TFLOP/s (pool keys recomputed per
+query program, no tensor cores) and scales 16x to 128K, which accounts for
+the 124 s. The compact indexer cache path (`cached_pool_logits`, precomputed
+64-wide pool keys) is gated "qualified only on SM80"
+(`glm5_next_indexer.py:125`); qualifying it here, or a GEMM-form scoring
+kernel, is the first prefill item and moves into Phase 1.
+
+Decisions: baseline recorded, no change retained. Phase 1 order: (1) FP8
+backbone + decode GEMM re-land (bytes); (2) custom all-reduce over PCIe
+(`VLLM_CUSTOM_AR_ALLOW_PCIE=1`, upstream disables it on >2 PCIe GPUs); (3)
+indexer prefill scoring; the native NVFP4 expert kernel moves up to Phase 2
+because the control's c8 / c16 lead is mostly its expert path. Test
+classification and upstream breakages: campaign doc section 12.
+
+## 2026-09-11: rtx6000 Phase 1 (decode bytes and overhead), item by item
+
+Same box, harness and profile as the Phase 0 entry; every arm is
+`ab.sh <run> [ENV=..] -- --no-spec` (boot, canaries, three passes of
+c1/c8/c16 1000/300, a profiled c1 round for the state label, two gate.py
+runs), medians reported, like-state checked through the in-step idle and
+launches-per-step of the profiled round. Baseline for the phase: p0-nospec
+113.3 / 449.2 / 611.0 (in-step idle 0.17 ms, 1583 launches/step).
+
+### Item 2: vLLM custom all-reduce over PCIe (`VLLM_CUSTOM_AR_ALLOW_PCIE=1`) - RETAINED
+
+- Hypothesis: NCCL's ring all-reduce costs ~11 us per small reduction on
+  four PCIe-only ranks against ~5 us for vLLM's one-shot custom kernel over
+  peer mappings, and the step has ~90 reductions (mHC transitions plus the
+  attention/MLP TP reductions); the switch exists because vLLM disables the
+  custom kernel on more than two ranks without NVLink. Salvage table item 8
+  measured +11 % c1 on the Codex tree.
+- Result (p1-car): c1 121.3 / 122.9 / 122.9, c8 467.9 / 466.2 / 468.2, c16
+  640.1 / 638.6 / 640.9; medians 122.9 / 468.2 / 640.9 = +8.5 / +4.2 / +4.9 %.
+  `exact: true` on all nine runs. State: in-step idle 0.168 ms, 1577
+  launches/step (fast state, like-for-like). Gates -2.441 / -2.432 (band
+  -2.407..-2.478); canaries not run on this arm (the switch changes no
+  numerics path beyond reduction order). Trace
+  `~/.local/scratch/slimserve-glm53/profile-state-p1-car/`.
+- Decision: retained; `VLLM_CUSTOM_AR_ALLOW_PCIE=1` on the rtx6000 record
+  env with a note. `VLLM_CUSTOM_AR_PCIE_MAX_BYTES` (the two-shot cap,
+  default 8 MiB) is left for the prefill campaign: 4096-token chunks reduce
+  32 MiB per layer and stay on NCCL either way.
+- Raw: `perf/results/2026-09-11/p1-car-pass{1,2,3}/`, gates
+  `perf/results/2026-09-11/p1-car-gate{1,2}.json`.
+
+### Item 3: bf16 M<=16 tensor-core decode GEMM on the backbone projections - RETAINED
+
+- Hypothesis: cuBLAS runs the decode-shaped bf16 projections (M = 1..16,
+  N 2048..16384, K 512..4096) at 59-89 % of the streaming ceiling and often
+  as two launches (split-K plus reduce); a cp.async-staged mma.sync kernel
+  with fp32 accumulation (`csrc/quixicore/tm_cuda/bf16_decode_gemm.cuh`,
+  `quixicore_decode_linear` custom op in `layers/utils.py`, dispatched from
+  `cuda_unquantized_gemm`) reads each weight once per step at one launch.
+  Salvage table item 6 measured +1.5 % c1 on the Codex tree.
+- Result (p1-dgemm, on top of item 2): c1 122.4 / 124.1 / 124.0, c8 472.0 /
+  472.3 / 470.8, c16 641.9 / 640.4 / 641.4; medians 124.0 / 472.0 / 641.4 =
+  +0.9 / +0.8 / +0.1 % over p1-car. `exact: true` on all nine runs. State:
+  in-step idle 0.177 ms, 1516 launches/step (61 fewer than p1-car: the
+  cuBLAS split-K pairs). Gates -2.442 / -2.418 (band -2.407..-2.478).
+  Canaries: tool and image pass; the text canary hit its 400-token cap
+  still inside the reasoning block (one sample at temperature 1.0; the
+  canary now prints a reasoning excerpt and is re-run on the next boot).
+  Kernel tests `tests/kernels/test_quixicore_decode_gemm{,_fp8}.py` pass on
+  the shipped extension (44 + 45, one two-device test skipped each).
+- Decision: retained. Small, as on the Codex tree; the same pipeline is the
+  FP8 decode GEMM the swap-set (item 4) runs on. `SLIMSERVE_DECODE_GEMM=0`
+  keeps cuBLAS for A/B; the switch and the binding's presence are compile
+  cache factors (`VllmConfig.compute_hash`).
+- Raw: `perf/results/2026-09-11/p1-dgemm-pass{1,2,3}/`, gates
+  `p1-dgemm-gate{1,2}.json`, trace
+  `~/.local/scratch/slimserve-glm53/profile-state-p1-dgemm/`.
+
+### Item 4a: FP8 swap-set, native e4m3 block tensors for the dense MLP, shared experts and DSA q_b/o_proj - RETAINED
+
+- Hypothesis: RedHatAI's conversion stores ZAI's own FP8 block-128 tensors
+  (dense MLP of layers 0-2, the 42 shared experts, DSA `q_b_proj` /
+  `o_proj`) as their BF16 dequant, twice the bytes per step;
+  `slimserve.fp8_swapset` reads the FP8 bytes and 128x128 scales from the
+  native shards into `<model>/fp8-swapset.safetensors` (314 tensors, 2.5 GB,
+  dequant bit-identical to the conversion's BF16: 0 elements differ), the
+  loader substitutes them, the manifest's compressed-tensors group makes
+  those 112 modules block-FP8 (and drops them from `ignore`), and the M<=16
+  decode GEMM runs W8A16 on them (CUTLASS w8a8 above 16 tokens, the kernel
+  vLLM selects for the scheme on sm_120). Salvage table item 7: +5.5 % c1.
+- Result (p1-fp8swap, on top of item 3): c1 128.4 / 130.7 / 130.7, c8
+  480.2 / 482.5 / 481.1, c16 651.1 / 652.9 / 649.8; medians 130.7 / 481.1 /
+  651.1 = +5.4 / +1.9 / +1.5 % over p1-dgemm; cumulative over the Phase 0
+  baseline +15.4 / +7.1 / +6.6 %. `exact: true` on all nine runs. State:
+  in-step idle 0.172 ms, kernel busy 6.42 ms (6.76 before), 1558
+  launches/step. Gates -2.410 / -2.428 (band -2.407..-2.478). Canaries
+  text / tool / image pass (text: 207 chars of content after 1427 of
+  reasoning, finish stop).
+- Decision: retained. `SLIMSERVE_FP8_SWAPSET=0` serves the BF16 twins; the
+  manifest digest is a compile-cache factor. The runtime sidecar is the
+  campaign's vehicle; Phase 6 folds these tensors into the hybrid
+  checkpoint the profile will name (campaign doc, section 11).
+- Raw: `perf/results/2026-09-12/p1-fp8swap-pass{1,2,3}/`, gates
+  `p1-fp8swap-gate{1,2}.json`, trace
+  `~/.local/scratch/slimserve-glm53/profile-state-p1-fp8swap/`; sidecar
+  build log `~/.local/scratch/slimserve-glm53/serve-logs/swapset-build-4a.out`.
+
+### Item 4b: FP8 KDA projections (self-quantized, ZAI kept them BF16) - RETAINED, quality gate extended below
+
+- Hypothesis: the 34 KDA layers' merged `in_proj_qkvgfab` (6528 x 4096 per
+  rank) and `o_proj` (4096 x 2048) are the largest BF16 bytes left per step
+  (1.36 GB per rank at TP4); block-128 e4m3 halves them. The merged
+  projection's beta shard is one row per head (16 per rank), smaller than a
+  scale block and unsplittable by the block-scale loader, so the model gives
+  it a replicated whole block (`beta_block_rows=128`, the checkpoint's
+  [64, K] zero-padded on load) and each rank reads its heads from it; the
+  sidecar stores every tensor in its checkpoint shape, so it is
+  tensor-parallel agnostic (the Codex tree's per-rank padded beta layout was
+  TP-bound and is retired). `--self-quant-kda`: 238 tensors, rel Frobenius
+  error 2.6-2.8 %, worst element 3.8 % of absmax. Salvage table item 9:
+  +10.6 % c1, gate -0.014 nats.
+- Result (p1-fp8kda, on top of 4a): c1 141.8 / 144.8 / 144.7, c8 500.2 /
+  501.1 / 501.5, c16 672.2 / 671.2 / 669.7; medians 144.7 / 501.1 / 671.2 =
+  +10.7 / +4.2 / +3.1 % over p1-fp8swap; cumulative over Phase 0 +27.7 /
+  +11.6 / +9.9 %. `exact: true` on all nine runs. State: in-step idle
+  0.174 ms, kernel busy 5.79 ms (6.42 before), 1557 launches/step. Gates
+  -2.437 / -2.467: inside the band (-2.407..-2.478) but the pair's mean is
+  0.027 nats under the 4a boot's, at the size of the boot jitter, so the
+  gate is re-run eight times per arm (dense-only sidecar vs dense+KDA) on
+  fresh boots before the item is called clean; see the next entry. Canaries
+  tool / image pass; the text canary hit its 400-token cap inside a
+  coherent reasoning block ("A hash table is a data structure that stores
+  key-value pairs ..."), the cap is now 1200 tokens.
+- Decision: retained pending the extended gate. `SLIMSERVE_FP8_SWAPSET`
+  now also selects a sidecar by manifest stem for such comparisons.
+- Raw: `perf/results/2026-09-12/p1-fp8kda-pass{1,2,3}/`, gates
+  `p1-fp8kda-gate{1,2}.json`, trace
+  `~/.local/scratch/slimserve-glm53/profile-state-p1-fp8kda/`; sidecar
+  build log `~/.local/scratch/slimserve-glm53/serve-logs/swapset-build-4b.out`.
+
+### Item 4b, extended quality gate - CLEAN
+
+Eight gate.py runs per arm on fresh boots, same tree: dense-only sidecar
+(`SLIMSERVE_FP8_SWAPSET=fp8-swapset-dense`, p1-gate-dense) mean text
+logprob -2.456, sd 0.017 (-2.448 / -2.464 / -2.451 / -2.456 / -2.445 /
+-2.435 / -2.450 / -2.497); dense + KDA (p1-part boot) mean -2.447, sd 0.015
+(-2.462 / -2.428 / -2.431 / -2.447 / -2.447 / -2.467 / -2.464 / -2.430). No
+quality cost resolvable at the gate's noise (per-run sd ~0.016, so a pair
+of runs cannot see less than ~0.03; the -2.407..-2.478 band from two Phase
+0 runs is narrower than the real spread, one dense-arm run fell outside it).
+Decision: FP8 KDA retained without reservation. Raw:
+`perf/results/2026-09-12/p1-gate-dense-gate{1..8}.json`,
+`p1-part-gate{1..8}.json`.
+
+### Item 5: sparse MLA decode, 32/64-token partitions with the channel reducer - RETAINED
+
+- Hypothesis: the partitioned NoPE sparse decode reduced its P partials
+  with one warp per (head, token) walking P x 512 floats serially, so the
+  128-token partition (17 per 2048-wide list) was the compromise between
+  parallelism in the walk and cost in the reduce. `paged_attention_reduce_channels`
+  (one thread per latent channel, weights once per block) was already in the
+  tree for DSV4 but not launched by the NoPE bindings; with it the reduce is
+  flat in P, and small partitions expose more warps at decode: 32 tokens at
+  B <= 8, 64 at B <= 16, the 128 default above (prefill chunks). Salvage
+  table item 5: +3.7 % c1.
+- Result (p1-part, on top of 4b): c1 146.4 / 149.5 / 149.3, c8 504.2 /
+  500.8 / 501.3, c16 678.4 / 672.3 / 677.6; medians 149.3 / 501.3 / 677.6 =
+  +3.2 / +0.0 / +1.0 % over p1-fp8kda; cumulative over Phase 0 +31.8 / +11.6
+  / +10.9 %. `exact: true` on all nine runs. State: in-step idle 0.175 ms,
+  kernel busy 5.64 ms (5.79 before), 1554 launches/step. Gates: the eight
+  runs above (mean -2.447). Canaries text / tool / image pass.
+  `tests/kernels/test_quixicore_sparse_mla_bf16.py` now covers partitions
+  32 and 64 (71 passed).
+- Decision: retained (both NoPE bindings, bf16 and fp8 cache).
+- Raw: `perf/results/2026-09-12/p1-part-pass{1,2,3}/`, trace
+  `~/.local/scratch/slimserve-glm53/profile-state-p1-part/`.
+
+### Item 7a: FP32 router logits through cuBLAS bf16 x bf16 -> fp32 on sm_120 - RETAINED
+
+- Hypothesis: `GateLinear` reserved its cuBLAS bf16-in / fp32-out tier for
+  the GLM-5.3-Flash shape on SM80 only; on sm_120 (no SM90/SM100
+  specialized router kernels) the router ran F.linear in bf16 and cast the
+  logits to fp32 afterwards: a rounding step before expert selection and one
+  more launch per MoE layer. The tier is now taken wherever the specialized
+  kernels are absent.
+- Result (p1-router, on top of item 5): c1 150.6 / 151.1 / 150.8, c8 507.0 /
+  506.2 / 505.7, c16 679.0 / 679.4 / 674.8; medians 150.8 / 506.2 / 679.0 =
+  +1.0 / +1.0 / +0.2 % over p1-part; cumulative over Phase 0 +33.1 / +12.7 /
+  +11.1 %. `exact: true` on all nine runs. State: in-step idle 0.170 ms,
+  kernel busy 5.57 ms, 1516 launches/step (38 fewer: the casts). Gates
+  -2.455 / -2.444 / -2.430 / -2.441 (mean -2.443). Canaries pass.
+- Decision: retained.
+- Raw: `perf/results/2026-09-12/p1-router-pass{1,2,3}/`, gates
+  `p1-router-gate{1..4}.json`, trace
+  `~/.local/scratch/slimserve-glm53/profile-state-p1-router/`.
+
+### Item 7b: fused mHC norm (`_fuse_mhc_norm`) on sm_120 - REJECTED
+
+- Hypothesis: `Glm5NextDecoderLayer` fuses the mHC post/pre norms into the
+  `glm5_mhc_fused_post_pre` kernel on SM80 only; taking the same fusion on
+  sm_120 removes the separate triton norm launches (about 90 per step).
+- Result (p1-mhcnorm, on top of item 7a): c1 142.3 / 142.3 / 142.1, c8
+  491.9 / 492.4 / 491.0, c16 668.6 / 664.6 / 666.4; medians 142.3 / 491.9 /
+  666.4 = -5.6 / -2.8 / -1.9 % against p1-router. `exact: true` on all
+  nine runs. State: 1423 launches/step (93 fewer) but kernel busy 5.90 ms
+  (+0.33 ms): the Ampere-tuned fused kernel runs slower on this part than the
+  norms it replaces. Gates -2.438 / -2.463 / -2.442 / -2.450 (mean -2.448).
+- Decision: rejected, `_fuse_mhc_norm` stays SM80-gated. The mHC transition
+  (0.78 ms/step at c1, 91 launches of about 8.6 us, latency-bound) stays a
+  Phase 2 target for an sm_120-specific kernel rather than the A100 fusion.
+- Raw: `perf/results/2026-09-12/p1-mhcnorm-pass{1,2,3}/`, gates
+  `p1-mhcnorm-gate{1..4}.json`.
+
+### Item 8: FP8 main KV for the 11 sparse-MLA layers (`glm5_next_main_kv_fp8`) - REJECTED FOR NOW
+
+- Hypothesis: FP8 is the official KV cache quantization; the per-layer e4m3
+  main KV for the DSA layers halves the sparse decode's KV bytes (the 2048
+  gathered rows x 576 channels per head group) and the KV footprint.
+- Result (p1-fp8kv, on top of item 7a, the mHC edit reverted first): c1
+  148.3 / 148.2 / 148.2, c8 489.5 / 490.2 / 489.0, c16 650.7 / 649.7 / 650.6;
+  medians 148.2 / 489.5 / 650.6 = -1.7 / -3.3 / -4.2 % against p1-router.
+  `exact: true` on all nine runs. State: kernel busy 5.63 ms (+0.06 ms),
+  1512 launches/step; the loss grows with concurrency, so it sits in the
+  fp8 sparse decode kernel (`mla_decode_fp8_sparse_nope`), which did not get
+  item 5's 32/64-token partition rule (the bf16 path did) and pays the e4m3
+  dequant per gathered row. Gates -2.437 / -2.442 / -2.429 / -2.449 (mean
+  -2.439): no quality cost.
+- Decision: rejected for now; the record keeps the unquantized main KV,
+  which the policy permits. Re-measure once the fp8 sparse decode path gets
+  the partition rule and a fused dequant (Phase 2); the profile should move
+  to FP8 KV when it is at parity, for the footprint.
+- Raw: `perf/results/2026-09-12/p1-fp8kv-pass{1,2,3}/`, gates
+  `p1-fp8kv-gate{1..4}.json`.
+
+### Item 6: fused route+align and shared-expert combine on the Marlin MoE path - RETAINED
+
+- Hypothesis: per MoE layer the decode path spent four launches on routing
+  (grouped_topk 3.5 us, moe_align_block_size 3.0 us, count_and_sort 1.6 us
+  and a fill) and two on the combine (moe_sum 1.2 us, the traced
+  shared + routed add 1.3 us). QuixiCore `glm_route_align` does the sigmoid
+  scores, bias-only top-8, renormalize + scale and the Marlin block alignment
+  in one block for M <= 16; the router publishes the alignment and
+  fused_marlin_moe consumes it (matched on the topk_ids tensor).
+  `moe_sum_add` folds the shared-expert output into the per-assignment sum
+  (fp32 accumulation, one bf16 rounding): the runner launches the shared
+  experts first, still on the aux stream, hands the output to Marlin's
+  moe_sum through `combine_shared`, and the add moves inside a new
+  `moe_forward_folded` op so the traced forward no longer emits it.
+- Result (p1-item6, on top of item 7a): c1 149.9 / 154.7 / 154.7, c8 512.2 /
+  510.9 / 508.8, c16 684.5 / 680.8 / 682.8; medians 154.7 / 510.9 / 682.8 =
+  +2.6 / +0.9 / +0.6 % over p1-router; cumulative over Phase 0 +36.5 /
+  +13.7 / +11.8 %. `exact: true` on all nine runs. State: wall/step 5.75 ms,
+  kernel busy 5.43 ms (-0.14 ms), 1348 launches/step (-168). Trace:
+  route_align_kernel 42/step at 4.7 us, moe_sum_add 42/step at 1.5 us;
+  grouped_topk, moe_align, count_and_sort, moe_sum and the traced add are
+  gone. Gates -2.463 / -2.473 / -2.464 / -2.432 (mean -2.458). Canaries pass.
+- Also seen in the trace (Phase 2 notes): 66 int `fill_` launches per step
+  (six per DSA layer, about 90 us) in the sparse MLA metadata path, and 11
+  cuBLAS bf16 wmma GEMMs of 4.9 us (one per DSA layer, about 54 us).
+- Decision: retained. The diagnosis kill switches (`SLIMSERVE_GLM_ROUTE_ALIGN`,
+  `SLIMSERVE_MOE_COMBINE_SHARED`) came out once the path qualified; the
+  reference paths are the dispatch every other platform takes.
+  The kernel is instantiated for E=288 / top-8 / M <= 16; MTP-3 decode
+  batches beyond 16 tokens take the reference path until a wider variant.
+- Raw: `perf/results/2026-09-12/p1-item6-pass{1,2,3}/`, gates
+  `p1-item6-gate{1..4}.json`, trace
+  `~/.local/scratch/slimserve-glm53/profile-state-p1-item6/`. Tests:
+  `tests/kernels/test_quixicore_glm_route_align.py`,
+  `test_quixicore_moe_sum_add.py`, `test_moe_shared_handoff.py`.
+
+### Item 9: split SIMT mHC transition (Triton partials + finalize) on sm_120 - RETAINED
+
+- Hypothesis: on sm_120 every mHC site ran the cooperative dsv4_mhc
+  `fused_pre_transition` kernel (64 blocks, a grid sync): 89 launches x 8.7
+  us = 0.77 ms per c1 step, the largest latency-bound block left after item
+  6. The split Triton transition (`_mhc_partials` 64 x T blocks, then
+  `_mhc_finalize` one block per token) was gated to A100, where it was
+  measured; the math is identical.
+- Result (p1-mhctriton, on top of item 6): c1 157.5 / 157.6 / 157.7, c8
+  519.6 / 520.1 / 517.9, c16 691.3 / 688.8 / 683.7; medians 157.6 / 519.6 /
+  688.8 = +1.9 / +1.7 / +0.9 % over p1-item6; cumulative over Phase 0 +39.1
+  / +15.7 / +12.7 %. `exact: true` on all nine runs. State: wall/step 5.68
+  ms, kernel busy 5.31 ms (-0.12 ms), 1477 launches/step. Trace: partials
+  2.6 us + finalize 4.1 us per transition (6.7 us against 8.7). Gates
+  -2.456 / -2.445 / -2.459 / -2.472 (mean -2.458, same as p1-item6).
+- Decision: retained (`_USE_SPLIT_SIMT`, every CUDA part). The finalize
+  block (sinkhorn plus the 4096-wide mix in 4 warps) at 4.1 us for one token
+  is the next mHC target: an sm_120 kernel doing the transition in about 4 us
+  total would be worth another 0.25 ms per c1 step.
+- Raw: `perf/results/2026-09-12/p1-mhctriton-pass{1,2,3}/`, gates
+  `p1-mhctriton-gate{1..4}.json`, trace
+  `~/.local/scratch/slimserve-glm53/profile-state-p1-mhctriton/`.
+
+### Phase 3, arm 1: DFlash2 draft length k=3 and k=5 on the tuned tree
+
+- Setup: the registered DFlash2 drafter (`--spec`, block 8, greedy draft,
+  standard rejection sampling) on the p1-mhctriton tree, prose harness
+  1000/300 at temperature 1.0 / top_p 0.95 / top_k 20, three passes; the
+  no-spec reference is p1-mhctriton 157.6 / 519.6 / 688.8.
+- k=3 (p3-dflash2-k3): c1 172.7 / 211.3 / 180.5, c8 464.7 / 469.7 / 462.4,
+  c16 653.1 / 635.4 / 629.4; medians 180.5 / 464.7 / 635.4 = +14.5 / -10.6 /
+  -7.8 %. Accepted per draft call (accepted / drafts): c1 0.82 / 1.29 /
+  0.94, c8 0.83 / 0.79 / 0.80, c16 0.97 / 0.95 / 0.92; per drafted token
+  27-43 % at c1, ~27 % at c8, ~32 % at c16.
+- k=5 (p3-dflash2-k5): c1 161.9 / 148.9 / 175.2, c8 412.5 / 434.1 / 417.6,
+  c16 353.8 / 355.9 / 310.4; medians 161.9 / 417.6 / 353.8 = +2.7 / -19.6 /
+  -48.6 %. Accepted per draft call at c1 0.93 / 0.80 / 1.11: two more
+  drafted tokens buy about 0.1 more accepted token while the verify grows
+  from 4 to 6 rows per request.
+- Reading: with a greedy draft the V2 rejection test accepts a token with
+  probability p_target(draft argmax) (`v2_rejection_k`, draft_logprob 0), so
+  at temperature 1.0 the acceptance is capped by the target's own
+  peakedness, not by draft quality; the drafter's extra tokens only add
+  verify rows. k=3 is the only length that pays at c1; every length loses
+  at c8/c16 on this harness, so the record needs a per-batch schedule (k=3
+  small batch, 0 above) unless the sampling-method arms below lift the
+  acceptance. Phase 0's k=7 (153.6 / 330.9 / 340.3 on the untuned tree) is
+  consistent.
+- Canaries pass on both arms (text, tool call, image); `exact: true` on
+  all runs.
+- Raw: `perf/results/2026-09-12/p3-dflash2-k{3,5}-pass{1,2,3}/` (acceptance
+  in each `c*-1000-300.log` `spec_decode_*` fields), logs
+  `~/.local/scratch/slimserve-glm53/serve-logs/ab-p3-dflash2-k{3,5}.out`.
+
+### Item 10: fused top-k / top-p / Gumbel-max sampler (`topk_sample`) - RETAINED
+
+- Hypothesis: the no-spec sampler ran the Triton Qrita top-k/top-p mask
+  (`_topk_topp_kernel`, 124-189 us per step in the p1 traces) and then the
+  Gumbel argmax (`v2_gumbel_sample_k` + reduction, ~39 us): two full passes
+  over the 154,880-wide fp32 logits plus the mask write-back. The salvaged
+  Codex sampler (`topk_sample.cuh`, four launches: per-partition radix top-32
+  candidates, global k-th value with every omitted tie accounted for, nucleus
+  cutoff in fp64, then a full-vocabulary exponential race over the retained
+  tokens) does the mask and the draw without materializing the mask. Ported
+  with the noise generated inline from the sampler's own (seed, pos, token)
+  Philox stream (`tt_rand_nz` / `tt_rand64_nz`), so seeded requests draw the
+  same uniforms the Gumbel path does; the race score p / E with
+  E = -log(1 - U) orders tokens exactly as logit + G with G = -log E.
+  Eligibility (`vllm/v1/worker/gpu/sample/topk_sample.py`): every request in
+  the batch with 1 <= top_k <= 32, no greedy row, fp32 CUDA logits, no
+  processed-logprobs consumer; anything else keeps the Triton mask + Gumbel
+  path. Kill switch `SLIMSERVE_TOPK_SAMPLE=0`.
+- Parity: `tests/kernels/test_quixicore_topk_sample.py` (18 tests): the
+  sampled id is always inside the torch top-k/top-p mask, >= 99 % row
+  agreement with mask-then-`gumbel_sample` under the same seeds at V =
+  154,880 and V = 2053, fp32 and fp64, top_p none / 0.95 / 0.3; k = 1 is the
+  argmax; all ties at the k-th value retained, nucleus drops the low-id half
+  of a uniform row; -inf masks; NaN rows and -1 request slots return in-range
+  ids; the eligibility rules.
+- Microbench (GPU 0, V = 154,880, top_k 20 / top_p 0.95, 200 iterations,
+  excluding the fp32 copy): mask + Gumbel 117.5 / 146.5 / 153.8 us at B = 1
+  / 8 / 16 against 20.0 / 21.5 / 29.4 us fused (5.9x / 6.8x / 5.2x).
+- Result (p2-topksample, on top of item 9, no-spec): c1 160.4 / 160.9 /
+  160.7, c8 526.2 / 527.6 / 528.8, c16 701.0 / 691.1 / 699.9; medians 160.7
+  / 527.6 / 699.9 = +2.0 / +1.5 / +1.6 % over p1-mhctriton; cumulative over
+  Phase 0 +41.8 / +17.5 / +14.5 %. `exact: true` on all nine runs, canaries
+  pass (text, tool, image). No state label for this arm (the boot's shutdown
+  summary was lost to a harness edit made while it ran; the three passes and
+  their JSON are intact).
+- Decision: retained. Spec-mode steps do not use it (the V2 rejection sampler
+  samples through its own Gumbel kernels and applies no top-k/top-p), so it
+  counts on the no-spec path and on any batch-size range a schedule leaves
+  at k = 0.
+- Raw: `perf/results/2026-09-12/p2-topksample-pass{1,2,3}/`, microbench
+  `~/.local/scratch/slimserve-glm53/bench_topk_sample.py`.
+
+### Phase 3, arm 2: DFlash2 k=3 with probabilistic draft sampling - RETAINED
+
+- Hypothesis: the V2 rejection test with a greedy draft accepts with
+  probability p_target(draft argmax), which at temperature 1.0 is bounded by
+  how peaked the target is; with `draft_sample_method: probabilistic` the
+  draft samples from its own distribution and the test uses the ratio
+  p_target / q_draft, whose expected acceptance is sum_x min(p, q): for a
+  calibrated draft that approaches 1 - TV(p, q) and is far above p(argmax)
+  on flat distributions. DFlash2 caches its K candidate logits per step for
+  this (`_cache_draft_logits_kernel`), so the arm is one engine field.
+- Result (p3-dflash2-k3-prob, on top of item 10, `--spec`): c1 211.3 /
+  245.5 / 182.8, c8 524.5 / 549.2 / 536.2, c16 750.2 / 729.3 / 741.6;
+  medians 211.3 / 536.2 / 741.6 = +31.5 / +1.6 / +6.0 % over no-spec
+  (p2-topksample 160.7 / 527.6 / 699.9) and +17.1 / +15.4 / +16.7 % over
+  the greedy-draft k=3 arm. Accepted per draft call: c1 1.31 / 1.74 / 0.96,
+  c8 1.14 / 1.32 / 1.18 (greedy 0.83 / 0.79 / 0.80), c16 1.46 / 1.35 / 1.41
+  (greedy 0.97 / 0.95 / 0.92); the c1 spread follows the prompt content
+  (each pass draws different prompts). `exact: true` on all nine runs,
+  canaries pass.
+- Decision: retained as the record's speculator setting (k=3,
+  probabilistic draft); every concurrency is at or above no-spec, so no
+  per-batch schedule is needed on the prose harness. The structured Foundry
+  8-wide workload is measured separately below before the record is
+  written. Block verification is the next arm.
+- Raw: `perf/results/2026-09-12/p3-dflash2-k3-prob-pass{1,2,3}/`, log
+  `~/.local/scratch/slimserve-glm53/serve-logs/ab-p3-dflash2-k3-prob.out`.
+
+### Phase 3, arm 3: DFlash2 k=3 with block verification, greedy draft - NEUTRAL
+
+- Hypothesis: `rejection_sample_method: block` (Sun et al.) verifies the
+  draft block jointly and should accept more of the same drafts than the
+  token-by-token test.
+- Result (p3-dflash2-k3-block): c1 179.2 / 152.7 / 203.7, c8 462.5 / 448.2
+  / 448.3, c16 643.7 / 620.8 / 632.5; medians 179.2 / 448.3 / 632.5 against
+  the standard greedy-draft arm 180.5 / 464.7 / 635.4. Accepted per draft
+  call c1 0.92 / 0.61 / 1.21, c8 0.80 / 0.79 / 0.67, c16 1.09 / 0.95 /
+  0.91: the same band as the standard test.
+- Reading: with a greedy draft the proposal distribution is one-hot, so the
+  joint test has nothing beyond the token-by-token test to exploit; block
+  verification can only pay together with probabilistic drafts (arm 4).
+- Raw: `perf/results/2026-09-12/p3-dflash2-k3-block-pass{1,2,3}/`.
+
+### Phase 3, arm 4: DFlash2 k=3, probabilistic draft + block verification - RETAINED (record setting)
+
+- Result (p3-dflash2-k3-probblock): c1 212.5 / 239.0 / 289.6, c8 552.1 /
+  532.0 / 531.2, c16 747.8 / 725.1 / 729.2; medians 239.0 / 532.0 / 729.2
+  against arm 2 (probabilistic, standard test) 211.3 / 536.2 / 741.6.
+  Accepted per draft call c1 1.31 / 1.64 / 2.34, c8 1.33 / 1.12 / 1.18, c16
+  1.39 / 1.29 / 1.33 (arm 2: 1.31 / 1.74 / 0.96, 1.14 / 1.32 / 1.18, 1.46 /
+  1.35 / 1.41). `exact: true` on all nine runs, canaries pass.
+- Reading: with probabilistic drafts, block verification is neutral on this
+  harness: c8 / c16 within the 1-2 % pass spread, and the c1 median moves on
+  one pass whose sampled continuation happened to draft well (211 accepted
+  over 90 calls). Block verification never accepts fewer tokens in
+  expectation than the token-by-token test for the same draft distribution
+  and costs nothing per step, so the record takes it.
+- Decision: the record's speculator is DFlash2 k=3 with
+  `draft_sample_method: probabilistic` and `rejection_sample_method: block`
+  (`spec-winner.json` in the scratch dir drives the Foundry check). Against
+  the Phase 0 baseline (113.3 / 449.2 / 611.0 no-spec, DFlash2 k=7 greedy
+  153.6 / 330.9 / 340.3) the tree now stands at 239.0 / 532.0 / 729.2 with
+  speculation and 160.7 / 527.6 / 699.9 without. The control's MTP-3 row
+  (260.8 / 732.1 / 1005.8) still leads at c8 / c16, where the prefill share
+  of the 1000/300 wall (about a quarter) is the next campaign phase.
+- Not pursued: the checkpoint MTP head. The V1-only adapter measured +6.5 %
+  c1 on A100 and lost prose at temperature 1.0 (campaign doc section 1); a
+  V2 port would need the per-group indexer/MLA block tables of
+  `Glm5NextMTPProposer` inside the generic MTP speculator, and DFlash2 with
+  probabilistic drafts already clears the "c8 >= no-spec" bar.
+- Raw: `perf/results/2026-09-12/p3-dflash2-k3-probblock-pass{1,2,3}/`.
+
+## 2026-09-12: rtx6000 Phase 5 (prefill), item by item
+
+Same box, harness and profile; the arms boot with a temporary edit of the
+rtx6000 record's `additional_config` (restored by `git checkout` after each
+arm), `TTFT=1` adds `ttft_cold.py` (cold and warm 32K / 128K on distinct
+slices of the prompt source) after the benches and gates. Reference on the
+Phase 3 tree, no speculation (p5-ttft-ref): cold TTFT 32K 11.59 s, 128K
+123.8 s; warm 0.175 s / 1.17 s. Decode reference p2-topksample 160.7 /
+527.6 / 699.9.
+
+### Item P1: compact GLM indexer cache (`glm5_next_compact_indexer_cache`) on sm_120 - RETAINED (record setting; its prefix-cache misses are fixed in the follow-up below)
+
+- Hypothesis: the general indexer prefill scoring (`_pooled_logits_kernel`)
+  recomputes every pool key (gate softmax over 4 members, per channel) for
+  every query row: O(L^2) SIMT work, 57 % of a cold 32K prefill and the
+  reason 128K took 124 s. The compact page format (A100 candidate of
+  2026-09-09: 64 bf16 elements per token, completed pool keys plus an 8-row
+  raw ring) scores rows against precomputed keys with one `tl.dot` per
+  16-pool tile (`cached_pool_logits`), at prefill and at decode, and holds
+  a third of the row bytes. The gate at `glm5_next_indexer.py`
+  (`_cache_row_dim`) accepted SM80 only; widened to SM80 and SM120
+  (`_compact_cache_qualified`) after the 116 pool-cache CUDA tests passed on
+  GPU 0.
+- Result (p5-compact, no-spec): c1 160.8 / 164.3 / 164.2, c8 539.5 / 538.2
+  / 538.3, c16 718.9 / 715.6 / 720.2; medians 164.2 / 538.3 / 718.9 = +2.2 /
+  +2.0 / +2.7 % over p2-topksample. Cold TTFT 32K 5.31 s (-54 %), 128K
+  22.0 s (-82 %); prefill now scales close to linearly (4.1x tokens, 4.1x
+  time). KV capacity 2,817,628 tokens against 2,118,065 (+33 %). Gates
+  -2.418 / -2.428 (band mean -2.458, per-run sd 0.016, boots differ up to
+  0.04: at the edge, on the better side; the row-shard arm, a second
+  compact-cache boot, gated -2.472 / -2.482, so the two compact boots
+  straddle the band and the format carries no systematic shift). Canaries
+  pass, `exact: true` on all nine runs.
+- Open: the warm 32K repeat took 5.26 s (a full re-prefill; the reference
+  run's repeat took 0.175 s and its engine log shows the hit) while the
+  warm 128K repeat hit (0.377 s). Prefix caching is a standing requirement
+  (agentic traffic), so the item stays provisional until `prefix_probe.py`
+  (512 / 4096 / 32768 tokens, cold then repeat, engine
+  `prefix_cache_queries/hits` deltas) explains which lengths miss under the
+  compact pages and the cause is fixed.
+- Raw: `perf/results/2026-09-12/p5-compact-pass{1,2,3}/`, gates
+  `p5-compact-gate{1,2}.json`, `~/.local/scratch/slimserve-glm53/serve-logs/
+  ttft-p5-{ttft-ref,compact}.out`.
+
+### Item P2: TP row-sharded indexer decode scoring (`glm5_next_indexer_row_shard`) - REJECTED
+
+- Hypothesis: at c16 the pooled indexer costs 0.37 ms per step (22
+  launches at 17 us); sharding the 16 decode rows over the four ranks (4
+  rows each, `pynccl.all_gather` of the selections) should cut the scoring
+  four-fold. Gate widened alongside the compact cache (same
+  `_compact_cache_qualified`).
+- Result (p5-rowshard, compact cache + row shard, no-spec): c1 161.1 /
+  164.4 / 164.0, c8 540.3 / 537.4 / 537.5, c16 711.9 / 712.6 / 713.8;
+  medians 164.0 / 537.5 / 712.6 against the compact-only arm 164.2 / 538.3 /
+  718.9: c1 / c8 flat, c16 -0.9 %. Gates -2.472 / -2.482, canaries pass.
+- Reading: the per-layer all-gather over PCIe (11 sparse layers) costs at
+  least what the three-quarter scoring cut saves at these row counts; on
+  the A100 TP8 candidate the ratio was different (8 ranks, NVLink).
+- Decision: rejected on rtx6000; the flag stays off in the record, the
+  gate widening stays (harmless, and the prefill variant below reuses the
+  branch).
+- Raw: `perf/results/2026-09-12/p5-rowshard-pass{1,2,3}/`, gates
+  `p5-rowshard-gate{1,2}.json`.
+
+### Item P3: custom all-reduce buffer 64 MiB (`VLLM_CUSTOM_AR_MAX_SIZE_MB=64`) - RETAINED
+
+- Hypothesis: the custom all-reduce's IPC buffer is 8 MiB, so a prefill
+  chunk's [8192, 4096] bf16 reduction (64 MiB) fell back to NCCL's PCIe
+  ring (547 launches at 2.97 ms, 22.6 GB/s algbw, 14 % of the cold 32K
+  prefill), and the c8 / c16 1000-token prefills reduce at 8-16 MiB, just
+  above the cap. Salvaged knob from the Codex tree
+  (`custom_ar_max_size.diff`: `VLLM_CUSTOM_AR_MAX_SIZE_MB`, default 8, so
+  no behavior change unless set); Codex measured c8 +3 %.
+- Result (p5-car64, raw indexer cache, no-spec): c1 157.9 / 161.0 / 160.9,
+  c8 544.6 / 543.5 / 543.2, c16 711.0 / 712.3 / 712.3; medians 160.9 /
+  543.5 / 712.3 = +0.1 / +3.0 / +1.8 % over p2-topksample. Cold TTFT 32K
+  11.14 s (-3.9 % against 11.59), 128K 121.9 s (-1.5 %); warm 0.177 s /
+  1.19 s (prefix hits intact). Gates -2.473 / -2.449, canaries pass,
+  `exact: true` on all nine runs.
+- Reading: the two-shot custom kernel runs a 64 MiB reduction about 28 %
+  faster than NCCL's ring over these PCIe pairs (1.62 s -> ~1.17 s of the
+  32K prefill); the c8 / c16 gain is the 1000-token prefills' reductions.
+  Buffers cost 2 x 64 MiB per rank.
+- Decision: retained; the record's env gets `VLLM_CUSTOM_AR_MAX_SIZE_MB=64`
+  next to `VLLM_CUSTOM_AR_ALLOW_PCIE=1`.
+- Raw: `perf/results/2026-09-12/p5-car64-pass{1,2,3}/`, gates
+  `p5-car64-gate{1,2}.json`, `serve-logs/ttft-p5-car64.out`.
+
+### Item P4: `NCCL_PROTO=Simple` for the prefill reductions - REJECTED
+
+- Hypothesis: the 64 MiB prefill reductions ran NCCL's LL protocol (the
+  trace's `ring LL` kernels); Simple is the large-message protocol.
+- Result (p5-nccl-simple, raw cache, default 8 MiB custom-AR buffer, TTFT
+  only): cold 32K 11.72 s, 128K 124.9 s against 11.59 s / 123.8 s: within
+  noise, slightly worse. With item P3 those reductions no longer reach NCCL.
+- Raw: `~/.local/scratch/slimserve-glm53/serve-logs/ttft-p5-nccl-simple.out`.
+
+### Item P5: TP row-sharded indexer prefill scoring (`glm5_next_indexer_row_shard_prefill`) - REJECTED
+
+- Hypothesis: with the compact cache the prefill scoring
+  (`_cached_pool_logits`, 189 ms of the cold 32K window at 2.15 ms per
+  launch) is the last indexer cost; sharding each prefill chunk's rows
+  over the TP group and all-gathering the selected indices would cut it
+  4x if the all-gather is cheap at prefill widths (it was not at decode,
+  item P2).
+- Result (p5-rowshard-prefill: compact cache + decode shard + prefill
+  shard, no-spec): c1 160.6 / 164.2 / 164.1, c8 539.4 / 539.7 / 537.2,
+  c16 712.7 / 711.8 / 709.6; medians 164.1 / 539.4 / 711.8 against the
+  compact arm's 164.2 / 538.3 / 718.9 (the decode shard's c16 cost
+  again). Cold TTFT 32K 5.258 s against 5.31 s (-1 %, inside the
+  boot-to-boot spread), 128K 21.75 s against 22.0 s (-1 %). Warm 128K
+  0.389 s, warm 32K still a re-prefill (item P1's open point, resolved
+  below). Gates -2.419 / -2.448, canaries pass, `exact: true` on all
+  nine runs.
+- Reading: after the compact cache the prefill scoring is 3.6 % of the
+  cold 32K window; sharding cannot buy more than that and the per-chunk
+  all-gather ate most of it.
+- Decision: rejected; the prefill shard is removed from the tree (the
+  decode shard stays, gated off). The SM120 qualification of the compact
+  cache (`_compact_cache_qualified`) is kept.
+- Raw: `perf/results/2026-09-12/p5-rowshard-prefill-pass{1,2,3}/`, gates
+  `p5-rowshard-prefill-gate{1,2}.json`,
+  `~/.local/scratch/slimserve-glm53/serve-logs/ttft-p5-rowshard-prefill.out`.
+
+### Phase 5 attribution 2: cold 32K prefill with the compact cache (p5-compact-32k)
+
+Same method as the Phase 5 opener (`prof_prefill_long.sh`, TOKENS=32768,
+`prefill_attrib.py` over the rank-0 trace): window 5196.8 ms span,
+5137.5 ms kernel busy, 15,186 launches. This boot predates the record's
+`VLLM_CUSTOM_AR_MAX_SIZE_MB=64` (applied 18:09), so the 8192-token chunk
+reductions still went to NCCL.
+
+| class | ms | share | launches | us/launch |
+| --- | --- | --- | --- | --- |
+| nccl allreduce (`AllReduce_Sum_bf16_RING_LL`) | 1578.0 | 30.7 % | 455 | 3468 |
+| fp8 gemm class, of which `mla_decode_fp8_v<true,false,512,512>` | 1457.1 / 1247.6 | 28.4 % / 24.0 % | 2292 / 55 | 636 / 22,684 |
+| mHC transition (`dsv4_mhc::partials<24>` 855.9) | 937.8 | 18.3 % | 1626 | 577 |
+| marlin moe | 543.2 | 10.6 % | 504 | 1078 |
+| other | 220.1 | 4.3 % | 1700 | 129 |
+| KDA chunked prefill (FLA) | 104.6 | 2.0 % | 1632 | 64 |
+| indexer scoring (`_cached_pool_logits`) | 189.2 | 3.6 % | 88 | 2150 |
+
+- Reading: the indexer scoring fell from 57 % (raw format, O(L^2) pool
+  recompute) to 3.6 %. What is left, in order: the prefill reductions
+  (item P3's custom kernel takes them now; the residual is the PCIe
+  collective itself), the sparse-MLA prefill that runs through the decode
+  kernel (`mla_decode_fp8_v`, 55 launches at 22.7 ms = 24 % of the
+  window: a prefill-shaped kernel that shares K/V tiles across many query
+  rows is the obvious replacement), and the mHC partials (16.5 %).
+- Raw: `~/.local/scratch/slimserve-glm53/profile-prefill-p5-compact-32k/`
+  (four rank traces), `serve-logs/prof-prefill-p5-compact-32k.out`.
+
+### Phase 3, Foundry structured c8 workload: no-spec against the record speculator
+
+- Method: `workload_bench_c8.py --prompts foundry-fanout-prompts.json
+  --chat --temperature 1.0 --top-p 0.95 --concurrency 8 --repeats 2`
+  (eight concurrent agentic prompts with tool schemas and thinking on),
+  aggregate output tok/s and wall time per repeat, same boot as the
+  respective arm.
+- Result: no-spec 387.4 / 421.7 tok/s (73.1 s / 56.9 s wall, 2360-4096
+  output tokens per prompt); DFlash2 k=3 probabilistic + block 399.4 /
+  468.6 tok/s (58.8 s / 49.8 s), accepted tokens per step 1.59 / 1.57.
+- Reading: +3 / +11 % aggregate and -20 / -12 % wall on structured
+  output, where the c8 exact bench (1000/300, random-ish prose) had the
+  speculator at parity (532 against 538). Acceptance on this workload
+  (1.59 per step) is above the exact bench's; the record setting stands.
+- Raw: `~/.local/scratch/slimserve-glm53/serve-logs/workload-p3-foundry-{nospec,spec}.{out,json}`.
+
+### Item P1, follow-up: the compact cache's prefix-cache misses - FIXED (two coordinator defects)
+
+- Diagnosis (CPU reproduction, `tests/v1/core/test_hybrid_partial_hit_alignment.py`,
+  built from the engine's block geometry: the KDA page of 1,085,440 B
+  raises the attention block to 1088 tokens, and the compact indexer's
+  128 B/token page is unified by scaling its block to 8704 tokens; with
+  DFlash2 the page is 1,122,304 B, the blocks 1152 / 9216, plus the
+  drafter's 1152-token sliding-window group):
+  1. `HybridKVCacheCoordinator` demanded hits aligned to the LCM of the
+     group block sizes (8704 / 9216) because its hash-granular "partial
+     hit" mode only switched on when the *Mamba* block exceeded the hash
+     block. Align-mode KDA states exist only at chunk ends, which the
+     scheduler steers onto `cache_config.block_size` (1088) boundaries,
+     so a hit needed a state at a multiple of 8704 that no chunk ended
+     on. 128K hit by coincidence (130,560 = 120 x 1088 = 15 x 8704); 32K
+     (last cacheable position 32,640 = 30 x 1088) and 4K never did.
+     Fix: partial hits switch on whenever any prefix-cacheable group's
+     block is coarser than the hash block and every such manager
+     supports fine-grained lookup (full attention, Mamba). The 8704-token
+     indexer group then serves a hash-aligned partial tail with the
+     existing copy-on-write redirect.
+  2. Under the speculator (DFlash2 counts as EAGLE-like: one block backed
+     off, one hash unit dropped) the drafter's sliding-window manager
+     cached only the tails of `scheduler_block_size` segments (3 of
+     every 8 blocks) while hits were now searched at hash granularity, so
+     it could never confirm a hit and the fixed point collapsed to zero.
+     Fix: every manager caches at the coordinator's hit granularity
+     (`cache_hit_alignment_tokens`, the hash block when partial hits are
+     on). The A100 `glm53f-nvfp4-8` record (compact cache, TP8) had the
+     same geometry, so it was missing the same hits.
+- Tests: the reproduction covers raw / compact x no-spec / DFlash2 at
+  512 / 4096 / 32768 / 131072 tokens (17 cases, 0 hits before the fixes
+  for compact 4K/32K in both modes) plus the private copy-on-write tail;
+  `tests/v1/core` 212 pass.
+- Engine (p5-compactfix-prefix, no-spec, compact, record env): warm 4096
+  0.169 s with 3,264 hits (cold 0.579 s), warm 32768 0.176 s with 32,640
+  hits (cold 4.681 s); 512 cannot hit below one 1088-token block. Cold
+  32K 4.68 s against 5.31 s before the record's 64 MiB custom-AR buffer.
+- Engine, spec mode under fix 2 (p5-fix2-prefix-spec, DFlash2 k=3, compact,
+  record env): warm 4096 0.327 s with 2,304 hits (cold 0.598 s), warm 32768
+  0.360 s with 31,104 hits (cold 4.676 s) - exactly the CPU model's
+  27 x 1152 (the EAGLE-style drop recomputes the last 1152-token block
+  before the prompt's tail). Before fix 2 the same boot geometry gave 0
+  hits at both lengths (p5-compactfix-verify, p5-record-spec).
+- Raw: `~/.local/scratch/slimserve-glm53/serve-logs/probe-boot-p5-compactfix-{prefix,verify}.out`,
+  `queue-f.out`.
+
+### Record arm, spec (p5-record-spec): compact cache + DFlash2 k=3 probabilistic/block + custom AR 64 MiB - RETAINED (record)
+
+- Boot 18:17 (fix 1 in, fix 2 not yet): c1 195.5 / 213.7 / 215.1, c8
+  565.6 / 567.7 / 581.8, c16 784.2 / 783.4 / 771.2; medians 213.7 /
+  567.7 / 783.4. Against arm 4 (same speculator, raw cache, 8 MiB AR:
+  239.0 / 532.0 / 729.2) that is c1 -10.6 %, c8 +6.7 %, c16 +7.4 %.
+  Cold TTFT 32K 4.72 s, 128K 19.8 s; warm 128K 0.656 s, warm 32K still a
+  re-prefill (expected on this boot, see fix 2). Gates -2.462 / -2.473
+  (in band). Canaries pass, `exact: true` on all nine runs.
+- The c1 gap against arm 4 is the spec-mode c1 spread, not a loss: see
+  the isolating arm below (p5-spec-raw-car64), which puts the raw cache
+  under the same speculator and AR buffer at 197.4 and shows arm 4's own
+  passes ran 212.5 / 239.0 / 289.6.
+- Raw: `perf/results/2026-09-12/p5-record-spec-pass{1,2,3}/`, gates
+  `p5-record-spec-gate{1,2}.json`, `serve-logs/ttft-p5-record-spec.out`.
+
+- Correctness of the hash-granular hits (prefix_verify.py: cold request,
+  then the identical prompt warm, top-8 logprobs of the first generated
+  token at the recommended sampling settings): no-spec warm 4096 (3,264
+  hits) max |delta| 0.30, warm 32768 (32,640 hits) 1.19; spec warm 4096
+  (2,304 hits) 1.10, warm 32768 (31,104 hits) 0.94. The same probe with
+  NO hits (the pre-fix-2 spec boot, both requests re-prefilled) gave 1.20
+  / 0.56, so the deltas are the stack's run-to-run noise on far-tail
+  tokens (logprobs -10 to -13, probabilities ~1e-5), not a cache effect:
+  the top-1 token agrees at every length with its logprob within 0.07
+  (4096) and 1e-4 (32768). The second gate of every later arm runs warm
+  (its prompts hit) and is the standing quality check for the reused
+  states. Raw: `serve-logs/probe-boot-p5-{compactfix-verify,fix2-verify-spec,fix2-verify-nospec}.out`.
+
+### Isolating arm, spec + raw indexer cache + custom AR 64 MiB (p5-spec-raw-car64): the compact cache stays on the record
+
+- Question: the record arm's c1 (213.7) sat 10.6 % under arm 4 (239.0;
+  raw cache, 8 MiB AR) while c8/c16 gained 7 %. This arm keeps the record
+  (speculator, 64 MiB AR, fix 1 + fix 2) and only switches
+  `glm5_next_compact_indexer_cache` off, to split the cache from the AR
+  buffer under speculation.
+- Result (boot 18:37, TTFT + 3 passes): c1 193.7 / 197.4 / 201.3, c8
+  550.5 / 563.1 / 569.1, c16 770.5 / 751.4 / 764.4; medians 197.4 /
+  563.1 / 764.4. Cold TTFT 32K 11.15 s, 128K 122.1 s; warm 32K 1.01 s,
+  128K 3.81 s. `exact: true` on all nine runs, canaries pass.
+- Reading: with the raw cache the record's speculator lands BELOW the
+  compact record arm on every axis (c1 -7.6 %, c8 -0.8 %, c16 -2.4 %,
+  cold 32K 2.4x slower, cold 128K 6.2x slower), so neither the compact
+  cache nor the 64 MiB buffer costs c1. The gap to arm 4 is c1 noise
+  under speculation: arm 4's three passes were 212.5 / 239.0 / 289.6 and
+  the record arm's 195.5 / 213.7 / 215.1. A 300-token c1 reply under
+  DFlash2 takes ~1.5 s and its acceptance follows the sampled text, so a
+  three-pass c1 median resolves only >30 % effects in spec mode; c8/c16
+  (pass spread <= 3 %) decide spec arms, c1 is reported, not decided on.
+- The raw-cache prefill numbers reproduce every earlier raw arm (cold 32K
+  11.1-11.7 s, cold 128K 122-125 s on p5-ttft-ref / p5-car64 /
+  p5-nccl-simple); the compact cache is what cut them to 4.7 s / 19.6 s.
+- Decision: the record keeps the compact cache, the 64 MiB AR buffer and
+  DFlash2 k=3 probabilistic/block (`speculative_overrides`); the record
+  arm's PROVISIONAL is cleared.
+- Raw: `perf/results/2026-09-12/p5-spec-raw-car64-pass{1,2,3}/`,
+  `~/.local/scratch/slimserve-glm53/serve-logs/{ab,ttft}-p5-spec-raw-car64.out`.
+
+### Item 8, re-measure after the upstream merge: FP8 main KV (`glm5_next_main_kv_fp8`) with upstream's fp8 sparse prefill kernel - REJECTED (kernel unqualified on sm_120)
+
+- Why again: the merge of upstream/main 9d76a981b brought the A100 record's
+  fp8 main KV pieces: the partition rule for the fp8 sparse decode kernel
+  and `mla_sparse_prefill_fp8` (groups of 4 queries over the union of
+  their pools, tensor cores, default on for fp8 caches). Item 8 had been
+  rejected on decode cost alone (p1-fp8kv: c16 -4.7 %).
+- Arm p6-fp8kv-nospec (boot 18:52, compact cache, 64 MiB AR, flag on):
+  c1 167.0 / 167.0 / 166.8, c8 581.6 / 581.1 / 573.7, c16 769.5 / 776.4 /
+  768.7; cold TTFT 32K 2.91 s, 128K 12.15 s; warm 0.177 s / 0.372 s.
+  `exact: true` on all nine runs - and the gates at -10.32 / -10.46 with
+  needle margins 1.7 / -13.5 and 2.1 / -20.5: the model is answering
+  garbage. Every throughput number of this arm is void.
+- Cause: `sparse_prefill_attn_kernel` asks 116,224 B of opt-in shared
+  memory per block (Q 66.5 KB + K tile 33 KB + score exchange 16 KB); the
+  RTX PRO 6000 opts in to 101,376 B. The binding set the attribute without
+  checking the result and launched without a launch check, so the kernel
+  never ran and the output buffer was returned uninitialised. Upstream's
+  own parity test (`tests/kernels/test_quixicore_sparse_prefill.py`) fails
+  5/5 here.
+- Fix (this branch): the binding now checks `cudaFuncSetAttribute` and the
+  launch (`C10_CUDA_KERNEL_LAUNCH_CHECK`), exposes
+  `mla_sparse_prefill_fp8_smem_bytes()`, and `_sparse_prefill_enabled()`
+  turns the kernel off with a warning on a device whose opt-in limit is
+  below its need, so an fp8 main KV on sm_120 falls back to the per-token
+  decode kernel for prefill instead of serving noise. A native sm_120
+  variant (a 32-row Q tile, 58 KB) is a separate item; with Item 8's decode
+  cost unchanged it is not queued.
+- Decision: FP8 main KV stays off the record; `glm5_next_sparse_prefill`
+  is self-qualifying. The prefill sparse-MLA lever for the bf16 cache is
+  the rows kernel (P6 below).
+- Raw: `perf/results/2026-09-12/p6-fp8kv-nospec-pass{1,2,3}/`, gates
+  `p6-fp8kv-nospec-gate{1,2}.json`, `serve-logs/{ab,ttft}-p6-fp8kv-nospec.out`,
+  `serve-logs/queue-h.out` (the test line).
+
+### Post-merge baseline (p6-merge-base-nospec): upstream/main 9d76a981b merged into the branch
+
+- What the merge brings to this record: the batched warp-split mHC partials
+  (`QC_MHC_PARTIALS_WS`, default on; the T > 1 prefill steps take the
+  batched path), the scheduler's hybrid invalid-block fix, the host-tier
+  hash fix, and the fp8 main KV pieces measured in the entry above. Same
+  record settings as p5-record-nospec (compact cache, 64 MiB AR).
+- Result (boot 18:59, no-spec, TTFT + 2 gates + 3 passes): c1 162.5 /
+  166.0 / 165.7, c8 572.3 / 572.8 / 572.6, c16 767.2 / 764.4 / 765.8;
+  medians 165.7 / 572.6 / 765.8 against p5-record-nospec 163.8 / 555.0 /
+  730.9 (c1 +1.2 %, c8 +3.2 %, c16 +4.8 %). Cold TTFT 32K 4.14 s (from
+  4.70 s, -12 %), 128K 17.2 s (from 19.6 s, -12 %); warm 0.177 s / 0.362 s.
+  Gates -2.469 / -2.452 (in band), canaries pass, `exact: true` on all
+  nine runs.
+- Reading: the prefill gain is upstream's batched mHC partials (Phase 5
+  attribution 2 had the mHC partials at 16.5 % of the cold 32K), the c8/c16
+  gain the same kernel on the verify-sized steps. This is the baseline for
+  the P6 prefill kernel arm below.
+- Raw: `perf/results/2026-09-12/p6-merge-base-nospec-pass{1,2,3}/`, gates
+  `p6-merge-base-nospec-gate{1,2}.json`, `serve-logs/{ab,ttft}-p6-merge-base-nospec.out`.
+
+### Item P6: prefill-shaped sparse MLA tensor-core kernel (`sparse_tc_nope_rows`, `glm5_next_sparse_tc_prefill`) - RETAINED (record setting)
+
+- Baseline: p6-merge-base-nospec above (cold 32K 4.14 s, 128K 17.2 s; c1 /
+  c8 / c16 165.7 / 572.6 / 765.8). Phase 5 attribution 2 had the sparse MLA
+  of the prefill chunks at 24 % of the cold 32K: the per-token SIMT decode
+  kernel (`mla_decode_fp8_v`, one warp per head x token) walking each row's
+  2,080-wide list once per head, 55 launches x 22.7 ms.
+- Hypothesis: one Triton program per query token, all 16 heads at once,
+  online softmax over the row's index list in 32/64-row gathered tiles
+  (each tile read once for every head), the query held transposed [512,
+  16] so the gathered tile is the A operand of both dots and no transposed
+  copy is needed inside sm_120's 99 KB of shared memory; fp32 softmax with
+  split bf16 probabilities (the decode TC kernel's numerics). No partition
+  scratch, so it scales to chunks of thousands of rows. bf16 latents only:
+  an fp8 main KV takes the native fp8 prefill kernel (the fp8 decode branch
+  asked 147 KB of shared memory at tile 64 and duplicated that kernel; it
+  was removed).
+- Correctness: `tests/glm5_next/test_sparse_tc_prefill_rows.py` (17 tests):
+  parity with the pure-torch reference and with the native SIMT kernel at
+  1 / 7 / 64 / 257 rows with growing visible prefixes, -1 gaps and halved
+  lengths, 8 and 16 heads, tile 32 and 64 (atol 0.002 / 0.004), packed-slab
+  page strides against the partitioned decode TC kernel. (The first run of
+  the parity test failed 13/18 against the native kernel: the test had
+  called it with page_stride_bytes=0 on a strided view; the rows kernel
+  matched the reference throughout.) Gates on the arm -2.450 / -2.464 (in
+  band, gate2 warm), canaries pass, `exact: true` on all nine runs.
+- Microbench (GPU 0, 32K context, H=16, 2,080-wide lists, 7,616 rows = the
+  last chunk of a 32K prompt): native SIMT unpartitioned 25.91 ms, rows
+  kernel tile 32 7.85 ms, tile 64 7.05 ms (3.7x), max |delta| vs native
+  0.0002; 1,024 rows: 3.64 ms vs 0.94 ms.
+- Result (p6-tcprefill-nospec, boot 19:06, flag on, no-spec): cold TTFT
+  32K 3.126 s (-24 %), 128K 13.17 s (-23 %); warm 0.197 s / 0.355 s. c1
+  162.6 / 166.2 / 166.2, c8 581.0 / 580.7 / 578.4, c16 776.9 / 774.8 /
+  775.0; medians 166.2 / 580.7 / 775.0 (+0.3 / +1.4 / +1.2 %: the kernel
+  also serves the verify-sized prefill steps of the c8/c16 mix).
+- Decision: retained; `glm5_next_sparse_tc_prefill: true` joins the
+  record's `additional_config` (opt-in like the decode TC switch; the A100
+  records at 8 heads per rank qualify but are not measured here). Dispatch:
+  chunked-prefill steps with 8 or 16 heads, bf16 q and cache, 512-wide
+  latent; decode steps keep their own dispatch. Tile 64.
+- Raw: `perf/results/2026-09-12/p6-tcprefill-nospec-pass{1,2,3}/`, gates
+  `p6-tcprefill-nospec-gate{1,2}.json`, `serve-logs/{ab,ttft}-p6-tcprefill-nospec.out`,
+  `serve-logs/queue-h.out` (microbench lines), `queue-i.out` (17 passed).
+
+### Final record arms (p7-final-nospec, p7-final-spec): the campaign's closing numbers on the final tree
+
+- Tree: 4c1e0a90f (upstream/main 9d76a981b merged; `_quixicore_C` rebuilt
+  with the fp8 sparse prefill checks; the branch cleanup and the P6 flag on
+  the record). Every GPU kernel test of the branch passes on this build
+  (rows 17, sparse MLA bf16 27, route+align 11, shared hand-off 3,
+  moe_sum_add 35, topk_sample 18, decode GEMM 44 + 45, KDA decode 8, mHC
+  batched partials 5; the fp8 sparse prefill test skips with the
+  shared-memory reason).
+- No speculation (boot 19:16): c1 165.9 / 166.2 / 166.3, c8 582.0 / 581.1 / 581.5, c16
+  777.0 / 781.6 / 778.0; medians 166.2 / 581.5 / 778.0. Cold TTFT 32K
+  3.14 s, 128K 13.1 s; warm 0.174 s / 0.354 s. Gates
+  -2.452 / -2.439.
+- DFlash2 k=3 probabilistic/block (boot 19:21, `--spec`): c1 218.0 / 218.9 / 214.2,
+  c8 579.2 / 618.7 / 598.1, c16 862.3 / 839.9 / 848.4; medians 218.0 / 598.1 / 848.4.
+  Cold TTFT 32K 3.16 s, 128K 13.3 s; warm 0.296 s /
+  0.544 s. Gates -2.446 / -2.477 (the warm gate at the band's
+  low edge, -2.478; every other spec gate of the campaign sat inside it).
+- Against the bring-up baseline (113.3 / 449.2 / 611.0, cold 11.8 s /
+  124 s): c1 +47 %, c8 +29 %, c16 +27 % without speculation; +92 % / +33 % /
+  +39 % with it; cold 32K prefill 3.8x faster, 128K 9.4x. Against the
+  unhandicapped B12X control (166.5 / 687.9 / 966.8, MTP-3 260.8 / 732.1 /
+  1005.8, cold 2.93 s / 14.9 s): c1 at parity (no-spec) and 84 % of the
+  control's MTP-3 (spec), c8 85 %, c16 80 % (88 % under speculation), cold
+  32K 1.07x the control's, 128K faster than the control's.
+- Canaries pass on both boots, `exact: true` on all eighteen runs. These
+  two arms are the record rows in `perf/baseline_status.md`.
+- Raw: `perf/results/2026-09-12/p7-final-{nospec,spec}-pass{1,2,3}/`, gates
+  `p7-final-{nospec,spec}-gate{1,2}.json`, `serve-logs/{ab,ttft}-p7-final-*.out`,
+  `serve-logs/queue-j.out` (build and test lines).
+
+## 2026-09-12: rtx6000 Phase 7 (the control's decode gap), item by item
+
+The mandate after the Phase 6 close: exceed the B12X control's exact-token
+1000/300 numbers (166.5 / 687.9 / 966.8 tok/s at c1 / c8 / c16, no
+speculation) rather than stop at 83 % / 79 % of them at c8 / c16. The
+control's expert kernels turned out to be the open-source `b12x` library
+(Apache-2.0, Luke Alonso; the image's tree is newer than PyPI 1.3.0), so
+the first arm put its native sm_120 NVFP4 experts on our tree.
+
+### Item B1: b12x native NVFP4 W4A4 experts (`moe_backend: b12x`) - REJECTED for decode
+
+- Baseline: the p7-final-nospec record, 166.2 / 581.5 / 778.0, cold TTFT
+  32K 3.14 s, 128K 13.1 s.
+- Hypothesis: the control's ~18 % c8 / ~24 % c16 lead is its native
+  W4A4 expert kernel (the control's log names `B12X` as its NvFp4 MoE
+  backend); Marlin W4A16 dequantizes FP4 to bf16 fragments and cannot use
+  the sm_120 block-scaled MMA.
+- Implementation (branch, opt-in): `vllm/model_executor/layers/fused_moe/b12x.py`
+  (`B12xExperts`, a `FusedMoEExpertsModular` kernel over
+  `b12x.moe.fused_moe` plan / bind / run, capacities {1, max_num_tokens},
+  quant modes nvfp4 / w4a8_nvfp4 / w4a16),
+  `quantization/utils/b12x_moe.py` (ModelOpt tensors to b12x's layout: FC1
+  halves padded to 64 rows, swizzled block scales, per-expert activation
+  scales), `warmup/b12x_warmup.py` + `utils/b12x.py` (every serving token
+  count compiled before the first CUDA graph capture, from
+  `kernel_warmup` and the trial capture in `gpu_worker`), the `B12X` member
+  of `NvFp4MoeBackend` (`oracle/nvfp4.py`, `config/kernel.py`), an A16
+  switch `VLLM_B12X_MOE_FP4_FORCE_A16`, and `tests/kernels/test_b12x_moe_prep.py`.
+  The `ll_bf16` router GEMM's availability check now also requires `quack`
+  (installing `nvidia-cutlass-dsl` for b12x made `cutlass` importable and
+  its warmup crashed the boot on the missing `quack.compile_utils`).
+- Correctness: canaries pass (text / tool / image), `exact: true` on all
+  nine runs, gates -2.437 / -2.444 (in band) on the image-tree arm.
+- Result, image b12x tree (b12x-a4c, boot 21:16, no-spec, three passes):
+  c1 158.7 / 157.1 / 158.7, c8 565.6 / 566.6 / 564.9, c16 765.2 / 760.8 /
+  750.9; medians 158.7 / 565.6 / 760.8 = -4.5 % / -2.7 % / -2.2 % against
+  the Marlin record. Cold TTFT 32K 3.07 s (-2 %), 128K 12.65 s (-3 %); warm
+  0.237 s / 0.419 s.
+- PyPI b12x 1.3.0 (b12x-a4b, boot 21:08; no `b12x.policy` device profiles):
+  157.1 / 507.0 / 729.2, cold 32K 5.30 s, gates -2.403 / -2.447.
+- Profiles (c8 and c16, torch profiler, six full steps each, `prof_one_conc.sh`):
+  the b12x expert kernel is 132 us per layer at c8 and 209 us at c16
+  (5.50 / 8.72 ms per step) against Marlin's 2 x 64.8 us and 2 x 103 us
+  (5.34 / 8.59 ms); GPU span per step 11.78 / 15.85 ms (b12x) vs 11.50 /
+  15.53 ms (Marlin). Both sit near the expert-read floor (about 57 distinct
+  experts x 3.15 MB per layer at c8, 103 at c16, at 1.4 to 1.5 TB/s), so
+  neither kernel can carry a 20 % step gain.
+- Decision: rejected for the decode record; Marlin stays. The backend stays
+  in the tree as an opt-in (`moe_backend: b12x`) because it is the faster
+  prefill kernel (-2 to -3 % cold TTFT) and the natural home for a later
+  W4A16 / `nvfp4_auto` decode experiment; it needs a b12x newer than PyPI
+  1.3.0 (the control image's tree, or the public `sparkinfer` repository
+  from 2026-09-08 on). The record note that called a native sm_120 expert
+  kernel "campaign work" is rewritten.
+- Raw: `perf/results/2026-09-12/b12x-a4{b,c}-pass{1,2,3}/`, gates
+  `b12x-a4{b,c}-gate{1,2}.json`, `serve-logs/{ab,ttft}-b12x-a4{b,c}.out`,
+  profiles `profile-conc{8,16}-{b12x,marlin}/`, tables in
+  `serve-logs/prof-conc{8,16}-{b12x,marlin}.out`.
+
+### Phase 7 attribution: the control profiled with the same capture (c8 and c16)
+
+- Method: the r28.1 container booted with `--profiler-config` (torch
+  profiler, 8 iterations, `ignore_frontend`), the same `prof_run.py` rounds
+  (two warmups of 64 tokens, the profiled 384-token round at c8 / c16), the
+  same `step_attrib.py` over rank 0 (`control_prof.sh`, traces in
+  `profile-control-c{8,16}/`, tables in `serve-logs/prof-control-c{8,16}.out`).
+- GPU span per decode step: control 11.30 ms at c8 and 16.16 ms at c16;
+  ours (Marlin record) 11.50 ms and 15.53 ms. Launches per step 1682 /
+  1712 (control) vs 1532 / 1555. The control's kernel-busy time is 15.0 /
+  21.3 ms per step because it runs four streams (main, shared-expert
+  GEMMs, KDA, L2 prefetch) and overlaps 3.7 / 5.1 ms of it.
+- Where the control's step goes (c8): b12x experts 5.20 ms (125.8 us per
+  layer; ours 130), L2 weight prefetch 2.24 ms on its own stream (132
+  launches of `cp.async.bulk.prefetch.L2` for the next layer's dense
+  weights during the idle-DRAM windows, `l2_prefetch.py`), cuBLAS bf16
+  nvjet GEMMs 2.66 ms + 0.57 ms split-K reduce (bf16 backbone, 2x our
+  bytes, reading from L2 at up to 2.4 TB/s effective), one-shot PCIe
+  all-reduce 11.0 us x 89.5 = 0.98 ms (ours 2-stage 10.4 us x 90 =
+  0.93), b12x mHC 10.7 us per transition (ours 8.6), packed sequential KDA
+  decode 9.5 us + conv 5.6 us (ours 8.1 + 2.0 + 2.1 + 2.0), MLA
+  decode 10.8 + 2.5 us (ours 14.2 x 2). At c16 the control's two-shot AR
+  is 13.8 us (ours 12.2), its experts 221 us per layer (ours 206), its
+  dense GEMMs 4.3 ms (ours 2.7 ms).
+- Reading: on the GPU our decode step is at parity with the control at
+  c8 (+1.8 %) and ahead at c16 (-3.9 %). The bench gap (688 vs 581 at c8,
+  967 vs 778 at c16) is therefore not in the decode kernels; the
+  exact-token 1000/300 wall includes the prefill of 8 x 1000 and 16 x 1000
+  prompt tokens (no prefix-cache hits between passes: the serve logs show
+  0.0 % hit rate through the passes) and any host time between steps.
+  The metrics-instrumented bench below separates them.
+- Dense block-FP8 GEMM microbench (`fp8_b12x_bench.py`, GPU 0, the
+  swap-set per-rank shapes, weights rotated past L2, M = 1 / 8 / 16):
+  b12x `gemm.blockscaled.mm_block_fp8` (e4m3 activations, `expected_m`)
+  is slower than the QuixiCore `decode_gemm_fp8` (bf16 activations) on
+  every shape, before its activation quantization (KDA in_proj 25.7 MB:
+  17.9 vs 18.6 us at M=8; shared gate_up 4.2 MB: 7.0 vs 10.1 us; +1.7 us
+  of `per_token_group_quant_fp8` on top), and its 128-row alignment would
+  pad the 6192-row KDA projection. CUTLASS blockwise sits between them.
+  REJECTED as a dense-GEMM lever. Table in `serve-logs/fp8-b12x-bench.out`.
+
+### Phase 7 attribution 2: where the bench wall goes (metrics-instrumented 1000/300 on both servers)
+
+- Method: `metrics_bench.sh` / `control_metrics_bench.sh` boot each
+  server once and run the exact-token c8 / c16 / c1 shapes twice, reading
+  the engine's own `/metrics` histograms (TTFT, prefill time, queue time,
+  inter-token latency, decode time) before and after each shape. Same
+  prompts, same sampling, same client as `ab2.sh`. Raw:
+  `serve-logs/metrics-bench-{ours,control}.out`,
+  `serve-logs/metrics-mb-{ours,control}/`, `perf/results/2026-09-12/mb-{ours,control}-p{1,2}-*/`.
+- Ours (Marlin record), pass 1 / pass 2:
+  c8 581.1 / 582.0 tok/s, TTFT 613 / 586 ms, prefill 506 / 505 ms,
+  inter-token 12.0 / 12.0 ms;
+  c16 776.0 / 778.4 tok/s, TTFT 1023 / 1042 ms, prefill 905 / 950 ms,
+  inter-token 18.2 / 18.1 ms; c1 166.8 / 166.9, TTFT 105 / 102 ms,
+  inter-token 5.7 ms. Prefix cache hit rate 0.0 % through both passes.
+- Control r28.1, pass 1 / pass 2:
+  c8 680.6 / 685.0 tok/s, TTFT 545 / 30 ms, prefill 270 / 6.7 ms,
+  inter-token 12.6 / 11.6 ms;
+  c16 960.0 / 969.5 tok/s, TTFT 757 / 45 ms, prefill 269 / 6.4 ms,
+  inter-token 17.3 / 16.4 ms; c1 166.4 / 166.5, TTFT 12.6 / 11.4 ms
+  (prefill 7 / 6 ms: the warm-up request already primed its prompt),
+  inter-token 6.0 ms.
+- Reading. (1) The decode step is nearly the same on both servers: 12.0 vs
+  11.6 ms at c8 (3 %), 18.1 vs 16.4 ms at c16 (10 %), 5.7 vs 6.0 ms at c1.
+  (2) The control's bench lead is its prefix cache: from the second pass
+  on (and for the c1 warm-up), every 1000-token prompt hits and the
+  prefill costs 6 ms; ours never hits because the hybrid page-size
+  unification makes the MLA/KDA block 1088 tokens and hashes at that
+  granularity (`prefix_match_unit` unset, gcd of the group blocks), so a
+  1000-token prompt has no complete block to hit. Its 0.5 s / 1.0 s of
+  prefill is 12 % / 16 % of the c8 / c16 wall; the control's split-page
+  layout keeps 2048-token pages but checkpoints the recurrent state at
+  request boundaries (`boundary_checkpoint.py`, prompt / response /
+  instruction slots) so a repeated or continued prompt hits exactly.
+  (3) Our cold prefill of the 8 prompts is also slower: 506 vs 270 ms.
+  The batched-prefill profile (`prof_prefill.sh c8-1000`, trace
+  `profile-prefill-c8-1000/`) shows the first request alone in a 1000-token
+  step of 145 ms (2599 launches, 96 ms of kernels: launch-bound), then a
+  7000-token step of 343 ms whose kernels are custom all-reduce 122 ms
+  (36 %, 55 x 2.2 ms for 57 MB messages: 39 GB/s of PCIe reads per GPU),
+  Marlin experts 63 ms, mHC 47 ms, FP8 GEMMs 42 ms, KDA 16 ms, sparse
+  MLA 11 ms. The control's prefill under the profiler is not
+  representative (its DMA all-reduce spins in 2366 flag kernels; 410 ms
+  for the same 1000-token step), so its 270 ms comes from the metrics only.
+- Levers, in order: prefix hits for prompts shorter than the page
+  (`prefix_match_unit: 64` uses the branch's hash-granular partial hits,
+  commit a3d4fb49d, plus upstream's partial-block primitives: E1 below);
+  the c16 step's 2.6 ms of non-GPU time (18.1 ms measured against a 15.5 ms
+  GPU span under the profiler); the prefill all-reduce (pull-based 2-stage
+  kernel at 39 GB/s on PCIe) and the launch-bound small prefill steps.
+
+### Item E1: `prefix_match_unit: 64` on the record (hash-granular prefix hits) - RETAINED
+
+- Baseline: p7-final-nospec 166.2 / 581.5 / 778.0 (prefix hit rate 0.0 %
+  on the exact bench; every 1000-token prompt below the 1088-token
+  unified block).
+- Change: the rtx6000 record hashes at 64 tokens (`prefix_match_unit: 64`
+  next to `block_size: 64`); the branch's partial-hit machinery
+  (`enable_partial_hash_hits`, fine-grained lookups in the full-attention
+  and mamba managers, CoW redirect of the shared tail block) turns a
+  repeated 1000-token prompt into a 960-token hit plus a 40-token eager
+  chunk.
+- Result (e1b-pmu64, boot 22:14, `--no-spec`, gates + cold/warm TTFT +
+  three passes): c1 166.4 / 166.7 / 166.7, c8 656.1 / 653.9 / 655.9,
+  c16 969.2 / 977.4 / 971.2 = +0.3 / +12.8 / +24.8 % over the record.
+  Gates -2.461 / -2.469 (in band). Cold TTFT 32K 3.145 s, 128K 13.11 s;
+  warm 128K 0.362 s, warm 32K 1.060 s (record 0.174 s: REGRESSION, see
+  below). `exact: true` on all nine runs, canaries pass.
+- Metrics bench (e1-metrics, `metrics_bench.sh`, pass 1 / pass 2): c8
+  651.1 / 656.3 tok/s, TTFT 458 / 198 ms, prefill 370 / 104 ms, inter-token
+  11.8 / 11.5 ms; c16 950.9 / 950.2, TTFT 821 / 238 ms, prefill 719 /
+  149 ms, inter-token 16.3 / 15.9 ms; c1 166.8 / 166.5, TTFT 107 / 107 ms,
+  prefill 102 ms. Engine hit rate 74-81 % through the passes. The warm
+  prefill is 104 / 149 ms against the control's 6.7 / 6.4 ms: the 40-token
+  leftover chunk runs as an eager prefill step, and every eager step on
+  this tree costs about 100 ms of host time regardless of its token count
+  (below).
+- Warm 32K regression, root cause: 32768 is a multiple of 64, so the
+  tail rule's boundary equals the prompt length; the cold prefill's
+  chunks end at 8192 / 16384 / 24576 / 32768 and the mamba state is
+  materialized only at chunk ends, so the deepest usable state (the hit
+  must stop at P-1) sat at 24576 and the warm request re-prefilled 8192
+  tokens (1.06 s). Fixed by E2 (the replay boundary at P-1).
+- Raw: `perf/results/2026-09-12/e1b-pmu64-pass{1,2,3}/`, gates
+  `e1b-pmu64-gate{1,2}.json`, `serve-logs/{ab,ttft}-e1b-pmu64.out`,
+  `serve-logs/metrics-bench-e1.out`, `serve-logs/metrics-e1-metrics/`.
+
+### Phase 7 attribution 3: client-side token cadence, the prefill step's true GPU time, and the PCIe all-reduce microbench
+
+- Streaming probe (`stream_itl.py`, 1000-token prompt slices, seeded
+  sampling, `ignore_eos`, per-chunk timestamps; ours pre-E1 then the
+  control, two rounds each; `serve-logs/stream-probe-chain.out`):
+  c8 ours 568 / 566 tok/s, TTFT mean 736 / 742 ms, ITL median 11.41 /
+  11.45 ms (p99 12.0); control 659 / 659, TTFT 187 / 159 ms, ITL median
+  11.38 / 11.39 (p99 12.7). c16 ours 749 / 753, TTFT 1411 / 1371 ms, ITL
+  median 15.52 / 15.54 (p99 16.3); control 318 (first round: an 11 s TTFT
+  outlier and 2.8 s stalls while its second-pass state settled) / 931,
+  TTFT 5279 / 299 ms, ITL median 11.96 / 15.98. The decode cadence is the
+  same on both servers at c8 and ours is 3 % faster at c16; the bench
+  gap was TTFT (prefix hits plus the cold prefill).
+- Prefill step timeline (`step_timeline.py` over the
+  `profile-prefill-c8-1000` trace, GPU-side spans instead of the CPU
+  annotations the earlier entry used): the 1000-token step is host-bound
+  (145 ms wall, 96 ms of kernels: 46 compiled FX graph pieces at 1.79 ms
+  of host time each plus 34 `kda_attention` calls at 1.09 ms; the floor is
+  about 100 ms for ANY eager step, which is also the warm-TTFT floor E1
+  hit); the 7000-token step's CPU annotation is 343 ms but its kernels
+  run 553 ms (the GPU finishes 208 ms after the annotation closes):
+  custom all-reduce 202 ms (36 %), Marlin experts 110 ms, mHC 75 ms, FP8
+  GEMMs 65 ms, KDA 16 ms, sparse MLA 11 ms.
+- Control prefill profile (`control_prof_prefill.sh`, same capture,
+  `profile-control-prefill-c8-1000/`): not representative of its serving
+  prefill (415 ms window for the 1000-token step, 2366 DMA flag-wait
+  kernels at 86.6 us spinning while peers copy, 1092 PtoP memcpys); its
+  MoE kernel is 42 x 1.07 ms and its mHC prefill kernels total 5.3 ms.
+  Its 270 ms per-request prefill comes from the metrics only.
+- All-reduce microbench (`ar_bench.py`, 4 ranks, bf16 rows x 4096, us per
+  call, max over ranks, median of 5 x 20; `serve-logs/ar-bench.out`):
+
+  | bytes | NCCL | ours 2-stage | ours 1-stage | b12x DMA ring |
+  |---:|---:|---:|---:|---:|
+  | 8.2 MB (1000 rows) | 555 | 331 | 616 | 845 |
+  | 16.8 MB (2048) | 1107 | 664 | 1242 | 841 |
+  | 33.6 MB (4096) | 2189 | 1308 | 2467 | 930 |
+  | 57.3 MB (7000) | 3725 | 2230 | 4236 | 1572 |
+  | 67.1 MB (8192) | 4357 | 2607 | 4969 | 1834 |
+
+  Our 2-stage kernel holds 38.6 GB/s of bus bandwidth at every size (1.7x
+  NCCL's 23 GB/s); the b12x DMA ring reaches 54-55 GB/s from 33 MB up but
+  sits on a ~840 us floor below that (six ring steps of CE copies, flag
+  kernels and adds issued from Python across four streams: host-bound at
+  small sizes), so it only pays above ~24 MB (about 3000 prefill tokens):
+  at the 7000-token step it would save 30 % of the 202 ms of all-reduce
+  (~60 ms of 553) at the cost of ~0.8 ms of host time per call. Results
+  `allclose` on both kernels. Deferred behind the prefix-hit work; the
+  prefill lever list is now: the DMA ring for >= 24 MB messages, the mHC
+  prefill kernel (75 ms vs the control's ~5 ms), and the host-bound small
+  steps (piecewise graphs or a leaner KDA small-chunk path).
+
+### Item E2: the prompt tail at the replay boundary (exact repeats hit P-1 tokens) - RETAINED
+
+- Hypothesis: E1's warm TTFT (198 / 238 ms at c8 / c16) is one eager step
+  for the 40 leftover tokens, and any eager step costs ~100 ms of host
+  time. The control avoids it by checkpointing the recurrent state at
+  request boundaries (`boundary_checkpoint.py`) so a repeated prompt hits
+  its full length and the first token comes out of a decode-shaped step.
+  The same result follows from the branch's own partial-hit machinery if
+  the last cold chunk stops at P-1 and the state there is cached under a
+  hash of the exact prefix: the warm request then hits P-1 tokens
+  (`get_computed_blocks` caps hits at num_tokens - 1 anyway) and its last
+  prompt token runs as a 1-token step, which is decode-shaped and takes
+  the FULL_DECODE_ONLY graph.
+- Implementation (`vllm/v1/core/`): `prompt_tail_boundary()` in
+  `kv_cache_utils.py` (P-1 when replay applies, else the E1 unit floor);
+  `RequestBlockHasher.hash_prefix(request, end)` and
+  `Request.hash_prefix(end)` (memoized): the unit-boundary hash when
+  `end` is on the hash grid, else a chained hash of the tail tokens with
+  the preceding unit hash as parent and the request's extra keys;
+  `BlockPool.cache_partial_block` stores unaligned tails under that hash
+  and indexes them by root (`tail_entries_by_root`) so a LONGER prompt
+  finds a shorter prompt's tail through its shared unit prefix
+  (`find_tail_entry`); `cache_full_blocks(keep_partial_entries=True)`
+  keeps the full-attention tail entries when the block later fills (the
+  E1 promotion removed them); the full-attention and mamba managers probe
+  the tail index before each unit entry in `find_longest_cache_hit`
+  (`_find_prompt_tail`) and register their tail at the replay boundary in
+  `_cache_partial_tail_block`; the hybrid coordinator enables
+  `prompt_tail_replay` when partial hashing is on, no eagle, and a mamba
+  group exists; the scheduler's `_mamba_block_aligned_split` stops the
+  last cold chunk at P-1 (`tail_boundary`), so the cold path runs P-1
+  tokens then 1 token instead of E1's 960 + 40. The mamba state at P-1 is
+  the chunk-end state the align mode already materializes; registering
+  it at a boundary triggers the existing CoW copy so the frozen state
+  survives the request's own next step. A tail hit skips the alignment
+  floor (`hit_length -= hit_length % alignment_tokens`) because the mamba
+  state exists exactly there.
+- Tests (`tests/v1/core/test_hybrid_partial_hit_alignment.py`, 24 pass;
+  all 224 tests under `tests/v1/core/` pass): repeats of 1000 / 1088 /
+  1089 / 4096 / 32768 tokens hit P-1 with a single 1-token chunk; a
+  1500-token prompt sharing a 1000-token prompt's prefix hits 999 through
+  the root index (chunks 89 / 411 / 1: resumed mid-block, it realigns to
+  the 1088 grid); a prompt diverging inside the tail hits 0 (no
+  intermediate unit entries: the mamba state exists only at chunk ends);
+  the tail index forgets evicted entries and `reset_prefix_cache` clears
+  it.
+- Result (e2-replaytail, boot 22:44, `--no-spec`, three passes): c1
+  168.1 / 168.3 / 168.4, c8 667.7 / 664.9 / 664.3, c16 977.9 / 976.4 /
+  972.0; medians 168.3 / 664.9 / 976.4 against E1's 166.7 / 655.9 / 971.2
+  and the control's 166.5 / 687.9 / 966.8 (c1 +1.1 %, c8 -3.3 %, c16
+  +1.0 %). Gates -2.454 / -2.450 (in band). Cold TTFT 32K 3.214 s, 128K
+  13.10 s; warm 32K 0.155 s (E1's regression fixed; record 0.174 s), warm
+  128K 0.367 s. `exact: true` on all nine runs, canaries pass.
+- Raw: `perf/results/2026-09-12/e2-replaytail-pass{1,2,3}/`, gates
+  `e2-replaytail-gate{1,2}.json`, `serve-logs/{ab,ttft}-e2-replaytail.out`.
+
+### Phase 7 attribution 4: the speculative step at c1 (DFlash2 k=3, torch profiler)
+
+- Method: `prof_spec.sh c1 1` (one boot with `--spec`, `prof_run.py` at
+  concurrency 1, eight profiled steps; `profile-spec-c1/`, summary in
+  `serve-logs/prof-spec-c1.out`, gap attribution `gap_kernels.py`).
+- The step period is 9.85 ms with the GPU 93 % busy (81.4 ms of kernels in
+  an 87.3 ms window): the CPU annotation closes at 7.4 ms and the GPU runs
+  2.5 ms past it, so the "gap" between steps is GPU time, not host time.
+  The no-spec step is 6.0 ms, so k=3 costs 3.9 ms per step and pays only
+  through the 2.2-2.4 tokens it accepts per step (c1 218 tok/s = 300 tokens
+  in 131 steps).
+- Per step (8-step averages): Marlin experts 2.65 ms (672 launches; the
+  4-token verify reads ~3x the experts of a 1-token step), FP8 decode GEMMs
+  1.72 ms (138 + 42 launches), custom one-shot all-reduce 0.83 ms (102 x
+  8.1 us), the drafter's own dense GEMMs 0.63 ms (14 cuBLAS wmma 16x16
+  kernels at 45 us: DFlash2's five 4096 x 12288 layers), bf16 decode GEMMs
+  0.50 ms, mHC 0.68 ms, KDA recurrent + conv 0.37 ms, sparse MLA 0.24 ms,
+  the drafter's flash attention 0.13 ms (5 x 25 us), `_topk_topp_kernel`
+  0.16 ms (the draft's probabilistic sampling still uses the Triton
+  top-k/top-p mask, not the fused `topk_sample`), NCCL all-gather 0.08 ms
+  (3 x 25 us, drafter).
+- Against the control's MTP-3 at c1 (260.8 tok/s at 2.45 accepted per step
+  = 9.4 ms per step; ours 9.85 ms at 2.29): the step is within 5 %, the
+  acceptance length is 7 % shorter, and the warm TTFT (100 ms of a 1.37 s
+  wall, no hit under speculation: below) is the rest of the 16 % gap.
+  Levers in order: prefix hits under speculation (E3), the draft sampling
+  through the fused sampler (0.16 ms), the drafter's GEMMs through the
+  decode GEMM kernels (0.3 ms), and the checkpoint's own MTP head at k=3
+  (the control's drafter; 2.45 accepted per step) as an acceptance arm.
+
+### E2 under speculation, and the metrics bench on the E2 tree (why the warm TTFT was still 90 ms)
+
+- Metrics bench on E2 (`metrics-bench-e2.out`, `--no-spec`, warm pass): c1
+  TTFT 89.6 ms of which prefill_time 84.5 ms (two client rounds); c8 TTFT
+  158 ms / prefill 90 ms; c16 TTFT 172 ms / prefill 93 ms. So the replay
+  hit P-1 tokens but the 1-token tail step still cost an eager step
+  (~85 ms): the runner keeps any batch holding a mid-prefill request off
+  the FULL decode graph (`num_computed_prefill_tokens < prefill_len`), and
+  the GDN builder classified the row as a prefill (`is_prefilling`), whose
+  chunked kernels take the eager path. Both are right for a fresh 1-token
+  prompt (the decode kernels read state slots it never wrote) and wrong
+  for the tail (its conv and recurrent state exist at P-1).
+- E2 under `--spec` (`ab-e2-replaytail-spec.out`, boot 22:56): prefix hit
+  rate 0.0 %, warm 32K TTFT 3.07 s (equal to cold), warm 128K 7.2 s, gate1
+  -2.493 (out of the -2.407..-2.478 band), c1 / c8 / c16 207.7-218.8 /
+  564.7-612.7 / 779.3-848.9. Root cause, from the coordinator: the DFlash2
+  drafter adds a sliding-window KV group whose `SlidingWindowManager` had
+  no fine-grained hash lookup, so `enable_partial_hash_hits` fell back to
+  False, the hit alignment became the 9216-token scheduler block (the
+  indexer block x8 under spec) and every 1000-token prompt missed. E1 and
+  E2 had only ever been measured with `--no-spec`; the spec arm of the
+  final record (p7-final-spec) carried the same 0 % hit rate unnoticed
+  because it never re-sent a prompt.
+- Raw: `$S/serve-logs/bench-e2-metrics-p{1,2}-c{1,8,16}-1000-300.out`,
+  `$S/serve-logs/ab-e2-replaytail{,-spec}.out`,
+  `$S/serve-logs/bench-e2-replaytail-pass{1,2}.out`.
+
+### Item E3: the tail step on the decode graph, and hash-granular hits under speculation - RETAINED
+
+- Hypothesis: with E2's P-1 hit in place the whole warm cost is the one
+  eager tail step; run it on the FULL decode graph (a 1-token decode-shaped
+  step, ~10 ms) and warm TTFT drops to the control's 30-45 ms range. Under
+  speculation, give the drafter's sliding-window group the same
+  hash-granular lookup the full-attention and mamba groups have, so the
+  hit machinery (E1 + E2) applies with `--spec` at all.
+- Implementation, three parts:
+  1. `uniform_token_count_with_prefills()` (`cudagraph_utils.py`, used by
+     the runner's dispatch guard): a batch keeps its uniform token count
+     when every still-prefilling request is a 1-token chunk that completes
+     a prompt with computed tokens (the replay tail); a fresh 1-token
+     prompt, a mid-prompt 1-token chunk and a spec-width prompt chunk stay
+     eager. `promote_prompt_tail_rows()` (`gdn_attn.py`): the GDN builder
+     reclassifies such rows from prefill to decode before its split, so the
+     step takes `causal_conv1d_update` + the fused recurrent decode with
+     the persistent FULL-graph buffers (`mamba_attn.py` already did this
+     as `prefill_to_decode`). Tests:
+     `tests/v1/worker/test_prompt_tail_decode_graph.py` (8).
+  2. `SlidingWindowManager` gains `supports_fine_grained_hash_lookup` and
+     `keeps_partial_entries_on_fill`: `find_longest_cache_hit` runs the
+     coarse right-to-left window scan over the hash-unit view
+     (`BlockHashListWithBlockSize`), then probes the partial units and
+     tail entries of the next block exactly as the full-attention manager
+     does, and trims to whole blocks; `cache_blocks` registers the tail at
+     the replay boundary; `reachable_block_mask` keeps its window
+     arithmetic for both granularities.
+  3. The eagle drop (hide the last hash unit so a shifted drafter's context
+     is complete) is gated to EAGLE/MTP: DFlash keys its context K/V on the
+     target hidden state of each token alone (`set_inputs_first_pass`
+     writes them the same step), so every cached boundary is exact.
+     `scheduler.eagle_drop` (False for `use_dflash()`) feeds
+     `KVCacheManager(use_eagle=...)` and the mamba split's tail boundary;
+     the coordinator's `eagle_group_ids` is empty unless the drop applies,
+     and `prompt_tail_replay` no longer excludes eagle engines. Without
+     this the DFlash2 arm hit 0 again (a grid-aligned P-1 dropped to 0).
+     Tests: `test_hybrid_partial_hit_alignment.py` (29; the replay test now
+     runs both no-spec and dflash2), 255 under `tests/v1/core/`.
+- Result, `--no-spec` (e3-nospec, boot 23:12, three passes): c1 171.0 /
+  175.6 / 175.6, c8 685.2 / 688.5 / 690.8, c16 993.6 / 993.8 / 1004.2;
+  medians 175.6 / 688.5 / 993.8 against E2's 168.3 / 664.9 / 976.4 and
+  the control's 166.5 / 687.9 / 966.8 (c1 +5.5 %, c8 +0.1 %, c16 +2.8 %).
+  Gates -2.412 / -2.452 (in band). Cold TTFT 32K 3.148 s, 128K 13.06 s;
+  warm 32K 0.081 s (E2 0.155 s; control 0.030 s), warm 128K 0.270 s.
+  Metrics bench, warm pass: c1 TTFT 15.0 ms / prefill_time 10.2 ms (E2
+  89.6 / 84.5); c8 39.9 / 22.3 ms (158 / 90); c16 50.4 / 28.6 ms (172 /
+  93); c1 175.6, c8 684.9, c16 998.6 tok/s.
+- Raw: `perf/results/2026-09-12/e3-nospec-pass{1,2,3}/`, gates
+  `e3-nospec-gate{1,2}.json`, `serve-logs/ab-e3-nospec.out`,
+  `metrics-bench-e3-nospec.out`.
+- Result, `--spec` (e3-spec, boot 23:21, three passes): c1 223.9 / 223.6 /
+  223.3, c8 698.2 / 772.9 / 780.1, c16 1172.7 / 1100.7 / 1113.2; medians
+  223.6 / 772.9 / 1113.2 against the record's 218.0 / 598.1 / 848.4 and
+  the control's MTP-3 260.8 / 732.1 / 1005.8 (c1 -14.3 %, c8 +5.6 %, c16
+  +10.7 %). Gates -2.464 / -2.454 (in band). Cold TTFT 32K 3.229 s, 128K
+  13.36 s; warm 32K 0.146 s (E2 3.07 s: the hit is back; the 65 ms over
+  no-spec is the tail step, still eager under speculation because the
+  target manager captured only (1+k)-wide decode graphs), warm 128K
+  0.340 s. Acceptance unchanged at 2.29 per step (c1 pass 2: 169
+  accepted / 131 drafts of 3). The c8 / c16 gains over the record are
+  the hits themselves: the harness repeats its prompt set, so under
+  speculation every request after the first now replays its prefix
+  instead of re-prefilling (the control's numbers include the same hits).
+- Raw: `perf/results/2026-09-12/e3-spec-pass{1,2,3}/`, gates
+  `e3-spec-gate{1,2}.json`, `serve-logs/ab-e3-spec.out`.
+
+### Item E4: 1-wide decode graphs in the speculative engine, and the DFlash context pass inside the drafter's graph - RETAINED
+
+- Hypothesis (two parts, one arm). (1) E3's spec-mode warm TTFT was 146 ms
+  against 81 ms without speculation: the target manager captures FULL
+  decode graphs only at the verify width (1+k), so the 1-token replay
+  tail ran eager. A speculative engine also runs 1-token uniform batches
+  (the replay tail, an empty-draft decode), so `CudaGraphManager` adds
+  width 1 to its decode query lengths whenever the configured width is
+  wider (`_init_candidates`; the 1-wide family stops at the request
+  ceiling, 5 graphs on the record). (2) The spec c1 step had a 2.5 ms
+  inter-step gap that was 93 % GPU-busy: the drafter's context K/V
+  precompute (`precompute_and_store_context_kv`: norm, the fused K/V
+  projection, RoPE, five cache writes) ran eagerly ahead of the captured
+  query forward because its context width varies with the target chunk.
+  For a batch of speculative decode rows the width is fixed at
+  `num_reqs x (1+k)`, so `DFlashSpeculator` captures a second graph
+  family (`step_cudagraph_manager`, `_generate_step`: precompute + query
+  forward) and dispatches to it when every row is a decode row; padded
+  rows carry PAD context slots so their K/V is computed and dropped;
+  prefill chunks keep the eager precompute + query graph. Capture records
+  the context slots as PAD so the recorded runs touch no block. 14 step
+  graphs on the record, 0.39 GiB of graphs in all (E3: 0.33).
+- Tests: `tests/v1/worker/test_cudagraph_dispatch.py` (the stub gains
+  `data_parallel_replicate_moe`, which the manager has read since
+  db08f2fbe; the file had failed since) +
+  `test_spec_manager_serves_one_token_batches`; 19 pass with the prompt
+  tail file.
+- Result, `--spec` (e5-spec, boot 23:42, three passes): c1 252.1 /
+  252.0 / 251.8, c8 821.2 / 788.3 / 777.3, c16 1183.9 / 1032.1 / 1086.9;
+  medians 252.0 / 788.3 / 1086.9 against E3's 223.6 / 772.9 / 1113.2 and
+  the control's MTP-3 260.8 / 732.1 / 1005.8 (c1 -3.4 %, c8 +7.7 %, c16
+  +8.1 %). Gates -2.450 / -2.459 (in band). Cold TTFT 32K 3.152 s, 128K
+  13.29 s; warm 32K 0.073 s (E3 0.146 s), warm 128K 0.276 s. c1 at 121
+  steps per 300 tokens (2.48 per step; the seeded harness repeats the
+  same trajectory on all three passes), c8 1.6-2.0 accepted drafts per
+  call, c16 1.55-1.9.
+- Profile (`prof-spec-e5-c1.out`, `profile-spec-e5-c1/`): step period
+  9.5 ms (E3 9.85), inter-step gap 2.1 ms (2.5) at 94 % GPU busy. What
+  the gap holds now, per step: the target lm_head on cuBLAS 201 us (317
+  MB per rank, near its floor), the logits all-gather 60 us, the Triton
+  top-k/top-p mask 143 us, rejection kernels 50 us, the drafter's tap
+  projection `fc` (20480 -> 4096, replicated: 168 MB per rank) 117 us on
+  the decode GEMM, then the drafter graph: five layers at ~138 us each
+  (memory floor 62 us; the conv and qkv projections at N < 2048 stay on
+  cuBLAS, flash attention 27 us per layer for 8 queries) and the
+  candidate lm_head (another 317 MB read) with its top-16 all-gathers.
+- Raw: `perf/results/2026-09-12/e5-spec-pass{1,2,3}/`, gates
+  `e5-spec-gate{1,2}.json`, `serve-logs/ab-e5-spec.out`.
+
+### Item E6: native top-k/top-p mask on the verify rows, and the drafter's tap projection sharded - RETAINED
+
+- Baseline: E5 (spec c1 252.0 / c8 788.3 / c16 1086.9; control MTP-3
+  260.8 / 732.1 / 1005.8). The E5 c1 profile put 143 us per step in the
+  Triton top-k/top-p mask that `RejectionSampler._verify` applies to the
+  verify rows before rejection sampling, and 117 us in the drafter's
+  `fc` (20480 -> 4096, a replicated 168 MB read on every rank).
+- Hypothesis: (A) the fused sampler's candidate/cutoff passes already
+  find the k-th value and the top-p cutoff of a row in one bandwidth
+  pass; a third pass that writes -inf below the cutoff gives the same
+  mask without the vocabulary sort. (B) `fc` as a RowParallelLinear
+  (each rank contracts its 5120-wide slice of the taps, one all-reduce)
+  reads 42 MB per rank instead of 168.
+- Change: `csrc/quixicore/serving/topk_sample_kernels.cuh`
+  `mask_partitions_kernel` (same tie rank logic as the sampling pass; a
+  NaN cutoff leaves the row alone), `topk_topp_mask` binding in
+  `tm_cuda_m6.cu`, `quixicore_ops.topk_topp_mask`,
+  `topk_sample.mask_eligible/mask`, and `SamplingStates.apply_top_k_top_p`
+  takes it when eligible; `qwen3_dflash.py` builds `fc` as
+  RowParallelLinear(input_is_parallel=False, disable_tp=replicate_backbone).
+- Tests: `tests/kernels/test_quixicore_topk_sample.py` gains
+  `test_mask_matches_the_torch_mask`,
+  `test_mask_keeps_every_tie_at_the_kth_value`,
+  `test_mask_leaves_a_row_without_a_distribution_alone`; 26 pass.
+- Result, `--spec` (e6-spec, boot 13:15, three passes): c1 260.8 /
+  261.0 / 260.8, c8 807.8 / 892.3 / 897.4, c16 1159.1 / 1110.6 / 1120.4;
+  medians 260.8 / 892.3 / 1120.4 against E5's 252.0 / 788.3 / 1086.9 and
+  the control's 260.8 / 732.1 / 1005.8 (c1 +0.0 %, c8 +21.9 %, c16
+  +11.4 %). Gates -2.454 / -2.467 (in band). Cold TTFT 32K 3.131 s, 128K
+  13.34 s; warm 32K 0.083 s, 128K 0.261 s. The c8/c16 step is the one
+  the torch mask hurt most: it sorts every verify row over the 154,880
+  vocabulary (32 rows per step at c8), which the native passes replace
+  with three bandwidth passes.
+- Profile (`prof-spec-e6-c1.out`, `profile-spec-e6-c1/`): step period
+  9.6 ms at 93 % GPU busy. The 2.2 ms "gap" between the execute
+  annotations is GPU work, not host time: the seven gaps of the trace
+  hold 15.8 ms of kernels in 15.9 ms of gap (the annotation closes while
+  the GPU is still ~2 ms behind). Per step: Marlin experts 45 x
+  (gate_up 40-50 us + down 22-27 us) = 3.1 ms (32 %; at M = 4 the step
+  reads up to 32 experts per layer, 2.4 MB each per rank, 60 % of the
+  bandwidth floor), FP8 decode GEMMs 1.34 ms, custom one-shot all-reduce
+  103 x 8.0 us = 0.82 ms, mHC 90 x 7.6 us = 0.68 ms, lm_head 200 us
+  twice (verify logits, then the drafter's candidate logits), drafter
+  layers 5 x ~60 us, KDA 0.48 ms, sparse MLA 0.4 ms. c1 bench: 300
+  tokens in 119 steps (181 of 357 drafts accepted, 2.52 tokens per
+  step), 999 of 1000 prompt tokens prefix hits.
+- Decision: retained. c1 is level with the control; the remaining c1
+  levers are the two lm_head reads (an FP8 channel-wise swapset, ~-200
+  us), Marlin's M = 4 efficiency, and an all-reduce + mHC fusion for the
+  90 pairs of 8 us launches.
+- CORRECTION (2026-09-15): "60 % of the bandwidth floor" above is wrong,
+  and with it the whole premise of a native expert kernel. It counted
+  2.4 MB per expert per rank, which is gate+up only. An expert's full
+  per-rank footprint is 3.375 MiB: `gate_proj` and `up_proj` are 4.0 MiB
+  packed + 0.5 MiB of E4M3 block scales each and `down_proj` the same,
+  13.5 MiB unsharded over TP4. At M = 4 a layer touches 30 distinct
+  experts of 288 (32 draws), so the pair of launches moves 107.4 MB in
+  69 us = 1556 GB/s. This card reads at 1628 GB/s (measured: a 1 GiB
+  bf16 reduction; 1464 GB/s on a copy). The Marlin expert path is
+  therefore at 96 % of the achievable read bandwidth at decode, with no
+  headroom for any kernel, and the MoE cost is a pure function of the
+  bytes a step's routing touches.
+- Raw: `perf/results/2026-09-14/e6-spec-pass{1,2,3}/`, gates
+  `e6-spec-gate{1,2}.json`, `serve-logs/ab-e6-spec.out`.
+
+### Prefill campaign baseline: the cold 32K step on the E6 tree (2026-09-14)
+
+`prof_prefill_long.sh e6-32k` (`prof-prefill-e6-32k.out`,
+`profile-prefill-e6-32k/`, rank 0): 32,768 tokens in 6 chunks of 5461,
+prefill window 3049.6 ms, 2924.1 ms kernel busy (96 %), 15,655 launches;
+the measured cold TTFT (3.13-3.15 s) is the GPU window.
+
+| class | ms | share | launches | us/launch | note |
+|---|---:|---:|---:|---:|---|
+| custom all-reduce (2-stage) | 975.0 | 33.3 % | 547 | 1783 | 91 per chunk at 44.7 MB; matches the microbench's 2-stage (1308 us at 33.6 MB, 2230 at 57.3); the b12x DMA ring runs those at 930 / 1572 |
+| Marlin experts | 535.8 | 18.3 % | 504 | 1063 | 84 per chunk; every expert touched, ~195 TFLOP/s |
+| sparse MLA prefill `_sparse_tc_rows` | 296.6 | 10.1 % | 66 | 4494 | 11 per chunk |
+| mHC transition | 354.1 | 12.1 % | 1626 | 218 | `partials_batched_ws<24,4>` 534 x 506 us, `apply_pre_mix<25>` 540 x 121 us, finalize |
+| FP8 GEMMs | 201.0 | 6.9 % | 2226 | 90 | cutlass blockwise 900 x 195 us + per-token quant |
+| indexer `_cached_pool_logits` | 175.8 | 6.0 % | 88 | 1998 | |
+| KDA chunked prefill (FLA) | 107.0 | 3.7 % | 1632 | 66 | |
+| MoE glue | 83.1 | 2.8 % | 1348 | 62 | `moe_sum_vec` 252 x 229 us |
+| bf16 GEMMs | 66.2 | 2.3 % | 1289 | 51 | |
+| copies / triton / aten | 92.3 | 3.2 % | | | |
+
+Order: (P1) the mHC transition kernels, (P2) the DMA-ring all-reduce
+for messages of 24 MiB and up, then the sparse-MLA prefill rows kernel,
+the expert GEMM (b12x prefill MoE was -2..3 % TTFT but needs a b12x newer
+than PyPI 1.3.0), and the FP8 GEMMs.
+
+### Item P1: the mHC transition at prefill - a persistent partials kernel and token slabs - RETAINED (kernel -10 %, TTFT neutral)
+
+- Baseline: the E6 32K profile above: `partials_batched_ws<24,4,float>`
+  506 us and `apply_pre_mix<25>` 121 us per transition at 5461 tokens,
+  89 transitions per chunk (12 % of the step).
+- Hypothesis: the tiled kernel re-reads its 1.5 MiB fp32 `fn` slice from
+  L2 for every 4-token tile (ten times the activation bytes it moves); a
+  block that owns one split for the whole call keeps the slice in 48
+  registers per lane and walks 8-token tiles with a grid stride (two
+  blocks per SM), and 4-byte bf16-pair loads/stores replace the 2-byte
+  strided ones. Then, since the apply kernel re-reads the 32 KiB per
+  token of `residual_out` the partials kernel just wrote, running the
+  three kernels in 2048-token slabs keeps that re-read in the 128 MiB L2.
+- Change: `mhc_ampere.cuh` `partials_batched_persistent<NOUT, 8, FnT>`;
+  `tm_cuda_serving.cu` takes it from 128 tokens up
+  (`QC_MHC_PERSISTENT_MIN_TOKENS`, 0 disables) and runs the fused post+pre
+  binding in slabs (`QC_MHC_SLAB_TOKENS`, default 2048, 0 disables).
+- Correctness: `tests/kernels/test_quixicore_mhc_transition.py` (6
+  tests: the CUDA op against the Triton split transition run in 64-token
+  slices at 65 / 127 / 128 / 300 / 1000 tokens, plus determinism and the
+  sinkhorn column sums at 301 tokens); residual_out bit-identical to the
+  tiled kernel, mixes within 3e-7, layer_input within one bf16 ulp
+  (`bench_mhc_prefill.py`).
+- Microbench (GPU 0, whole fused op = partials + finalize + apply, us):
+  1000 tokens 104.6 -> 81.9, 2731 317.9 -> 291.7, 5461 641.5 -> 578.2,
+  8192 994.0 -> 874.4 (persistent alone 600.0 / 914.9 at 5461 / 8192; the
+  slab adds the rest). The op moves 120 KiB per token (5 streams read,
+  4 written, 4 re-read, 1 written): 655 MB at 5461 tokens, 445 us at the
+  1.47 TB/s a plain bf16 copy reaches on this card, so the op now runs at
+  77 % of the copy rate. A 33 MB working set (1000 tokens) is L2-resident,
+  where the op is launch/latency-bound, not bandwidth-bound.
+- Result (p1-mhc, boot 13:45, `--spec`, one pass): cold TTFT 32K
+  3.151 s (E6 3.131), 128K 13.125 s (13.34); warm 0.089 / 0.284 s; c1
+  258.0, c8 731.3, c16 1138.7 (the c8 pass is inside E6's 807-897
+  spread). Gates -2.464 / -2.475 (in band). The expected -34 ms over six
+  chunks is below the cold-TTFT noise.
+- Decision: retained (faster kernel, identical numerics); not a TTFT
+  item on its own. What would be: fusing the apply pass into the
+  partials kernel needs the finalized per-token coefficients, i.e. a
+  grid-wide barrier per token tile.
+- Raw: `perf/results/2026-09-14/p1-mhc-pass1/`, `serve-logs/ab-p1-mhc.out`,
+  `serve-logs/native-build-mhc{persist,slab}.out`.
+
+### Item P2: the b12x PCIe DMA-ring all-reduce for prefill-sized messages - RETAINED (cold 32K -11 %, now 5 % ahead of the control)
+
+- Baseline: the E6 32K profile (custom two-stage all-reduce 33 % of the
+  step: 91 x 1783 us per 5461-token chunk at 44.7 MB) and the all-reduce
+  microbench (`ar_bench.py`: two-stage 1308 / 2230 us at 33.6 / 57.3 MB,
+  the b12x ring 930 / 1572 us, NCCL 2189 / 3725).
+- Hypothesis: the ring moves each shard once over the copy engines
+  (reduce-scatter, then all-gather, bf16 on the wire) instead of every
+  peer reading across the bus, so from ~24 MiB up it beats the two-stage
+  kernel by 30 %; decode-size messages (below the threshold) and graph
+  captures keep the custom kernel. The control's prefill profile already
+  showed it running this ring ("DMA flag-wait kernels").
+- Change: `vllm/distributed/device_communicators/b12x_dma_all_reduce.py`
+  (`B12xDmaAllReduce`: size-gated wrapper around
+  `b12x.comm.pcie.pcie_dma.PCIeDmaAllReduce`, never inside a capture,
+  disabled with a warning when b12x is missing or the world size is
+  unsupported), wired into `CudaCommunicator.all_reduce` ahead of the
+  custom kernel; `VLLM_B12X_DMA_AR_MIN_MB` (0 = off) and
+  `VLLM_B12X_DMA_AR_MAX_MB` (128: the ring's scratch is 1.5x this per
+  communicator; the record's 8192-token chunks reduce 67 MB).
+  `dma_wrap_check.py` (4 ranks, gloo exchange group): 8.2 MB not taken,
+  33.6 / 57.3 MB taken with max |diff| 0.0625 against NCCL (bf16 rounding
+  of a four-way sum), never inside a graph capture.
+- Result (p2-dma, boot 13:51, `--spec`, `VLLM_B12X_DMA_AR_MIN_MB=24`,
+  one pass): cold TTFT 32K 2.781 s (E6 3.131: -11.2 %; control 2.93:
+  -5.1 %), 128K 11.894 s (13.34: -10.8 %; control 14.9: -20 %); warm
+  0.079 / 0.280 s. c1 273.6, c8 764.1, c16 1135.9 (decode messages stay
+  on the custom kernel; the c1 pass is above E6's 260.8 and gets its
+  three-pass reading on the next arm). Gates -2.450 / -2.454 (in band).
+  Predicted from the microbench: 91 x 0.53 ms x 6 chunks = 0.29 s;
+  measured 0.35 s.
+- Decision: retained; `VLLM_B12X_DMA_AR_MIN_MB: "24"` goes on the
+  rtx6000 record's env with the closing arms. Next on the same path:
+  the ring's compressed wire (`B12X_PCIE_DMA_FP8=ag`: the all-gather
+  phase quantized once at its owner, half its bytes), gate-checked.
+- Profile (`prof-prefill-p2-32k.out`, same capture as the E6 baseline):
+  prefill window 2750 ms (E6 3050), 3261 ms of kernel time inside it
+  (the ring's copy and flag-wait kernels run on their own streams and
+  overlap; the per-class table no longer attributes the reduction
+  cleanly: 12,937 "bf16 gemm" launches at 53 us and 9,629 copies are the
+  ring). Marlin 541 ms, sparse rows + indexer 506, mHC 313 (E6 354: P1's
+  slabs), FP8 GEMMs 202, custom all-reduce 116 (183 launches, the
+  messages under 24 MiB).
+- Raw: `perf/results/2026-09-14/p2-dma-pass1/`, `serve-logs/ab-p2-dma.out`,
+  `serve-logs/ttft-p2-dma.out`, profile `profile-prefill-p2-32k/` with
+  `prof-prefill-p2-32k.out`.
+
+### Item P3: the DMA ring's fp8 all-gather wire (`B12X_PCIE_DMA_FP8=ag`) - RETAINED (cold 32K -4.3 %, 128K -5.0 %)
+
+- Hypothesis: the ring's all-gather phase moves each reduced shard to
+  every peer in bf16; with the `ag` wire mode the owner quantizes its
+  shard once (e4m3 with a per-row scale, dequantized on receipt) and the
+  all-gather moves half the bytes. The reduce-scatter phase stays bf16, so
+  the four-way sum is unchanged; only the broadcast copy rounds once more.
+- Result (p3-dma-fp8ag, boot 14:25, `--spec`, `VLLM_B12X_DMA_AR_MIN_MB=24
+  B12X_PCIE_DMA_FP8=ag`, one pass + TTFT): cold TTFT 32K 2.661 s (P2 2.781:
+  -4.3 %; control 2.93: -9.2 %), 128K 11.302 s (P2 11.894: -5.0 %; control
+  14.9: -24 %); warm 0.084 / 0.269 s. Gates -2.429 / -2.437 (in band, at
+  the good end). c1 221.1 / c8 741.9 / c16 1155.7 (one pass; the c1 spec
+  reading is a trajectory draw, see the note under D3 below).
+- Decision: retained; `B12X_PCIE_DMA_FP8: "ag"` joins
+  `VLLM_B12X_DMA_AR_MIN_MB` on the record env. The `ring` / `a2a` wire
+  modes (fp8 on the reduce-scatter too) would change the sum's rounding and
+  are not taken without a gate study of their own.
+- Raw: `perf/results/2026-09-14/p3-dma-fp8ag-pass1/`, gates
+  `p3-dma-fp8ag-gate{1,2}.json`, `serve-logs/ab-p3-dma-fp8ag.out`.
+
+### Item D3: the QuixiCore router GEMV for 288 experts on sm_120 - RETAINED (step -1.6 %; the c1 spec reading is a trajectory draw)
+
+- Hypothesis: the router (`GateLinear`, bf16 [288, 4096] -> fp32 logits)
+  ran on cuBLAS at decode as a tensor-core GEMM plus a split-K reduce (3.8
+  + 2.3 us) x 42 layers = 0.26 ms per step. The QuixiCore
+  `dsv4_router_gemm` (one block per expert row, fp32 accumulation of the
+  bf16 products, 1..8 tokens) served DSV4's 256 experts on A100; the
+  kernel's grid is the expert count, so it generalizes to 288 and to
+  sm_120 with the row count as a runtime argument.
+- Change: `dsv4_router_ampere.cuh` takes `experts` (grid and output
+  stride), the binding checks `weight.size(0) >= 1`;
+  `gate_linear.py` enables the tier on sm_120 and at 288 outputs, and
+  the 1..8-token branch moves inside the custom op (cuBLAS above 8) so
+  the compiled graph does not specialize on the token count.
+  `tests/kernels/test_quixicore_router_gemm.py` (256 / 288 experts, 1..8
+  tokens, 1e-4 against the fp32 reference; 9 tokens rejected) and the
+  glm5_next router precision test's expectation; 50 kernel tests pass.
+- Result (d3-router-spec, boot 14:11, three passes): c1 237.1 / 237.1 /
+  237.2, c8 778.9 / 791.4 / 769.2, c16 1198.7 / 1077.5 / 1129.1. Gates
+  -2.481 / -2.461 (gate 1 is 0.003 below the band's low edge; gate 2 in
+  band). Profile (`prof-spec-d1-c1.out`, the same tree plus the failed D1
+  sidecar): `bf16_fp32_gemv<4>` 3.7 us x 42 = 0.16 ms per step against
+  cuBLAS's 0.26 ms, all other kernels unchanged; the c1 step is 9.5 ms
+  (1.264 s / 133 steps) against E6's 9.66 ms.
+- THE C1 SPEC READING IS A TRAJECTORY DRAW. The c1 number fell from
+  260.8 to 237.1 while the step got 1.6 % faster: the seeded 300-token
+  sample accepted 2.26 drafts per step instead of 2.52 (133 steps against
+  119). Any change to the model's arithmetic (this kernel's fp32
+  reduction order, P1's prefill kernel, P2's ring, P3's wire) re-rolls
+  the sampled text, and the acceptance rate of one 300-token sample
+  ranges 2.09-2.64 per step across the decode-identical trees measured
+  today (E6 260.8 at 2.52, P1 258.0 at 2.49, P2 273.6 at 2.64, D3 237.1 at
+  2.26, P3 221.1 at 2.09): a +-10 % band that has nothing to do with the
+  kernels. The no-spec c1 (one token per step) does not have this
+  problem. The control's spec c1 (260.8 at 2.45) is one draw too. The
+  closing spec arms therefore report c1 as the mean over five prompt
+  offsets (0, 2000, 4000, 6000, 8000 tokens into the source; shape
+  `c1-1000-300-oN`), and the control is re-measured under the same
+  protocol; step time and acceptance are reported separately.
+- Decision: retained (a kernel-level saving with equivalent numerics:
+  both paths accumulate the bf16 products in fp32).
+- Raw: `perf/results/2026-09-14/d3-router-spec-pass{1,2,3}/`, gates
+  `d3-router-spec-gate{1,2}.json`, `serve-logs/ab-d3-router-spec.out`,
+  profile `profile-spec-d1-c1/`.
+
+### Item D1 (first arm): the lm_head FP8 channel-wise sidecar - INVALID RUN (the head was never quantized)
+
+- Hypothesis: the target's lm_head is a 317 MB bf16 read per rank, twice
+  per spec step (verify logits, then the drafter's candidate logits) at
+  198 us each on cuBLAS; an e4m3 copy with one fp32 scale per vocabulary
+  row halves the bytes (`slimserve.fp8_swapset --self-quant-lm-head`,
+  sidecar `fp8-swapset-lmhead.{json,safetensors}`, 7.8 GB, relative
+  Frobenius error 0.0277 on the head), served as a compressed-tensors
+  channel-scale FP8 group.
+- Result (d1-lmhead-spec, boot 14:17): gates -18499 / -18415 (the model
+  emitted near-random text; the harness's exact-token flag stayed true
+  because it only counts tokens), c1 357 at 3.55 accepted per step.
+  Cause, from the server log: "unmatched weight lm_head.weight_scale" -
+  the served model is `Glm5NextForConditionalGeneration`, whose head is
+  `language_model.lm_head`, and the sidecar's group targeted the exact
+  name `lm_head`; the head stayed unquantized, the loader copied the e4m3
+  bytes into its bf16 weight (a copy_ cast, no error) and the scale was
+  dropped, so every logit was ~448x too large.
+- Fix (next arm): the group targets `re:.*lm_head$`; the M <= 16 path
+  runs the QuixiCore FP8 decode GEMM with per-row scales (a `CHANNEL`
+  variant of `fp8_decode_gemm.cuh`: bf16 activations, the row scale
+  applied in the fragment conversion, one launch instead of the
+  activation quant + CUTLASS pair) with `decode_gemm_fp8` accepting an
+  [N] / [N, 1] scale and N up to 65536 (the 38720-row vocabulary shard);
+  `tests/kernels/test_quixicore_decode_gemm_fp8.py` gains the channel
+  cases. Also worth noting for the D3 profile above: with the head broken
+  the shared-expert down projection (`fp8_decode_gemm_kernel<32,8,128,4>`
+  on the aux stream) read 40 us instead of 3-4 us in the trace - it now
+  overlaps Marlin instead of running in a gap; the step period is the
+  metric, not the busy sum.
+- Raw: `perf/results/2026-09-14/d1-lmhead-spec-pass{1,2,3}/` (invalid),
+  `serve-logs/ab-d1-lmhead-spec.out`, `serve-logs/serve-20260914-141747.log`.
+
+### Item P4: bf16 probabilities in the sparse-MLA prefill rows kernel - REJECTED (TTFT neutral)
+
+- Hypothesis: `_sparse_tc_rows` splits each probability tile into a bf16
+  high and low part and runs two P.V tensor-core products so the product
+  carries fp32-grade probabilities; a single bf16 product halves that
+  MMA work (66 launches x 4.5 ms per cold 32K prefill, 10 % of the window)
+  at the cost of bf16-rounded probabilities (the decode kernel's
+  precision class). Option `glm5_next_sparse_tc_prefill_bf16_p` on the
+  record's additional_config, `split_p` on `sparse_tc_nope_rows`.
+- Result (p4-bf16p, boot 14:30, `--spec`, `VLLM_B12X_DMA_AR_MIN_MB=24`,
+  one pass + TTFT; compare P2, the same env): cold TTFT 32K 2.805 s (P2
+  2.781: +0.9 %), 128K 11.819 s (P2 11.894: -0.6 %); warm 0.088 / 0.290 s.
+  Gates -2.441 / -2.460 (in band). c1 282.2 (one draw), c8 730.3, c16
+  1190.0.
+- Decision: rejected; the second MMA is not on the kernel's critical
+  path at this shape (the rows kernel is bound by its key/value streaming,
+  not the P.V math), so the precision is given up for nothing. The option
+  and the `split_p` parameter are removed; the kernel keeps the split.
+- Raw: `perf/results/2026-09-14/p4-bf16p-pass1/`, gates
+  `p4-bf16p-gate{1,2}.json`, `serve-logs/ab-p4-bf16p.out`.
+
+### Item D1b: the lm_head FP8 channel-wise sidecar, head matched by regex - RETAINED (step -1.5 %)
+
+- Fix from the invalid D1 arm: the served head is `language_model.lm_head`
+  (`Glm5NextForConditionalGeneration`), the swap-set group targeted
+  `lm_head` exactly and never matched. `LM_HEAD_TARGET` is now
+  `re:.*lm_head$` (sidecar manifest on disk fixed the same way), the
+  `ParallelLMHead` takes the compressed-tensors channel scheme, and the
+  channel-scale variant of the QuixiCore FP8 decode GEMM
+  (`quixicore_fp8_channel_linear`, cutlass above M = 16) serves it.
+- Result (d1b-lmhead, boot 14:45, `--spec`, `VLLM_B12X_DMA_AR_MIN_MB=24
+  B12X_PCIE_DMA_FP8=ag QC_MHC_LAST_BLOCK_MAX_TOKENS=0
+  SLIMSERVE_FP8_SWAPSET=fp8-swapset-lmhead`, three passes, c1 as the
+  5-offset mean): gates -2.471 / -2.438 (in band). c1 mean 246.0 / 246.1 /
+  246.1 over offsets 0/2000/4000/6000/8000 [286@2.69 248@2.34 222@2.08
+  232@2.17 243@2.28]; c8 790.6@3.04 / 762.1@2.70 / 833.6@2.90; c16
+  1106.0@2.64 / 1073.9@2.51 / 1079.2@2.49 (spec c8/c16 draws vary +-8 %
+  with the batch's acceptance; the D3 tree read 769-791 / 1078-1199).
+  Verifier steps/s (tok/s over tokens per step) at c1: 106.3-106.9 on
+  every offset = 9.39 ms per step; the D3 tree read 104.9 (9.53 ms) and E6
+  103.5 (9.66 ms).
+- Profile (prof-spec-d1b-c1, c1 spec): the head runs as
+  `dynamic_per_token_scaled_fp8_quant` 1.7 us + cutlass sm120 FP8 GEMM
+  103.0 us per call (159 MB per rank: at the bandwidth floor, so the
+  decode GEMM path is moot for it) against 198 us bf16 before; the
+  1300-launch steps read 7.3-7.5 ms wall (D1 7.5-7.6).
+- Decision: retained; `fp8-swapset-lmhead` becomes the record's sidecar
+  (the earlier `fp8-swapset.*` sidecar is superseded: flagged below, not
+  deleted).
+- Raw: `perf/results/2026-09-14/d1b-lmhead-pass{1,2,3}/`, gates
+  `d1b-lmhead-gate{1,2}.json`, `serve-logs/ab-d1b-lmhead.out`,
+  `serve-logs/prof-spec-d1b-c1.out`, `profile-spec-d1b-c1/`.
+
+### Control re-measure on the 5-offset c1 protocol (control-mtp3-offsets): the control's drafter accepts more per step
+
+- The control (voipmonitor r28.1, MTP-3) run through the same
+  `c1-1000-300-oN` shapes, two passes: c1 mean 270.4 [319@3.22 325@3.32
+  233@2.32 253@2.51 221@2.18] and 264.9 [263@2.65 231@2.30 243@2.41
+  247@2.45 340@3.52]; c8 731.3@2.43 / 740.5@2.45; c16 1028.4@2.47 /
+  1012.8@2.36. The control's per-offset readings differ between passes
+  (its draft sampling is unseeded), so its ten c1 draws are ten samples:
+  tokens per step 2.67 +- 0.14 (standard error), 96.6-101.4 verifier
+  steps/s = 10.0 ms per step.
+- Reading: our verify step is 6 % faster (9.39 ms) but the DFlash2 k=3
+  drafter accepts 2.31 tokens per step on the same prompts against the
+  control's native MTP-3 at 2.67, which is why the control's c1 spec mean
+  (267.6 over ten draws) sits above ours (246.0). The decode levers that
+  follow (L2 prefetch, the packed indexer projection, the fused mHC norm)
+  target the step; the acceptance gap is the drafter's.
+- Raw: `perf/results/2026-09-14/control-mtp3-offsets-pass{1,2}/`,
+  `serve-logs/control-mtp3-offsets.out`.
+
+### Item D4: L2 weight prefetch, packed indexer projection, fused mHC norm on sm_120 - packed projection and fused norm RETAINED, prefetch REJECTED in no-spec (spec isolation pending)
+
+- Hypothesis (from the D1b profile): three step levers behind env toggles
+  for the arms. (a) L2 weight prefetch after the control's design
+  (`glm5_next_l2_prefetch.py`, CUDA `serving/l2_prefetch.cuh`,
+  `cp.async.bulk.prefetch.L2` over a per-layer (address, bytes) table on
+  a side stream): window A (o_proj, absorbed MLA weights, router and
+  shared expert) issued after in_proj / fused_qkv_a, window C (the next
+  layer's mHC coefficients, norm and first projections) before the MoE
+  all-reduce. (b) The indexer's wk / gate / weights_proj as one packed
+  bf16 projection through `dsv4_ampere_router_gemm` (replaces the
+  21 us cuBLAS 16x16 gate GEMM per MLA layer). (c) The RMSNorm folded
+  into the split Triton transition's finalize on sm_120 as on sm_80
+  (-1.5 us x 90 sites).
+- Result, all three on (d4-levers-nospec, boot 15:21, no speculation, one
+  pass; `VLLM_B12X_DMA_AR_MIN_MB=24 B12X_PCIE_DMA_FP8=ag
+  SLIMSERVE_FP8_SWAPSET=fp8-swapset-lmhead SLIMSERVE_GLM5_MHC_FUSE_NORM=1`):
+  gates -2.463 / -2.491 (in band); c1 179.4 / c8 702.9 / c16 1000.8
+  against the E3 tree's 175.6 / 688.5 / 993.8 (+2.2 / +2.1 / +0.7 %).
+  Speculative (d4-levers-spec, boot 15:37, three passes, c1 as the
+  5-offset mean): gates -2.460 / -2.445; c1 267.5 / 267.3 / 267.3
+  [322@2.96 277@2.54 221@2.01 277@2.54 241@2.17] = the control's 267.6;
+  verifier steps/s 108.8-111.0 per offset (9.12 ms per step) against
+  D1b's 106.3-106.9 (9.39 ms): the step is 2.9 % faster and this tree's
+  draws accept 2.44 tokens per step against D1b's 2.31 (seeded draws on
+  a changed kernel set are new trajectories; the acceptance-independent
+  reading is the step). c8 899.5@3.15 / 808.3@2.81 / 765.7@2.45, c16
+  1101.3@2.58 / 1221.4@3.05 / 1105.1@2.58.
+- Isolation, one lever off at a time (no speculation, one pass, no
+  gates, each boot on its own `VLLM_CACHE_ROOT`; the all-on arm read
+  179.4 / 702.9): prefetch off 181.2 / 718.1 (+1.0 / +2.2 %: the
+  prefetch costs), packed projection off 176.5 / 686.3 (the projection
+  is worth +1.6 / +2.4 %), fused norm off 176.7 / 694.2 (+1.5 / +1.3 %).
+- Profile (prof-spec-d4-c1, c1 spec): 1300-launch steps at 7.3-7.4 ms
+  GPU span; per transition site the one-shot custom all-reduce 8.1 us,
+  the Triton finalize 5.0 us and the partials 3.3 us (16.4 us x 90
+  sites = 1.5 ms of the step: the fused all-reduce + transition of Item
+  D5 targets it); `prefetch_segments_kernel` 15.4 us per issue on the
+  side stream (1.4 ms per step of L2 traffic competing with the weight
+  stream, which is where the no-spec loss comes from).
+- Decision: the packed indexer projection and the fused mHC norm are
+  retained and become the sm_120 defaults (no env); the L2 prefetch is
+  rejected on the no-spec reading and is removed unless the speculative
+  isolation (d4-iso-nopf-spec, queued after D5) shows a gain there.
+- Harness: two boots tripped the boot guard on torch's warning-level
+  `triton_bundler` tracebacks (guards now ignore `W`-level lines); a
+  lever toggled off loaded the toggle-on compiled graph from the shared
+  torch.compile cache ("expected Tensor() for op: input") because env
+  toggles are not in the cache key: every non-default configuration arm
+  now boots on its own cache root, and retained levers move to
+  `additional_config` (hashed) rather than env.
+- Drafter arms on this tree, both config-only, both failed at boot and
+  are re-queued with fixes: native MTP-3 (`method: mtp`, probabilistic
+  draft, block verify) - the V2 speculator widens its hidden buffer by
+  the draft config's `hc_mult` (DSV4 feeds its head the four residual
+  streams) while the GLM head takes the contracted post-norm state, as
+  the control does; the GLM draft override now sets `hc_mult: 1`.
+  DFlash2 drafter at FP8 (`quantization: fp8`) - the context-KV
+  precompute stacked raw `qkv_proj.weight` slices for one GEMM; FP8
+  weights are transposed with scales, so quantized projections now take
+  the per-layer path the GGUF drafters use.
+- Raw: `perf/results/2026-09-14/d4-levers-nospec-pass1/`,
+  `d4-levers-spec-pass{1,2,3}/`, `d4-iso-{nopf,nopacked,nonorm}-pass1/`,
+  gates `d4-levers-{nospec,spec}-gate{1,2}.json`,
+  `serve-logs/ab-d4-*.out`, `serve-logs/prof-spec-d4-c1.out`,
+  `profile-spec-d4-c1/`.
+
+### Item D5: the mHC transition fused into the custom all-reduce (`glm5_next_mhc_allreduce_fusion`) - first kernel REJECTED (94 us per site), rewritten (arms pending)
+
+- Hypothesis (from the D4 profile): every transition site of the decode
+  step is three launches on the critical path - the one-shot custom
+  all-reduce (8.1 us at T <= 4), the Triton partials (3.3 us) and the
+  Triton finalize (5.0 us) - and the two Triton kernels re-read the
+  reduced tensor and the residual streams the all-reduce just wrote. One
+  kernel that reads the peers' partials, mixes the residual streams,
+  projects them through fn, runs the per-token sinkhorn and writes the
+  next layer's normed input would keep one pair of PCIe barriers per site
+  and drop two launches and two round trips through L2: target ~9-10 us
+  per site, -0.55 ms per 9.1 ms step. Built as
+  `csrc/quixicore/serving/glm5_mhc_allreduce.cuh` (included by
+  `custom_all_reduce.cuh`, launched by `CustomAllreduce::allreduce_glm5_mhc`,
+  bound as `glm5_mhc_allreduce` in the QuixiCore extension so the
+  stable-ABI extension stays untouched), wired behind the hashed
+  `additional_config` key `glm5_next_mhc_allreduce_fusion`
+  (`layers/glm5_next_mhc_ar.py` op, `fused_all_reduce_glm5_mhc` on the
+  communicator, `reduce_results=False` on the KDA / MLA o_proj, the MoE
+  and the dense MLP so the fused kernel is the only reduction). Parity
+  test `tests/kernels/test_glm5_mhc_allreduce.py` (world sizes 2 and 4,
+  T in 1/4/7/64, norm on and off, eager and graph replay against the
+  all-reduce + Triton reference): passes.
+- First kernel (one thread per hidden dim on 32 blocks, 2-byte peer reads,
+  the block completing a token's partials finalizing that token):
+  d8-mhcar-nospec (boot 16:16, no speculation, one pass, own cache root)
+  gates -2.476 / -2.457 (in band, so the fusion is numerically right) but
+  c1 147.8 / c8 316.7 / c16 359.5 against D4's 179.4 / 702.9 / 1000.8.
+  Profile at c1 spec (prof-spec-d8-c1): `allreduce_transition<4, true>`
+  93.7 us per site (712 sites in 149.8 ms of GPU span; the Marlin expert
+  kernels unchanged at 32.2 us) against the 16.4 us it replaced. Two
+  design faults, both visible in the numbers: 2-byte peer loads make
+  every token's slice 384 PCIe requests of 64 bytes where the one-shot
+  kernel issues 48 of 512 bytes (peer reads are priced per request), and
+  the "last block finalizes" rule serializes the T finalizes on one block
+  (the block that finished token t last is late for token t+1 and stays
+  last), which is why c8 / c16 collapsed by more than c1.
+- Rewrite (same interface, same numerics; built and benchmarked next):
+  the peers' slices of a token group are staged in shared memory with
+  16-byte loads, the peer loop unrolled so the pointer table stays in
+  registers; the per-token finalize is spread across the blocks (block b
+  spins on token b's arrival counter with `ld.acquire.gpu`, then sums the
+  partial rows, runs sinkhorn and the pre-mix + RMSNorm with 16-byte L2
+  reads), so a batch costs one finalize instead of T. ptxas: 167
+  registers, no spills, 8.7 KB shared.
+- Raw: `perf/results/2026-09-14/d8-mhcar-nospec-pass1/`, gates
+  `d8-mhcar-nospec-gate{1,2}.json`, `serve-logs/ab-d8-mhcar-nospec.out`,
+  `serve-logs/prof-spec-d8-c1.out`, `profile-spec-d8-c1/`.
+
+### Item D6: the native MTP-3 drafter on this tree (`method: mtp`, probabilistic draft, block verify) - boots, accepts 1.7 tokens per step against the control's 2.67 - UNDER INVESTIGATION
+
+- Hypothesis: the control's c1 spec lead over our DFlash2 tree is its
+  drafter's acceptance (2.67 tokens per step against DFlash2's 2.31-2.44
+  on the same prompts); the same MTP weights on our faster verify step
+  should land above the control.
+- Result (d6-mtp3-spec, boot 16:29, one pass, own cache root; draft
+  config override `hc_mult: 1` from Item D4): gates -2.481 / -2.464 (in
+  band); c1 5-offset mean 176.5 [166@1.57 218@2.10 163@1.54 164@1.55
+  171@1.71] against the control's 270.4 [319@3.22 325@3.32 233@2.32
+  253@2.51 221@2.18]; c8 461.9@1.54, c16 688.1@1.57. Verifier steps/s
+  100 (10.0 ms per step, the control's step time: the MTP draft costs
+  ~1.9 ms per step on this tree against DFlash2's ~1.0). Per-position
+  acceptance from the server metrics: 0.49-0.80 / 0.07-0.26 / 0.005-0.03,
+  so the first draft forward is already degraded (the control's 2.67
+  needs ~0.85 at position 0), not only the recycled steps.
+- Reading: the draft path is functionally off (same weights, same
+  sampling settings, half the acceptance), so the arm measures a bug, not
+  the drafter. Under static audit against the control's
+  `glm5next/nvidia/mtp.py` (hidden-state source, position masking, the
+  draft layer's MLA / pooled-indexer caches and the shared
+  topk_indices_buffer, MoE routing config, draft sampling); a k=1 arm
+  (d6b-mtp1-spec) is queued to read position-0 acceptance in isolation.
+- Raw: `perf/results/2026-09-14/d6-mtp3-spec-pass1/`, gates
+  `d6-mtp3-spec-gate{1,2}.json`, `serve-logs/ab-d6-mtp3-spec.out`,
+  `serve-logs/serve-20260914-162927.log` (SpecDecoding metrics lines).
+
+### Item D7: the DFlash2 drafter at FP8 (`quantization: fp8`) - BOOT FAILED at torch.compile (fix staged, low value)
+
+- Hypothesis: the drafter's five bf16 layers stream ~0.13 ms of weights
+  per draft step; FP8 online quantization halves that.
+- Result (d7-drafter-fp8, boot 16:35): with the Item D4 fix the context-KV
+  precompute no longer stacks the transposed FP8 weights, and the boot now
+  reaches the drafter's compile, where our strict `fix_functionalization`
+  pass stops on two auto-functionalized ops the FP8 linear introduces
+  (`_C.cutlass_scaled_mm`, `_C.dynamic_per_token_scaled_fp8_quant`).
+  Fix staged (`$S/stage/patch_fixfunc.py`: de-functionalize both with
+  their `out` / `result, scale` mutated args); re-arm after the D5 and
+  draft-width arms since the expected gain is ~1 %.
+- Raw: `serve-logs/ab-d7-drafter-fp8.out`,
+  `serve-logs/serve-20260914-163516.log`.
+
+### Item D4, closing: the L2 weight prefetch is REJECTED in speculative mode too (step -1.3 %)
+
+- Isolation (d4-iso-nopf-spec, boot 16:39, `SLIMSERVE_GLM5_L2_PREFETCH=0`,
+  own cache root, one pass, no gates): c1 5-offset mean 308.6 [305@2.73
+  329@2.98 288@2.57 388@3.58 234@2.07], c8 807.5@2.92, c16 1137.5@2.75.
+  The tok/s readings ride on new trajectory draws (2.07-3.58 accepted per
+  step against the prefetch-on arm's 2.01-2.96); the acceptance-independent
+  verifier rate is 108.4-113.0 steps/s (9.0 ms per step) against the
+  prefetch-on 108.8-111.0 (9.12 ms): the prefetch costs 1.3 % of the
+  speculative step as well as 1.0 / 2.2 % of the no-spec c1 / c8.
+- Decision: REJECTED in both modes; the feature (kernel, binding, plan
+  module, model hooks, tests) is removed in the cleanup pass. Every arm
+  from here runs with `SLIMSERVE_GLM5_L2_PREFETCH=0` on its own cache
+  root until the code is gone.
+- Raw: `perf/results/2026-09-14/d4-iso-nopf-spec-pass1/`,
+  `serve-logs/ab-d4-iso-nopf-spec.out`.
+
+### Item D6, follow-up: the draft's top-k index buffer was split-brain - FIXED (MTP-3 c1 276.7 = control +3.4 %; c8/c16 still below)
+
+- Root cause (static audit against the control's `glm5next/nvidia/mtp.py`):
+  `load_eagle_model` repoints every draft `nn.Module`'s
+  `topk_indices_buffer` to the target's buffer, but the sparse-MLA
+  attention impl (`QuixiCoreMLASparseImpl`, not a module, reached through
+  `MLAAttention.impl`) had captured the draft's own `torch.empty` buffer at
+  construction: the draft's indexer wrote its selections into the target's
+  buffer while its attention read the unwritten one, so every draft query
+  attended over garbage indices (the control never shares the buffer - its
+  target keeps it as a local - so its writer and reader always agree).
+  Fix in `vllm/v1/worker/gpu/spec_decode/eagle/utils.py`: the `impl`
+  attribute moves with the module. Second divergence fixed alongside:
+  DeepSeek's layer zeroes the embedding at absolute position 0; the GLM
+  head was trained without that mask (the reference concatenates
+  `enorm(embeds)` and `hnorm(previous)` unconditionally), so
+  `Glm5NextMTPLayer.forward` now runs the unmasked recurrence
+  (pre-norm state to the logits' final norm, post-norm state recycled).
+- Result (d6c-mtp3-fix, boot 17:02, prefetch off, one pass, own cache
+  root): gates -2.468 / -2.439 (in band); c1 5-offset mean 276.7
+  [262@2.43 291@2.73 270@2.53 282@2.60 278@2.65] against the control's
+  267.6 over ten draws (+3.4 %) - the verify step is 104.9-108.5 steps/s
+  (9.35 ms) against the control's 96.6-101.4 (10.0 ms), with 2.59 accepted
+  per step against the control's 2.67 +- 0.14; per-position acceptance
+  0.68 / 0.40 / 0.22 (was 0.49-0.80 / 0.07-0.26 / 0.005-0.03). c8
+  697.0@2.28 and c16 974.9@2.32 against the control's 731-741@2.43-2.45
+  and 1013-1028@2.36-2.47: equal batch-step times (26.2 / 38.0 ms against
+  26.6 / 38.5), 6 % fewer accepted tokens per step. Against this tree's
+  DFlash2 k=3: c1 267.5-308.6 (draw-dependent), c8 766-900@2.45-3.15,
+  c16 1101-1221@2.58-3.05 - the DFlash2 block drafter accepts more at
+  batch, the native head slightly more at c1.
+- Remaining draft-side divergences from the audit, in value order: no
+  pooled-indexer tail snapshot / restore around the multi-step draft (the
+  control rolls the drafter's tail back after rejected tokens; ours lets a
+  speculative token commit a pool key), the draft head reads the FP8
+  lm_head sidecar where the control builds a bf16 draft head, the
+  drafter's Gumbel noise is not salted away from the target's (a
+  distribution-correctness item, not acceptance), and `swiglu_limit`
+  (next item). Decision on the record's drafter waits for the DFlash2
+  draft-width sweep (d9-k4/k5/k7) and the fused transition.
+- Raw: `perf/results/2026-09-14/d6c-mtp3-fix-pass1/`, gates
+  `d6c-mtp3-fix-gate{1,2}.json`, `serve-logs/ab-d6c-mtp3-fix.out`.
+
+### Item D9: DFlash2 draft width (k = 4, 5, 7 against the record's 3) - REJECTED (k = 3 stays; k = 7 is outside the compact indexer cache's envelope)
+
+- Hypothesis: the DFlash2 block drafter accepts 0.47-0.63 at its third
+  position; a fourth or fifth draft position could add 0.2-0.4 accepted
+  tokens per step for a few percent of verify time.
+- Method: `speculative_overrides.num_speculative_tokens` 4 / 5 / 7 on the
+  record (prefetch off, own cache root, one pass, two gates each);
+  the acceptance-independent reading is the verify rate (tok/s divided by
+  the accepted tokens per step), since every kernel-set change redraws the
+  sampled trajectories.
+- k = 4 (d9-k4, boot 17:08): gates -2.478 / -2.464; c1 5-offset mean
+  285.0 [325@3.15 326@3.16 226@2.15 251@2.42 298@2.89] at 103.1-105.1
+  steps/s (9.65 ms) - per position 0.58-0.85 / 0.37-0.72 / 0.28-0.63 /
+  0.21-0.57; c8 785.6@3.17 (32.3 ms per batch step); c16 669.4@3.60 ran
+  EAGER (16 x 5 = 80 tokens exceed `max_cudagraph_capture_size` 64), so
+  the c16 reading is not a fair one.
+- k = 5 (d9-k5, boot 17:14): gates -2.454 / -2.461; c1 mean 265.2
+  [376@4.01 297@3.11 217@2.25 224@2.31 211@2.20] at 93.8-97.0 steps/s
+  (10.4 ms) - fifth position accepts 0.17-0.43; c8 782.0@3.43 (35.1 ms);
+  c16 729.1@3.91 (eager again).
+- k = 7: BOOT FAILED - `Compact GLM indexer cache requires kpool=4 and at
+  most five speculative tokens` (the compact pooled-indexer cache sizes
+  its per-request tail for at most six queries per step; a wider draft
+  needs the uncompacted cache, which the record does not run).
+- Against k = 3 on the same kernel set (d4-iso-nopf-spec / d7b: c1
+  108.4-113.3 steps/s at 9.0 ms, c8 28.6-28.9 ms per batch step at 2.92-
+  2.96 accepted): each extra draft position adds ~7 % to the c1 verify
+  step (the draft's five layers plus one more verify row) and ~12 % to
+  the c8 batch step, while adding 0.2-0.5 accepted tokens - net c1 285 /
+  265 against 302-309, c8 785 / 782 against 808-828. The c16 verify
+  step at 80 tokens would touch more experts per step than the 64-token
+  step, so a capture-size-128 rerun cannot recover the c8 deficit there.
+- Decision: REJECTED; the record keeps `num_speculative_tokens: 3`. The
+  compact cache's five-token cap is now documented here; the boot error
+  is the intended guard.
+- Raw: `perf/results/2026-09-14/d9-k{4,5}-pass1/`, gates
+  `d9-k{4,5}-gate{1,2}.json`, `serve-logs/ab-d9-k{4,5,7}.out`,
+  `serve-logs/q14-chain.out`.
+
+### Item D7, retry: the DFlash2 drafter at FP8 - boots after the pass fix, step unchanged - REJECTED
+
+- Fix: `fix_functionalization` now de-functionalizes
+  `_C.cutlass_scaled_mm` (mutated `out`) and
+  `_C.dynamic_per_token_scaled_fp8_quant` (mutated `result`, `scale`), the
+  two auto-functionalized ops the FP8 linear layers introduce into the
+  drafter's compiled graph (the strict pass otherwise refuses to leave
+  them in place). The fix is retained: it is correct for any FP8 linear
+  that reaches the pass.
+- Result (d7b-drafter-fp8, boot 17:21, `quantization: fp8` on the
+  speculator, prefetch off, own cache root): gates -2.476 / -2.463 (in
+  band); c1 5-offset mean 302.6 [290@2.60 322@2.88 252@2.25 366@3.33
+  282@2.49] at 109.9-113.3 steps/s (8.95 ms) against the bf16 drafter's
+  108.4-113.0 (9.0 ms); c8 827.8@2.96 (28.6 ms per batch step against
+  28.9); c16 1145.4@2.78 (38.8 ms against 38.7). Per-position acceptance
+  0.57-0.76 / 0.35-0.59 / 0.25-0.47, the bf16 drafter's range.
+- Decision: REJECTED - the drafter's weight stream is not on the step's
+  critical path at this size (five layers, ~0.13 ms of bf16 at c1 out of
+  a 9.0 ms step, and the draft step is dominated by launches and the
+  target's KV reads); the difference is inside run-to-run noise (< 1 %).
+  The record keeps the bf16 drafter, whose draft distribution is the one
+  the DFlash2 head was trained to produce.
+- Raw: `perf/results/2026-09-14/d7b-drafter-fp8-pass1/`, gates
+  `d7b-drafter-fp8-gate{1,2}.json`, `serve-logs/ab-d7b-drafter-fp8.out`.
+
+### Item D5, second kernel: the fused all-reduce + mHC transition rewritten around its phase stamps (serving arms in queue 15)
+
+- Instrumentation: the kernel stamps `%globaltimer` at its phase boundaries
+  (block 0, `glm5_mhc_allreduce_timeline` binding, `$S/bench_mhc_ar.py`
+  prints the phases of one eager launch after the graph-replay timings).
+  First reading of the v2 kernel at T=1 (us): start barrier 0.4, peer
+  staging 3.1, partials 1.1, arrival wait 0.6, finalize 9.0, end barrier
+  0.9 - the finalize alone cost as much as the whole split path
+  (one-shot all-reduce + Triton pair 10.2 us under graph replay).
+- Finalize, first pass (single-thread sinkhorn with precise `expf` /
+  division, 113 instructions per iteration, twenty iterations serialized
+  on one lane; residual rows read after the sinkhorn): fast-math
+  sinkhorn, residual rows and the norm weight loaded in flight with the
+  partial rows, one release-add per block instead of a fence per thread
+  -> finalize 3.2 us, kernel 11.5 us at T=1 (was 17.3).
+- Phase one rewritten: cp.async 16-byte staging of the peers' slices, the
+  residual slices and the per-token mixes into shared memory,
+  double-buffered so the next group's copies fly while a group is
+  reduced; the 25 fn projections reduced with a transposed shuffle
+  reduction (31 shuffles per warp and token instead of 125); one barrier
+  and one release-add per token group instead of per token -> 9.2 us at
+  T=1, 13.0 at T=4 (split path 10.2 / 14.5); the remaining fixed cost was
+  the four-lane sinkhorn, 2.2 us of serial normalizations on the path to
+  the end barrier.
+- Sinkhorn deferred (the DSV4 fused all-reduce's schedule): the kernel
+  leaves the next site's comb coefficients as raw logits; the launcher
+  forks a one-block `sinkhorn_deferred` onto a low-priority side stream
+  behind the kernel and every consumer of the coefficients joins first -
+  the next fused site inside the launcher, the split fallback and the
+  model's `glm5_mhc_post` reads (final streams, drafter taps) through
+  `join_glm5_mhc`. The join is capture-aware: eager work is joined before
+  a capture starts (the forward ends with a join) and captured work
+  before the capture ends; crossing that boundary with a pending sinkhorn
+  raises instead of deadlocking. The class gained data members, so the
+  stable extension that constructs the communicator was rebuilt with it.
+  Main-kernel phases at T=1 (us): start barrier 0.6, staging 1.5,
+  partials 0.8, wait 0.3, partial sums 0.6, coefficients 0.5, mix+norm
+  0.4, end barrier 1.0 - 5.6 total.
+- Microbench with a ~100 us GEMM interposed between calls (the deferred
+  kernel overlaps it as in serving; cost over the GEMM alone, us):
+
+  | T | split (AR + Triton) | AR only | fused v3 |
+  |---|---|---|---|
+  | 1 | 10.6 | 7.8 | 9.6 |
+  | 4 | 14.5 | 7.2 | 13.4 |
+  | 8 | 19.9 | 8.4 | 19.5 |
+  | 16 | 25.8 | 11.9 | 28.1 |
+  | 64 | 51.2 | 31.5 | 65.3 |
+
+  Behind a GEMM the one-shot all-reduce itself costs 7-8 us (launch and
+  rank skew), the Triton pair adds 2.8-3.4 us at T <= 8, and the fused
+  kernel undercuts the pair by ~1 us at T <= 8 and loses above (its
+  blocks walk the tokens of a group serially; the Triton partials kernel
+  spreads them over the GPU), so the fused path is taken for T <= 8
+  (`_GLM5_MHC_FUSE_TOKENS`) and the split path above. Parity test
+  (`tests/kernels/test_glm5_mhc_allreduce.py`, T 1..64, eager and graph
+  replay, ws 2 and 4) passes.
+- Serving arms (queue 15): d10-fuse-nospec / d10-fuse-spec against the
+  same tree with the flag off (s1-swiglu-nospec / s1-swiglu-spec).
+
+### Item D5, closing: the fused all-reduce + mHC transition - RETAINED (no-spec c1 +4.5 %, spec step -2.8 %); flag on the record, instrumentation removed
+
+- Queue 15, one pass each, exact-token 1000/300, seed 42 (fresh server per
+  arm, torch.compile cache per tree). Both arms run the same tree; the
+  only difference is `glm5_next_mhc_allreduce_fusion` in additional_config.
+
+  | arm | c1 | c8 | c16 | spec c1 5-offset mean (tokens/step) | steps/s |
+  |---|---|---|---|---|---|
+  | s1-swiglu-nospec (flag off) | 181.4 | 716.6 | 1019.6 | - | - |
+  | d10-fuse-nospec (flag on) | 189.6 | 719.8 | 1018.0 | - | - |
+  | s1-swiglu-spec (flag off) | - | - | - | 292.6 [343@3.08 303@2.74 244@2.18 269@2.41 304@2.74] | 111.3 |
+  | d10-fuse-spec (flag on) | - | - | - | 278.1 [317@2.78 291@2.56 251@2.19 256@2.21 276@2.40] | 114.6 |
+
+  No-spec c1 +4.5 % (every decode step is T=1 and takes the fused path at
+  all 45 sites), c8 +0.4 %, c16 unchanged (T=16 takes the split path by
+  policy). Spec c1: the tokens/s means differ by the draws (a changed
+  kernel set is a new trajectory; acceptance 2.40-2.78 against
+  2.18-3.08), the acceptance-independent step rate is +3.0 % (8.73 ms
+  against 8.98 ms per step; control 10.0 ms). Gates in band (mean text
+  logprob -2.41..-2.46, needle margins 12.6-19.6). The spec c8/c16 rows
+  of both arms are withheld: see the correctness item below.
+- Correctness, found while chasing the placeholder bug below: with the flag
+  on, the spec c8 / c16 completions of d10-fuse-spec carried a
+  prompt-independent stream ("_atomic usse usse usse ...", the same text
+  for different prompts: 6 of 8 and 6 of 16) that the flag-off arm never
+  produced (0 of 24) and no-spec never produced. Isolated on the live
+  server: a fresh boot's c8 is clean (0 of 8, 661 tok/s); after a few
+  eager steps that take the fused path (tiny 1-4 token prompts beside a
+  decoding request, T = 5..8, eager because the batch is not uniform) the
+  same c8 comes out corrupted for every batch position past the first
+  (6-8 of 8, 960-1176 tok/s from accepted constant drafts), although c8's
+  own steps never fuse (T = 32). With the fused path restricted to captured
+  graphs (`_GLM5_MHC_FUSE_EAGER = False`: eager steps take the split path)
+  the same traffic leaves c8 / c16 clean (0 of 8, 0 of 16; 682-708 / 938
+  tok/s). The mechanism is not isolated: the parity test passes eagerly,
+  `compute-sanitizer memcheck` over it reports no invalid access, the
+  barriers are the stock per-block counters; the eager-only ingredients are
+  the staging-buffer copy (registered=False), the per-call workspaces and
+  the side-stream sinkhorn against the caching allocator. Recorded as an
+  open item; the kernel ships only where it is measured and clean.
+- A second, rarer anomaly seen twice on this tree, once with eager fusion
+  on and once with it off: the very first request after a boot came out as
+  the same prompt-independent stream (probe boots 20:17 and 20:42; the
+  boots at 19:59, 20:31 and every queue-15 arm had a clean first request).
+  Open; the closing arms' completions are scanned for the signature.
+- Decision: RETAINED inside captured decode graphs.
+  `glm5_next_mhc_allreduce_fusion: true` is on the rtx6000 record's
+  additional_config; the fuse policy is T <= 8 and graph capture only. The
+  `%globaltimer` phase stamps, the `glm5_mhc_allreduce_timeline` binding
+  and the bench's phase readout are removed from the shipped kernel (they
+  were the rewrite's instrument, not a serving feature);
+  `$S/bench_mhc_ar.py` keeps the graph-replay timings.
+- Raw: perf/results/2026-09-14/{s1-swiglu-nospec,d10-fuse-nospec,
+  d10-fuse-spec,s1-swiglu-spec}/, chain log $S/serve-logs/q15-chain.out.
+
+### Item D10: `swiglu_limit` (GLM config 10.0) applied in the dense MLP, the shared experts and the routed experts - RETAINED (fidelity; throughput neutral)
+
+- The checkpoint config carries `swiglu_limit: 10.0`; the HF reference and
+  the control clamp the gate activation (`silu(min(gate, limit))`) and the
+  up projection (`clamp(up, -limit, limit)`) in every MLP, dense and
+  expert. This tree never wired it: `DeepseekV2MLP` and the fused-MoE
+  activation ran the plain SiLU-gated product, a silent departure from
+  the reference numerics on every token.
+- Baseline: the same kernel set without the clamp, the D4 prefetch-off
+  isolation arm (`d4-iso-nopf`, no speculation, c1 181.2 / c8 718.1).
+- Hypothesis: clamping the gate and up projections to the checkpoint's
+  `swiglu_limit` restores the reference numerics at no measurable step
+  cost (the clamp rides in the existing activation kernels).
+- Change: `silu_and_mul(swiglu_limit)` helper in deepseek_v2.py
+  (`DeepseekV2MLP(swiglu_limit=)`, `DeepseekV2MoE` hands it to the shared
+  experts and `FusedMoE(swiglu_limit=)`), the dense MLP in glm5_next.py.
+  Unit test tests/glm5_next/test_swiglu_limit.py (clamped against the
+  reference formula, and the un-clamped path unchanged when the limit is
+  None).
+- Cost: s1-swiglu-nospec c1 181.4 / c8 716.6 / c16 1019.6 against the
+  same kernel set before the clamp (the D4 prefetch-off isolation arm,
+  c1 181.2 / c8 718.1; no c16 in that arm): within noise. Gates: mean
+  text logprob -2.470 / -2.453 against the D4 levers arm's -2.463 /
+  -2.491; needle margins 13.4-17.5 against 13.6-18.0.
+- Raw: `perf/results/2026-09-14/s1-swiglu-{nospec,spec}-pass1/`, gates
+  `s1-swiglu-{nospec,spec}-gate{1,2}.json`; baseline `d4-iso-nopf-pass1/`,
+  `d4-levers-{nospec,spec}-gate{1,2}.json`.
+- Decision: RETAINED as a fidelity fix; no throughput claim.
+
+### Correctness: a newcomer's padded tail step accepted three placeholder drafts ("!!!" prefix, corrupted context) - FIXED
+
+- Symptom: with the DFlash2 drafter, a request whose prompt has exactly
+  one token left to compute (a prefix-cache hit replayed to P-1, the
+  standing E3 configuration) that arrives while other requests are
+  decoding started its answer with "!!!" (token id 0 three times) and
+  went on with those three tokens in its context. Reproduced with
+  `$S/tail_probe.py` (A alone, B alone, then B submitted while A decodes:
+  B-during-A opened with '!!!      .      .' while B alone and a fresh
+  prompt C during A were clean). The verify dump
+  (`QWEN38_DFLASH_DUMP`, record 146) showed the request's step with draft
+  ids [220, 0, 0, 0] and num_sampled 4.
+- Mechanism: the scheduler pads such a request's single token to
+  1 + num_spec_tokens so the step keeps its full cudagraph
+  (`pad_spec_decode`, pr12 merge 6beb5c8) and marks the rows with draft
+  id -1. The V2 runner only counts those ids; the rows' input ids come
+  from `req_states.draft_tokens`, zeroed when the request is added, and
+  the DFlash draft-logits row for that slot is whatever its previous
+  occupant left. Block verification (the record's
+  `rejection_sample_method`) computes the prefix joint ratio from p/q
+  with q read off the stale row and had no -1 guard at all; the plain
+  Leviathan kernels did guard on -1 but never saw one. The MTP drafter
+  (one-hot draft, no draft logits) rejects the zeros by their target
+  probability, which is why the MTP arms and no-spec were clean.
+- Fix: the request state tracks whether the speculator has drafted for
+  the slot (`has_draft_tokens`, cleared on add, set after every propose);
+  the runner marks the draft rows of a request scheduled with drafts it
+  does not hold (`InputBatch.draft_placeholder_mask`, built only on steps
+  that have such a request) and the rejection sampler verifies them as
+  -1. Every verification path now treats -1 as a certain rejection whose
+  row resamples from the target distribution: the Triton block-verify
+  kernel (prefix ratio forced to zero, acceptance masked), the Triton and
+  native resample kernels (residual = target when the rejected draft is a
+  placeholder), and the MPS path. Test
+  tests/kernels/test_rejection_sample_placeholder.py (placeholder request
+  next to a real-draft request; Leviathan and block verification; no
+  draft logits, a stale row and an all -inf row; greedy and sampled)
+  passes on the rebuilt extension.
+- Scheduler: the padding itself is removed (`pad_spec_decode` and the
+  dynamic-width mirror it fed). A newcomer whose prompt has one token left
+  is scheduled as that one token; under E3 it runs as a promoted decode
+  row (the batch goes eager for that step, ~10 ms once per arrival), while
+  the padded spec-width tail was a prefill chunk whose recurrent state
+  advanced through the placeholders with no rollback: even with the
+  placeholders rejected, the padded request's first token was wrong and
+  its context stayed corrupt (probe: B-during-A '_atomic usse usse ...'
+  against B-alone '626.348 | 1.412x |'). Without padding B-during-A equals
+  B-alone token for token. The control pads the same way (its scheduler
+  carries the same block) with its MTP drafter.
+- Affected measurements: every DFlash spec c8/c16 row recorded since Item
+  E3 landed (2026-09-12) - e3-spec, the D4 spec arms, d7b-drafter-fp8,
+  d9-k4/k5, d10-fuse-spec, s1-swiglu-spec - had its hit requests padded
+  (s1-swiglu-spec: 7 of 8 c8 and 14 of 16 c16 completions open with "!!!";
+  d10-fuse-spec 7 of 8 and 15 of 16), so their tokens/step and tokens/s
+  are inflated (d10-fuse-spec c8 1175 at 3.76 tokens/step is the clearest
+  case) and their comparisons stand only relative to each other. The c1 protocol (one request at a time, so no
+  running requests to pad against), the no-spec arms and the MTP arms are
+  unaffected. The closing arms below re-measure spec c8/c16 on the fixed
+  tree.
+
+### Closing arms on the final tree (z1-final): against the control, no-spec and prefill ahead at every shape; DFlash2 spec level at c1 / c16, behind at c8
+
+- Tree: fusion flag on the record (graph-only fused all-reduce, Item D5),
+  `swiglu_limit` (D10), the placeholder-draft fix and the scheduler padding
+  removal (Correctness above), prefetch off, DMA ring on, lm_head swapset.
+  Three seeded passes per mode (seeds 42-44), exact-token 1000/300, gates
+  after each arm, cold TTFT after the no-spec arm, every completion scanned
+  for the garbage signature ("usseusse") and the placeholder prefix ("!!!").
+  Control: voipmonitor jovian r28.1 on the same box, same harness.
+
+  | shape | control no-spec | ours no-spec (3 passes) | control MTP-3 | ours DFlash2 k=3 (3 passes) |
+  |---|---|---|---|---|
+  | c1 | 166.5 | 196.6 / 196.7 / 196.5 (+18 %) | 260.8; 5-offset 267.6 @2.67 | 5-offset 272.4 @2.35 / 262.2 @2.26 / 261.9 @2.26 (-1 %) |
+  | c8 | 687.9 | 734.1 / 729.5 / 728.2 (+6 %) | 732.1 @2.43-2.45 | 686.0 @2.16 / 692.5 @2.13 / 708.8 @2.21 (-5 %) |
+  | c16 | 966.8 | 1010.1 / 1027.0 / 1014.3 (+5 %) | 1005.8 @2.36-2.47 | 1023.2 @2.29 / 983.0 @2.28 / 1058.4 @2.36 (+2 %) |
+
+  Steps per second (the acceptance-independent rate): spec c1 115.9 /
+  115.8 / 115.9 steps/s = 8.63 ms per step against the control's 10.0 ms
+  (+16 % step rate); c8 batch step 25.2 / 24.6 / 24.9 ms against 26.6;
+  c16 35.8 / 37.1 / 35.7 against 38.5. Every spec step is faster than the
+  control's; the tokens/s gap at c8 is the DFlash2 drafter's acceptance
+  (2.13-2.21 accepted per step against the MTP-3 head's 2.43-2.45 on the
+  control, 2.28 on this tree in Item D6).
+- Prefill: cold TTFT 32K 2.696 s (control 2.93, -8 %), 128K 11.226 s
+  (14.9, -25 %); warm (prefix hit) 0.079 / 0.268 s.
+- Gates: no-spec -2.440 / -2.445, spec -2.440 / -2.452 mean text logprob,
+  needle margins 12.8-19.6 (band -2.41..-2.47). Completion scan: 0 of 75
+  no-spec and 0 of 87 spec completions carry either signature; the first
+  request of both boots is clean (the boot anomaly of Item D5 did not
+  recur).
+- Reading: on this hardware the spec step at c8 (T = 32 query rows) streams
+  ~172 of the 288 experts per layer against ~58 at T = 8, so DFlash2 k=3
+  at c8 (686-709) is a loss against this tree's own no-spec c8 (728-734)
+  and only level at c16; the win is c1 (+35 % over no-spec). The
+  per-batch-size schedule the other records use
+  (`num_speculative_tokens_per_batch_size`) is the lever: DFlash2 drafts
+  a fixed block, so its schedule can only switch drafting off above a
+  batch size; the autoregressive MTP-3 head honours a partial width, so
+  k=1 / k=2 above 4 running requests are measured next (z2 arms).
+- Raw: `perf/results/2026-09-14/z1-final-{nospec,spec}-pass{1,2,3}/`,
+  gates `z1-final-{nospec,spec}-gate{1,2}.json`,
+  `serve-logs/ab-z1-final-{nospec,spec}.out`, chain
+  `serve-logs/closing-chain.out`.
+
+### Item D11: batch-size draft schedules (`num_speculative_tokens_per_batch_size`) on the final tree - REJECTED for the record (level with DFlash2 k=3 within the pass spread); the MTP head with a schedule recorded as the commercially clean alternative
+
+- Hypothesis: at c8 the DFlash2 k=3 verify step (T = 32 rows) streams ~172
+  of the 288 experts per layer against ~58 at T = 8 and drafting is a loss
+  against this tree's own no-spec c8 (692 against 730), so the schedule
+  the glm53f-nvfp4-8 and qwen38fn records use (a smaller k, or none, above
+  a batch size) should recover c8 / c16 while keeping k=3 at c1. DFlash2
+  drafts a fixed block, so its schedule can only switch drafting off
+  (`propose` asserts on a partial width; the runner skips the drafter at
+  k=0); the autoregressive MTP head honours a partial width (`steps =
+  min(num_steps, k)`), so k=1 and k=2 above 4 running requests were
+  measured with it. Three seeded passes each, c8 / c16 only (c1 on the
+  MTP k=1 arm for the drafter comparison), gates, completion scan.
+
+  | arm | c1 5-offset means | c8 | c16 |
+  |---|---|---|---|
+  | control (MTP-3) | 267.6 | 732.1 | 1005.8 |
+  | no-spec (z1) | 196.6 | 734.1 / 729.5 / 728.2 | 1010.1 / 1027.0 / 1014.3 |
+  | DFlash2 k=3 (z1) | 272.4 / 262.2 / 261.9 | 686.0 / 692.5 / 708.8 @2.13-2.21 | 1023.2 / 983.0 / 1058.4 @2.28-2.36 |
+  | DFlash2 [[1,4,3],[5,16,0]] | - | 699.1 / 655.5 / 694.6 | 950.9 / 960.5 / 939.1 |
+  | MTP-3 [[1,4,3],[5,16,1]] | 279.8 / 256.6 / 280.0 | 662.4 / 739.1 / 725.4 @1.67-1.71 | 976.8 / 1037.8 / 986.2 @1.68-1.71 |
+  | MTP-3 [[1,4,3],[5,16,2]] | - | 720.0 / 666.6 / 686.0 @2.08-2.11 | 969.4 / 1029.7 / 1035.3 @2.11-2.13 |
+
+- Reading: the first pass of every arm is the lowest (its prompts are not
+  yet in the prefix cache), so the medians carry. Drafting off above 4
+  (DFlash2) loses 5-8 % against plain no-spec at both shapes: a k=0
+  decode step in a speculative engine costs ~1 ms more than the no-spec
+  step (11.5-12.2 ms against 10.9 at c8; 16.8 against 15.8 at c16) -
+  the drafter's KV group and the spec-mode step bookkeeping, not
+  isolated; open item. MTP-3 with k=1 above 4: c8 725 (median, -1 %
+  against the control, +5 % against DFlash2 k=3), c16 986 (-2 % / -4 %);
+  the c8 step is 18.2 ms for 1.68 accepted (break-even against the 10.9
+  ms no-spec step by construction: 1.67x the time for 1.68x the tokens).
+  k=2 above 4: c8 686, c16 1030. The MTP head's c1 five-offset means
+  (272.1 over three passes, k=3) sit 2.5 % above DFlash2's (265.5) and
+  1.7 % above the control's 267.6 at 9.0 ms per step (control 10.0, DFlash2
+  8.63); its acceptance draws (2.02-3.04) are as wide as the control's.
+  Gates in band on every arm (-2.433..-2.468); 0 of 168 completions
+  carry either signature.
+- Decision: the record keeps DFlash2 k=3 (the registered drafter, the
+  structured Foundry c8 workload validated on it, best c16). No schedule
+  exceeds the control at c8 by more than the pass spread: on this
+  hardware the c8 speculative step is bound by the experts it streams
+  (the k=3 step at 24.6 ms is already 8 % shorter than the control's
+  26.6 ms; the control's 5 % lead at c8 is its head's 2.43 accepted per
+  step against 2.13-2.21), so the c8 spec gap closes only through
+  acceptance (the MTP head's pooled-indexer tail restore around the draft
+  loop, Item D6's open list) or a faster expert kernel (the native sm_120
+  NVFP4 expert kernel, the Phase 2 backlog's first item). The MTP head
+  with [[1,4,3],[5,8,1],[9,16,2]] (the best range of each arm composed) is
+  recorded in the profile notes as the commercially clean alternative
+  and re-measured once on the cleaned tree below (z3-mtp-sched).
+- Raw: `perf/results/2026-09-14/z2-{dflash-dyn0,mtp-dyn1,mtp-dyn2}-pass{1,2,3}/`,
+  gates `z2-*-gate{1,2}.json`, `serve-logs/ab-z2-*.out`, chain
+  `serve-logs/dyn-chain.out`, script `$S/dyn_chain.sh`.
+
+### Cleaned tree validation (z3-clean-*): the cleanup pass costs nothing measurable; the Foundry structured c8 workload is +12 / +15 % over its 2026-09-12 reading
+
+- Tree: the cleanup patch applied (L2 prefetch and the mHC last-block
+  kernel removed, the review's items), both extensions rebuilt, every
+  unit test green (the four test_profiles failures pre-exist on HEAD). One
+  pass per arm with gates, canaries (text / tool / image), cold and warm
+  TTFT (no-spec) and the Foundry structured c8 workload (spec arms).
+- no-spec: c1 191.5 / c8 733.7 / c16 1019.2 (z1 medians 196.6 / 729.5 /
+  1014.3; the c1 reading is one boot against z1's single boot - boot
+  spread, not a measured regression); cold TTFT 32K 2.732 s, 128K 11.262 s;
+  warm 0.087 / 0.299 s; gate -2.469; canaries pass.
+- DFlash2 k=3: c1 five-offset mean 275.7 [290@2.53 300@2.63 215@1.88
+  295@2.58 279@2.44], c8 659.6@2.17 (first pass after boot), c16
+  1011.5@2.38; Foundry c8 447.6 / 540.6 tok/s at 1.57 / 1.56 accepted per
+  step (2026-09-12: 399.4 / 468.6); gate -2.446; canaries pass.
+- MTP-3 head with [[1,4,3],[5,8,1],[9,16,2]]: c1 265.9 [228@2.05 292@2.64
+  282@2.53 277@2.47 251@2.32], c8 709.3@1.67, c16 972.5@2.08; Foundry c8
+  452.6 / 556.3 at 0.87 / 0.86 accepted per step (k=1 there); gate -2.456;
+  canaries pass.
+- Completion scan: 0 of 87 completions carry either signature. Raw:
+  `perf/results/2026-09-14/z3-{clean-nospec,clean-spec,mtp-sched}-pass1/`,
+  `serve-logs/ab-z3-*.out`, `serve-logs/workload-z3-*.json`, chain
+  `serve-logs/final-chain.out`.
+
+### Item D12: a BF16 draft head for the MTP layer (m1-mtp-bf16head) - REJECTED, mechanism removed
+
+- Hypothesis: the drafter scores its proposals with the target's lm_head,
+  which on this record is the FP8 swap-set's channel-wise head; the
+  control's MTP draft scores with a BF16 head. A dense BF16 copy of the
+  checkpoint's lm_head for the draft (loaded from the shard the index
+  names) might lift acceptance toward the control's.
+- Arm (MTP-3 head, five-offset c1, two passes, gate): c1 means 256.4 /
+  262.8 [296@2.74 226@2.09 262@2.43 251@2.32 248@2.28 | 284@2.64 289@2.67
+  268@2.47 262@2.41 212@1.95]; pooled 2.375 tokens per step (1737 accepted
+  over 1263 drafts); per-position 0.72 / 0.44 / 0.26; step 9.24 ms (9.19-
+  9.30); gate -2.448.
+- Reading: no acceptance gain - the FP8-head MTP arms pool at 2.35-2.45
+  over the same protocol (z2-mtp-dyn1 c1 draws 2.02-3.04, z3-mtp-sched
+  2.05-2.64) - and the step is 2 % longer (9.24 against 9.03 ms: the BF16
+  head GEMV streams twice the bytes of the FP8 head over the 151K vocab).
+  The target's FP8 head error is shared by a draft that uses the same head,
+  so the two distributions stay correlated; a separate BF16 head only
+  decorrelates them.
+- Decision: REJECTED. The option (`glm5_next_mtp_draft_head`), the shard
+  loader and the sharing guard in `eagle/utils._should_share` were removed
+  before the next arm; the drafter keeps the target's head.
+- Raw: `perf/results/2026-09-14/m1-mtp-bf16head-pass{1,2}/`,
+  `serve-logs/ab-m1-mtp-bf16head.out`, chain `serve-logs/m1-chain.out`.
+
+### Item D13: index sharing across the MTP draft steps (`index_share_for_mtp_iteration`, m2-mtp-share) - the arm ran with the mechanism INACTIVE; re-measured through the config override below
+
+- Mechanism (the control's, and what the checkpoint config declares): the
+  draft's sparse-MLA indexer runs its top-k only on the draft's prefill
+  step; steps 1+ reuse those rows (`skip_topk` on the draft's mla_attn),
+  after the prefill step the rows of each request's last token are
+  compacted to the front of the shared `topk_indices_buffer`. Ours:
+  `Glm5NextMultiTokenPredictor.set_skip_topk` / `compact_topk_indices`,
+  four lifecycle hooks on the autoregressive speculator
+  (`on_prefill_begin/end`, `on_multi_step_decode_begin/end`, called from
+  `capture` and `propose`), and `MTPSpeculator` implementing them when the
+  draft config sets the flag and the model exposes both methods.
+- Arm (BF16 head still on, five-offset c1, two passes, gate): 248.6 /
+  271.4 [247@2.27 285@2.66 265@2.46 244@2.23 202@1.87 | 237@2.18 355@3.33
+  232@2.14 283@2.59 250@2.30]; pooled 2.351; per-position 0.69 / 0.43 /
+  0.27; step 9.24 ms (9.14-9.38); gate -2.439; 0 signatures.
+- Reading, corrected after the arm: the draft config override
+  (`SpeculativeConfig.hf_config_override`) sets
+  `index_share_for_mtp_iteration: False` on the GLM draft config ("validate
+  GLM's pooled-tail state before enabling"), and the speculator reads the
+  flag from that config, so `share_mtp_topk_indices` was False and the
+  hooks never toggled `skip_topk`: m2 is a repeat of m1 (same pooled
+  acceptance and step within noise), not a measurement of the mechanism.
+  The mechanism is switched on without a code change through the record's
+  `speculative_overrides` (`index_share_for_mtp_iteration: true`, which the
+  config plumbs onto the draft config); the acceptance chain 2 below
+  measures it on the c8 probe. The same mechanism was retained on the
+  Qwen3.8-Flash QSA record (+6.1 % at c8, 2026-08 entry).
+- Decision: code kept (the model's declared inference behaviour, inert
+  until the override enables it); verdict with the chain-2 reading.
+- Raw: `perf/results/2026-09-14/m2-mtp-share-pass{1,2}/`,
+  `serve-logs/ab-m2-mtp-share.out`, chain `serve-logs/m2-chain.out`,
+  patch `$S/stage/patch_index_share.py`.
+
+### Acceptance audit, part 1: the control accepts 2.45 tokens per step pooled, not 2.67; its verification rule is standard, ours is block
+
+- The 2.67 quoted for the control's MTP-3 head (Item D11's reading) was
+  the mean of ten five-offset c1 draws; the per-request spread of this
+  protocol is 1.9-3.5 accepted per step (the same prompt at seeds 42 / 43
+  drew 2.18 and 3.52 on the control). Pooled over every 2026-09-14
+  control run (10268 accepted over 7074 drafts, 21222 draft tokens) the
+  control's head accepts 2.45 per step; its per-position log means are
+  0.69 / 0.44 / 0.30. Ours over the same protocol: 2.35-2.45 pooled,
+  0.69 / 0.43 / 0.27. The gap is inside the draw noise of a five-draw
+  mean; whether any of it is real needs a pooled measurement over many
+  prompts, which the acceptance chain below provides.
+- The control serves `draft_sample_method: probabilistic` with
+  `rejection_sample_method: standard` (its non-default args); the record's
+  `--spec` overrides run probabilistic drafts under `block` verification.
+  Both trees carry the same block-verification kernel (Sun et al. 2024,
+  the cumulative joint ratio, the residual-mass acceptance `h`, the
+  backward max over positions) and the same Leviathan rule; ours differs
+  only in the placeholder (-1) handling and the temperature being applied
+  before the draft logits are stored (bit-identical at temperature 1.0).
+  Block verification is at least as long as standard in expectation for
+  the same draft, so a measured shortfall would point at draft quality,
+  not the rule.
+- Raw: the control's 2026-09-14 runs,
+  `perf/results/2026-09-14/control-mtp3-offsets-pass{1,2}/` and
+  `perf/results/2026-09-14/acc-control{,-k1}-pass{1,2,3}/`.
+
+### Acceptance audit, part 2: the c8 probe (32 prompts x 3 seeds) - the control accepts 2.38 per step, DFlash2 2.24, the MTP head 2.21; the verification rule is not the difference
+
+- Protocol (`$S/acc_chain.sh`, `acc_summary.py`, `acc_table.py`): the exact
+  bench at c8 on four prompt offsets (0 / 500 / 1000 / 1500 -> 32 distinct
+  1000-token prompts), 300 output tokens, seeds 42 / 43 / 44 (three passes),
+  Prometheus spec counters pooled per arm (~12-13K verify steps, ~38K draft
+  tokens each). The control ran the same shapes and seeds in its container.
+
+  | arm | tokens/step (pooled) | per-draft acceptance | per-position | c8 tok/s (mean of 12) | step |
+  |---|---|---|---|---|---|
+  | control MTP-3 (probabilistic + standard) | 2.378 | 0.459 | 0.668 / 0.404 / 0.240 | 701.4 | 27.1 ms |
+  | ours MTP-3, block | 2.213 | 0.404 | 0.646 / 0.368 / 0.198 | 656.9 | 26.9 ms |
+  | ours MTP-3, standard | 2.214 | 0.405 | - | 645.8 | 27.4 ms |
+  | ours DFlash2 k=3, block (record) | 2.239 | 0.413 | - | 701.2 | 25.5 ms |
+
+  Per shape (tok/s @ tokens/step): control 735@2.44 / 672@2.28 /
+  712@2.46 / 686@2.35 at offsets 0 / 500 / 1000 / 1500; ours MTP block
+  634@2.15 / 644@2.20 / 674@2.26 / 675@2.25; DFlash2 722@2.26 / 685@2.23 /
+  696@2.27 / 703@2.21.
+- Reading: block and standard verification accept the same (2.213 vs
+  2.214), so the rule is not the gap; the same MTP head accepts 7 % fewer
+  tokens per step in our tree than in the control's, spread over every
+  position (position 1 -3 %, conditionals 0.57 / 0.54 against 0.60 /
+  0.59), with the shortfall varying 3-12 % by prompt set. It is draft /
+  target agreement, i.e. numerics somewhere in the drafter's inputs, its
+  own path, or the target's distribution (the FP8 swap-set covers the KDA
+  and dense projections and the head). DFlash2 accepts as much as our MTP
+  head on this set and its step is 1.4 ms shorter, so at c8 on the broad
+  probe the record is level with the control (701 vs 701); the official
+  offset-0 set is where the control's head is strongest (2.44) and the
+  record trails (722 vs 735 here, 692 vs 732-740 in the closing arms).
+- The MTP head's c8 step is 26.9 ms against DFlash2's 25.5: its draft
+  prefill step runs the MTP layer's FP8 experts on all 32 rows (up to 288
+  distinct experts x 6.3 MB per rank) where only 8 rows feed drafts;
+  Item D14 (row selection, the control's prefill-output compaction)
+  addresses that.
+- Next probes (acceptance chain 2): the BF16 twins (`SLIMSERVE_FP8_SWAPSET=0`),
+  index sharing through the config override, k=1 on both trees (the
+  first-position gap in isolation), the control's fidelity gate.
+- Raw: `perf/results/2026-09-14/acc-{mtp-block,mtp-std,dflash,control}-pass{1,2,3}/`,
+  `serve-logs/ab-acc-*.out`, `serve-logs/control-acc.out`,
+  `serve-logs/control-acc-control.log`, chain `serve-logs/acc-chain.out`.
+
+### Item D14: row selection for the MTP drafter's prefill step (the control's prefill-output compaction) - RETAINED (c16 +2-3 %, c1 step -1.3 %, c8 within noise)
+
+- Hypothesis: the draft's prefill step runs the MTP layer on every scheduled
+  row (k+1 per request: 32 at c8, 64 at c16) but only each request's last
+  row feeds a draft; attention must see every row (it owns the layer's
+  latent and pool caches), the experts, norm and head need not. The
+  control selects the tail rows before its MoE (`set_prefill_output_indices`).
+- Implementation (`$S/stage/patch_prefill_compact.py`): `Glm5NextMTP.forward`
+  takes `output_rows`; the block `index_select`s the attention output and
+  the residual after attention, so the shared experts, routed experts,
+  final norm and head run on the selected rows. The speculator passes the
+  request tails (`last_token_indices`) on the prefill step and the
+  identity (`row_identity[:num_tokens]`) on decode steps so the
+  AOT-compiled forward keeps one specialization (guards are off under AOT
+  compile; an optional-tensor argument would have been traced once and
+  then silently misapplied). `_prefill` reads rows `[:num_reqs]` of the
+  compact output instead of gathering by index. Other drafters (DFlash2,
+  EAGLE) are untouched (`selects_output_rows` defaults False).
+- Paired arms (MTP-3 head, block, two seeded passes, gate + canaries):
+
+  | arm | c1 five-offset means | c1 step | c8 (4 offsets) | c16 |
+  |---|---|---|---|---|
+  | d14-mtp-base | 264.2 / 266.5 (draws 2.13-2.80) | 8.98 ms | 656.9 mean (acc-mtp-block, same tree) | 935.7@2.34 / 948.7@2.30 (39.4 ms) |
+  | d14-mtp-rows | 284.3 / 239.2 (draws 1.74-3.00) | 8.86 ms | 653 / 670 per pass, 662 mean | 967.3@2.30 / 957.2@2.29 (38.1 ms) |
+
+  Pooled acceptance unchanged (rows 2.264 over c1/c8/c16; c8 rows
+  2.15-2.38 against 2.15-2.26); gate -2.444 (base -2.475; band); canaries
+  text / tool / image pass on both; recompile of the draft's AOT graph
+  took 5 s. The c1 means swing with the draws (the step, tok/s x
+  accepted, is the stable reading).
+- Reading: the saving is the draft-prefill MoE's rows, 1.3 ms at c16 (64
+  -> 16 rows), 0.1 ms at c1; at c8 (32 -> 8 rows) it is inside the pass
+  spread, so the MTP draft's 26.9 ms c8 step (DFlash2 25.5) is not mainly
+  that MoE. The MTP head stays behind DFlash2 at c8 / c16 (662 / 962
+  against 701 / 1023) on acceptance (2.2-2.3 against 2.24-2.38) and step.
+- Decision: RETAINED (no cost, correctness intact, the control's
+  behaviour). The record's drafter is still DFlash2; the MTP head's
+  standing depends on the acceptance audit.
+- Raw: `perf/results/2026-09-14/d14-mtp-{base,rows}-pass{1,2}/`, gates
+  `d14-mtp-*-gate1.json`, `serve-logs/ab-d14-mtp-*.out`, chain
+  `serve-logs/d14-chain.out`.
+
+### Item D13 re-measured: index sharing across the MTP draft steps on the full protocol - within noise (c8 +1.5 %, c16 -2 %, acceptance level); kept as inert hooks, not enabled
+
+- Baseline: d14-mtp-rows (the same tree, MTP-3 head, block, sharing off;
+  two seeded passes, gate, canaries, 2026-09-14).
+- Hypothesis: with the draft's indexer top-k run once per verify step and
+  reused across draft steps 2 and 3 (`index_share_for_mtp_iteration: true`
+  through the record's `speculative_overrides`, the checkpoint's declared
+  inference behaviour), the draft's steps shorten and the drafts see the
+  rows the control's drafter sees, so acceptance and c8 / c16 rise. The
+  c8 probe (acceptance audit, part 3) had read +2 % (674.6 against 656.9)
+  at level acceptance (2.228 against 2.213).
+- Arm (d13-mtp-share; the chain that launched it was killed while the arm
+  was already running, the arm itself completed on its own - the harness
+  incident is recorded in the part-3 entry below; the data is complete):
+
+  | arm | c1 five-offset means (pass 1 / 2) | c8 by offset (0 / 500 / 1000 / 1500, means of 2) | c16 | tokens/step pooled (passes) | per-position |
+  |---|---|---|---|---|---|
+  | d14-mtp-rows | 264.2 / 239.2 | 649 / 650 / 707 / 640 (661) | 962 (967 / 957) | 2.264 | 0.67 / 0.39 / 0.22 |
+  | d13-mtp-share | 251.5 / 263.2 | 633 / 672 / 729 / 657 (673) | 940 (955 / 926) | 2.254 (2.228 / 2.281) | 0.670 / 0.389 / 0.223 |
+
+  Gate -2.4525 (rows -2.444; band); canaries text / tool / image PASS;
+  engine e2e latency mean 2.10 s over 215 requests; 0 signatures.
+- Reading: the draft's indexer top-k on steps 2 and 3 is a small part of
+  the draft step at these batch sizes (the MTP layer runs on 8-16 rows;
+  the top-k over a 1000-token pool is one small kernel per step), so the
+  shortening is inside the pass spread, and the drafts' rows do not
+  change what the head accepts (2.254 against 2.264 pooled, every
+  position level). The +2 % of the c8 probe was one sample of the 3 %
+  arm-to-arm spread (the acc3 no-op arm measured 2.286 on the same
+  config). c16 -2 % (940 against 962) is also inside that spread.
+- Decision: hooks kept (inert without the override, the mechanism the
+  config declares, retained on the Qwen record where it measured +6 %),
+  NOT enabled on the rtx6000 record; the record-candidate arm (rc) runs
+  without it.
+- Raw: `perf/results/2026-09-14/d13-mtp-share-pass{1,2}/`, gate
+  `d13-mtp-share-gate1.json`, `serve-logs/ab-d13-mtp-share.out`;
+  baseline `d14-mtp-rows-pass{1,2}/`.
+
+### Acceptance audit, part 3: the swap-set, index sharing, the draft KV dtype and the native sampler kernels are all excluded; the two targets differ (TV 0.19 on the gate text) and the draft's dead draws are the lever
+
+- Question: the checkpoint's own MTP head accepts 0.723 per draft in the
+  control's tree (k=1, c8 probe) and 0.676 in ours - same head, same
+  weights. Which of our tree's differences costs the 0.047?
+- Arms (the c8 probe of part 2: 4 offsets x 3 seeds, 300 tokens, pooled
+  Prometheus counters; every arm the MTP head with block verification):
+
+  | arm | what changes | tokens/step | per draft | per-position | c8 tok/s (mean of 12) |
+  |---|---|---|---|---|---|
+  | acc-mtp-block (part 2) | reference | 2.213 | 0.404 | 0.646 / 0.368 / 0.198 | 656.9 |
+  | acc-mtp-bf16 | `SLIMSERVE_FP8_SWAPSET=0`: the FP8 KDA / dense / lm_head sidecars off | 2.218 | 0.406 | 0.646 / 0.373 / 0.204 | 629.7 |
+  | acc-mtp-share | `index_share_for_mtp_iteration: true` | 2.228 | 0.409 | 0.647 / 0.368 / 0.199 | 674.6 |
+  | acc-mtp-bf16kv | `kv_cache_dtype: auto` on the draft (a no-op: the draft inherits the target's `auto`, and the record's target KV IS BF16) - a variance sample | 2.286 | 0.429 | 0.661 / 0.398 / 0.223 | 679.0 |
+  | acc-mtp-tri | `VLLM_QC_DISABLE_NATIVE=1`: the Triton top-k/top-p mask, Gumbel and flatten paths | 2.227 | 0.409 | 0.645 / 0.372 / 0.204 | 669.0 |
+  | acc-mtp-k1 | k=1 | 1.676 | 0.676 | 0.679 | 750.8 (offset 0: 793 / 786 / 793) |
+  | acc-mtp-k1-tri | k=1, native sampler kernels off | 1.678 | 0.678 | 0.676 | 744.5 |
+  | acc-control-k1 | the control at MTP depth 1 | 1.723 | 0.723 | 0.742 | 774.1 (offset 0: 780 / 775 / 754) |
+
+  Gates (`gate.py --top 20`, 44,786 positions of the same text on both
+  servers): ours mean text logprob -2.44 / -2.47 (arms), the control -2.57
+  / -2.61; sharpness ours top-1 logprob -0.801, top-5 mass 0.779, top-20
+  mass 0.879, top-20 entropy 1.288, actual-is-top-1 0.530; the control
+  -0.791 / 0.782 / 0.885 / 1.311 / 0.510.
+- Reading, exclusions: the FP8 swap-set (2.218 vs 2.213), the verification
+  rule (part 2), index sharing (2.228; +2 % on this probe, within noise on
+  the full protocol - Item D13 above), the draft KV dtype (there is
+  nothing to change: the record serves the target's KV as BF16 and the
+  draft inherits it), the native sampler kernels (k=1 0.678 vs 0.676, k=3
+  2.227 vs 2.213), the draft expert kernel (Marlin FP8 W8A16 in both
+  trees), the hidden-state handoff (post-final-norm in both), the router
+  (bit-exact unit test), the indexer (the probe's 1,300-token pools are
+  under the top-2048, so every row is attended in both). Calibration: the
+  arm-to-arm spread on this probe is up to 3 % (the no-op arm read 2.286
+  against 2.213 - 2.228), so the 0.047-per-draft gap at k=1 (2.8 % of
+  1.676) is at the edge of what the probe resolves, though it is
+  consistent across every k=1 / k=3 pairing.
+- Reading, what remains: the two targets are not the same distribution.
+  On the gate text the total variation between our top-20 and the
+  control's is 0.186 mean (median 0.159, p90 0.415), the argmax agrees at
+  74 % of positions, and 4.4 % of our top-20 mass sits outside the
+  control's top-20 (5.0 % the other way). Ours is the sharper of the two
+  (top-1 logprob, entropy, actual-is-top-1, mean text logprob all say so).
+  The head was trained against the BF16 model, and whichever quantized
+  target sits closer to it accepts more; that is the control's b12x W4A4
+  experts + fp8_ds_mla latent cache against our Marlin W4A16 + BF16 KV,
+  and it is not settled by these probes (the BF16 model does not fit the
+  box).
+- Finding on the way (adopted): the control salts its drafter's Gumbel
+  noise (`_DRAFT_NOISE_SALT = 1 << 30`, `positions + 1`, `is_drafting`);
+  ours keyed the draft draw at (seed, position + 1) unsalted, the same key
+  the verifier's residual resample uses for that row. Verification is a
+  probability-ratio test, not a Gumbel coupling, so a shared noise vector
+  biases the resample toward the token the noise favoured (an output
+  bias, not an acceptance effect). `$S/stage/patch_draft_salt.py` adds
+  `DRAFT_NOISE_SALT` and `is_drafting=True` on the three draft draws, with
+  `tests/v1/sample/test_gumbel_draft_salt.py` (applied by the rc chain).
+- The lever this leaves (Item D16 below): both trees draw the draft from
+  its full distribution and cut only the target to top-k 20 / top-p 0.95
+  at verification (`_copy_request_inputs`: "ignore ... top_k and top_p, for
+  simplicity and performance"). On the gate text the target's top-20 holds
+  0.88 of its mass, so a draft that matched the target exactly would still
+  waste about a tenth of its draws outside the target's support. Cutting
+  the draft the same way is exact under rejection sampling and is a lever
+  the control does not pull.
+- Raw: `perf/results/2026-09-14/acc-{mtp-bf16,mtp-share,mtp-bf16kv,mtp-tri,mtp-k1,mtp-k1-tri,control-k1}-pass{1,2,3}/`,
+  gates `acc-mtp-bf16-gate1.json`, `acc-mtp-k1-tri-gate1.json`,
+  `acc-control-k1-gate1.json`, `rc-control-gate-gate1.json` (sharpness
+  records); chains `serve-logs/{acc2,acc3,acc4}-chain.out`,
+  `control-acc-k1.out`, `control-rc-gate.out`.
+
+### Item D15: the record candidate - the MTP head with the batch-size schedule [[1,4,3],[5,8,1],[9,16,2]] on the full protocol (rc-mtp-sched) - ahead of the control at c8 / c16, level at c1; the drafter switch waits on D16
+
+- Baseline: the committed record (DFlash2 k=3, z1-final three-pass medians
+  265.5 / 692.5 / 1023.2) and the control (shipped MTP-3 267.6 five-offset
+  / 732.1 / 1005.8; its depth-1 c8 ~774).
+- Hypothesis: at c8 the k=1 verify streams half the experts of k=3 (the
+  acceptance chain 2 probe read 790 at offset 0 against 660-690), at c1
+  k=3 is worth its rows, at c16 k=2 (Item D11's reading); the schedule
+  gives each shape its width, so the one drafter beats DFlash2 at every
+  shape and the control at c8 / c16.
+- Tree: 49f13739a + the CodeRabbit round-2 fixes, the cleanup rename, the
+  draft-noise salt, the mHC width guard (rebuilt), index sharing off.
+  First launch (2026-09-14 23:55) died at boot on the staged DMA-ring
+  hunk's `unique_name` (for `self.unique_name`; ruff had flagged it, the
+  chain did not gate on lint - it does now); relaunched 10:11.
+- Arm (three seeded passes, two gates, canaries, TTFT, Foundry c8):
+
+  | shape | pass 1 | pass 2 | pass 3 | median | control (shipped) | control best |
+  |---|---|---|---|---|---|---|
+  | c1 five-offset mean (tok/s @ accepted/step) | 305.5 [315@2.80 322@2.85 254@2.25 395@3.60 241@2.12] | 257.5 [246@2.17 288@2.56 231@2.03 268@2.35 254@2.21] | 262.8 [222@1.96 308@2.75 258@2.27 245@2.17 281@2.47] | 262.8 | 267.6 | - |
+  | c8 offset 0 | 749.0@1.70 | 760.9@1.69 | 757.1@1.68 | 757.1 | 732.1 | ~774 (depth 1) |
+  | c8 four-offset mean | 764 | 765 | 762 | 764 | 701 (probe) | 774 (probe) |
+  | c16 | 1020.1@2.10 | 1056.8@2.09 | 1020.3@2.09 | 1020.3 | 1005.8 | - |
+
+  Per shape over the three passes: c1 259@2.26 / o2000 261@2.26 / o4000
+  306@2.71 / o6000 248@2.18 / o8000 303@2.58; c8 756@1.69 / o500 778@1.67
+  / o1000 763@1.68 / o1500 758@1.68; c16 1032@2.09. Cold TTFT 32K 2.70 s,
+  128K 11.8 s (control 2.93 / 14.9); warm 0.087 / 0.280 s. Foundry
+  structured c8 480 / 548 tok/s (DFlash2 record 448 / 541; the MTP
+  schedule arm of D11 453 / 556). Gates -2.436 / -2.425 (band; sharpness
+  top-20 mass 0.879, entropy 1.29); canaries text / tool / image PASS;
+  engine e2e mean 1.84 s over 321 requests; every run `exact: true`.
+- Reading: c8 +3.4 % over the control's shipped head and level with its
+  depth-1 best (757 against ~774 at offset 0, 764 against 774 on four
+  offsets: the same k=1 verify, the control's head accepting 0.72 per
+  draft against our 0.68); c16 +1.4 %; c1 level (the five-offset mean
+  swings 257-305 with the draws; the per-shape three-pass figures, 248-306,
+  bracket the control's 267.6). Against the committed DFlash2 record: c8
+  +9 %, c16 level, c1 level. The candidate beats the control's shipped
+  config at every shape but only by the c8 margin the schedule buys; the
+  acceptance shortfall (audit part 3) caps c1 and c16 where k=3 / k=2
+  drafts carry the win.
+- Decision: the drafter switch (the variant carrying the checkpoint's own
+  MTP head as its `speculator`, `$S/stage/patch_record_mtp.py`) waits on
+  Item D16 (the draft cut), measured next on the c8 probe and then on this
+  protocol (rc3).
+- Raw: `perf/results/2026-09-15/rc-mtp-sched-pass{1,2,3}/`, gates
+  `rc-mtp-sched-gate{1,2}.json`, `serve-logs/ab-rc-mtp-sched.out`, chains
+  `serve-logs/rc-chain.out` (the failed boot, `serve-20260914-235449.log`)
+  and `rc2-chain.out`.
+
+### Item D16: the drafter draws under the request's top-k / top-p (`draft_top_k_top_p`) - RETAINED (exact; +1 % accepted per draft at k=1 and k=3, at the edge of the probe's resolution)
+
+- Baseline: the MTP head on the c8 probe, k=1 0.676 / 0.678 per draft
+  (native / Triton sampler paths), k=3 2.213 - 2.228 tokens/step (block,
+  share, Triton arms; the no-op arm's 2.286 marks the spread).
+- Hypothesis: the verifier cuts the target to the request's top-k 20 /
+  top-p 0.95 and the drafter draws from its full distribution (upstream's
+  "ignore top_k and top_p, for simplicity and performance"; the control
+  does the same), so every draw that lands outside the target's cut is
+  rejected outright. On the gate text the target's top-20 holds 0.88 of
+  its mass, so a draft matched to the target would waste up to a tenth of
+  its draws; cutting the draft the same way is exact under rejection
+  sampling (any proposal recovers the target) and should lift acceptance.
+- Implementation (`$S/stage/patch_draft_masks.py`, in-tree):
+  `SpeculativeConfig.draft_top_k_top_p` (requires probabilistic
+  drafting); the runner binds the sampler's `SamplingStates` to the
+  drafter; `_copy_request_inputs` notes the batch's cutoffs from the
+  states' CPU copies (any top-k, any top-p, whether every row's k fits the
+  native cutoff kernel's 1..32); `sample_draft` tempers a fresh FP32 copy
+  of the head's logits, cuts them in place with the native
+  `topk_topp_mask` (or upstream's Triton op when a row's k is wider) and
+  draws with the temperature already applied, so the tempered, cut logits
+  are what the verifier reads as the proposal. `mask_draft_logits` is a
+  module function; `tests/v1/sample/test_draft_sampling_masks.py` checks
+  it against the verifier's own cut ops (native and fallback) and that 50
+  Gumbel draws never leave the cut. DFlash2 has its own candidate path
+  (already a 16-candidate proposal) and is untouched.
+- Arms (c8 probe, three seeds):
+
+  | arm | tokens/step | per draft | per-position | c8 tok/s (12) |
+  |---|---|---|---|---|
+  | acc-mtp-k1 / -tri (no cut) | 1.676 / 1.678 | 0.676 / 0.678 | 0.679 / 0.676 | 750.8 / 744.5 |
+  | acc-mtp-k1-mask | 1.684 (1.687 / 1.681 / 1.684) | 0.684 | 0.683 | 758.0 |
+  | acc-mtp-block / -tri (no cut) | 2.213 / 2.227 | 0.404 / 0.409 | 0.646 / 0.368 / 0.198 | 656.9 / 669.0 |
+  | acc-mtp-mask | 2.245 (2.266 / 2.256 / 2.213) | 0.415 | 0.653 / 0.384 / 0.221 | 680.0 |
+
+  Gate -2.432 (band).
+- Reading: +0.008 per draft at k=1 and +0.03 tokens/step at k=3, every
+  position up a little, both inside the probe's 3 % spread. The dead-draw
+  share on the model's own generations is about 1 %, not the tenth the
+  gate text (natural prose, flatter) suggested: the head is far sharper
+  than the target, so its draws seldom leave the target's cut - the 0.68
+  acceptance is the head putting too much mass on its argmax where the
+  target spreads it (an accept ratio p/q below 1 on the very tokens both
+  rank first). That points at the draft's own temperature (Item D17).
+- Decision: RETAINED, on for the MTP record (exact, a 10 MB copy and one
+  cutoff kernel per draft step, a small consistent gain); the cut is the
+  draft's, not a change to what the verifier accepts.
+- Raw: `perf/results/2026-09-15/acc-mtp-{k1-mask,mask}-pass{1,2,3}/`, gate
+  `acc-mtp-k1-mask-gate1.json`, chain `serve-logs/acc5-chain.out` (the
+  first launch died on its own unit test - the native cutoff row must
+  have k <= 32; relaunched as acc5b into the same log).
+
+### Item D15, second arm (rc3-mtp-mask): the candidate with the draft cut (D16) on - c8 767 / c16 1047 / c1 263 against the control's 732 / 1006 / 268
+
+- The rc2 arm re-run with `draft_top_k_top_p: true` (everything else the
+  same tree and protocol; three seeded passes, two gates, canaries, TTFT,
+  Foundry c8):
+
+  | shape | pass 1 | pass 2 | pass 3 | median | rc2 median | control (shipped) | control best |
+  |---|---|---|---|---|---|---|---|
+  | c1 five-offset mean (tok/s @ accepted/step) | 263.4 [262@2.30 253@2.23 287@2.56 250@2.21 265@2.35] | 262.7 [253@2.24 281@2.49 263@2.32 264@2.32 252@2.20] | 283.5 [261@2.32 296@2.62 271@2.40 291@2.59 298@2.67] | 263.4 | 262.8 | 267.6 | - |
+  | c8 offset 0 | 780.0@1.67 | 762.9@1.69 | 766.5@1.75 | 766.5 | 757.1 | 732.1 | ~774 (depth 1) |
+  | c8 four-offset mean | 773 | 768 | 777 | 773 | 764 | 701 (probe) | 774 (probe) |
+  | c16 | 1046.7@2.12 | 1017.5@2.10 | 1069.5@2.10 | 1046.7 | 1020.3 | 1005.8 | - |
+
+  Per shape over the three passes: c1 272@2.39 / o2000 258@2.28 / o4000
+  277@2.44 / o6000 274@2.42 / o8000 269@2.36 (every offset 258-277: the
+  draws were calmer than rc2's 248-306); c8 770@1.67 / o500 751@1.70 /
+  o1000 770@1.70 / o1500 799@1.72; c16 1045@2.11. Cold TTFT 32K 2.71 s,
+  128K 11.9 s; warm 0.087 / 0.272 s. Foundry structured c8 545 / 556
+  tok/s (rc2 480 / 548). Gates -2.480 / -2.454 (band); canaries PASS;
+  engine e2e mean 1.82 s over 321 requests; `exact: true` throughout.
+- Reading: against the control's shipped configuration c8 +4.7 %, c16
+  +4.1 %, c1 +0.9 % (the five-offset mean over all three passes is 270.0
+  against its 267.6; the per-pass means, 263 / 263 / 284, swing with the
+  draws, so the pooled per-offset figures above are the reading);
+  against its best c8 configuration
+  (depth 1) level, 767 against ~774 at offset 0 and 773 against 774 on
+  the four-offset probe. Against the committed DFlash2 record c8 +11 %,
+  c16 +2 %, c1 level. The cut's +1 % per draft reads as +1-3 % at c8 /
+  c16 here, inside the pass spread but in the same direction as the
+  probe.
+- Decision: this is the record candidate's configuration unless the
+  draft-temperature scan (D17) moves acceptance; the switch itself
+  (`$S/stage/patch_record_mtp.py`) follows that reading.
+- Raw: `perf/results/2026-09-15/rc3-mtp-mask-pass{1,2,3}/`, gates
+  `rc3-mtp-mask-gate{1,2}.json`, `serve-logs/ab-rc3-mtp-mask.out`, chain
+  `serve-logs/rc3-chain.out`.
+
+### Item D17: the draft's own temperature (`draft_temperature_scale`) - REJECTED, mechanism removed (the request's temperature is already the peak)
+
+- Baseline: Item D16's arm, the MTP head at k=1 on the c8 probe with the
+  draft cut on, 0.684 accepted per draft (c8 758.0).
+- Hypothesis: rejection sampling recovers the target distribution from any
+  proposal, so the draft's sharpness costs nothing and only its agreement
+  with the target matters. D16 showed the head is far sharper than the
+  target (its draws almost never leave the target's cut, yet only 0.68 of
+  them survive the ratio test), which reads as too much mass on its own
+  argmax - so a flatter draft should be accepted more often, and the
+  optimum need not be the request's temperature.
+- Implementation (staged, `$S/stage/patch_draft_temp.py`, reverted after
+  the scan): `SpeculativeConfig.draft_temperature_scale` multiplying the
+  drafter's copy of the request temperature in `_copy_request_inputs`
+  (every drafter draws from that buffer, and the verifier reads the
+  tempered logits the draw stores, so one multiply covers the whole path;
+  greedy rows stay at 0).
+- Scan (c8 probe, k=1, three seeds each, the draft cut on):
+
+  | scale | tokens/step | per draft | c8 tok/s (12) |
+  |---|---|---|---|
+  | 0.75 | 1.675 | 0.675 | 748.8 |
+  | 0.90 | 1.679 | 0.679 | 773.3 |
+  | 1.00 (D16) | 1.684 | 0.684 | 758.0 |
+  | 1.15 | 1.663 | 0.663 | 742.6 |
+  | 1.35 | 1.589 | 0.589 | 728.3 |
+
+- Reading: the curve peaks at the request's own temperature and falls off
+  either side, steeply on the flat side (1.35 costs 0.095 per draft, 14 %
+  of the acceptance). So the head is not mis-scaled against this target:
+  its 0.68 is disagreement in the distribution's shape, not its sharpness
+  - consistent with the audit's conclusion that the gap is the target's
+  quantization, not the drafter's sampling. It also says the MTP head is
+  correctly temperature-coupled to the target, which is the property a
+  mis-wired draft head would fail.
+- Decision: REJECTED; the config field and the multiply are removed from
+  the tree (nothing is left gated off). `patch_draft_temp.py` stays in
+  scratch as the reproducer.
+- Raw: `perf/results/2026-09-15/acc-mtp-k1-t{075,09,115,135}-pass{1,2,3}/`,
+  chain `serve-logs/acc6-chain.out`.
+
+### Record validation (z4-record): the record exactly as committed, with no bench overrides at all
+
+- Every arm above set the drafter through `speculative_overrides` with an
+  explicit checkpoint path, so the last thing to check is the record as it
+  ships: `slimserve glm53f-nvfp4-4 --serve --spec` with a clean
+  `slimserve/profiles.json` (the chain refuses to run if it is dirty), the
+  drafter resolved from the variant's own `speculator` entry.
+- Boot: `SpeculativeConfig(method='mtp',
+  model='/raid/weights/GLM-5.3-Flash-NVFP4', num_spec_tokens=3)` with
+  `'draft_top_k_top_p': True` and the batch-size schedule - the draft model
+  is the target's own directory, resolved from `local_dir` under the
+  operator's `SLIMSERVE_CACHE`, so the repo carries no host path. Healthy
+  in 140 s.
+- One full-protocol pass, gate, canaries, TTFT, Foundry workload:
+
+  | shape | z4-record | rc3 (three passes) | control |
+  |---|---|---|---|
+  | c1 five-offset mean | 272.3 [265 / 282 / 284 / 255 / 275] | 263-284 per pass, 270.0 pooled | 267.6 |
+  | c8 offset 0 | 748.5@1.69 | 763-780 | 732.1 |
+  | c8 four-offset mean | 755.5 | 768-777 | 701 (probe), 774 (its depth-1 best) |
+  | c16 | 1006.9@2.08 | 1017-1070 | 1005.8 |
+
+  Cold TTFT 32K 2.700 s, 128K 11.804 s; warm 0.085 / 0.281 s. Foundry
+  structured c8 517 / 565 tok/s. Gate -2.452 (band); canaries text / tool /
+  image PASS; engine e2e mean 2.01 s over 109 requests; `exact: true`
+  everywhere; pooled 1.859 tokens per step.
+- Reading: the shipped record reproduces the candidate arms inside the
+  single-pass spread (c1 at the top of it, c8 and c16 at the bottom), and
+  nothing in the registry path costs throughput. The record stands.
+- Raw: `perf/results/2026-09-15/z4-record-pass1/`, gate
+  `z4-record-gate1.json`, `serve-logs/ab-z4-record.out`, chain
+  `serve-logs/z4-chain.out`, boot `serve-logs/serve-20260915-115714.log`.
+
+### Decode roofline audit (2026-09-15): the step is expert-bandwidth-bound, the expert GEMM is at 96 % of the card, and the native expert kernel is dead
+
+- Why: the campaign's standing "next lever" was a native sm_120 NVFP4
+  expert kernel, on the strength of the E6 note that Marlin reads experts
+  at "60 % of the bandwidth floor". That note counted 2.4 MB per expert
+  per rank. Measured from the checkpoint headers, one expert is 13.5 MiB
+  unsharded - `gate_proj` and `up_proj` are 4.0 MiB packed + 0.5 MiB of
+  E4M3 block scales each, `down_proj` the same - so 3.375 MiB per rank at
+  TP4, 1.5x the note's figure.
+- Card ceiling, measured: 1628 GB/s read (a 1 GiB bf16 reduction), 1464
+  GB/s copy. Spec is 1792 GB/s.
+- Checkpoint split: routed experts 178.5 GB, dense backbone 16.8 GB,
+  embed/head/vision 2.5 GB. Decode is almost entirely expert streaming.
+- Expert GEMM: at c1 (M = 4 rows) a layer touches ~30 of 288 experts and
+  its two launches take 69 us, i.e. 107.4 MB at **1556 GB/s = 96 % of the
+  achievable read bandwidth**. At c8 Marlin is 50 % of the step at the
+  same rate (its 8.25 ms/step implies ~86 distinct experts per layer, so
+  real routing is ~17 % more concentrated than uniform). NO KERNEL CAN
+  BEAT THIS; the MoE cost is a pure function of the bytes the routing
+  touches. Item closed before any code was written.
+- Fresh c1 profile of the shipped record (`prof-rec-c1`, 8 steps): GPU
+  90.6 % busy over the trace (9.4 % idle, half of it one warm-up gap), so
+  there is no host stall either. Critical path by union over streams,
+  8.80 ms/step:
+
+  | kernel | ms/step | exclusive | reading |
+  |---|---:|---:|---|
+  | Marlin expert GEMM | 2.153 | 1.345 | at the roofline |
+  | FP8 dense GEMM | 1.987 | 1.075 | 1.45 TB/s on the 25 MB shapes, 0.70 on the 2-4 MB ones |
+  | fused all-reduce + mHC | 1.119 | 1.118 | 89 calls x 12.6 us, all critical path |
+  | cutlass GEMMs | 0.699 | 0.699 | lm_head 4 x 103 us (at the roofline) + 32 x 8.9 us of the drafter's bf16 projections |
+  | KDA / MLA / all-gather / pools | 0.86 | 0.86 | |
+  | MoE glue, sinkhorn, triton | 0.51 | 0.07 | ALREADY hidden under Marlin |
+
+- The MoE glue (route+align 5.2 us, router GEMV 3.3, act_and_mul and
+  moe_sum_add 1.7 each per layer) looks like 0.5 ms/step by kernel time
+  and is 0.07 ms on the critical path: it runs under the Marlin launches.
+  Fusing it would have returned nothing. Same for `sinkhorn_deferred`,
+  which is already on its side stream (0.023 ms exclusive of 0.158).
+- Collective floor (`bench_mhc_ar.py`, world size 4, isolated): at T = 4
+  the pure all-reduce is 5.95 us, the fused all-reduce + transition 13.10,
+  the split all-reduce + Triton pair 15.24. So the fused kernel's 12.6 us
+  in the trace is ~6 us of PCIe floor and ~7 us of transition math, and
+  the fusion is already the better of the two forms below 8 tokens (at
+  T = 16 the split pair wins, 26.9 against 29.7, which is what the record
+  already switches to).
+- Tile sweep of the FP8 decode GEMM (`fp8_nt_sweep.py`, the record's
+  per-rank shapes at M = 4 / 16): the shipped rule (32 rows for N >= 2048)
+  is best on every shape; 16- and 8-row tiles lose 15-40 %. The small
+  shapes (shared gate_up 4.2 MB at 703 GB/s, shared down 2.1 MB at 717)
+  are launch-latency-bound, not tile- or grid-bound - a 188-SM grid
+  argument predicted the opposite and was wrong.
+- Standing conclusion: at c1 the step is 8.80 ms against a ~4.0 ms floor
+  set by the 6.5 GB it must read (4.5 GB experts + ~2 GB dense). The
+  addressable remainder is ~2 ms of exclusive non-streaming work: the
+  transition math (~0.6 ms), the drafter's bf16 projections (0.29 ms),
+  the vocabulary all-gather (0.14 ms) and a tail of 0.1 ms items. A
+  campaign over those is worth perhaps 7-9 % at c1 and 4-6 % at c8, in
+  many small validated steps; there is no single large lever left in
+  decode on this hardware.
+- Raw: `serve-logs/prof-rec-c{1,8}.out`, `profile-spec-rec-c{1,8}/`,
+  `$S/fp8_nt_sweep.py`, `$S/bench_mhc_ar.py`.
+
+### Acceptance audit, part 4: the target's expert quantization is NOT the gap either (native W4A4 accepts 0.681 against Marlin W4A16's 0.690)
+
+- The standing hypothesis after part 3 was that the same MTP head accepts
+  0.68 per draft against our Marlin W4A16 experts and 0.72 against the
+  control's native W4A4, because the two targets are different
+  distributions (TV 0.19 on the gate text). Item B1 already ships the
+  native path as an opt-in backend, rejected for decode on speed but
+  correct, so the hypothesis is one arm, not a project. The b12x installed
+  in the venv is byte-identical to the tree inside the control's container
+  (`diff -rq` clean but for `__pycache__`), so this is the control's own
+  expert kernel library over our checkpoint.
+- Protocol: the c8 probe (4 offsets x 3 seeds), the record's drafter and
+  draft cut, k=1 at every batch size, paired the same afternoon. The only
+  variable is the target's expert arithmetic.
+
+  | arm | target experts | tokens/step | per draft | c8 tok/s (12) | gate |
+  |---|---|---|---|---|---|
+  | acc-k1-marlin | Marlin W4A16 (the record) | 1.690 | 0.690 | 769.9 | -2.461 |
+  | acc-k1-b12x | b12x native W4A4 | 1.681 | 0.681 | 677.7 | -2.429 |
+  | control (part 3) | b12x native W4A4, its own tree | 1.723 | 0.723 | 774.1 | -2.573 |
+
+  Canaries text / tool / image PASS on both; `exact: true` throughout.
+- Reading: W4A4 does not raise acceptance here - it is 0.009 lower, i.e.
+  level inside the probe's 3 % spread, and it costs 12 % of c8 throughput
+  (the same rejection Item B1 recorded). So the expert quantization is
+  excluded, and with it the last mechanism the audit could name. The
+  control runs the same head over the same weights with the same expert
+  kernel and still accepts 0.042 more per draft, which now has to come
+  from somewhere other than the experts: the latent cache format (its
+  per-token-scaled `fp8_ds_mla` against our BF16 latents) or the attention
+  and dense path around it. Note the direction that rules out a simple
+  precision story: our latents are the HIGHER-precision pair and accept
+  less, so "closer to the BF16 reference accepts more" is false.
+- Boot finding on the way: a model whose target experts are NVFP4 and
+  whose MTP draft head's experts are FP8 cannot express its choice through
+  one global `moe_backend` - the draft head's FP8 oracle raises
+  ("moe_backend='b12x' is not supported for FP8 MoE") and the boot fails.
+  The arm ran with a staged fallback that leaves the other scheme on its
+  automatic choice with a warning
+  (`$S/stage/patch_fp8_backend_fallback.py`, reverted after the arm). If a
+  mixed-scheme backend choice is ever wanted for serving, the knob needs
+  to be per scheme rather than one name; nothing in the record wants it
+  today.
+- Decision: the audit closes here. Marlin W4A16 stays on the record on
+  throughput, and the 0.04-per-draft acceptance gap is documented as
+  unattributed, bounded by the arms above, and worth about 6 % at c1 to
+  whoever closes it.
+- Raw: `perf/results/2026-09-15/acc-k1-{marlin,b12x}-pass{1,2,3}/`, gates
+  `acc-k1-{marlin,b12x}-gate1.json`, chains `serve-logs/acc7-chain.out`
+  (the failed boot) and `acc7b-chain.out`.
+
+### Item D18: the draft width at c1 (k=2 against the record's k=3, MTP head with the draft cut) - NO CHANGE, the point sits on a flat optimum; and what the c1 measurement's spread does to the margin
+
+- Hypothesis, from the roofline audit: the c1 step is expert-bandwidth-
+  bound, and the draft width sets how many experts a verify step touches
+  (k=3 presents 4 rows and touches ~30 of 288 per layer, k=2 presents 3
+  and touches ~24). A narrower draft buys ~20-25 % of the expert bytes for
+  ~0.3 accepted tokens per step, so the sign is not obvious from either
+  side alone. The record's k=3 at c1 predates both the draft cut and the
+  audit.
+- Paired arms, one chain, same seeds, the five-offset c1 protocol, three
+  passes each, gates and canaries:
+
+  | arm | per-pass means | n | mean | median | sd | tokens/step | per-position |
+  |---|---|---:|---:|---:|---:|---:|---|
+  | d18-c1-k3 (the record) | 266.7 / 280.1 / 290.1 | 15 | 278.9 +- 8.7 | 266.4 | 33.6 | 2.437 | 0.734 / 0.474 / 0.311 |
+  | d18-c1-k2 | 272.8 / 276.6 / 276.8 | 15 | 275.4 +- 5.7 | 275.5 | 22.1 | 2.119 | 0.707 / 0.442 |
+
+  Difference 3.5 tok/s, standard error 10.4: 0.34 standard errors, i.e.
+  level. Gates -2.447 (k=3) and -2.474 (k=2), both in band; canaries pass
+  on both.
+- Reading: the two effects cancel almost exactly. k=2 accepts 13 % fewer
+  tokens per step and runs a step that is 13 % shorter, which is the
+  bandwidth story the audit predicted, and the throughput lands on the
+  same point. The c1 optimum is therefore flat in the draft width, not a
+  peak the record happened to hit: nothing is being left on the table
+  here, and nothing is gained by narrowing. k=2 does have the tighter
+  distribution (sd 22 against 34), which is a latency-predictability
+  argument rather than a throughput one.
+- Decision: NO CHANGE. The record keeps k=3 at batch sizes 1-4; it is the
+  validated width and it is level on the mean.
+- What the spread means for the campaign's c1 claim: pooling every c1 run
+  of the shipped configuration measured on 2026-09-15 (rc3-mtp-mask,
+  z4-record and d18-c1-k3: 35 runs) gives mean 274.1, median 265.1, sd
+  24.8. The comparable statistic against the control's five-offset c1 mean
+  of 267.6 is our mean, so c1 is +2.4 %, but that is ~1.5 standard errors
+  and the median sits just under the control. The honest statement is that
+  c1 is ahead by a couple of percent and that no single arm establishes
+  it; c8 (+5 %) and c16 (+4 %) are several times their spread and are not
+  in any doubt. A single five-offset c1 arm should never be quoted on its
+  own - the per-run range today was 226 to 358 tok/s.
+- Raw: `perf/results/2026-09-15/d18-c1-k{3,2}-pass{1,2,3}/`, gates
+  `d18-c1-k{3,2}-gate1.json`, chain `serve-logs/d18-chain.out`.
+
+### Acceptance audit, part 5 (closing): the latent cache format is not the gap either, and the draft head's weights do load - the 0.04 per draft is unattributed
+
+- Last named hypothesis after part 4: the control serves its MLA latents
+  as per-token-scaled `fp8_ds_mla` and accepts 0.723 per draft; we serve
+  BF16 latents and accept 0.690. This tree has an fp8 (e4m3) main KV for
+  the sparse MLA layers (`glm5_next_main_kv_fp8`), rejected earlier on
+  decode cost, and correct since the prefill kernel disqualifies itself on
+  this card (it needs 116,224 B of shared memory against the 101,376 B the
+  card opts into) and falls back instead of serving noise.
+- Arm (c8 probe, k=1, three seeds, the record's drafter and draft cut; the
+  only variable is the latent dtype of the sparse attention layers):
+
+  | arm | latents | tokens/step | per draft | c8 tok/s (12) | gate |
+  |---|---|---|---|---|---|
+  | acc-k1-marlin (part 4) | BF16 | 1.690 | 0.690 | 769.9 | -2.461 |
+  | acc-k1-fp8kv | fp8 e4m3 | 1.687 | 0.687 | 746.2 | -2.431 |
+  | control (part 3) | fp8_ds_mla | 1.723 | 0.723 | 774.1 | -2.573 |
+
+  Boot logs the fp8 path (`glm5_next: sparse MLA layers use fp8 (e4m3)
+  main KV`) and the prefill kernel's skip; canaries pass, gates in band.
+- The loading hypothesis, checked statically: a draft head with a silently
+  unloaded parameter would lose acceptance and nothing else, which is
+  exactly this symptom. It is not that. The MTP shard holds 1,753 tensors
+  (eh_proj, enorm, hnorm, the two layernorms, 288 experts x 3 weights and
+  scales, the shared experts, the gate and its correction bias, the full
+  attention block, the seven indexer tensors and `shared_head.norm`); the
+  draft model is built through `get_model`, whose loader RAISES on any
+  parameter it did not initialize from the checkpoint, and every boot of
+  this campaign has passed that check.
+- Closing statement of the audit. Excluded, each on its own arm or its own
+  code reading: the FP8 swap-set, the verification rule (block =
+  standard), index sharing, the draft cache dtype, the native sampler
+  kernels, the draft expert kernel, the hidden-state handoff, the routing
+  kernel, the indexer (at these prompt lengths every row is attended, so
+  it cannot select differently), the target's expert quantization (part 4:
+  native W4A4 accepts 0.681 against Marlin's 0.690), the target's latent
+  precision (this part), and unloaded draft weights. Two directions also
+  rule out a simple precision story: our latents are the HIGHER-precision
+  pair and accept no more, and moving the experts to the control's own
+  kernel library moves acceptance by less than the probe's noise.
+- What it is worth, for whoever picks it up: 0.033 per draft at k=1 -
+  about 5 % of the tokens per step, ~6 % at c1 and ~3 % at c8 in
+  throughput. What is left to look at is the draft head's own arithmetic
+  against a reference forward (the head is bf16 on a W4A16 target here and
+  bf16 on a W4A4 target there, so its inputs differ in ways neither arm
+  isolates), and the control's `fp8_ds_mla` per-token scaling, which is a
+  different cache format from our per-tensor e4m3 rather than a different
+  precision.
+- Decision: the audit is closed as unattributed and bounded. FP8 main KV
+  stays off the record (it costs 3 % at c8 here and 4.7 % at c16 in the
+  earlier arm, and buys no acceptance).
+- Raw: `perf/results/2026-09-15/acc-k1-fp8kv-pass{1,2,3}/`, gate
+  `acc-k1-fp8kv-gate1.json`, chain `serve-logs/acc8-chain.out`.
+
+### The fused mHC transition does not spill: 171/195 registers and zero spill traffic, so the "cut the resident `fn` column" rewrite is not a lever - REJECTED as a hypothesis, and a standalone ptxas probe is retained as the instrument
+
+- Context. Section 13 of `docs/glm53f-rtx6000-campaign.md` names the mHC
+  transition math as the largest of the four addressable items left in
+  decode: ~0.6 ms of the 8.80 ms c1 step, 89 fused calls at 12.6 us each,
+  of which ~6 us is the PCIe all-reduce floor. Subtracting the pure
+  all-reduce path from the fused path in `bench_mhc_ar.py 4 50` isolates
+  the arithmetic: T=1 10.08 - 7.79 = 2.29 us, T=4 11.41 - 4.98 = 6.43 us,
+  T=8 17.86 - 6.20 = 11.66 us, T=16 27.51 - 9.98 = 17.53 us. 6.43 us x 89
+  calls = 0.57 ms/step, which is where the section-13 estimate comes from.
+  (At T=16 the fused arithmetic, 17.53 us, is worse than the split Triton
+  pair's 15.40 us - that is why the shipped fuse policy is T <= 8, and
+  this entry does not change it.)
+- Hypothesis. `allreduce_transition` holds a lot of state per thread: the
+  24-row `fn` column lives in registers across the accumulate loop, and
+  the finalize tail holds `streams_packed[HC][FIN_VECS]` (16 x uint4 = 64
+  registers) plus `mixed_packed`/`weight_packed`. If ptxas were spilling,
+  the fix would be structural and obvious - re-load `fn` per stream inside
+  the loop, or split NOUT into two passes, or re-load `streams_packed` per
+  stream in the pre-mix - and would buy back local-memory traffic.
+- Method. Nsight Compute cannot profile this kernel: kernel replay would
+  deadlock the cross-device `barrier_at_start`/`barrier_at_end`
+  handshakes, and application replay under `mp.spawn` desynchronizes the
+  ranks. A full module rebuild to read a build log costs ~73 minutes. So
+  the register question was answered with a standalone probe instead:
+  `$S/regprobe.cu` includes `c10/util/BFloat16.h` and `c10/util/Half.h`
+  (which `custom_all_reduce.cuh` needs but does not include - it pulls in
+  no torch headers itself) and then `custom_all_reduce.cuh`, and
+  explicitly instantiates the two shipped specializations. Compiled to
+  `/dev/null` with `-Xptxas -v` it prints per-function registers, stack
+  frame, spill stores, spill loads and smem in seconds:
+
+      T=.venv/lib/python3.12/site-packages/torch
+      /usr/local/cuda-13.0/bin/nvcc -std=c++17 -arch=sm_120 -O3 \
+        -Xptxas -v -c -o /dev/null -I csrc -I $T/include \
+        -I $T/include/torch/csrc/api/include $S/regprobe.cu
+
+- Result (CUDA 13.0 V13.0.88, `sm_120`, `-O3`):
+
+  | kernel | registers | stack | spill st / ld | smem |
+  |---|---|---|---|---|
+  | `allreduce_transition<4, false>` | 171 | 64 B | 0 / 0 | 37,364 B |
+  | `allreduce_transition<4, true>` | 195 | 64 B | 0 / 0 | 37,380 B |
+  | `sinkhorn_deferred` | 28 | 0 B | 0 / 0 | - |
+  | `dsv4_tp_input_owned::finalize_attention` | 12 | 0 B | 0 / 0 | - |
+  | `tms::dsv4_mhc::finalize_head_mix` | 39 | 0 B | 0 / 0 | - |
+  | `tms::dsv4_mhc::post` | 32 | 0 B | 0 / 0 | - |
+  | `tms::dsv4_mhc::finalize_pre_mix` | 38 | 0 B | 0 / 0 | 104 B |
+
+  The 64-byte stack frame is not spill: ptxas reports it as "cumulative
+  stack size" with the spill counters at zero, and the same TU's other
+  kernels carry none. The neighbours are listed because they are the
+  control - if the probe were mis-measuring, they would not come out at
+  12-39 registers.
+- Decision: REJECTED as a hypothesis. There is no spill traffic to
+  recover, so neither the `fn`-column restructuring nor the
+  `streams_packed` re-load is justified by this reading. Both remain
+  available as *occupancy* levers, but see the next bullet for why that
+  is a weak argument too.
+- What the numbers do say. At 195 registers x 128 threads = 24,960
+  registers and 37.4 KB smem per block, at most two blocks could co-reside
+  on one SM (65,536 registers, ~100 KB smem). But the launch is
+  `NBLOCKS = HIDDEN / THREADS` = 32 blocks total on a 188-SM card: the
+  kernel occupies ~17 % of the machine with one warp per scheduler and 156
+  SMs idle, so per-SM occupancy is moot and cutting registers would buy
+  nothing. The cost is dependent-instruction latency on a grid that never
+  fills the card. The surviving lever from this reading is therefore grid
+  *shape*, not register pressure - more blocks over fewer hidden dims
+  each - and it is bounded by a tight constraint set already in the
+  source: `kMaxBlocks = 64` (`csrc/custom_all_reduce.cuh:39`) with
+  `static_assert(NBLOCKS <= kMaxBlocks, "one signal slot per block")`;
+  `NBLOCKS % (THREADS / 32) == 0` and `PARTIALS <= 32`;
+  `HIDDEN % (THREADS * VEC) == 0`; the finalize's
+  `BLOCKS_PER_WARP = NBLOCKS / WARPS` (= 8); the arrivals protocol's
+  `while (ld_acquire_gpu(arrivals + token) < unsigned(NBLOCKS)) {}`; and
+  the header's own warning that `PARTIAL_STRIDE`, `NBLOCKS` and the 32
+  lanes of a warp coincide at 32 "by coincidence, not by construction".
+  The smem footprint also scales with `TOKEN_GROUP` (8 at NGPU=4), so a
+  reshape interacts with the double-buffered staging.
+- Retained instrument. `$S/regprobe.cu` plus the command line above is the
+  cheap screen for any register or occupancy question on this kernel or
+  its neighbours in the translation unit: seconds, no module rebuild, no
+  GPU. A candidate grid reshape can be screened with it before anything is
+  built. If per-phase attribution inside the kernel is wanted instead, the
+  `%globaltimer` phase stamps and the `glm5_mhc_allreduce_timeline`
+  binding were never committed (`git log -S` finds nothing in `csrc/`) and
+  would have to be re-written - one rebuild; `bench_mhc_ar.py` already
+  contains the printing code, guarded by `getattr(..., None)`.
+- Raw: `perf/results/2026-09-15/mhc-regprobe/ptxas.log`, baseline deltas
+  reproduced in `$S/mhcar-base.log`.
+
+### The fused mHC transition splits the token axis across a second grid axis: -9 % of the transition arithmetic at T=4, -13 % at T=8 as shipped - RETAINED, and it is 0.05-0.14 ms/step, not the 0.4-0.5 ms section 13 projected
+
+- Baseline. `bench_mhc_ar.py 4 50`, ws4, the fused kernel against the
+  one-shot all-reduce on the same inputs. Subtracting the pure all-reduce
+  from the fused path isolates the transition arithmetic: T=1 2.39 us, T=4
+  6.56 us, T=8 11.81 us, T=64 33.22 us. The near-exact linearity in T
+  (1.35 us/token, 1.05 us intercept) is the per-block token loop, and the
+  preceding entry established there is no register spill to recover.
+- Hypothesis. `NBLOCKS = HIDDEN / THREADS = 32` blocks occupy 32 of this
+  card's 188 SMs because the kernel maps one thread to one hidden dimension,
+  so the token loop is serial on a grid that never fills the machine. The
+  token axis is the free axis: give the grid a second, flat axis of
+  TOKEN_CHUNKS copies of the NBLOCKS dimension blocks, each chunk owning a
+  contiguous token range.
+- Why it fits the existing protocol without touching it. `arrivals[token]`
+  counts NBLOCKS arrivals and the `partial` rows are `[token][block][value]`;
+  a token is still covered by exactly the 32 dimension blocks of its own
+  chunk, so both are unchanged as long as the partial write uses the
+  dimension index rather than the flat `blockIdx.x`. The peer barriers index
+  one signal slot per block by flat `blockIdx.x`, so the product must stay
+  inside `vllm::kMaxBlocks` (64) - which is exactly 2 chunks. The finalize
+  loop strides by `gridDim.x` instead of NBLOCKS so each token is still
+  finalized once, and it already covers the whole hidden dimension
+  (`FIN_VECS * THREADS * VEC == HIDDEN`), so any block can finalize any
+  token. Deadlock safety: 64 blocks at 197 registers and 37.4 KB smem is one
+  block per SM on 188 SMs, so every block is co-resident and neither the
+  peer barrier nor the arrivals spin can starve.
+- Result (ws4, `bench_mhc_ar.py 4 50`, fused us and the arithmetic after
+  subtracting the all-reduce):
+
+  | T | fused before | fused after | arithmetic before | after | delta |
+  |---|---:|---:|---:|---:|---:|
+  | 1 | 9.85 | 10.02 | 2.39 | 2.41 | 1 chunk, unchanged |
+  | 4 | 11.87 | 11.39 | 6.56 | 5.99 | **-9 %** |
+  | 8 | 18.01 | 16.19 | 11.81 | 10.22 | **-13 %** |
+  | 16 | 27.80 | 27.11 | - | - | gated to 1 chunk |
+  | 64 | 66.02 | 65.89 | 33.22 | 33.24 | gated to 1 chunk |
+
+- The gate, and why it is not microbenchmark-fitting. Ungated, the split
+  regressed T=16 (27.80 -> 29.76) and T=64 (66.02 -> 69.27). Each extra
+  chunk re-reads the whole `fn` column - 4096 threads x 96 floats = 1.5 MB
+  per call - because a chunk's blocks load their own dimension's column
+  independently. That is a fixed cost, while the latency it removes shrinks
+  as T grows, so the trade inverts. `token_chunks()` therefore returns 1
+  above `TOKEN_CHUNK_MAX_TOKENS = 8`, which restores the baseline exactly
+  (27.11 / 65.89). The shipped fuse policy already never sends more than 8
+  tokens to this kernel, so the gate is unreachable in production; it is
+  there so the kernel stays monotone if the policy changes.
+- The same doubled `fn` read is why the win is smaller than the loop math
+  predicts. At T=8 the halved loop alone predicts 1.05 + 4 x 1.35 = 6.45 us;
+  measured 10.22. The difference is the extra 1.5 MB and the lower L2 hit
+  rate across twice the blocks.
+- Correctness: `tests/kernels/test_glm5_mhc_allreduce.py` passes at ws2 and
+  ws4 over `TOKENS = (1, 4, 7, 9, 33, 64)`, which covers uneven chunk splits
+  (7, 9, 33) and both chunk counts; the surrounding mHC suite
+  (`test_quixicore_mhc_transition`, `glm5_next/test_mhc_{transition,dispatch,
+  norm,partials_batched,runtime_stream}`) is 201 passed.
+- Decision: RETAINED. It is strictly better inside the fused range, exactly
+  neutral outside it, parity-clean and free.
+- **Honest sizing, against section 13 of the campaign doc.** That section
+  named the transition as the largest addressable decode item at ~0.6 ms of
+  the 8.80 ms c1 step and Phase 2 item 1 targeted -0.4 to -0.5 ms. This
+  delivers 0.57 us x 89 calls = **0.051 ms/step at T=4** (c1 with
+  speculation, 0.58 %) and 1.59 us x 89 = **0.142 ms/step at T=8** (c8
+  without speculation, 1.3 %). Both are below the arm-to-arm spread (~3 %),
+  so **no end-to-end arm was spent on this and no e2e gain is claimed** -
+  the microbenchmark and the parity suite are the whole evidence. The
+  premise behind the 0.4-0.5 ms target was that the token loop was the
+  transition's cost; it is not. The cost is the fixed PCIe all-reduce floor
+  (~5-6 us of the 11-16 us) plus the `fn` read, and neither yields to grid
+  shape. Section 13's ranking of this item should be read down accordingly.
+- Raw: `perf/results/2026-09-15/mhc-token-chunks/mhcar-{base2,chunks,
+  chunks-gated}.log`; register screen in the preceding entry.
+
+### The sparse MLA tensor-core decode kernel was never too big for sm_120: only its SPLIT=128 tile was, and qualifying it is +2.2 % at c16 - RETAINED (record setting)
+
+- Baseline. `glm5_next_sparse_tc_decode` has been off on this platform since
+  the Phase 1 survey, on the reading recorded at the top of this notebook:
+  "kernel needs a 99 KB shared-memory retune (fails at 147-163 KB)". The
+  gate in `quixicore_mla_sparse.py` is a hard
+  `is_device_capability((8, 0))` that raises on anything else.
+- What the footprint actually is. The partition kernel's tile is the
+  gathered latents, SPLIT x 512 bf16, plus the 16 x 512 bf16 query rows.
+  Compiled for `cuda:120` through `triton.compile` (no GPU needed, seconds):
+
+  | SPLIT | shared | fits sm_120's 99 KB |
+  |---|---:|---|
+  | 32 | 48.0 KB | yes |
+  | 64 | 80.0 KB | yes |
+  | 128 | 144.0 KB | no (this is the 147,456 B in the error) |
+
+  Two of the three always fitted. The 147-163 KB figure is the SPLIT=128
+  tile and the fp8 branch, not the kernel as such - and
+  `_sparse_tc_split` returned exactly 128 for every batch of eight rows or
+  more, so every shape that mattered asked for the one tile that could not
+  load. The kernel needed no retune; it needed a dispatch that does not ask
+  for it.
+- Change. sm_120 gets its own branch: the 64-wide tile (the larger of the
+  two that fit, and the faster), a 16-row floor, and a 64-row cap. SM80 is
+  untouched - `glm53f-nvfp4-8`/a100 has this switch on and qualified, and
+  its table still reads 32 below eight rows and 128 above. The fp8 branch
+  stays native here: it assembles e4m3 through an int32 intermediate, so
+  its tile is 147 KB even at SPLIT=64, and this record serves bf16 latents.
+- Why a 16-row floor. The tensor-core kernel costs a near-constant ~38 us
+  per call at every row count and list width while the native SIMT path
+  scales with the work, so below the crossover native is still ahead.
+  Microbench (`perf/results/2026-09-15/sparse-tc-sm120/`, GPU 0, H=16,
+  us per call, native against SPLIT=64):
+
+  | rows | 512-wide | 1024 | 1536 | 2048 |
+  |---|---|---|---|---|
+  | 1 | 33.8 / 38.3 | 34.0 / 39.3 | 34.5 / 39.2 | 34.8 / 41.7 |
+  | 8 | 34.6 / 38.4 | 38.4 / 38.0 | 42.1 / 38.6 | 45.7 / 38.8 |
+  | 16 | 38.1 / 38.2 | 45.1 / 37.9 | 85.5 / 38.6 | 96.2 / 38.4 |
+  | 32 | 43.4 / 38.4 | 93.7 / 38.4 | 133.4 / 38.8 | 140.7 / 40.0 |
+  | 48 | 80.6 / 38.6 | 129.6 / 38.8 | 171.3 / 45.8 | 217.5 / 55.7 |
+
+  The crossover moves between 8 and 16 rows as the list widens, so 16 is
+  the width-independent safe point. Parity against the native path over the
+  whole sweep is max |delta| 0.001, one bf16 quantum.
+- Why not a width-conditioned floor. The obvious refinement - drop the
+  floor to 8 only when the list is wide, where 8 rows is already 1.07x at
+  1536 and 1.19x at 2048 - is not implementable here. The effective width
+  lives in `tlen`, a device tensor, and the dispatch runs under CUDA-graph
+  capture, where the host cannot read it. The host-side proxy (the
+  profile's `index_topk`) is the ALLOCATED width, not the used one, and at
+  512 wide 8 rows is a 0.90x LOSS (34.7 native against 39.3). It would buy
+  nothing anyway: rows are batch x (drafts + 1), so the served
+  concurrencies land on 4, 16 and 48 and never on 8. The width-independent
+  floor is both the safe answer and the free one.
+- Rows are batch x (drafts + 1). With the record's schedule
+  `[[1,4,3],[5,8,1],[9,16,2]]` that is 4 at c1 (native, unchanged), 16 at
+  c8 and 48 at c16 - which makes c1 a control channel that the change
+  cannot touch, and its movement between arms measures the harness noise
+  directly.
+- Result, two paired A/Bs on the same box, `--spec`, exact-token:
+
+  | shape | OFF | ON | delta |
+  |---|---:|---:|---:|
+  | c16-1000-300 (pooled, n=8 each) | 1037.2 | 1060.0 | **+2.2 %** |
+  | c8-1000-300 (n=3) | 737.1 | 738.0 | +0.1 % |
+  | c8-32000-300 (n=5, warm-up pass dropped) | 702.3 | 708.5 | +0.9 % |
+  | c1-1000-300 (n=3, native BOTH arms) | 279.9 | 256.9 | -8.2 % (noise) |
+
+  c16 pooled: OFF 1009.0 / 1021.2 / 1024.8 / 1032.4 / 1044.7 / 1049.1 /
+  1056.2 / 1059.8, ON 1038.3 / 1046.0 / 1056.0 / 1060.8 / 1068.0 / 1068.1 /
+  1068.7 / 1073.7. Mann-Whitney U = 55 of 64, p ~ 0.01 one-tailed.
+- **The harness noise, which is the more important result of the night.**
+  c1 runs the native path in both arms and still read -8.2 % between them.
+  Its within-arm spread was 8.4 % (244.5-265.0) and 9.4 % (269.4-295.7).
+  The record's own five-offset c1 samples span 250-287, so this is
+  historical, not new - but it means **a three-pass single-offset c1 arm
+  cannot resolve anything smaller than about 10 %**, and the record's c1
+  270.0 is trustworthy only because it is a five-offset mean over fifteen
+  samples. c16 is the stable shape here (within-arm spread 2.6-3.5 %);
+  future one-factor arms should be read there, or at c1 only through the
+  five-offset protocol.
+- **Why 2.2-3.7x on the kernel is only +2.2 % end to end.** Sparse MLA is
+  11 of 45 layers, and the decode roofline audit above put it in the
+  KDA/MLA/all-gather/pools group at 0.86 ms of which very little is
+  exclusive - it runs under the Marlin and FP8 GEMMs on other streams. At
+  c8-32K the arithmetic predicts 11 x 57.8 us = 0.64 ms of a 19.4 ms step,
+  3.3 %; the measurement says 0.9 %. Shrinking an overlapped kernel does
+  not shorten the step. This is the same lesson as the MoE glue and the
+  mHC transition, and it is now three for three: on this tree, kernel time
+  and step time are only loosely coupled, and every remaining decode
+  candidate should be sized by its EXCLUSIVE critical-path share, not by
+  its kernel time.
+- Correctness: canaries text / tool / image pass on both arms, `exact:
+  true` on all 26 runs, gate -2.4552 (ON) and -2.4521 (OFF), both in the
+  -2.407..-2.478 band, needle margins 13.2-19.0 nats.
+- Decision: RETAINED; `glm5_next_sparse_tc_decode: true` joins the record's
+  `additional_config`. It is never worse than native (the floor keeps the
+  small shapes on the old path), it is clean on every gate, and c16 is the
+  one shape where the record's margin over the control was thinnest.
+- Raw: `perf/results/2026-09-15/sparse-tc-sm120/` - the four-candidate
+  sweep (`bench-tc-decode.log`, script `bench_tc_decode.py`), both A/B
+  pairs (`ab-tcdec-{off,on}.out`, `ab-tcdec2-{off,on}.out`) and their chain
+  logs (`tcdec-chain.out`, `tcdec-base-chain.out`, `tcdec2-chain.out`).
+  Per-pass harness JSON in `perf/results/2026-09-15/tcdec{,2}-{off,on}-pass*/`,
+  canaries in `perf/results/2026-09-15/tcdec-{off,on}-gate1.json`.
+
+### The partition-free `rows` kernel is NOT the better decode form above 16 rows - REJECTED (it scales with the list; the partitioned one does not)
+
+- Hypothesis. The partitioned decode kernel is flat at ~39 us per call from
+  1 to 48 rows, and at the high end its cost is the partial buffer it
+  writes and re-reads (rows x parts x H x 512 fp32: 50 MB at 48 rows and a
+  2048-wide list, ~61 us of traffic at the measured 1628 GB/s roofline).
+  Above 16 rows the row dimension already supplies the parallelism that
+  partitioning exists to create, so `sparse_tc_nope_rows` - the
+  prefill-shaped kernel, one program per token over all 16 heads, online
+  softmax, no partition scratch and no reduce launch - should win.
+- Result: it loses, and not marginally. Its cost scales with the list
+  because each program walks the whole thing serially (us per call, H=16,
+  tile 64, against the partitioned SPLIT=64):
+
+  | list width | 512 | 1024 | 1536 | 2048 |
+  |---|---:|---:|---:|---:|
+  | rows kernel (48 rows) | 38.9 | 75.6 | 113.1 | 155.7 |
+  | partitioned (48 rows) | 38.6 | 39.0 | 46.2 | 55.9 |
+
+  Only at a 512-wide list, where there is nothing to walk, are they level.
+  The partitioned kernel's flatness is exactly what partitioning buys: the
+  list is split across `parts` blocks, so widening it adds blocks rather
+  than serial work. The partial traffic is the price, and it is the cheaper
+  side of the trade at every width that matters.
+- Decision: REJECTED. The shipped choice (SPLIT=64 above 16 rows) is
+  confirmed best at every decode shape at or above the floor. The prefill
+  kernel keeps the prefill dispatch, where the row count is in the
+  thousands and the per-program walk is amortized.
+- Cost of the test: one microbench run, no arm. Recorded because the
+  reasoning ("no scratch must be better") is the kind that looks obviously
+  right and is not.
+- Raw: the `row32`/`row64` columns of
+  `perf/results/2026-09-15/sparse-tc-sm120/bench-tc-decode.log`.
+
+### Item D5, re-test (2026-09-17): the eager fused-path corruption does not reproduce on the placeholder-fixed tree - ATTRIBUTED to the placeholder-draft bug; the graph-only gate stays as the measured configuration
+
+- Why: the closing D5 entry restricted the fused all-reduce + mHC
+  transition to captured decode graphs because eager fused launches (tiny
+  1-4 token prompts beside a decoding request, T = 5..8) left later c8
+  batches producing the prompt-independent "usse" stream for every batch
+  position past the first (6-8 of 8), and the mechanism was never
+  isolated. The placeholder-draft bug ("Correctness: a newcomer's padded
+  tail step ...", fixed the same day) had the same trigger - a newcomer's
+  tail step beside a decoding request - and the same signature, and the D5
+  flag A/B ran before that fix. Nobody had re-run the eager path on the
+  fixed tree.
+- Method: the committed tree (c9c5a7c47, merged with upstream 02fb15fc1)
+  with `_GLM5_MHC_FUSE_EAGER = True` in the working tree, the record with
+  `--spec`, one boot; then the tree exactly as committed (gate on) as the
+  control, one boot. Per boot: a c8-1000-300 pass on the fresh boot,
+  `$S/tiny_probe.py` (four tiny prompts beside a 600-token decode - the
+  eager T = 5..8 steps that fuse under the flag), `$S/tail_probe.py` (A
+  alone, B alone, then B and C during A), a second c8 pass after the eager
+  steps, `$S/fresh_probe.py 8`; every completion scanned for "usseusse" and
+  the "!!!" prefix.
+- Result, flag on: c8 on the fresh boot 0/8 garbage and 0/8 placeholder
+  (975 accepted tokens); tiny prompts 8/8 clean; tail probe clean (A-long
+  matches A-alone token for token, B and C coherent); c8 after the eager
+  steps 0/8 and 0/8 (962 accepted); fresh prompts 0/8. Control (gate on):
+  c8 0/8 and 0/8 (991 accepted), tiny prompts 8/8 clean, tail probe clean.
+- The one difference between the arms is where a batched draw diverges
+  from its alone draw. With the flag on, B-during-A differs from B-alone
+  from its first token ('675.415 |' against '626.415 |'); in the control
+  it matches for the first cells and diverges four tokens later
+  ('1,748.098' against '1,530.414'); two of the four tiny prompts diverge
+  in both arms (tiny2 with the flag on; tiny2 and tiny3 in the control),
+  and B-alone itself draws differently across the two boots after its
+  first cells (same seed, same prompt). These are temperature-1.0 draws
+  over logits that differ at bf16 level between a batched step and an
+  alone step - the fused kernel reduces in a different order than the
+  one-shot all-reduce plus the Triton pair - and the divergence is of the
+  same kind in both arms, not a corruption signature.
+- Reading: the 2026-09-14 corruption is attributed to the placeholder-draft
+  bug, which the fused-eager arm (d10-fuse-spec) carried too - 7 of 8 of
+  its c8 completions opened with "!!!" - and which corrupted a padded
+  newcomer's context on exactly the steps the eager fused launches ran
+  in. Nothing in this probe set distinguishes the eager fused path from
+  the split path beyond bf16-level draw divergence.
+- Decision: ATTRIBUTED, and closed as an open defect. The gate
+  (`_GLM5_MHC_FUSE_EAGER = False`: fusion inside captured decode graphs
+  only) STAYS: it is the configuration every retained arm and the record's
+  validation measured, the eager steps it covers are rare (a newcomer's
+  tail, a tiny prompt beside a decoding request) and worth ~1 us per site,
+  and removing it would be a serving-path change with no full-protocol arm
+  behind it. The code comment says so now.
+- Raw: `perf/results/2026-09-17/d5probe-eager-c8a/`, `d5probe-eager-c8b/`,
+  `d5probe-off-c8/` (bench logs and completions), probe transcripts
+  `perf/results/2026-09-17/d5probe-eager/probes.txt` and
+  `d5probe-off/probes.txt`, serve logs `$S/serve-logs/serve-20260917-024756.log`
+  (flag on) and `serve-20260917-025458.log` (control).
+
+### Final confirmation at the PR head (2026-09-17): the record re-measured at 68aab5d8d after the review rounds - CONFIRMED, at or above the published numbers at every shape
+
+- Why: the published numbers were measured at 48c5c8f93; since then the
+  sparse-TC decode kernel, the mHC token split, the upstream merge
+  (02fb15fc1) and six CodeRabbit rounds landed (the padded-fold guard, the
+  routed-forward cleanup boundary, the binding device checks, the
+  per-device shared-memory opt-in). The PR should state numbers from the
+  tree it ships.
+- Method: `$S/ab2.sh` at HEAD 68aab5d8d, two arms one after the other:
+  the record with `--spec` (the MTP head drafter, schedule
+  [[1,4,3],[5,8,1],[9,16,2]]), then the record plain. Per arm one boot,
+  then two exact-token passes (seeds 42 and 43) over c1/c8/c16 1000/300;
+  every completion scanned for "usseusse" and the "!!!" prefix.
+- Result (tokens/s, exact=True on all twelve runs), pass1 / pass2:
+  speculative c1 328.7 / 255.4, c8 765.6 / 816.4, c16 1063.2 / 1092.4;
+  plain c1 191.4 / 196.5, c8 734.2 / 730.2, c16 1039.6 / 1031.4.
+  Published (48c5c8f93): speculative 270.0 / 766.5 / 1046.7, plain
+  196.6 / 729.5 / 1014.3. Control (voipmonitor r28.1): MTP-3 267.6 / 732.1
+  / 1005.8, plain 166.5 / 687.9 / 966.8. Health 170 s (spec) and 215 s
+  (plain). 0 of 12 completion files carry garbage or a placeholder.
+- Reading: every shape is at or above the published number; the c1
+  speculative spread across passes (255-329 here, 267-290 before) is the
+  known one - a 300-token single stream whose acceptance run decides the
+  figure - so c1 under speculation stays reported as LEVEL with the control
+  (its five-offset 267.6 sits inside the spread), everything else ahead.
+- Decision: CONFIRMED; the PR body carries these as the head's numbers
+  next to the published ones. The round-7 runner change that followed
+  (6313d5fba, the deferred-add flag as a property) was re-smoked the same
+  way, `--spec` c8 only: 757.6 / 738.8, exact, 0 of 2 completion files
+  flagged (`perf/results/2026-09-17/final2-spec-pass{1,2}/`).
+- Raw: `perf/results/2026-09-17/final-spec-pass{1,2}/`,
+  `final-nospec-pass{1,2}/` (bench JSON and completions), driver logs
+  `$S/serve-logs/ab-final-spec.out` and `ab-final-nospec.out`, serve logs
+  `$S/serve-logs/serve-20260917-102812.log` (spec) and
+  `$S/serve-logs/serve-20260917-103238.log` (plain).

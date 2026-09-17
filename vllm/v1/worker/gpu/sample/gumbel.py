@@ -36,6 +36,14 @@ def _use_native_sample_kernels() -> bool:
 
 _GUMBEL_LOGITS_DTYPES = (torch.float32, torch.bfloat16, torch.float16)
 
+# Offset salt keeping a drafter's Gumbel noise disjoint from the target's.
+# Verification is a probability-ratio test, not a Gumbel coupling: a rejected
+# proposal is resampled from the residual under the same (seed, position)
+# key, and a shared noise vector biases that resample (the token the noise
+# favoured is exactly the one the residual excludes). Positions never
+# approach 2**30, so the two streams cannot collide.
+DRAFT_NOISE_SALT = 1 << 30
+
 # Smallest positive value produced by Triton's fp32 `tl.rand`. Used to clamp
 # zero draws before the flipped Gumbel transform below.
 #
@@ -373,10 +381,13 @@ def gumbel_sample(
     output_processed_logits_col: torch.Tensor | None = None,
     use_fp64: bool = False,
     all_greedy: bool | None = None,
+    is_drafting: bool = False,
 ) -> torch.Tensor:
     # Enforce contiguity on non-strided input tensors
     expanded_idx_mapping = expanded_idx_mapping.contiguous()
     pos = pos.contiguous()
+    if is_drafting:
+        pos = pos + DRAFT_NOISE_SALT
     if output_processed_logits_col is not None:
         output_processed_logits_col = output_processed_logits_col.contiguous()
     num_tokens, vocab_size = logits.shape

@@ -33,7 +33,10 @@ from torch import nn
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+)
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.model_executor.layers.fused_moe import (
@@ -56,6 +59,9 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
 )
 import vllm.model_executor.layers.glm5_next_mhc_ops  # noqa: F401  (registers torch.ops.vllm.glm5_mhc_*)
+from vllm.model_executor.layers.glm5_next_mhc_ar import (  # registers the op
+    mhc_allreduce_fusion_enabled,
+)
 from vllm.model_executor.layers.glm5_next_mhc_project import (
     plain_bf16_projection,
     prepare_router_projection,
@@ -99,6 +105,118 @@ from vllm.sequence import IntermediateTensors
 
 logger = init_logger(__name__)
 
+F32_OVERRIDES_ENV = "SLIMSERVE_F32_OVERRIDES"
+
+
+def _load_f32_overrides(model_path: str | None) -> dict[str, torch.Tensor]:
+    """Tensors to substitute for the checkpoint's copies, keyed by HF name.
+
+    Some NVFP4 conversions of GLM-5.3-Flash (RedHatAI's, 2026-08) saved the
+    router bias (``mlp.gate.e_score_correction_bias``), the KDA decay
+    tensors (``A_log``, ``dt_bias``) and the mHC base/scale vectors in BF16
+    although the native checkpoint keeps them in F32 and this model holds
+    them as F32 parameters. ``slimserve.f32_overrides`` rebuilds them from
+    the native checkpoint into ``<model>/f32-overrides.safetensors``; when
+    that file is present it wins over the shard copies. Set
+    ``SLIMSERVE_F32_OVERRIDES=0`` to serve the shard copies for an A/B.
+    """
+    import os
+
+    from slimserve.f32_overrides import OVERRIDES_FILE
+
+    if not model_path or os.environ.get(F32_OVERRIDES_ENV, "1") == "0":
+        return {}
+    path = os.path.join(model_path, OVERRIDES_FILE)
+    if not os.path.isfile(path):
+        return {}
+    from safetensors.torch import load_file
+
+    overrides = load_file(path)
+    bad = [k for k, v in overrides.items() if v.dtype != torch.float32]
+    if bad:
+        raise ValueError(
+            f"{path}: {len(bad)} override tensors are not float32, e.g. {bad[0]}"
+        )
+    logger.info("glm5_next: %d F32 override tensors from %s", len(overrides), path)
+    return overrides
+
+
+def iter_with_overrides(
+    weights: Iterable[tuple[str, torch.Tensor]],
+    overrides: dict[str, torch.Tensor],
+    extras: dict[str, torch.Tensor] | None = None,
+    strict: bool = False,
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """Yield ``weights`` with any name present in ``overrides`` replaced, then
+    the ``extras`` (tensors the checkpoint stream does not carry, such as the
+    block scales of a swapped FP8 weight). ``strict`` turns an override that
+    never appeared into an error: for the FP8 swap-set a missing substitution
+    would let the loader copy a BF16 shard into an FP8 parameter."""
+    if not overrides and not extras:
+        yield from weights
+        return
+    pending = set(overrides)
+    for name, weight in weights:
+        if name in overrides:
+            pending.discard(name)
+            yield name, overrides[name]
+        else:
+            yield name, weight
+    if pending:
+        msg = (
+            f"glm5_next: {len(pending)} override tensors never appeared in the "
+            f"checkpoint stream, e.g. {sorted(pending)[0]}"
+        )
+        if strict:
+            raise ValueError(msg)
+        logger.warning(msg)
+    if extras:
+        yield from extras.items()
+
+
+def _load_fp8_swapset(
+    model_path: str | None,
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    """(weights to substitute, block scales to inject) from the FP8 swap-set
+    ``slimserve.fp8_swapset`` wrote next to the checkpoint; empty when the
+    files are absent or ``SLIMSERVE_FP8_SWAPSET=0``. The quantization config
+    group that makes those modules block-FP8 is added by the model loader
+    from the same manifest, so the two cannot disagree."""
+    import json
+    import os
+
+    from slimserve.fp8_swapset import manifest_path
+
+    path = manifest_path(model_path)
+    if path is None:
+        return {}, {}
+    with open(path) as fh:
+        manifest = json.load(fh)
+    from safetensors.torch import load_file
+
+    # The tensor file shares the manifest's stem, so a sidecar selected by
+    # stem (SLIMSERVE_FP8_SWAPSET=<stem>) reads its own weights.
+    file = os.path.splitext(path)[0] + ".safetensors"
+    tensors = load_file(file)
+    if sorted(tensors) != sorted(manifest["tensors"]):
+        raise ValueError(f"{file}: tensor names do not match the manifest {path}")
+    subs = {k: v for k, v in tensors.items() if k.endswith(".weight")}
+    extras = {k: v for k, v in tensors.items() if k.endswith(".weight_scale")}
+    bad = [k for k, v in subs.items() if v.dtype != torch.float8_e4m3fn]
+    bad += [k for k, v in extras.items() if v.dtype != torch.float32]
+    if bad or len(subs) + len(extras) != len(tensors):
+        raise ValueError(
+            f"{file}: expected float8_e4m3fn weights and float32 weight_scale "
+            f"tensors only, e.g. {(bad or sorted(tensors))[0]}"
+        )
+    logger.info(
+        "glm5_next: FP8 swap-set from %s: %d weights, %d block scales",
+        file,
+        len(subs),
+        len(extras),
+    )
+    return subs, extras
+
 
 class Glm5NextMLAAttention(nn.Module):
     """NoPE MLA for the DeepSeek-sparse-attention layers, sparse through
@@ -111,6 +229,7 @@ class Glm5NextMLAAttention(nn.Module):
         prefix: str = "",
         topk_indices_buffer: torch.Tensor | None = None,
         indexer_workspace: Glm5NextIndexerWorkspace | None = None,
+        reduce_results: bool = True,
     ) -> None:
         super().__init__()
         cache_config = vllm_config.cache_config
@@ -152,9 +271,7 @@ class Glm5NextMLAAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.q_b_proj",
         )
-        self.kv_a_layernorm = RMSNorm(
-            self.kv_lora_rank, eps=config.rms_norm_eps
-        )
+        self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
         self.kv_b_proj = ColumnParallelLinear(
             self.kv_lora_rank,
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
@@ -168,6 +285,7 @@ class Glm5NextMLAAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
+            reduce_results=reduce_results,
         )
 
         assert topk_indices_buffer is not None
@@ -228,6 +346,11 @@ class Glm5NextDecoderLayer(nn.Module):
     checkpoint's ``hc_{attn,ffn}_{fn,base,scale}`` names.
     """
 
+    # Class default so a partially constructed layer (tests/glm5_next/
+    # test_mhc_dispatch.py builds one without __init__) dispatches the
+    # unfused sites; __init__ sets the configured value.
+    _fuse_mhc_allreduce: bool = False
+
     def __init__(
         self,
         config,
@@ -237,29 +360,50 @@ class Glm5NextDecoderLayer(nn.Module):
         indexer_workspace: Glm5NextIndexerWorkspace | None = None,
         mhc_stream_key: str = "",
         enable_router_projection: bool = False,
+        fuse_mhc_allreduce: bool = False,
     ) -> None:
         super().__init__()
         quant_config = vllm_config.quant_config
         self.layer_idx = int(prefix.rsplit(".", 1)[1])
         self.hidden_size = config.hidden_size
         self.rms_norm_eps = config.rms_norm_eps
-        self._fuse_mhc_norm = (
-            current_platform.is_cuda()
-            and current_platform.is_device_capability((8, 0))
+        # The RMSNorm rides inside the mHC transition's finalize (the split
+        # Triton finalize and the cooperative kernel both carry it) on the
+        # measured CUDA parts: sm_80 and sm_120 (Item D4, +1.5 % c1).
+        self._fuse_mhc_norm = current_platform.is_cuda() and (
+            current_platform.is_device_capability((8, 0))
+            or current_platform.is_device_capability_family(120)
         )
-        self.is_linear = (
-            config.layer_types[self.layer_idx] == "linear_attention"
-        )
+        self.is_linear = config.layer_types[self.layer_idx] == "linear_attention"
+        # Each transition site reduces its producer's TP partial inside the
+        # transition launch (glm5_next_mhc_ar); the producers then keep
+        # their partials instead of all-reducing them. The model evaluates
+        # the option once and hands it to every layer.
+        self._fuse_mhc_allreduce = fuse_mhc_allreduce
+        reduce_results = not fuse_mhc_allreduce
 
         if self.is_linear:
+            from slimserve.fp8_swapset import beta_block_rows
+
             self.self_attn = KimiGatedDeltaNetAttention(
-                config, vllm_config, prefix=f"{prefix}.self_attn", fuse_gate_a=True
+                config,
+                vllm_config,
+                prefix=f"{prefix}.self_attn",
+                fuse_gate_a=True,
+                beta_block_rows=beta_block_rows(
+                    vllm_config.model_config.model,
+                    f"{prefix}.self_attn.in_proj_qkvgfab",
+                ),
+                reduce_results=reduce_results,
             )
         else:
             self.self_attn = Glm5NextMLAAttention(
-                config, vllm_config, prefix=f"{prefix}.self_attn",
+                config,
+                vllm_config,
+                prefix=f"{prefix}.self_attn",
                 topk_indices_buffer=topk_indices_buffer,
                 indexer_workspace=indexer_workspace,
+                reduce_results=reduce_results,
             )
 
         if config.mlp_layer_types[self.layer_idx] == "sparse":
@@ -267,21 +411,26 @@ class Glm5NextDecoderLayer(nn.Module):
                 config=config,
                 parallel_config=vllm_config.parallel_config,
                 quant_config=quant_config,
+                reduce_results=reduce_results,
                 prefix=f"{prefix}.mlp",
             )
+            if self._fuse_mhc_allreduce:
+                # The deferred all-reduce request must have been honored,
+                # otherwise the fused transition double-reduces.
+                assert self.mlp.experts.moe_config.skip_final_all_reduce
         else:
             self.mlp = DeepseekV2MLP(
                 hidden_size=self.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
+                reduce_results=reduce_results,
                 prefix=f"{prefix}.mlp",
+                swiglu_limit=getattr(config, "swiglu_limit", None),
             )
 
         self.input_layernorm = RMSNorm(self.hidden_size, config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
-            self.hidden_size, config.rms_norm_eps
-        )
+        self.post_attention_layernorm = RMSNorm(self.hidden_size, config.rms_norm_eps)
 
         self.hc_mult = config.hc_mult
         self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
@@ -303,34 +452,63 @@ class Glm5NextDecoderLayer(nn.Module):
         self.hc_ffn_scale = _p(3)
 
         self._mhc_stream_key = mhc_stream_key
+        # The projection overlaps route a site through the plain transition
+        # (glm5_mhc_project_runtime wraps glm5_mhc_fused_post_pre) with a
+        # reduced x; under the all-reduce fusion the site's x is a TP
+        # partial that only glm5_mhc_ar_transition reduces, so both stay
+        # off there.
         self._overlap_kda = (
-            bool(mhc_stream_key) and self._fuse_mhc_norm and self.is_linear
+            bool(mhc_stream_key)
+            and self._fuse_mhc_norm
+            and not self._fuse_mhc_allreduce
+            and self.is_linear
             and plain_bf16_projection(self.self_attn.in_proj_qkvgfab)
         )
         self._overlap_router = (
-            bool(mhc_stream_key) and self._fuse_mhc_norm
+            bool(mhc_stream_key)
+            and self._fuse_mhc_norm
+            and not self._fuse_mhc_allreduce
             and enable_router_projection
             and isinstance(self.mlp, DeepseekV2MoE)
             and prepare_router_projection(self.mlp)
         )
 
-
     def _site_pre(self, residual, fn, scale, base, norm_weight):
         post_mix, res_mix, x = torch.ops.vllm.glm5_mhc_pre(
-            residual, fn, scale, base, self.rms_norm_eps, self.hc_eps,
-            self.hc_post_alpha, self.hc_sinkhorn_iters,
-            norm_weight if self._fuse_mhc_norm else None, self.rms_norm_eps,
+            residual,
+            fn,
+            scale,
+            base,
+            self.rms_norm_eps,
+            self.hc_eps,
+            self.hc_post_alpha,
+            self.hc_sinkhorn_iters,
+            norm_weight if self._fuse_mhc_norm else None,
+            self.rms_norm_eps,
         )
         return residual, post_mix, res_mix, x
 
-    def _site_fused(
-        self, x, residual, post_mix, res_mix, fn, scale, base, norm_weight
-    ):
-        return torch.ops.vllm.glm5_mhc_fused_post_pre(
-            x, residual, post_mix, res_mix, fn, scale, base,
-            self.rms_norm_eps, self.hc_eps, self.hc_post_alpha,
+    def _site_fused(self, x, residual, post_mix, res_mix, fn, scale, base, norm_weight):
+        # With the all-reduce fusion x is the producer's TP partial.
+        transition = (
+            torch.ops.vllm.glm5_mhc_ar_transition
+            if self._fuse_mhc_allreduce
+            else torch.ops.vllm.glm5_mhc_fused_post_pre
+        )
+        return transition(
+            x,
+            residual,
+            post_mix,
+            res_mix,
+            fn,
+            scale,
+            base,
+            self.rms_norm_eps,
+            self.hc_eps,
+            self.hc_post_alpha,
             self.hc_sinkhorn_iters,
-            norm_weight if self._fuse_mhc_norm else None, self.rms_norm_eps,
+            norm_weight if self._fuse_mhc_norm else None,
+            self.rms_norm_eps,
         )
 
     def forward(
@@ -345,22 +523,42 @@ class Glm5NextDecoderLayer(nn.Module):
         if residual is None:
             # First layer: x is the expanded [T, hc_mult, D] stream tensor.
             residual, post_mix, res_mix, x = self._site_pre(
-                x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base,
+                x,
+                self.hc_attn_fn,
+                self.hc_attn_scale,
+                self.hc_attn_base,
                 self.input_layernorm.weight,
             )
         elif self._overlap_kda:
-            residual, post_mix, res_mix, x, projected = torch.ops.vllm.glm5_mhc_project_runtime(
-                x, residual, post_mix, res_mix,
-                self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base,
-                self.input_layernorm.weight, self.self_attn.in_proj_qkvgfab.weight,
-                self._mhc_stream_key, False,
-                self.rms_norm_eps, self.hc_eps, self.hc_post_alpha,
-                self.hc_sinkhorn_iters, self.rms_norm_eps,
+            residual, post_mix, res_mix, x, projected = (
+                torch.ops.vllm.glm5_mhc_project_runtime(
+                    x,
+                    residual,
+                    post_mix,
+                    res_mix,
+                    self.hc_attn_fn,
+                    self.hc_attn_scale,
+                    self.hc_attn_base,
+                    self.input_layernorm.weight,
+                    self.self_attn.in_proj_qkvgfab.weight,
+                    self._mhc_stream_key,
+                    False,
+                    self.rms_norm_eps,
+                    self.hc_eps,
+                    self.hc_post_alpha,
+                    self.hc_sinkhorn_iters,
+                    self.rms_norm_eps,
+                )
             )
         else:
             residual, post_mix, res_mix, x = self._site_fused(
-                x, residual, post_mix, res_mix,
-                self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base,
+                x,
+                residual,
+                post_mix,
+                res_mix,
+                self.hc_attn_fn,
+                self.hc_attn_scale,
+                self.hc_attn_base,
                 self.input_layernorm.weight,
             )
         # Only the measured SM80 path fuses norm inside the mHC transition.
@@ -375,21 +573,37 @@ class Glm5NextDecoderLayer(nn.Module):
         else:
             attn_out = self.self_attn(positions, x)
 
-
         router_logits = None
         if self._overlap_router:
-            residual, post_mix, res_mix, x, router_logits = torch.ops.vllm.glm5_mhc_project_runtime(
-                attn_out, residual, post_mix, res_mix,
-                self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base,
-                self.post_attention_layernorm.weight, self.mlp.gate.weight,
-                self._mhc_stream_key, True,
-                self.rms_norm_eps, self.hc_eps, self.hc_post_alpha,
-                self.hc_sinkhorn_iters, self.rms_norm_eps,
+            residual, post_mix, res_mix, x, router_logits = (
+                torch.ops.vllm.glm5_mhc_project_runtime(
+                    attn_out,
+                    residual,
+                    post_mix,
+                    res_mix,
+                    self.hc_ffn_fn,
+                    self.hc_ffn_scale,
+                    self.hc_ffn_base,
+                    self.post_attention_layernorm.weight,
+                    self.mlp.gate.weight,
+                    self._mhc_stream_key,
+                    True,
+                    self.rms_norm_eps,
+                    self.hc_eps,
+                    self.hc_post_alpha,
+                    self.hc_sinkhorn_iters,
+                    self.rms_norm_eps,
+                )
             )
         else:
             residual, post_mix, res_mix, x = self._site_fused(
-                attn_out, residual, post_mix, res_mix,
-                self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base,
+                attn_out,
+                residual,
+                post_mix,
+                res_mix,
+                self.hc_ffn_fn,
+                self.hc_ffn_scale,
+                self.hc_ffn_base,
                 self.post_attention_layernorm.weight,
             )
         if not self._fuse_mhc_norm:
@@ -440,25 +654,37 @@ class Glm5NextTextModel(nn.Module):
             vllm_config.additional_config,
             sm80=current_platform.is_cuda()
             and current_platform.is_device_capability((8, 0)),
-            hidden_size=config.hidden_size, hc_mult=config.hc_mult,
+            hidden_size=config.hidden_size,
+            hc_mult=config.hc_mult,
             dtype=vllm_config.model_config.dtype,
             lora=vllm_config.lora_config is not None,
         ):
             self.mhc_projection_stream = torch.cuda.Stream()
             mhc_stream_key = maybe_prefix(prefix, "mhc_projection_stream")
             register_projection_stream(
-                vllm_config.compilation_config, mhc_stream_key,
+                vllm_config.compilation_config,
+                mhc_stream_key,
                 self.mhc_projection_stream,
             )
-        enable_router_projection = router_projection_enabled(vllm_config.additional_config)
+        enable_router_projection = router_projection_enabled(
+            vllm_config.additional_config
+        )
+        # With the fused transitions every layer output is a TP partial; the
+        # taps and the final head read it reduced.
+        self._fuse_mhc_allreduce = mhc_allreduce_fusion_enabled(
+            vllm_config.additional_config
+        )
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: Glm5NextDecoderLayer(
-                config, vllm_config, prefix=prefix,
+                config,
+                vllm_config,
+                prefix=prefix,
                 topk_indices_buffer=self.topk_indices_buffer,
                 indexer_workspace=self.indexer_workspace,
                 mhc_stream_key=mhc_stream_key,
                 enable_router_projection=enable_router_projection,
+                fuse_mhc_allreduce=self._fuse_mhc_allreduce,
             ),
             prefix=maybe_prefix(prefix, "layers"),
         )
@@ -470,11 +696,10 @@ class Glm5NextTextModel(nn.Module):
                 sum(getattr(layer, "_overlap_router", False) for layer in self.layers),
             )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.make_empty_intermediate_tensors = (
-            make_empty_intermediate_tensors_factory(
-                ["hidden_states"], config.hidden_size
-            )
+        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
+            ["hidden_states"], config.hidden_size
         )
+        self._decode_plans_ready = False
         # EAGLE-3 / DFlash convention: a value v in this tuple captures the
         # completed output of layer v - 1 (set_eagle3_aux_hidden_state_layers
         # passes the drafter's target_layer_ids + 1).
@@ -482,6 +707,23 @@ class Glm5NextTextModel(nn.Module):
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
+
+    def prepare_decode_plans(self) -> None:
+        """Post-load, pre-compile setup that needs the processed weights:
+        the pooled indexer's packed projection. Called by the top-level
+        forward (outside the compiled region)."""
+        if self._decode_plans_ready:
+            return
+        self._decode_plans_ready = True
+        for i in range(self.start_layer, self.end_layer):
+            indexer = getattr(self.layers[i].self_attn, "indexer", None)
+            if indexer is not None and hasattr(indexer, "build_packed_projection"):
+                indexer.build_packed_projection()
+
+    def _reduced(self, x: torch.Tensor) -> torch.Tensor:
+        if self._fuse_mhc_allreduce:
+            return tensor_model_parallel_all_reduce(x)
+        return x
 
     def forward(
         self,
@@ -511,10 +753,14 @@ class Glm5NextTextModel(nn.Module):
                 # transition would consume); the drafters were trained on
                 # its hc_contract, the mean over the streams (SGLang PR
                 # 36708, sglang.kernels.ops.layernorm.mhc.hc_contract).
-                taps = torch.ops.vllm.glm5_mhc_post(x, residual, post_mix, res_mix)
+                taps = torch.ops.vllm.glm5_mhc_post(
+                    self._reduced(x), residual, post_mix, res_mix
+                )
                 aux_hidden_states.append(taps.mean(dim=1))
         assert layer is not None
-        streams = torch.ops.vllm.glm5_mhc_post(x, residual, post_mix, res_mix)
+        streams = torch.ops.vllm.glm5_mhc_post(
+            self._reduced(x), residual, post_mix, res_mix
+        )
         # HyperHead: unweighted mean over the streams (reference; DSV4's
         # weighted head does not apply).
         hidden_states = streams.mean(dim=1)
@@ -524,11 +770,15 @@ class Glm5NextTextModel(nn.Module):
         return hidden_states
 
 
-
-
 # EAGLE-3 / DFlash auxiliary hidden-state taps (V2 speculators call
 # set_eagle3_aux_hidden_state_layers on the top-level model).
-_DFLASH_DEFAULT_TAPS = (6, 15, 25, 34, 43)  # incoai/GLM-5.3-Flash-DFlash2 target_layer_ids + 1
+_DFLASH_DEFAULT_TAPS = (
+    6,
+    15,
+    25,
+    34,
+    43,
+)  # incoai/GLM-5.3-Flash-DFlash2 target_layer_ids + 1
 
 
 class _Glm5NextAuxTaps:
@@ -546,6 +796,7 @@ class _Glm5NextAuxTaps:
 
     def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
         return _DFLASH_DEFAULT_TAPS
+
 
 class Glm5NextForCausalLM(
     nn.Module, _Glm5NextAuxTaps, HasInnerState, IsHybrid, SupportsPP, SupportsEagle3
@@ -586,6 +837,7 @@ class Glm5NextForCausalLM(
         super().__init__()
         config = vllm_config.model_config.hf_config.get_text_config()
         self.config = config
+        self._model_path = vllm_config.model_config.model
         self.model = Glm5NextTextModel(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
@@ -627,9 +879,7 @@ class Glm5NextForCausalLM(
             tp_size,
             hf_config.linear_attn_config["num_heads"],
             hf_config.linear_attn_config["head_dim"],
-            conv_kernel_size=hf_config.linear_attn_config[
-                "short_conv_kernel_size"
-            ],
+            conv_kernel_size=hf_config.linear_attn_config["short_conv_kernel_size"],
             num_spec=num_spec,
         )
 
@@ -646,16 +896,13 @@ class Glm5NextForCausalLM(
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
-        return self.model(
-            input_ids, positions, intermediate_tensors, inputs_embeds
-        )
+        self.model.prepare_decode_plans()
+        return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.logits_processor(self.lm_head, hidden_states)
 
-    def load_weights(
-        self, weights: Iterable[tuple[str, torch.Tensor]]
-    ) -> set[str]:
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         num_text_layers = self.config.num_hidden_layers
         expert_params_mapping = fused_moe_make_expert_params_mapping(
             self,
@@ -666,6 +913,10 @@ class Glm5NextForCausalLM(
         )
         params_dict = dict(self.named_parameters())
         loaded: set[str] = set()
+        model_path = self._model_path
+        weights = iter_with_overrides(weights, _load_f32_overrides(model_path))
+        fp8_weights, fp8_scales = _load_fp8_swapset(model_path)
+        weights = iter_with_overrides(weights, fp8_weights, fp8_scales, strict=True)
         for name, weight in weights:
             # Vision tower and MTP layer: later phases.
             if name.startswith("model.visual."):
@@ -674,7 +925,7 @@ class Glm5NextForCausalLM(
                 continue
             for pref, new in self.hf_to_vllm_prefix.items():
                 if name.startswith(pref):
-                    name = new + name[len(pref):]
+                    name = new + name[len(pref) :]
                     break
             else:
                 continue
@@ -684,9 +935,7 @@ class Glm5NextForCausalLM(
             if not is_expert:
                 for target, ckpt_name, shard_id in self.stacked_params_mapping:
                     token = f".{ckpt_name}."
-                    if token not in name and not name.endswith(
-                        f".{ckpt_name}"
-                    ):
+                    if token not in name and not name.endswith(f".{ckpt_name}"):
                         continue
                     tgt = name.replace(ckpt_name, target)
                     if tgt not in params_dict:
@@ -727,9 +976,7 @@ class Glm5NextForCausalLM(
                 logger.warning_once("glm5_next: unmatched weight %s", name)
                 continue
             param = params_dict[name]
-            loader = getattr(
-                param, "weight_loader", None
-            )
+            loader = getattr(param, "weight_loader", None)
             if loader is not None:
                 loader(param, weight)
             else:
@@ -874,7 +1121,9 @@ class Glm5NextDummyInputsBuilder(BaseDummyInputsBuilder[Glm5NextProcessingInfo])
         w, h = self.info.get_image_size_with_most_features()
         return {
             "image": self._get_dummy_images(
-                width=w, height=h, num_images=num_images,
+                width=w,
+                height=h,
+                num_images=num_images,
                 overrides=mm_options.get("image"),
             )
         }
@@ -917,8 +1166,13 @@ class Glm5NextMultiModalProcessor(BaseMultiModalProcessor[Glm5NextProcessingInfo
     dummy_inputs=Glm5NextDummyInputsBuilder,
 )
 class Glm5NextForConditionalGeneration(
-    nn.Module, _Glm5NextAuxTaps, SupportsMultiModal, SupportsPP, HasInnerState,
-    IsHybrid, SupportsEagle3,
+    nn.Module,
+    _Glm5NextAuxTaps,
+    SupportsMultiModal,
+    SupportsPP,
+    HasInnerState,
+    IsHybrid,
+    SupportsEagle3,
 ):
     """GLM-5.3-Flash: vision tower + hybrid text backbone."""
 
@@ -1017,9 +1271,9 @@ class Glm5NextForConditionalGeneration(
     ) -> torch.Tensor | IntermediateTensors:
         if intermediate_tensors is not None:
             inputs_embeds = None
-        return self.language_model.model(
-            input_ids, positions, intermediate_tensors, inputs_embeds
-        )
+        text_model = self.language_model.model
+        text_model.prepare_decode_plans()
+        return text_model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
@@ -1036,7 +1290,7 @@ class Glm5NextForConditionalGeneration(
             if not name.startswith("model.visual."):
                 text_weights.append((name, weight))
                 continue
-            vname = name[len("model.visual."):]
+            vname = name[len("model.visual.") :]
             # merger: gate/up/down live on the merger's mlp submodule
             for leaf in ("gate_proj", "up_proj", "down_proj"):
                 vname = vname.replace(f"merger.{leaf}", f"merger.mlp.{leaf}")

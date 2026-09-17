@@ -50,6 +50,7 @@ from vllm.distributed.weight_transfer import (
 )
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
+from vllm.model_executor.warmup.b12x_warmup import b12x_warmup
 from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
 from vllm.multimodal.gpu_ipc_memory import reserve_mm_ipc_gpu_memory
 from vllm.platforms import current_platform
@@ -558,6 +559,11 @@ class Worker(WorkerBase):
             and current_platform.is_cuda_alike()
             and self.vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
         ):
+            # The trial capture must not be the first launch of a JIT kernel.
+            b12x_warmup(
+                self,
+                self.vllm_config.compilation_config.cudagraph_capture_sizes or [],
+            )
             bootstamp(f"worker[{self.rank}]: profile_cudagraph_memory start")
             cudagraph_memory_estimate = self.model_runner.profile_cudagraph_memory()
             bootstamp(f"worker[{self.rank}]: profile_cudagraph_memory done")
