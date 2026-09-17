@@ -7,13 +7,14 @@ import math
 import warnings
 from dataclasses import dataclass
 from json import JSONDecodeError, JSONDecoder
-from typing import Any, TypeAlias
+from typing import Any, Literal, TypeAlias
 
 import partial_json_parser
 from openai.types.responses import (
     CustomTool,
     FunctionTool,
     NamespaceTool,
+    ToolChoiceAllowed,
     ToolChoiceCustom,
     ToolChoiceFunction,
 )
@@ -39,6 +40,7 @@ logger = init_logger(__name__)
 NamedToolChoice: TypeAlias = (
     ToolChoiceFunction | ToolChoiceCustom | ChatCompletionNamedToolChoiceParam
 )
+ToolChoiceMode: TypeAlias = Literal["none", "auto", "required"]
 
 
 def safe_literal_eval(text: str):
@@ -226,6 +228,45 @@ def named_tool_choice_name(tool_choice: object) -> str | None:
     return None
 
 
+def tool_choice_mode(tool_choice: object) -> ToolChoiceMode | None:
+    """Return the effective mode for literal and Responses allowed choices.
+
+    ``ToolChoiceAllowed`` wraps the same ``auto``/``required`` modes used by
+    plain tool choices.  Keeping this normalization here prevents individual
+    parser paths from accidentally treating an allowed-tools request as an
+    unrelated named choice or as tool calling being disabled.
+    """
+    if tool_choice in ("none", "auto", "required"):
+        return tool_choice  # type: ignore[return-value]
+    if isinstance(tool_choice, ToolChoiceAllowed):
+        return tool_choice.mode
+    return None
+
+
+def allowed_tool_choice_names(tool_choice: object) -> frozenset[str] | None:
+    """Return named tools permitted by a Responses ``allowed_tools`` choice.
+
+    ``None`` means the request is not an allowed-tools choice.  An empty set is
+    intentionally distinct: it means the choice contains no named
+    function/custom tools (it may contain only built-in tool references).
+    """
+    if not isinstance(tool_choice, ToolChoiceAllowed):
+        return None
+    return frozenset(
+        name
+        for tool in tool_choice.tools
+        if isinstance(tool, dict)
+        and tool.get("type") in ("function", "custom")
+        and isinstance((name := tool.get("name")), str)
+    )
+
+
+def tool_name_allowed(tool_choice: object, tool_name: str) -> bool:
+    """Whether a generated named call is permitted by ``tool_choice``."""
+    allowed_names = allowed_tool_choice_names(tool_choice)
+    return allowed_names is None or tool_name in allowed_names
+
+
 def iter_response_function_tool_dicts(
     tools: list[ResponsesTool],
 ) -> list[dict[str, Any]]:
@@ -381,6 +422,7 @@ def _get_tool_schema_defs(
 
 def _get_json_schema_from_tools(
     tools: list[Tool],
+    allowed_names: frozenset[str] | None = None,
 ) -> dict:
     fn_tool_schemas: list[dict[str, Any]] = []
     fn_tools: list[Tool] = []
@@ -389,10 +431,16 @@ def _get_json_schema_from_tools(
             fn_tool_schemas.extend(
                 _get_tool_schema_from_name_and_params(name, params)
                 for name, params in iter_response_function_tool_info(tool)
+                if allowed_names is None or name in allowed_names
             )
-            if isinstance(tool, FunctionTool):
+            if isinstance(tool, FunctionTool) and (
+                allowed_names is None or tool.name in allowed_names
+            ):
                 fn_tools.append(tool)
         elif _is_function_tool(tool):
+            name, _ = _extract_tool_info(tool)
+            if allowed_names is not None and name not in allowed_names:
+                continue
             fn_tool_schemas.append(_get_tool_schema_from_tool(tool))
             fn_tools.append(tool)
     json_schema = {
@@ -410,11 +458,12 @@ def _get_json_schema_from_tools(
 
 
 def get_json_schema_from_tools(
-    tool_choice: str | NamedToolChoice,
+    tool_choice: object,
     tools: list[Tool] | None,
 ) -> str | dict | None:
+    choice_mode = tool_choice_mode(tool_choice)
     # tool_choice: "none"
-    if tool_choice in ("none", None) or tools is None:
+    if choice_mode == "none" or tool_choice is None or tools is None:
         return None
     # tool_choice: Forced Function (Responses)
     if (not isinstance(tool_choice, str)) and isinstance(
@@ -450,8 +499,11 @@ def get_json_schema_from_tools(
             raise ValueError(f"Tool '{tool_name}' has not been passed in `tools`.")
         return chat_tool_map[tool_name].function.parameters
     # tool_choice: "required"
-    if tool_choice == "required":
-        return _get_json_schema_from_tools(tools)
+    if choice_mode == "required":
+        return _get_json_schema_from_tools(
+            tools,
+            allowed_names=allowed_tool_choice_names(tool_choice),
+        )
     # tool_choice: "auto"
     return None
 
