@@ -29656,7 +29656,10 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   figure - so c1 under speculation stays reported as LEVEL with the control
   (its five-offset 267.6 sits inside the spread), everything else ahead.
 - Decision: CONFIRMED; the PR body carries these as the head's numbers
-  next to the published ones.
+  next to the published ones. The round-7 runner change that followed
+  (6313d5fba, the deferred-add flag as a property) was re-smoked the same
+  way, `--spec` c8 only: 757.6 / 738.8, exact, 0 of 2 completion files
+  flagged (`perf/results/2026-09-17/final2-spec-pass{1,2}/`).
 - Raw: `perf/results/2026-09-17/final-spec-pass{1,2}/`,
   `final-nospec-pass{1,2}/` (bench JSON and completions), driver logs
   `$S/serve-logs/ab-final-spec.out` and `ab-final-nospec.out`, serve logs
