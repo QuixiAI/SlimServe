@@ -386,15 +386,14 @@ class CustomAllreduce:
     # block, the Triton partials kernel spreads them over the whole GPU.
     _GLM5_MHC_FUSE_TOKENS = 8
     # Serving fuses inside captured decode graphs only. Eager fused launches
-    # (a newcomer's tail or a tiny prompt beside a decoding request) left the
-    # engine producing prompt-independent output on every later batched step
-    # for batch positions past the first (2026-09-14, c8 7 of 8 corrupted
-    # after such steps, none after graph replays; the parity test and
-    # memcheck are clean). The eager ingredients are the staging-buffer copy,
-    # the per-call workspaces and the side-stream sinkhorn; the mechanism is
-    # not isolated, so eager steps take the split path (~1 us more per site
-    # on the rare steps that are not graph replays). Tests set this True to
-    # exercise the kernel eagerly.
+    # (a newcomer's tail or a tiny prompt beside a decoding request) were
+    # seen on 2026-09-14 beside a corruption that the placeholder-draft fix
+    # of the same day turned out to own (same trigger, same signature); the
+    # eager path re-probed clean on the fixed tree (2026-09-17, notebook
+    # "Item D5, re-test"). The gate stays because it is the configuration
+    # every retained arm measured, and the eager steps it covers are rare
+    # (~1 us more per site on them). Tests set this True to exercise the
+    # kernel eagerly.
     _GLM5_MHC_FUSE_EAGER = False
 
     def should_fuse_glm5_mhc(self, inp: torch.Tensor, residual: torch.Tensor) -> bool:

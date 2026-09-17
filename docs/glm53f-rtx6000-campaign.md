@@ -1106,8 +1106,9 @@ draft against our Marlin W4A16's 0.690, level inside the probe's spread and
 12 % slower (notebook, "Acceptance audit, part 4"), so what is left is the
 latent cache format (its per-token-scaled fp8_ds_mla against our BF16
 latents) or the attention path around it, and every point of acceptance is
-worth ~1.5 % at c1; the ~1 ms spec-mode overhead on a k=0 decode step (Item D11) and the
-eager fused-path corruption (Item D5); then the QuixiCore-CUDA port of the
+worth ~1.5 % at c1; the ~1 ms spec-mode overhead on a k=0 decode step (Item D11) - the
+eager fused-path corruption (Item D5) was re-probed clean on 2026-09-17 and attributed to the
+placeholder-draft bug (notebook "Item D5, re-test"); then the QuixiCore-CUDA port of the
 retained kernels (decode GEMMs, route+align, moe_sum_add, topk_sample, the
 rows kernel, the fused all-reduce transition), a 32-row-Q sm_120 variant of
 the fp8 sparse prefill kernel with a re-measure of FP8 main KV, the host +

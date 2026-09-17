@@ -35,9 +35,10 @@ PR #29 through review (merged with upstream main 02fb15fc1 on 2026-09-17);
 then, per campaign doc section 13, the decode items the roofline audit left
 (the mHC site cost at 16..48 rows, the drafter's bf16 projections, the
 vocabulary all-gather - each worth 1-2 %), the unattributed 0.03-per-draft
-acceptance gap, and a re-test of the eager fused all-reduce path now that
-the placeholder-draft bug is fixed. NOT the native sm_120 NVFP4 expert
-kernel: the expert GEMM already reads at 96 % of the card's bandwidth.
+acceptance gap. The eager fused all-reduce path re-probed clean on
+2026-09-17 (the D5 corruption was the placeholder-draft bug; the graph-only
+gate stays as the measured configuration). NOT the native sm_120 NVFP4
+expert kernel: the expert GEMM already reads at 96 % of the card's bandwidth.
 
 <!--
 The campaign handoffs in this file cover different

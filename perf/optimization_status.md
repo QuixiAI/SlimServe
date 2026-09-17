@@ -29566,3 +29566,60 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   right and is not.
 - Raw: the `row32`/`row64` columns of
   `perf/results/2026-09-15/sparse-tc-sm120/bench-tc-decode.log`.
+
+### Item D5, re-test (2026-09-17): the eager fused-path corruption does not reproduce on the placeholder-fixed tree - ATTRIBUTED to the placeholder-draft bug; the graph-only gate stays as the measured configuration
+
+- Why: the closing D5 entry restricted the fused all-reduce + mHC
+  transition to captured decode graphs because eager fused launches (tiny
+  1-4 token prompts beside a decoding request, T = 5..8) left later c8
+  batches producing the prompt-independent "usse" stream for every batch
+  position past the first (6-8 of 8), and the mechanism was never
+  isolated. The placeholder-draft bug ("Correctness: a newcomer's padded
+  tail step ...", fixed the same day) had the same trigger - a newcomer's
+  tail step beside a decoding request - and the same signature, and the D5
+  flag A/B ran before that fix. Nobody had re-run the eager path on the
+  fixed tree.
+- Method: the committed tree (c9c5a7c47, merged with upstream 02fb15fc1)
+  with `_GLM5_MHC_FUSE_EAGER = True` in the working tree, the record with
+  `--spec`, one boot; then the tree exactly as committed (gate on) as the
+  control, one boot. Per boot: a c8-1000-300 pass on the fresh boot,
+  `$S/tiny_probe.py` (four tiny prompts beside a 600-token decode - the
+  eager T = 5..8 steps that fuse under the flag), `$S/tail_probe.py` (A
+  alone, B alone, then B and C during A), a second c8 pass after the eager
+  steps, `$S/fresh_probe.py 8`; every completion scanned for "usseusse" and
+  the "!!!" prefix.
+- Result, flag on: c8 on the fresh boot 0/8 garbage and 0/8 placeholder
+  (975 accepted tokens); tiny prompts 8/8 clean; tail probe clean (A-long
+  matches A-alone token for token, B and C coherent); c8 after the eager
+  steps 0/8 and 0/8 (962 accepted); fresh prompts 0/8. Control (gate on):
+  c8 0/8 and 0/8 (991 accepted), tiny prompts 8/8 clean, tail probe clean.
+- The one difference between the arms is where a batched draw diverges
+  from its alone draw. With the flag on, B-during-A differs from B-alone
+  from its first token ('675.415 |' against '626.415 |'); in the control
+  it matches for the first cells and diverges four tokens later
+  ('1,748.098' against '1,530.414'); two of the four tiny prompts diverge
+  in both arms (tiny2 with the flag on; tiny2 and tiny3 in the control),
+  and B-alone itself draws differently across the two boots after its
+  first cells (same seed, same prompt). These are temperature-1.0 draws
+  over logits that differ at bf16 level between a batched step and an
+  alone step - the fused kernel reduces in a different order than the
+  one-shot all-reduce plus the Triton pair - and the divergence is of the
+  same kind in both arms, not a corruption signature.
+- Reading: the 2026-09-14 corruption is attributed to the placeholder-draft
+  bug, which the fused-eager arm (d10-fuse-spec) carried too - 7 of 8 of
+  its c8 completions opened with "!!!" - and which corrupted a padded
+  newcomer's context on exactly the steps the eager fused launches ran
+  in. Nothing in this probe set distinguishes the eager fused path from
+  the split path beyond bf16-level draw divergence.
+- Decision: ATTRIBUTED, and closed as an open defect. The gate
+  (`_GLM5_MHC_FUSE_EAGER = False`: fusion inside captured decode graphs
+  only) STAYS: it is the configuration every retained arm and the record's
+  validation measured, the eager steps it covers are rare (a newcomer's
+  tail, a tiny prompt beside a decoding request) and worth ~1 us per site,
+  and removing it would be a serving-path change with no full-protocol arm
+  behind it. The code comment says so now.
+- Raw: `perf/results/2026-09-17/d5probe-eager-c8a/`, `d5probe-eager-c8b/`,
+  `d5probe-off-c8/` (bench logs and completions), probe transcripts
+  `perf/results/2026-09-17/d5probe-eager/probes.txt` and
+  `d5probe-off/probes.txt`, serve logs `$S/serve-logs/serve-20260917-024756.log`
+  (flag on) and `serve-20260917-025458.log` (control).
