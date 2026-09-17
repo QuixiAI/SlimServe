@@ -131,3 +131,30 @@ def test_a_router_failure_after_the_deferred_shared_run_discards_its_output():
         runner._apply_quant_method(x, torch.zeros(2, 8), x, fold_shared=True)
     assert calls == ["discard"]
     assert combine_shared.consume(stale_ids) is None
+
+
+def test_a_monolithic_forward_that_raises_discards_the_shared_output():
+    # Without a fold the NO_OVERLAP order fills the shared slot before the
+    # routed forward; a monolithic kernel that raises must drop it too.
+    runner = _runner_shell()
+    calls: list[str] = []
+
+    class Shared:
+        def __call__(self, inp, order, pq):
+            calls.append(f"shared:{order.name}")
+
+        def discard(self):
+            calls.append("discard")
+
+    runner._shared_experts = Shared()
+
+    def boom(**kwargs):
+        raise RuntimeError("monolithic failed")
+
+    runner.routed_experts = SimpleNamespace(
+        quant_method=SimpleNamespace(is_monolithic=True), forward_monolithic=boom
+    )
+    x = torch.zeros(2, 4)
+    with pytest.raises(RuntimeError, match="monolithic failed"):
+        runner._apply_quant_method(x, torch.zeros(2, 8), x)
+    assert calls == ["shared:NO_OVERLAP", "discard"]

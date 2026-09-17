@@ -680,20 +680,20 @@ class MoERunner(MoERunnerInterface):
                 shared_experts_input, SharedExpertsOrder.NO_OVERLAP, prequant_input
             )
 
+        # The shared output may already be filled above (deferred, or the
+        # NO_OVERLAP order), so from here on anything that raises must drop
+        # it, or the next batch trips over the stale slot.
         entry: combine_shared.SharedOutput | None = None
-        if self.routed_experts.quant_method.is_monolithic:
-            # Monolithic kernels: pass router_logits to routed_experts
-            fused_out = self.routed_experts.forward_monolithic(
-                x=hidden_states,
-                router_logits=router_logits,
-                input_ids=input_ids,
-            )
-        else:
-            # Modular kernels: select experts first, then call routed_experts.
-            # The shared output was filled above (deferred or not), so from
-            # here on anything that raises must drop it, or the next batch
-            # trips over the stale slot.
-            try:
+        try:
+            if self.routed_experts.quant_method.is_monolithic:
+                # Monolithic kernels: pass router_logits to routed_experts
+                fused_out = self.routed_experts.forward_monolithic(
+                    x=hidden_states,
+                    router_logits=router_logits,
+                    input_ids=input_ids,
+                )
+            else:
+                # Modular kernels: select experts first, then call routed_experts
                 if preselected is None:
                     topk_weights, topk_ids = self.router.select_experts(
                         hidden_states=hidden_states,
@@ -716,14 +716,14 @@ class MoERunner(MoERunnerInterface):
                     shared_experts_input=shared_experts_input,
                     prequant_input=prequant_input,
                 )
-            except Exception:
-                # Never consumed: drop it with the published entry (if any)
-                # so a later batch does not inherit either.
-                if self._shared_experts is not None:
-                    self._shared_experts.discard()
-                raise
-            finally:
-                combine_shared.clear()
+        except Exception:
+            # Never consumed: drop it with the published entry (if any) so a
+            # later batch does not inherit either.
+            if self._shared_experts is not None:
+                self._shared_experts.discard()
+            raise
+        finally:
+            combine_shared.clear()
 
         if deferred is None:
             self._maybe_apply_shared_experts(
