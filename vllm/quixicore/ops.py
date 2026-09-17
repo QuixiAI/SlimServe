@@ -1762,6 +1762,13 @@ class quixicore_ops:
         return int(fn()) if fn is not None else 0
 
     @staticmethod
+    def nvfp4_moe_gemm_smem_bytes(cfg: int) -> int:
+        """Opt-in shared memory per block the NVFP4 MoE GEMM launches with
+        for `cfg`; 0 from a build that predates the query."""
+        fn = getattr(_qc(), "nvfp4_moe_gemm_smem_bytes", None)
+        return int(fn(cfg)) if fn is not None else 0
+
+    @staticmethod
     def nvfp4_moe_gemm(
         a: torch.Tensor,
         b: torch.Tensor,

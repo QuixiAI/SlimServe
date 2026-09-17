@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Fused MoE utilities for GPTQ."""
 
+import functools
 import math
 import os
 from collections.abc import Callable
@@ -91,6 +92,16 @@ def _qc_nvfp4_prefill_stages() -> int:
     return int(os.getenv("VLLM_QC_NVFP4_PREFILL_MOE_STAGES", "2"))
 
 
+@functools.cache
+def _qc_nvfp4_prefill_fits(device_index: int, cfg: int) -> bool:
+    """Whether the device opts in to the shared memory the cfg launches with
+    (three stages need 119 KB; sm_120 opts in to 99 KB)."""
+    need = quixicore_ops.nvfp4_moe_gemm_smem_bytes(cfg)
+    props = torch.cuda.get_device_properties(device_index)
+    have = getattr(props, "shared_memory_per_block_optin", 0)
+    return not (need and have and have < need)
+
+
 def _qc_nvfp4_prefill_applicable(
     quant_type: ScalarType,
     hidden_states: torch.Tensor,
@@ -120,6 +131,8 @@ def _qc_nvfp4_prefill_applicable(
     except ImportError:
         return False
     if not hasattr(qc, "nvfp4_moe_gemm"):
+        return False
+    if not _qc_nvfp4_prefill_fits(hidden_states.device.index or 0, _qc_nvfp4_prefill_stages()):
         return False
     if quant_type != scalar_types.float4_e2m1f or global_scale1 is None or global_scale2 is None:
         return False

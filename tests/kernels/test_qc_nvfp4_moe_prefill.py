@@ -2,8 +2,6 @@
 """QuixiCore NVFP4 prefill MoE GEMM (csrc/quixicore/serving/nvfp4_moe_prefill_ampere.cuh)
 against Marlin on identical packed weights: the direct GEMMs (w13 and the
 topk-weighted w2) and the fused MoE end to end through fused_marlin_moe."""
-import os
-
 import pytest
 import torch
 
@@ -60,6 +58,13 @@ def _close(out, ref, rel_max=2e-2, mean_rel=3e-3):
 def test_direct_gemms_match_marlin(weights, M, stages):
     import vllm._custom_ops as ops
     from vllm.quixicore.ops import quixicore_ops
+
+    need = quixicore_ops.nvfp4_moe_gemm_smem_bytes(stages)
+    have = torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).shared_memory_per_block_optin
+    if need > have:
+        pytest.skip(f"cfg {stages} needs {need} B of shared memory; the device opts in to {have}")
 
     w13, w13_s, w13_s2, w2, w2_s, w2_s2 = weights
     dev = "cuda"

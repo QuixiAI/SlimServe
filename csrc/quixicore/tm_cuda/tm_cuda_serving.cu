@@ -1909,13 +1909,24 @@ static void launch_nvfp4_moe(const __nv_bfloat16* a, int lda, const int32_t* b, 
     constexpr int THREADS = tms::nvfp4moe::Warps<WM, WN>::THREADS;
     static bool attr_set = false;
     if (!attr_set) {
-        cudaFuncSetAttribute(tms::nvfp4moe::nvfp4_moe_gemm_kernel<STAGES, WM, WN>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+        // Three stages need 119 KB of opt-in shared memory: fine on sm80 and
+        // sm90/sm100, over sm_120's 99 KB. Unchecked, the launch below failed
+        // with "invalid argument" instead (RTX PRO 6000, 2026-09-17).
+        const cudaError_t err = cudaFuncSetAttribute(tms::nvfp4moe::nvfp4_moe_gemm_kernel<STAGES, WM, WN>,
+                                                     cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+        TORCH_CHECK(err == cudaSuccess, "nvfp4_moe_gemm needs ", SMEM,
+                    " bytes of shared memory per block for this configuration, which this device does not opt in to (",
+                    cudaGetErrorString(err), "); qualify the device with nvfp4_moe_gemm_smem_bytes(cfg)");
         attr_set = true;
     }
     const dim3 grid(N / tms::nvfp4moe::BN, max_blocks);
     tms::nvfp4moe::nvfp4_moe_gemm_kernel<STAGES, WM, WN><<<grid, THREADS, SMEM, stream()>>>(
         a, lda, b, s, g, ids, eids, npp, tw, c, ldc, M_topk, top_k, N, K, mul_topk);
+}
+// Opt-in shared memory per block the NVFP4 MoE GEMM launches with for a cfg
+// (the "stages" argument of nvfp4_moe_gemm): 3 and 5 run three stages.
+static int64_t nvfp4_moe_gemm_smem_bytes(int64_t cfg) {
+    return (cfg == 3 || cfg == 5) ? tms::nvfp4moe::smem_bytes<3>() : tms::nvfp4moe::smem_bytes<2>();
 }
 static torch::Tensor py_nvfp4_moe_gemm(torch::Tensor a, torch::Tensor b, torch::Tensor s, torch::Tensor g,
                                        torch::Tensor sorted_ids, torch::Tensor expert_ids,
@@ -3037,6 +3048,8 @@ void init_serving(py::module_& m) {
     m.def("mla_sparse_prefill_fp8_smem_bytes", []() { return int64_t(tms::sparse_prefill::SMEM_TOTAL); },
           "opt-in shared memory per block the fp8 sparse prefill kernel launches with");
     m.def("mla_sparse_prefill_prep_debug", &py_mla_sparse_prefill_prep_debug);
+    m.def("nvfp4_moe_gemm_smem_bytes", &nvfp4_moe_gemm_smem_bytes, py::arg("cfg"),
+          "opt-in shared memory per block the NVFP4 MoE GEMM launches with for a cfg");
     m.def("nvfp4_moe_gemm", &py_nvfp4_moe_gemm, py::arg("a"), py::arg("b"), py::arg("s"), py::arg("g"), py::arg("sorted_ids"),
           py::arg("expert_ids"), py::arg("num_post_padded"), py::arg("topk_weights") = py::none(), py::arg("c"),
           py::arg("top_k"), py::arg("mul_topk"), py::arg("stages") = 3,
