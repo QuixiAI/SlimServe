@@ -67,6 +67,7 @@ class Request:
         arrival_time: float | None = None,
         prompt_embeds: torch.Tensor | None = None,
         prompt_is_token_ids: list[bool] | None = None,
+        semantic_cache_boundaries: list[int] | None = None,
         mm_features: list[MultiModalFeatureSpec] | None = None,
         lora_request: "LoRARequest | None" = None,
         cache_salt: str | None = None,
@@ -139,6 +140,17 @@ class Request:
         self._prompt_embeds_per_block_hashes: dict[tuple[int, int], bytes] = {}
         self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
             prompt_token_ids, prompt_embeds
+        )
+        self.semantic_cache_boundaries = tuple(
+            sorted(
+                {
+                    boundary
+                    for boundary in (semantic_cache_boundaries or ())
+                    if isinstance(boundary, int)
+                    and not isinstance(boundary, bool)
+                    and 0 < boundary <= self.num_prompt_tokens
+                }
+            )
         )
         self._output_token_ids: list[int] = []
         self._all_token_ids: list[int] = (
@@ -226,6 +238,7 @@ class Request:
             prompt_token_ids=request.prompt_token_ids,
             prompt_embeds=request.prompt_embeds,
             prompt_is_token_ids=request.prompt_is_token_ids,
+            semantic_cache_boundaries=request.semantic_cache_boundaries,
             mm_features=request.mm_features,
             sampling_params=request.sampling_params,
             pooling_params=request.pooling_params,

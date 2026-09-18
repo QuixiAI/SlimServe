@@ -254,6 +254,35 @@ def test_fill_stages_attention_and_pinned_tail_at_finish():
     assert conn.index.stats()["resumable"] == 1
 
 
+def test_semantic_boundary_stages_content_addressed_kda_checkpoint():
+    conn = make_connector()
+    req = FakeRequest("semantic", [h(i) for i in range(3)], 3 * BLOCK + 4)
+    # A rendered message boundary inside block 2 is materialized at the prior
+    # complete hash-block boundary.
+    req.semantic_cache_boundaries = (2 * BLOCK + 5,)
+    conn.on_new_request(req)
+    conn.update_state_after_alloc(req, alloc(3, planned=0), 0)
+
+    req.num_computed_tokens = 3 * BLOCK
+    meta = conn.build_connector_meta(sched_output({req.request_id: 1}))
+    semantic_ops = [
+        op
+        for ops in meta.offloads.values()
+        for op in ops
+        if op[2] in conn.state_groups
+    ]
+    assert len(semantic_ops) == 2
+    assert {block for block, _, _ in semantic_ops} == {97, 98}
+    conn.build_connector_meta(sched_output({}))  # confirm host writes
+
+    # A different request id with the same full chained prefix resumes at the
+    # semantic checkpoint even though no terminal tail was ever saved.
+    hit = conn.index.lookup(req.block_hashes)
+    assert hit is not None and hit[0] == "semantic" and hit[1] == 2
+    assert conn.index.stats()["semantic_checkpoint_saves"] == 1
+    assert conn.index.stats()["semantic_checkpoint_hits"] == 1
+
+
 def test_missing_cached_boundary_skips_save():
     conn = make_connector()
     req = FakeRequest("rx", [h(i) for i in range(3)], num_tokens=3 * BLOCK + 4)

@@ -36,6 +36,12 @@ idles (WildChat leg, 2026-09-13). Two rules keep the placement balanced:
   back and forth as the footprints drift; with a single home the way back
   costs a full re-prefill again.
 
+Renderer-proven message/content-part checkpoints are stronger ownership
+signals: until peer-to-peer cache hydration is available, a request whose
+prefix reaches one of those checkpoints is routed to its owning replica even
+under load imbalance. This avoids selecting a replica that cannot consume the
+pinned-host KDA snapshot and then paying a full re-prefill.
+
 Block hashes are chained like the engine's prefix cache (parent hash +
 block tokens, seeded by ``cache_salt``) but computed locally, so only
 self-consistency matters; the engine's own hash algorithm is not involved.
@@ -102,6 +108,7 @@ class PrefixAffinityRouter:
         self.prompt_blocks_total = 0
         self.followed_affinity = 0
         self.migrated = 0
+        self.semantic_affinity = 0
 
     @property
     def num_engines(self) -> int:
@@ -154,6 +161,7 @@ class PrefixAffinityRouter:
         cache_salt: str | None,
         load_scores: Sequence[int],
         start_index: int = 0,
+        semantic_cache_boundaries: Sequence[int] = (),
     ) -> tuple[int, int]:
         """Pick an engine; returns ``(engine_index, matched_blocks)``.
 
@@ -172,17 +180,25 @@ class PrefixAffinityRouter:
         max_matched = max(matched_by_engine) if matched_by_engine else 0
         # Only the longest match is a home; see the module docstring.
         home = order[matched_by_engine.index(max_matched)] if max_matched else -1
-        best, best_cost, best_matched = 0, None, 0
-        for idx, matched in zip(order, matched_by_engine):
-            credit = matched if idx == home else 0
-            cost = (
-                n_tokens
-                - credit * self.block_size
-                + self.load_tokens * load_scores[idx]
-                + (self._recent_tokens[idx] * self.recent_permille) // 1000
-            )
-            if best_cost is None or cost < best_cost:
-                best, best_cost, best_matched = idx, cost, credit
+        reaches_semantic_checkpoint = any(
+            0 < boundary // self.block_size <= max_matched
+            for boundary in semantic_cache_boundaries
+        )
+        if home >= 0 and reaches_semantic_checkpoint:
+            best, best_matched = home, max_matched
+            self.semantic_affinity += 1
+        else:
+            best, best_cost, best_matched = 0, None, 0
+            for idx, matched in zip(order, matched_by_engine):
+                credit = matched if idx == home else 0
+                cost = (
+                    n_tokens
+                    - credit * self.block_size
+                    + self.load_tokens * load_scores[idx]
+                    + (self._recent_tokens[idx] * self.recent_permille) // 1000
+                )
+                if best_cost is None or cost < best_cost:
+                    best, best_cost, best_matched = idx, cost, credit
         if hashes:
             self.record(best, hashes)
         self._note_routed(best, n_tokens)
@@ -201,6 +217,7 @@ class PrefixAffinityRouter:
         return (
             f"routed={self.routed} with_prefix={self.routed_with_match} "
             f"followed={self.followed_affinity} migrated={self.migrated} "
+            f"semantic={self.semantic_affinity} "
             f"matched_blocks={self.matched_blocks_total}/{self.prompt_blocks_total} "
             f"recent_tokens={self._recent_tokens}"
         )

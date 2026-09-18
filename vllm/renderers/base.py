@@ -847,6 +847,8 @@ class BaseRenderer(ABC, Generic[_T]):
             engine_input["prompt"] = prompt_text
         if cache_salt := prompt.get("cache_salt"):
             engine_input["cache_salt"] = cache_salt
+        if boundaries := prompt.get("semantic_cache_boundaries"):
+            engine_input["semantic_cache_boundaries"] = boundaries
         # Narrow the union — `prompt_token_offsets` is only on TokensInput.
         if engine_input["type"] == "token" and (
             (offsets := prompt.get("prompt_token_offsets")) is not None
@@ -910,6 +912,8 @@ class BaseRenderer(ABC, Generic[_T]):
             engine_input["prompt"] = prompt_text
         if cache_salt := prompt.get("cache_salt"):
             engine_input["cache_salt"] = cache_salt
+        if boundaries := prompt.get("semantic_cache_boundaries"):
+            engine_input["semantic_cache_boundaries"] = boundaries
         # Narrow the union — `prompt_token_offsets` is only on TokensInput.
         if engine_input["type"] == "token" and (
             (offsets := prompt.get("prompt_token_offsets")) is not None
