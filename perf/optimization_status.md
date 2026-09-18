@@ -29741,3 +29741,211 @@ than PyPI 1.3.0), and the FP8 GEMMs.
 - Decision: pursue B, C, E (no quality exposure) and A (canary-gated,
   the largest single byte lever) in that order, D as an experiment behind
   them. Each lands as its own qualified arm with the exact bench.
+
+### Phase 8 / P2 groundwork (2026-09-17 evening): programmatic dependent launch works under graph replay; the fp8 decode GEMM is L2-issue-bound at ~2.5 TB/s; wide K chunks rejected
+
+- Per-layer critical paths from the c1 record trace (`profile-spec-rec-c1`,
+  one KDA / MLA / MoE block each, us): KDA layer = AR+mHC 12 + in_proj 19.4
+  + gate_pair 1.8 + conv 3.0 + recurrence 7.9 + gated norm 1.4 + o_proj 7.2
+  = 53 against a 27 us byte+PCIe floor (x34 = 0.88 ms of overhead per
+  step). MoE block = AR+mHC 12.5 + max(router gemv 3.4 + route_align 6.2,
+  shared gate_up 7.3 on the aux stream) + Marlin 48 + act_and_mul 1.8 +
+  Marlin 26 + moe_sum_add 1.6 + memcpy 1.0 = ~110 against 72 (x42 = 1.6
+  ms, of which Marlin's own excess over the 66 us expert floor is 8). MLA
+  layer = ~103 us against ~45 (x11 = 0.66 ms): the replicated bf16
+  projections on the bf16 decode GEMM (12.1 + 9.7), the pooled indexer's
+  glue (~12 small kernels), mla_decode 19.3 for 1 MB of latents. The
+  shared-expert GEMMs that run beside Marlin stretch to 40-45 us in the
+  trace but end inside Marlin's span and cost nothing on the critical path.
+- PDL (`griddepcontrol`): device-timestamp probe (`$S/p8/pdl_probe.py`,
+  `pdl_probe2.py`): a grid launched with
+  `cudaLaunchAttributeProgrammaticStreamSerialization` behind a primary
+  that executes `launch_dependents` at entry enters at 0.3-0.4 us into the
+  primary (eager and inside a captured graph alike) and passes its wait
+  0.2 us after the primary ends; `cp.async.bulk.prefetch.L2` of a 8.4 MB
+  slice issued before the wait makes the post-wait read 2.2 us against 4.9
+  cold (the line-hint `prefetch.global.L2` and real loads did not retain
+  the lines). Outputs bit-exact against the plain launch in every mode.
+- The fp8 decode GEMM behind a latency-bound predecessor
+  (`$S/p8/bench_pdl.py`, spin kernel + GEMM under graph replay, GPU 0):
+  o_proj 8.4 MB behind 12 us of spin 19.39 -> 17.58 us (PDL + bulk
+  prefetch), in_proj 25.7 MB 30.24 -> 27.66. The remaining post-wait time
+  is the kernel's own ceiling: with the weights already L2-resident
+  (`bench_hot.py`) it runs o_proj in 4.1 us (2.05 TB/s), in_proj 10.4
+  (2.47 TB/s), MLA o_proj 6.4 (2.6 TB/s) against 6.9 / 17.7 / 12.2 cold.
+  So the prefetch can return at most (cold - hot) per site: 7.3 us on
+  in_proj, 2.9 on o_proj, 5.7 on the MLA o_proj, ~0.45 ms per c1 step if
+  every predecessor triggers.
+- Wide K chunks (256 / 512 bytes, 2-4 stages, `QC_FP8_WIDE` switch) were
+  the obvious fix for the per-chunk sync round trip and are REJECTED: every
+  configuration is slower hot and cold (in_proj hot 10.4 -> 14.2-15.4,
+  cold 17.7 -> 21.9-23.7); 8 stages of 128-byte chunks likewise (hot 13.1,
+  cold 19.0). The limit is not the chunk sync; it is the per-SM issue rate
+  of the 16-byte cp.async + ldmatrix + convert path at one block per SM
+  (128-204 blocks on 188 SMs). The wide configs stay in the header behind
+  the switch as the record of the arm; the shipped config is unchanged.
+- Landed for the serving A/B: `QC_PDL=2` launches every fp8 decode GEMM with
+  the attribute, bulk-prefetches the block's rows before `griddepcontrol.wait`
+  and triggers its own dependents at entry; `pdl_launch_dependents()` at the
+  entry of `cross_device_reduce_1stage/2stage`, the fused-norm variant and
+  `allreduce_transition` (the `_C_stable_libtorch` rebuild). Next the same
+  attribute on the bf16 decode GEMM, `launch_pdl` on the KDA-chain Triton
+  kernels and the pooled indexer's, and triggers in `mla_decode_fp8_v` and
+  Marlin, then the exact bench at c1/c8 both modes.
+- Raw: `perf/results/2026-09-17/p1-kda-recurrence/` (sweep1.txt, fp8_*.txt,
+  pdl_bench_*.txt, c1_exclusive_by_kernel.txt).
+
+### Phase 8 / P2 first serving A/B (2026-09-17 18:46-18:54): QC_PDL=2 (dependent launch + bulk L2 prefetch on every decode GEMM, triggers in the all-reduce kernels, the KDA-chain Triton kernels PDL-launched) - NEUTRAL at c1/c8, -2.5 % at c16 no-spec; not retained in that form
+
+- Arms `ab2.sh pdl2-spec QC_PDL=2 -- --spec` and `pdl2-nospec QC_PDL=2`
+  (exact-token 1000/300, two passes each, one boot per arm) against the
+  PR-head confirmation of the same afternoon:
+
+  | mode | shape | QC_PDL=2 | head (68aab5d8d) |
+  |---|---|---:|---:|
+  | no-spec | c1 | 197.8 / 197.9 | 191.4 / 196.5 |
+  | no-spec | c8 | 741.9 / 741.9 | 734.2 / 730.2 |
+  | no-spec | c16 | 1011.1 / 1009.5 | 1039.6 / 1031.4 |
+  | spec | c1 | 279.1 / 248.6 | 328.7 / 255.4 |
+  | spec | c8 | 687.6 / 757.6 | 765.6 / 816.4 |
+  | spec | c16 | 1072.6 / 1047.7 | 1063.2 / 1092.4 |
+
+  All `exact: true`, no garbage / placeholder signatures.
+- Reading: +1..3 % at c1/c8 no-spec (inside the day's spread), -2.5 % at
+  c16 no-spec and level-to-worse under speculation. At 16 rows and above
+  the transition runs as the split pair (two-stage all-reduce + Triton
+  partials/finalize, none of which trigger), so no GEMM launches early
+  there and the bulk prefetch only duplicates HBM traffic in front of its
+  own pipeline; back-to-back GEMMs (gate_up -> down) prefetch against each
+  other's streaming for the same reason (microbench: in_proj 17.8 -> 18.9
+  us behind a triggering neighbour). The overlap only pays behind a
+  latency-bound, triggering predecessor - today that is the fused
+  transition at T <= 8.
+- Consequences (both built, arms next): (1) `QC_PDL=4` = the attribute,
+  trigger and wait with NO prefetch, so the launch overlap is kept and the
+  traffic duplication is not; (2) the fused transition extended to every
+  decode batch by the reduce-scatter exchange (`QC_MHC_RS`, Item P3 below),
+  which triggers at all T; (3) a prefetch only where the predecessor is
+  known to be latency-bound, decided at the call site, if the site count
+  justifies it after (1) and (2).
+- Raw: `serve-logs/ab-pdl2-{spec,nospec}.out`,
+  `perf/results/2026-09-17/pdl2-{spec,nospec}-pass{1,2}/`.
+
+### Item P3: the fused all-reduce + mHC transition for every decode batch - reduce-scatter exchange and an eight-chunk grid (2026-09-17 19:00), bit-exact, microbench -6 us per site at 16 rows
+
+- Before: the fused kernel served T <= 8 only (`_GLM5_MHC_FUSE_TOKENS`);
+  above it the split pair ran (two-stage all-reduce 12.3 us + `_mhc_partials`
+  6.3 + `_mhc_finalize` 5.0 = 23.6 us per site in the c8 spec trace). Two
+  causes: the one-shot exchange reads every peer's full input (3 x T x 8 KB
+  over PCIe, 384 KB at T = 16 against the two-stage's 192), and the grid was
+  capped at 2 token chunks x 32 dimension blocks (`kMaxBlocks` = 64 barrier
+  slots), so at T = 16 every block walked 16 tokens serially (~10 us).
+- Change: `allreduce_transition<NGPU, FUSED_NORM, RS>`: with RS the kernel
+  first reduce-scatters (every block reduces a share of this rank's 1024
+  dimensions for all tokens, rank-ordered fp32 rounded to bf16 exactly like
+  the one-shot sum, into the rank's IPC scratch), a middle barrier
+  (release/acquire, monotonic wait), then the transition reads each
+  dimension block's reduced slice from its owner (the all-gather) and runs
+  unchanged. The Signal struct gains `mhc_start/mhc_end/mhc_flag[256]` so
+  the transition's grid can be 8 chunks x 32 blocks (`token_chunks` = min(T,
+  8)); the plain all-reduce's 64-block cap is untouched. `QC_MHC_RS=<n>`
+  selects RS from n tokens up (0 = the one-shot path, today's behaviour);
+  with it set the Python cap becomes 64 tokens.
+- Exactness (`$S/p8/mhc_rs_check.py`, 4 ranks, graph replay, T in 1, 2, 4,
+  5, 8, 12, 16, 32, 48, 64): RS with 8 chunks is bit-identical to the
+  one-shot kernel with 2 chunks in residual, post, comb and layer_input at
+  every T. Against the split path both fused variants differ by the known
+  one-ulp bf16 rounding in layer_input at some T (residual bit-equal).
+- Microbench (`bench_mhc_ar.py`, us per site over the same work, 8 chunks):
+
+  | T | split pair | one-shot fused | RS fused |
+  |---|---:|---:|---:|
+  | 1 | 10.2 | 9.8 | 12.0 |
+  | 4 | 13.0 | 10.9 | 13.7 |
+  | 8 | 18.3 | 13.2 | 13.7 |
+  | 16 | 23.0 | 21.1 | 16.5 |
+  | 64 | 51.1 | 66.1 | 37.9 |
+
+  (2-chunk one-shot: 16.3 at T = 8, 26.7 at 16.) So one-shot stays the path
+  to 4 tokens, RS from 5 up; at 16 rows the site costs 16.5 against the
+  split pair's 23: -6.5 us x 90 = ~0.6 ms per c8 spec / c16 step (5 %).
+- Arms in flight: `rs5-{nospec,spec}` (QC_MHC_RS=5) and `rs5pdl4-*`
+  (+ QC_PDL=4, dependent launch without prefetch).
+- Raw: `$S/p8/chain_rs{,2}.out`, `perf/results/2026-09-17/rs5*`.
+
+- PHASE 8 / P2 + P3 SERVING ARMS: PDL mode 4 and the reduce-scatter transition
+  become the record's defaults (2026-09-17 19:07-19:22 PDT, ab2.sh, exact-token
+  1000/300, two passes per shape, tok/s). Baseline is the head re-measure at
+  68aab5d8d (plain 191.4/196.5, 734.2/730.2, 1039.6/1031.4; spec 328.7/255.4,
+  765.6/816.4, 1063.2/1092.4).
+  | arm | plain c1 | c8 | c16 | spec c1 | c8 | c16 |
+  |---|---|---|---|---|---|---|
+  | QC_MHC_RS=5 | 193.4/195.5 | 740.5/734.1 | 1070.8/1059.9 | 230.4/258.6 | 737.6/759.3 | 1037.7/1077.4 |
+  | QC_MHC_RS=5 QC_PDL=4 | 196.7/197.0 | 745.7/746.9 | 1079.1/1079.8 | 262.7/217.3 | 822.2/794.1 | 1067.5/1057.1 |
+  Plain decode with both: c1 +1.5 %, c8 +1.9 %, c16 +4.2 % over the head, every
+  pass exact. Under speculation the c8 pair is +2 % on average, c16 within the
+  pass-to-pass spread (-1..-3 %), and c1 swings 217-329 across the six spec
+  passes of the day: the c1 spec number is sampling-dependent (temperature 1.0,
+  the drafter's acceptance varies with the sampled path) and single passes
+  cannot resolve a few percent there; a longer c1 spec protocol is needed
+  before any c1 spec claim. DECISION: retained as code defaults - `pdl_mode()`
+  returns 4 when QC_PDL is unset (bf16/fp8 decode GEMMs, the Triton KDA-chain
+  kernels' `_pdl_enabled`, Marlin's launcher), `glm5_mhc_rs_min_tokens()`
+  returns 5 (`_GLM5_MHC_FUSE_TOKENS` 64) when QC_MHC_RS is unset; QC_PDL=0 /
+  QC_MHC_RS=0 restore the previous paths for A/B. Raw:
+  `$S/serve-logs/ab-rs5-{nospec,spec}.out`, `ab-rs5pdl4-{nospec,spec}.out`.
+- PHASE 8 / P1: THE FUSED KDA DECODE CHAIN (2026-09-17 evening, in progress).
+  `csrc/quixicore/serving/kda_decode_chain.cuh`, binding `kda_chain_decode`
+  (`_quixicore_C`), Python op `vllm::kda_attention_chain` (a graph-splitting
+  op beside `kda_attention`; `_forward_chain` falls back to the gate pair +
+  `_forward` for prefill batches or more than 8 rows per request; QC_KDA_CHAIN=0
+  disables, QC_KDA_SPLIT sets the V split, default 4). Two launches per layer
+  replace kda_gate_pair + causal_conv1d_update + fused_recurrent_kda +
+  layer_norm_gated: (1) one block per (request, head): the conv taps and SiLU
+  on the head's 384 channels with the Triton kernel's exact history roll
+  (plain rows roll width-1 columns, a speculative request of len rows rolls
+  len+2 - the varlen-revised state_len - and leaves the rest of the history
+  untouched; both matter, the first parity run failed on a 6-column history
+  under plain decode), the f_b/g_b GEMVs with the head's 2 x 32 KB of weights
+  read once for all rows, the gate exp, q/k L2 norms, beta sigmoid, all
+  bf16-rounded where the Triton chain materialises bf16; (2) SPLIT blocks per
+  (request, head), each holding V/SPLIT state rows in registers across the
+  rows (4 lanes per row, interleaved 16 B chunks), per-row state stores into
+  each row's column, bf16-rounded read-outs and their sum of squares to
+  scratch; the last of the SPLIT blocks (atomic counter, threadfence) applies
+  the gated RMS norm and writes the bf16 output. Both under programmatic
+  dependent launch (trigger at entry, wait before the first dependent read).
+  Parity test `tests/kernels/test_kda_decode_chain.py` against the Triton
+  chain: conv state bit-exact, SSM state within one bf16 ulp of the gate
+  (the GEMV's fp32 summation order differs from Triton's tree sum), output
+  2e-2; plain and speculative rows, ragged request lengths, bf16 and fp32 conv
+  states, splits 1/2/4.
+  RESULT (microbench, GPU 0, CUDA-graph replay, us per layer, Triton chain vs
+  fused split 1 / 4; raw perf/results/2026-09-17/p1-kda-chain/):
+  | rows | L2-hot: triton | fused | cold (256 MB flush before every call): triton | fused |
+  |---|---|---|---|---|
+  | 1 x 1 | 5.6 | 9.0 / 7.2 | 3.0 | 9.2 / 7.0 |
+  | 8 x 1 | 9.0 | 12.8 / 16.9 | 11.7 | 15.3 / 12.8 |
+  | 16 x 1 | 11.9 | 18.7 / 20.5 | 24.5 | 27.1 / 27.3 |
+  | 1 x 4 (spec) | 11.3 | 18.3 / 14.0 | 11.1 | 14.2 / 13.0 |
+  | 8 x 4 | 20.8 | 30.6 / 31.0 | 27.6 | 33.6 / 34.5 |
+  | 16 x 4 | 28.0 | 41.3 / 41.8 | 58.6 | 60.7 / 64.0 |
+  The fused chain is slower everywhere. Two findings behind it: (1) the
+  serving trace's per-kernel durations for the KDA glue (conv 3.0, gate pair
+  1.9, norm 1.4, recurrence 8.0 us at c1) are inflated by the profiler and by
+  dependent-launch overlap; replayed in a graph the whole four-kernel chain
+  is 5.6 us at one row, so the "launch-bound glue" the plan's P1 targeted
+  (0.35-0.45 ms per step) does not exist - graphs plus PDL already hide it, and
+  a fused kernel that serialises conv -> GEMV -> norm -> recurrence -> norm
+  inside 16-64 blocks has a longer critical path than four wide, single-round-
+  trip kernels. (2) Cold, the chain is bandwidth-bound by the recurrent state:
+  16 requests x 4 rows read 16 MB and write 64 MB of state per layer (1 read +
+  T per-row stores of 1 MB per request) in 58.6 us = 1.4 TB/s; per step that
+  is 2.0 ms at c16 under speculation and 0.9 ms at c8 - the writes are 80 % of
+  it. DECISION: rejected for serving; kept as an opt-in diagnostic
+  (QC_KDA_CHAIN=1) with its parity test until the cleanup pass, where it goes
+  unless a use appears. The KDA lever is the speculative state-write traffic
+  (the deferred commit, kernels already parity-tested on 2026-09-12: forward
+  without stores + a post-sampling commit that stores only the accepted and
+  boundary columns, 3 traffic units instead of 5), see the Phase 8 plan
+  revision below.

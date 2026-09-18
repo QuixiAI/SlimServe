@@ -9,6 +9,35 @@ import numpy as np
 import torch
 
 from vllm.triton_utils import tl, triton
+
+# Programmatic dependent launch (Phase 8 / P2): when QC_PDL is set the decode
+# kernels are launched with the programmatic-serialization attribute and start
+# with a trigger for their own successor plus a wait for their predecessor
+# (both no-ops without the attribute; kept out of the kernel entirely on
+# non-CUDA targets and for the A/B baseline through the PDL constexpr).
+def _pdl_enabled() -> bool:
+    import os
+    if os.environ.get("QC_PDL", "4") == "0":
+        return False
+    try:
+        import torch
+        return torch.cuda.is_available() and torch.version.hip is None
+    except Exception:
+        return False
+
+
+_PDL = _pdl_enabled()
+if _PDL:
+    from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
+else:
+    @triton.jit
+    def gdc_launch_dependents():
+        pass
+
+    @triton.jit
+    def gdc_wait():
+        pass
+
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
 
 
@@ -789,7 +818,12 @@ def _causal_conv1d_update_kernel(
     NP2_STATELEN: tl.constexpr,
     HAS_NULL_BLOCK: tl.constexpr,
     BLOCK_N: tl.constexpr,
+
+    PDL: tl.constexpr = False,
 ):
+    if PDL:
+        gdc_launch_dependents()
+        gdc_wait()
     # ruff: noqa: E501
     idx_seq = tl.program_id(0)
     if idx_seq >= batch:
@@ -1245,6 +1279,9 @@ def causal_conv1d_update(
         NP2_STATELEN=np2_statelen,
         HAS_NULL_BLOCK=null_block_id is not None,
         BLOCK_N=256,
+    
+        PDL=_PDL,
+        launch_pdl=_PDL,
     )
     if unsqueeze:
         out = out.squeeze(-1)

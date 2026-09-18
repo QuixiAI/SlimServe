@@ -10,6 +10,7 @@
 // block and a block's NT rows sit inside one 128-row scale group, so a chunk has a single scale.
 // Requirements: K % 128 == 0 (16-byte aligned rows follow), rows beyond N clamped for the load and
 // skipped for the store.
+#include <cstdlib>
 #include <cuda_fp16.h>
 #include "bf16_decode_gemm.cuh"
 
@@ -24,6 +25,13 @@ using tms::decode_gemm::ldmatrix_x4;
 using tms::decode_gemm::mma_bf16_16816;
 using tms::decode_gemm::to_out;
 using tms::decode_gemm::check_cuda_status;
+using tms::decode_gemm::pdl_trigger;
+using tms::decode_gemm::pdl_wait;
+using tms::decode_gemm::prefetch_l2;
+using tms::decode_gemm::prefetch_bulk_l2;
+using tms::decode_gemm::touch_l2;
+using tms::decode_gemm::pdl_mode;
+using tms::decode_gemm::use_pdl;
 
 constexpr int SB = 128;     // scale block: 128 rows x 128 k
 constexpr int WPAD = 16;    // bytes of padding per fp8 weight row in smem (conflict-free 16-bit loads)
@@ -52,8 +60,10 @@ struct Cfg {
     static constexpr int NTILES = NT / 8;
     static constexpr int XVEC = KCHUNK / 8;            // 16-byte vectors per x row per chunk
     static constexpr int WVEC = KCHUNK / 16;           // 16-byte vectors per w row per chunk
-    static_assert(KCHUNK == SB, "one K chunk is one scale block");
+
     static_assert(SB % NT == 0, "a block's rows lie inside one scale row group");
+    static_assert(KCHUNK % SB == 0, "a chunk covers whole scale blocks");
+    static constexpr int SCALES_PER_CHUNK = KCHUNK / SB;
     static_assert(KSTEPS % WARPS == 0, "warps split the k16 steps of a chunk evenly");
     static_assert(NT % 8 == 0, "NT is a multiple of the n8 tile");
     static_assert(STAGES >= 2, "double buffering at least");
@@ -69,13 +79,37 @@ __global__ void __launch_bounds__(WARPS * 32) fp8_decode_gemm_kernel(
         const float* __restrict__ scale,         // [ceil(N/128), K/128], or [N] when CHANNEL
         const float* __restrict__ bias,          // [N] or nullptr
         OutT* __restrict__ out,                  // [M, N]
-        int M, int N, int K) {
+        int M, int N, int K, int pdl) {
     using C = Cfg<NT, WARPS, KCHUNK, STAGES>;
     extern __shared__ __align__(16) unsigned char smem_raw[];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int n0 = blockIdx.x * NT;
     const int nchunks = K / KCHUNK;
-    const float* srow = scale + size_t(n0 / SB) * nchunks;   // this block's scale row: one value per chunk
+    const float* srow = scale + size_t(n0 / SB) * (K / SB);   // this block's scale row: one value per scale block
+    if (pdl) {
+        pdl_trigger();
+        // The weight slice does not depend on the predecessor: request every
+        // 128-byte line of the block's NT rows (NT * K bytes) into L2 now, so
+        // the staged cp.async loads below hit L2 once the activation is ready.
+        const size_t row_bytes = size_t(K);
+        if (pdl == 4) {
+            // launch overlap only: no prefetch
+        } else if (pdl == 2) {
+            // one bulk prefetch per row (K bytes, contiguous)
+            if (tid < NT) prefetch_bulk_l2(w + size_t(min(n0 + tid, N - 1)) * K, uint32_t(row_bytes));
+        } else {
+            const size_t lines_per_row = row_bytes / 128;
+            for (size_t i = tid; i < size_t(NT) * lines_per_row; i += C::THREADS) {
+                const int r = int(i / lines_per_row);
+                const size_t off = (i - size_t(r) * lines_per_row) * 128;
+                const int n = min(n0 + r, N - 1);
+                if (pdl == 3) touch_l2(w + size_t(n) * K + off);
+                else prefetch_l2(w + size_t(n) * K + off);
+            }
+        }
+        if constexpr (!CHANNEL) { if (tid == 0) prefetch_l2(srow); }   // one line holds the row's scales
+        pdl_wait();
+    }
 
     auto stage_x = [&](int s) { return smem_raw + s * C::STAGE_BYTES; };
     auto stage_w = [&](int s) { return smem_raw + s * C::STAGE_BYTES + C::X_BYTES; };
@@ -129,7 +163,11 @@ __global__ void __launch_bounds__(WARPS * 32) fp8_decode_gemm_kernel(
         const int s = c % STAGES;
         const uint32_t xs = smem_u32(stage_x(s));
         const unsigned char* ws = stage_w(s);
-        const float sc = CHANNEL ? 0.0f : __ldg(srow + c);
+        float chunk_scale[C::SCALES_PER_CHUNK];
+        if constexpr (!CHANNEL) {
+#pragma unroll
+            for (int q = 0; q < C::SCALES_PER_CHUNK; ++q) chunk_scale[q] = __ldg(srow + c * C::SCALES_PER_CHUNK + q);
+        }
 #pragma unroll
         for (int step = warp; step < C::KSTEPS; step += WARPS) {
             const int k0 = step * 16;
@@ -140,7 +178,7 @@ __global__ void __launch_bounds__(WARPS * 32) fp8_decode_gemm_kernel(
                 const unsigned char* p = ws + (8 * j + bn) * C::WROW + k0 + bk;
                 const uint16_t lo = *reinterpret_cast<const uint16_t*>(p);
                 const uint16_t hi = *reinterpret_cast<const uint16_t*>(p + 8);
-                const float s = CHANNEL ? row_scale[j] : sc;
+                const float s = CHANNEL ? row_scale[j] : chunk_scale[k0 / SB];
                 mma_bf16_16816(acc[j], a, e4m3x2_scaled_to_bf16x2(lo, s), e4m3x2_scaled_to_bf16x2(hi, s));
             }
         }
@@ -173,6 +211,21 @@ __global__ void __launch_bounds__(WARPS * 32) fp8_decode_gemm_kernel(
     }
 }
 
+// QC_PDL=1 launches every decode GEMM with programmatic stream serialization
+// (read once per process). Off by default until the serving arm qualifies it.
+// QC_FP8_WIDE: experiment switch for the N >= 2048 configuration (0 = the
+// shipped 32 rows / 128-byte chunks / 4 stages; 1..6 see launch_auto). A
+// chunk must divide K, so wide chunks fall back when K is not a multiple.
+inline int wide_cfg(int K) {
+    static const int v = [] {
+        const char* e = std::getenv("QC_FP8_WIDE");
+        return e != nullptr ? std::atoi(e) : 0;
+    }();
+    if (v == 0) return 0;
+    const int kchunk = (v == 3 || v == 6) ? 512 : (v == 4 ? 128 : 256);
+    return (K % kchunk == 0) ? v : 0;
+}
+
 template <int NT, int WARPS, int KCHUNK, int STAGES, typename OutT, bool CHANNEL = false>
 static inline void launch(const __nv_bfloat16* x, const uint8_t* w, const float* scale, const float* bias, OutT* out,
                    int M, int N, int K, cudaStream_t stream) {
@@ -190,7 +243,21 @@ static inline void launch(const __nv_bfloat16* x, const uint8_t* w, const float*
         configured_device = device;
     }
     const int blocks = (N + NT - 1) / NT;
-    kern<<<blocks, C::THREADS, C::SMEM_BYTES, stream>>>(x, w, scale, bias, out, M, N, K);
+    if (use_pdl()) {
+        cudaLaunchConfig_t cfg = {};
+        cfg.gridDim = dim3(blocks);
+        cfg.blockDim = dim3(C::THREADS);
+        cfg.dynamicSmemBytes = C::SMEM_BYTES;
+        cfg.stream = stream;
+        cudaLaunchAttribute attr[1];
+        attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attr[0].val.programmaticStreamSerializationAllowed = 1;
+        cfg.attrs = attr;
+        cfg.numAttrs = 1;
+        check_cuda_status(cudaLaunchKernelEx(&cfg, kern, x, w, scale, bias, out, M, N, K, pdl_mode()));
+    } else {
+        kern<<<blocks, C::THREADS, C::SMEM_BYTES, stream>>>(x, w, scale, bias, out, M, N, K, 0);
+    }
 }
 
 // Retained configs (fp8_gemm16_bench.py, 2026-09-07, RTX PRO 6000): 32 rows /
@@ -208,7 +275,20 @@ static inline void launch(const __nv_bfloat16* x, const uint8_t* w, const float*
 template <typename OutT, bool CHANNEL = false>
 inline void launch_auto(const __nv_bfloat16* x, const uint8_t* w, const float* scale, const float* bias, OutT* out,
                         int M, int N, int K, cudaStream_t stream) {
-    if (N >= 2048) launch<32, 8, 128, 4, OutT, CHANNEL>(x, w, scale, bias, out, M, N, K, stream);
+    // Under programmatic dependent launch the weight slice is L2-resident by
+    // the time the wait returns, and the pipeline's per-chunk round trip is
+    // the limit: eight stages keep seven chunks in flight instead of three.
+    if (N >= 2048) {
+        switch (wide_cfg(K)) {
+            case 1: launch<32, 8, 256, 4, OutT, CHANNEL>(x, w, scale, bias, out, M, N, K, stream); return;
+            case 2: launch<32, 8, 256, 3, OutT, CHANNEL>(x, w, scale, bias, out, M, N, K, stream); return;
+            case 3: launch<32, 8, 512, 2, OutT, CHANNEL>(x, w, scale, bias, out, M, N, K, stream); return;
+            case 4: launch<32, 8, 128, 8, OutT, CHANNEL>(x, w, scale, bias, out, M, N, K, stream); return;
+            case 5: launch<16, 8, 256, 4, OutT, CHANNEL>(x, w, scale, bias, out, M, N, K, stream); return;
+            case 6: launch<16, 8, 512, 2, OutT, CHANNEL>(x, w, scale, bias, out, M, N, K, stream); return;
+            default: launch<32, 8, 128, 4, OutT, CHANNEL>(x, w, scale, bias, out, M, N, K, stream); return;
+        }
+    }
     else if (M <= 8) launch<8, 8, 128, 8, OutT, CHANNEL>(x, w, scale, bias, out, M, N, K, stream);
     else launch<16, 8, 128, 8, OutT, CHANNEL>(x, w, scale, bias, out, M, N, K, stream);
 }

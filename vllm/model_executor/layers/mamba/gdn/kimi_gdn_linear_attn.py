@@ -50,6 +50,8 @@ from ..ops.gather_initial_states import gather_initial_states
 
 # Empirical lower bound for the KDA gate to avoid numerical underflow.
 _KDA_GATE_LOGBOUND_MIN = -5.0
+# V split of the fused chain's recurrence kernel (blocks per request x head).
+_KDA_CHAIN_SPLIT = int(__import__("os").environ.get("QC_KDA_SPLIT", "4"))
 
 
 def _apply_kda_output_norm(
@@ -85,6 +87,25 @@ def _materialize_kda_gate_and_beta(
     else:
         gate = -decay * F.softplus(gate_input)
     return gate, raw_beta.float().sigmoid()
+
+
+def _use_kda_chain() -> bool:
+    """The fused decode chain (QuixiCore kda_chain_decode: conv + gate GEMVs
+    + recurrence + gated RMS norm in two launches per layer) on CUDA. Opt-in
+    diagnostic (QC_KDA_CHAIN=1): measured 2026-09-17 on sm_120 it is never
+    faster than the four Triton kernels under graph replay with dependent
+    launch (perf/optimization_status.md, "Phase 8 / P1"), so the Triton chain
+    stays the serving path."""
+    import os
+
+    if os.environ.get("QC_KDA_CHAIN", "0") != "1" or not current_platform.is_cuda():
+        return False
+    try:
+        from vllm.quixicore.ops import _qc
+
+        return hasattr(_qc(), "kda_chain_decode")
+    except ImportError:
+        return False
 
 
 def _use_recurrent_kda_prefill() -> bool:
@@ -450,6 +471,14 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             and self.g_b_proj.weight.dtype == torch.bfloat16
         )
         self.o_norm = FusedRMSNormGated(self.head_dim, activation="sigmoid")
+        # The fused decode chain takes the paired-gate inputs (f_a, g_a) and
+        # runs the whole decode glue of the layer in two launches.
+        self.use_kda_chain = (
+            self.use_paired_gate_projection
+            and self.conv_size == 4
+            and self.head_dim == 128
+            and _use_kda_chain()
+        )
         self.o_proj = RowParallelLinear(
             self.projection_size,
             self.hidden_size,
@@ -513,6 +542,18 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 start = get_tensor_model_parallel_rank() * self.local_num_heads
                 beta = beta[..., start : start + self.local_num_heads]
             g_a = projected[3] if self.fuse_gate_a else self.g_a_proj(hidden_states)[0]
+            if self.use_kda_chain:
+                core_attn_out = torch.empty(
+                    (1, num_tokens, self.local_num_heads, self.head_dim),
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device,
+                )
+                torch.ops.vllm.kda_attention_chain(
+                    mixed_qkv, f_a, g_a, beta.unsqueeze(0), core_attn_out, self.prefix
+                )
+                core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
+                output[:] = self.o_proj(core_attn_out)[0]
+                return
             if self.use_paired_gate_projection:
                 g1, g_proj_states = torch.ops.vllm.kda_gate_pair(
                     f_a, g_a, self.f_b_proj.weight, self.g_b_proj.weight
@@ -543,6 +584,140 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
         core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
         output[:] = self.o_proj(core_attn_out)[0]
+
+    @eager_break_during_capture
+    def _forward_chain(
+        self,
+        mixed_qkv: torch.Tensor,
+        f_a: torch.Tensor,
+        g_a: torch.Tensor,
+        beta: torch.Tensor,
+        core_attn_out: torch.Tensor,
+    ) -> None:
+        """Decode batches through kda_chain_decode; anything else (prefill,
+        more than 8 rows per request) through the gate pair and _forward."""
+        forward_context = get_forward_context()
+        attn_metadata_raw = forward_context.attn_metadata
+        if attn_metadata_raw is None:
+            return
+        assert isinstance(attn_metadata_raw, dict)
+        m = attn_metadata_raw[self.prefix]
+        assert isinstance(m, GDNAttentionMetadata)
+        spec_rows = (
+            m.spec_state_indices_tensor.size(-1)
+            if m.spec_sequence_masks is not None
+            and m.spec_state_indices_tensor is not None
+            else 1
+        )
+        if m.num_prefills > 0 or spec_rows > 8:
+            g1, g2 = torch.ops.vllm.kda_gate_pair(
+                f_a, g_a, self.f_b_proj.weight, self.g_b_proj.weight
+            )
+            g1 = rearrange(g1, "n (h d) -> 1 n h d", d=self.head_dim)
+            g2 = rearrange(g2, "n (h d) -> n h d", d=self.head_dim)
+            self._forward(
+                mixed_qkv=mixed_qkv, g1=g1, g2=g2, beta=beta, core_attn_out=core_attn_out
+            )
+            return
+        from vllm.quixicore.ops import _qc
+
+        qc = _qc()
+        num_actual_tokens = m.num_actual_tokens
+        mixed_qkv = mixed_qkv[:num_actual_tokens]
+        f_a = f_a[:num_actual_tokens]
+        g_a = g_a[:num_actual_tokens]
+        beta = beta[:, :num_actual_tokens]
+        conv_state, recurrent_state = self.kv_cache
+        if not is_conv_state_dim_first():
+            conv_state = conv_state.transpose(-1, -2)
+        conv_weights = self.conv1d.weight.view(
+            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+        )
+        lower_bound = self.gate_lower_bound
+        common = dict(
+            conv_state=conv_state,
+            conv_weight=conv_weights,
+            f_w=self.f_b_proj.weight,
+            g_w=self.g_b_proj.weight,
+            A_log=self.A_log,
+            dt_bias=self.dt_bias,
+            state=recurrent_state,
+            norm_w=self.o_norm.weight,
+            scale=self.head_dim**-0.5,
+            lower_bound=lower_bound if lower_bound is not None else 0.0,
+            use_lower_bound=lower_bound is not None,
+            eps=self.o_norm.eps,
+            split=_KDA_CHAIN_SPLIT,
+        )
+        spec_out = non_spec_out = None
+        mixed_batch = m.spec_sequence_masks is not None and m.num_decodes > 0
+        if m.spec_sequence_masks is not None:
+            assert m.spec_state_indices_tensor is not None
+            assert m.spec_query_start_loc is not None
+            if mixed_batch:
+                idx = m.spec_token_indx
+                rows = (
+                    mixed_qkv.index_select(0, idx),
+                    f_a.index_select(0, idx),
+                    g_a.index_select(0, idx),
+                    beta.index_select(1, idx),
+                )
+                spec_out = torch.empty(
+                    (1, rows[0].size(0), self.local_num_heads, self.head_dim),
+                    dtype=core_attn_out.dtype,
+                    device=core_attn_out.device,
+                )
+            else:
+                rows = (mixed_qkv, f_a, g_a, beta)
+                spec_out = core_attn_out[:, :num_actual_tokens]
+            qc.kda_chain_decode(
+                rows[0],
+                conv_idx=m.spec_state_indices_tensor[:, 0][: m.num_spec_decodes],
+                f_a=rows[1],
+                g_a=rows[2],
+                raw_beta=rows[3],
+                state_indices=m.spec_state_indices_tensor,
+                cu_seqlens=m.spec_query_start_loc[: m.num_spec_decodes + 1],
+                accepted=m.num_accepted_tokens,
+                out=spec_out,
+                **common,
+            )
+        if m.spec_sequence_masks is None or mixed_batch:
+            assert m.non_spec_state_indices_tensor is not None
+            if mixed_batch:
+                idx = m.non_spec_token_indx
+                rows = (
+                    mixed_qkv.index_select(0, idx),
+                    f_a.index_select(0, idx),
+                    g_a.index_select(0, idx),
+                    beta.index_select(1, idx),
+                )
+                non_spec_out = torch.empty(
+                    (1, rows[0].size(0), self.local_num_heads, self.head_dim),
+                    dtype=core_attn_out.dtype,
+                    device=core_attn_out.device,
+                )
+            else:
+                rows = (mixed_qkv, f_a, g_a, beta)
+                non_spec_out = core_attn_out[:, :num_actual_tokens]
+            n_rows = rows[0].size(0)
+            qc.kda_chain_decode(
+                rows[0],
+                conv_idx=m.non_spec_state_indices_tensor[:n_rows],
+                f_a=rows[1],
+                g_a=rows[2],
+                raw_beta=rows[3],
+                state_indices=m.non_spec_state_indices_tensor[:n_rows],
+                cu_seqlens=None,
+                accepted=None,
+                out=non_spec_out,
+                **common,
+            )
+        if mixed_batch:
+            assert spec_out is not None and non_spec_out is not None
+            merged = core_attn_out[0, :num_actual_tokens]
+            merged.index_copy_(0, m.spec_token_indx, spec_out[0])
+            merged.index_copy_(0, m.non_spec_token_indx, non_spec_out[0])
 
     @eager_break_during_capture
     def _forward(
@@ -859,4 +1034,37 @@ direct_register_custom_op(
     op_func=kda_attention,
     mutates_args=["core_attn_out"],
     fake_impl=kda_attention_fake,
+)
+
+
+def kda_attention_chain(
+    mixed_qkv: torch.Tensor,
+    f_a: torch.Tensor,
+    g_a: torch.Tensor,
+    beta: torch.Tensor,
+    core_attn_out: torch.Tensor,
+    layer_name: str,
+) -> None:
+    layer = get_forward_context().no_compile_layers[layer_name]
+    layer._forward_chain(
+        mixed_qkv=mixed_qkv, f_a=f_a, g_a=g_a, beta=beta, core_attn_out=core_attn_out
+    )
+
+
+def kda_attention_chain_fake(
+    mixed_qkv: torch.Tensor,
+    f_a: torch.Tensor,
+    g_a: torch.Tensor,
+    beta: torch.Tensor,
+    core_attn_out: torch.Tensor,
+    layer_name: str,
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="kda_attention_chain",
+    op_func=kda_attention_chain,
+    mutates_args=["core_attn_out"],
+    fake_impl=kda_attention_chain_fake,
 )

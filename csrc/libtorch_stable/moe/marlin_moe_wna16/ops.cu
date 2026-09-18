@@ -25,6 +25,8 @@
 
 #include "kernel.h"
 
+#include <cstdlib>
+
 #include <torch/csrc/stable/accelerator.h>
 #include <torch/csrc/stable/library.h>
 #include <torch/csrc/stable/ops.h>
@@ -341,6 +343,16 @@ exec_config_t determine_exec_config(
   return exec_cfg;
 }
 
+
+// QC_PDL (read once): launch the MoE GEMM with programmatic stream
+// serialization; the kernel waits at entry (marlin_template.h).
+static bool marlin_pdl() {
+  static const bool v = [] {
+    const char* e = std::getenv("QC_PDL");
+    return e == nullptr || e[0] != '0';   // default on (record, 2026-09-17)
+  }();
+  return v;
+}
 void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                void* a_s, void* b_s, void* g_s, void* zp, void* g_idx,
                void* perm, void* a_tmp, void* sorted_token_ids,
@@ -530,6 +542,27 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                        max_shared_mem);
   // avoid ">>>" being formatted to "> > >"
   // clang-format off
+  if (marlin_pdl()) {
+    // Programmatic dependent launch: the grid may be scheduled while the
+    // routing kernels ahead of it on the stream are still running; the kernel
+    // waits at entry before reading them.
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = dim3(blocks);
+    cfg.blockDim = dim3(num_threads);
+    cfg.dynamicSmemBytes = max_shared_mem;
+    cfg.stream = stream;
+    cudaLaunchAttribute attr[1];
+    attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr[0].val.programmaticStreamSerializationAllowed = 1;
+    cfg.attrs = attr;
+    cfg.numAttrs = 1;
+    cudaLaunchKernelEx(&cfg, kernel,
+      
+      A_ptr, B_ptr, C_ptr, C_tmp_ptr, bias_ptr, a_s_ptr, b_s_ptr, g_s_ptr, zp_ptr, g_idx_ptr,
+      sorted_token_ids_ptr, expert_ids_ptr, num_tokens_past_padded_ptr,
+      topk_weights_ptr, top_k, mul_topk_weights, num_groups, prob_m,
+      prob_n, prob_k, locks, has_bias, use_atomic_add, use_fp32_reduce);
+  } else
   kernel<<<blocks, num_threads, max_shared_mem, stream>>>(
       A_ptr, B_ptr, C_ptr, C_tmp_ptr, bias_ptr, a_s_ptr, b_s_ptr, g_s_ptr, zp_ptr, g_idx_ptr,
       sorted_token_ids_ptr, expert_ids_ptr, num_tokens_past_padded_ptr,

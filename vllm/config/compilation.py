@@ -792,6 +792,7 @@ class CompilationConfig:
         "vllm::gdn_attention_core_xpu",
         "vllm::olmo_hybrid_gdn_full_forward",
         "vllm::kda_attention",
+        "vllm::kda_attention_chain",
         "vllm::sparse_attn_indexer",
         "vllm::rocm_aiter_sparse_attn_indexer",
         "vllm::glm5_next_pooled_indexer",

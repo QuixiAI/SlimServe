@@ -12,6 +12,35 @@ import torch
 
 from vllm.third_party.flash_linear_attention.ops.op import exp, log
 from vllm.triton_utils import tl, triton
+
+# Programmatic dependent launch (Phase 8 / P2): when QC_PDL is set the decode
+# kernels are launched with the programmatic-serialization attribute and start
+# with a trigger for their own successor plus a wait for their predecessor
+# (both no-ops without the attribute; kept out of the kernel entirely on
+# non-CUDA targets and for the A/B baseline through the PDL constexpr).
+def _pdl_enabled() -> bool:
+    import os
+    if os.environ.get("QC_PDL", "4") == "0":
+        return False
+    try:
+        import torch
+        return torch.cuda.is_available() and torch.version.hip is None
+    except Exception:
+        return False
+
+
+_PDL = _pdl_enabled()
+if _PDL:
+    from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
+else:
+    @triton.jit
+    def gdc_launch_dependents():
+        pass
+
+    @triton.jit
+    def gdc_wait():
+        pass
+
 from vllm.utils.math_utils import cdiv, next_power_of_2
 
 
@@ -167,7 +196,12 @@ def fused_recurrent_kda_fwd_kernel(
     USE_LOWER_BOUND: tl.constexpr,
     num_stages: tl.constexpr,
     STORE_STATES: tl.constexpr = True,
+
+    PDL: tl.constexpr = False,
 ):
+    if PDL:
+        gdc_launch_dependents()
+        gdc_wait()
     pid = tl.program_id(0)
     i_v = pid % tl.cdiv(V, BV)
     i_nh = pid // tl.cdiv(V, BV)
@@ -331,7 +365,12 @@ def fused_recurrent_kda_commit_kernel(
     HAS_DT_BIAS: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
     num_stages: tl.constexpr,
+
+    PDL: tl.constexpr = False,
 ):
+    if PDL:
+        gdc_launch_dependents()
+        gdc_wait()
     """Deferred commit for the speculative path: replay the ACCEPTED rows of
     the step from the state the forward started at and store only what the
     next step and the align bookkeeping read - the state after the last
@@ -483,6 +522,9 @@ def fused_recurrent_kda_commit(
         APPLY_BETA_SIGMOID=True,
         num_warps=num_warps,
         num_stages=2,
+    
+        PDL=_PDL,
+        launch_pdl=_PDL,
     )
 
 def fused_recurrent_kda_fwd(
@@ -580,6 +622,9 @@ def fused_recurrent_kda_fwd(
         num_warps=num_warps,
         num_stages=2,
         STORE_STATES=store_states,
+    
+        PDL=_PDL,
+        launch_pdl=_PDL,
     )
     return out, initial_state
 
@@ -667,7 +712,12 @@ def fused_recurrent_kda_packed_decode_kernel(
     BV: tl.constexpr,
     SOFTPLUS_THRESHOLD: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
+
+    PDL: tl.constexpr = False,
 ):
+    if PDL:
+        gdc_launch_dependents()
+        gdc_wait()
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
 
@@ -831,5 +881,8 @@ def fused_recurrent_kda_packed_decode(
         USE_LOWER_BOUND=lower_bound is not None,
         num_warps=decode_warps,
         num_stages=2,
+    
+        PDL=_PDL,
+        launch_pdl=_PDL,
     )
     return out, initial_state

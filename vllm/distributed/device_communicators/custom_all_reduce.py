@@ -4,6 +4,7 @@
 from contextlib import contextmanager
 from typing import cast
 
+import os
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
@@ -384,7 +385,9 @@ class CustomAllreduce:
     # Above this batch the split path (one-shot all-reduce + the Triton pair)
     # is faster: the fused kernel walks the tokens of a group serially per
     # block, the Triton partials kernel spreads them over the whole GPU.
-    _GLM5_MHC_FUSE_TOKENS = 8
+    # With QC_MHC_RS=<n> (the reduce-scatter exchange from n tokens up, see
+    # glm5_mhc_allreduce.cuh) the fused site serves every decode batch.
+    _GLM5_MHC_FUSE_TOKENS = 64 if int(os.environ.get("QC_MHC_RS", "5")) > 0 else 8
     # Serving fuses inside captured decode graphs only. Eager fused launches
     # (a newcomer's tail or a tiny prompt beside a decoding request) were
     # seen on 2026-09-14 beside a corruption that the placeholder-draft fix

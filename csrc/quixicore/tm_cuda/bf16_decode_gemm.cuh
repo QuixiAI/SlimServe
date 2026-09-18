@@ -17,6 +17,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace tms::decode_gemm {
@@ -59,6 +60,54 @@ template <typename OutT> __device__ __forceinline__ OutT to_out(float v);
 template <> __device__ __forceinline__ float to_out<float>(float v) { return v; }
 template <> __device__ __forceinline__ __nv_bfloat16 to_out<__nv_bfloat16>(float v) { return __float2bfloat16_rn(v); }
 
+// Programmatic dependent launch (sm_90+). With the launch attribute set, the
+// grid may begin before the preceding kernel on the stream has finished:
+// `pdl_trigger` lets the NEXT kernel start early, `pdl_wait` blocks until every
+// preceding kernel has completed and its writes are visible. Everything
+// between the two that does not read a predecessor's output - here the
+// block's whole weight slice, pulled into L2 - overlaps the predecessor's
+// tail (an all-reduce spinning on PCIe flags, a latency-bound glue kernel).
+// Both are no-ops when the kernel was launched without the attribute.
+__device__ __forceinline__ void pdl_trigger() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
+}
+__device__ __forceinline__ void pdl_wait() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+}
+__device__ __forceinline__ void prefetch_l2(const void* p) {
+    asm volatile("prefetch.global.L2 [%0];" ::"l"(p));
+}
+// Bulk L2 prefetch (sm_90+): one instruction per contiguous span, 16-byte
+// aligned, size a multiple of 16; unlike the line hint it is not dropped
+// under load.
+__device__ __forceinline__ void prefetch_bulk_l2(const void* p, uint32_t bytes) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(p), "r"(bytes) : "memory");
+#endif
+}
+// A real 16-byte load whose result is kept alive: pulls the line into L2 (and
+// L1) through the LSU with true memory-level parallelism.
+__device__ __forceinline__ void touch_l2(const void* p) {
+    uint32_t a, b, c, d;
+    asm volatile("ld.global.L2::128B.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(a), "=r"(b), "=r"(c), "=r"(d) : "l"(p) : "memory");
+    asm volatile("" ::"r"(a), "r"(b), "r"(c), "r"(d));
+}
+
+// QC_PDL: 0 off; 1 line-hint prefetch; 2 bulk L2 prefetch; 3 real loads;
+// 4 the attribute, trigger and wait only (no prefetch).
+inline int pdl_mode() {
+    static const int v = [] {
+        const char* e = std::getenv("QC_PDL");
+        return e != nullptr ? std::atoi(e) : 4;   // default: mode 4 (record, 2026-09-17)
+    }();
+    return v;
+}
+inline bool use_pdl() { return pdl_mode() != 0; }
+
 template <int NT, int WARPS, int KCHUNK, int STAGES>
 struct Cfg {
     static constexpr int THREADS = WARPS * 32;
@@ -83,7 +132,7 @@ __global__ void __launch_bounds__(WARPS * 32) bf16_decode_gemm_kernel(
         const __nv_bfloat16* __restrict__ w,     // [N, K]
         const float* __restrict__ bias,          // [N] or nullptr
         OutT* __restrict__ out,                  // [M, N]
-        int M, int N, int K) {
+        int M, int N, int K, int pdl) {
     using C = Cfg<NT, WARPS, KCHUNK, STAGES>;
     extern __shared__ __align__(16) unsigned char smem_raw[];
     __nv_bfloat16* smem = reinterpret_cast<__nv_bfloat16*>(smem_raw);
@@ -91,6 +140,27 @@ __global__ void __launch_bounds__(WARPS * 32) bf16_decode_gemm_kernel(
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int n0 = blockIdx.x * NT;
     const int nchunks = K / KCHUNK;
+    if (pdl) {
+        pdl_trigger();
+        // bf16 rows: 2 * K bytes each, contiguous; the weight slice does not
+        // depend on the predecessor.
+        const size_t row_bytes = size_t(K) * 2;
+        if (pdl == 4) {
+            // launch overlap only: no prefetch
+        } else if (pdl == 2) {
+            if (tid < NT) prefetch_bulk_l2(w + size_t(min(n0 + tid, N - 1)) * K, uint32_t(row_bytes));
+        } else {
+            const size_t lines_per_row = row_bytes / 128;
+            for (size_t i = tid; i < size_t(NT) * lines_per_row; i += C::THREADS) {
+                const int r = int(i / lines_per_row);
+                const size_t off = (i - size_t(r) * lines_per_row) * 128;
+                const int n = min(n0 + r, N - 1);
+                if (pdl == 3) touch_l2(reinterpret_cast<const unsigned char*>(w + size_t(n) * K) + off);
+                else prefetch_l2(reinterpret_cast<const unsigned char*>(w + size_t(n) * K) + off);
+            }
+        }
+        pdl_wait();
+    }
 
     auto stage_x = [&](int s) { return smem + s * C::STAGE; };
     auto stage_w = [&](int s) { return smem + s * C::STAGE + C::X_TILE; };
@@ -211,7 +281,21 @@ static inline void launch(const __nv_bfloat16* x, const __nv_bfloat16* w, const 
         configured_device = device;
     }
     const int blocks = (N + NT - 1) / NT;
-    kern<<<blocks, C::THREADS, C::SMEM_BYTES, stream>>>(x, w, bias, out, M, N, K);
+    if (use_pdl()) {
+        cudaLaunchConfig_t cfg = {};
+        cfg.gridDim = dim3(blocks);
+        cfg.blockDim = dim3(C::THREADS);
+        cfg.dynamicSmemBytes = C::SMEM_BYTES;
+        cfg.stream = stream;
+        cudaLaunchAttribute attr[1];
+        attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attr[0].val.programmaticStreamSerializationAllowed = 1;
+        cfg.attrs = attr;
+        cfg.numAttrs = 1;
+        check_cuda_status(cudaLaunchKernelEx(&cfg, kern, x, w, bias, out, M, N, K, pdl_mode()));
+    } else {
+        kern<<<blocks, C::THREADS, C::SMEM_BYTES, stream>>>(x, w, bias, out, M, N, K, 0);
+    }
 }
 
 // Production configs (microbench 2026-09-07, gemm16_bench.py on RTX PRO 6000): 32 rows /

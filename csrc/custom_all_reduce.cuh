@@ -37,6 +37,9 @@ namespace vllm {
 
 // Maximal number of blocks in allreduce kernel.
 constexpr int kMaxBlocks = 64;
+// Block cap of the GLM-5.3 fused transition (token chunks x dimension
+// blocks); it has its own barrier slots below.
+constexpr int kMhcMaxBlocks = 256;
 
 // Default number of blocks in allreduce kernel.
 #ifndef USE_ROCM
@@ -62,6 +65,11 @@ struct Signal {
   alignas(128) FlagType start[kMaxBlocks][8];
   alignas(128) FlagType end[kMaxBlocks][8];
   alignas(128) FlagType _flag[kMaxBlocks];  // incremental flags for each rank
+  // GLM-5.3 fused transition barriers (glm5_mhc_allreduce.cuh), one slot
+  // per block of its larger grid.
+  alignas(128) FlagType mhc_start[kMhcMaxBlocks][8];
+  alignas(128) FlagType mhc_end[kMhcMaxBlocks][8];
+  alignas(128) FlagType mhc_flag[kMhcMaxBlocks];
   // DSV4 TP-owned mHC projection state. Urgent coefficients are published
   // before the existing end epoch; deferred coefficients are published by the
   // auxiliary stream and made visible by the next existing start epoch.
@@ -112,6 +120,17 @@ struct packed_t {
 };
 
 #define DINLINE __device__ __forceinline__
+
+// Programmatic dependent launch: let the kernel queued behind this one on the
+// stream begin its prologue now (it still blocks in griddepcontrol.wait until
+// this grid has fully completed before touching anything we produce). No-op
+// unless the successor was launched with the programmatic-serialization
+// attribute; no-op below sm_90.
+DINLINE void pdl_launch_dependents() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
+}
 
 // scalar cast functions
 DINLINE float upcast_s(half val) { return __half2float(val); }
@@ -336,6 +355,7 @@ __global__ void __launch_bounds__(512, 1)
   // note: we don't reorder the address so the accumulation order is the same
   // for all ranks, ensuring bitwise identical results
   auto dp = *_dp;
+  pdl_launch_dependents();
   barrier_at_start<ngpus>(sg, self_sg, rank);
   // do the actual reduction
   for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size;
@@ -365,6 +385,7 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_norm_1stage(
   P* out_v = (P*)result;
   const P* w_v = (const P*)weight;
   const int hidden_size = vec_hidden_size * P::size;
+  pdl_launch_dependents();
   barrier_at_start<ngpus>(sg, self_sg, rank);
   for (int token = blockIdx.x; token < num_tokens; token += gridDim.x) {
     const int base = token * vec_hidden_size;
@@ -436,6 +457,7 @@ __global__ void __launch_bounds__(512, 1)
     tmps[i] = get_tmp_buf<P>(sg.signals[target]);
   }
   auto tmp_out = tmps[0];
+  pdl_launch_dependents();
   barrier_at_start<ngpus>(sg, self_sg, rank);
 
   // stage 1: reduce scatter
@@ -1243,6 +1265,16 @@ class CustomAllreduce {
   // GLM-5.3 decode: the TP all-reduce of `input` ([num_tokens, 4096] bf16,
   // registered or captured like every custom all-reduce input) fused with the
   // mHC transition; see quixicore/serving/glm5_mhc_allreduce.cuh.
+  // QC_MHC_RS=<tokens>: from that many tokens the fused site exchanges by
+  // reduce-scatter + all-gather (read once per process; 0 = off).
+  static int glm5_mhc_rs_min_tokens() {
+    static const int v = [] {
+      const char* e = std::getenv("QC_MHC_RS");
+      return e != nullptr ? std::atoi(e) : 5;   // default: reduce-scatter exchange from 5 rows (record, 2026-09-17)
+    }();
+    return v;
+  }
+
   template <bool FUSED_NORM>
   void allreduce_glm5_mhc(
       cudaStream_t stream, nv_bfloat16* input, const nv_bfloat16* residual,
@@ -1274,8 +1306,12 @@ class CustomAllreduce {
     // comb_mix is the previous site's deferred output.
     wait_glm5_mhc(stream);
     const int mhc_chunks = glm5_mhc_ar::token_chunks(num_tokens);
-#define GLM5_MHC_AR_LAUNCH(NGPU)                                              \
-  glm5_mhc_ar::allreduce_transition<NGPU, FUSED_NORM>                        \
+    // Reduce-scatter exchange from QC_MHC_RS tokens up (0 = never; the
+    // one-shot peer reads stay the path below it).
+    const bool rs = glm5_mhc_rs_min_tokens() > 0 &&
+                    num_tokens >= glm5_mhc_rs_min_tokens();
+#define GLM5_MHC_AR_LAUNCH(NGPU, RS)                                          \
+  glm5_mhc_ar::allreduce_transition<NGPU, FUSED_NORM, RS>                    \
       <<<glm5_mhc_ar::NBLOCKS * mhc_chunks, glm5_mhc_ar::THREADS, 0,         \
          stream>>>(                                                           \
           ptrs, sg_, self_sg_, residual, post_mix, comb_mix, fn,             \
@@ -1284,13 +1320,13 @@ class CustomAllreduce {
           post_multiplier, sinkhorn_repeat, norm_eps, rank_, num_tokens)
     switch (world_size_) {
       case 2:
-        GLM5_MHC_AR_LAUNCH(2);
+        if (rs) GLM5_MHC_AR_LAUNCH(2, true); else GLM5_MHC_AR_LAUNCH(2, false);
         break;
       case 4:
-        GLM5_MHC_AR_LAUNCH(4);
+        if (rs) GLM5_MHC_AR_LAUNCH(4, true); else GLM5_MHC_AR_LAUNCH(4, false);
         break;
       case 8:
-        GLM5_MHC_AR_LAUNCH(8);
+        if (rs) GLM5_MHC_AR_LAUNCH(8, true); else GLM5_MHC_AR_LAUNCH(8, false);
         break;
       default:
         throw std::runtime_error(

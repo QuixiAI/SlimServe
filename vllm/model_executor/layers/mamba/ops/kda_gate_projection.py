@@ -11,6 +11,35 @@ import torch
 import torch.nn.functional as F
 
 from vllm.triton_utils import tl, triton
+
+# Programmatic dependent launch (Phase 8 / P2): when QC_PDL is set the decode
+# kernels are launched with the programmatic-serialization attribute and start
+# with a trigger for their own successor plus a wait for their predecessor
+# (both no-ops without the attribute; kept out of the kernel entirely on
+# non-CUDA targets and for the A/B baseline through the PDL constexpr).
+def _pdl_enabled() -> bool:
+    import os
+    if os.environ.get("QC_PDL", "4") == "0":
+        return False
+    try:
+        import torch
+        return torch.cuda.is_available() and torch.version.hip is None
+    except Exception:
+        return False
+
+
+_PDL = _pdl_enabled()
+if _PDL:
+    from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
+else:
+    @triton.jit
+    def gdc_launch_dependents():
+        pass
+
+    @triton.jit
+    def gdc_wait():
+        pass
+
 from vllm.utils.torch_utils import direct_register_custom_op
 
 
@@ -28,7 +57,12 @@ def _gate_pair_kernel(
     SG: tl.constexpr,
     BM: tl.constexpr,
     BN: tl.constexpr,
+
+    PDL: tl.constexpr = False,
 ):
+    if PDL:
+        gdc_launch_dependents()
+        gdc_wait()
     group = tl.program_id(2)
     ap = tl.where(group == 0, AF, AG)
     wp = tl.where(group == 0, WF, WG)
@@ -90,6 +124,9 @@ def kda_gate_pair(
         16,
         bn,
         num_warps=4,
+    
+        PDL=_PDL,
+        launch_pdl=_PDL,
     )
     return out_f, out_g
 
