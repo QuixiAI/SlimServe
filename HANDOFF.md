@@ -131,6 +131,22 @@ six-pass A/B), P5 (+2 % c8 spec), then the fixed cost every shape pays
 pair itself has ~4.5 us per layer left to the card's rate. Scripts: `$S/p8/bench_moe_decode2.py` (cold per-kernel, honours
 QC_PDL), `$S/p9/mb.cu` (standalone nvcc microbench), `$S/p8/chain_p9{,b,c}.sh`,
 `$S/p8/trace_moe_kinds.py`; raw `perf/results/2026-09-17/p9-moe-decode/`.
+PR #29 updated 2026-09-18 16:50 PDT at 649c319a5 (Phase 8 section and the
+record table in the body; CodeRabbit round pending). P12 measured level
+(k=1 vs k=2 at c16, record unchanged); P13a (NVFP4 for the MTP experts)
+level everywhere, opt-in; the draft step's cost is launch latency
+(lm_head 104 us, logits all-gather 61, ~25 sampling kernels, ~25 MTP-layer
+launches), not bytes. Pre-existing on the branch, not from Phase 8:
+`tests/slimserve/test_profiles.py::test_every_profile_source_names_a_blessed_dspark_download`
+fails because the `glm53f-gguf` source has no `speculator` entry.
+Remaining levers, each 1-4 %: the per-layer copies (two memcpys plus the
+inductor slice/copy kernels, ~3 us per layer at every shape), the shared
+expert absorbed into the pair (c1 only), a draft-only NVFP4 lm_head and the
+P5 candidate gather (spec only), the pair's last 4.5 us per layer to the
+card's rate. The fixed ~2 ms per step of per-layer launch latency (about
+25 launches per layer against ~50 us of bytes) is what separates every
+shape from its physics floor (c1 ~2.3 ms per step against 4.5) and needs a
+layer-level fusion design, not another kernel.
 
 <!--
 The campaign handoffs in this file cover different
