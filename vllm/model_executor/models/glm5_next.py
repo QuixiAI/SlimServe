@@ -79,9 +79,6 @@ from vllm.model_executor.layers.mla import (
     MLAModules,
     MultiHeadLatentAttentionWrapper,
 )
-from vllm.model_executor.layers.quantization.base_config import (
-    QuantizationConfig,
-)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -94,8 +91,6 @@ from vllm.model_executor.models.interfaces import (
     SupportsPP,
 )
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
-    PPMissingLayer,
     is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     make_layers,
@@ -1264,7 +1259,6 @@ class Glm5NextForConditionalGeneration(
         super().__init__()
         config = vllm_config.model_config.hf_config
         self.config = config
-        quant_config = vllm_config.quant_config
         with self._mark_tower_model(vllm_config, "image"):
             self.visual = Glm5NextVisionTransformer(
                 config.vision_config,
