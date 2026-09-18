@@ -115,6 +115,11 @@ def parse_args() -> argparse.Namespace:
         "expert payloads when enabled on the server. Routing capture adds "
         "server/transport overhead; such runs are not baseline TPS.",
     )
+    parser.add_argument(
+        "--output-json",
+        default=None,
+        help="Write the exact benchmark summary to this path in addition to stdout.",
+    )
     return parser.parse_args()
 
 
@@ -371,7 +376,12 @@ def main() -> None:
         "exact": prompt_counts == [args.input_tokens] * args.concurrency
         and completion_counts == [args.output_tokens] * args.concurrency,
     }
-    print(json.dumps(summary, indent=2, sort_keys=True))
+    encoded_summary = json.dumps(summary, indent=2, sort_keys=True)
+    if args.output_json:
+        output_path = Path(args.output_json)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(encoded_summary + "\n")
+    print(encoded_summary)
     if not summary["exact"]:
         raise SystemExit("server did not honor the exact benchmark token counts")
     if (
