@@ -82,6 +82,24 @@ eager fused all-reduce path re-probed clean on 2026-09-17 (the D5
 corruption was the placeholder-draft bug; the graph-only gate stays as the
 measured configuration). NOT the native sm_120 NVFP4 expert kernel: the
 expert GEMM already reads at 96 % of the card's bandwidth.
+P4 landed after (fp8-swapset-mla: the DSA q_a/kv_a projections native fp8
+and the indexer wq_b self-quantized; +1.8 / +0.8 / +0.6 % plain). Record
+2026-09-17 22:00 PDT (no extra environment): plain 207.6 / 765-772 /
+1111-1114 (+25 / +12 / +15 % on the control), spec six-pass medians c8
+826.5 / c16 1097.2 (+13 / +9 %; c1 spec single passes 311-318). The
+six-pass A/B against the 19:56 record configuration read c8 spec level and
+c16 spec +3 %; spec passes ramp within a boot, so six passes and medians
+are the rule. Sizing round 22:30 PDT (notebook "Sizing the next levers",
+campaign doc 14.1): the Marlin expert GEMM is at 90-95 % of the card's
+1.62 TB/s from 8 rows up (no c8/c16 kernel lever there) but at 62 % at one
+row (28 us per layer against 17.5), the small fp8 dense shapes run at
+0.66-1.15 TB/s on a 128-CTA grid with no K split, and the router chain is
+0.35 ms of launch-latency work per c1 step. Next in order: P11 cluster
+split-K for the decode GEMMs (+5-6 % c1, +3 % c8, +2 % c16), P9 fused
+expert GEMV pair at one row (+8 % c1 plain), P10 router chain (+3.5 % c1),
+P12 the c16 schedule entry (c16 spec sits below c16 plain), P5. Scripts:
+`$S/p8/bench_moe_rotate.py`, `bench_moe_cfg.py`, `bench_small_dense.py`;
+raw `perf/results/2026-09-17/p9-moe-decode/`.
 
 <!--
 The campaign handoffs in this file cover different

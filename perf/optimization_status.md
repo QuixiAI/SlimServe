@@ -30219,3 +30219,103 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   every boot, so the spread is not the drafter losing the target; the
   six-pass A/B (`$S/p8/chain_ab6.sh`: the 19:56 record configuration
   against today's record, c8 and c16 spec, six passes each) settles it.
+
+- PHASE 8 / SIX-PASS SPEC A/B, OLD RECORD CONFIGURATION AGAINST TODAY'S RECORD
+  (2026-09-17 21:55-22:08 PDT, `$S/p8/chain_ab6.sh`, ab2.sh exact-token
+  1000/300 with `--spec`, six passes per shape on one boot per arm). Arm A is
+  the 19:56 record (SLIMSERVE_NVFP4_SWAPSET=0, SLIMSERVE_FP8_SWAPSET=
+  fp8-swapset-lmhead, the profile's mamba_ssm_cache_dtype line removed for
+  the boot and restored after); arm B is the record as committed (P6 in_proj
+  sidecar, P8 bf16 state, P4 fp8-swapset-mla).
+  | arm | c8 spec passes 1..6 | median | c16 spec passes 1..6 | median |
+  |---|---|---|---|---|
+  | A old record | 744.1 833.4 801.7 831.7 839.1 821.8 | 826.8 | 1011.4 1028.3 1061.2 1065.1 1145.1 1151.1 | 1063.2 |
+  | B today | 804.0 792.9 862.4 840.8 859.5 812.1 | 826.5 | 1043.3 1079.5 1103.6 1103.1 1096.1 1098.3 | 1097.2 |
+  c8 spec level (826.8 vs 826.5), c16 spec +3.2 %. Both boots ramp within
+  the boot (A's c16 1011 -> 1151, B's c8 793 -> 862): the pass order moves
+  a spec number more than the arm does, which is why single passes have
+  read anywhere in 716-862 today. The plain gains of the day stand (c1 +6
+  %, c8 +4 %, c16 +3 %); with speculation the day is level at c8 and +3 %
+  at c16. Against the control's spec 732.1 / 1005.8: c8 +13 %, c16 +9 %.
+  Observation for the schedule: c16 spec (1097) is below c16 plain (1112)
+  on this record. With two drafts at c16 the step reads ~212 experts per
+  layer for 16 x 2.07 accepted tokens, plain reads ~105 for 16: the
+  expert-stream cap is ~1740 against ~1640 tok/s, so the extra rows buy
+  almost nothing and the verify overhead eats it. Item P12 below.
+  Raw: `$S/serve-logs/ab-ab6{old,new}-spec.out`, `perf/results/2026-09-17/ab6*`.
+  `slimserve/profiles.json` verified restored (git diff clean).
+
+- PHASE 8 / SIZING THE NEXT LEVERS: MOE DECODE GEMM, SMALL FP8 SHAPES, C1 GLUE
+  (2026-09-17 22:08-22:30 PDT, GPU 0 idle, CUDA-graph replay, QC_PDL=0 so
+  kernel durations carry no dependent-launch entry waits; every call reads
+  fresh random experts of two 1 GB layer copies / rotating weight copies past
+  the 128 MB L2. Raw: `perf/results/2026-09-17/p9-moe-decode/`, scripts
+  `$S/p8/bench_moe_rotate.py`, `bench_moe_cfg.py`, `bench_small_dense.py`).
+  (1) Marlin MoE at the record's per-rank expert geometry (K 4096, N 512,
+  288 experts, top-8, moe_block_size 8; gemm1 + act + gemm2, alignment
+  precomputed), us per layer and TB/s over the touched-expert bytes (3.54 MB
+  per expert):
+  | rows (tokens x 8) | experts | us | MB | TB/s |
+  |---|---|---|---|---|
+  | 1 x 8 | 8.0 | 28.0 | 28.3 | 1.01 |
+  | 2 x 8 | 15.8 | 43.9 | 55.9 | 1.27 |
+  | 4 x 8 | 31.1 | 79.1 | 110.1 | 1.39 |
+  | 8 x 8 | 57.8 | 138.8 | 204.7 | 1.47 |
+  | 16 x 8 | 103.4 | 238.2 | 365.8 | 1.54 |
+  The launcher's config sweep (thread_k/thread_n in 128/128, 64/128, 128/64
+  x blocks_per_sm 1-4, gemm1 and gemm2 separately): the launcher's own
+  choice is the best or within 1 % at every shape (M=1: gemm1 16.0 us =
+  1.18 TB/s, gemm2 9.7 = 0.97; M=8: 88.4 = 1.55, 43.5 = 1.57; M=16: 158.4 =
+  1.57, 82.2 = 1.51). Read ceiling of the card (torch.sum over rotating
+  buffers): 1.62 TB/s at 512 MB, 1.56 at 128 MB, 1.35 at 32 MB. So from 8
+  rows up the expert stream runs at 90-95 % of the card (the notebook's "96
+  %" stands; c8/c16 have no MoE-kernel lever) and at one row it runs at 62
+  %: 28.0 us against ~17.5 at the ceiling = 0.44 ms of the 4.8 ms c1 step,
+  the c1 spec drafter's 1-row MoE included. The 1-row loss is structural
+  (128 n-tiles x split-K 3 over 376 persistent blocks, each streaming 44 KB
+  behind a 4-stage pipeline and a locked fp32 reduce): item P9.
+  (2) fp8 decode GEMM, the small dense shapes, cold (us, TB/s; M = 1):
+  shared gate_up 1024x4096 5.95 (0.70), shared down 4096x512 3.16 (0.66),
+  KDA/MLA o_proj 4096x2048 7.27 (1.15), MLA q_b 4096x1536 6.06 (1.04), dense
+  down 4096x3072 10.4 (1.21); M = 8 within 0.5 us of these. The grid is
+  N / NT = 128 CTAs on 188 SMs with no K split (4-8 x 128-byte stages in
+  flight per CTA). The QC_FP8_WIDE 0-6 configurations re-swept cold: the
+  shipped one is the best at every shape (`fp8_wide_cold_sweep.txt`; the
+  2026-09-07 sweep was L2-hot). Per c1 step these shapes cost 42 x (5.95 +
+  3.16) + 45 x 7.27 + 11 x 6.1 = 0.78 ms against ~0.47 at 1.5 TB/s: item
+  P11 (0.3 ms = 6 % at c1, ~3 % at c8, ~2 % at c16).
+  (3) The c1 record trace (`$S/profile-p6in-c1`, PDL on, so durations include
+  entry waits): 1293 launches per 4.9 ms step; classes per step: other 1.70
+  ms (370 launches at 4.6 us), fp8 decode gemm 1.39 (144), marlin moe 1.13
+  (83), marlin dense 0.65 (33; true 12.5 us each = 0.41), bf16 decode gemm
+  0.37 (22: fused_qkv_a + indexer wq_b, since moved to fp8 by P4), KDA
+  recurrence+conv 0.24 (67), router cuBLAS gemv 0.22 (63 at 3.5 us), Triton
+  norms/adds 0.18 (146 at 1.2), sparse MLA 0.14, moe glue 0.14 (93 at 1.4),
+  aten elementwise 0.13 (141), copies 0.07 (96). The router chain (router
+  GEMV 3.3 + topKPerRow 0.9 + route_align 4.0 us, 42 layers) is 0.35 ms of
+  launch-latency-bound work per step: item P10.
+  PLAN (worked in this order, each its own arm with parity test, cold
+  microbench, ab2 exact bench in both modes, gates, notebook entry, commit):
+  P11 cluster split-K for the fp8 (then bf16) decode GEMM at small N x K: a
+  thread-block cluster of 2-4 CTAs along K (sm_120 reports
+  cudaDevAttrClusterLaunch = 1), every CTA runs today's pipeline on its K
+  share, rank 0 sums the peers' [MT x NT] fp32 partials through distributed
+  shared memory in fixed rank order (deterministic, no workspace, no
+  counters, graph-capturable with the PDL attribute); grid = N/NT x split.
+  Expected: shared gate_up 5.95 -> ~3.5 us, shared down 3.2 -> ~2.2, o_proj
+  7.3 -> ~5.6, q_b 6.1 -> ~4.3; -0.25..0.3 ms c1 (+5-6 %), -0.3 ms c8 (+3 %),
+  +2 % c16.
+  P9 MoE decode at one row: a fused expert GEMV pair over the Marlin weight
+  layout (gemm1 + SiLU in one kernel: CTA per expert x 32-column gate/up
+  pair, 8 warps split K, fixed-order smem reduce; gemm2 + the top-k
+  weighted sum over the 8 experts in the other: CTA per 32 output columns,
+  warp per expert, fixed-order reduce), replacing Marlin x 2 + act +
+  moe_sum at c1 plain and in the drafter; target 28 -> ~19 us per layer =
+  -0.38 ms (+8 % c1 plain, ~+1 % c1 spec, 0 at c8+). Marlin keeps every
+  other shape.
+  P10 router chain at decode: router GEMV + top-k + route_align in one
+  kernel per layer (-0.17 ms: +3.5 % c1, +1.5 % c8).
+  P12 the c16 schedule entry: six-pass A/B of [9,16,1] and no drafts at c16
+  against [9,16,2] (a profile change; the c16 spec number is the one
+  furthest under its plain number).
+  P5 unchanged (+2 % c8 spec).

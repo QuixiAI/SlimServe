@@ -1273,3 +1273,22 @@ Realistic landing if P1b-P6 hold: c1 270-285 tok/s (spec 420-450), c8
 % / +30 %. The literal floors are 350 / 470 / 1040 / 1240 / 1400. At c16 the
 margin is physically capped near +45 % because the expert stream, which the
 control reads at the same rate, is three quarters of the floor there.
+
+### 14.1 Sizing round of 2026-09-17 22:30 PDT: what is left and the order
+
+The six-pass spec A/B (old record configuration against today's record)
+settled the day: c8 spec level (826.8 vs 826.5), c16 spec +3 % (1063 ->
+1097), plain +6 / +4 / +3 %. Cold rotating microbenches (notebook entry
+"Sizing the next levers") then measured every candidate against the card's
+1.62 TB/s read ceiling:
+
+| item | measured | expected per step |
+|---|---|---|
+| P11 cluster split-K for the fp8/bf16 decode GEMM at small N x K | shared gate_up 5.95 us (0.70 TB/s), shared down 3.16 (0.66), o_proj 7.27 (1.15), q_b 6.06 (1.04): 128 CTAs on 188 SMs, no K split; the shipped config is the best of the seven cold | -0.25..0.3 ms c1 (+5-6 %), -0.3 ms c8 (+3 %), +2 % c16 |
+| P9 fused expert GEMV pair over the Marlin layout at one row (gemm1+SiLU, gemm2+weighted sum) | Marlin MoE at 1 x 8 rows: 28.0 us per layer = 1.01 TB/s (62 % of the ceiling); at 8 rows 1.47, at 16 rows 1.54 TB/s (90-95 %: c8/c16 have no MoE-kernel lever) | -0.38 ms c1 plain (+8 %), ~+1 % c1 spec, 0 at c8+ |
+| P10 router chain in one kernel (router GEMV 3.3 us + top-k 0.9 + route_align 4.0) | 0.35 ms per c1 step at launch latency | -0.17 ms (+3.5 % c1, +1.5 % c8) |
+| P12 the c16 schedule entry | c16 spec 1097 sits below c16 plain 1112; the expert-stream cap with 2 drafts (~1740) is barely above plain's (~1640) | c16 spec + a few % if [9,16,1] or no drafts wins the six-pass A/B |
+| P5 candidate gather | unchanged | +2 % c8 spec |
+
+Order: P11, P9, P10, P12, P5. Launch latency itself is hidden (P1's
+finding); what these items remove is real kernel time at small shapes.
