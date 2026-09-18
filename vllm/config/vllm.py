@@ -569,9 +569,13 @@ class VllmConfig:
             f",fp8={decode_gemm_fp8_enabled()}"
         )
         from slimserve.fp8_swapset import hash_factor
+        from slimserve.nvfp4_swapset import hash_factor as nvfp4_hash_factor
 
         vllm_factors.append(
             hash_factor(self.model_config.model if self.model_config else None)
+        )
+        vllm_factors.append(
+            nvfp4_hash_factor(self.model_config.model if self.model_config else None)
         )
         factors.append(vllm_factors)
 

@@ -108,6 +108,50 @@ logger = init_logger(__name__)
 F32_OVERRIDES_ENV = "SLIMSERVE_F32_OVERRIDES"
 
 
+def _load_nvfp4_swapset(
+    model_path: str | None,
+) -> tuple[dict[str, torch.Tensor | None], dict[str, torch.Tensor]]:
+    """(checkpoint weights to consume, NVFP4 tensors to inject) from the
+    sidecar ``slimserve.nvfp4_swapset`` wrote next to the checkpoint; empty
+    when it is absent or ``SLIMSERVE_NVFP4_SWAPSET`` is unset. Each swapped
+    ``<shard>.weight`` is consumed (never copied into the packed parameter)
+    and ``<shard>.weight_packed`` / ``.weight_scale`` /
+    ``.weight_global_scale`` take its place; the config group that makes
+    those modules NVFP4A16 comes from the same manifest."""
+    import os
+
+    from slimserve.nvfp4_swapset import load_manifest
+
+    manifest = load_manifest(model_path)
+    if manifest is None or not manifest["tensors"]:
+        return {}, {}
+    from safetensors.torch import load_file
+
+    file = os.path.join(os.path.dirname(manifest["path"]), manifest["file"])
+    tensors = load_file(file)
+    wanted = set(manifest["tensors"])
+    missing = wanted - set(tensors)
+    if missing:
+        raise ValueError(f"{file}: {len(missing)} manifest tensors missing, e.g. {sorted(missing)[0]}")
+    extras = {k: tensors[k] for k in wanted}
+    consume: dict[str, torch.Tensor | None] = {shard + ".weight": None for shard in manifest["shards"]}
+    for k, v in extras.items():
+        ok = (
+            (k.endswith(".weight_packed") and v.dtype == torch.uint8)
+            or (k.endswith(".weight_scale") and v.dtype == torch.float8_e4m3fn)
+            or (k.endswith(".weight_global_scale") and v.dtype == torch.float32)
+        )
+        if not ok:
+            raise ValueError(f"{file}: unexpected tensor {k} ({v.dtype})")
+    logger.info(
+        "glm5_next: NVFP4 sidecar from %s: %d modules (%s)",
+        file,
+        len(manifest["modules"]),
+        ", ".join(manifest["families"]),
+    )
+    return consume, extras
+
+
 def _load_f32_overrides(model_path: str | None) -> dict[str, torch.Tensor]:
     """Tensors to substitute for the checkpoint's copies, keyed by HF name.
 
@@ -159,7 +203,10 @@ def iter_with_overrides(
     for name, weight in weights:
         if name in overrides:
             pending.discard(name)
-            yield name, overrides[name]
+            # None consumes the checkpoint tensor (a sidecar replaces it with
+            # tensors under other names, listed in ``extras``).
+            if overrides[name] is not None:
+                yield name, overrides[name]
         else:
             yield name, weight
     if pending:
@@ -202,6 +249,24 @@ def _load_fp8_swapset(
         raise ValueError(f"{file}: tensor names do not match the manifest {path}")
     subs = {k: v for k, v in tensors.items() if k.endswith(".weight")}
     extras = {k: v for k, v in tensors.items() if k.endswith(".weight_scale")}
+    # Modules the NVFP4 sidecar serves leave the FP8 swap-set.
+    from slimserve.nvfp4_swapset import claimed_modules
+
+    claimed = claimed_modules(model_path)
+    if claimed:
+
+        def _taken(name: str) -> bool:
+            from slimserve.fp8_swapset import SWAP_MODULES, _split
+
+            parts = _split(name if name.endswith(".weight") else name[: -len("_scale")])
+            if parts is None:
+                return False
+            module = SWAP_MODULES.get(parts[2])
+            return module is not None and f"layers.{parts[1]}.{module}" in claimed
+
+        subs = {k: v for k, v in subs.items() if not _taken(k)}
+        extras = {k: v for k, v in extras.items() if not _taken(k)}
+        tensors = {k: v for k, v in tensors.items() if not _taken(k)}
     bad = [k for k, v in subs.items() if v.dtype != torch.float8_e4m3fn]
     bad += [k for k, v in extras.items() if v.dtype != torch.float32]
     if bad or len(subs) + len(extras) != len(tensors):
@@ -917,6 +982,8 @@ class Glm5NextForCausalLM(
         weights = iter_with_overrides(weights, _load_f32_overrides(model_path))
         fp8_weights, fp8_scales = _load_fp8_swapset(model_path)
         weights = iter_with_overrides(weights, fp8_weights, fp8_scales, strict=True)
+        nvfp4_consume, nvfp4_tensors = _load_nvfp4_swapset(model_path)
+        weights = iter_with_overrides(weights, nvfp4_consume, nvfp4_tensors, strict=True)
         for name, weight in weights:
             # Vision tower and MTP layer: later phases.
             if name.startswith("model.visual."):

@@ -29949,3 +29949,36 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   without stores + a post-sampling commit that stores only the accepted and
   boundary columns, 3 traffic units instead of 5), see the Phase 8 plan
   revision below.
+- PHASE 8 / P1 SERVING ARMS (2026-09-17 19:40-19:55 PDT, QC_KDA_CHAIN=1 on the
+  new defaults, vs the rs5pdl4 arms): plain 188.5/193.5, 734.6/735.1,
+  1058.3/1057.5 (vs 196.7/197.0, 745.7/746.9, 1079.1/1079.8: -2..-4 %); spec
+  213.7/271.1, 753.0/811.5, 1027.6/1045.4 (vs 262.7/217.3, 822.2/794.1,
+  1067.5/1057.1). The serving loss matches the microbench; P1 stays rejected.
+- PHASE 8 / P6 GO/NO-GO: MARLIN W4A16 NVFP4 DENSE vs THE FP8 DECODE GEMM
+  (2026-09-17 ~19:55 PDT, GPU 0, graph replay, per-rank shapes, us; raw
+  perf/results/2026-09-17/p6-nvfp4-dense/marlin_fp4_vs_fp8_decode{,_cold}.txt;
+  "cold" = a 256 MB L2 flush inside the graph before every call, its time
+  subtracted - noisy below ~3 us).
+  | shape (N x K) | M | fp8 hot | nvfp4 hot | fp8 cold | nvfp4 cold |
+  |---|---|---|---|---|---|
+  | KDA in_proj 6464 x 4096 | 1 | 10.9 | 6.8 | 18.9 | 8.7 |
+  | KDA in_proj | 16 | 18.5 | 8.8 | 19.3 | 9.2 |
+  | dense gate_up 6144 x 4096 | 1 | 10.7 | 8.2 | 17.8 | 7.7 |
+  | dense down 4096 x 3072 | 1 | 7.7 | 5.6 | 7.1 | 4.8 |
+  | KDA / MLA o_proj 4096 x 2048 | 1 | 5.7 | 5.0 | 4.2-6.6 | 4.9-5.2 |
+  | MLA q_b 4096 x 1536 | 1 | 4.5 | 4.9 | 4.6 | 4.3 |
+  | shared gate_up 1024 x 4096 | 1 | 5.9 | 10.2 | 1.8 | 8.9 |
+  | shared down 4096 x 512 | 1 | 2.5 | 3.4 | 3.0 | 2.6 |
+  Marlin's dense NVFP4 path is bandwidth-shaped on the wide projections (the
+  cold in_proj call drops from 18.9 to 8.7 us, 1.7 TB/s of e2m1 bytes) and
+  latency-floored near 5 us on the narrow ones; the shared experts lose
+  outright (N = 1024 leaves most of the grid idle). DECISION: sidecar
+  families = in_proj_qkvgfab, o_proj (KDA and DSA), q_b_proj, dense
+  gate_up/down; shared experts stay fp8. Expected per step: 34 x 10 us
+  (in_proj) + 3 x 12 (dense) + 45 x ~1 (o_proj) + 11 x ~0.5 (q_b) = 0.42 ms
+  at c1 (5.1 -> 4.7 ms, +9 %), about the same absolute at c8/c16 (+3-4 %).
+  Sidecar built (`python -m slimserve.nvfp4_swapset --model <GLM-5.3-Flash-NVFP4>`,
+  every family, GPU 1, ~4 min): rel Frobenius error 0.093-0.096 per module
+  (fp8 block: ~0.02) - the logprob gate decides. Arms `$S/p8/chain_p6.sh`:
+  p6ref-nospec (two gates on the fp8 record = jitter reference),
+  p6nvfp4-nospec (two gates), p6nvfp4-spec.

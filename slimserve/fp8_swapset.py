@@ -399,6 +399,10 @@ def beta_block_rows(model_path: str | None, module: str) -> int | None:
     # Compare from ``layers.N`` on: the model's prefix above it depends on the
     # wrapping (multimodal vs text-only) while the manifest stores one form.
     tail = module.split(".layers.", 1)[-1]
+    from slimserve.nvfp4_swapset import claimed_modules
+
+    if f"layers.{tail}" in claimed_modules(model_path):
+        return None  # the NVFP4 sidecar serves it with the model's own layout
     listed = {m.split(".layers.", 1)[-1] for m in manifest["modules"]}
     return manifest["beta_block_rows"] if tail in listed else None
 

@@ -383,7 +383,10 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             prefix=f"{prefix}.in_proj_qkvgfab",
         )
         if self.in_proj_padding:
-            self.in_proj_qkvgfab.weight.data[-self.in_proj_padding :].zero_()
+            # Quantized (packed) projections carry their own parameter names;
+            # their padding rows are zero-filled by the sidecar loader.
+            if hasattr(self.in_proj_qkvgfab, "weight"):
+                self.in_proj_qkvgfab.weight.data[-self.in_proj_padding :].zero_()
 
         self.f_b_proj = ColumnParallelLinear(
             self.head_dim,

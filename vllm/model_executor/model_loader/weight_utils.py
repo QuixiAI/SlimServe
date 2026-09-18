@@ -268,9 +268,15 @@ def get_quant_config(
     # checkpoint that serves the native FP8 block tensors of modules the
     # conversion left in BF16; its manifest carries the config group that
     # quantizes exactly those modules, and they leave the ignore list.
+    from slimserve.fp8_swapset import GROUP_NAME as FP8_GROUP_NAME
     from slimserve.fp8_swapset import apply_config_group
 
     apply_config_group(model_config.model, hf_quant_config)
+    # SlimServe NVFP4 sidecar (slimserve.nvfp4_swapset): the dense projections
+    # as W4A16 NVFP4; its modules leave the FP8 group and the ignore list.
+    from slimserve.nvfp4_swapset import apply_config_group as apply_nvfp4_group
+
+    apply_nvfp4_group(model_config.model, hf_quant_config, FP8_GROUP_NAME)
 
     # Pipe information about heads to enable TP-aware loading of attn_head scales
     if (
