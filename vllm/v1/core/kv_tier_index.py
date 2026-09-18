@@ -56,6 +56,25 @@ _EMPTY_HASH = BlockHash(b"")
 
 
 @dataclass
+class SemanticStateCheckpoint:
+    """Tiered recurrent state at a full chained-prefix hash."""
+
+    boundary_hash: BlockHash
+    state_slots: dict[int, int] = field(default_factory=dict)
+    disk_state_slots: dict[int, int] = field(default_factory=dict)
+
+    def host_ready(self, host_pending: set[int]) -> bool:
+        return bool(self.state_slots) and not any(
+            slot in host_pending for slot in self.state_slots.values()
+        )
+
+    def disk_ready(self, disk_pending: set[int]) -> bool:
+        return bool(self.disk_state_slots) and not any(
+            slot in disk_pending for slot in self.disk_state_slots.values()
+        )
+
+
+@dataclass
 class Trajectory:
     hashes: list[BlockHash] = field(default_factory=list)
     # Attention slots, position-indexed: attn_slots[i] maps each attention
@@ -76,6 +95,11 @@ class Trajectory:
     # trajectory is simply dead rather than dangerously matchable.
     tail_hash: BlockHash = _EMPTY_HASH
     tail_pending: bool = False  # tail-state writes still in flight
+    # Additional message/content-part checkpoints. Keys are aligned hash-block
+    # boundaries and ``boundary_hash`` is the COMPLETE chained prefix hash at
+    # that boundary. Both pinned-host and NVMe locations are tracked so an
+    # evicted conversation can promote the exact selected recurrent snapshot.
+    semantic_states: dict[int, SemanticStateCheckpoint] = field(default_factory=dict)
     last_touch: float = 0.0
     # Disk (NVMe tier) locations, mirroring the host ones position for
     # position and group for group. A copy is disk-resident when its disk
@@ -173,25 +197,51 @@ class Trajectory:
         return n
 
     def host_slots(self) -> list[int]:
-        return [s for d in self.attn_slots for s in d.values()] + list(
-            self.tail_state_slots.values()
+        return (
+            [s for d in self.attn_slots for s in d.values()]
+            + list(self.tail_state_slots.values())
+            + [
+                slot
+                for checkpoint in self.semantic_states.values()
+                for slot in checkpoint.state_slots.values()
+            ]
         )
 
     def disk_slots(self) -> list[int]:
-        return [d for m in self.disk_attn for d in m.values()] + list(
-            self.disk_tail_slots.values()
+        return (
+            [d for m in self.disk_attn for d in m.values()]
+            + list(self.disk_tail_slots.values())
+            + [
+                slot
+                for checkpoint in self.semantic_states.values()
+                for slot in checkpoint.disk_state_slots.values()
+            ]
         )
 
     def fully_on_disk(self, due: DueGids, disk_pending: set[int]) -> bool:
-        """Every resumable position and the current tail are disk-resident,
-        so the host copies can be released without losing resumability."""
-        if self.tail_boundary <= 0 or self.disk_tail_boundary != self.tail_boundary:
+        """Every retained recurrent checkpoint is safely disk-resident.
+
+        Attention history is required through the deepest checkpoint. This is
+        intentionally all-or-nothing: host reclamation must never silently
+        discard a shallower semantic fallback or the terminal tail.
+        """
+        boundaries: list[int] = []
+        if self.tail_state_slots or self.disk_tail_slots:
+            if (
+                self.tail_boundary <= 0
+                or self.disk_tail_boundary != self.tail_boundary
+                or not self.disk_tail_slots
+                or any(d in disk_pending for d in self.disk_tail_slots.values())
+            ):
+                return False
+            boundaries.append(self.tail_boundary)
+        for boundary, checkpoint in self.semantic_states.items():
+            if not checkpoint.disk_ready(disk_pending):
+                return False
+            boundaries.append(boundary)
+        if not boundaries:
             return False
-        if not self.disk_tail_slots or any(
-            d in disk_pending for d in self.disk_tail_slots.values()
-        ):
-            return False
-        for i in range(self.tail_boundary):
+        for i in range(max(boundaries)):
             disk = self.disk_attn[i] if i < len(self.disk_attn) else {}
             for gid in due(i):
                 d = disk.get(gid)
@@ -210,9 +260,13 @@ class HostKVTierIndex:
         num_disk_slots: int = 0,
         attn_ratio: dict[int, int] | None = None,
         num_main_slots: int = 0,
+        semantic_checkpoint_limit: int = 8,
     ):
         assert num_slots > 0
         self.num_slots = num_slots
+        self.semantic_checkpoint_limit = max(0, int(semantic_checkpoint_limit))
+        self.semantic_checkpoint_saves = 0
+        self.semantic_checkpoint_hits = 0
         # Attention KV-cache group ids a complete position must cover.
         self.attn_gids = frozenset(attn_gids if attn_gids is not None else [0])
         # Hash blocks per KV block, per attention group (1 unless a group's
@@ -315,6 +369,27 @@ class HostKVTierIndex:
             self._orphaned_pending.add(slot)
         else:
             self._free.append(slot)
+
+    def _retire_tiered_state(
+        self, host_slots: dict[int, int], disk_slots: dict[int, int]
+    ) -> None:
+        """Retire one tail/checkpoint without recycling in-flight storage."""
+        retired_disk = set(disk_slots.values())
+        for slot in host_slots.values():
+            disk = self._disk_of_host.pop(slot, None)
+            if disk is not None:
+                retired_disk.add(disk)
+            if slot in self._host_busy:
+                self._orphaned_busy.add(slot)
+            elif slot in self._pending_write:
+                self._orphaned_pending.add(slot)
+            else:
+                self._free.append(slot)
+        for disk in retired_disk:
+            if disk in self._disk_pending:
+                self._orphaned_disk_pending.add(disk)
+            else:
+                self._free_disk_slot(disk)
 
     def _ensure_position(
         self, owner: str, logical: int, block_hash: BlockHash, supersede: bool
@@ -466,6 +541,76 @@ class HostKVTierIndex:
             if disk:
                 traj.disk_tail_slots = disk
                 traj.disk_tail_boundary = boundary
+        return slots
+
+    def stage_semantic_states(
+        self,
+        owner: str,
+        boundary: int,
+        num_state_groups: int,
+        boundary_hash: BlockHash,
+    ) -> dict[int, int] | None:
+        """Reserve a recurrent-state snapshot at a semantic prefix boundary.
+
+        The key is the full chained block hash at ``boundary``. A repeated
+        request with identical tokens can therefore reuse the checkpoint even
+        when it has a different request id, while conversations that merely
+        share their first block cannot collide.
+        """
+        if boundary <= 0 or not boundary_hash:
+            return None
+        traj = self._trajectories.setdefault(owner, Trajectory())
+        self.touch(owner)
+        old = traj.semantic_states.get(boundary)
+        if old is not None and old.boundary_hash == boundary_hash:
+            return None
+        if old is None and self.semantic_checkpoint_limit == 0:
+            return None
+        if (
+            old is None
+            and len(traj.semantic_states) >= self.semantic_checkpoint_limit
+        ):
+            shallowest = min(traj.semantic_states)
+            # Keep the deepest checkpoints: they avoid the most prefill.
+            if boundary <= shallowest:
+                return None
+            retired = traj.semantic_states.pop(shallowest)
+            self._retire_tiered_state(
+                retired.state_slots, retired.disk_state_slots
+            )
+
+        slots: dict[int, int] = {}
+        for gid in range(num_state_groups):
+            slot = self._alloc_slot(owner)
+            if slot is None:
+                for allocated in slots.values():
+                    self._pending_write.discard(allocated)
+                    self._free.append(allocated)
+                return None
+            slots[gid] = slot
+            self.slot_kind[slot] = ("tail", gid)
+
+        if old is not None:
+            self._retire_tiered_state(old.state_slots, old.disk_state_slots)
+        checkpoint = SemanticStateCheckpoint(
+            boundary_hash=boundary_hash,
+            state_slots=slots,
+        )
+        if self.num_disk_slots > 0:
+            disk_slots: dict[int, int] = {}
+            for gid, slot in slots.items():
+                disk = self._alloc_disk_slot(owner)
+                if disk is None:
+                    for allocated in disk_slots.values():
+                        self._free_disk_slot(allocated)
+                    disk_slots = {}
+                    break
+                disk_slots[gid] = disk
+            for gid, disk in disk_slots.items():
+                self._disk_of_host[slots[gid]] = disk
+            checkpoint.disk_state_slots = disk_slots
+        traj.semantic_states[boundary] = checkpoint
+        self.semantic_checkpoint_saves += 1
         return slots
 
     def confirm_writes(self, slots: list[int]) -> None:
@@ -630,7 +775,16 @@ class HostKVTierIndex:
             return False
         if any(not self.due(i) <= d.keys() for i, d in enumerate(attn[:n])):
             return True
-        return bool(traj.tail_boundary > 0 and not tail and traj.disk_tail_slots)
+        if tail:
+            return False
+        checkpoint = traj.semantic_states.get(n)
+        if checkpoint is not None and checkpoint.disk_ready(self._disk_pending):
+            return True
+        return bool(
+            traj.tail_boundary == n
+            and traj.disk_tail_boundary == n
+            and traj.disk_tail_slots
+        )
 
     def promote(
         self, owner: str, n_blocks: int
@@ -665,10 +819,32 @@ class HostKVTierIndex:
                 new_slots.append(s)
                 reads.append((d, s))
             attn.append(dict(host))
-        tail: dict[int, int] = dict(traj.tail_state_slots)
-        if not tail or traj.tail_pending:
+        # Restore the recurrent snapshot selected by lookup. A semantic
+        # checkpoint and the legacy terminal tail can coexist at different
+        # boundaries, so promotion must key state by ``n_blocks`` rather than
+        # blindly reading the trajectory's terminal state.
+        semantic = traj.semantic_states.get(n_blocks)
+        use_semantic = semantic is not None and (
+            semantic.host_ready(self._pending_write)
+            or semantic.disk_ready(self._disk_pending)
+        )
+        if use_semantic:
+            assert semantic is not None
+            state_host = semantic.state_slots
+            state_disk = semantic.disk_state_slots
+            state_ready = semantic.host_ready(self._pending_write)
+        else:
+            if traj.tail_boundary != n_blocks:
+                self._rollback_promotion(traj, new_slots)
+                return None
+            state_host = traj.tail_state_slots
+            state_disk = traj.disk_tail_slots
+            state_ready = bool(state_host) and not traj.tail_pending
+
+        tail: dict[int, int] = dict(state_host)
+        if not state_ready:
             tail = {}
-            for gid, d in traj.disk_tail_slots.items():
+            for gid, d in state_disk.items():
                 s = self._alloc_slot(owner)
                 if s is None:
                     self._rollback_promotion(traj, new_slots)
@@ -676,8 +852,13 @@ class HostKVTierIndex:
                 tail[gid] = s
                 new_slots.append(s)
                 reads.append((d, s))
-            traj.tail_state_slots = tail
-            traj.tail_pending = bool(reads)
+                self.slot_kind[s] = ("tail", gid)
+            if use_semantic:
+                assert semantic is not None
+                semantic.state_slots = tail
+            else:
+                traj.tail_state_slots = tail
+                traj.tail_pending = bool(tail)
         if new_slots:
             self._promotions.setdefault(owner, []).extend(new_slots)
         return attn, tail, reads
@@ -689,6 +870,9 @@ class HostKVTierIndex:
                 del d[gid]
         for gid in [g for g, s in traj.tail_state_slots.items() if s in drop]:
             del traj.tail_state_slots[gid]
+        for checkpoint in traj.semantic_states.values():
+            for gid in [g for g, s in checkpoint.state_slots.items() if s in drop]:
+                del checkpoint.state_slots[gid]
         for s in slots:
             self._pending_write.discard(s)
             self._free.append(s)
@@ -756,43 +940,88 @@ class HostKVTierIndex:
                 )
                 best_owner = owner
                 continue
-            # Hybrid resumability is exactly tail_boundary or zero. Reject
-            # unrelated chains before walking all their host/disk/main pages.
-            # Positive matches still pass the unchanged readiness checks.
-            n = traj.tail_boundary
-            if n <= 0 or n > len(hashes):
-                continue
-            if best is not None and n <= best[1]:
-                continue
-            if not traj.hashes or traj.hashes[0] != hashes[0]:
-                continue
-            if not traj._tail_available(self._disk_pending):
-                continue
-            if traj.hashes[:n] != hashes[:n]:
-                continue
-            if (
-                traj.resumable_blocks(
-                    self.due,
-                    self._disk_pending,
-                    self._main_pending if self.require_main else None,
+            # Hybrid resumability can use the legacy final tail or any
+            # renderer-selected semantic checkpoint. Try deepest first.
+            candidates: list[
+                tuple[int, BlockHash, dict[int, int], bool, bool, bool]
+            ] = [
+                (
+                    traj.tail_boundary,
+                    traj.tail_hash,
+                    traj.tail_state_slots,
+                    traj.tail_pending,
+                    True,  # legacy tail may be disk-only
+                    bool(
+                        traj.disk_tail_boundary == traj.tail_boundary
+                        and traj.disk_tail_slots
+                        and not any(
+                            slot in self._disk_pending
+                            for slot in traj.disk_tail_slots.values()
+                        )
+                    ),
                 )
-                != n
-            ):
-                continue
-            if any(
-                s in self._pending_write
-                for d in traj.attn_slots[:n]
-                for s in d.values()
-            ):
-                continue
-            tail = {} if traj.tail_pending else dict(traj.tail_state_slots)
-            best = (
-                owner,
-                n,
-                [dict(d) for d in traj.attn_slots[:n]],
-                tail,
+            ]
+            candidates.extend(
+                (
+                    boundary,
+                    checkpoint.boundary_hash,
+                    checkpoint.state_slots,
+                    not checkpoint.host_ready(self._pending_write),
+                    False,
+                    checkpoint.disk_ready(self._disk_pending),
+                )
+                for boundary, checkpoint in traj.semantic_states.items()
             )
-            best_owner = owner
+            for (
+                n,
+                boundary_hash,
+                state_slots,
+                state_pending,
+                legacy,
+                disk_state_ready,
+            ) in sorted(
+                candidates, key=lambda item: item[0], reverse=True
+            ):
+                if n <= 0 or n > len(hashes):
+                    continue
+                if best is not None and n <= best[1]:
+                    break
+                if not traj.hashes or traj.hashes[0] != hashes[0]:
+                    break
+                if state_pending and not disk_state_ready:
+                    continue
+                if legacy and not traj._tail_available(self._disk_pending):
+                    continue
+                if boundary_hash != hashes[n - 1] or traj.hashes[:n] != hashes[:n]:
+                    continue
+                if any(
+                    not traj._attn_complete(i, self.due, self._disk_pending)
+                    or (
+                        self.require_main
+                        and not traj._main_ready(i, self._main_pending)
+                    )
+                    for i in range(n)
+                ):
+                    continue
+                if any(
+                    slot in self._pending_write
+                    for pages in traj.attn_slots[:n]
+                    for slot in pages.values()
+                ):
+                    continue
+                # An empty state mapping represents a disk-only checkpoint;
+                # promote(owner, n) resolves the exact boundary's disk slots.
+                tail = {} if state_pending else dict(state_slots)
+                best = (
+                    owner,
+                    n,
+                    [dict(d) for d in traj.attn_slots[:n]],
+                    tail,
+                )
+                if not legacy:
+                    self.semantic_checkpoint_hits += 1
+                best_owner = owner
+                break
         if best_owner is not None:
             self.touch(best_owner)
         return best
@@ -858,6 +1087,10 @@ class HostKVTierIndex:
         ) or any(
             s in self._pending_write or s in self._host_busy
             for s in traj.tail_state_slots.values()
+        ) or any(
+            s in self._pending_write or s in self._host_busy
+            for checkpoint in traj.semantic_states.values()
+            for s in checkpoint.state_slots.values()
         )
 
     def _delete(self, owner: str, traj: Trajectory) -> None:
@@ -881,7 +1114,11 @@ class HostKVTierIndex:
             # Demoted trajectories keep their position-indexed empty dicts.
             # Their host slot list is empty; test this in C before walking
             # those dicts in Python or constructing temporary slot lists.
-            if not traj.tail_state_slots and not any(traj.attn_slots):
+            if (
+                not traj.tail_state_slots
+                and not traj.semantic_states
+                and not any(traj.attn_slots)
+            ):
                 continue
             if self._busy(traj) or self._main_busy(traj):
                 continue
@@ -899,6 +1136,8 @@ class HostKVTierIndex:
                 traj.attn_slots = [{} for _ in traj.attn_slots]
                 traj.tail_state_slots = {}
                 traj.tail_pending = False
+                for checkpoint in traj.semantic_states.values():
+                    checkpoint.state_slots = {}
             else:
                 if traj.main_slot_list():
                     logger.info(
@@ -934,6 +1173,8 @@ class HostKVTierIndex:
             traj.disk_attn = [{} for _ in traj.disk_attn]
             traj.disk_tail_slots = {}
             traj.disk_tail_boundary = -1
+            for checkpoint in traj.semantic_states.values():
+                checkpoint.disk_state_slots = {}
             return True
         return False
 
@@ -978,4 +1219,9 @@ class HostKVTierIndex:
             "main_used": self.num_main_slots - len(self._main_free),
             "main_pending": len(self._main_pending),
             "main_held": len(self._main_held),
+            "semantic_checkpoints": sum(
+                len(t.semantic_states) for t in self._trajectories.values()
+            ),
+            "semantic_checkpoint_saves": self.semantic_checkpoint_saves,
+            "semantic_checkpoint_hits": self.semantic_checkpoint_hits,
         }

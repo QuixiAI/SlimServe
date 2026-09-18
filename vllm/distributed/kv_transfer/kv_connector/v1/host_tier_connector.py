@@ -41,6 +41,8 @@ resume path matches host-resident positions only.
 Config (kv_transfer_config.kv_connector_extra_config):
     host_tier_gb_per_rank: pinned arena size per rank in GiB (required).
     nvme_tier_gb_per_rank: NVMe tier file size per rank in GiB (0 = off).
+    semantic_checkpoints_per_trajectory: deepest message/part KDA snapshots
+        retained in pinned RAM per trajectory (default 8; 0 disables).
     The tier directory comes from the operator's environment
     (SLIMSERVE_KV_TIER_DIR, else $SLIMSERVE_CACHE/kv-tier, else
     ~/.cache/slimserve/kv-tier) - never from the profile.
@@ -182,6 +184,9 @@ class _ReqTrack:
     # Diagnostic restore-from-zero: GPU-cached leading blocks counted as
     # covered by the first staging call.
     restore_extra: int = 0
+    # Hash-block boundaries whose semantic recurrent-state snapshots were
+    # already staged for this request/lineage.
+    semantic_staged: set[int] = field(default_factory=set)
 
 
 class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
@@ -238,6 +243,9 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
         self.num_slots = int(tier_gb * (1 << 30)) // self.block_stride
         if self.num_slots <= 0:
             raise ValueError("host tier smaller than one block stride")
+        self._semantic_checkpoint_limit = max(
+            0, int(extra.get("semantic_checkpoints_per_trajectory", 8) or 0)
+        )
         from vllm.v1.worker.gpu.kv_tier_dma import padded_stride
 
         self.row_bytes = padded_stride(self.block_stride)
@@ -471,6 +479,7 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
                 num_disk_slots=self.num_disk_slots,
                 attn_ratio=self._attn_ratio,
                 num_main_slots=self.num_main_slots,
+                semantic_checkpoint_limit=self._semantic_checkpoint_limit,
             )
             self._staged_main_homes: dict[int, int] = {}
             self._staged_main_flush: dict[int, list[tuple[int, int]]] = {}
@@ -948,6 +957,69 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
                     self._offload_seq += 1
                     self._staged_offloads[self._offload_seq] = ops
             track.staged_upto = n_full
+            self._stage_semantic_states(request, track, n_full)
+
+    def _stage_semantic_states(
+        self, request: Request, track: _ReqTrack, n_full: int
+    ) -> None:
+        """Stage KDA state at renderer-selected prefix checkpoints.
+
+        The current align-mode restore protocol transfers whole hash blocks,
+        so an arbitrary message offset is floored to the nearest boundary at
+        which every attention/state group has a complete page. This bounds
+        replay to less than one alignment quantum while preserving the exact
+        full chained hash as the checkpoint identity.
+        """
+        semantic_boundaries = getattr(request, "semantic_cache_boundaries", ())
+        if (
+            not self.state_groups
+            or not semantic_boundaries
+            or self._semantic_checkpoint_limit <= 0
+        ):
+            return
+        quantum = self.hash_block_size * self._resume_align
+        candidates = sorted(
+            {
+                (token_boundary // quantum) * self._resume_align
+                for token_boundary in semantic_boundaries
+                if token_boundary >= quantum
+            }
+        )[-self._semantic_checkpoint_limit :]
+        owner = self._owner(request, track)
+        for boundary in candidates:
+            if boundary > n_full or boundary in track.semantic_staged:
+                continue
+            sources: list[int] = []
+            for gid in self.state_groups:
+                ratio = self._state_ratio[gid]
+                state_pos = boundary // ratio - 1
+                blocks = track.group_blocks[gid]
+                if state_pos < 0 or state_pos >= len(blocks) or blocks[state_pos] < 0:
+                    sources = []
+                    break
+                sources.append(blocks[state_pos])
+            if not sources:
+                continue
+            slots = self.index.stage_semantic_states(
+                owner,
+                boundary,
+                len(self.state_groups),
+                boundary_hash=request.block_hashes[boundary - 1],
+            )
+            track.semantic_staged.add(boundary)
+            if slots is None:
+                continue
+            ops = [
+                (sources[tier_gid], slots[tier_gid], self.state_groups[tier_gid])
+                for tier_gid in range(len(self.state_groups))
+            ]
+            self._offload_seq += 1
+            self._staged_offloads[self._offload_seq] = ops
+            logger.debug(
+                "host-tier: staged semantic KDA checkpoint for %s at block %d",
+                request.request_id[-8:],
+                boundary,
+            )
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput

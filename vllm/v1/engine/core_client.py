@@ -1490,6 +1490,7 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                     request.cache_salt,
                     [w * 4 + r for w, r in current_counts],
                     self.eng_start_index,
+                    getattr(request, "semantic_cache_boundaries", None) or (),
                 )
                 if self.prefix_router.routed % 100 == 0:
                     logger.info("dp prefix affinity: %s", self.prefix_router.stats())

@@ -456,6 +456,7 @@ class SingleTypeKVCacheManager(ABC):
         reachable_boundaries = [request.num_prompt_tokens - 1]
         if request.shared_prefix_boundary:
             reachable_boundaries.append(request.shared_prefix_boundary)
+        reachable_boundaries.extend(request.semantic_cache_boundaries)
 
         block_mask = self.reachable_block_mask(
             start_block=num_cached_blocks,
