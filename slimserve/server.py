@@ -33,7 +33,12 @@ def free_port() -> int:
         return int(probe.getsockname()[1])
 
 
-def exec_server(plan: Plan, host: str, port: int) -> int:
+def exec_server(
+    plan: Plan,
+    host: str,
+    port: int,
+    log_path: str | None = None,
+) -> int:
     """Replace this process with the API server."""
     apply_env(plan)
     argv = [sys.executable, "-m", _MODULE, *serve_argv(plan, host, port)]
@@ -41,6 +46,20 @@ def exec_server(plan: Plan, host: str, port: int) -> int:
         f"serving {plan.engine.get('served_model_name', plan.title)} on "
         f"http://{host}:{port}"
     )
+    if log_path:
+        term.info(f"engine log: {log_path}")
+        sys.stdout.flush()
+        sys.stderr.flush()
+        log_fd = os.open(
+            log_path,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+            0o644,
+        )
+        try:
+            os.dup2(log_fd, sys.stdout.fileno())
+            os.dup2(log_fd, sys.stderr.fileno())
+        finally:
+            os.close(log_fd)
     os.execv(sys.executable, argv)
     return 0  # unreachable; execv does not return
 
