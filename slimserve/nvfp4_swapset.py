@@ -328,12 +328,153 @@ def main() -> None:
     ap.add_argument("--out", help=f"output file (default <model>/{DEFAULT_STEM}.safetensors)")
     ap.add_argument("--skip-layer", type=int, default=45, help="layer to leave alone (the MTP layer)")
     ap.add_argument("--families", default=",".join(FAMILIES), help="comma-separated vLLM module suffixes")
+    ap.add_argument("--mtp-experts", action="store_true", help=f"build the MTP layer's experts sidecar ({MTP_STEM}) instead")
     args = ap.parse_args()
+    if args.mtp_experts:
+        build_mtp_experts(args.model, args.out, args.skip_layer)
+        return
     families = [f.strip() for f in args.families.split(",") if f.strip()]
     unknown = set(families) - set(FAMILIES)
     if unknown:
         raise SystemExit(f"unknown families {sorted(unknown)}; known {FAMILIES}")
     build(args.model, args.out, args.skip_layer, families)
+
+
+
+# ------------------------------------------------- the MTP layer's experts
+# The conversion left the MTP (draft) layer's 288 routed experts in block-FP8
+# (25 MB per expert, 1.8 GB per rank), so every draft step streams twice the
+# bytes of a target MoE layer and Marlin's W8A16 path serves it instead of the
+# NVFP4 decode pair. This sidecar re-quantizes them with the experts' own
+# NVFP4 recipe (one global scale per expert for gate+up, one for down) and
+# serves them through the checkpoint's NVFP4 experts config group.
+#     python -m slimserve.nvfp4_swapset --model <dir> --mtp-experts
+# Serving: ``SLIMSERVE_NVFP4_MTP_SWAPSET=nvfp4-swapset-mtp`` (a manifest stem
+# next to the checkpoint; unset or 0 = off).
+MTP_ENV = "SLIMSERVE_NVFP4_MTP_SWAPSET"
+MTP_STEM = "nvfp4-swapset-mtp"
+_MTP_EXPERT_RE = re.compile(r"^(?P<base>.*\.layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<e>\d+)\.(?P<proj>gate_proj|up_proj|down_proj))\.weight$")
+
+
+def build_mtp_experts(model_dir: str, out: str | None, layer: int) -> Path:
+    from slimserve.fp8_swapset import dequant_bf16
+
+    converted = _headers(model_dir)
+    experts: dict[int, dict[str, str]] = defaultdict(dict)
+    for name, (entry, _, _) in converted.items():
+        m = _MTP_EXPERT_RE.match(name)
+        if m is None or int(m.group("layer")) != layer or entry["dtype"] != "F8_E4M3":
+            continue
+        experts[int(m.group("e"))][m.group("proj")] = m.group("base")
+    if not experts:
+        raise SystemExit(f"no FP8 experts found in layer {layer}")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    tensors: dict[str, torch.Tensor] = {}
+    consume: list[str] = []
+    qerr: dict[str, list[float]] = defaultdict(list)
+    for e in sorted(experts):
+        projs = experts[e]
+        if set(projs) != {"gate_proj", "up_proj", "down_proj"}:
+            raise SystemExit(f"expert {e}: incomplete projections {sorted(projs)}")
+        ws = {}
+        for proj, base in projs.items():
+            w = _read(*converted[base + ".weight"])
+            sc = _read(*converted[base + ".weight_scale"])
+            ws[proj] = dequant_bf16(w, sc.float()).to(device)
+            consume += [base + ".weight", base + ".weight_scale"]
+        gs13 = global_scale_for([ws["gate_proj"], ws["up_proj"]]).to(device)
+        gs2 = global_scale_for([ws["down_proj"]]).to(device)
+        for proj, base in projs.items():
+            gs = gs2 if proj == "down_proj" else gs13
+            packed, scale = quantize_nvfp4(ws[proj], gs)
+            err = (dequant_nvfp4(packed, scale, gs) - ws[proj].float()).norm() / ws[proj].float().norm().clamp(min=1e-12)
+            qerr[proj].append(err.item())
+            tensors[base + ".weight_packed"] = packed.cpu()
+            tensors[base + ".weight_scale"] = scale.cpu()
+            tensors[base + ".weight_global_scale"] = gs.reshape(1).cpu()
+            # W4A16 through Marlin never quantizes the activations; the loader still
+            # wants the parameter, as the target's experts carry it.
+            tensors[base + ".input_global_scale"] = torch.ones(1, dtype=torch.float32)
+        del ws
+    from safetensors.torch import save_file
+
+    out_path = Path(out or os.path.join(model_dir, MTP_STEM + ".safetensors"))
+    save_file(tensors, str(out_path), metadata={"purpose": f"NVFP4 (W4A16, group 16) sidecar of layer {layer}'s routed experts"})
+    manifest = {
+        "file": out_path.name,
+        "kind": "mtp_experts",
+        "layer": layer,
+        "experts": len(experts),
+        "tensors": sorted(tensors),
+        "consume": sorted(consume),
+        "target": rf"re:.*\.layers\.{layer}\.mlp\.experts\.\d+\.(gate_proj|up_proj|down_proj)$",
+    }
+    manifest_file = out_path.with_suffix(".json")
+    with open(manifest_file, "w") as fh:
+        json.dump(manifest, fh, indent=1)
+    nbytes = sum(t.numel() * t.element_size() for t in tensors.values())
+    print(f"{len(tensors)} tensors, {nbytes} bytes -> {out_path}; manifest {manifest_file}")
+    for proj, rows in sorted(qerr.items()):
+        print(f"  {proj:12s} n={len(rows):3d} rel Frobenius error mean {sum(rows) / len(rows):.4f} max {max(rows):.4f}")
+    return out_path
+
+
+def mtp_manifest_path(model_path: str | None) -> str | None:
+    choice = os.environ.get(MTP_ENV, "0")
+    if not model_path or choice in ("", "0"):
+        return None
+    stem = MTP_STEM if choice == "1" else choice
+    path = os.path.join(model_path, f"{stem}.json")
+    return path if os.path.isfile(path) else None
+
+
+def load_mtp_manifest(model_path: str | None) -> dict | None:
+    path = mtp_manifest_path(model_path)
+    if path is None:
+        return None
+    with open(path) as fh:
+        manifest = json.load(fh)
+    manifest["path"] = path
+    return manifest
+
+
+def apply_mtp_config_group(model_path: str | None, hf_quant_config: dict | None) -> bool:
+    """Move the MTP layer's experts from their FP8 group into the checkpoint's
+    NVFP4 experts group (the one whose weights are 4-bit tensor_group)."""
+    manifest = load_mtp_manifest(model_path)
+    if manifest is None or not hf_quant_config:
+        return False
+    if hf_quant_config.get("quant_method") != "compressed-tensors":
+        raise ValueError(f"{manifest['path']}: the sidecar needs a compressed-tensors model")
+    groups = hf_quant_config.get("config_groups") or {}
+    sample = f"model.language_model.layers.{manifest['layer']}.mlp.experts.0.gate_proj"
+    nvfp4 = None
+    for name, g in list(groups.items()):
+        targets = g.get("targets") or []
+        w = g.get("weights") or {}
+        if w.get("num_bits") == 4 and w.get("strategy") == "tensor_group" and nvfp4 is None and any("experts" in t for t in targets):
+            nvfp4 = g
+            continue
+        kept = [t for t in targets if not (t.startswith("re:") and re.match(t[3:], sample))]
+        if len(kept) != len(targets):
+            if kept:
+                g["targets"] = kept
+            else:
+                del groups[name]
+    if nvfp4 is None:
+        raise ValueError(f"{manifest['path']}: no NVFP4 experts config group to join")
+    if manifest["target"] not in nvfp4["targets"]:
+        nvfp4["targets"] = list(nvfp4["targets"]) + [manifest["target"]]
+    return True
+
+
+def mtp_hash_factor(model_path: str | None) -> str:
+    manifest = load_mtp_manifest(model_path)
+    if manifest is None:
+        return "nvfp4_mtp_swapset=off"
+    with open(manifest["path"], "rb") as fh:
+        digest = hashlib.sha256(fh.read()).hexdigest()[:16]
+    return f"nvfp4_mtp_swapset={digest}"
 
 
 if __name__ == "__main__":

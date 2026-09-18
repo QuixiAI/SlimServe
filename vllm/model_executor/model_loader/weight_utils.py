@@ -277,6 +277,11 @@ def get_quant_config(
     from slimserve.nvfp4_swapset import apply_config_group as apply_nvfp4_group
 
     apply_nvfp4_group(model_config.model, hf_quant_config, FP8_GROUP_NAME)
+    # The MTP layer's experts re-quantized to NVFP4 (slimserve.nvfp4_swapset
+    # --mtp-experts): they leave their FP8 group for the NVFP4 experts group.
+    from slimserve.nvfp4_swapset import apply_mtp_config_group
+
+    apply_mtp_config_group(model_config.model, hf_quant_config)
 
     # Pipe information about heads to enable TP-aware loading of attn_head scales
     if (

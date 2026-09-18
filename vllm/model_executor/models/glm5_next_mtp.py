@@ -17,6 +17,7 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.logger import init_logger
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.sequence import IntermediateTensors
@@ -30,6 +31,8 @@ from .deepseek_mtp import (
 from .deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV2MoE
 from .glm5_next import Glm5NextMLAAttention
 from .utils import get_spec_layer_idx_from_weight_name, maybe_prefix
+
+logger = init_logger(__name__)
 
 
 def _draft_config(vllm_config):
@@ -182,6 +185,46 @@ class Glm5NextMultiTokenPredictor(DeepSeekMultiTokenPredictor):
         self.topk_indices_buffer[:num_rows] = self.topk_indices_buffer[row_ids]
 
 
+def _with_mtp_experts_sidecar(
+    weights: Iterable[tuple[str, torch.Tensor]], model_path: str | None
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """The NVFP4 sidecar of the MTP layer's experts (slimserve.nvfp4_swapset
+    --mtp-experts) when SLIMSERVE_NVFP4_MTP_SWAPSET selects one: the
+    checkpoint's FP8 expert tensors are consumed and the sidecar's packed
+    NVFP4 tensors take their place."""
+    import os
+
+    from slimserve.nvfp4_swapset import MTP_ENV, load_mtp_manifest
+
+    from vllm.model_executor.models.glm5_next import iter_with_overrides
+
+    manifest = load_mtp_manifest(model_path)
+    if manifest is None:
+        if os.environ.get(MTP_ENV, "0") not in ("", "0") and model_path:
+            logger.warning(
+                "glm5_next_mtp: %s=%s selects an NVFP4 experts sidecar but %s has none; "
+                "serving the checkpoint's FP8 experts (build it with "
+                "python -m slimserve.nvfp4_swapset --mtp-experts)",
+                MTP_ENV, os.environ.get(MTP_ENV), model_path,
+            )
+        return weights
+    from safetensors.torch import load_file
+
+    file = os.path.join(os.path.dirname(manifest["path"]), manifest["file"])
+    tensors = load_file(file)
+    wanted = set(manifest["tensors"])
+    missing = wanted - set(tensors)
+    if missing:
+        raise ValueError(f"{file}: {len(missing)} manifest tensors missing, e.g. {sorted(missing)[0]}")
+    extras = {k: tensors[k] for k in wanted}
+    consume: dict[str, torch.Tensor | None] = {name: None for name in manifest["consume"]}
+    logger.info(
+        "glm5_next_mtp: NVFP4 experts sidecar from %s: layer %d, %d experts",
+        file, manifest["layer"], manifest["experts"],
+    )
+    return iter_with_overrides(weights, consume, extras)
+
+
 @support_torch_compile
 class Glm5NextMTP(DeepSeekMTP):
     # The speculator passes `output_rows` on every forward (the request
@@ -193,6 +236,7 @@ class Glm5NextMTP(DeepSeekMTP):
         nn.Module.__init__(self)
         self.config = _draft_config(vllm_config)
         self.quant_config = vllm_config.quant_config
+        self._model_path = vllm_config.speculative_config.draft_model_config.model
         self.model = Glm5NextMultiTokenPredictor(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
@@ -220,6 +264,7 @@ class Glm5NextMTP(DeepSeekMTP):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         params = dict(self.named_parameters())
         loaded_indexer = set()
+        weights = _with_mtp_experts_sidecar(weights, self._model_path)
 
         def normalized_weights():
             for name, weight in weights:

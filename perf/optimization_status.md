@@ -30637,3 +30637,74 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   longer holds after P9/P10 (c16 spec 1130-1145 against plain 1110-1113).
   DECISION: the record keeps [9, 16, 2]; `slimserve/profiles.json`
   verified restored (git diff clean). Raw `$S/serve-logs/ab-p12k{1,2}-spec.out`.
+
+- PHASE 8 / P13 THE DRAFT STEP (sizing 2026-09-18 15:45-16:00 PDT, profiled
+  c1 spec round `$S/profile-state-p10-profspec`, `$S/p8/trace_spec.py`).
+  Per c1 spec step (9.1 ms for a verify of 4 rows + 3 draft steps, 1376
+  launches): the verify pass is the target forward at 4 rows (gemv1 42 x
+  49 us, fp8 GEMMs 168 launches 2.2 ms, all-reduce 89 x 12.5 us, gemv2 42
+  x 24, the KDA chain at 4 rows with the T > 1 recurrence 9.3 and gated norm
+  9.8 us per layer, the lm_head cutlass GEMM 104 us); each MTP draft step is
+  ~550 us of a very different path: the target's lm_head GEMM 104 us (158
+  MB of fp8 per rank) + the [1, 154880] logits all-gather 61 us (NCCL ring,
+  latency-bound) + ~25 sampling / rejection kernels (~140 us, three
+  device-to-host copies among them) + the MTP layer itself ~300 us: eh_proj
+  as a REPLICATED bf16 cuBLAS GEMM (67 MB, 43.5 us per rank), bf16 q_b /
+  kv_b / o_proj through the bf16 decode GEMM (10-23 us each), the MLA sparse
+  attention (20 us), vLLM's custom all-reduce (8-9 us, three per draft step)
+  instead of the fused mHC transition, the router + route_align (11 us), and
+  the experts through Marlin's W8A16 path (25.7 + act + 14.3 us: the
+  conversion left layer 45's 288 experts in block-FP8, 25 MB per expert,
+  1.8 GB per rank, so the pair declines them - "quant type float8_e4m3fn"
+  in the boot log). Bytes per draft step per rank ~370 MB (0.25 ms at the
+  card's rate) against ~550 us measured; the three draft steps are 18 % of
+  the c1 spec step, and at c16 (k = 2, 16 rows) each draft step touches ~100
+  fp8 experts = 630 MB.
+  PLAN P13 (each its own arm): (a) the MTP experts re-quantized to NVFP4
+  with the experts' recipe and served through the checkpoint's NVFP4
+  experts group (`python -m slimserve.nvfp4_swapset --mtp-experts`,
+  `SLIMSERVE_NVFP4_MTP_SWAPSET=nvfp4-swapset-mtp`; `apply_mtp_config_group`
+  moves layer 45's experts out of their FP8 group; the drafter's loader
+  consumes the FP8 tensors and injects the sidecar's): halves the drafter's
+  expert bytes at every shape and lets the pair serve it (c16 spec ~+3 %,
+  c8 +2 %, c1 spec +1 %); the acceptance counters are the gate. (b) the
+  MTP dense projections (eh_proj, q_a/q_b, kv_a/kv_b, o_proj, the shared
+  experts, the indexer wq_b) from BF16 to block-FP8 through the FP8
+  swap-set (-70 MB per draft step, c1 spec ~+1.7 %). (c) a draft-only
+  NVFP4 lm_head (79 MB instead of 158 per draft step, ~+1.7 % c1 spec).
+  (d) P5's candidate gather for the logits (four all-gathers per step at
+  c1). Sidecar (a) built 16:00 PDT: 3456 tensors, 4.08 GB, rel Frobenius
+  error 0.093 per projection (NVFP4 of the FP8-dequantized experts).
+  P13a SERVING (2026-09-18 16:02-16:24 PDT, `$S/p8/chain_p13.sh`,
+  `chain_p13b.sh`): the sidecar boots (the drafter's loader logs "NVFP4
+  experts sidecar ... layer 45, 288 experts"), canaries text/tool/image
+  PASS. Mixed-shape four-pass arm: c1 308.8 266.3 298.3 304.3 (median 301),
+  c8 782.5 744.6 815.6 799.1 (791), c16 1067.3 1091.9 1141.4 1107.7 (1100)
+  - c8/c16 read below the 15:21 round, so each shape got its own paired
+  boots with the acceptance counters:
+  | shape | sidecar on: passes, median, accepted per draft | sidecar off: passes, median, accepted per draft |
+  |---|---|---|---|
+  | c8 spec (k=1) | 753.7 789.2 870.8 827.0, 808, 0.706 | 795.2 806.1 814.5 834.2, 810, 0.693 |
+  | c16 spec (k=2) | 1114.0 1071.4 1146.7 1130.7, 1122, 1.068 | 1116.1 1105.3 1139.0 1134.5, 1125, 1.093 |
+  Level at both, acceptance within 2 % either way (double quantization did
+  not cost the drafter). Why no gain there: a c16 spec step is ~30 ms for
+  16 x 2.09 tokens and its verify pass at 48 rows streams ~210 experts x
+  3.54 MB x 42 layers = 31 GB (20 ms at the card's rate) against the two
+  draft steps' 0.6 GB; the drafter's bytes are 2 % of that step, and 4 % of
+  c8's. The draft steps are 18 % of the step only at c1 (eight-pass c1 spec
+  arm running: reference p10r-c1spec median 283, 1.429 accepted per draft).
+  Eight-pass c1 spec with the sidecar (16:24-16:28 PDT): 318.1 276.6 324.8
+  254.5 266.2 251.2 283.3 341.0, median 280, 1.400 accepted per draft -
+  against 283 / 281 and 1.429 / 1.384 for the two 15:27 references. LEVEL
+  at c1 as well: the draft step's ~550 us is not its 56 MB of expert bytes
+  (28 MB with the sidecar: ~20 us x 3 per step, under the draw) but the
+  lm_head GEMM (104 us), the logits all-gather (61 us), ~25 sampling and
+  rejection kernels with three device-to-host copies (~140 us) and the MTP
+  layer's ~25 small launches (~300 us). DECISION: P13a is level everywhere
+  and stays OPT-IN (`SLIMSERVE_NVFP4_MTP_SWAPSET=nvfp4-swapset-mtp`; it
+  frees 0.9 GB per rank of expert weight and lets the pair serve the
+  drafter); the record's environment is unchanged. The drafter's levers are
+  P13c (a draft-only NVFP4 lm_head, -50 us per draft step) and P5 (the
+  candidate gather, -50 us per gather, four per c1 spec step): ~-0.35 ms
+  of the 8.6 ms c1 spec step (+4 %), ~2 % at c8/c16 spec; the sampling and
+  MTP-layer launch chains are the rest and are latency, not bytes.
