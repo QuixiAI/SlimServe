@@ -26179,3 +26179,22 @@ Phases, by value over risk:
   leg engines 3.63/3.65 avg running (was 2.71/4.63), restores 9.6K (was
   20.1K), recall 112/112 (was 105/106), turns 704 (was 671); 2048 leg
   3.46/3.50, migrated=0 in both. Commit d6af7171b.
+- DRAFT ACCEPTANCE, HOW TO READ IT (2026-09-18): the engine's periodic
+  "Draft acceptance rate" lines are per-interval and unweighted - an idle
+  window with two drafted tokens counts the same as a loaded window with
+  thousands, so both the mean of those percentages (95.5% over 1339 samples)
+  and any two sampled lines (36.9%, 43.2%) are meaningless. Sum the
+  "Accepted: N tokens, Drafted: M tokens" pairs instead. Traffic-weighted on
+  the same profile: an uncensored GLM-5.3-Flash fine-tune served through the
+  record's config gives 74.9% (198,591/265,182) with mean acceptance length
+  1.45, versus the registered checkpoint's 70.0-72.2% and 1.14-1.19 in the
+  2026-09-13 arms. A fine-tuned target does NOT necessarily degrade the
+  DFlash2 drafter trained on the base weights - here it improved on it.
+- A FINE-TUNE UNDER THE RECORD'S CONFIG (2026-09-18, an uncensored
+  GLM-5.3-Flash NVFP4 checkpoint through the --model override): KV pool
+  identical at 2,818,758 tokens (the bf16 MTP layer it leaves unquantized is
+  not loaded), canaries pass including image and tool, exact c8 median 566.7
+  vs the record's 572.3 (parity), exact c1 median 111.7 vs 136.4. c1 on a
+  live server is dominated by noise and competing traffic (110-162 across
+  runs today), so the c1 gap is not established. Single-stream decode with
+  ignore_eos: 141-187 tok/s.
