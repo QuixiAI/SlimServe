@@ -84,7 +84,7 @@ def test_no_spec_cli_flag_disables_the_resolved_speculator(monkeypatch):
 
     monkeypatch.setattr(cli, "_chat", _capture_chat)
 
-    assert cli.main(["dsv4-q4ktail-2", "--quant", "IQ2_XXS", "--no-spec"]) == 0
+    assert cli.main(["dsv4-q4ktail-2", "--quant", "IQ2_XXS", "--no-spec", "--chat"]) == 0
     assert len(seen) == 1
     assert seen[0].speculative is False
     assert "speculative_config" not in engine_kwargs(seen[0])
@@ -124,7 +124,7 @@ def test_spec_cli_opt_in_keeps_registered_glm_defaults(monkeypatch):
         return 0
 
     monkeypatch.setattr(cli, "_chat", record_chat)
-    assert cli.main(["glm53f-nvfp4-4", "--quant", "NVFP4", "--spec"]) == 0
+    assert cli.main(["glm53f-nvfp4-4", "--quant", "NVFP4", "--spec", "--chat"]) == 0
     assert len(seen) == 1 and seen[0].speculative
     config = engine_kwargs(seen[0])["speculative_config"]
     # incoai/GLM-5.3-Flash-DFlash2 (block 8): up to 7 drafts per verify.
