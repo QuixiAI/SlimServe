@@ -4,7 +4,7 @@
 > Metal. Earlier TurboQuant directives and measurements below are historical.
 > See `perf/optimization_status.md` for current validation evidence.
 
-# HANDOFF — GLM-5.3-Flash NVFP4 on 4x RTX PRO 6000 Blackwell (`glm53f-nvfp4-4` / `rtx6000`), branch `glm53f-rtx6000` (campaign closed 2026-09-15, PR #29 open)
+# HANDOFF — GLM-5.3-Flash NVFP4 on 4x RTX PRO 6000 Blackwell (`glm53f-nvfp4-4` / `rtx6000`), branch `glm53f-rtx6000` (PR #29 open and review-clean; Phase 8, the floor campaign, open since 2026-09-17)
 
 The regimen, rubric, the log of every phase and the next command are in
 `docs/glm53f-rtx6000-campaign.md` (sections 12b and 12c are the log, 13 the
@@ -36,16 +36,25 @@ warning and the prefill numbers above do not hold.
 Obsolete sidecars on /raid (not deleted, operator's call): in
 /raid/weights/GLM-5.3-Flash-NVFP4/, `fp8-swapset-kda-tp4.{safetensors,json}`
 (6.8 GB), `fp8-swapset-dense.*` (2.4 GB) and `fp8-swapset.*` (6.7 GB) are
-superseded by `fp8-swapset-lmhead.*` (7.3 GB, the record's sidecar). Next:
-PR #29 through review (merged with upstream main 02fb15fc1 on 2026-09-17;
-six CodeRabbit rounds addressed through 68aab5d8d);
-then, per campaign doc section 13, the decode items the roofline audit left
-(the mHC site cost at 16..48 rows, the drafter's bf16 projections, the
-vocabulary all-gather - each worth 1-2 %), the unattributed 0.03-per-draft
-acceptance gap. The eager fused all-reduce path re-probed clean on
-2026-09-17 (the D5 corruption was the placeholder-draft bug; the graph-only
-gate stays as the measured configuration). NOT the native sm_120 NVFP4
-expert kernel: the expert GEMM already reads at 96 % of the card's bandwidth.
+superseded by `fp8-swapset-lmhead.*` (7.3 GB, the record's sidecar).
+PR #29 passed automated review at c67d2452f on 2026-09-17 (nine CodeRabbit
+rounds, every finding addressed; merged with upstream main 02fb15fc1).
+THE PERFORMANCE MANDATE IS NOT MET: the operator's standard is a decisive
+margin over the control, and +5..18 % is not one. The whole-step physics
+floor is now computed (notebook, "Whole-step physics floor", 2026-09-17):
+the record runs at 56 % of the floor at c1 and ~70 % at c8/c16, the expert
+stream is at 96 % of the card and is NOT the gap; the gap is per-layer
+latency (mHC/all-reduce sites, the launch-bound KDA layer chain, small-shape
+GEMMs, the logits all-gather, a ~400-launch tail). The plan to close it is
+campaign doc section 14 (Phase 8, seven items with the kernel each replaces,
+its verification, and its expected gain); work it top to bottom, each item
+as its own qualified arm, and re-run the exact bench at every shape after
+each. Realistic landing: c1 270-285 / spec 420-450, c8 ~900 / spec
+~1000-1050, c16 ~1250-1300 tok/s (+65 / +30 / +30 % over the control). The
+eager fused all-reduce path re-probed clean on 2026-09-17 (the D5
+corruption was the placeholder-draft bug; the graph-only gate stays as the
+measured configuration). NOT the native sm_120 NVFP4 expert kernel: the
+expert GEMM already reads at 96 % of the card's bandwidth.
 
 <!--
 The campaign handoffs in this file cover different

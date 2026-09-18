@@ -1113,3 +1113,93 @@ retained kernels (decode GEMMs, route+align, moe_sum_add, topk_sample, the
 rows kernel, the fused all-reduce transition), a 32-row-Q sm_120 variant of
 the fp8 sparse prefill kernel with a re-measure of FP8 main KV, the host +
 NVMe KV tiers with the eviction-restore acceptance, TP2 vs TP4 once.
+
+## 14. Phase 8: the floor campaign (opened 2026-09-17)
+
+Standard (operator, 2026-09-17): a decisive margin over the control, not a
+win. Basis: the notebook entry "Whole-step physics floor" (2026-09-17). Per
+rank per step the record must read 2.59 GB of dense weights (1.59 ms at the
+measured 1628 GB/s) plus 3.54 MB per touched expert (c1 8, c8 ~57, c16
+~90-104 per layer) and pay 90 all-reduces at a 6 us PCIe floor. Floors and
+measured: c1 2.9 ms (~350 tok/s) against 5.1 (196); c8 7.7 ms (~1040)
+against 10.9 (734); c16 ~11 ms (~1400) against 15.5 (1035); spec c1 5.2 ms
+(~470) against 7.3 (329). The expert GEMM is at 96 % of the card and is not
+in the gap. Every item below names the kernels it replaces, how it is
+verified, and what it is expected to return; each lands as its own arm
+(ruff F, kernel parity test, `ab2.sh` exact bench at c1/c8/c16 in both
+modes, logprob gate in band, canaries, notebook entry, commit) and the plan
+is worked top to bottom.
+
+| item | replaces | expected per step |
+|---|---|---|
+| P1 KDA decode chain, one kernel per layer | `causal_conv1d_update` (2.8 us) + `fused_recurrent_kda_packed_decode` (11.5 us for 2 MB of state traffic: grid 4 x N*H = 64 CTAs at c1) + `layer_norm_gated` (1.4 us) + `kda_gate_pair` (1.9 us), 34 layers | -0.35..0.45 ms at every batch (c1 +8 %, c8 +4 %) |
+| P2 programmatic dependent launch on our kernels | the 1-2 us serialization gap before each of the ~300 hot launches per step (fp8 decode GEMM, Marlin, fused all-reduce, route/align, combine, P1) | -0.3..0.6 ms (c1 +6-12 %, c8 +3-6 %) |
+| P3 fused all-reduce + mHC transition above 8 rows | the split pair at T > 8: `cross_device_reduce_2stage` 12.3 + `_mhc_partials` 6.3 + `_mhc_finalize` 5.0 = 23.6 us x 90 sites = 2.1 ms at c8/c16 | -0.9 ms at c8/c16 (+8 % / +6 %) |
+| P4 replicated bf16 MLA-side projections onto the fp8 decode GEMM | `fused_qkv_a_proj` (16.8 MB) + indexer `wq_b`/`wk`/`weights_proj` (14.9 MB) per MLA layer on cuBLAS wmma + splitK (6.2 us per call, ~26 per step) | -0.15 ms (-0.16 GB, fewer launches) |
+| P5 candidate gather instead of the full logits all-gather | `ncclDevKernel_AllGather` over [T, 154880] bf16 (145 us per call at 16 rows, 2 per c8 spec step; 60 us at c1) | -0.1 ms c1, -0.25 ms c8/c16 |
+| P6 NVFP4 dense sidecar (W4A16) | the fp8 stream of KDA in_proj/o_proj (1.19 GB), MLA q_b/o_proj (0.25), kv_b, dense MLP, shared experts: 1.9 GB -> 0.95 GB per rank | -0.58 ms (c1 +13 %, c8 +5 %); canary-gated per module family |
+| P7 L2 prefetch of the next GEMM's weights under the all-reduce | the 6 us PCIe floor x 90 sites that nothing overlaps today (128 MB L2; a KDA in_proj slice is 25 MB) | -0.3..0.5 ms if it holds under graph replay |
+
+Item detail:
+
+- **P1.** (a) First the cheap probe: the packed decode recurrence already
+  exposes `KDA_DECODE_BV` / `KDA_DECODE_WARPS`; sweep BV 8/16/32 x warps
+  1/2/4/8 at the per-rank shape (H 16, K = V = 128, N 1/8/16) in a
+  microbench and, if a config is ahead, make it the sm_120 default in
+  `vllm/models/kimi_k3/amd/ops/third_party/kda/fused_recurrent.py`. (b)
+  Then the kernel: `kda_decode_fused` in `csrc/quixicore/serving/`, one
+  launch per layer per step: conv-state shift + 4-tap conv + SiLU for the
+  q/k/v channels of each token, q/k L2 normalisation, the gate
+  (`A_log`, `dt_bias`, softplus or the lower-bound sigmoid), the delta-rule
+  state update and read-out with the state read and written once, then the
+  gated RMS norm (`o_norm`, sigmoid(g2)) on the way out. Bound through
+  `tm_cuda_serving.cu`, switched in `kimi_gdn_linear_attn.py` for the
+  non-spec decode path first (the spec multi-query path keeps the Triton
+  chain until the fused kernel takes `num_accepted_tokens`), parity test
+  in `tests/kernels/` against the Triton chain on random states and
+  indices, graph-captured. Verify the state fingerprints across a 300-token
+  decode (the eviction-restore acceptance's fingerprints) and the exact
+  bench.
+- **P2.** `cudaLaunchKernelEx` with
+  `cudaLaunchAttributeProgrammaticStreamSerialization` on our launchers;
+  `cudaGridDependencySynchronize()` at each kernel's first dependent read
+  (after address math and, for the GEMMs, after the weight-tile prefetch
+  that does not depend on the activation) and
+  `cudaTriggerProgrammaticLaunchCompletion()` after the last global read.
+  Verify bit-identical outputs under graph replay and the replay time of a
+  captured step (the profiler's `busy` against `wall`).
+- **P3.** Third iteration of `glm5_mhc_allreduce.cuh`: keep the one-shot
+  exchange, map the transition math over (row, split) CTAs with the fp32
+  partials in shared memory so the per-site cost stops growing with rows;
+  the `bench_mhc_ar.py` microbench decides the crossover, the sparse-suite
+  parity and the exact bench qualify it. Target 14 us per site at
+  T = 16-64.
+- **P4.** Extend `slimserve/fp8_swapset.py` to `fused_qkv_a_proj` (quantize
+  all of its shards, the indexer ones included, so one module carries one
+  scheme) and the indexer projections; the loader already injects
+  block-scaled fp8 for the other families. Same block format, canary-gated.
+- **P5.** In the logits processor / sampler: per-rank top-k (k = the
+  request's top_k, plus the draft tokens under speculation) and the local
+  logsumexp, an all-gather of `[T, tp x (k + 1)]` instead of `[T, vocab]`,
+  merge to the exact global top-k distribution. Exact for top_k <= k_max;
+  fall back to the full gather when logprobs are requested or top_k is
+  unset. The rejection sampler's residual distribution is restricted to
+  the same candidate set, which is exact under top-k masking.
+- **P6.** A sibling of the fp8 swapset (`slimserve/nvfp4_swapset.py`):
+  e2m1 group-16 with e4m3 group scales and an fp32 global scale (the
+  experts' recipe), served through Marlin's dense NVFP4 W4A16 path at
+  M <= 64 and the existing prefill GEMM above; per-family logprob canary
+  (mean |dlogprob| against the bf16 floor 0.13, top-1 >= 93 %), the KDA
+  in_proj is the family most likely to fail and is dropped alone if it
+  does. Operator note: this changes serving weights from fp8 to 4-bit on
+  the attention projections; the canary is the gate.
+- **P7.** A side-stream prefetch kernel (`prefetch.global.L2` over the next
+  GEMM's weight slice) ordered before each fused all-reduce inside the
+  capture; measured by graph replay time, kept only if it returns
+  >= 0.2 ms.
+
+Realistic landing if P1-P6 hold: c1 270-285 tok/s (spec 420-450), c8
+900-920 (spec 1000-1050), c16 1250-1300; against the control +65-70 % / +30
+% / +30 %. The literal floors are 350 / 470 / 1040 / 1240 / 1400. At c16 the
+margin is physically capped near +45 % because the expert stream, which the
+control reads at the same rate, is three quarters of the floor there.
