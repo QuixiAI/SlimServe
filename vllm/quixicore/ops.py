@@ -1762,6 +1762,48 @@ class quixicore_ops:
         return int(fn()) if fn is not None else 0
 
     @staticmethod
+    def has_nvfp4_moe_decode() -> bool:
+        return quixicore_ops.is_available() and hasattr(_qc(), "nvfp4_moe_gemv2")
+
+    @staticmethod
+    def nvfp4_moe_gemv1(
+        x: torch.Tensor,
+        b: torch.Tensor,
+        s: torch.Tensor,
+        g: torch.Tensor,
+        topk_ids: torch.Tensor,
+        act: torch.Tensor,
+        nj: int = 2,
+        stages: int = 4,
+        clamp_limit: float | None = None,
+    ) -> torch.Tensor:
+        """Decode MoE gate/up projection + SiLU over the Marlin-packed NVFP4
+        experts: one CTA per (assignment slot, 16*nj columns), a `stages`-deep
+        cp.async ring of 16-tile chunks; clamp_limit as silu_and_mul_with_clamp
+        (gate from above, up to +/- limit); writes act[M * top_k, N] bf16 (row =
+        token * top_k + k)."""
+        clamp = -1.0 if clamp_limit is None else float(clamp_limit)
+        return _qc().nvfp4_moe_gemv1(x, b, s, g, topk_ids, act, nj, stages, clamp)
+
+    @staticmethod
+    def nvfp4_moe_gemv2(
+        act: torch.Tensor,
+        b: torch.Tensor,
+        s: torch.Tensor,
+        g: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor | None,
+        shared: torch.Tensor | None,
+        out: torch.Tensor,
+        nj: int = 2,
+        stages: int = 4,
+    ) -> torch.Tensor:
+        """Decode MoE down projection with the top-k combine (fp32, slot
+        order) and the optional shared-expert add folded in: out[M, D] bf16.
+        topk_weights None means the weights already sit on the input."""
+        return _qc().nvfp4_moe_gemv2(act, b, s, g, topk_ids, topk_weights, shared, out, nj, stages)
+
+    @staticmethod
     def nvfp4_moe_gemm_smem_bytes(cfg: int) -> int:
         """Opt-in shared memory per block the NVFP4 MoE GEMM launches with
         for `cfg`; 0 from a build that predates the query."""

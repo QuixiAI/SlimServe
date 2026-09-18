@@ -30319,3 +30319,189 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   against [9,16,2] (a profile change; the c16 spec number is the one
   furthest under its plain number).
   P5 unchanged (+2 % c8 spec).
+
+- PHASE 8 / P11 CLUSTER SPLIT-K FOR THE FP8 DECODE GEMM: REJECTED
+  (2026-09-17 22:35-22:50 PDT; patch kept at `$S/p8/patch_p11_split.py`,
+  the tree reverted, `_quixicore_C` rebuilt from the reverted tree; raw
+  `perf/results/2026-09-17/p9-moe-decode/fp8_split_cold_sweep.txt`).
+  Hypothesis: the small dense shapes (shared gate_up 1024x4096, shared down
+  and MLA kv_b 4096x512, o_proj 4096x2048, q_b 4096x1536) run at 0.66-1.15
+  TB/s because 128 CTAs on 188 SMs keep too few bytes in flight; a
+  thread-block cluster of 2-4 CTAs along K, each running today's pipeline on
+  its K share and rank 0 summing the peers' fp32 tiles through distributed
+  shared memory in rank order, would lift them toward 1.5 TB/s.
+  Implementation: `QC_FP8_SPLIT` = 1/2/4 selects the cluster size; the
+  cluster launches through cudaLaunchKernelEx with the cluster-dimension and
+  PDL attributes; parity exact against split 1 and deterministic (fixed
+  rank order, no atomics, no workspace).
+  Result, cold, us at M = 1 / 8 / 16 (split 1 = the shipped kernel):
+  | shape | split 1 | split 2 | split 4 |
+  |---|---|---|---|
+  | shared gate_up 1024x4096 | 5.96 / 6.80 / 7.12 | 5.39 / 6.76 / 6.32 | 6.76 / 7.24 / 7.73 |
+  | shared down 4096x512 | 3.16 / 3.25 / 3.79 | 4.30 / 4.61 / 4.92 | 5.73 / 6.31 / 6.88 |
+  | KDA / MLA o_proj 4096x2048 | 7.26 / 7.43 / 7.73 | 7.96 / 8.26 / 8.41 | 9.38 / 9.75 / 10.98 |
+  | MLA q_b 4096x1536 | 6.03 / 6.42 / 6.69 | 6.87 / 7.10 / 7.21 | 8.36 / 8.91 / 9.62 |
+  | dense down 4096x3072 | 10.38 / 10.80 / 11.41 | 10.72 / 11.12 / 11.53 | 11.44 / 12.12 / 13.19 |
+  Only the shared gate_up at M = 1 gains (5.96 -> 5.39 us); every other shape
+  and split is slower, split 4 by 10-80 % (the auto choice, split -1, reads
+  the same as split 4). Lesson: at these sizes the kernel
+  is not short of CTAs but bound by the per-CTA fixed cost (prologue, the
+  pipeline fill, the epilogue reduce) and the K-split adds a full copy of
+  that cost per cluster rank plus the DSMEM reduce, while the bytes each
+  CTA streams shrink below what its pipeline needs to reach the card's rate.
+  This is the same shape of result as the NT=16 "more CTAs" configurations
+  of the 22:08 sweep. The 0.3 ms of small-shape loss per c1 step is a
+  per-launch cost question (P10-style fusion of neighbours, or a persistent
+  decode megakernel), not a grid-shape question. Decision: rejected; code
+  reverted; the shipped kernel and its launcher are unchanged.
+
+- PHASE 8 / P9 NVFP4 DECODE MOE PAIR: THE KERNEL ROUNDS (2026-09-17 23:00 -
+  2026-09-18 13:47 PDT; `csrc/quixicore/serving/nvfp4_moe_decode_ampere.cuh`,
+  bindings `nvfp4_moe_gemv1/2` in `tm_cuda_serving.cu`, dispatch in
+  `marlin_moe.fused_marlin_moe` (QC_NVFP4_DECODE=0 disables, rows cap
+  QC_NVFP4_DECODE_ROWS default 32 = M x top_k, QC_NVFP4_DECODE_NJ default 2,
+  QC_NVFP4_DECODE_STAGES default 4), test
+  `tests/kernels/test_nvfp4_moe_decode.py` (13 tests: kernels vs a
+  plain-torch dequantization of the e2m1 x e4m3 x global tensors at
+  m 1/2/4 x nj 1/2/4 within 2^-7, determinism of the combine, the
+  fused_marlin_moe dispatch and its rows cap, the shared-expert fold and
+  input-side weights, shape rejection). Raw
+  `perf/results/2026-09-17/p9-moe-decode/pair_*`, scripts
+  `$S/p8/bench_moe_decode2.py` (cold, random experts of two 1 GB layer
+  copies, CUDA-graph replay, QC_PDL=0), `$S/p9/mb.cu` (standalone nvcc
+  microbench, L2-hot, `-Xptxas -v` and SASS counts).
+  Design: two kernels read the Marlin-packed expert tensors in place (no
+  repack, no second copy of 34 GB of experts): gemv1 = gate/up + SiLU into
+  the [M x top_k, N] intermediate, gemv2 = down + the top-k weighted combine
+  in slot order + the shared-expert add (the moe_sum_add fold). A CTA owns
+  one activation row and 16 x nj columns; each warp owns one 16-k Marlin
+  tile per chunk; Marlin's own dequant (e2m1 bit trick, e4m3 scale decode,
+  bf16 fragment multiply) feeds mma.m16n8k16 with A rows 8..15 zero; the
+  warps' fp32 partials are summed in warp order. Deterministic, no
+  workspace, no alignment metadata, no atomics.
+  Rounds (cold, us per layer at M = 1 x top-8, Marlin path = gemm1 15.9 +
+  act + gemm2 + moe_sum_add 13.3 = 29.2):
+  | round | change | gemv1 | gemv2 | pair |
+  |---|---|---|---|---|
+  | 1 | plain global loads, one k-tile in flight per warp | - | - | 24.5 (nj 2), 32.2 (nj 4) |
+  | 2 | register prefetch of 4/8 k-tiles, gemv2 double-buffered with a runtime buffer index | 14.5 | 19.6-25 | 34+ |
+  | 3 | cp.async ring of 8-tile chunks in shared memory, block barrier per chunk | 14.9 | 22.7 | 37.6 |
+  | 3b | + the activation row(s) staged in shared memory once | 13.9 | 13.8 | 27.7 |
+  | 4 | per-warp rings, constant-stride cursors, unrolled ring index, warp sync | 13.5 | 9.8-10.2 | 23.6 |
+  | 4b | 16 warps per CTA (256-k chunks), ring in dynamic shared memory | 13.6 | 8.6 | 22.2 |
+  What each round taught: (2) a register array indexed by a runtime buffer
+  number goes to local memory (gemv2 fell to 0.44 TB/s); (3) the ring alone
+  did not help because every chunk re-read its A fragment from global
+  memory after the barrier - one L2 round trip per chunk serialized the
+  loop at ~0.5 us per chunk whatever the depth; (3b -> 4) with the row in
+  shared memory the loop was issue-bound: the SASS main loop was ~200
+  instructions per chunk, half of them address arithmetic (IMAD/LEA/LOP3)
+  and the block barrier, for 8 HMMA; per-warp rings (the warp's copies are
+  its own, so __syncwarp replaces __syncthreads), pointer cursors that
+  advance by a constant stride and a fully unrolled ring index took the
+  gemv2 from 13.8 to 9.8 us; (4b) a CTA's chunks run serially, so the
+  bytes in flight per SM scale with warps, not stages: 16 warps beat 8 at
+  one token (gemv2 9.8 -> 8.6 us) while deeper rings (8 stages) lose 1 us to
+  the longer prologue at every shape. One race fixed on the way: the staged
+  row is written by every thread's cp.async group 0 and read by every warp,
+  so its completion needs one block barrier after the prologue wait (the
+  warp-private ring does not) - without it the m=4 x nj=4 test failed one
+  run in two; with it 13/13 x 8 runs.
+  Cold, the shipped configuration (nj 2, stages 4, 16 warps) against Marlin,
+  us per layer / TB/s over the touched-expert bytes:
+  | rows | Marlin gemm1 | Marlin act+gemm2+sum | Marlin total | gemv1 | gemv2 | pair total | pair vs Marlin |
+  |---|---|---|---|---|---|---|---|
+  | 1 x 8 | 16.0 (1.18) | 13.3 (0.71) | 29.3 | 13.6 (1.39) | 8.6 (1.10) | 22.2 | -24 % |
+  | 2 x 8 | 26.4 (1.41) | 17.2 (1.08) | 43.7 | 25.7 (1.45) | 15.2 (1.22) | 41.0 | -6 % |
+  | 4 x 8 | 47.5 (1.52) | 27.5 (1.32) | 75.0 | 45.6 (1.59) | 23.3 (1.56) | 68.9 | -8 % |
+  | 8 x 8 | 88.1 (1.54) | 47.2 (1.44) | 135.3 | 87.5 (1.55) | 44.3 (1.53) | 131.8 | -3 % |
+  (nj 4 is the better gemv2 at 2 rows, 12.8 us, and the pair's best total
+  there, 37.6; nj 1 is never best; the rows cap of 32 hands 8 x 8 and above
+  to Marlin, which is within 3 % of the pair there and better at 16 rows.)
+  At one token the pair reads the 28 MB of expert bytes at 1.27 TB/s
+  against Marlin's 0.97: 7 us per MoE layer, 42 layers, -0.30 ms of the
+  4.8 ms c1 step (+6-7 % expected at c1 plain; the c1 spec drafter and its
+  1-3-row verify steps sit under the cap too; nothing at c8/c16 plain).
+  Serving A/B: `$S/p8/chain_p9.sh` (below).
+  Serving, first round (2026-09-18 13:47-14:04 PDT, `$S/p8/chain_p9.sh`):
+  the pair-enabled boot read c1 207.9 / 207.8, c8 778.8 / 764.5, c16 1108.1
+  / 1107.3 and the QC_NVFP4_DECODE=0 boot 207.5 / 207.2, 768.7 / 770.8,
+  1105.8 / 1106.5 - identical, and the profiled c1 round
+  (`$S/profile-state-p9prof-nospec`, `$S/p8/trace_moe_kinds.py`) showed why:
+  77 Marlin MoE launches per step and no pair kernels. A one-time INFO line
+  now names the first reason a small batch stays on Marlin
+  (`marlin_moe._qc_nvfp4_decode_why_not`); the boot said "activation
+  MoEActivation.SILU clamp 10.0": GLM-5.3's MoE is SiLU with
+  silu_and_mul_with_clamp's limit (gate clamped from above, up to +/-10),
+  which the harness test never exercised because the standalone test called
+  fused_marlin_moe without a clamp. The clamp is folded into gemv1's
+  epilogue (fp32, before the bf16 rounding; the kernel test now checks it
+  against the clamped reference on inputs wide enough that it bites, and
+  the dispatch test passes clamp_limit=10). The pair announces itself once
+  when it first serves a batch ("Using the QuixiCore NVFP4 decode MoE pair").
+  Second round: `$S/p8/chain_p9b.sh` (below). Gates of the first round
+  (4 gates, pair path inactive) are the record's: mean_text_logprob -2.448 /
+  -2.439 / -2.434 / -2.464, canaries text/tool/image PASS.
+  Serving, second round (2026-09-18 14:08-14:23 PDT, `$S/p8/chain_p9b.sh`,
+  the pair dispatching - the boot's "Using the QuixiCore NVFP4 decode MoE
+  pair (first batch 4 x top-8; rows cap 32, nj 2, stages 4)"): plain c1
+  211.4 / 211.3, c8 777.1 / 766.9, c16 1108.8 / 1105.0 against the Marlin
+  boot's 207.5 / 207.2, 768.7 / 770.8, 1105.8 / 1106.5: c1 +1.9 %, c8 and
+  c16 level (as designed: above 32 rows Marlin serves). Gates (4) -2.438 /
+  -2.460 / -2.455 / -2.455 mean_text_logprob, needle margins 11-20, canaries
+  text/tool/image PASS. Under speculation, four passes per shape, pair
+  against Marlin pass by pass:
+  | shape | pair passes 1..4 | Marlin passes 1..4 | pair vs Marlin per pass |
+  |---|---|---|---|
+  | c1 spec | 310.7 293.2 279.1 351.8 | 285.1 254.0 254.7 318.8 | +9 % +15 % +10 % +10 % |
+  | c8 spec | 802.6 798.8 784.9 795.8 | 809.8 796.0 791.9 820.4 | -1 % 0 -1 % -3 % |
+  | c16 spec | 1080.8 1115.7 1132.8 1159.1 | 1075.5 1125.5 1180.2 1126.4 | 0 -1 % -4 % +3 % |
+  c1 spec is the trajectory draw it always is (254-352 across passes) but
+  the pair leads in every pass position by 9-15 %: the drafter's 1-row MoE
+  and the 2-4-row verify steps both sit under the cap. c8/c16 spec: level
+  (the verify batches are 16-48 rows; only the drafter's rows are the
+  pair's). The plain c1 gain, +1.9 %, was a third of the cold prediction,
+  and the cold bench run under the record's PDL mode (QC_PDL=4) found why
+  (`pair_pdl4_early_cold.txt`): with the dependent-launch trigger at the top
+  of the kernel the pair at one token measured 29.3 us - Marlin's 29.1 - and
+  24.7 at nj 4; the next kernel's CTAs (512 threads, ~27 KB of shared
+  memory) launch at the trigger and sit on the SMs in griddepcontrol.wait
+  while gemv1 streams, and against gemv1's 45 KB per CTA and the 99 KB
+  budget that halves gemv1's residency wherever they land. Trigger moved
+  to after the stream (before the epilogue) in both kernels
+  (`pair_pdl4_late_cold.txt`, us per layer at M = 1 / 2 / 4 / 8, PDL 4):
+  | path | 1 x 8 | 2 x 8 | 4 x 8 | 8 x 8 |
+  |---|---|---|---|---|
+  | Marlin gemm1 + act + gemm2 + sum | 29.0 | 43.5 | 74.7 | 135.2 |
+  | pair nj 2, early trigger | 29.3 | 39.1 | 69.1 | 131.3 |
+  | pair nj 2, late trigger | 24.8 | 40.7 | 68.5 | 131.4 |
+  | pair nj 4, late trigger | 24.7 | 36.5 | 72.5 | 130.0 |
+  (PDL off the late-trigger pair reads 22.3 / 41.0 / 69.2 / 131.9: the
+  2.5 us left at one token is the dependent launch's own entry wait, which
+  every kernel on the record pays.) Dispatch now picks nj 4 up to 16
+  assignment rows and nj 2 above (QC_NVFP4_DECODE_NJ pins one). Third round:
+  `$S/p8/chain_p9c.sh` (below).
+  Serving, third round (2026-09-18 14:27-14:37 PDT, `$S/p8/chain_p9c.sh`,
+  late trigger + nj by batch; references p9off-nospec 13:54 and p9off-spec
+  14:18): plain c1 214.6 / 214.5, c8 766.8 / 766.6, c16 1115.0 / 1102.3
+  against Marlin's 207.5 / 207.2, 768.7 / 770.8, 1105.8 / 1106.5: c1 +3.4 %
+  (the PDL-on cold bench predicted +3.9 %), c8 / c16 level. Gates (4)
+  -2.475 / -2.454 / -2.448 / -2.461, canaries PASS. Spec, four passes:
+  | shape | pair (round 3) passes 1..4 | median | Marlin passes 1..4 | median |
+  |---|---|---|---|---|
+  | c1 spec | 343.3 288.8 310.9 299.6 | 305 | 285.1 254.0 254.7 318.8 | 270 |
+  | c8 spec | 829.8 802.4 795.7 830.6 | 816 | 809.8 796.0 791.9 820.4 | 803 |
+  | c16 spec | 1082.8 1126.5 1143.3 1110.9 | 1119 | 1075.5 1125.5 1180.2 1126.4 | 1126 |
+  c1 spec +13 % on medians (three of four pass positions ahead by 14-22 %,
+  the fourth behind by 6 %: the draw), c8 spec +1.6 %, c16 spec level.
+  DECISION: retained as the record's default (no environment; QC_NVFP4_DECODE=0
+  restores Marlin below 32 rows). Record 2026-09-18 14:37 PDT: plain 214.5 /
+  767 / 1102-1115 (+29 / +12 / +15 % on the control), spec medians c1 305,
+  c8 816, c16 1119. Committed with the kernel, binding, dispatch, test and
+  the harness scripts named above. Next on this item: gemv2 at one token
+  runs 64-128 CTAs on 188 SMs, each streaming its 16 chunks serially at
+  0.9 TB/s (9.8-10.9 us for 9.4 MB against ~6 at the card's rate); a split
+  over the token's experts (cluster of 2-4 CTAs along the slot axis, DSMEM
+  reduce in rank order - the P11 mechanism, but here the CTA count, not
+  the per-CTA fixed cost, is the shortfall) is the candidate, worth ~4 us
+  per layer = +3-4 % c1 plain more.

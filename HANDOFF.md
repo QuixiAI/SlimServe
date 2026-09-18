@@ -100,6 +100,26 @@ expert GEMV pair at one row (+8 % c1 plain), P10 router chain (+3.5 % c1),
 P12 the c16 schedule entry (c16 spec sits below c16 plain), P5. Scripts:
 `$S/p8/bench_moe_rotate.py`, `bench_moe_cfg.py`, `bench_small_dense.py`;
 raw `perf/results/2026-09-17/p9-moe-decode/`.
+P11 was built and REJECTED on 2026-09-18 (cluster split-K along K is
+slower at every small shape but one: per-CTA fixed cost, not CTA count;
+notebook "P11 cluster split-K: rejected"). P9 LANDED 2026-09-18 14:37 PDT
+as the NVFP4 decode MoE pair (`csrc/quixicore/serving/nvfp4_moe_decode_ampere.cuh`,
+`nvfp4_moe_gemv1/2`, dispatched from `fused_marlin_moe` below 32 assignment
+rows; QC_NVFP4_DECODE=0 restores Marlin; `tests/kernels/test_nvfp4_moe_decode.py`):
+record plain 214.5 / 767 / 1102-1115 (+29 / +12 / +15 % on the control;
+c1 +3.4 % on the 22:00 record), spec four-pass medians c1 305 / c8 816 /
+c16 1119 (c1 spec +13 % on Marlin in the same session). Two lessons that
+cost a serving round each, both now logged by the boot: GLM-5.3's MoE is
+SiLU with a clamp limit of 10 (the pair folds it into gemv1's epilogue),
+and a dependent-launch trigger at the top of a streaming kernel lets the
+next kernel's CTAs squat on the SMs (trigger after the stream: 29.3 -> 24.8
+us per layer under PDL). Next: gemv2's CTA count at one token (64-128 CTAs
+streaming 16 serial chunks at 0.9 TB/s; a split over the token's experts
+is worth ~+3-4 % c1), then P10 (a top-k-only routing kernel for the pair
+path: route_align's 4 us block alignment is dead weight below 32 rows),
+P12, P5. Scripts: `$S/p8/bench_moe_decode2.py` (cold per-kernel, honours
+QC_PDL), `$S/p9/mb.cu` (standalone nvcc microbench), `$S/p8/chain_p9{,b,c}.sh`,
+`$S/p8/trace_moe_kinds.py`; raw `perf/results/2026-09-17/p9-moe-decode/`.
 
 <!--
 The campaign handoffs in this file cover different

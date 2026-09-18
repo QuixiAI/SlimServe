@@ -6,6 +6,7 @@
 #include "skinny_gemm_ampere.cuh"
 #include "w8a16_gemm_ampere.cuh"
 #include "nvfp4_moe_prefill_ampere.cuh"
+#include "nvfp4_moe_decode_ampere.cuh"
 #include "mla_sparse_prefill_kernels.cuh"
 #include "kv_cache_kernels.cuh"
 #include "paged_attn_v2_kernels.cuh"
@@ -2027,6 +2028,153 @@ static torch::Tensor py_nvfp4_moe_gemm(torch::Tensor a, torch::Tensor b, torch::
 #undef QC_NVFP4_LAUNCH
     return c;
 }
+
+// NVFP4 routed-expert MoE for decode-sized batches (nvfp4_moe_decode_ampere.cuh):
+// gemv1 (gate/up + SiLU) and gemv2 (down + top-k combine + shared fold).
+template <int NJ, int KT>
+static void launch_nvfp4_gemv1(const __nv_bfloat16* x, int ldx, const int32_t* b, const uint8_t* s, const float* g,
+                               const int32_t* ids, __nv_bfloat16* act, int slots, int top_k, int N, int K, int E, int gstride,
+                               float clamp) {
+    const dim3 grid(N / (16 * NJ), slots);
+    const size_t dyn = size_t(K) * 2 + tms::nvfp4dec::gemv1_ring_bytes<NJ, KT>();   // the staged row + the ring
+    TORCH_CHECK(dyn <= 99 * 1024, "nvfp4_moe_gemv1: nj/stages too wide for shared memory (", dyn, " B)");
+    static size_t granted = 0;          // dynamic smem crosses 48 KB for the wide configs (sm_120: 99 KB opt-in)
+    if (dyn > granted) {
+        tms::decode_gemm::check_cuda_status(cudaFuncSetAttribute(tms::nvfp4dec::nvfp4_moe_gemv1_kernel<NJ, KT>,
+                                                                 cudaFuncAttributeMaxDynamicSharedMemorySize, int(dyn)));
+        granted = dyn;
+    }
+    const int pdl = tms::decode_gemm::pdl_mode();
+    if (pdl) {
+        cudaLaunchConfig_t cfg = {};
+        cfg.gridDim = grid; cfg.blockDim = dim3(tms::nvfp4dec::THREADS); cfg.stream = stream(); cfg.dynamicSmemBytes = dyn;
+        cudaLaunchAttribute attr[1];
+        attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attr[0].val.programmaticStreamSerializationAllowed = 1;
+        cfg.attrs = attr; cfg.numAttrs = 1;
+        tms::decode_gemm::check_cuda_status(cudaLaunchKernelEx(&cfg, tms::nvfp4dec::nvfp4_moe_gemv1_kernel<NJ, KT>,
+                                                               x, ldx, b, s, g, ids, act, top_k, N, K, E, gstride, clamp, pdl));
+    } else {
+        tms::nvfp4dec::nvfp4_moe_gemv1_kernel<NJ, KT><<<grid, tms::nvfp4dec::THREADS, dyn, stream()>>>(
+            x, ldx, b, s, g, ids, act, top_k, N, K, E, gstride, clamp, 0);
+    }
+}
+template <int NJ, int KT>
+static void launch_nvfp4_gemv2(const __nv_bfloat16* act, const int32_t* b, const uint8_t* s, const float* g,
+                               const int32_t* ids, const float* tw, const __nv_bfloat16* shared, __nv_bfloat16* out,
+                               int M, int top_k, int D, int Ki, int E, int gstride) {
+    const dim3 grid(D / (16 * NJ), M);
+    const size_t dyn = size_t(top_k) * Ki * 2 + tms::nvfp4dec::gemv2_ring_bytes<NJ, KT>();   // the staged rows + the ring
+    TORCH_CHECK(dyn <= 99 * 1024, "nvfp4_moe_gemv2: nj/stages too wide for shared memory (", dyn, " B)");
+    static size_t granted = 0;          // dynamic smem crosses 48 KB for the wide configs (sm_120: 99 KB opt-in)
+    if (dyn > granted) {
+        tms::decode_gemm::check_cuda_status(cudaFuncSetAttribute(tms::nvfp4dec::nvfp4_moe_gemv2_kernel<NJ, KT>,
+                                                                 cudaFuncAttributeMaxDynamicSharedMemorySize, int(dyn)));
+        granted = dyn;
+    }
+    const int pdl = tms::decode_gemm::pdl_mode();
+    if (pdl) {
+        cudaLaunchConfig_t cfg = {};
+        cfg.gridDim = grid; cfg.blockDim = dim3(tms::nvfp4dec::THREADS); cfg.stream = stream(); cfg.dynamicSmemBytes = dyn;
+        cudaLaunchAttribute attr[1];
+        attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attr[0].val.programmaticStreamSerializationAllowed = 1;
+        cfg.attrs = attr; cfg.numAttrs = 1;
+        tms::decode_gemm::check_cuda_status(cudaLaunchKernelEx(&cfg, tms::nvfp4dec::nvfp4_moe_gemv2_kernel<NJ, KT>,
+                                                               act, b, s, g, ids, tw, shared, out, top_k, D, Ki, E, gstride, pdl));
+    } else {
+        tms::nvfp4dec::nvfp4_moe_gemv2_kernel<NJ, KT><<<grid, tms::nvfp4dec::THREADS, dyn, stream()>>>(
+            act, b, s, g, ids, tw, shared, out, top_k, D, Ki, E, gstride, 0);
+    }
+}
+static void nvfp4_dec_check(const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& s, const torch::Tensor& g,
+                            const torch::Tensor& ids, const char* who) {
+    CK(b); CK(s); CK(g); CK(ids);
+    TORCH_CHECK(a.is_cuda() && a.dim() == 2 && a.stride(1) == 1 && a.scalar_type() == torch::kBFloat16, who, ": activations [rows, K] bf16");
+    for (const auto* t : {&b, &s, &g, &ids})
+        TORCH_CHECK(t->device() == a.device(), who, ": every operand must be on the activations' device");
+    TORCH_CHECK(b.dim() == 3 && b.scalar_type() == torch::kInt32 && s.dim() == 3 && s.scalar_type() == torch::kUInt8,
+                who, ": b int32 [E, K/16, 2N], s uint8 [E, K/16, N]");
+    TORCH_CHECK(s.size(0) == b.size(0) && s.size(1) == b.size(1) && s.size(2) * 2 == b.size(2), who, ": scales shape");
+    TORCH_CHECK((g.numel() == b.size(0) || g.numel() == 1) && g.scalar_type() == torch::kFloat32, who, ": global scale [E] or [1] fp32");
+    TORCH_CHECK(ids.scalar_type() == torch::kInt32, who, ": topk_ids int32");
+}
+// x [M, K] bf16 (row stride = stride(0)); b int32 [E, K/16, (2N)*2]; s uint8 [E, K/16, 2N]; g fp32 [E];
+// topk_ids int32 [M, top_k]; act [M * top_k, N] bf16 (written); nj in {1, 2, 4}.
+static torch::Tensor py_nvfp4_moe_gemv1(torch::Tensor x, torch::Tensor b, torch::Tensor s, torch::Tensor g,
+                                        torch::Tensor topk_ids, torch::Tensor act, int64_t nj, int64_t kt, double clamp) {
+    nvfp4_dec_check(x, b, s, g, topk_ids, "nvfp4_moe_gemv1");
+    CK(act);
+    TORCH_CHECK(act.device() == x.device(), "nvfp4_moe_gemv1: act must be on x's device");
+    const int E = int(b.size(0)), K = int(b.size(1)) * 16, N2 = int(b.size(2)) / 2, N = N2 / 2;
+    TORCH_CHECK(x.size(1) == K && K % tms::nvfp4dec::CHUNK_K == 0, "nvfp4_moe_gemv1: K % 256");
+    TORCH_CHECK(topk_ids.size(1) <= 64, "nvfp4_moe_gemv1: top_k <= 64");
+    TORCH_CHECK(topk_ids.dim() == 2 && topk_ids.size(0) == x.size(0), "nvfp4_moe_gemv1: topk_ids [M, top_k]");
+    const int M = int(x.size(0)), top_k = int(topk_ids.size(1));
+    TORCH_CHECK(act.dim() == 2 && act.size(0) == M * top_k && act.size(1) == N && act.scalar_type() == torch::kBFloat16,
+                "nvfp4_moe_gemv1: act [M * top_k, N] bf16");
+    TORCH_CHECK(N % 64 == 0 && N % (16 * nj) == 0 && (nj == 1 || nj == 2 || nj == 4), "nvfp4_moe_gemv1: N % 64, nj in 1/2/4");
+    TORCH_CHECK(kt == 4 || kt == 8, "nvfp4_moe_gemv1: stages in 4/8");
+    TORCH_CHECK(K % (tms::nvfp4dec::CHUNK_K * kt) == 0, "nvfp4_moe_gemv1: K % (256 * stages)");
+    const c10::cuda::CUDAGuard guard(x.device());
+    const int slots = M * top_k;
+#define QC_G1(NJ, KT) launch_nvfp4_gemv1<NJ, KT>(bp(x), int(x.stride(0)), b.data_ptr<int32_t>(), s.data_ptr<uint8_t>(), fp(g), \
+                                                 topk_ids.data_ptr<int32_t>(), bpm(act), slots, top_k, N, K, E, g.numel() == 1 ? 0 : 1, \
+                                                 float(clamp))
+    switch (nj * 16 + kt) {
+        case 1 * 16 + 4: QC_G1(1, 4); break; case 1 * 16 + 8: QC_G1(1, 8); break;
+        case 2 * 16 + 4: QC_G1(2, 4); break; case 2 * 16 + 8: QC_G1(2, 8); break;
+        case 4 * 16 + 8: QC_G1(4, 8); break; default: QC_G1(4, 4); break;
+    }
+#undef QC_G1
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return act;
+}
+// act [M * top_k, Ki] bf16; b int32 [E, Ki/16, D*2]; s uint8 [E, Ki/16, D]; g fp32 [E]; topk_ids int32 [M, top_k];
+// topk_weights fp32 [M, top_k] or none (the weights sit on the input already); shared [M, D] bf16 or none;
+// out [M, D] bf16 (written).
+static torch::Tensor py_nvfp4_moe_gemv2(torch::Tensor act, torch::Tensor b, torch::Tensor s, torch::Tensor g,
+                                        torch::Tensor topk_ids, c10::optional<torch::Tensor> topk_weights,
+                                        c10::optional<torch::Tensor> shared, torch::Tensor out, int64_t nj, int64_t kt) {
+    nvfp4_dec_check(act, b, s, g, topk_ids, "nvfp4_moe_gemv2");
+    CK(act); CK(out);
+    TORCH_CHECK(out.device() == act.device(), "nvfp4_moe_gemv2: out must be on act's device");
+    const int E = int(b.size(0)), Ki = int(b.size(1)) * 16, D = int(b.size(2)) / 2;
+    TORCH_CHECK(act.size(1) == Ki && Ki % tms::nvfp4dec::CHUNK_K == 0, "nvfp4_moe_gemv2: Ki % 256");
+    TORCH_CHECK(topk_ids.size(1) <= 64, "nvfp4_moe_gemv2: top_k <= 64");
+    TORCH_CHECK(topk_ids.dim() == 2, "nvfp4_moe_gemv2: topk_ids [M, top_k]");
+    const int M = int(topk_ids.size(0)), top_k = int(topk_ids.size(1));
+    TORCH_CHECK(act.size(0) == M * top_k, "nvfp4_moe_gemv2: act [M * top_k, Ki]");
+    TORCH_CHECK(out.dim() == 2 && out.size(0) == M && out.size(1) == D && out.scalar_type() == torch::kBFloat16,
+                "nvfp4_moe_gemv2: out [M, D] bf16");
+    TORCH_CHECK(D % 64 == 0 && D % (16 * nj) == 0 && (nj == 1 || nj == 2 || nj == 4), "nvfp4_moe_gemv2: D % 64, nj in 1/2/4");
+    TORCH_CHECK(kt == 4 || kt == 8, "nvfp4_moe_gemv2: stages in 4/8");
+    const float* tw = nullptr;
+    if (topk_weights.has_value()) {
+        CK(topk_weights.value());
+        TORCH_CHECK(topk_weights->device() == act.device() && topk_weights->scalar_type() == torch::kFloat32 &&
+                    topk_weights->numel() == M * top_k, "nvfp4_moe_gemv2: topk_weights fp32 [M, top_k]");
+        tw = fp(topk_weights.value());
+    }
+    const __nv_bfloat16* sh = nullptr;
+    if (shared.has_value()) {
+        CK(shared.value());
+        TORCH_CHECK(shared->device() == act.device() && shared->scalar_type() == torch::kBFloat16 &&
+                    shared->dim() == 2 && shared->size(0) == M && shared->size(1) == D, "nvfp4_moe_gemv2: shared [M, D] bf16");
+        sh = bp(shared.value());
+    }
+    const c10::cuda::CUDAGuard guard(act.device());
+#define QC_G2(NJ, KT) launch_nvfp4_gemv2<NJ, KT>(bp(act), b.data_ptr<int32_t>(), s.data_ptr<uint8_t>(), fp(g), \
+                                                 topk_ids.data_ptr<int32_t>(), tw, sh, bpm(out), M, top_k, D, Ki, E, g.numel() == 1 ? 0 : 1)
+    switch (nj * 16 + kt) {
+        case 1 * 16 + 4: QC_G2(1, 4); break; case 1 * 16 + 8: QC_G2(1, 8); break;
+        case 2 * 16 + 4: QC_G2(2, 4); break; case 2 * 16 + 8: QC_G2(2, 8); break;
+        case 4 * 16 + 8: QC_G2(4, 8); break; default: QC_G2(4, 4); break;
+    }
+#undef QC_G2
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
 static torch::Tensor py_w8a16_gemm(torch::Tensor x, torch::Tensor wp, torch::Tensor scale,
                                    c10::optional<torch::Tensor> bias, int64_t N, int64_t target_ctas, int64_t cfg) {
     // x [M, K] bf16; wp packed (from w8a16_pack); scale [N] fp32 (per channel, already x 2^8).
@@ -3264,6 +3412,13 @@ void init_serving(py::module_& m) {
           py::arg("expert_ids"), py::arg("num_post_padded"), py::arg("topk_weights") = py::none(), py::arg("c"),
           py::arg("top_k"), py::arg("mul_topk"), py::arg("stages") = 3,
           "NVFP4 grouped MoE GEMM over Marlin-packed experts for prefill chunks (128-row blocks)");
+    m.def("nvfp4_moe_gemv1", &py_nvfp4_moe_gemv1, py::arg("x"), py::arg("b"), py::arg("s"), py::arg("g"), py::arg("topk_ids"),
+          py::arg("act"), py::arg("nj") = 2, py::arg("stages") = 4, py::arg("clamp") = -1.0,
+          "NVFP4 decode MoE gate/up + SiLU (clamp >= 0: gate from above, up to +/- clamp) over Marlin-packed experts: "
+          "act[M*top_k, N] (one slot per CTA row)");
+    m.def("nvfp4_moe_gemv2", &py_nvfp4_moe_gemv2, py::arg("act"), py::arg("b"), py::arg("s"), py::arg("g"), py::arg("topk_ids"),
+          py::arg("topk_weights") = py::none(), py::arg("shared") = py::none(), py::arg("out"), py::arg("nj") = 2, py::arg("stages") = 4,
+          "NVFP4 decode MoE down projection + top-k combine (+ shared-expert add) over Marlin-packed experts: out[M, D]");
     m.def("w8a16_dequant", &py_w8a16_dequant, py::arg("wp"), py::arg("scale"), py::arg("N"), py::arg("K"),
           "Unpack fp8 weights to bf16 [N,K] (prefill path)");
     m.def("w8a16_pack", &py_w8a16_pack, py::arg("w_fp8"), "Pack [N,K] e4m3 weights into mma fragment order");

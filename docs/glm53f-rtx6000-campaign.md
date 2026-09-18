@@ -1292,3 +1292,30 @@ settled the day: c8 spec level (826.8 vs 826.5), c16 spec +3 % (1063 ->
 
 Order: P11, P9, P10, P12, P5. Launch latency itself is hidden (P1's
 finding); what these items remove is real kernel time at small shapes.
+
+### 14.2 P11 rejected, P9 built (2026-09-18)
+
+P11 (cluster split-K along K for the fp8 decode GEMM, DSMEM fixed-order
+reduce) was implemented, exact and deterministic, and slower than the
+shipped 128-CTA grid at every shape but the shared gate_up at one row
+(5.96 -> 5.39 us); split 4 loses 10-80 %. The small shapes are bound by
+per-CTA fixed cost, not by CTA count; the code is reverted and the lesson
+recorded (notebook "P11 cluster split-K: rejected").
+
+P9 became a two-kernel NVFP4 decode MoE path over the Marlin-packed expert
+tensors in place (`csrc/quixicore/serving/nvfp4_moe_decode_ampere.cuh`):
+gate/up + SiLU, then down + the top-k combine + the shared-expert fold,
+deterministic, dispatched from `fused_marlin_moe` below 32 assignment rows
+(`QC_NVFP4_DECODE=0` restores Marlin). Four kernel rounds took the pair
+from 24.5 to 22.2 us per layer cold at one token against Marlin's 29.3
+(-24 %); -6 / -8 / -3 % at 2 / 4 / 8 tokens. The rounds and their lessons
+(runtime-indexed register arrays, the A-fragment round trip per chunk, the
+issue-bound loop, warps over stages) are in the notebook entry "P9 NVFP4
+decode MoE pair: the kernel rounds". Three serving rounds landed it
+(14:37 PDT): the first found the pair not dispatched (GLM-5.3's SiLU
+carries a clamp limit of 10, now folded into gemv1), the second found the
+early dependent-launch trigger costing the whole gain under PDL (29.3 vs
+24.8 us per layer), the third read plain c1 +3.4 % on the 22:00 record
+(214.5 / 767 / 1102-1115: +29 / +12 / +15 % on the control) and spec
+medians c1 305 (+13 % on Marlin in-session), c8 816, c16 1119. Retained as
+the default. Left on the item: gemv2's CTA count at one token.
