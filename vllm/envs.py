@@ -28,6 +28,8 @@ if TYPE_CHECKING:
     VLLM_API_KEY: str | None = None
     VLLM_ADMISSION_MAX_CONCURRENT: int | None = None
     VLLM_DEBUG_LOG_API_SERVER_RESPONSE: bool = False
+    VLLM_BAD_REQUEST_LOG_PATH: str | None = None
+    VLLM_BAD_REQUEST_LOG_MAX_BYTES: int = 262144
     S3_ACCESS_KEY_ID: str | None = None
     S3_SECRET_ACCESS_KEY: str | None = None
     S3_ENDPOINT_URL: str | None = None
@@ -770,6 +772,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Whether to log responses from API Server for debugging
     "VLLM_DEBUG_LOG_API_SERVER_RESPONSE": lambda: (
         os.environ.get("VLLM_DEBUG_LOG_API_SERVER_RESPONSE", "False").lower() == "true"
+    ),
+    # Optional owner-only JSONL capture of bounded request/response bodies for
+    # 4xx diagnostics. Authorization headers are never recorded.
+    "VLLM_BAD_REQUEST_LOG_PATH": lambda: os.getenv("VLLM_BAD_REQUEST_LOG_PATH"),
+    "VLLM_BAD_REQUEST_LOG_MAX_BYTES": lambda: int(
+        os.getenv("VLLM_BAD_REQUEST_LOG_MAX_BYTES", "262144")
     ),
     # S3 access information, used for tensorizer to load model from S3
     "S3_ACCESS_KEY_ID": lambda: os.environ.get("S3_ACCESS_KEY_ID", None),

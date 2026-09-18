@@ -3,11 +3,14 @@
 import asyncio
 import hashlib
 import json
+import os
 import secrets
+import stat
 import uuid
 from argparse import Namespace
 from collections.abc import Awaitable
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from http import HTTPStatus
 
 import pydantic
@@ -50,6 +53,122 @@ ADMISSION_GUARDED_SUFFIXES = (
     "/responses",
     "/messages",
 )
+
+
+class BadRequestBodyCaptureMiddleware:
+    """Write bounded request/response bodies for failed HTTP requests.
+
+    This diagnostic is intentionally opt-in. Records go to a separate 0600
+    JSONL file, never include request headers (especially ``Authorization``),
+    and are written only for 4xx responses. Body hashes cover the complete
+    streams even when the recorded prefix is truncated.
+    """
+
+    def __init__(self, app: ASGIApp, path: str, max_body_bytes: int) -> None:
+        if not path:
+            raise ValueError("bad-request capture path must not be empty")
+        if max_body_bytes <= 0:
+            raise ValueError("bad-request capture size must be positive")
+        self.app = app
+        self.path = os.path.abspath(path)
+        self.max_body_bytes = max_body_bytes
+
+    @staticmethod
+    def _append_prefix(destination: bytearray, chunk: bytes, limit: int) -> None:
+        remaining = limit - len(destination)
+        if remaining > 0:
+            destination.extend(chunk[:remaining])
+
+    def _write_record(self, record: dict) -> None:
+        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(self.path, flags, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise OSError(f"diagnostic path is not a regular file: {self.path}")
+            payload = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+            os.write(fd, payload.encode("utf-8") + b"\n")
+        finally:
+            os.close(fd)
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+
+        request_prefix = bytearray()
+        response_prefix = bytearray()
+        request_hash = hashlib.sha256()
+        response_hash = hashlib.sha256()
+        request_bytes = 0
+        response_bytes = 0
+        status_code: int | None = None
+        response_request_id: str | None = None
+
+        async def capture_receive() -> Message:
+            nonlocal request_bytes
+            message = await receive()
+            if message["type"] == "http.request":
+                chunk = message.get("body", b"")
+                request_bytes += len(chunk)
+                request_hash.update(chunk)
+                self._append_prefix(
+                    request_prefix,
+                    chunk,
+                    self.max_body_bytes,
+                )
+            return message
+
+        async def capture_send(message: Message) -> None:
+            nonlocal status_code, response_bytes, response_request_id
+            if message["type"] == "http.response.start":
+                status_code = message["status"]
+                response_headers = Headers(raw=message.get("headers", []))
+                response_request_id = response_headers.get("x-request-id")
+            elif message["type"] == "http.response.body":
+                chunk = message.get("body", b"")
+                response_bytes += len(chunk)
+                response_hash.update(chunk)
+                self._append_prefix(
+                    response_prefix,
+                    chunk,
+                    self.max_body_bytes,
+                )
+            await send(message)
+
+        await self.app(scope, capture_receive, capture_send)
+
+        if status_code is None or not 400 <= status_code < 500:
+            return
+
+        request_headers = Headers(scope=scope)
+        client = scope.get("client")
+        request_id = request_headers.get("x-request-id") or response_request_id
+        record = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "method": scope.get("method"),
+            "path": scope.get("path"),
+            "status": status_code,
+            "request_id": request_id,
+            "client": list(client) if client else None,
+            "content_type": request_headers.get("content-type"),
+            "request_body": request_prefix.decode("utf-8", errors="replace"),
+            "request_body_bytes": request_bytes,
+            "request_body_truncated": request_bytes > len(request_prefix),
+            "request_sha256": request_hash.hexdigest(),
+            "response_body": response_prefix.decode("utf-8", errors="replace"),
+            "response_body_bytes": response_bytes,
+            "response_body_truncated": response_bytes > len(response_prefix),
+            "response_sha256": response_hash.hexdigest(),
+        }
+        try:
+            self._write_record(record)
+        except OSError:
+            logger.exception(
+                "Failed to write bad-request diagnostic record to %s",
+                self.path,
+            )
 
 
 class AdmissionControlMiddleware:
