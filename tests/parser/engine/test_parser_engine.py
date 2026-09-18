@@ -1105,6 +1105,26 @@ class TestToolAdapterForwardsKwargs:
         assert engine.parser_engine_config.initial_state == expected_state
 
 
+class TestGlm47ThinkingControls:
+    def test_enable_thinking_false_overrides_thinking_default(self):
+        from vllm.parser.glm47_moe import Glm47MoeParser
+
+        parser = Glm47MoeParser(
+            make_mock_tokenizer(_VOCAB),
+            chat_template_kwargs={
+                "thinking": True,
+                "enable_thinking": False,
+            },
+        )
+
+        assert parser.thinking_enabled is False
+        assert parser.parser_engine_config.initial_state == ParserState.CONTENT
+        assert parser.extract_reasoning("SLIMSERVE_READY", None) == (
+            None,
+            "SLIMSERVE_READY",
+        )
+
+
 # ── TestExtractContentIdsNoEmptyReturn ─────────────────────────────
 
 

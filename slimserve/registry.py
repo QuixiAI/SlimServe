@@ -365,9 +365,12 @@ def _merge_platform(profile: dict[str, Any], platform: str) -> dict[str, Any]:
     left to merge now that each platform has its own record.
     """
     record = profile["variants"][platform]
+    env = dict(record.get("env") or {})
+    if tool_calling_profile := record.get("tool_calling_profile"):
+        env["VLLM_TOOL_CALLING_PROFILE"] = str(tool_calling_profile)
     return {
         "engine": dict(record["engine"]),
-        "env": dict(record.get("env") or {}),
+        "env": env,
         "notes": list(record.get("notes") or []),
         "default_quant": record["default_quant"],
         "speculative_overrides": dict(record.get("speculative_overrides") or {}),
