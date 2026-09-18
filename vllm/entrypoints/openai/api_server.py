@@ -42,6 +42,7 @@ from vllm.entrypoints.serve.utils.api_utils import (
 )
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 from vllm.entrypoints.serve.utils.server_utils import (
+    BadRequestBodyCaptureMiddleware,
     engine_error_handler,
     exception_handler,
     generation_error_handler,
@@ -359,6 +360,21 @@ def build_app(
             "avoided in production."
         )
         app.middleware("http")(log_response)
+
+    if bad_request_log_path := envs.VLLM_BAD_REQUEST_LOG_PATH:
+        bad_request_log_max_bytes = envs.VLLM_BAD_REQUEST_LOG_MAX_BYTES
+        app.add_middleware(
+            BadRequestBodyCaptureMiddleware,
+            path=bad_request_log_path,
+            max_body_bytes=bad_request_log_max_bytes,
+        )
+        logger.warning(
+            "Bad-request body capture enabled at %s (max %d bytes per body). "
+            "The file can contain sensitive prompt/tool data and is forced "
+            "to owner-only permissions.",
+            os.path.abspath(bad_request_log_path),
+            bad_request_log_max_bytes,
+        )
 
     for middleware in args.middleware:
         module_path, object_name = middleware.rsplit(".", 1)
