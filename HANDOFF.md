@@ -117,10 +117,18 @@ cost a serving round each, both now logged by the boot: GLM-5.3's MoE is
 SiLU with a clamp limit of 10 (the pair folds it into gemv1's epilogue),
 and a dependent-launch trigger at the top of a streaming kernel lets the
 next kernel's CTAs squat on the SMs (trigger after the stream: 29.3 -> 24.8
-us per layer under PDL). Next: P10 (a top-k-only routing kernel for the
-pair path: route_align's 4 us block alignment is dead weight below 32
-rows), P12, P5; the pair itself has ~4.5 us per layer left to the card's
-rate (gemv1 1.39 TB/s, gemv2 1.12 at one token). Scripts: `$S/p8/bench_moe_decode2.py` (cold per-kernel, honours
+us per layer under PDL). P10 landed 15:35 PDT as the router folded into
+gemv1 (the fp32 logits go to the kernel, which writes topk_ids / weights;
+`glm_route_align.DeferredRouting` is the contract, QC_NVFP4_DECODE_ROUTE=0
+the switch): plain c1 222.0 (+7 % on Marlin in-session, +33 % on the
+control), c8 spec 831, c16 spec 1130, c1 spec ~283 as an EIGHT-pass median
+(four passes at c1 spec are a draw: 270-311 medians from the same
+configuration). The c1 MoE-layer critical path is now router GEMV 3 ->
+gemv1 ~18 (routing prologue 1.9 + stream) -> gemv2 9.5 us; the shared
+expert runs hidden on the side stream. Next: P12 (the c16 schedule
+six-pass A/B), P5 (+2 % c8 spec), then the fixed cost every shape pays
+(all-reduce transitions 2 per layer, the small fp8 shapes, KDA glue); the
+pair itself has ~4.5 us per layer left to the card's rate. Scripts: `$S/p8/bench_moe_decode2.py` (cold per-kernel, honours
 QC_PDL), `$S/p9/mb.cu` (standalone nvcc microbench), `$S/p8/chain_p9{,b,c}.sh`,
 `$S/p8/trace_moe_kinds.py`; raw `perf/results/2026-09-17/p9-moe-decode/`.
 

@@ -216,3 +216,83 @@ def test_rejects_bad_shapes() -> None:
             lay.l.w2_weight_scale_2, ids, w[:, :1].contiguous(), None,
             torch.empty(1, K, device=DEV, dtype=torch.bfloat16),
         )
+
+
+def reference_routing(logits, bias, scaling=1.0):
+    """glm_route_align's selection: sigmoid scores, bias-only top-k, renormalized
+    unbiased scores times the scaling factor."""
+    scores = torch.sigmoid(logits.float())
+    ids = torch.topk(scores + bias, TOPK, dim=-1).indices
+    w = torch.gather(scores, 1, ids)
+    return ids.to(torch.int32), (w / w.sum(-1, keepdim=True) * scaling).float()
+
+
+@pytest.mark.parametrize("m", [1, 3])
+def test_gemv1_folded_router_matches_route_align_selection(m: int) -> None:
+    lay = Layer(5)
+    g = torch.Generator(device=DEV).manual_seed(31 + m)
+    x = torch.randn(m, K, device=DEV, dtype=torch.bfloat16, generator=g)
+    logits = torch.randn(m, E, device=DEV, generator=g) * 2
+    bias = torch.randn(E, device=DEV, generator=g) * 0.5
+    ids_ref, w_ref = reference_routing(logits, bias, scaling=2.5)
+    act_ref, _ = lay.reference(x, ids_ref, w_ref)
+    ids = torch.full((m, TOPK), -7, device=DEV, dtype=torch.int32)
+    w = torch.zeros(m, TOPK, device=DEV, dtype=torch.float32)
+    act = torch.empty(m * TOPK, N, device=DEV, dtype=torch.bfloat16)
+    quixicore_ops.nvfp4_moe_gemv1(
+        x, lay.l.w13_weight, lay.s13, lay.l.w13_weight_scale_2, ids, act,
+        logits=logits, bias=bias, scoring=0, scaling=2.5, renormalize=True, topk_weights=w,
+    )
+    assert torch.equal(ids, ids_ref), (ids, ids_ref)
+    assert torch.allclose(w, w_ref, rtol=1e-5, atol=1e-6)
+    assert rel(act, act_ref) < 2**-7
+    # A NaN logits row (vLLM's dummy runs) still routes to valid experts.
+    logits[0] = float("nan")
+    quixicore_ops.nvfp4_moe_gemv1(
+        x, lay.l.w13_weight, lay.s13, lay.l.w13_weight_scale_2, ids, act,
+        logits=logits, bias=bias, scoring=0, scaling=2.5, renormalize=True, topk_weights=w,
+    )
+    assert bool(((ids >= 0) & (ids < E)).all())
+    assert len(set(ids[0].tolist())) == TOPK
+
+
+def test_deferred_routing_through_fused_marlin_moe(monkeypatch) -> None:
+    from vllm.model_executor.layers.fused_moe.router import glm_route_align
+
+    lay = Layer(6)
+    m = 2
+    g = torch.Generator(device=DEV).manual_seed(77)
+    x = 4 * torch.randn(m, K, device=DEV, dtype=torch.bfloat16, generator=g)
+    logits = torch.randn(m, E, device=DEV, generator=g) * 2
+    bias = torch.randn(E, device=DEV, generator=g) * 0.5
+    ids_ref, w_ref = reference_routing(logits, bias, scaling=1.0)
+    _, out_ref = lay.reference(x, ids_ref, w_ref, clamp=10.0)
+    ids = torch.empty(m, TOPK, device=DEV, dtype=torch.int32)
+    w = torch.empty(m, TOPK, device=DEV, dtype=torch.float32)
+    entry = glm_route_align.DeferredRouting(ids, w, logits, bias, TOPK, 0, True, 1.0, 8, m * TOPK * 8, m * TOPK)
+    monkeypatch.setattr(marlin_moe, "_qc_nvfp4_decode_rows", lambda: 32)
+    monkeypatch.setattr(glm_route_align, "_deferred", entry)
+    out = marlin_moe.fused_marlin_moe(
+        hidden_states=x, w1=lay.l.w13_weight, w2=lay.l.w2_weight, bias1=None, bias2=None,
+        w1_scale=lay.l.w13_weight_scale, w2_scale=lay.l.w2_weight_scale, topk_weights=w, topk_ids=ids,
+        quant_type_id=scalar_types.float4_e2m1f.id, global_num_experts=E, activation=MoEActivation.SILU,
+        global_scale1=lay.l.w13_weight_scale_2, global_scale2=lay.l.w2_weight_scale_2, workspace=lay.l.workspace,
+        clamp_limit=10.0,
+    )
+    assert glm_route_align._deferred is None
+    assert torch.equal(ids, ids_ref)
+    assert rel(out, out_ref) < 2**-6
+    # The pair now reports itself active for small batches.
+    assert marlin_moe.nvfp4_decode_pair_serves(m * TOPK)
+    assert not marlin_moe.nvfp4_decode_pair_serves(33)
+    # A deferred entry for a different tensor is a loud error, never silent garbage.
+    monkeypatch.setattr(glm_route_align, "_deferred", entry)
+    with pytest.raises(RuntimeError):
+        marlin_moe.fused_marlin_moe(
+            hidden_states=x, w1=lay.l.w13_weight, w2=lay.l.w2_weight, bias1=None, bias2=None,
+            w1_scale=lay.l.w13_weight_scale, w2_scale=lay.l.w2_weight_scale, topk_weights=w, topk_ids=ids.clone(),
+            quant_type_id=scalar_types.float4_e2m1f.id, global_num_experts=E, activation=MoEActivation.SILU,
+            global_scale1=lay.l.w13_weight_scale_2, global_scale2=lay.l.w2_weight_scale_2, workspace=lay.l.workspace,
+            clamp_limit=10.0,
+        )
+    monkeypatch.setattr(glm_route_align, "_deferred", None)

@@ -1776,14 +1776,25 @@ class quixicore_ops:
         nj: int = 2,
         stages: int = 4,
         clamp_limit: float | None = None,
+        logits: torch.Tensor | None = None,
+        bias: torch.Tensor | None = None,
+        scoring: int = 0,
+        scaling: float = 1.0,
+        renormalize: bool = True,
+        topk_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Decode MoE gate/up projection + SiLU over the Marlin-packed NVFP4
         experts: one CTA per (assignment slot, 16*nj columns), a `stages`-deep
         cp.async ring of 16-tile chunks; clamp_limit as silu_and_mul_with_clamp
         (gate from above, up to +/- limit); writes act[M * top_k, N] bf16 (row =
-        token * top_k + k)."""
+        token * top_k + k). With `logits` (fp32 [M, E]) and `bias` (fp32 [E]) the
+        router is folded in (glm_route_align's selection: scoring 0 sigmoid / 1
+        sqrt-softplus, bias-only top-k, renormalize, scaling) and topk_ids /
+        topk_weights are OUTPUTS written by the kernel."""
         clamp = -1.0 if clamp_limit is None else float(clamp_limit)
-        return _qc().nvfp4_moe_gemv1(x, b, s, g, topk_ids, act, nj, stages, clamp)
+        return _qc().nvfp4_moe_gemv1(
+            x, b, s, g, topk_ids, act, nj, stages, clamp, logits, bias, scoring, scaling, renormalize, topk_weights
+        )
 
     @staticmethod
     def nvfp4_moe_gemv2(

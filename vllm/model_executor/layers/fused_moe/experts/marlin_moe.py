@@ -282,10 +282,29 @@ def _qc_nvfp4_decode_declined(why: str) -> None:
 
 
 _qc_nvfp4_decode_announced = False
+_qc_nvfp4_decode_pair_active = False   # the pair has served a batch of this model
+
+
+@functools.cache
+def _qc_nvfp4_decode_route_enabled() -> bool:
+    """QC_NVFP4_DECODE_ROUTE=0 keeps the routing in the route_align launch."""
+    return os.environ.get("QC_NVFP4_DECODE_ROUTE", "1") != "0"
+
+
+def nvfp4_decode_pair_serves(rows: int) -> bool:
+    """Whether the NVFP4 decode pair will serve a batch of `rows` assignment
+    rows: it has served one already (the layer shapes qualified) and the batch
+    is under the rows cap. glm_route_align defers the routing to gemv1 then."""
+    return (
+        _qc_nvfp4_decode_route_enabled()
+        and _qc_nvfp4_decode_pair_active
+        and 0 < rows <= _qc_nvfp4_decode_rows()
+    )
 
 
 def _qc_nvfp4_decode_announce(M: int, topk: int) -> None:
-    global _qc_nvfp4_decode_announced
+    global _qc_nvfp4_decode_announced, _qc_nvfp4_decode_pair_active
+    _qc_nvfp4_decode_pair_active = True
     if not _qc_nvfp4_decode_announced:
         _qc_nvfp4_decode_announced = True
         logger.info(
@@ -308,10 +327,13 @@ def _qc_nvfp4_decode_moe(
     intermediate_cache2: torch.Tensor | None,
     output: torch.Tensor | None,
     clamp_limit: float | None = None,
+    routing: glm_route_align.DeferredRouting | None = None,
 ) -> torch.Tensor:
     """The decode pair: gate/up + SiLU into the [M * top_k, N] intermediate,
     then down + top-k combine (+ the runner's shared-expert output when it
-    published one for this batch) into output [M, K]."""
+    published one for this batch) into output [M, K]. With `routing` gemv1
+    computes the top-k from the router logits and writes topk_ids /
+    topk_weights itself."""
     M, K = hidden_states.shape
     topk = topk_ids.size(1)
     N = w2.size(1) * 16
@@ -323,11 +345,19 @@ def _qc_nvfp4_decode_moe(
         act = _resize_cache(intermediate_cache2, (M * topk, N))
     if output is None:
         output = torch.empty_like(hidden_states)
-    ids = topk_ids if topk_ids.dtype == torch.int32 else topk_ids.to(torch.int32)
-    ids = ids.contiguous()
-    quixicore_ops.nvfp4_moe_gemv1(
-        hidden_states, w1, w1_scale.view(torch.uint8), global_scale1, ids, act, nj, stages, clamp_limit
-    )
+    if routing is not None:
+        ids = routing.topk_ids
+        topk_weights = routing.topk_weights
+        quixicore_ops.nvfp4_moe_gemv1(
+            hidden_states, w1, w1_scale.view(torch.uint8), global_scale1, ids, act, nj, stages, clamp_limit,
+            routing.logits, routing.bias, routing.scoring, routing.scaling, routing.renormalize, topk_weights,
+        )
+    else:
+        ids = topk_ids if topk_ids.dtype == torch.int32 else topk_ids.to(torch.int32)
+        ids = ids.contiguous()
+        quixicore_ops.nvfp4_moe_gemv1(
+            hidden_states, w1, w1_scale.view(torch.uint8), global_scale1, ids, act, nj, stages, clamp_limit
+        )
     shared = combine_shared.consume(topk_ids)
     shared_out = None
     if (
@@ -668,12 +698,21 @@ def fused_marlin_moe(
     ):
         assert w1_scale is not None and w2_scale is not None
         assert global_scale1 is not None and global_scale2 is not None
+        routing = glm_route_align.consume_deferred(topk_ids)
+        if routing is None and glm_route_align.pending_deferred():
+            raise RuntimeError(
+                "nvfp4 decode pair: a deferred routing is pending for another topk_ids tensor; "
+                "the batch's topk_ids must reach fused_marlin_moe unchanged"
+            )
         _qc_nvfp4_decode_announce(M, topk)
         return _qc_nvfp4_decode_moe(
             hidden_states, w1, w2, w1_scale, w2_scale, global_scale1, global_scale2,
             topk_weights, topk_ids, apply_router_weight_on_input, intermediate_cache2, output,
-            clamp_limit,
+            clamp_limit, routing,
         )
+    deferred = glm_route_align.consume_deferred(topk_ids)
+    if deferred is not None:
+        glm_route_align.materialize(deferred)   # the pair declined this batch: route it now
 
     use_qc_prefill = _qc_nvfp4_prefill_applicable(
         quant_type, hidden_states, w1, w2, M, topk, E, bias1, bias2,

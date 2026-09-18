@@ -2033,10 +2033,12 @@ static torch::Tensor py_nvfp4_moe_gemm(torch::Tensor a, torch::Tensor b, torch::
 // gemv1 (gate/up + SiLU) and gemv2 (down + top-k combine + shared fold).
 template <int NJ, int KT>
 static void launch_nvfp4_gemv1(const __nv_bfloat16* x, int ldx, const int32_t* b, const uint8_t* s, const float* g,
-                               const int32_t* ids, __nv_bfloat16* act, int slots, int top_k, int N, int K, int E, int gstride,
-                               float clamp) {
+                               int32_t* ids, __nv_bfloat16* act, int slots, int top_k, int N, int K, int E, int gstride,
+                               float clamp, const float* logits, const float* bias, int scoring, float scaling, int renorm,
+                               float* topk_w) {
     const dim3 grid(N / (16 * NJ), slots);
-    const size_t dyn = size_t(K) * 2 + tms::nvfp4dec::gemv1_ring_bytes<NJ, KT>();   // the staged row + the ring
+    // the staged row + the ring (+ the folded router's choice/score arrays)
+    const size_t dyn = size_t(K) * 2 + tms::nvfp4dec::gemv1_ring_bytes<NJ, KT>() + (logits != nullptr ? size_t(2 * E) * 4 : 0);
     TORCH_CHECK(dyn <= 99 * 1024, "nvfp4_moe_gemv1: nj/stages too wide for shared memory (", dyn, " B)");
     static size_t granted = 0;          // dynamic smem crosses 48 KB for the wide configs (sm_120: 99 KB opt-in)
     if (dyn > granted) {
@@ -2053,10 +2055,11 @@ static void launch_nvfp4_gemv1(const __nv_bfloat16* x, int ldx, const int32_t* b
         attr[0].val.programmaticStreamSerializationAllowed = 1;
         cfg.attrs = attr; cfg.numAttrs = 1;
         tms::decode_gemm::check_cuda_status(cudaLaunchKernelEx(&cfg, tms::nvfp4dec::nvfp4_moe_gemv1_kernel<NJ, KT>,
-                                                               x, ldx, b, s, g, ids, act, top_k, N, K, E, gstride, clamp, pdl));
+                                                               x, ldx, b, s, g, ids, act, top_k, N, K, E, gstride, clamp,
+                                                               logits, bias, scoring, scaling, renorm, topk_w, pdl));
     } else {
         tms::nvfp4dec::nvfp4_moe_gemv1_kernel<NJ, KT><<<grid, tms::nvfp4dec::THREADS, dyn, stream()>>>(
-            x, ldx, b, s, g, ids, act, top_k, N, K, E, gstride, clamp, 0);
+            x, ldx, b, s, g, ids, act, top_k, N, K, E, gstride, clamp, logits, bias, scoring, scaling, renorm, topk_w, 0);
     }
 }
 template <int NJ, int KT>
@@ -2111,7 +2114,9 @@ static void nvfp4_dec_check(const torch::Tensor& a, const torch::Tensor& b, cons
 // x [M, K] bf16 (row stride = stride(0)); b int32 [E, K/16, (2N)*2]; s uint8 [E, K/16, 2N]; g fp32 [E];
 // topk_ids int32 [M, top_k]; act [M * top_k, N] bf16 (written); nj in {1, 2, 4}.
 static torch::Tensor py_nvfp4_moe_gemv1(torch::Tensor x, torch::Tensor b, torch::Tensor s, torch::Tensor g,
-                                        torch::Tensor topk_ids, torch::Tensor act, int64_t nj, int64_t kt, double clamp) {
+                                        torch::Tensor topk_ids, torch::Tensor act, int64_t nj, int64_t kt, double clamp,
+                                        c10::optional<torch::Tensor> logits, c10::optional<torch::Tensor> bias, int64_t scoring,
+                                        double scaling, bool renormalize, c10::optional<torch::Tensor> topk_weights) {
     nvfp4_dec_check(x, b, s, g, topk_ids, "nvfp4_moe_gemv1");
     CK(act);
     TORCH_CHECK(act.device() == x.device(), "nvfp4_moe_gemv1: act must be on x's device");
@@ -2125,11 +2130,24 @@ static torch::Tensor py_nvfp4_moe_gemv1(torch::Tensor x, torch::Tensor b, torch:
     TORCH_CHECK(N % 64 == 0 && N % (16 * nj) == 0 && (nj == 1 || nj == 2 || nj == 4), "nvfp4_moe_gemv1: N % 64, nj in 1/2/4");
     TORCH_CHECK(kt == 4 || kt == 8, "nvfp4_moe_gemv1: stages in 4/8");
     TORCH_CHECK(K % (tms::nvfp4dec::CHUNK_K * kt) == 0, "nvfp4_moe_gemv1: K % (256 * stages)");
+    // The folded router: logits fp32 [M, E] + bias fp32 [E] in, topk_ids / topk_weights out.
+    const float* lg = nullptr; const float* bs = nullptr; float* tw = nullptr;
+    if (logits.has_value()) {
+        CK(logits.value()); CK(bias.value()); CK(topk_weights.value());
+        TORCH_CHECK(logits->scalar_type() == torch::kFloat32 && logits->dim() == 2 && logits->size(0) == M && logits->size(1) == E &&
+                    logits->device() == x.device(), "nvfp4_moe_gemv1: logits fp32 [M, E]");
+        TORCH_CHECK(bias->scalar_type() == torch::kFloat32 && bias->numel() == E && bias->device() == x.device(),
+                    "nvfp4_moe_gemv1: bias fp32 [E]");
+        TORCH_CHECK(topk_weights->scalar_type() == torch::kFloat32 && topk_weights->numel() == M * top_k &&
+                    topk_weights->device() == x.device(), "nvfp4_moe_gemv1: topk_weights fp32 [M, top_k]");
+        TORCH_CHECK(E <= tms::nvfp4dec::ROUTE_MAX_E && (scoring == 0 || scoring == 1), "nvfp4_moe_gemv1: router E <= 512, scoring 0/1");
+        lg = fp(logits.value()); bs = fp(bias.value()); tw = fpm(topk_weights.value());
+    }
     const c10::cuda::CUDAGuard guard(x.device());
     const int slots = M * top_k;
 #define QC_G1(NJ, KT) launch_nvfp4_gemv1<NJ, KT>(bp(x), int(x.stride(0)), b.data_ptr<int32_t>(), s.data_ptr<uint8_t>(), fp(g), \
                                                  topk_ids.data_ptr<int32_t>(), bpm(act), slots, top_k, N, K, E, g.numel() == 1 ? 0 : 1, \
-                                                 float(clamp))
+                                                 float(clamp), lg, bs, int(scoring), float(scaling), renormalize ? 1 : 0, tw)
     switch (nj * 16 + kt) {
         case 1 * 16 + 4: QC_G1(1, 4); break; case 1 * 16 + 8: QC_G1(1, 8); break;
         case 2 * 16 + 4: QC_G1(2, 4); break; case 2 * 16 + 8: QC_G1(2, 8); break;
@@ -3426,8 +3444,10 @@ void init_serving(py::module_& m) {
           "NVFP4 grouped MoE GEMM over Marlin-packed experts for prefill chunks (128-row blocks)");
     m.def("nvfp4_moe_gemv1", &py_nvfp4_moe_gemv1, py::arg("x"), py::arg("b"), py::arg("s"), py::arg("g"), py::arg("topk_ids"),
           py::arg("act"), py::arg("nj") = 2, py::arg("stages") = 4, py::arg("clamp") = -1.0,
+          py::arg("logits") = py::none(), py::arg("bias") = py::none(), py::arg("scoring") = 0, py::arg("scaling") = 1.0,
+          py::arg("renormalize") = true, py::arg("topk_weights") = py::none(),
           "NVFP4 decode MoE gate/up + SiLU (clamp >= 0: gate from above, up to +/- clamp) over Marlin-packed experts: "
-          "act[M*top_k, N] (one slot per CTA row)");
+          "act[M*top_k, N] (one slot per CTA row); with logits/bias the router is folded in and topk_ids/topk_weights are written");
     m.def("nvfp4_moe_gemv2", &py_nvfp4_moe_gemv2, py::arg("act"), py::arg("b"), py::arg("s"), py::arg("g"), py::arg("topk_ids"),
           py::arg("topk_weights") = py::none(), py::arg("shared") = py::none(), py::arg("out"), py::arg("nj") = 2, py::arg("stages") = 4, py::arg("split") = 1,
           "NVFP4 decode MoE down projection + top-k combine (+ shared-expert add) over Marlin-packed experts: out[M, D]");

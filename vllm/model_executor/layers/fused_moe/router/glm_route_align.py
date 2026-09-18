@@ -43,6 +43,63 @@ class RoutingAlignment:
 _published: RoutingAlignment | None = None
 
 
+@dataclass
+class DeferredRouting:
+    """A batch whose routing the NVFP4 decode pair computes inside its first
+    kernel: `route` hands out the (still unwritten) topk_ids / topk_weights
+    tensors and keeps the router inputs here; `fused_marlin_moe` consumes the
+    entry (matched on the topk_ids identity) and either lets gemv1 write the
+    tensors or, when the pair declines the batch, materializes the routing
+    with the route_align kernel and publishes the alignment as usual."""
+
+    topk_ids: torch.Tensor
+    topk_weights: torch.Tensor
+    logits: torch.Tensor
+    bias: torch.Tensor
+    top_k: int
+    scoring: int
+    renormalize: bool
+    scaling: float
+    block_size: int
+    max_padded: int
+    max_blocks: int
+
+
+_deferred: DeferredRouting | None = None
+
+
+def consume_deferred(topk_ids: torch.Tensor) -> DeferredRouting | None:
+    global _deferred
+    entry = _deferred
+    if entry is not None and entry.topk_ids is topk_ids:
+        _deferred = None
+        return entry
+    return None
+
+
+def pending_deferred() -> bool:
+    return _deferred is not None
+
+
+def materialize(entry: DeferredRouting) -> None:
+    """Route the batch now (the pair is not serving it): fills the handed-out
+    tensors in place and publishes the Marlin alignment."""
+    weights, ids, sorted_ids, expert_ids, post_pad = torch.ops.vllm.glm_route_align(
+        entry.logits,
+        entry.bias,
+        entry.top_k,
+        entry.scoring,
+        entry.renormalize,
+        entry.scaling,
+        entry.block_size,
+        entry.max_padded,
+        entry.max_blocks,
+    )
+    entry.topk_ids.copy_(ids)
+    entry.topk_weights.copy_(weights)
+    publish(RoutingAlignment(entry.topk_ids, sorted_ids, expert_ids, post_pad, entry.block_size))
+
+
 def publish(alignment: RoutingAlignment) -> None:
     global _published
     _published = alignment
@@ -90,6 +147,22 @@ def route(router, router_logits: torch.Tensor):
     max_padded, max_blocks = moe_align_block_size_geometry(
         num_tokens * router.top_k, num_experts, block_size
     )
+    from vllm.model_executor.layers.fused_moe.experts.marlin_moe import (
+        nvfp4_decode_pair_serves,
+    )
+
+    if nvfp4_decode_pair_serves(num_tokens * router.top_k):
+        # The pair's gemv1 routes the batch itself (one launch fewer on the
+        # decode critical path); hand out the tensors it will write.
+        global _deferred
+        ids = torch.empty((num_tokens, router.top_k), dtype=torch.int32, device=router_logits.device)
+        weights = torch.empty((num_tokens, router.top_k), dtype=torch.float32, device=router_logits.device)
+        _deferred = DeferredRouting(
+            ids, weights, router_logits, router.e_score_correction_bias.data, router.top_k,
+            SCORING[router.scoring_func], bool(router.renormalize), float(router.routed_scaling_factor),
+            block_size, max_padded, max_blocks,
+        )
+        return weights, ids
     weights, ids, sorted_ids, expert_ids, post_pad = torch.ops.vllm.glm_route_align(
         router_logits,
         router.e_score_correction_bias.data,

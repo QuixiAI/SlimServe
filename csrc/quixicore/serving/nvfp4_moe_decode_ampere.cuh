@@ -51,6 +51,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <cstdint>
+#include <cfloat>
 #include <cooperative_groups.h>
 #include "../tm_cuda/bf16_decode_gemm.cuh"
 
@@ -120,9 +121,9 @@ struct TileBytes {
 // Dynamic shared memory of the kernels: the staged activation row(s) then the ring
 // (the ring lives in dynamic memory so the wide configs can pass the 48 KB static cap).
 template <int NJ, int STAGES>
-constexpr int gemv1_ring_bytes() { return STAGES * WARPS * 2 * TileBytes<NJ>::TILE; }
+__host__ __device__ constexpr int gemv1_ring_bytes() { return STAGES * WARPS * 2 * TileBytes<NJ>::TILE; }
 template <int NJ, int STAGES>
-constexpr int gemv2_ring_bytes() { return STAGES * WARPS * TileBytes<NJ>::TILE; }
+__host__ __device__ constexpr int gemv2_ring_bytes() { return STAGES * WARPS * TileBytes<NJ>::TILE; }
 
 // Per-warp copy state for one operand: the lane's word pointer and (lanes 0..7)
 // scale pointer at the warp's k-tile of the current chunk; `advance` steps one chunk.
@@ -216,17 +217,96 @@ __device__ __forceinline__ float warp_sum(const float* red, int col) {
     return v;
 }
 
+// The router folded into gemv1 (`logits` != nullptr): every CTA of slot s = token * top_k + k
+// recomputes the token's routing from the fp32 router logits - glm_moe_routing.cuh's
+// selection exactly: sigmoid / sqrt-softplus scores, bias-only top-k with ties to the lowest
+// index and NaN below every finite score, weights = unbiased score (renormalized over the
+// top-k) * scaling - and takes expert sel[k]; the CTAs of column group 0 write topk_ids and
+// topk_w for gemv2 and the runner. One warp's eight argmax rounds cost ~0.5 us inside the
+// prologue against the 4.8 us the separate route_align launch held on the critical path.
+constexpr int ROUTE_MAX_E = 512;
+enum RouteScoring : int { ROUTE_SIGMOID = 0, ROUTE_SQRT_SOFTPLUS = 1 };
+__device__ __forceinline__ float route_score(float x, int scoring) {
+    if (scoring == ROUTE_SIGMOID) return 1.0f / (1.0f + expf(-x));
+    const float sp = x > 20.0f ? x : log1pf(expf(x));
+    return sqrtf(sp);
+}
+// Returns the slot's expert (always in [0, E)) and its weight. `choice`/`score` are E floats
+// each in shared memory; every thread of the block takes part.
+__device__ __forceinline__ int route_slot(const float* __restrict__ logits, const float* __restrict__ bias, int E,
+                                          int scoring, float scaling, int renorm, int top_k, int k,
+                                          float* choice, float* score, float& weight_out, int tid, int lane, int warp) {
+    for (int e = tid; e < E; e += THREADS) {
+        const float sc = route_score(logits[e], scoring);
+        score[e] = sc;
+        const float c = sc + bias[e];
+        choice[e] = (c == c) ? c : -FLT_MAX;
+    }
+    __shared__ int sel_e;
+    __shared__ float sel_w;
+    __syncthreads();
+    if (warp == 0) {
+        // Each lane keeps its candidates in registers (expert lane + 32 j); a round is a
+        // register argmax, a warp argmax by shuffles and one register invalidation.
+        constexpr int NPL = ROUTE_MAX_E / 32;
+        float v[NPL];
+#pragma unroll
+        for (int j = 0; j < NPL; ++j) {
+            const int e = lane + 32 * j;
+            v[j] = e < E ? choice[e] : -INFINITY;
+        }
+        float wsum = 0.0f;
+        int mine = 0;
+        float mine_s = 0.0f;
+        for (int r = 0; r < top_k; ++r) {
+            float best = -INFINITY; int bj = 0;
+#pragma unroll
+            for (int j = 0; j < NPL; ++j) {
+                if (v[j] > best) { best = v[j]; bj = j; }   // lower j = lower expert index within the lane
+            }
+            int best_e = lane + 32 * bj;
+            if (best == -INFINITY) best_e = E;
+            // Warp argmax in two redux ops: the max orderable key, then the lowest expert
+            // index among the lanes holding it (ties to the lowest index, as route_align).
+            int key = __float_as_int(best);
+            key = key >= 0 ? key : key ^ 0x7FFFFFFF;
+            const int kmax = __reduce_max_sync(0xffffffffu, key);
+            best_e = __reduce_min_sync(0xffffffffu, key == kmax ? best_e : E);
+            if ((best_e & 31) == lane) {
+#pragma unroll
+                for (int j = 0; j < NPL; ++j)
+                    if (j == (best_e >> 5)) v[j] = -INFINITY;
+            }
+            const float sc = score[best_e];
+            wsum += sc;
+            if (r == k) { mine = best_e; mine_s = sc; }
+        }
+        if (lane == 0) {
+            const float inv = renorm ? 1.0f / fmaxf(wsum, 1e-20f) : 1.0f;
+            sel_e = mine;
+            sel_w = mine_s * inv * scaling;
+        }
+    }
+    __syncthreads();
+    weight_out = sel_w;
+    return sel_e;
+}
+
 // gemv1: act[s][col] = silu(gs * gate) * (gs * up) for slot s and its expert.
 //   x [M][K] bf16 (row stride ldx), B int32 [E][K/16][(2N)*2], S uint8 [E][K/16][2N],
 //   G fp32 [E] (gstride 1) or [1] (gstride 0), topk_ids int32 [M*top_k], act [M*top_k][N] bf16,
-//   clamp < 0 for none. grid (N / (16 NJ), M * top_k), dynamic smem K * 2 (the row) + gemv1_ring_bytes.
-//   K % (CHUNK_K * STAGES) == 0.
+//   clamp < 0 for none. grid (N / (16 NJ), M * top_k), dynamic smem K * 2 (the row) + gemv1_ring_bytes
+//   (+ 2 * E * 4 with the folded router). K % (CHUNK_K * STAGES) == 0.
+//   Folded router: logits fp32 [M][E], bias fp32 [E] (nullptr = topk_ids is an input);
+//   topk_ids int32 [M*top_k] and topk_w fp32 [M*top_k] are then written by column group 0.
 template <int NJ, int STAGES>
 __global__ void __launch_bounds__(THREADS) nvfp4_moe_gemv1_kernel(
         const __nv_bfloat16* __restrict__ x, int ldx,
         const int32_t* __restrict__ B, const uint8_t* __restrict__ S, const float* __restrict__ G,
-        const int32_t* __restrict__ topk_ids, __nv_bfloat16* __restrict__ act,
-        int top_k, int N, int K, int E, int gstride, float clamp, int pdl) {
+        int32_t* __restrict__ topk_ids, __nv_bfloat16* __restrict__ act,
+        int top_k, int N, int K, int E, int gstride, float clamp,
+        const float* __restrict__ logits, const float* __restrict__ bias, int scoring, float scaling, int renorm,
+        float* __restrict__ topk_w, int pdl) {
     using T = TileBytes<NJ>;
     constexpr int WTILE = 2 * T::TILE;            // the warp's gate + up tiles of one chunk
     constexpr int STAGE = WARPS * WTILE;
@@ -246,9 +326,24 @@ __global__ void __launch_bounds__(THREADS) nvfp4_moe_gemv1_kernel(
     // residency on 128 SMs (45 KB per CTA against the 99 KB budget): in situ the
     // pair's first serving round saved 2 us per layer of the 7 us measured cold.
     if (pdl) pdl_wait();
-    const int e = topk_ids[s];
+    {
+        const __nv_bfloat16* xr = x + size_t(token) * ldx;   // the row: independent of the expert, ahead of the routing
+        for (int i = tid; i < K / 8; i += THREADS) cp_async<16>(smem_u32(dyn + 16 * i), xr + 8 * i);
+    }
+    int e;
+    if (logits != nullptr) {
+        float* choice = reinterpret_cast<float*>(dyn + size_t(K) * 2 + gemv1_ring_bytes<NJ, STAGES>());
+        float w;
+        e = route_slot(logits + size_t(token) * E, bias, E, scoring, scaling, renorm, top_k, s - token * top_k,
+                       choice, choice + E, w, tid, lane, warp);
+        if (cg == 0 && tid == 0) { topk_ids[s] = e; topk_w[s] = w; }
+    } else {
+        e = topk_ids[s];
+    }
     if (e < 0 || e >= E) {
         for (int c = tid; c < 16 * NJ; c += THREADS) act[size_t(s) * N + col0 + c] = __float2bfloat16_rn(0.0f);
+        cp_async_commit();
+        cp_async_wait<0>();                          // the row copies were issued above
         return;
     }
     const int N2 = 2 * N;                            // the packed row: gate columns then up columns
@@ -265,10 +360,6 @@ __global__ void __launch_bounds__(THREADS) nvfp4_moe_gemv1_kernel(
         cu_.advance();
     };
 
-    {
-        const __nv_bfloat16* xr = x + size_t(token) * ldx;
-        for (int i = tid; i < K / 8; i += THREADS) cp_async<16>(smem_u32(dyn + 16 * i), xr + 8 * i);
-    }
     float accg[NJ][2][4], accu[NJ][2][4];
     zero_acc<NJ>(accg);
     zero_acc<NJ>(accu);
@@ -318,11 +409,8 @@ __global__ void __launch_bounds__(THREADS) nvfp4_moe_gemv1_kernel(
 // gemv2: out[m][col] = shared[m][col] + sum_k topk_w[m][k] * gs_e * (act[m*top_k+k] . W2_e^T)[col].
 //   act [M*top_k][Ki] bf16, B int32 [E][Ki/16][D*2], S uint8 [E][Ki/16][D], G fp32 [E] or [1],
 //   topk_ids int32 [M*top_k], topk_w fp32 [M*top_k] or nullptr (weights already on the input),
-//   shared [M][D] bf16 or nullptr, out [M][D] bf16. grid (D / (16 NJ), M, split) launched as
-//   clusters of `split` CTAs along z (split | top_k; 1 = plain launch), dynamic smem
-//   (top_k / split) * Ki * 2 (the CTA's rows) + gemv2_ring_bytes. Ki % CHUNK_K == 0, top_k <= 64.
-//   At one token the unsplit grid is 64-128 CTAs each streaming 16 chunks in series; the
-//   split doubles the CTAs and halves the chain, the rank-order DSMEM sum keeps it deterministic. The chunk sequence is
+//   shared [M][D] bf16 or nullptr, out [M][D] bf16. grid (D / (16 NJ), M), dynamic smem
+//   top_k * Ki * 2 (the token's rows) + gemv2_ring_bytes. Ki % CHUNK_K == 0, top_k <= 64. The chunk sequence is
 //   (slot, chunk-of-Ki) flattened, so the ring streams across expert boundaries.
 template <int NJ, int STAGES>
 __global__ void __launch_bounds__(THREADS) nvfp4_moe_gemv2_kernel(

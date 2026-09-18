@@ -30542,3 +30542,83 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   closed at 22.0 us per MoE layer at one token against Marlin's 29.0 (the
   card's rate would be ~17.5): gemv1 13.5 us at 1.39 TB/s and gemv2 8.4 at
   1.12 are the remaining 4.5 us = ~+4 % c1, a smaller lever than P10 now.
+
+- PHASE 8 / P10 THE ROUTER FOLDED INTO GEMV1 (2026-09-18 15:00-15:16 PDT;
+  `nvfp4_moe_decode_ampere.cuh` route_slot, binding args logits/bias/
+  scoring/scaling/renormalize/topk_weights on `nvfp4_moe_gemv1`,
+  `glm_route_align.DeferredRouting` + `materialize`, dispatch in
+  `fused_marlin_moe`; tests `test_gemv1_folded_router_matches_route_align_selection`,
+  `test_deferred_routing_through_fused_marlin_moe`; scratch `$S/p9/mb.cu`,
+  `mb_route.cu`).
+  Sizing first. The c1 profile of the 14:57 record (`$S/p8/trace_top.py` on
+  `$S/profile-state-p9d-prof`): per MoE layer the critical path is router
+  GEMV 3.0 -> route_align 4.8 -> gemv1 16.2 -> gemv2 9.5 us, on stream 180;
+  the shared expert (fp8 gate_up 7.8, the Triton clamp-SiLU 4.2, fp8 down
+  8.9) runs on stream 179 in parallel with route_align + gemv1 and finishes
+  ~3 us before gemv1 does, so it is hidden - which is also why gemv1 reads
+  16.2 us in situ against 13.5 cold (it shares the SMs and the HBM with the
+  shared expert's 6 MB). Folding the shared expert into the pair therefore
+  buys nothing; folding the routing into gemv1 removes a launch from the
+  critical path. The standalone routing kernel measured 3.8 us at one token
+  of which the alignment stage is 0.7 (`mb_route.cu`: 3.1 us with the
+  kernel cut after the top-k), so a top-k-only routing kernel was not worth
+  a round.
+  Design: with `logits` (the fp32 router logits the mHC projection already
+  produces) and `bias`, every gemv1 CTA of slot s recomputes its token's
+  routing in the prologue - glm_moe_routing.cuh's selection exactly
+  (sigmoid / sqrt-softplus scores, bias-only top-k with ties to the lowest
+  index and NaN below every finite score, weights = unbiased score
+  renormalized over the top-k, times the scaling) - and takes expert
+  sel[k]; the CTAs of column group 0 write topk_ids and topk_weights for
+  gemv2 and the runner. The row's cp.async is issued ahead of the routing
+  (it does not depend on the expert; that alone took the plain gemv1 from
+  9.0 to 8.8 us hot). Hot microbench, gemv1 nj 2 at one token: 8.8 us
+  plain; with the routing 11.5 through shared-memory argmax rounds, 11.4
+  with the candidates in registers (the shuffle chain, not the shared
+  traffic, was the cost), 10.7 with the warp argmax as two redux.sync
+  reductions (max orderable key, then min index among the holders): +1.9 us
+  in the prologue against the 4.8 us launch it replaces, ~-3 us per MoE
+  layer expected (-0.12 ms per c1 step, +2.7 %).
+  Contract: `glm_route_align.route` asks `marlin_moe.nvfp4_decode_pair_serves(rows)`
+  (the pair has served a batch of this model and rows <= the cap); if so it
+  hands out empty int32 ids / fp32 weights and keeps the router inputs in a
+  DeferredRouting matched on the ids tensor's identity. `fused_marlin_moe`
+  consumes it: the pair passes the logits to gemv1, which writes the
+  tensors; a declined batch materializes the routing with the route_align
+  kernel (in place, alignment published) and Marlin proceeds. A pending
+  entry that does not match the ids reaching the dispatch raises rather
+  than routing garbage. The first batch of a boot still goes through
+  route_align (the flag is set by the first pair dispatch); everything after
+  it, graph capture included, is deferred. Serving: `$S/p8/chain_p10.sh`
+  (below).
+  Serving (2026-09-18 15:16-15:26 PDT, `$S/p8/chain_p10.sh`; references
+  p9d-nospec 14:47 and p9d-spec 14:52): plain c1 221.9 / 222.0, c8 770.4 /
+  767.0, c16 1113.0 / 1110.0 against round 4's 218.0 / 218.2, 774.2 /
+  763.6, 1110.5 / 1108.2: c1 +1.7 % (the fold's -3 us per layer predicted
+  +2.7 %; 42 layers x 1.9 us of routing prologue remain), c8 / c16 level.
+  Gates (4) -2.451 / -2.446 / -2.441 / -2.454, canaries PASS. Spec, four
+  passes: c1 247.4 268.9 319.8 270.1 (median 270; round 4 read 307 337 274
+  315, median 311; Marlin 270), c8 830.2 831.9 794.3 849.2 (median 831;
+  round 4 820), c16 1124.1 1120.9 1135.6 1164.8 (median 1130; round 4 1116).
+  The c1 spec draw moved against the change while c8/c16 spec moved with
+  it; c1 spec depends on the sampled trajectory and its acceptance, so an
+  eight-pass c1-spec-only A/B with the engine's acceptance counters
+  (`vllm:spec_decode_num_{drafts,draft_tokens,accepted_tokens}_total`, now
+  printed by ab2.sh after the passes) decides it: `$S/p8/chain_p10c1.sh`,
+  QC_NVFP4_DECODE_ROUTE=0 keeping the routing in the route_align launch.
+  Eight-pass c1 spec A/B (15:27-15:35 PDT, `$S/p8/chain_p10c1.sh`):
+  | arm | c1 spec passes 1..8 | median | accepted per draft (3 draft tokens) |
+  |---|---|---|---|
+  | folded router (default) | 291.5 272.0 304.4 247.3 306.7 274.5 274.0 344.1 | 283 | 1.429 (0.476 per draft token) |
+  | route_align launch (QC_NVFP4_DECODE_ROUTE=0) | 302.2 319.6 256.2 246.3 343.5 276.3 268.3 286.6 | 281 | 1.384 (0.461) |
+  Level: the fold's ~0.13 ms per verify step sits inside the c1 spec draw
+  (246-344 in both arms) and the acceptance is unchanged (the selection is
+  bit-for-bit route_align's). Note for the record: with eight passes the c1
+  spec median of this configuration is ~280, not the 311 the four-pass
+  round 4 drew; four passes at c1 spec are a draw, eight are a reading.
+  DECISION: retained (plain c1 +1.7 %, c8 spec +1.3 %, c1 spec level, gates
+  and canaries clean; QC_NVFP4_DECODE_ROUTE=0 restores the route_align
+  launch). RECORD 2026-09-18 15:35 PDT: plain 222.0 / 767-770 / 1110-1113
+  (+33 / +12 / +15 % on the control's 166.5 / 687.9 / 966.8), spec medians
+  c1 ~283 (eight passes; +9 % on the control's MTP-3 260.8), c8 831 (+13.5 %
+  on 732.1), c16 1130 (+12 % on 1005.8).

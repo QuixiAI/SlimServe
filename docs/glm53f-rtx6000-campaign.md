@@ -1321,3 +1321,10 @@ cluster of two at one token: record 218.2 / 764-774 / 1108-1110 (+31 /
 +12 / +15 % on the control), spec medians c1 311 (+15 % on Marlin
 in-session), c8 820 (+2 %), c16 1116. Retained as the default; item closed
 at 22.0 us per MoE layer at one token (Marlin 29.0, card ~17.5).
+
+P10 (15:35 PDT): the routing folded into gemv1's prologue (two redux.sync
+reductions per argmax round, the row copy issued ahead of it) takes the
+route_align launch off the decode critical path: plain c1 222.0 (+1.7 %),
+c8 spec 831 (+1.3 %), c1 spec level on an eight-pass A/B with unchanged
+acceptance. Record: plain 222.0 / 767-770 / 1110-1113 (+33 / +12 / +15 %
+on the control), spec c1 ~283 (eight-pass median) / c8 831 / c16 1130.
