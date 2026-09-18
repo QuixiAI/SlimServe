@@ -30622,3 +30622,18 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   (+33 / +12 / +15 % on the control's 166.5 / 687.9 / 966.8), spec medians
   c1 ~283 (eight passes; +9 % on the control's MTP-3 260.8), c8 831 (+13.5 %
   on 732.1), c16 1130 (+12 % on 1005.8).
+
+- PHASE 8 / P12 THE C16 SCHEDULE ENTRY: MEASURED LEVEL, NO CHANGE (2026-09-18
+  15:37-15:45 PDT, `$S/p8/chain_p12.sh`, `set_c16_k.py` editing the record's
+  [9, 16, k] entry for one boot and restoring it; six passes of c16 spec per
+  arm, same session).
+  | c16 entry | passes 1..6 | median | accepted per draft |
+  |---|---|---|---|
+  | [9, 16, 1] | 1147.4 1132.7 1148.9 1150.8 1142.3 1144.9 | 1146 | 0.708 (1 draft token) |
+  | [9, 16, 2] (record) | 1133.0 1123.7 1168.6 1105.7 1157.7 1179.7 | 1145 | 1.124 (2 draft tokens, 0.566 each) |
+  The second draft token buys 0.42 accepted tokens per step and costs the
+  same in verify rows: level within 0.1 % on medians, k=1 the tighter
+  spread. The 22:30 observation (c16 spec 1097 below c16 plain 1112) no
+  longer holds after P9/P10 (c16 spec 1130-1145 against plain 1110-1113).
+  DECISION: the record keeps [9, 16, 2]; `slimserve/profiles.json`
+  verified restored (git diff clean). Raw `$S/serve-logs/ab-p12k{1,2}-spec.out`.
