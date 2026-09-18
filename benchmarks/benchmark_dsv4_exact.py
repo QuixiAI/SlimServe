@@ -180,12 +180,30 @@ def exact_prompts(
         raise ValueError(f"prompt offset must be between 0 and {max_start}")
     stride = max(1, (max_start - prompt_offset) // max(1, count - 1))
     prompts: list[str] = []
+    attempted_starts: set[int] = set()
     candidate = prompt_offset
     while len(prompts) < count and candidate <= max_start:
+        attempted_starts.add(candidate)
         text = tokenizer.decode(source_ids[candidate : candidate + token_count])
         if len(tokenizer.encode(text, add_special_tokens=False)) == token_count:
             prompts.append(text)
         candidate += stride if prompts else 1
+    # Some tokenizers do not round-trip every arbitrary token boundary: a
+    # decode followed by encode can merge or split boundary tokens.  The
+    # evenly spaced first pass historically discarded such a window without
+    # replacing it, making otherwise-large sources fail at higher
+    # concurrency.  Preserve the existing prompt selection when it succeeds,
+    # but fill any deficit from untried nearby starts.
+    if len(prompts) < count:
+        for candidate in range(prompt_offset, max_start + 1):
+            if candidate in attempted_starts:
+                continue
+            text = tokenizer.decode(source_ids[candidate : candidate + token_count])
+            if len(tokenizer.encode(text, add_special_tokens=False)) != token_count:
+                continue
+            prompts.append(text)
+            if len(prompts) == count:
+                break
     if len(prompts) != count:
         raise ValueError(f"could only construct {len(prompts)} exact prompts")
     return prompts

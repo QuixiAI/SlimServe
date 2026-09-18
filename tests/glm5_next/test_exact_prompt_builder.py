@@ -14,6 +14,14 @@ class CharacterTokenizer:
         return "".join(map(chr, ids))
 
 
+class OneBadBoundaryTokenizer(CharacterTokenizer):
+    def decode(self, ids):
+        text = super().decode(ids)
+        if text.startswith("f"):
+            return text + "!"
+        return text
+
+
 @pytest.mark.parametrize("count", [1, 8, 16, 32, 128])
 @pytest.mark.parametrize("offset", [0, 23])
 def test_repeated_source_has_concurrent_windows(count, offset):
@@ -31,6 +39,14 @@ def test_short_protocol_unchanged_when_source_is_sufficient():
     expected = ["abcde", "fghij", "klmno"]
     assert exact_prompts(tokenizer, source, 3, 5, 0, False) == expected
     assert exact_prompts(tokenizer, source, 3, 5, 0, True) == expected
+
+
+def test_invalid_evenly_spaced_boundary_is_replaced():
+    prompts = exact_prompts(
+        OneBadBoundaryTokenizer(), "abcdefghijklmno", 3, 5, 0, False
+    )
+    assert prompts == ["abcde", "klmno", "bcdef"]
+    assert all(len(prompt) == 5 for prompt in prompts)
 
 
 @pytest.mark.parametrize("repeat", [False, True])
