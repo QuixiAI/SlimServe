@@ -1434,6 +1434,16 @@
           "sha256": "ae23e14c6979e889051b2e4a39351abcdafb161e18e606fae4d8c40095a4bf3a"
         }
       ],
+      "speculator": {
+        "repo": "incoai/GLM-5.3-Flash-DFlash2",
+        "revision": "bf582e4eacc1810f76656d1811693ff6c6737d2a",
+        "local_dir": "GLM-5.3-Flash-DFlash2",
+        "engine": {
+          "method": "dflash",
+          "num_speculative_tokens": 7
+        },
+        "note": "Same registered drafter as the NVFP4 source of this model: DFlash 2 for GLM-5.3-Flash (Inco AI, cc-by-nc-nd-4.0; 2.34 GB bf16, block size 8 = up to 7 draft tokens per verify, target taps [5, 14, 24, 33, 42] through the aux-hidden-state interface), pinned at the same revision. Registering it records which drafter this artifact would run; glm53f-q2-1 keeps speculative decoding OFF until the Metal target-model qualification completes, and no draft weights are downloaded while it is off."
+      },
       "quants": {
         "Q2": {
           "title": "Q2 (IQ2_XXS gate/up, Q2_K down)",
@@ -3075,7 +3085,8 @@
             "Bring-up in progress: end-to-end Metal qualification is not yet complete.",
             "Context is read from the GGUF metadata (1048576); vision uses the exact companion GLM-5.3-Flash-Vision-Encoder.gguf.",
             "Resident loading is the first qualification target. Expert offload is only needed if the complete runtime at native context exceeds the 128 GiB memory budget.",
-            "No speculative decoder is enabled during the initial target-model qualification."
+            "No speculative decoder is enabled during the initial target-model qualification.",
+            "Main KV is fp8 (e4m3) through kv_cache_dtype, per the standing directive that FP8 is the official KV cache quantization. NOT yet validated on box: it is part of the pending Metal qualification, together with resident loading and the vision encoder."
           ]
         }
       }
