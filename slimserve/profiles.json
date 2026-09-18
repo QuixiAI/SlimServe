@@ -2960,6 +2960,7 @@
             "prefix_match_unit": 64,
             "gpu_memory_utilization": 0.85,
             "kv_cache_dtype": "auto",
+            "mamba_ssm_cache_dtype": "bfloat16",
             "attention_config": {
               "backend": "QUIXICORE_MLA_SPARSE",
               "sparse_mla_force_mqa": true
@@ -2996,7 +2997,7 @@
             "VLLM_CUSTOM_AR_MAX_SIZE_MB": "64",
             "VLLM_B12X_DMA_AR_MIN_MB": "24",
             "B12X_PCIE_DMA_FP8": "ag",
-            "SLIMSERVE_FP8_SWAPSET": "fp8-swapset-lmhead",
+            "SLIMSERVE_FP8_SWAPSET": "fp8-swapset-mla",
             "SLIMSERVE_NVFP4_SWAPSET": "nvfp4-swapset-inproj"
           },
           "notes": [
@@ -3017,7 +3018,8 @@
             "additional_config glm5_next_mhc_allreduce_fusion (Item D5): the mHC transition fused into the custom all-reduce (one launch per site, the next site's comb coefficients normalized on a side stream), taken for decode batches of at most 8 tokens inside captured decode graphs only; eager steps take the split path. No-spec c1 +4.5 %, spec step -2.8 %.",
             "additional_config glm5_next_sparse_tc_decode: the partitioned tensor-core sparse-MLA kernel (sparse_tc_nope, SPLIT=64; only its SPLIT=128 tile was ever too big for sm_120's 99 KB) for decode batches of 16 to 64 rows on bf16 latents, the SIMT kernel below (it is faster there at every list width). Rows are batch x (drafts + 1), so c1 stays SIMT, c8 and c16 take it: c16 +2.2 % (pooled n=8 per arm), c8 within noise.",
             "env VLLM_B12X_DMA_AR_MIN_MB=24 with B12X_PCIE_DMA_FP8=ag (Items P2/P3 of the second prefill block): prefill-sized all-reduces (24 MiB and up) take the b12x PCIe DMA ring with an fp8 all-gather wire; the reduce-scatter stays bf16. Cold 32K -11 % then -4.3 %, 128K -5 %. Needs the b12x package (PyPI b12x, Apache-2.0; 1.3.0 validated), which is not a SlimServe requirement: without it the ring is skipped with a warning, these all-reduces stay on the custom kernel, and the prefill numbers above do not hold.",
-            "env SLIMSERVE_FP8_SWAPSET=fp8-swapset-lmhead (Item D1b): the FP8 swap-set sidecar that also carries the lm_head channel-wise FP8 tensors (the head is language_model.lm_head; matched by regex); step -1.5 %. The sidecar is built on first use next to the checkpoint.",
+            "env SLIMSERVE_FP8_SWAPSET=fp8-swapset-mla (Item D1b, extended by Phase 8 item P4): the FP8 swap-set sidecar with the self-quantized KDA projections, the lm_head channel-wise FP8 tensors (the head is language_model.lm_head; matched by regex; step -1.5 %), and since P4 the DSA layers' latent projections (q_a_proj / kv_a_proj_with_mqa, the checkpoint's own native FP8 block tensors, merged into the replicated fused_qkv_a_proj) plus the indexer's self-quantized wq_b (--self-quant-indexer): plain +1.8 % c1 / +0.8 % c8 / +0.6 % c16, gates unchanged. Built once with `python -m slimserve.fp8_swapset --native <native dir> --model <dir> --self-quant-kda --self-quant-lm-head --self-quant-indexer --out <dir>/fp8-swapset-mla.safetensors`.",
+            "mamba_ssm_cache_dtype bfloat16 (Phase 8, item P8): the KDA recurrent state (34 layers, H 16, K = V = 128) is stored bf16 instead of fp32; every KDA kernel loads it to fp32 and stores through the tensor's dtype, so each state move per request per layer per step is 0.5 MB instead of 1 MB and the KDA state pages halve. Plain +0.5 / +0.6 / +1.5 % (c1/c8/c16), spec inside its pass spread; four gates (-3.268 all-position mean), the text/tool/image canaries and the temperature-1.0 acceptance probe unchanged against the fp32 state. This record has no host/NVMe tier configured; the a100 glm53f records keep auto (fp32).",
             "env SLIMSERVE_NVFP4_SWAPSET=nvfp4-swapset-inproj (Phase 8, Item P6): the NVFP4 sidecar (slimserve.nvfp4_swapset: e2m1 group-16 with e4m3 group scales and one fp32 global scale per merged module, served as a compressed-tensors NVFP4A16 group through Marlin's dense W4A16 path) for the KDA in_proj family only (self_attn.in_proj_qkvgfab: q/k/v/beta and the f_a/g_a gate inputs), which halves the largest dense stream of the step (26.5 MB -> 14.9 MB per layer per rank at HBM-cold 12.6 us against the fp8 GEMM's 18.2 us). Plain +3 % c1 / +2 % c8 / +0.5 % c16, spec +1.5 % c16, for 0.012 nats per token of prompt NLL (six-gate all-position mean -3.269 against the fp8 record's -3.257; the fp8 KDA swap itself cost 0.007). The other dense families (o_proj, q_b, dense MLP) were measured and left fp8: 0.028 nats for +1 % c1 and nothing at c8/c16; the shared experts lose outright at N = 1024. Built once with `python -m slimserve.nvfp4_swapset --model <dir> --families self_attn.in_proj_qkvgfab --out <dir>/nvfp4-swapset-inproj.safetensors`; the loader warns and serves the fp8 record when the selected sidecar is absent. SLIMSERVE_NVFP4_FAMILIES narrows a wider sidecar for experiments."
           ],
           "speculator": {

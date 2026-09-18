@@ -47,7 +47,11 @@ graph replay + PDL; opt-in QC_KDA_CHAIN=1 until the cleanup pass); the
 NVFP4 dense sidecar landed for the KDA in_proj family only
 (`SLIMSERVE_NVFP4_SWAPSET=nvfp4-swapset-inproj` on the record, +3 / +2 /
 +0.5 % plain for 0.012 nats per token; the other families cost 0.028 for
-+1 % and stay fp8). Record after these (boots with no extra environment,
++1 % and stay fp8). The KDA recurrent state is bf16 on the record since 21:45 PDT
+(`mamba_ssm_cache_dtype: bfloat16`; `kda_state_dtype` honours the setting,
+"auto" keeps fp32 for the a100 records): plain +0.5 / +0.6 / +1.5 %, gates
+and canaries unchanged, the KDA state pages halve. Record before that
+(boots with no extra environment,
 exact, two passes, 2026-09-17 21:00 PDT): plain 198-203 / 756-760 /
 1086-1092, spec 263-310 / 733-784 / 1026-1081 (control 166.5 / 687.9 /
 966.8 and 267.6 / 732.1 / 1005.8).

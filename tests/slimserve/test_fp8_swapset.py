@@ -187,3 +187,31 @@ def test_lm_head_group_targets_the_head_with_channel_scales(tmp_path):
     ]
     assert cfg["config_groups"][fp8_swapset.GROUP_NAME] == template
     assert cfg["ignore"] == ["model.visual.blocks.0.attn.qkv"]
+
+
+def test_dsa_latent_and_indexer_families():
+    """P4: the native fp8 q_a / kv_a twins load into the merged
+    fused_qkv_a_proj; the indexer's wq_b is selected for self-quantization
+    only where it is BF16, never on the skipped MTP layer."""
+    from slimserve.fp8_swapset import SWAP_MODULES, select_indexer, targets_for
+
+    assert SWAP_MODULES["self_attn.q_a_proj"] == "self_attn.fused_qkv_a_proj"
+    assert SWAP_MODULES["self_attn.kv_a_proj_with_mqa"] == "self_attn.fused_qkv_a_proj"
+    converted = {
+        "model.language_model.layers.3.self_attn.indexer.wq_b.weight": ({"dtype": "BF16"}, "", 0),
+        "model.language_model.layers.45.self_attn.indexer.wq_b.weight": ({"dtype": "BF16"}, "", 0),
+        "model.language_model.layers.7.self_attn.indexer.wk.weight": ({"dtype": "BF16"}, "", 0),
+        "model.language_model.layers.7.self_attn.indexer.wq_b.weight": ({"dtype": "F8_E4M3"}, "", 0),
+    }
+    assert select_indexer(converted, 45) == [
+        "model.language_model.layers.3.self_attn.indexer.wq_b.weight"
+    ]
+    targets = targets_for(
+        [
+            "model.language_model.layers.3.self_attn.q_a_proj.weight",
+            "model.language_model.layers.3.self_attn.kv_a_proj_with_mqa.weight",
+            "model.language_model.layers.3.self_attn.indexer.wq_b.weight",
+        ]
+    )
+    assert any("fused_qkv_a_proj" in x and "(3)" in x for x in targets)
+    assert any("indexer\\.wq_b" in x for x in targets)

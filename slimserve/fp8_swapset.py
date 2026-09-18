@@ -22,9 +22,11 @@ scales, and the quantization config gains the group; set
 ``SLIMSERVE_FP8_SWAPSET=0`` to serve the BF16 twins for an A/B, or to the stem
 of another manifest next to the checkpoint to serve that sidecar instead.
 
-``self_attn.q_a_proj`` / ``kv_a_proj_with_mqa`` are left out: they load into
-``fused_qkv_a_proj`` together with three indexer shards the native
-checkpoint keeps in BF16, and one module takes one scheme.
+``self_attn.q_a_proj`` / ``kv_a_proj_with_mqa`` (native FP8, merged into
+``fused_qkv_a_proj``, replicated on every rank) ride along since Phase 8
+item P4; ``--self-quant-indexer`` adds the indexer's ``wq_b`` (BF16 in every
+checkpoint, 4096 x 1536 per DSA layer) in the same block format, so the
+replicated bf16 GEMMs of the eleven DSA layers stream half their bytes.
 
 ``--self-quant-kda`` adds the KDA (linear-attention) projections, which every
 GLM-5.3-Flash checkpoint keeps in BF16: ``q/k/v/b/f_a/g_a_proj`` (the merged
@@ -80,6 +82,11 @@ SWAP_MODULES = {
     "mlp.shared_experts.down_proj": "mlp.shared_experts.down_proj",
     "self_attn.q_b_proj": "self_attn.q_b_proj",
     "self_attn.o_proj": "self_attn.o_proj",
+    # DSA latent projections (native FP8; merged, replicated on every rank).
+    "self_attn.q_a_proj": "self_attn.fused_qkv_a_proj",
+    "self_attn.kv_a_proj_with_mqa": "self_attn.fused_qkv_a_proj",
+    # Indexer query projection (self-quantized only; BF16 in every checkpoint).
+    "self_attn.indexer.wq_b": "self_attn.indexer.wq_b",
     # KDA layers (self-quantized only; BF16 in the native checkpoint).
     "self_attn.q_proj": "self_attn.in_proj_qkvgfab",
     "self_attn.k_proj": "self_attn.in_proj_qkvgfab",
@@ -98,6 +105,7 @@ KDA_SUFFIXES = (
     "self_attn.o_proj",
 )
 KDA_MARKER = "self_attn.b_proj"  # a tensor only the KDA layers carry
+INDEXER_SUFFIXES = ("self_attn.indexer.wq_b",)
 BETA_ROWS = BLOCK  # rows the model reserves for the replicated beta shard
 FP8_MAX = 448.0  # float8_e4m3fn
 _LAYER_RE = re.compile(
@@ -163,6 +171,21 @@ def select_kda(converted: dict, skip_layer: int | None) -> list[str]:
             continue
         if f"{prefix}{layer}.{KDA_MARKER}.weight" not in converted:
             continue  # DSA layer: its o_proj is a native FP8 twin, not KDA
+        names.append(name)
+    return sorted(names)
+
+
+def select_indexer(converted: dict, skip_layer: int | None) -> list[str]:
+    """BF16 indexer projection weights of the conversion (the DSA layers'
+    ``indexer.wq_b``), to be self-quantized."""
+    names = []
+    for name, (entry, _, _) in converted.items():
+        parts = _split(name)
+        if parts is None or entry["dtype"] != "BF16":
+            continue
+        _, layer, suffix = parts
+        if suffix not in INDEXER_SUFFIXES or layer == skip_layer:
+            continue
         names.append(name)
     return sorted(names)
 
@@ -262,6 +285,7 @@ def build(
     skip_layer: int | None = 45,
     self_quant_kda: bool = False,
     self_quant_lm_head: bool = False,
+    self_quant_indexer: bool = False,
 ) -> Path:
     native = _headers(native_dir)
     converted = _headers(model_dir)
@@ -271,6 +295,10 @@ def build(
     kda = select_kda(converted, skip_layer) if self_quant_kda else []
     if self_quant_kda and not kda:
         raise SystemExit("--self-quant-kda found no BF16 KDA projections")
+    indexer = select_indexer(converted, skip_layer) if self_quant_indexer else []
+    if self_quant_indexer and not indexer:
+        raise SystemExit("--self-quant-indexer found no BF16 indexer projections")
+    kda = kda + indexer
     lm_head = converted.get(LM_HEAD) if self_quant_lm_head else None
     if self_quant_lm_head and (lm_head is None or lm_head[0]["dtype"] != "BF16"):
         raise SystemExit("--self-quant-lm-head found no BF16 lm_head.weight")
@@ -457,6 +485,11 @@ def main() -> None:
         action="store_true",
         help="also quantize the BF16 lm_head (per-channel scales)",
     )
+    ap.add_argument(
+        "--self-quant-indexer",
+        action="store_true",
+        help="also quantize the BF16 indexer wq_b projections (block scales)",
+    )
     args = ap.parse_args()
     build(
         args.native,
@@ -465,6 +498,7 @@ def main() -> None:
         args.skip_layer,
         self_quant_kda=args.self_quant_kda,
         self_quant_lm_head=args.self_quant_lm_head,
+        self_quant_indexer=args.self_quant_indexer,
     )
 
 

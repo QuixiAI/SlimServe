@@ -292,7 +292,9 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         if self.model_config is None or self.cache_config is None:
             raise ValueError("model_config and cache_config must be set")
         return MambaStateDtypeCalculator.kda_state_dtype(
-            self.model_config.dtype, self.cache_config.mamba_cache_dtype
+            self.model_config.dtype,
+            self.cache_config.mamba_cache_dtype,
+            self.cache_config.mamba_ssm_cache_dtype,
         )
 
     def get_state_shape(
@@ -949,8 +951,10 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                         use_qk_l2norm_in_kernel=True,
                         cu_seqlens=non_spec_query_start_loc,
                     )
+                    # The chunk kernel returns fp32 states; the cache may be
+                    # bf16 (mamba_ssm_cache_dtype), so store through its dtype.
                     recurrent_state[non_spec_state_indices_tensor] = (
-                        last_recurrent_state
+                        last_recurrent_state.to(recurrent_state.dtype)
                     )
 
             else:

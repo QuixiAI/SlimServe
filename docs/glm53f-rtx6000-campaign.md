@@ -1149,13 +1149,15 @@ Item detail:
   later item: measure the replaced kernels in a graph with PDL on before
   fusing - launch gaps are already hidden, and a fused kernel must have a
   shorter critical path than the sum of the wide kernels it replaces.
-- **P1b (design fixed 2026-09-17 21:00 PDT, next up).** Only the 34 target
-  KDA layers are involved (the MTP drafter is MLA). Per request per layer
-  per speculative step the state (1 MB) moves once in and T times out
-  today (T = draft rows, 5 at c8/c16); with the commit it moves once in
-  and, in the commit, once in and once or twice out, i.e. 4 MB against
-  6 MB at T = 5: -2 MB x 16 requests x 34 layers = 1.1 GB per c16 step
-  (0.67 ms of ~15 ms, +4 %; c8 +2 %; c1 and plain 0). The pieces:
+- **P1b (design fixed 2026-09-17 21:00 PDT; parked behind P8).** Only the
+  34 target KDA layers are involved (the MTP drafter is MLA). Per request
+  per layer per speculative step the state moves once in and T times out
+  today (T = rows = drafts + 1: 4 at c1, 2 at c8, 3 at c16 under the
+  record's schedule); with the commit it moves once in and, in the commit,
+  once in and once or twice out. That is 3 against 3 moves at c8 (nothing),
+  3-4 against 4 at c16 (~0.34 ms, +2 %), 3 against 5 at c1 (68 MB, <1 %) -
+  and half of that once the state is bf16 (P8). Kept as the design for
+  when the spec schedule widens; the pieces:
   (1) `fused_recurrent_kda_fwd_kernel` gets `STORE_INPUTS`: with
   `STORE_STATES=False` it writes the raw g and beta rows it read into a
   persistent per-layer buffer (`self._spec_inputs`, [rows_max, H, K+1]
@@ -1249,7 +1251,10 @@ Order after the 2026-09-17 evening results (P2 and P3 landed as defaults,
 plain c1/c8/c16 +1.5/+1.9/+4.2 % on the head; P1 closed; P6 landed at +3 /
 +2 / +0.5 % with the in_proj family only - the byte lever on the dense
 stream is spent, the plan's +13 % rested on a flush-in-graph microbench
-that overstated the cold rates): P1b, P5, P4, P7 remain, each 1-3 %. The
+that overstated the cold rates): P8 landed (bf16 KDA recurrent state, `mamba_ssm_cache_dtype: bfloat16`
+on the record: plain +0.5 / +0.6 / +1.5 %, spec inside its spread with
+c16's best pass at 1141; gates, canaries and the acceptance probe
+unchanged), then P4 (arms running), P5, P7, P1b, each 1-3 %. The
 record after P2/P3/P6 (2026-09-17 21:00 PDT, exact, two passes, record
 boots with no extra environment): plain 198-203 / 756-760 / 1086-1092,
 spec 263-310 / 733-784 / 1026-1081 against

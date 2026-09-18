@@ -30114,3 +30114,108 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   (733-784 / 1026-1081 here), so a spec claim at any shape needs the
   six-pass protocol, and a launch-path change must be measured under
   speculation (32-64 rows) with it, not read off two passes.
+
+- PHASE 8 / P8 (new item): KDA RECURRENT STATE IN BF16 (2026-09-17 21:20 PDT,
+  hypothesis; arms `$S/p8/chain_bf16st.sh`)
+  While fixing the P1b design the record's draft schedule ([1,4,3],
+  [5,8,1], [9,16,2]) turned the deferred commit's gain into 0 at c8 (two
+  rows: 1 read + 2 stores today, 1 + 1 + 1 with the commit) and ~0.34 ms
+  at c16 (three rows). The bigger lever on the same traffic is the state's
+  dtype: `MambaStateDtypeCalculator.kda_state_dtype` hard-coded fp32 for the
+  recurrent state (1 MB per request per layer at H 16, K = V = 128) while
+  the Qwen GDN path honours `mamba_ssm_cache_dtype` (the qwen38fn records
+  serve bf16 states since 2026-09-07 with deep recall at 144K). Every KDA
+  kernel on the path loads the state to fp32 and stores through the
+  tensor's dtype (fused_recurrent, the packed decode, the commit kernel,
+  the FLA chunk kernels' p_ht stores), so the change is the dtype rule
+  (now honours the setting, "auto" keeps fp32; `tests/kernels/
+  test_kda_state_dtype.py`) plus `mamba_ssm_cache_dtype: bfloat16` on the
+  record. Expected per step, 34 layers, 0.5 MB saved per state move: plain
+  c16 16 x 2 moves = 0.54 GB = 0.33 ms (+2 %), c8 +1.5 %, c1 0; spec c16
+  (3 rows: 4 moves) 1.09 GB = 0.67 ms (+4.5 %), spec c8 (2 rows) 0.41 GB
+  (+2 %), spec c1 (4 rows: 5 moves) 0.05 ms (+1 %). Also halves the KDA
+  state pages (block bytes) and so the host/NVMe tier traffic per block.
+  Quality: one bf16 rounding of the state per decode step; the gate
+  (prompt logprobs, prefill in one chunk) does not exercise it, so the
+  arms add the text/tool/image canaries and the acceptance probe under
+  speculation at temperature 1.0 (accept_probe.py: the drafter's accepted
+  length per step is the most sensitive live measure of the target's
+  decode numerics), against the fp32-state boot's probe from the same
+  chain. If retained, the tier acceptance (VLLM_KV_TIER_VERIFY=1) must be
+  re-run for the new page format before the record claims it.
+  First boot (21:19 PDT) died in warmup: the chunked-prefill write-back
+  `recurrent_state[idx] = last_recurrent_state` assigns the chunk kernel's
+  fp32 final state into the now-bf16 cache ("Index put requires the source
+  and destination dtypes match"); the Qwen GDN layer casts at the same
+  spot (`qwen_gdn_linear_attn.py`), the KDA layer now does too. Every
+  other state move on the path (the recurrent decode/prefill kernels, the
+  packed decode, the chunk kernel's h0 load, the align copy, the tier)
+  loads to fp32 and stores through the tensor's dtype. The fp32-state
+  acceptance reference from the same chain (fp32st-spec, temperature 1.0,
+  300 tokens over the probe's prompts): accept/draft_token 0.479,
+  accepted/step 1.44. Second attempt `$S/p8/chain_bf16st2.sh`.
+  RESULT (21:27-21:45 PDT, record + `mamba_ssm_cache_dtype: bfloat16`, two
+  passes, exact on all twelve; raw bf16st-{nospec,spec}-pass{1,2}/, gates
+  bf16st-nospec-gate{1..4}.json, canaries canary-bf16st-*.out, probes
+  after-{fp32st,bf16st}-spec.out):
+  | arm | c1 | c8 | c16 |
+  |---|---|---|---|
+  | record, fp32 state (p6rec-nospec) | 198.0 / 202.8 | 755.7 / 760.2 | 1092.4 / 1086.3 |
+  | bf16 state (bf16st-nospec) | 203.8 / 204.0 | 760.6 / 764.7 | 1107.4 / 1097.8 |
+  | record spec, fp32 state (p6rec-spec) | 263.2 / 309.7 | 783.7 / 733.0 | 1080.5 / 1025.6 |
+  | bf16 state spec (bf16st-spec) | 260.7 / 263.2 | 731.9 / 802.4 | 1140.9 / 1059.6 |
+  Plain +0.5 / +0.6 / +1.5 % (c16 expected +2 %); spec inside the pass
+  spread with c16's best pass at 1141. Quality: four gates -3.2682 /
+  -3.2705 / -3.2646 / (gate 4 in the JSON) = -3.268 all-position mean, the
+  same as the fp32-state record's -3.269 (the gate's prefill path stores
+  the state once per chunk); text / tool / image canaries pass on both
+  boots; acceptance probe at temperature 1.0 over 11 prompts: 0.467 per
+  draft token, 1.40 per step, against 0.479 / 1.44 with the fp32 state -
+  the per-prompt figures scatter 0.3-0.8 between the two runs (seeded
+  sampling diverges at the first differing token), so the probe cannot
+  resolve less than ~0.03 and the difference is inside that. DECISION:
+  RETAINED on the record (page bytes of the four KDA state groups halve
+  with it: more KV slots per rank). The rtx6000 record configures no
+  host/NVMe tier (its notes say so), so no tier qualification exists to
+  invalidate; the a100 glm53f records keep "auto" (fp32) and are untouched.
+  When a tier is added to this record its acceptance runs on the bf16
+  pages.
+
+- PHASE 8 / P4: THE DSA LATENT PROJECTIONS AND THE INDEXER QUERY PROJECTION
+  ONTO THE FP8 SWAP-SET (2026-09-17 21:39-21:58 PDT; `$S/p8/chain_p4.sh`;
+  raw p4mla-{nospec,spec}-pass{1,2}/, gates p4mla-nospec-gate{1..4}.json;
+  sidecar build `$S/p8/fp8_build_mla.out`)
+  Hypothesis: the eleven DSA layers run two replicated bf16 GEMMs per step
+  on every rank - `fused_qkv_a_proj` (q_a 1536 x 4096 + kv_a 512 x 4096 =
+  16.8 MB, native FP8 twins with block scales in the checkpoint, served as
+  the conversion's BF16 upcast) and the indexer's `wq_b` (4096 x 1536,
+  12.6 MB, BF16 in every checkpoint) - 0.32 GB per step at c1 (the "bf16
+  decode gemm (item 4)" class of the profile: 22 launches, 0.37 ms). The
+  swap-set's docstring left q_a/kv_a out for a layout that no longer
+  exists (the pooled indexer packs its own wk/gate/weights_proj). Change:
+  `SWAP_MODULES` gains q_a_proj / kv_a_proj_with_mqa -> fused_qkv_a_proj
+  (native fp8, no requantization) and `--self-quant-indexer` adds
+  indexer.wq_b in the 128x128 block format (rel Frobenius error 0.026, the
+  same as the KDA self-quant); the loader, config-group and ignore-trim
+  machinery are unchanged; the fp8 decode GEMM covers both shapes (N 2048
+  and 4096, K 4096 and 1536). Sidecar `fp8-swapset-mla` (858 tensors, 7.9
+  GB, 1 min on GPU 1); the record's `fp8-swapset-lmhead` stays on /raid.
+  | arm | c1 | c8 | c16 |
+  |---|---|---|---|
+  | bf16 state (bf16st-nospec) | 203.8 / 204.0 | 760.6 / 764.7 | 1107.4 / 1097.8 |
+  | + P4 (p4mla-nospec) | 207.6 / 207.6 | 765.1 / 771.6 | 1110.7 / 1114.4 |
+  | bf16 state spec (bf16st-spec) | 260.7 / 263.2 | 731.9 / 802.4 | 1140.9 / 1059.6 |
+  | + P4 spec (p4mla-spec) | 311.3 / 318.4 | 716.2 / 744.0 | 1085.2 / 1085.2 |
+  Plain +1.8 / +0.8 / +0.6 % (0.09 ms of the c1 step, the byte saving);
+  spec inside the spread. Gates -3.2850 / -3.2690 / -3.2622 / -3.2803 =
+  -3.274, within noise of the record's -3.268; q_a/kv_a are the
+  checkpoint's own precision, wq_b is fp8-block. DECISION: RETAINED,
+  record env `SLIMSERVE_FP8_SWAPSET=fp8-swapset-mla`.
+  Day total on the plain record (fp8 record at 19:56 -> P6 in_proj + P8
+  bf16 state + P4): c1 191.9-196.4 -> 207.6 (+6 %), c8 736.6-740.2 ->
+  765-772 (+4 %), c16 1076-1084 -> 1111-1114 (+3 %). Spec c8 read
+  716-830 across the day's boots with the interval logs' c8-phase
+  acceptance (mean acceptance length 1.64-1.71, rate 0.63-0.71) the same on
+  every boot, so the spread is not the drafter losing the target; the
+  six-pass A/B (`$S/p8/chain_ab6.sh`: the 19:56 record configuration
+  against today's record, c8 and c16 spec, six passes each) settles it.
