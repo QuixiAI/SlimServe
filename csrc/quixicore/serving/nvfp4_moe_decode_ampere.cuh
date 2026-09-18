@@ -51,6 +51,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <cstdint>
+#include <cooperative_groups.h>
 #include "../tm_cuda/bf16_decode_gemm.cuh"
 
 namespace tms::nvfp4dec {
@@ -317,8 +318,11 @@ __global__ void __launch_bounds__(THREADS) nvfp4_moe_gemv1_kernel(
 // gemv2: out[m][col] = shared[m][col] + sum_k topk_w[m][k] * gs_e * (act[m*top_k+k] . W2_e^T)[col].
 //   act [M*top_k][Ki] bf16, B int32 [E][Ki/16][D*2], S uint8 [E][Ki/16][D], G fp32 [E] or [1],
 //   topk_ids int32 [M*top_k], topk_w fp32 [M*top_k] or nullptr (weights already on the input),
-//   shared [M][D] bf16 or nullptr, out [M][D] bf16. grid (D / (16 NJ), M), dynamic smem
-//   top_k * Ki * 2 (the token's rows) + gemv2_ring_bytes. Ki % CHUNK_K == 0, top_k <= 64. The chunk sequence is
+//   shared [M][D] bf16 or nullptr, out [M][D] bf16. grid (D / (16 NJ), M, split) launched as
+//   clusters of `split` CTAs along z (split | top_k; 1 = plain launch), dynamic smem
+//   (top_k / split) * Ki * 2 (the CTA's rows) + gemv2_ring_bytes. Ki % CHUNK_K == 0, top_k <= 64.
+//   At one token the unsplit grid is 64-128 CTAs each streaming 16 chunks in series; the
+//   split doubles the CTAs and halves the chain, the rank-order DSMEM sum keeps it deterministic. The chunk sequence is
 //   (slot, chunk-of-Ki) flattened, so the ring streams across expert boundaries.
 template <int NJ, int STAGES>
 __global__ void __launch_bounds__(THREADS) nvfp4_moe_gemv2_kernel(
@@ -330,32 +334,38 @@ __global__ void __launch_bounds__(THREADS) nvfp4_moe_gemv2_kernel(
     using T = TileBytes<NJ>;
     constexpr int STAGE = WARPS * T::TILE;
     __shared__ float red[WARPS][NJ * 16];
+    __shared__ float red_out[NJ * 16];               // this CTA's column sums, read by cluster rank 0
     __shared__ int s_e[64];
     __shared__ float s_w[64];
-    extern __shared__ __align__(16) unsigned char dyn[];   // the token's top_k rows: top_k * Ki bf16, then the ring
+    extern __shared__ __align__(16) unsigned char dyn[];   // the CTA's slots' rows: (top_k / split) * Ki bf16, then the ring
     const __nv_bfloat16* as = reinterpret_cast<const __nv_bfloat16*>(dyn);
-    unsigned char* ring = dyn + size_t(top_k) * Ki * 2;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int m = blockIdx.y;
+    // Launched as a cluster of `split` CTAs along z, each takes top_k / split of the
+    // token's slots and rank 0 sums the ranks' column sums in rank order (DSMEM).
+    cooperative_groups::cluster_group cluster = cooperative_groups::this_cluster();
+    const int split = int(cluster.num_blocks()), rank = int(cluster.block_rank());
+    const int kper = top_k / split, k0 = rank * kper;
+    unsigned char* ring = dyn + size_t(kper) * Ki * 2;
     const int cg = blockIdx.x;
     const int nt = cg / (4 / NJ), j0 = (cg % (4 / NJ)) * NJ;
     const int col0 = 64 * nt + 16 * j0;
     if (pdl) pdl_wait();                             // act, topk_ids, weights, shared: all from predecessors
     // The token's experts and weights (top_k <= 64).
-    if (tid < top_k) {
-        const int s = m * top_k + tid;
+    if (tid < kper) {
+        const int s = m * top_k + k0 + tid;
         const int e = topk_ids[s];
         const bool ok = e >= 0 && e < E;
         s_e[tid] = ok ? e : -1;
         s_w[tid] = ok ? (topk_w != nullptr ? topk_w[s] : 1.0f) * G[(ok ? e : 0) * gstride] : 0.0f;
     }
     {
-        const __nv_bfloat16* ar = act + size_t(m) * top_k * Ki;
-        for (int i = tid; i < top_k * Ki / 8; i += THREADS) cp_async<16>(smem_u32(dyn + 16 * i), ar + 8 * i);
+        const __nv_bfloat16* ar = act + size_t(m * top_k + k0) * Ki;
+        for (int i = tid; i < kper * Ki / 8; i += THREADS) cp_async<16>(smem_u32(dyn + 16 * i), ar + 8 * i);
     }
     __syncthreads();
     const int cpe = Ki / CHUNK_K;                    // chunks per expert (2 at Ki = 512)
-    const int nchunks = top_k * cpe;
+    const int nchunks = kper * cpe;
     const size_t ewords = size_t(Ki / 16) * (size_t(D) * 2), escales = size_t(Ki / 16) * size_t(D);
     const uint32_t rbase = smem_u32(ring) + warp * T::TILE;
     const unsigned char* rb = ring + warp * T::TILE;
@@ -373,7 +383,7 @@ __global__ void __launch_bounds__(THREADS) nvfp4_moe_gemv2_kernel(
         cur.advance();
         if (++cp == cpe) {
             cp = 0;
-            if (++kp < top_k) set_slot();
+            if (++kp < kper) set_slot();
         }
     };
 
@@ -425,11 +435,25 @@ __global__ void __launch_bounds__(THREADS) nvfp4_moe_gemv2_kernel(
     if (pdl) pdl_trigger();
     store_partial<NJ>(&red[0][0], acc, warp, lane);
     __syncthreads();
-    for (int c = tid; c < 16 * NJ; c += THREADS) {
-        float v = warp_sum<NJ>(&red[0][0], c);
-        if (shared != nullptr) v += __bfloat162float(shared[size_t(m) * D + col0 + c]);
-        out[size_t(m) * D + col0 + c] = __float2bfloat16_rn(v);
+    if (split == 1) {
+        for (int c = tid; c < 16 * NJ; c += THREADS) {
+            float v = warp_sum<NJ>(&red[0][0], c);
+            if (shared != nullptr) v += __bfloat162float(shared[size_t(m) * D + col0 + c]);
+            out[size_t(m) * D + col0 + c] = __float2bfloat16_rn(v);
+        }
+        return;
     }
+    for (int c = tid; c < 16 * NJ; c += THREADS) red_out[c] = warp_sum<NJ>(&red[0][0], c);
+    cluster.sync();                                  // every rank's red_out is complete and visible
+    if (rank == 0) {
+        for (int c = tid; c < 16 * NJ; c += THREADS) {
+            float v = red_out[c];
+            for (int r = 1; r < split; ++r) v += cluster.map_shared_rank(red_out, r)[c];
+            if (shared != nullptr) v += __bfloat162float(shared[size_t(m) * D + col0 + c]);
+            out[size_t(m) * D + col0 + c] = __float2bfloat16_rn(v);
+        }
+    }
+    cluster.sync();                                  // peers keep their shared memory until rank 0 has read it
 }
 
 }  // namespace tms::nvfp4dec

@@ -2062,9 +2062,9 @@ static void launch_nvfp4_gemv1(const __nv_bfloat16* x, int ldx, const int32_t* b
 template <int NJ, int KT>
 static void launch_nvfp4_gemv2(const __nv_bfloat16* act, const int32_t* b, const uint8_t* s, const float* g,
                                const int32_t* ids, const float* tw, const __nv_bfloat16* shared, __nv_bfloat16* out,
-                               int M, int top_k, int D, int Ki, int E, int gstride) {
-    const dim3 grid(D / (16 * NJ), M);
-    const size_t dyn = size_t(top_k) * Ki * 2 + tms::nvfp4dec::gemv2_ring_bytes<NJ, KT>();   // the staged rows + the ring
+                               int M, int top_k, int D, int Ki, int E, int gstride, int split) {
+    const dim3 grid(D / (16 * NJ), M, split);
+    const size_t dyn = size_t(top_k / split) * Ki * 2 + tms::nvfp4dec::gemv2_ring_bytes<NJ, KT>();   // the CTA's rows + the ring
     TORCH_CHECK(dyn <= 99 * 1024, "nvfp4_moe_gemv2: nj/stages too wide for shared memory (", dyn, " B)");
     static size_t granted = 0;          // dynamic smem crosses 48 KB for the wide configs (sm_120: 99 KB opt-in)
     if (dyn > granted) {
@@ -2073,13 +2073,22 @@ static void launch_nvfp4_gemv2(const __nv_bfloat16* act, const int32_t* b, const
         granted = dyn;
     }
     const int pdl = tms::decode_gemm::pdl_mode();
-    if (pdl) {
+    if (pdl || split > 1) {
         cudaLaunchConfig_t cfg = {};
         cfg.gridDim = grid; cfg.blockDim = dim3(tms::nvfp4dec::THREADS); cfg.stream = stream(); cfg.dynamicSmemBytes = dyn;
-        cudaLaunchAttribute attr[1];
-        attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        attr[0].val.programmaticStreamSerializationAllowed = 1;
-        cfg.attrs = attr; cfg.numAttrs = 1;
+        cudaLaunchAttribute attr[2];
+        int n = 0;
+        if (pdl) {
+            attr[n].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+            attr[n].val.programmaticStreamSerializationAllowed = 1;
+            ++n;
+        }
+        if (split > 1) {
+            attr[n].id = cudaLaunchAttributeClusterDimension;
+            attr[n].val.clusterDim.x = 1; attr[n].val.clusterDim.y = 1; attr[n].val.clusterDim.z = unsigned(split);
+            ++n;
+        }
+        cfg.attrs = attr; cfg.numAttrs = unsigned(n);
         tms::decode_gemm::check_cuda_status(cudaLaunchKernelEx(&cfg, tms::nvfp4dec::nvfp4_moe_gemv2_kernel<NJ, KT>,
                                                                act, b, s, g, ids, tw, shared, out, top_k, D, Ki, E, gstride, pdl));
     } else {
@@ -2135,7 +2144,8 @@ static torch::Tensor py_nvfp4_moe_gemv1(torch::Tensor x, torch::Tensor b, torch:
 // out [M, D] bf16 (written).
 static torch::Tensor py_nvfp4_moe_gemv2(torch::Tensor act, torch::Tensor b, torch::Tensor s, torch::Tensor g,
                                         torch::Tensor topk_ids, c10::optional<torch::Tensor> topk_weights,
-                                        c10::optional<torch::Tensor> shared, torch::Tensor out, int64_t nj, int64_t kt) {
+                                        c10::optional<torch::Tensor> shared, torch::Tensor out, int64_t nj, int64_t kt,
+                                        int64_t split) {
     nvfp4_dec_check(act, b, s, g, topk_ids, "nvfp4_moe_gemv2");
     CK(act); CK(out);
     TORCH_CHECK(out.device() == act.device(), "nvfp4_moe_gemv2: out must be on act's device");
@@ -2149,6 +2159,8 @@ static torch::Tensor py_nvfp4_moe_gemv2(torch::Tensor act, torch::Tensor b, torc
                 "nvfp4_moe_gemv2: out [M, D] bf16");
     TORCH_CHECK(D % 64 == 0 && D % (16 * nj) == 0 && (nj == 1 || nj == 2 || nj == 4), "nvfp4_moe_gemv2: D % 64, nj in 1/2/4");
     TORCH_CHECK(kt == 4 || kt == 8, "nvfp4_moe_gemv2: stages in 4/8");
+    TORCH_CHECK((split == 1 || split == 2 || split == 4 || split == 8) && top_k % split == 0,
+                "nvfp4_moe_gemv2: split in 1/2/4/8 dividing top_k");
     const float* tw = nullptr;
     if (topk_weights.has_value()) {
         CK(topk_weights.value());
@@ -2165,7 +2177,7 @@ static torch::Tensor py_nvfp4_moe_gemv2(torch::Tensor act, torch::Tensor b, torc
     }
     const c10::cuda::CUDAGuard guard(act.device());
 #define QC_G2(NJ, KT) launch_nvfp4_gemv2<NJ, KT>(bp(act), b.data_ptr<int32_t>(), s.data_ptr<uint8_t>(), fp(g), \
-                                                 topk_ids.data_ptr<int32_t>(), tw, sh, bpm(out), M, top_k, D, Ki, E, g.numel() == 1 ? 0 : 1)
+                                                 topk_ids.data_ptr<int32_t>(), tw, sh, bpm(out), M, top_k, D, Ki, E, g.numel() == 1 ? 0 : 1, int(split))
     switch (nj * 16 + kt) {
         case 1 * 16 + 4: QC_G2(1, 4); break; case 1 * 16 + 8: QC_G2(1, 8); break;
         case 2 * 16 + 4: QC_G2(2, 4); break; case 2 * 16 + 8: QC_G2(2, 8); break;
@@ -3417,7 +3429,7 @@ void init_serving(py::module_& m) {
           "NVFP4 decode MoE gate/up + SiLU (clamp >= 0: gate from above, up to +/- clamp) over Marlin-packed experts: "
           "act[M*top_k, N] (one slot per CTA row)");
     m.def("nvfp4_moe_gemv2", &py_nvfp4_moe_gemv2, py::arg("act"), py::arg("b"), py::arg("s"), py::arg("g"), py::arg("topk_ids"),
-          py::arg("topk_weights") = py::none(), py::arg("shared") = py::none(), py::arg("out"), py::arg("nj") = 2, py::arg("stages") = 4,
+          py::arg("topk_weights") = py::none(), py::arg("shared") = py::none(), py::arg("out"), py::arg("nj") = 2, py::arg("stages") = 4, py::arg("split") = 1,
           "NVFP4 decode MoE down projection + top-k combine (+ shared-expert add) over Marlin-packed experts: out[M, D]");
     m.def("w8a16_dequant", &py_w8a16_dequant, py::arg("wp"), py::arg("scale"), py::arg("N"), py::arg("K"),
           "Unpack fp8 weights to bf16 [N,K] (prefill path)");

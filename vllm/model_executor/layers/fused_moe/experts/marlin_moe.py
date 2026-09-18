@@ -158,7 +158,8 @@ def _qc_nvfp4_prefill_applicable(
 # serves NVFP4 batches of up to QC_NVFP4_DECODE_ROWS assignment rows (M * top_k,
 # default 32); 0 keeps Marlin for every batch. QC_NVFP4_DECODE_NJ (1/2/4) is the
 # column-group width per CTA (16 * nj columns), default by batch (4 to 16 rows, else 2); QC_NVFP4_DECODE_STAGES
-# (4/8) the depth of the cp.async ring, default 4.
+# (4/8) the depth of the cp.async ring, default 4; QC_NVFP4_DECODE_SPLIT gemv2's cluster split over a token's
+# experts, default by batch (2 up to 8 rows, else 1).
 @functools.cache
 def _qc_nvfp4_decode_rows() -> int:
     if os.environ.get("QC_NVFP4_DECODE", "1") == "0":
@@ -184,6 +185,23 @@ def _qc_nvfp4_decode_nj(rows: int) -> int:
 @functools.cache
 def _qc_nvfp4_decode_stages() -> int:
     return int(os.environ.get("QC_NVFP4_DECODE_STAGES", "4"))
+
+
+@functools.cache
+def _qc_nvfp4_decode_split_env() -> int:
+    return int(os.environ.get("QC_NVFP4_DECODE_SPLIT", "0"))
+
+
+def _qc_nvfp4_decode_split(rows: int) -> int:
+    """gemv2's cluster split over a token's experts. Cold under the record's PDL
+    mode a split of 2 takes the one-token gemv2 from 11.1 to 8.4 us (64 -> 128
+    CTAs, half the serial chain) and loses from two tokens up (12.7 -> 16.7 at
+    2 x 8), so it serves single-token batches only. QC_NVFP4_DECODE_SPLIT pins
+    one value (1/2/4/8, dividing top_k)."""
+    forced = _qc_nvfp4_decode_split_env()
+    if forced:
+        return forced
+    return 2 if rows <= 8 else 1
 
 
 def _qc_nvfp4_decode_applicable(
@@ -324,8 +342,11 @@ def _qc_nvfp4_decode_moe(
         shared_out = shared.output
         shared.folded = True
     weights = None if apply_router_weight_on_input else topk_weights.contiguous()
+    split = _qc_nvfp4_decode_split(M * topk)
+    if topk % split:
+        split = 1
     quixicore_ops.nvfp4_moe_gemv2(
-        act, w2, w2_scale.view(torch.uint8), global_scale2, ids, weights, shared_out, output, nj, stages
+        act, w2, w2_scale.view(torch.uint8), global_scale2, ids, weights, shared_out, output, nj, stages, split
     )
     return output
 

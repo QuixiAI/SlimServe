@@ -109,6 +109,12 @@ def test_kernels_match_dequantized_reference(m: int, nj: int) -> None:
         act_ref.to(torch.bfloat16), lay.l.w2_weight, lay.s2, lay.l.w2_weight_scale_2, ids, w, None, again, nj
     )
     assert torch.equal(out, again), "the combine must be deterministic"
+    for split in (2, 4, 8):   # a cluster of CTAs per token, rank-order sum
+        outs = torch.empty_like(out)
+        quixicore_ops.nvfp4_moe_gemv2(
+            act_ref.to(torch.bfloat16), lay.l.w2_weight, lay.s2, lay.l.w2_weight_scale_2, ids, w, None, outs, nj, 4, split
+        )
+        assert rel(outs, out_ref) < 2**-7, split
 
 
 def test_gemv1_clamp_matches_silu_and_mul_with_clamp() -> None:

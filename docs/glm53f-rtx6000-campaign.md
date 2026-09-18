@@ -1315,7 +1315,9 @@ decode MoE pair: the kernel rounds". Three serving rounds landed it
 (14:37 PDT): the first found the pair not dispatched (GLM-5.3's SiLU
 carries a clamp limit of 10, now folded into gemv1), the second found the
 early dependent-launch trigger costing the whole gain under PDL (29.3 vs
-24.8 us per layer), the third read plain c1 +3.4 % on the 22:00 record
-(214.5 / 767 / 1102-1115: +29 / +12 / +15 % on the control) and spec
-medians c1 305 (+13 % on Marlin in-session), c8 816, c16 1119. Retained as
-the default. Left on the item: gemv2's CTA count at one token.
+24.8 us per layer), the third read plain c1 +3.4 % (late trigger, nj by
+batch), the fourth +5.1 % with gemv2 split over the token's experts as a
+cluster of two at one token: record 218.2 / 764-774 / 1108-1110 (+31 /
++12 / +15 % on the control), spec medians c1 311 (+15 % on Marlin
+in-session), c8 820 (+2 %), c16 1116. Retained as the default; item closed
+at 22.0 us per MoE layer at one token (Marlin 29.0, card ~17.5).

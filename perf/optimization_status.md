@@ -30505,3 +30505,40 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   reduce in rank order - the P11 mechanism, but here the CTA count, not
   the per-CTA fixed cost, is the shortfall) is the candidate, worth ~4 us
   per layer = +3-4 % c1 plain more.
+  gemv2 expert split (2026-09-18 14:40-14:46 PDT; `pair_pdl4_split_cold.txt`,
+  hot numbers from `$S/p9/mb.cu`): gemv2 launched as a cluster of `split`
+  CTAs along z, each taking top_k / split of the token's slots, rank 0
+  summing the ranks' column sums in rank order through distributed shared
+  memory (deterministic; split 1 is the plain launch, the kernel reads the
+  split from cluster.num_blocks()). Cold, PDL 4, gemv2 us at M = 1 / 2 / 4 / 8:
+  | config | 1 x 8 | 2 x 8 | 4 x 8 | 8 x 8 |
+  |---|---|---|---|---|
+  | nj 2 split 1 | 10.1 | 15.5 | 23.4 | 44.7 |
+  | nj 2 split 2 | 9.8 | 14.8 | 25.6 | 46.1 |
+  | nj 4 split 1 | 11.1 | 12.7 | 26.5 | 43.5 |
+  | nj 4 split 2 | 8.4 | 16.7 | 26.7 | 48.6 |
+  | nj 4 split 4 | 11.4 | 18.2 | 31.3 | 57.0 |
+  Pair totals at one token: 24.6 (nj 4) -> 22.0 (nj 4, split 2); Marlin
+  29.0. The split pays only where the grid is short of the 188 SMs (64 CTAs
+  at one token with nj 4); from two tokens the grid is full and the split
+  is pure cluster overhead (the P11 lesson again). Dispatch rule: split 2
+  up to 8 assignment rows, else 1 (QC_NVFP4_DECODE_SPLIT pins one). Kernel
+  test covers split 2/4/8 against the reference. Serving round 4:
+  `$S/p8/chain_p9d.sh` (below).
+  Serving, fourth round (2026-09-18 14:47-14:57 PDT, `$S/p8/chain_p9d.sh`;
+  references p9off-nospec 13:54, p9off-spec 14:18): plain c1 218.0 / 218.2,
+  c8 774.2 / 763.6, c16 1110.5 / 1108.2 against Marlin's 207.5 / 207.2,
+  768.7 / 770.8, 1105.8 / 1106.5: c1 +5.1 %, c8 / c16 level. Gates (4)
+  -2.449 / -2.452 / -2.456 / -2.459, canaries PASS. Spec, four passes:
+  | shape | pair (round 4) passes 1..4 | median | Marlin median (14:18) |
+  |---|---|---|---|
+  | c1 spec | 307.1 336.5 273.7 315.3 | 311 | 270 (+15 %) |
+  | c8 spec | 818.3 812.6 856.1 821.0 | 820 | 803 (+2 %) |
+  | c16 spec | 1080.7 1136.1 1103.9 1128.2 | 1116 | 1126 (level) |
+  DECISION: retained. RECORD 2026-09-18 14:57 PDT (no extra environment):
+  plain 218.2 / 764-774 / 1108-1110 (+31 / +11-13 / +15 % on the control's
+  166.5 / 687.9 / 966.8), spec four-pass medians c1 311 / c8 820 / c16 1116
+  (+19 / +12 / +11 % on the control's MTP-3 260.8 / 732.1 / 1005.8). The P9 item is
+  closed at 22.0 us per MoE layer at one token against Marlin's 29.0 (the
+  card's rate would be ~17.5): gemv1 13.5 us at 1.39 TB/s and gemv2 8.4 at
+  1.12 are the remaining 4.5 us = ~+4 % c1, a smaller lever than P10 now.

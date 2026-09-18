@@ -1797,11 +1797,14 @@ class quixicore_ops:
         out: torch.Tensor,
         nj: int = 2,
         stages: int = 4,
+        split: int = 1,
     ) -> torch.Tensor:
         """Decode MoE down projection with the top-k combine (fp32, slot
         order) and the optional shared-expert add folded in: out[M, D] bf16.
-        topk_weights None means the weights already sit on the input."""
-        return _qc().nvfp4_moe_gemv2(act, b, s, g, topk_ids, topk_weights, shared, out, nj, stages)
+        topk_weights None means the weights already sit on the input; split
+        (1/2/4/8, dividing top_k) spreads a token's experts over a cluster of
+        CTAs summed in rank order."""
+        return _qc().nvfp4_moe_gemv2(act, b, s, g, topk_ids, topk_weights, shared, out, nj, stages, split)
 
     @staticmethod
     def nvfp4_moe_gemm_smem_bytes(cfg: int) -> int:
