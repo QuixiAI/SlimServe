@@ -26,6 +26,23 @@ from vllm.v1.worker.utils import AttentionGroup
 logger = init_logger(__name__)
 
 
+def _get_draft_hidden_size(draft_model_config) -> int:
+    """Return the target-state width consumed by a draft model.
+
+    ``hc_mult`` alone does not imply that the draft consumes the expanded
+    hyper-connection residual.  GLM-5.3-Flash has four mHC streams, but its
+    checkpoint MTP head is trained on their contracted 4096-wide mean.  The
+    uncontracted ``hc_mult * hidden_size`` contract is specific to DeepSeek V4
+    drafts, identified by the same ``compress_ratios`` marker used by the V1
+    proposer.
+    """
+    hidden_size = draft_model_config.get_hidden_size()
+    hf_config = draft_model_config.hf_config
+    if hasattr(hf_config, "compress_ratios") and hasattr(hf_config, "hc_mult"):
+        hidden_size *= hf_config.hc_mult
+    return hidden_size
+
+
 class BaseSpeculator(ABC):
     @abstractmethod
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
@@ -87,12 +104,7 @@ class DraftModelSpeculator(BaseSpeculator):
         # We need to get the hidden size from the draft model config because
         # the draft model's hidden size can be different from the target model's
         # hidden size (e.g., Llama 3.3 70B).
-        self.hidden_size = self.draft_model_config.get_hidden_size()
-        # Widen for HC-multiplexed residuals (e.g. DeepSeek V4 feeds the MTP
-        # draft the target's pre-hc_head (T, hc_mult * hidden_size) residual).
-        # Non-HC models default to hc_mult=1 and are unaffected.
-        hc_mult = getattr(self.draft_model_config.hf_config, "hc_mult", 1)
-        self.hidden_size = self.hidden_size * hc_mult
+        self.hidden_size = _get_draft_hidden_size(self.draft_model_config)
         self.vocab_size = self.draft_model_config.get_vocab_size()
         self.dtype = vllm_config.model_config.dtype
         self.use_fp64_gumbel = vllm_config.model_config.use_fp64_gumbel
