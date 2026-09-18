@@ -12,7 +12,7 @@ from __future__ import annotations
 import copy
 import json
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -156,6 +156,8 @@ class Plan:
     # Variant-level drafter when platforms diverge; falls back to the
     # source-level speculator.
     variant_speculator: dict[str, Any] | None = None
+    # Operator-supplied checkpoint served in place of the registered one.
+    model_override: "ModelOverride | None" = None
 
     @property
     def speculator(self) -> dict[str, Any] | None:
@@ -163,6 +165,13 @@ class Plan:
 
     @property
     def model_dir(self) -> Path:
+        if self.model_override is not None:
+            return self.model_override.directory
+        return cache_root() / self.source["local_dir"]
+
+    @property
+    def registered_model_dir(self) -> Path:
+        """Where the profile's own checkpoint lives, override or not."""
         return cache_root() / self.source["local_dir"]
 
     @property
@@ -175,6 +184,105 @@ class Plan:
         if self.quant.assembly:
             return self.model_dir / self.quant.assembly["output"]
         return self.model_dir / self.quant.files[0]["path"]
+
+
+@dataclass(frozen=True)
+class ModelOverride:
+    """A drop-in checkpoint served in place of a profile's registered model.
+
+    For a fine-tune of the profile's model: same architecture, same
+    quantization, same tokenizer geometry, different weights. Everything else
+    in the plan - engine arguments, drafter, kernel flags, KV layout - stays
+    exactly as the profile validated it, so the override is only legal when
+    `conflicts()` finds nothing. It is an operator-supplied value (a path or a
+    Hugging Face repo id), never a registry field: the registry records
+    configurations we have qualified, and an override by definition has not
+    been.
+    """
+
+    spec: str
+    repo: str | None
+    directory: Path
+
+    @property
+    def base_url(self) -> str | None:
+        if self.repo is None:
+            return None
+        return f"https://huggingface.co/{self.repo}/resolve/main"
+
+
+def replace_override(plan: Plan, override: ModelOverride | None) -> Plan:
+    """The same plan, serving `override` instead of its registered model."""
+    return replace(plan, model_override=override)
+
+
+def parse_model_override(spec: str) -> ModelOverride:
+    """Read an operator's --model value as a local directory or a repo id."""
+    text = spec.strip()
+    if not text:
+        raise ProfileError("--model needs a directory or a Hugging Face repo id")
+    candidate = Path(text).expanduser()
+    if candidate.is_dir() or text.startswith((".", "/", "~")):
+        if not candidate.is_dir():
+            raise ProfileError(f"--model {spec}: no such directory")
+        return ModelOverride(spec=text, repo=None, directory=candidate.resolve())
+    parts = text.split("/")
+    if len(parts) != 2 or not all(parts):
+        raise ProfileError(
+            f"--model {spec}: expected a local directory or a Hugging Face "
+            "repo id of the form owner/name"
+        )
+    return ModelOverride(spec=text, repo=text, directory=cache_root() / parts[1])
+
+
+def _config_of(directory: Path) -> dict[str, Any]:
+    path = directory / "config.json"
+    if not path.is_file():
+        raise ProfileError(f"{directory} has no config.json")
+    with path.open() as handle:
+        config = json.load(handle)
+    # glm5_next and friends nest the language model under text_config; compare
+    # the union so a nested-only key still participates.
+    merged = {**config.get("text_config", {}), **config}
+    return merged
+
+
+# Model properties an override must match for the profile's engine arguments,
+# kernels and drafter to remain the ones we qualified.
+_OVERRIDE_KEYS = (
+    "architectures",
+    "vocab_size",
+    "hidden_size",
+    "num_hidden_layers",
+    "num_attention_heads",
+    "max_position_embeddings",
+    "num_experts",
+    "n_routed_experts",
+    "num_experts_per_tok",
+)
+
+
+def override_conflicts(registered: Path, override: Path) -> list[str]:
+    """Differences that make an override illegal for a profile, in words.
+
+    Empty means the checkpoint is interchangeable with the registered one as
+    far as the serving configuration can tell.
+    """
+    ours, theirs = _config_of(registered), _config_of(override)
+    problems = []
+    for key in _OVERRIDE_KEYS:
+        mine, other = ours.get(key), theirs.get(key)
+        if mine != other:
+            problems.append(f"{key}: profile has {mine!r}, override has {other!r}")
+    mine = (ours.get("quantization_config") or {}).get("quant_algo") or (
+        ours.get("quantization_config") or {}
+    ).get("quant_method")
+    other = (theirs.get("quantization_config") or {}).get("quant_algo") or (
+        theirs.get("quantization_config") or {}
+    ).get("quant_method")
+    if mine != other:
+        problems.append(f"quantization: profile has {mine!r}, override has {other!r}")
+    return problems
 
 
 class ProfileError(Exception):

@@ -16,9 +16,84 @@ from pathlib import Path
 from typing import Any
 
 from slimserve import term
-from slimserve.registry import Plan, cache_root, files_for
+from slimserve.registry import ModelOverride, Plan, ProfileError, cache_root, files_for
 
 _CHUNK = 32 << 20
+
+
+def hf_token() -> str | None:
+    """The operator's Hugging Face token, for gated repos. Never logged."""
+    import os
+
+    for name in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_TOKEN"):
+        if value := os.environ.get(name):
+            return value.strip()
+    stored = Path.home() / ".cache/huggingface/token"
+    if stored.is_file():
+        return stored.read_text().strip() or None
+    return None
+
+
+def override_entries(override: ModelOverride) -> list[dict[str, Any]]:
+    """Download entries for an overridden checkpoint.
+
+    A registry source carries a hand-written manifest because it names a
+    configuration we qualified; an override is operator-supplied, so its file
+    list comes from the repo itself. A local-directory override downloads
+    nothing.
+    """
+    if override.repo is None:
+        return []
+    import requests
+
+    token = hf_token()
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    api = f"https://huggingface.co/api/models/{override.repo}?blobs=true"
+    response = requests.get(api, headers=headers, timeout=60)
+    if response.status_code in (401, 403):
+        raise ProfileError(
+            f"{override.repo} is gated or private and this machine's Hugging "
+            f"Face token cannot read it (HTTP {response.status_code}). Accept "
+            "the repo's terms with the account that owns the token, or put a "
+            "token that can read it in HF_TOKEN."
+        )
+    if response.status_code == 404:
+        raise ProfileError(f"{override.repo}: no such Hugging Face repo")
+    response.raise_for_status()
+    siblings = response.json().get("siblings") or []
+    entries = []
+    for sibling in siblings:
+        name = sibling["rfilename"]
+        if name.startswith(".") or name.endswith(".md"):
+            continue
+        entries.append(
+            {
+                "path": name,
+                "bytes": int(sibling.get("size") or 0),
+                "url": f"{override.base_url}/{name}",
+                "local_dir": override.directory.name,
+                "role": "model",
+                "headers": dict(headers),
+            }
+        )
+    if not entries:
+        raise ProfileError(f"{override.repo} lists no model files")
+    # The listing is public metadata even for a gated repo; the files are not.
+    # Probe one byte now so a gate failure is reported here and not eight
+    # hours into a download.
+    probe = requests.get(
+        entries[0]["url"], headers={**headers, "Range": "bytes=0-0"}, timeout=60
+    )
+    if probe.status_code in (401, 403):
+        raise ProfileError(
+            f"{override.repo} is gated and this machine's Hugging Face token "
+            f"cannot download it (HTTP {probe.status_code}). Accept the repo's "
+            "terms at https://huggingface.co/"
+            f"{override.repo} with the account that owns the token, or set "
+            "HF_TOKEN to one that already has access."
+        )
+    probe.raise_for_status()
+    return entries
 
 
 def _complete(path: Path, size: int) -> bool:
@@ -26,7 +101,9 @@ def _complete(path: Path, size: int) -> bool:
 
 
 def _destination(entry: dict[str, Any]) -> Path:
-    return cache_root() / entry["local_dir"] / entry["path"]
+    local = Path(entry["local_dir"])
+    root = local if local.is_absolute() else cache_root() / local
+    return root / entry["path"]
 
 
 def _sha256(path: Path) -> str:
@@ -46,6 +123,12 @@ def _valid(path: Path, entry: dict[str, Any]) -> bool:
 
 def _pending(plan: Plan) -> list[tuple[dict[str, Any], Path]]:
     entries = files_for(plan)
+    if plan.model_override is not None:
+        # The override supplies the model; the profile still supplies the
+        # drafter and anything else that is not the checkpoint.
+        entries = [
+            entry for entry in entries if entry["role"] not in ("model", "shared")
+        ] + override_entries(plan.model_override)
     if plan.quant.assembly and _complete(plan.entry_file, plan.quant.assembly["bytes"]):
         # The assembled file is what gets served; the model parts are scaffolding.
         entries = [entry for entry in entries if entry["role"] != "model"]
@@ -92,7 +175,9 @@ def _download(entry: dict[str, Any], dest: Path) -> None:
         _finalize(part, dest, entry, done)
         return
 
-    headers = {"Range": f"bytes={have}-"} if have else {}
+    headers = dict(entry.get("headers") or {})
+    if have:
+        headers["Range"] = f"bytes={have}-"
     with requests.get(
         entry["url"], headers=headers, stream=True, timeout=60
     ) as response:
