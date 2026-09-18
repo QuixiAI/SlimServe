@@ -20,6 +20,7 @@ from typing import Any
 from slimserve.term import human_bytes
 
 REGISTRY_PATH = Path(__file__).with_name("profiles.json")
+CHAT_TEMPLATE_DIR = Path(__file__).with_name("chat_templates")
 
 
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -184,6 +185,12 @@ class Plan:
         if self.quant.assembly:
             return self.model_dir / self.quant.assembly["output"]
         return self.model_dir / self.quant.files[0]["path"]
+
+    @property
+    def chat_template_file(self) -> Path | None:
+        """Checked-in chat template selected by the model source."""
+        asset = self.source.get("chat_template_asset")
+        return CHAT_TEMPLATE_DIR / asset if asset else None
 
 
 @dataclass(frozen=True)
@@ -532,6 +539,11 @@ def resolve(
     # platform. A profile sets these keys itself only to opt out.
     for key, value in _SERVING_DEFAULTS.items():
         merged["engine"].setdefault(key, copy.deepcopy(value))
+
+    if template_asset := source.get("chat_template_asset"):
+        merged["engine"].setdefault(
+            "chat_template", str(CHAT_TEMPLATE_DIR / template_asset)
+        )
 
     plan = Plan(
         profile_id=profile_id,

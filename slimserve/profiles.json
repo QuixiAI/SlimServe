@@ -1174,6 +1174,7 @@
       "repo": "RedHatAI/GLM-5.3-Flash-NVFP4",
       "base_url": "https://huggingface.co/RedHatAI/GLM-5.3-Flash-NVFP4/resolve/main",
       "local_dir": "GLM-5.3-Flash-NVFP4",
+      "chat_template_asset": "glm53_tool_calling.jinja",
       "shared_note": "Safetensors checkpoint served from its directory; the vision tower, MTP head (model_mtp.safetensors), tokenizer and processor configs ship in the same repo. Requires transformers >= 5.16.1 for the native glm5_next config and processor.",
       "speculator": {
         "repo": "incoai/GLM-5.3-Flash-DFlash2",
