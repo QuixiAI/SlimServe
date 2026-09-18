@@ -464,7 +464,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.serve:
         from slimserve.server import exec_server
 
-        return exec_server(plan, args.host, args.port)
+        return exec_server(plan, args.host, args.port, args.engine_log)
 
     return _chat(plan, args.prompt, args.engine_log)
 
