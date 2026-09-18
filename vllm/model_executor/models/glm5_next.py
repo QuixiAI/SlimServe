@@ -120,10 +120,20 @@ def _load_nvfp4_swapset(
     those modules NVFP4A16 comes from the same manifest."""
     import os
 
-    from slimserve.nvfp4_swapset import load_manifest
+    from slimserve.nvfp4_swapset import SWAPSET_ENV, enabled, load_manifest
 
     manifest = load_manifest(model_path)
-    if manifest is None or not manifest["tensors"]:
+    if manifest is None:
+        if enabled() and model_path:
+            logger.warning(
+                "glm5_next: %s=%s selects an NVFP4 sidecar but %s has none; "
+                "serving the FP8 record (build it with python -m slimserve.nvfp4_swapset)",
+                SWAPSET_ENV,
+                os.environ.get(SWAPSET_ENV),
+                model_path,
+            )
+        return {}, {}
+    if not manifest["tensors"]:
         return {}, {}
     from safetensors.torch import load_file
 

@@ -1149,17 +1149,36 @@ Item detail:
   later item: measure the replaced kernels in a graph with PDL on before
   fusing - launch gaps are already hidden, and a fused kernel must have a
   shorter critical path than the sum of the wide kernels it replaces.
-- **P1b.** The KDA layer's `_forward` spec branch calls `fused_recurrent_kda`
-  with `store_states=False` (already supported) and records the branch's
-  q/k/v/g1/beta views and index tensors on the layer; after the sampler has
-  produced `num_accepted_tokens` for the step (where the mamba align
-  post-copy already consumes it), one grouped launch replays the accepted
-  rows of every KDA layer from the previous committed column and stores the
-  committed column plus the boundary column (`kda_spec_commit`, MODE 2).
-  The commit must run before the align post-copy that snapshots the boundary
-  column and inside the same captured step. Verify: the state fingerprints
-  across a 300-token speculative decode against the per-row-store path, the
-  exact bench, the eviction-restore acceptance.
+- **P1b (design fixed 2026-09-17 21:00 PDT, next up).** Only the 34 target
+  KDA layers are involved (the MTP drafter is MLA). Per request per layer
+  per speculative step the state (1 MB) moves once in and T times out
+  today (T = draft rows, 5 at c8/c16); with the commit it moves once in
+  and, in the commit, once in and once or twice out, i.e. 4 MB against
+  6 MB at T = 5: -2 MB x 16 requests x 34 layers = 1.1 GB per c16 step
+  (0.67 ms of ~15 ms, +4 %; c8 +2 %; c1 and plain 0). The pieces:
+  (1) `fused_recurrent_kda_fwd_kernel` gets `STORE_INPUTS`: with
+  `STORE_STATES=False` it writes the raw g and beta rows it read into a
+  persistent per-layer buffer (`self._spec_inputs`, [rows_max, H, K+1]
+  bf16, allocated once), and the spec conv writes its k/v output through
+  `out=` into a persistent buffer of the same lifetime, so nothing of the
+  step's graph pool is read after the graph (the pool reuses buffers
+  within a replay). (2) `fused_recurrent_kda_commit_kernel` exists since
+  2026-09-12 (prev_accepted, new_accepted, boundary_row; stores column
+  new_accepted-1 and the boundary column); it becomes a grouped launch
+  over the 34 layers through an int64 pointer table for the per-layer
+  state tensors (Triton `tl.cast(ptr_int, tl.pointer_type(...))`) and a
+  layer stride for the stacked input buffers and A_log/dt_bias, one
+  program per (layer, request, head, v-block). (3) The runner's
+  `_postprocess_mamba...` calls it after `num_accepted_tokens.gpu` is
+  written and before `postprocess_mamba_align_gpu`, with prev_accepted =
+  the metadata's num_accepted_tokens the forward started from,
+  new_accepted = this step's counts, boundary_row = the align kernel's
+  `accept_token_bias` when `needs_copy` (computed once on the GPU from the
+  staged num_computed/num_scheduled/num_draft buffers, shared with the
+  align kernel). Verify: state fingerprints of a 300-token speculative
+  decode against the per-row path (both paths on one boot, env switch),
+  the exact bench at c1/c8/c16 spec, the eviction-restore acceptance with
+  VLLM_KV_TIER_VERIFY=1 (the boundary column feeds the tier).
 - **P1 (a), superseded.** (a) First the cheap probe: the packed decode recurrence already
   exposes `KDA_DECODE_BV` / `KDA_DECODE_WARPS`; sweep BV 8/16/32 x warps
   1/2/4/8 at the per-rank shape (H 16, K = V = 128, N 1/8/16) in a
@@ -1203,24 +1222,46 @@ Item detail:
   fall back to the full gather when logprobs are requested or top_k is
   unset. The rejection sampler's residual distribution is restricted to
   the same candidate set, which is exact under top-k masking.
-- **P6.** A sibling of the fp8 swapset (`slimserve/nvfp4_swapset.py`):
-  e2m1 group-16 with e4m3 group scales and an fp32 global scale (the
-  experts' recipe), served through Marlin's dense NVFP4 W4A16 path at
-  M <= 64 and the existing prefill GEMM above; per-family logprob canary
-  (mean |dlogprob| against the bf16 floor 0.13, top-1 >= 93 %), the KDA
-  in_proj is the family most likely to fail and is dropped alone if it
-  does. Operator note: this changes serving weights from fp8 to 4-bit on
-  the attention projections; the canary is the gate.
+- **P6 (landed, reduced).** `slimserve/nvfp4_swapset.py`: e2m1 group-16
+  with e4m3 group scales and an fp32 global scale per merged module (the
+  experts' recipe), served as a compressed-tensors NVFP4A16 group through
+  Marlin's dense W4A16 path. Measured per family with the gate's
+  all-position prompt logprob (the token-level canary of the plan cannot be
+  met by the reference against itself: two runs of one boot differ by 0.26
+  nats per token, 87 % top-1 agreement): the KDA in_proj costs 0.012 nats
+  per token and returns +3 % c1 / +2 % c8 / +0.5 % c16 (spec c16 +1.5 %);
+  o_proj / q_b / dense MLP cost 0.028 for +1 % c1; the shared experts lose
+  outright. The record carries the in_proj sidecar only
+  (`SLIMSERVE_NVFP4_SWAPSET=nvfp4-swapset-inproj`). The gain is the byte
+  saving and nothing more: HBM-cold the fp8 in_proj GEMM streams at 1.46
+  TB/s and Marlin at 1.19 TB/s of half the bytes (18.1 vs 12.5 us); a
+  streaming NVFP4 kernel would add 0.08 ms (+1.6 % c1) and is not worth
+  building. A PDL launch for dense Marlin was neutral at 1-16 rows (the byte
+  saving is already fully realized) and reverted; its spec boot's low
+  c8/c16 passes turned out to be inside the spec pass spread (5-7 % on one
+  boot), which now puts spec c8/c16 under the same six-pass rule as c1.
 - **P7.** A side-stream prefetch kernel (`prefetch.global.L2` over the next
   GEMM's weight slice) ordered before each fused all-reduce inside the
   capture; measured by graph replay time, kept only if it returns
   >= 0.2 ms.
 
 Order after the 2026-09-17 evening results (P2 and P3 landed as defaults,
-plain c1/c8/c16 +1.5/+1.9/+4.2 % on the head; P1 closed): P6 first (the
-only double-digit c1 item; its go/no-go is the Marlin dense NVFP4 decode
-GEMM against the fp8 decode GEMM at M = 1..64, then the sidecar and the
-per-family canary), then P1b, P5, P4, P7.
+plain c1/c8/c16 +1.5/+1.9/+4.2 % on the head; P1 closed; P6 landed at +3 /
++2 / +0.5 % with the in_proj family only - the byte lever on the dense
+stream is spent, the plan's +13 % rested on a flush-in-graph microbench
+that overstated the cold rates): P1b, P5, P4, P7 remain, each 1-3 %. The
+record after P2/P3/P6 (2026-09-17 21:00 PDT, exact, two passes, record
+boots with no extra environment): plain 198-203 / 756-760 / 1086-1092,
+spec 263-310 / 733-784 / 1026-1081 against
+the control's 166.5 / 687.9 / 966.8 and 267.6 / 732.1 / 1005.8, i.e. +19 /
++10 / +12 % plain and level / +0-7 / +2-7 % with speculation (spec passes
+spread 5-7 % on one boot; six-pass medians before any spec claim). The floors (350 /
+1040 / 1400 plain) stay far: what separates the record from them is
+per-layer latency at 1-16 rows (90 all-reduce sites, the KDA glue, the
+small-shape GEMMs), which the fused-launch items P1/P1b/P7 were meant to
+cut and which P1's measurement showed graph replay + PDL already hides;
+the remaining honest levers are the spec state-write traffic (P1b), the
+logits gather (P5) and the replicated bf16 projections (P4).
 
 Realistic landing if P1b-P6 hold: c1 270-285 tok/s (spec 420-450), c8
 900-920 (spec 1000-1050), c16 1250-1300; against the control +65-70 % / +30

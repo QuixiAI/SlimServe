@@ -258,6 +258,7 @@ def load_manifest(model_path: str | None) -> dict | None:
     if chosen is not None:
         keep = [m for m in manifest["modules"] if m.split(".", 2)[2] in chosen]
         manifest["modules"] = keep
+        manifest["families"] = [f for f in manifest["families"] if f in chosen]
         manifest["shards"] = {s: m for s, m in manifest["shards"].items() if m in chosen}
         manifest["tensors"] = [t for t in manifest["tensors"] if t.rsplit(".", 1)[0] in manifest["shards"]]
         manifest["config_group"] = config_group(

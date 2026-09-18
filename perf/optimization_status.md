@@ -29982,3 +29982,135 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   (fp8 block: ~0.02) - the logprob gate decides. Arms `$S/p8/chain_p6.sh`:
   p6ref-nospec (two gates on the fp8 record = jitter reference),
   p6nvfp4-nospec (two gates), p6nvfp4-spec.
+
+- PHASE 8 / P6 SERVING ARMS (2026-09-17 19:53-20:16 PDT, tree 1984bd2be,
+  ab2.sh, two passes per boot, exact on every run; raw
+  perf/results/2026-09-17/p6{ref,nvfp4}-nospec-pass{1,2}/, p6nvfp4-spec-pass{1,2}/,
+  gates p6{ref,nvfp4}-nospec-gate{1,2}.json).
+  | arm | c1 | c8 | c16 |
+  |---|---|---|---|
+  | p6ref-nospec (fp8 record) | 191.9 / 196.4 | 736.6 / 740.2 | 1084.4 / 1076.1 |
+  | p6nvfp4-nospec (five families) | 199.4 / 204.9 | 758.3 / 760.7 | 1088.7 / 1088.7 |
+  | rs5pdl4-spec (fp8 record, earlier boot) | 262.7 / 217.3 | 822.2 / 794.1 | 1067.5 / 1057.1 |
+  | p6nvfp4-spec | 222.5 / 250.2 | 830.3 / 803.7 | 1082.6 / 1081.5 |
+  Throughput: plain +4 % c1, +3 % c8, +0.5-1 % c16; spec c8 +1-2 %, c16
+  +1.5-2 %, c1 inside its sampling spread. Less than half the 0.42 ms the
+  microbench promised at c1 (196 -> 205 is -0.2 ms of a 5.1 ms step); the
+  profile arm below attributes the rest.
+  Quality: the gate's continuation mean is too noisy for this (256 tokens;
+  ref -2.421 / -2.428, candidate -2.468 / -2.424). The all-position mean of
+  the same dumps (4344 prompt positions per run) resolves it: ref -3.2558 /
+  -3.2571, candidate -3.2996 / -3.3107, i.e. -0.049 nats per token (1.5 %
+  more NLL), 5-8 within-boot standard deviations by the 2026-09-12 eight-run
+  protocol (sd 0.006-0.012), where the fp8 KDA swap cost 0.007. Sharpness:
+  actual-is-top-1 0.530 -> 0.525. Needle margins 13.2 / 17.7 -> 10.6-11.0 /
+  20.6-22.0 (the 1k-haystack margin down 2.5 nats, the 7k up 3-5). Note for
+  every later canary: two gate runs on the SAME boot and weights disagree by
+  0.26 nats mean |dlogprob| per position with 87 % top-1 agreement (the
+  candidate against the reference: 0.40 and 82 %), so the token-level
+  "mean |dlogprob| 0.13 / top-1 >= 93 %" criterion of the plan cannot be met
+  by the reference itself on this stack; the all-position mean NLL over a
+  boot's gates is the statistic that resolves 0.01 nats.
+  Verdict so far: the full five-family sidecar buys +3-4 % at c1/c8 for a
+  0.05 nats/token prompt-NLL cost, which is not the trade the operator's
+  note allows without knowing which family carries it. Family isolation
+  arms (`$S/p8/chain_p6b.sh`, four gates each): p6in-nospec (KDA in_proj
+  alone, half the sidecar bytes and the suspected cost) and p6noin-nospec
+  (o_proj, q_b, dense gate_up/down).
+  RESULT (20:11-20:28 PDT; raw p6{in,noin}-nospec-pass{1,2}/, gates
+  p6{in,noin}-nospec-gate{1..4}.json; all-position mean logprob per gate,
+  `$S/p8/gate_allpos.py`):
+  | arm | gates (all-position mean) | mean, delta vs ref -3.2565 | c1 | c8 | c16 |
+  |---|---|---|---|---|---|
+  | p6in-nospec (KDA in_proj only) | -3.2682 / -3.2589 / -3.2750 / -3.2701 | -3.268, -0.012 | 197.7 / 203.1 | 755.2 / 752.3 | 1078.4 / 1086.4 |
+  | p6noin-nospec (o_proj, q_b, dense MLP) | -3.2859 / -3.2839 / (gates 3-4 in the JSONs) | -3.285, -0.028 | 193.4 / 198.1 | 743.1 / 741.9 | 1077.5 / 1079.9 |
+  | p6nvfp4-nospec (all five) | -3.2996 / -3.3107 | -3.305, -0.049 | 199.4 / 204.9 | 758.3 / 760.7 | 1088.7 / 1088.7 |
+  The costs add: the KDA in_proj (half the sidecar bytes, the family the
+  plan expected to fail) costs 0.012 nats per token - the size of the fp8
+  KDA swap's own 0.007 and within two gate standard deviations - and
+  returns +3 % c1 / +2 % c8, i.e. nearly the whole sidecar's throughput;
+  the o_proj / q_b / dense-MLP families cost 0.028 for +1 % c1 and nothing
+  at c8/c16. DECISION: the record's sidecar family is
+  `self_attn.in_proj_qkvgfab` alone; the other families stay fp8 and remain
+  selectable for experiments through SLIMSERVE_NVFP4_FAMILIES.
+  Why the in_proj gain is a third of the microbench's 0.35 ms: the dense
+  Marlin launch had no programmatic dependent launch (the fp8 decode GEMM it
+  replaces runs under PDL mode 4), so each of the 34 calls paid the full
+  graph-replay launch gap the rest of the step hides. Patched
+  (marlin_template.h entry trigger + wait, marlin.cu cudaLaunchKernelEx under
+  QC_PDL, same shape as the MoE Marlin; parity smoke `$S/p8/smoke_marlin_pdl.py`:
+  bit-identical to the plain launch, eager == graph, 3-4e-3 relative max
+  error against the dequantized reference) and measured on the in_proj-only
+  family (p6inpdl-nospec / p6inpdl-spec, 20:28-20:43 PDT):
+  | arm | c1 | c8 | c16 |
+  |---|---|---|---|
+  | p6in-nospec (no Marlin PDL) | 197.7 / 203.1 | 755.2 / 752.3 | 1078.4 / 1086.4 |
+  | p6inpdl-nospec | 202.8 / 203.1 | 759.7 / 754.2 | 1085.4 / 1084.9 |
+  | p6nvfp4-spec (five families, no Marlin PDL) | 222.5 / 250.2 | 830.3 / 803.7 | 1082.6 / 1081.5 |
+  | p6inpdl-spec | 284.7 / 309.9 | 788.1 / 731.9 | 1027.9 / 1014.3 |
+  Neutral at 1-16 rows (inside pass noise). Its spec boot read 732-788 at
+  c8 and 1014-1028 at c16, which looked like -4 %, but the record's own
+  spec boots later that hour read 733-784 / 1026-1081 across two passes
+  (p6rec-spec), so the loss is NOT established - the spec c8/c16 pass
+  spread is 5-7 % on one boot today and needs the six-pass protocol like
+  c1. REVERTED anyway: it returns nothing where it could (the byte saving
+  is fully realized without it, see the rotating microbench below), and a
+  persistent-grid kernel launched early with its full dynamic shared memory
+  is the one PDL shape that can park on the producer's SMs at 32-64 rows.
+  QC_PDL keeps its meaning for the fp8 GEMM, the Triton kernels and the MoE
+  Marlin. The c1 profiler boots (p6ref / p6in) attribute Marlin in-graph.
+
+- PHASE 8 / P6 CLOSE-OUT (2026-09-17 20:45-21:00 PDT, tree = 1984bd2be +
+  the record change below, `_C_stable_libtorch` rebuilt from the reverted
+  Marlin; raw perf/results/2026-09-17/p6in6-nospec-{pass1,pass2,gate1..6}/,
+  p6in-spec-pass{1,2}/, p6-nvfp4-dense/marlin_fp4_vs_fp8_decode_rotating.txt,
+  profiles $S/profile-p6{ref,in}-c1/).
+  Confirmation boot, KDA in_proj sidecar alone, six gates: all-position mean
+  -3.2694 / -3.2753 / -3.2833 / -3.2558 / -3.2659 / -3.2630 = -3.2688, sd
+  0.0096; against the fp8 record's -3.2565 that is -0.012 nats per token
+  (the fp8 KDA swap cost 0.007 on 2026-09-12; actual-is-top-1 0.526-0.527
+  against 0.530-0.531). Throughput, exact on every pass:
+  | arm | c1 | c8 | c16 |
+  |---|---|---|---|
+  | fp8 record (p6ref-nospec) | 191.9 / 196.4 | 736.6 / 740.2 | 1084.4 / 1076.1 |
+  | in_proj sidecar (p6in6-nospec) | 200.6 / 202.8 | 755.7 / 751.9 | 1084.9 / 1085.8 |
+  | fp8 record spec (rs5pdl4-spec) | 262.7 / 217.3 | 822.2 / 794.1 | 1067.5 / 1057.1 |
+  | in_proj sidecar spec (p6in-spec) | 257.9 / 263.6 | 787.0 / 791.5 | 1081.6 / 1077.0 |
+  Plain +3 % c1 / +2 % c8 / +0.5 % c16; spec c16 +1.5 %, c8 inside its
+  pass spread (this arm 787-792, the five-family arm 804-830, the fp8 arm
+  794-822), c1 inside the sampling spread.
+  Why it is +3 % and not the plan's +13 %: the flush-inside-the-graph
+  microbench overstated both kernels' cold rates (Marlin at 1.7 TB/s is above
+  the card). The rotating-copies bench (640 MB of distinct weights per
+  format, every call HBM-cold, `$S/p8/bench_dense_rotate.py`) gives the
+  truth at M = 1..16: in_proj fp8 GEMM 18.1-19.7 us (1.46 TB/s), Marlin
+  NVFP4 12.5-13.0 us (1.19 TB/s of its 14.9 MB); 5.6 us x 34 layers = 0.19
+  ms per step = the measured whole-step gain. A streaming NVFP4 kernel at
+  the fp8 GEMM's 1.46 TB/s would take 10.2 us, i.e. another 0.08 ms (+1.6 %
+  c1) - not worth a kernel. o_proj 6.8 vs 7.1 us, q_b 6.1 vs 5.7, dense
+  gate_up 14.2 vs 17.1, shared gate_up 11.7 vs 6.8: the narrow shapes are
+  latency-floored in both formats, which is why the other families returned
+  +1 % for 0.028 nats. In the c1 profiles the in_proj sidecar takes the step
+  from 5.10 to 4.91 ms; the per-kernel figures there (Marlin 19.6 us, fp8
+  in_proj ~26 us) are PDL-wait-inflated and are not the kernels' cost.
+  DECISION: RETAINED on the record as `SLIMSERVE_NVFP4_SWAPSET=
+  nvfp4-swapset-inproj` (a sidecar built for the in_proj family only, so the
+  record needs no family filter; SLIMSERVE_NVFP4_FAMILIES stays the
+  experiment knob over a wider sidecar); the loader now warns and serves the
+  fp8 record when the selected sidecar is absent. Record boots with no
+  extra environment (21:00-21:12 PDT, the sidecar log line names
+  nvfp4-swapset-inproj, 34 modules): p6rec-nospec 198.0 / 202.8, 755.7 /
+  760.2, 1092.4 / 1086.3; p6rec-spec 263.2 / 309.7, 783.7 / 733.0, 1080.5 /
+  1025.6 - exact on all twelve. The five-family
+  sidecar `nvfp4-swapset.{safetensors,json}` (4.0 GB) stays on /raid for
+  experiments (not deleted; operator's call).
+  Standing lessons: (1) the quality statistic for a sidecar is the
+  all-position mean of the gate's prompt logprobs over >= 4 gates on one
+  boot (sd ~0.01), not the 256-token continuation mean (sd ~0.02) nor a
+  token-level |dlogprob| (0.26 nats between two runs of the SAME boot); (2)
+  a cold microbench must rotate distinct weight copies past the 128 MB L2,
+  a flush kernel inside the graph leaves enough resident to overstate
+  narrow kernels by 2x; (3) spec c8/c16 passes spread 5-7 % on one boot
+  (733-784 / 1026-1081 here), so a spec claim at any shape needs the
+  six-pass protocol, and a launch-path change must be measured under
+  speculation (32-64 rows) with it, not read off two passes.

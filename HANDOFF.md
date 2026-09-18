@@ -39,6 +39,29 @@ Obsolete sidecars on /raid (not deleted, operator's call): in
 superseded by `fp8-swapset-lmhead.*` (7.3 GB, the record's sidecar).
 PR #29 passed automated review at c67d2452f on 2026-09-17 (nine CodeRabbit
 rounds, every finding addressed; merged with upstream main 02fb15fc1).
+Phase 8 so far (2026-09-17 evening, local commits after the reviewed head;
+the notebook entries "PHASE 8 / ..."): PDL mode 4 and the reduce-scatter mHC
+transition are code defaults (+1.5 / +1.9 / +4.2 % plain); the fused KDA
+decode chain was built, parity-tested and rejected (never faster under
+graph replay + PDL; opt-in QC_KDA_CHAIN=1 until the cleanup pass); the
+NVFP4 dense sidecar landed for the KDA in_proj family only
+(`SLIMSERVE_NVFP4_SWAPSET=nvfp4-swapset-inproj` on the record, +3 / +2 /
++0.5 % plain for 0.012 nats per token; the other families cost 0.028 for
++1 % and stay fp8). Record after these (boots with no extra environment,
+exact, two passes, 2026-09-17 21:00 PDT): plain 198-203 / 756-760 /
+1086-1092, spec 263-310 / 733-784 / 1026-1081 (control 166.5 / 687.9 /
+966.8 and 267.6 / 732.1 / 1005.8).
+Measurement rules that came out of it: a sidecar's quality is the
+all-position mean of gate.py's prompt logprobs over >= 4 gates on one boot
+(`$S/p8/gate_allpos.py`; two runs of the SAME boot differ by 0.26 nats per
+token at the token level, so no token-level canary can pass); cold
+microbenches must rotate distinct weight copies past the 128 MB L2
+(`$S/p8/bench_dense_rotate.py`), a flush kernel in the graph overstates
+narrow kernels 2x; profiler durations under PDL include the entry wait
+and are not kernel costs; spec passes spread 5-7 % at every shape on one
+boot, so any spec claim needs six passes (median); a dense-Marlin PDL
+launch was tried and reverted (nothing to gain, the byte saving is already
+realized).
 THE PERFORMANCE MANDATE IS NOT MET: the operator's standard is a decisive
 margin over the control, and +5..18 % is not one. The whole-step physics
 floor is now computed (notebook, "Whole-step physics floor", 2026-09-17):
