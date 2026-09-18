@@ -1132,7 +1132,8 @@ is worked top to bottom.
 
 | item | replaces | expected per step |
 |---|---|---|
-| P1 KDA decode chain, one kernel per layer | `causal_conv1d_update` (2.8 us) + `fused_recurrent_kda_packed_decode` (11.5 us for 2 MB of state traffic: grid 4 x N*H = 64 CTAs at c1) + `layer_norm_gated` (1.4 us) + `kda_gate_pair` (1.9 us), 34 layers | -0.35..0.45 ms at every batch (c1 +8 %, c8 +4 %) |
+| P1 KDA decode chain, one kernel per layer - CLOSED 2026-09-17, rejected | the four Triton kernels replay in 5.6 us per layer at one row under graphs plus PDL (the trace durations that suggested 17 us were inflated); the fused two-launch chain is slower at every shape, hot or cold (notebook "Phase 8 / P1") | none; superseded by P1b |
+| P1b KDA deferred state commit under speculation | the T per-row state stores of `fused_recurrent_kda` (1 read + T writes of 1 MB per request per layer: 64 MB written per layer at c16, 2.0 ms of DRAM-bound time per step at c16, 0.9 ms at c8) -> forward without stores + a post-sampling commit that stores the accepted column and the boundary column (kernels `kda_spec_fwd` MODE 1 / `kda_spec_commit`, parity-tested 2026-09-12) | -0.8 ms c16 spec (+5 %), -0.4 ms c8 spec (+3.5 %) |
 | P2 programmatic dependent launch on our kernels | the 1-2 us serialization gap before each of the ~300 hot launches per step (fp8 decode GEMM, Marlin, fused all-reduce, route/align, combine, P1) | -0.3..0.6 ms (c1 +6-12 %, c8 +3-6 %) |
 | P3 fused all-reduce + mHC transition above 8 rows | the split pair at T > 8: `cross_device_reduce_2stage` 12.3 + `_mhc_partials` 6.3 + `_mhc_finalize` 5.0 = 23.6 us x 90 sites = 2.1 ms at c8/c16 | -0.9 ms at c8/c16 (+8 % / +6 %) |
 | P4 replicated bf16 MLA-side projections onto the fp8 decode GEMM | `fused_qkv_a_proj` (16.8 MB) + indexer `wq_b`/`wk`/`weights_proj` (14.9 MB) per MLA layer on cuBLAS wmma + splitK (6.2 us per call, ~26 per step) | -0.15 ms (-0.16 GB, fewer launches) |
@@ -1142,7 +1143,24 @@ is worked top to bottom.
 
 Item detail:
 
-- **P1.** (a) First the cheap probe: the packed decode recurrence already
+- **P1 (closed).** Built as `kda_chain_decode` (opt-in QC_KDA_CHAIN=1, parity test
+  `tests/kernels/test_kda_decode_chain.py`); rejected on the microbench and
+  kept only as a diagnostic until the cleanup pass. The lesson for every
+  later item: measure the replaced kernels in a graph with PDL on before
+  fusing - launch gaps are already hidden, and a fused kernel must have a
+  shorter critical path than the sum of the wide kernels it replaces.
+- **P1b.** The KDA layer's `_forward` spec branch calls `fused_recurrent_kda`
+  with `store_states=False` (already supported) and records the branch's
+  q/k/v/g1/beta views and index tensors on the layer; after the sampler has
+  produced `num_accepted_tokens` for the step (where the mamba align
+  post-copy already consumes it), one grouped launch replays the accepted
+  rows of every KDA layer from the previous committed column and stores the
+  committed column plus the boundary column (`kda_spec_commit`, MODE 2).
+  The commit must run before the align post-copy that snapshots the boundary
+  column and inside the same captured step. Verify: the state fingerprints
+  across a 300-token speculative decode against the per-row-store path, the
+  exact bench, the eviction-restore acceptance.
+- **P1 (a), superseded.** (a) First the cheap probe: the packed decode recurrence already
   exposes `KDA_DECODE_BV` / `KDA_DECODE_WARPS`; sweep BV 8/16/32 x warps
   1/2/4/8 at the per-rank shape (H 16, K = V = 128, N 1/8/16) in a
   microbench and, if a config is ahead, make it the sm_120 default in
@@ -1198,7 +1216,13 @@ Item detail:
   capture; measured by graph replay time, kept only if it returns
   >= 0.2 ms.
 
-Realistic landing if P1-P6 hold: c1 270-285 tok/s (spec 420-450), c8
+Order after the 2026-09-17 evening results (P2 and P3 landed as defaults,
+plain c1/c8/c16 +1.5/+1.9/+4.2 % on the head; P1 closed): P6 first (the
+only double-digit c1 item; its go/no-go is the Marlin dense NVFP4 decode
+GEMM against the fp8 decode GEMM at M = 1..64, then the sidecar and the
+per-family canary), then P1b, P5, P4, P7.
+
+Realistic landing if P1b-P6 hold: c1 270-285 tok/s (spec 420-450), c8
 900-920 (spec 1000-1050), c16 1250-1300; against the control +65-70 % / +30
 % / +30 %. The literal floors are 350 / 470 / 1040 / 1240 / 1400. At c16 the
 margin is physically capped near +45 % because the expert stream, which the
