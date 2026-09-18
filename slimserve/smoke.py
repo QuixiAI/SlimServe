@@ -130,6 +130,10 @@ def validate_acceleration(plan: Plan) -> dict[str, Any]:
     executable configuration must carry every registered engine setting.
     """
     speculative = engine_kwargs(plan).get("speculative_config")
+    if not plan.speculative:
+        if speculative is not None:
+            raise RuntimeError("non-speculative plan unexpectedly resolved a drafter")
+        return {}
     if not isinstance(speculative, dict):
         raise RuntimeError("resolved plan has no speculative configuration")
     registered = plan.speculator["engine"]
@@ -270,7 +274,7 @@ def run_profile(
         "gpus": plan.gpus,
         "modalities": profile_modalities(plan),
         "speculative_method": speculative.get("method"),
-        "speculative_tokens": speculative["num_speculative_tokens"],
+        "speculative_tokens": speculative.get("num_speculative_tokens"),
         "draft_attention_backend": speculative.get("attention_backend"),
         "draft_kv_cache_dtype": speculative.get("kv_cache_dtype"),
         "load_seconds": loaded - started,
