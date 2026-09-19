@@ -26209,3 +26209,14 @@ Phases, by value over risk:
 - Results: no new throughput measurement or hardware qualification claimed.
 - Decision: submit as a focused PR; preserve current-main behavior outside this fix.
 - Raw artifacts: local test output; no traffic captures or model data committed.
+
+
+## 2026-09-19 - Add read-only auditors for captured serving protocol traffic
+
+- Status: retained for review.
+- Baseline: `feat/serving-capture-proxy`; forward-port from the B70 serving integration.
+- Change: Summarize terminal status, malformed JSON, empty assistant history and streamed/final call identity using protocol metadata and fingerprints, with bounded time/window filters.
+- Correctness: All 22 benign fixture and proxy tests passed on CPU; Ruff passed.
+- Results: no new throughput measurement or hardware qualification claimed.
+- Decision: submit as a focused PR; preserve current-main behavior outside this fix.
+- Raw artifacts: local test output; no traffic captures or model data committed.
