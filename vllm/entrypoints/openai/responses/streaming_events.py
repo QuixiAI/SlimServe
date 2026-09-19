@@ -1092,9 +1092,27 @@ def emit_simple_tool_call_delta(
     ]
 
 
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"Invalid JSON constant: {value}")
+
+
+def valid_function_call_arguments(arguments: str) -> bool:
+    """Check JSON syntax only; schema adherence belongs to strict decoding."""
+    try:
+        json.loads(arguments, parse_constant=_reject_json_constant)
+    except (ValueError, RecursionError):
+        return False
+    return True
+
+
 def emit_simple_tool_call_done(
     state: SimpleStreamingState,
+    *,
+    incomplete: bool = False,
 ) -> list[StreamingResponsesResponse]:
+    # Streamed deltas may end halfway through JSON when the token budget is
+    # exhausted. Never announce those arguments as a completed function call.
+    completed = not incomplete and valid_function_call_arguments(state.accumulated_text)
     events: list[StreamingResponsesResponse] = []
     is_custom = state.tool_call_name in state.custom_tool_names
     if is_custom:
@@ -1107,7 +1125,7 @@ def emit_simple_tool_call_done(
                 input=state.accumulated_text,
             )
         )
-    elif state.has_emitted_tool_call_delta:
+    elif completed and state.has_emitted_tool_call_delta:
         events.append(
             ResponseFunctionCallArgumentsDoneEvent(
                 type="response.function_call_arguments.done",
@@ -1132,7 +1150,7 @@ def emit_simple_tool_call_done(
             name=state.tool_call_name,
             namespace=state.tool_call_namespace,
             arguments=state.accumulated_text,
-            status="completed",
+            status="completed" if completed else "incomplete",
             id=state.current_item_id,
             call_id=state.tool_call_id,
         )
@@ -1273,8 +1291,12 @@ class SimpleStreamingEventProcessor:
             and self.state.tool_call_index != tool_call.index
         )
 
-    def close_current(self) -> list[StreamingResponsesResponse]:
-        """Close the current state and emit its 'done' event sequence."""
+    def close_current(
+        self, *, incomplete: bool = False
+    ) -> list[StreamingResponsesResponse]:
+        """Close the current item without completing interrupted tool calls."""
+        if self.state.current_state == _StateType.TOOL_CALL:
+            return emit_simple_tool_call_done(self.state, incomplete=incomplete)
         handlers = self._STATE_HANDLERS.get(self.state.current_state)
         if handlers is None:
             return []

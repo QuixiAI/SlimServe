@@ -19,6 +19,7 @@ from openai.types.responses import (
     ResponseStatus,
     response_text_delta_event,
 )
+from openai.types.responses.response_error import ResponseError
 from openai.types.responses.response_output_text import Logprob, LogprobTopLogprob
 from openai.types.responses.tool import Mcp, Tool
 from openai_harmony import Message as OpenAIHarmonyMessage
@@ -65,6 +66,8 @@ from vllm.entrypoints.openai.responses.protocol import (
     OutputTokensDetails,
     ResponseCompletedEvent,
     ResponseCreatedEvent,
+    ResponseFailedEvent,
+    ResponseIncompleteEvent,
     ResponseInProgressEvent,
     ResponseInputOutputItem,
     ResponseInputOutputMessage,
@@ -81,6 +84,7 @@ from vllm.entrypoints.openai.responses.streaming_events import (
     emit_previous_item_done_events,
     emit_tool_action_events,
     split_delta,
+    valid_function_call_arguments,
 )
 from vllm.entrypoints.openai.responses.utils import (
     build_response_output_items,
@@ -875,6 +879,22 @@ class OpenAIServingResponses(GenerateBaseServing):
             assert final_res.prompt_token_ids is not None
             num_tool_output_tokens = 0
 
+        invalid_function_arguments = False
+        for item in output:
+            # Custom tool calls carry freeform input and are deliberately exempt.
+            if item.type == "function_call" and not valid_function_call_arguments(
+                item.arguments
+            ):
+                item.status = "incomplete"
+                invalid_function_arguments = True
+        if invalid_function_arguments and status == "completed":
+            status = "failed"
+        if status == "incomplete" and output and output[-1].type == "function_call":
+            # The last active call was interrupted, even if its current argument
+            # prefix happens to be parseable (for example, a complete object
+            # without the model's closing tool envelope).
+            output[-1].status = "incomplete"
+
         assert isinstance(context, (SimpleContext, HarmonyContext, ParsableContext))
         num_prompt_tokens = context.num_prompt_tokens
         num_generated_tokens = context.num_output_tokens
@@ -934,6 +954,12 @@ class OpenAIServingResponses(GenerateBaseServing):
             kv_transfer_params=context.kv_transfer_params,
             ec_transfer_params=context.ec_transfer_params,
         )
+
+        if invalid_function_arguments and status == "failed":
+            response.error = ResponseError(
+                code="server_error",
+                message="Model generated incomplete or invalid JSON function arguments",
+            )
 
         if request.store:
             async with self.response_store_lock:
@@ -1264,7 +1290,11 @@ class OpenAIServingResponses(GenerateBaseServing):
             while current_index < len(event_deque):
                 event = event_deque[current_index]
                 yield event
-                if getattr(event, "type", "unknown") == "response.completed":
+                if getattr(event, "type", "unknown") in (
+                    "response.completed",
+                    "response.incomplete",
+                    "response.failed",
+                ):
                     return
                 current_index += 1
 
@@ -1345,6 +1375,7 @@ class OpenAIServingResponses(GenerateBaseServing):
         ],
     ) -> AsyncGenerator[StreamingResponsesResponse, None]:
         processor = SimpleStreamingEventProcessor(tools=request.tools)
+        finish_reason = None
 
         hide_stream_metadata = not request.include_reasoning and self.parser is not None
 
@@ -1368,6 +1399,7 @@ class OpenAIServingResponses(GenerateBaseServing):
                 continue
 
             output = ctx.last_output.outputs[0]
+            finish_reason = output.finish_reason
             self._raise_if_error(output.finish_reason, request.request_id)
             delta_text = output.text
             delta_token_ids = as_list(output.token_ids)
@@ -1400,7 +1432,7 @@ class OpenAIServingResponses(GenerateBaseServing):
                 for event in processor.emit_delta(dm, output, _get_logprobs):
                     yield _increment_sequence_number_and_return(event)
 
-        for event in processor.close_current():
+        for event in processor.close_current(incomplete=finish_reason != "stop"):
             yield _increment_sequence_number_and_return(event)
 
     async def _process_harmony_streaming_events(
@@ -1543,9 +1575,21 @@ class OpenAIServingResponses(GenerateBaseServing):
                 request_metadata,
                 created_time=created_time,
             )
+            if isinstance(final_response, ErrorResponse):
+                # A finalization failure must not be serialized as completion.
+                yield final_response
+                return
+            if final_response.status == "cancelled":
+                # Cancellation is exposed through retrieval; Responses defines
+                # no response.cancelled SSE event.
+                return
+            terminal_event = {
+                "incomplete": ResponseIncompleteEvent,
+                "failed": ResponseFailedEvent,
+            }.get(final_response.status, ResponseCompletedEvent)
             yield _increment_sequence_number_and_return(
-                ResponseCompletedEvent(
-                    type="response.completed",
+                terminal_event(
+                    type=f"response.{final_response.status}",
                     sequence_number=-1,
                     response=final_response,
                 )
