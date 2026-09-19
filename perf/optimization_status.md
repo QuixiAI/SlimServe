@@ -26198,3 +26198,14 @@ Phases, by value over risk:
   live server is dominated by noise and competing traffic (110-162 across
   runs today), so the c1 gap is not established. Single-stream decode with
   ignore_eos: 141-187 tok/s.
+
+
+## 2026-09-19 - Add a multi-turn Responses tool protocol benchmark
+
+- Status: retained for review.
+- Baseline: `origin/main`; forward-port from the B70 serving integration.
+- Change: Exercise required inventory-summary tool calls at configurable concurrency and model ID, retain raw events and exact API usage, and fail on missing calls or argument delta/done mismatches.
+- Correctness: CLI help, Ruff and a mock-SSE two-turn call/replay check passed; no fresh live throughput measurement.
+- Results: no new throughput measurement or hardware qualification claimed.
+- Decision: submit as a focused PR; preserve current-main behavior outside this fix.
+- Raw artifacts: local test output; no traffic captures or model data committed.
