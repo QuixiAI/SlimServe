@@ -257,13 +257,6 @@ class XpuMemAllocator:
         allocators = [entry[1] for entry in pool_entries]
         pool_entries.clear()
 
-        xpu_sync = getattr(torch.xpu, "synchronize", None)
-        if callable(xpu_sync):
-            try:
-                xpu_sync()
-            except Exception:
-                logger.debug("torch.xpu.synchronize() failed during release_pools")
-
         # Phase 1: drop MemPool refs while allocators are still strongly held.
         mem_pools.clear()
         gc.collect()

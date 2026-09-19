@@ -114,6 +114,10 @@ class MultiprocExecutor(Executor):
         self._finalizer = weakref.finalize(self, self.shutdown)
         self.is_failed = False
         self.failure_callback: FailureCallback | None = None
+        # This is set as soon as the EngineCore receives a shutdown signal.
+        # It is separate from shutting_down because expected worker exits may
+        # begin before executor cleanup, and cleanup must still run later.
+        self._worker_exit_expected = threading.Event()
 
         tp_size, pp_size, pcp_size = self._get_parallel_sizes()
         assert self.world_size == tp_size * pp_size * pcp_size, (
@@ -291,8 +295,15 @@ class MultiprocExecutor(Executor):
             sentinels = [h.proc.sentinel for h in workers]
             died = multiprocessing.connection.wait(sentinels)
             _self = self_ref()
-            if not _self or getattr(_self, "shutting_down", False):
-                logger.debug("MultiprocWorkerMonitor: shutdown already initiated")
+            expected_exit = (
+                _self is not None
+                and getattr(_self, "_worker_exit_expected", None) is not None
+                and _self._worker_exit_expected.is_set()
+            )
+            if not _self or getattr(_self, "shutting_down", False) or expected_exit:
+                logger.debug(
+                    "MultiprocWorkerMonitor: worker exit expected during shutdown"
+                )
                 return
             _self.is_failed = True
             proc = next(h.proc for h in workers if h.proc.sentinel == died[0])
@@ -321,6 +332,13 @@ class MultiprocExecutor(Executor):
             callback()
         else:
             self.failure_callback = callback
+
+    def notify_shutdown_requested(self) -> None:
+        """Suppress worker-failure handling before cleanup begins."""
+        expected = getattr(self, "_worker_exit_expected", None)
+        if expected is None:
+            expected = self._worker_exit_expected = threading.Event()
+        expected.set()
 
     def execute_model(  # type: ignore[override]
         self, scheduler_output: SchedulerOutput, non_block: bool = False
@@ -420,10 +438,14 @@ class MultiprocExecutor(Executor):
         return future if non_block else future.result()
 
     @staticmethod
-    def _ensure_worker_termination(worker_procs: list[BaseProcess]):
+    def _ensure_worker_termination(
+        worker_procs: list[BaseProcess], timeout: float | None = None
+    ):
         """Ensure that all worker processes are terminated. Assumes workers have
         received termination requests. Waits for processing, then sends
         termination and kill signals if needed."""
+        if timeout is None:
+            timeout = envs.VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS
 
         def wait_for_termination(procs, timeout):
             if not time:
@@ -445,9 +467,7 @@ class MultiprocExecutor(Executor):
             "[shutdown] Executor: waiting for worker exit count=%d",
             initial_count,
         )
-        if wait_for_termination(
-            active_procs(), timeout=envs.VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS
-        ):
+        if wait_for_termination(active_procs(), timeout=timeout):
             logger.info_once("[shutdown] Executor: all workers exited gracefully")
             return
 
@@ -472,23 +492,51 @@ class MultiprocExecutor(Executor):
                 p.kill()
 
     def shutdown(self):
-        """Properly shut down the executor and its workers"""
+        """Properly quiesce and shut down the executor and its workers."""
         if not getattr(self, "shutting_down", False):
             worker_count = len(getattr(self, "workers", None) or [])
             logger.debug(
                 "[shutdown] Executor: start worker_count=%d",
                 worker_count,
             )
+            self.notify_shutdown_requested()
             self.shutting_down = True
 
-            # Make sure all the worker processes are terminated first.
+            shutdown_timeout = envs.VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS
+            deadline = time.monotonic() + shutdown_timeout if time else None
+
+            def remaining_grace() -> float:
+                if deadline is None or not time:
+                    return shutdown_timeout
+                return max(0.0, deadline - time.monotonic())
+
+            # Keep every worker and its process group alive until all ranks
+            # acknowledge that device work is drained. Only then signal the
+            # worker busy loops to exit and begin distributed-state teardown.
             if workers := getattr(self, "workers", None):
+                if (
+                    getattr(self, "rpc_broadcast_mq", None) is not None
+                    and not self.is_failed
+                ):
+                    try:
+                        self.collective_rpc(
+                            "prepare_shutdown", timeout=remaining_grace()
+                        )
+                        logger.info_once("[shutdown] Executor: all workers quiesced")
+                    except Exception:
+                        logger.exception(
+                            "[shutdown] Executor: worker quiesce failed; "
+                            "continuing process teardown"
+                        )
+
                 for w in workers:
-                    # Close death_writer to signal child processes to exit
+                    # Close death_writer to signal child processes to exit.
                     if w.death_writer is not None:
                         w.death_writer.close()
                         w.death_writer = None
-                self._ensure_worker_termination([w.proc for w in workers])
+                self._ensure_worker_termination(
+                    [w.proc for w in workers], timeout=remaining_grace()
+                )
 
                 for w in workers:
                     # Shutdown response queues

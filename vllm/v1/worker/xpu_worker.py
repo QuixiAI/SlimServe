@@ -161,6 +161,65 @@ class XPUWorker(Worker):
             gpu_worker.kernel_warmup = original
             gpu_worker.warmup_kernels = original_v2
 
+    def prepare_shutdown(self) -> None:
+        """Drain this rank while the parent keeps every TP worker alive."""
+        if getattr(self, "_xpu_shutdown_prepared", False):
+            return
+        logger.info(
+            "XPUWorker prepare_shutdown: draining (rank=%s, local_rank=%s)",
+            getattr(self, "rank", "unknown"),
+            getattr(self, "local_rank", "unknown"),
+        )
+        stream = torch.xpu.current_stream(getattr(self, "device", None))
+        stream.synchronize()
+        self._xpu_shutdown_prepared = True
+        logger.info(
+            "XPUWorker prepare_shutdown: done (rank=%s, local_rank=%s)",
+            getattr(self, "rank", "unknown"),
+            getattr(self, "local_rank", "unknown"),
+        )
+
+    def shutdown(self) -> None:
+        """Release XPU resources once device work is collectively drained."""
+        if getattr(self, "_xpu_shutdown_complete", False):
+            return
+        if getattr(self, "_xpu_shutdown_in_progress", False):
+            logger.warning(
+                "XPUWorker shutdown already in progress (rank=%s, local_rank=%s)",
+                getattr(self, "rank", "unknown"),
+                getattr(self, "local_rank", "unknown"),
+            )
+            return
+
+        self._xpu_shutdown_in_progress = True
+        logger.info(
+            "XPUWorker shutdown: cleaning up (rank=%s, local_rank=%s)",
+            getattr(self, "rank", "unknown"),
+            getattr(self, "local_rank", "unknown"),
+        )
+        try:
+            try:
+                super().shutdown()
+            except Exception:
+                logger.exception("XPU base worker shutdown failed")
+
+            try:
+                from vllm.device_allocator.xpumem import XpuMemAllocator
+
+                allocator = XpuMemAllocator.instance
+                if allocator is not None:
+                    allocator.release_pools()
+            except Exception:
+                logger.exception("XPU allocator-pool release failed during shutdown")
+        finally:
+            self._xpu_shutdown_complete = True
+            self._xpu_shutdown_in_progress = False
+            logger.info(
+                "XPUWorker shutdown: done (rank=%s, local_rank=%s)",
+                getattr(self, "rank", "unknown"),
+                getattr(self, "local_rank", "unknown"),
+            )
+
     def profile(self, is_start: bool = True, profile_prefix: str | None = None):
         if self.profiler_config is None or self.profiler_config.profiler is None:
             raise RuntimeError(
