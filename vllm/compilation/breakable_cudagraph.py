@@ -168,8 +168,9 @@ def _xpu_graph_replayer(graph: Any) -> Callable[[], None]:
     ``functools.partial`` (Dynamo asserts on duplicate handler objects).
     (2) Replay is ordered against the eager oneCCL segments around it with a
     current-stream wait before and a graph wait after (the sibling tree
-    measured this as the safe default; ``VLLM_XPU_GRAPH_REPLAY_ORDER``
-    none/lead/trail exist there for A/B and are not wired here yet).
+    measured this as the safe default). ``VLLM_XPU_GRAPH_REPLAY_ORDER`` can
+    independently retain the leading and trailing waits for controlled A/Bs;
+    ``sync`` remains the conservative default.
     """
     import vllm._quixicore_C as qc
 

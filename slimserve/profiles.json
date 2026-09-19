@@ -469,6 +469,336 @@
         },
         "note": "DFlash 2 drafter (Inco AI, 2026-08-18): 5-layer qwen3-classed block-diffusion drafter reading target layers [5, 19, 33, 47, 61], block size 8, with a top-16 path selector (rank-256 bilinear over adjacent candidates) and two-tap dynamic convolutions around every sublayer. Vendor-measured mean acceptance 4.80 at block 8; upstream vLLM launches it as method dflash with num_speculative_tokens 7."
       }
+    },
+    "qwen38-27b-abliterated": {
+      "title": "Huihui-Qwen3.8-27B-abliterated",
+      "modalities": [
+        "text"
+      ],
+      "repo": "huihui-ai/Huihui-Qwen3.8-27B-abliterated",
+      "base_url": "https://huggingface.co/huihui-ai/Huihui-Qwen3.8-27B-abliterated/resolve/main",
+      "local_dir": "Huihui-Qwen3.8-27B-abliterated",
+      "shared_note": "Text only. The repo is tagged image-text-to-text, but this fork's Qwen3_5ForConditionalGeneration is a text-only adaptation (no vision tower), so no projector is fetched.",
+      "speculator": {
+        "repo": "huihui-ai/Huihui-Qwen3.8-27B-abliterated",
+        "base_url": "https://huggingface.co/huihui-ai/Huihui-Qwen3.8-27B-abliterated/resolve/main",
+        "local_dir": "Huihui-Qwen3.8-27B-abliterated",
+        "engine": {
+          "method": "mtp",
+          "num_speculative_tokens": 1,
+          "draft_tensor_parallel_size": 4,
+          "use_local_argmax_reduction": true
+        },
+        "note": "The BF16 checkpoint contains one native Qwen3.5 MTP layer. Depth 1 is the conservative qualification default; the benchmark matrix measures deeper reuse before promotion."
+      },
+      "quants": {
+        "bf16": {
+          "title": "Unquantised bf16 (HF safetensors, 18 shards)",
+          "bytes": 55586059962,
+          "summary": "Full-precision weights. Chosen over NVFP4 because NVFP4 measurably degraded this model's capability on B70 (2026-09-14).",
+          "directory": true,
+          "min_gpus": {
+            "b70": 4
+          },
+          "min_memory_bytes": {},
+          "files": [
+            {
+              "path": ".gitattributes",
+              "bytes": 1570
+            },
+            {
+              "path": "LICENSE",
+              "bytes": 11544
+            },
+            {
+              "path": "README.md",
+              "bytes": 10671
+            },
+            {
+              "path": "chat_template.jinja",
+              "bytes": 8952
+            },
+            {
+              "path": "config.json",
+              "bytes": 4312
+            },
+            {
+              "path": "crc32.txt",
+              "bytes": 238
+            },
+            {
+              "path": "generation_config.json",
+              "bytes": 202
+            },
+            {
+              "path": "merges.txt",
+              "bytes": 3353259
+            },
+            {
+              "path": "model-00001-of-00018.safetensors",
+              "bytes": 3966730520
+            },
+            {
+              "path": "model-00002-of-00018.safetensors",
+              "bytes": 3043080296
+            },
+            {
+              "path": "model-00003-of-00018.safetensors",
+              "bytes": 2542796928
+            },
+            {
+              "path": "model-00004-of-00018.safetensors",
+              "bytes": 3988973120
+            },
+            {
+              "path": "model-00005-of-00018.safetensors",
+              "bytes": 2099339832
+            },
+            {
+              "path": "model-00006-of-00018.safetensors",
+              "bytes": 3979553664
+            },
+            {
+              "path": "model-00007-of-00018.safetensors",
+              "bytes": 2108759312
+            },
+            {
+              "path": "model-00008-of-00018.safetensors",
+              "bytes": 3979553664
+            },
+            {
+              "path": "model-00009-of-00018.safetensors",
+              "bytes": 2108759312
+            },
+            {
+              "path": "model-00010-of-00018.safetensors",
+              "bytes": 3979553664
+            },
+            {
+              "path": "model-00011-of-00018.safetensors",
+              "bytes": 2108759312
+            },
+            {
+              "path": "model-00012-of-00018.safetensors",
+              "bytes": 3979553664
+            },
+            {
+              "path": "model-00013-of-00018.safetensors",
+              "bytes": 2108759312
+            },
+            {
+              "path": "model-00014-of-00018.safetensors",
+              "bytes": 3979553664
+            },
+            {
+              "path": "model-00015-of-00018.safetensors",
+              "bytes": 2108759312
+            },
+            {
+              "path": "model-00016-of-00018.safetensors",
+              "bytes": 3979564008
+            },
+            {
+              "path": "model-00017-of-00018.safetensors",
+              "bytes": 2108759312
+            },
+            {
+              "path": "model-00018-of-00018.safetensors",
+              "bytes": 3392197320
+            },
+            {
+              "path": "model.safetensors.index.json",
+              "bytes": 112216
+            },
+            {
+              "path": "preprocessor_config.json",
+              "bytes": 390
+            },
+            {
+              "path": "tokenizer.json",
+              "bytes": 12809320
+            },
+            {
+              "path": "tokenizer_config.json",
+              "bytes": 17928
+            },
+            {
+              "path": "video_preprocessor_config.json",
+              "bytes": 385
+            },
+            {
+              "path": "vocab.json",
+              "bytes": 6722759
+            }
+          ]
+        }
+      }
+    },
+    "qwen38-27b-uncensored-fp8": {
+      "title": "Qwen3.8-27B-Uncensored-FP8",
+      "modalities": [
+        "text",
+        "image"
+      ],
+      "repo": "orcarouter/Qwen3.8-27B-Uncensored-FP8",
+      "revision": "0f3cdb83820a8190ffedaef5b29cf4a635e49b4d",
+      "base_url": "https://huggingface.co/orcarouter/Qwen3.8-27B-Uncensored-FP8/resolve/0f3cdb83820a8190ffedaef5b29cf4a635e49b4d",
+      "local_dir": "Qwen3.8-27B-Uncensored-FP8",
+      "shared_note": "Native vision-language checkpoint with an MTP head. Linear weights use offline 128x128 block FP8 E4M3 with dynamic activation quantization; excluded modules remain BF16.",
+      "speculator": {
+        "repo": "orcarouter/Qwen3.8-27B-Uncensored-FP8",
+        "revision": "0f3cdb83820a8190ffedaef5b29cf4a635e49b4d",
+        "base_url": "https://huggingface.co/orcarouter/Qwen3.8-27B-Uncensored-FP8/resolve/0f3cdb83820a8190ffedaef5b29cf4a635e49b4d",
+        "local_dir": "Qwen3.8-27B-Uncensored-FP8",
+        "engine": {
+          "method": "mtp",
+          "num_speculative_tokens": 3,
+          "draft_tensor_parallel_size": 4,
+          "use_local_argmax_reduction": true
+        },
+        "note": "The checkpoint contains one native Qwen3.5 MTP layer. The measured k=3 profile reuses it for three draft positions; local argmax avoids a full 248K-vocabulary all-gather for each draft selection."
+      },
+      "quants": {
+        "fp8": {
+          "title": "Native block FP8 E4M3 (HF safetensors, 7 shards)",
+          "bytes": 30890016478,
+          "summary": "Offline 128x128 block-FP8 weights with dynamic FP8 activations. The checkpoint config selects serialized FP8 automatically.",
+          "directory": true,
+          "min_gpus": {
+            "b70": 4
+          },
+          "min_memory_bytes": {},
+          "files": [
+            {
+              "path": ".gitattributes",
+              "bytes": 1570
+            },
+            {
+              "path": "LICENSE",
+              "bytes": 11544
+            },
+            {
+              "path": "README.md",
+              "bytes": 15649
+            },
+            {
+              "path": "chat_template.jinja",
+              "bytes": 8952
+            },
+            {
+              "path": "config.json",
+              "bytes": 51350
+            },
+            {
+              "path": "generation_config.json",
+              "bytes": 202
+            },
+            {
+              "path": "merges.txt",
+              "bytes": 3353259
+            },
+            {
+              "path": "model-00001-of-00007.safetensors",
+              "bytes": 3969317448
+            },
+            {
+              "path": "model-00002-of-00007.safetensors",
+              "bytes": 4939321704
+            },
+            {
+              "path": "model-00003-of-00007.safetensors",
+              "bytes": 4939863424
+            },
+            {
+              "path": "model-00004-of-00007.safetensors",
+              "bytes": 4971328696
+            },
+            {
+              "path": "model-00005-of-00007.safetensors",
+              "bytes": 4955596064
+            },
+            {
+              "path": "model-00006-of-00007.safetensors",
+              "bytes": 4071440632
+            },
+            {
+              "path": "model-00007-of-00007.safetensors",
+              "bytes": 3019999168
+            },
+            {
+              "path": "model.safetensors.index.json",
+              "bytes": 156034
+            },
+            {
+              "path": "preprocessor_config.json",
+              "bytes": 390
+            },
+            {
+              "path": "tokenizer.json",
+              "bytes": 12809320
+            },
+            {
+              "path": "tokenizer_config.json",
+              "bytes": 17928
+            },
+            {
+              "path": "video_preprocessor_config.json",
+              "bytes": 385
+            },
+            {
+              "path": "vocab.json",
+              "bytes": 6722759
+            }
+          ]
+        }
+      },
+      "chat_template_asset": "qwen38_tool_calling.jinja"
+    },
+    "qwen38-hauhau-aggressive-gguf": {
+      "title": "Qwen3.8-27B Uncensored HauhauCS Aggressive GGUF",
+      "modalities": [
+        "text"
+      ],
+      "repo": "HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF",
+      "base_url": "https://huggingface.co/HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF/resolve/main",
+      "local_dir": "Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF",
+      "shared_note": "Aggressive uncensoring variant. The Q8 target preserves its embedded NextN head; the separate FastMTP sidecar needs its trimmed-vocabulary d2t loader before vLLM can use it.",
+      "speculator": {
+        "repo": "HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF",
+        "base_url": "https://huggingface.co/HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF/resolve/main",
+        "local_dir": "Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF",
+        "file": {
+          "path": "Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q8_K_P.gguf",
+          "bytes": 31457990784,
+          "sha256": "4e7735df4d1e2ec721f2551f531b815702a2f89123238c564797eda4b0304bc2"
+        },
+        "engine": {
+          "method": "mtp",
+          "num_speculative_tokens": 1,
+          "quantization": "gguf",
+          "draft_tensor_parallel_size": 4,
+          "use_local_argmax_reduction": true
+        },
+        "note": "Embedded one-layer NextN head. Measured depth 1 is the Q8 throughput default; the target verifies every proposed token."
+      },
+      "quants": {
+        "Q8_K_P": {
+          "title": "HauhauCS Q8_K_P (GGUF)",
+          "bytes": 31457990784,
+          "summary": "HauhauCS model-specific Q8_K_P recipe: Q8_0 text tensors with selected BF16 tensors, including the embedded NextN block.",
+          "min_gpus": {
+            "b70": 4
+          },
+          "min_memory_bytes": {},
+          "files": [
+            {
+              "path": "Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q8_K_P.gguf",
+              "bytes": 31457990784,
+              "sha256": "4e7735df4d1e2ec721f2551f531b815702a2f89123238c564797eda4b0304bc2"
+            }
+          ]
+        }
+      }
     }
   },
   "platforms": {
@@ -1307,7 +1637,8 @@
       },
       "speculative": false,
       "env": {
-        "VLLM_USE_BREAKABLE_CUDAGRAPH": "1"
+        "VLLM_USE_BREAKABLE_CUDAGRAPH": "1",
+        "VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS": "120"
       },
       "notes": [
         "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
@@ -1316,6 +1647,214 @@
         "speculative is false on purpose: 86.7 GB of IQ2_XXS weights split over 4 x 32 GiB leaves ~10 GiB per card for KV, workspace, and graphs; the 6.5 GiB DSpark drafter plus its TurboQuant draft cache does not fit next to a usable context.",
         "max_model_len 65536, max_num_seqs 16, and gpu_memory_utilization 0.92 are provisional first-boot sizing for the ~10 GiB/GPU headroom; qualify KV headroom and re-tune per perf/perf.md before recording a baseline.",
         "PIECEWISE XPU graphs through the breakable capture (VLLM_USE_BREAKABLE_CUDAGRAPH=1, auto-enabled for DSV4): oneCCL collectives are not capturable into SYCL command graphs and the indexer/attention eager-break ops host-sync, so they run as eager segments between graph segments; FULL modes would record them into the graph. Capture sizes cover max_num_seqs 16."
+      ]
+    },
+    "qwen38-huihui-bf16-b70-4": {
+      "title": "Huihui Qwen3.8-27B abliterated BF16 on 4 Intel Arc Pro B70",
+      "source": "qwen38-27b-abliterated",
+      "gpus": 4,
+      "platforms": [
+        "b70"
+      ],
+      "status": "in-progress",
+      "status_reason": "BF16 TP4 qualification hit Xe copy-engine faults",
+      "status_detail": "The checkpoint and native MTP tensor contract validate offline, and eager chat canaries passed, but the first matched benchmark hung. The following graph boot coincided with Xe BCS memory CAT errors and engine resets on two cards, then rank 0 stalled during load. A second reset occurred during teardown. Keep this profile gated until the XPU copy-engine failure is isolated and a clean cold boot, canaries, and matched throughput matrix pass.",
+      "default_quant": "bf16",
+      "summary": "Native BF16 Huihui checkpoint with embedded MTP, TP4 decode graphs, and FP8 E4M3 KV cache; live qualification is gated after Xe copy-engine resets.",
+      "engine": {
+        "tensor_parallel_size": 4,
+        "shutdown_timeout": 120,
+        "max_model_len": 262144,
+        "max_num_seqs": 32,
+        "max_num_batched_tokens": 16384,
+        "gpu_memory_utilization": 0.9,
+        "kv_cache_dtype": "fp8_e4m3",
+        "attention_backend": "FLASH_ATTN",
+        "enable_prefix_caching": true,
+        "compilation_config": {
+          "mode": 0,
+          "cudagraph_mode": "FULL_DECODE_ONLY",
+          "cudagraph_capture_sizes": [
+            2,
+            4,
+            6,
+            8,
+            12,
+            16,
+            20,
+            24,
+            32,
+            40,
+            48,
+            64
+          ]
+        },
+        "enable_auto_tool_choice": true,
+        "tool_call_parser": "qwen3_coder",
+        "reasoning_parser": "qwen3",
+        "served_model_name": "Huihui-Qwen3.8-27B-abliterated-BF16",
+        "override_generation_config": {
+          "thinking_token_budget": 2000
+        }
+      },
+      "speculative": true,
+      "env": {
+        "VLLM_USE_BREAKABLE_CUDAGRAPH": "1",
+        "VLLM_XPU_ENABLE_XPU_GRAPH": "0",
+        "VLLM_XPU_GEMMA_NORM_FUSED": "1",
+        "ZES_ENABLE_SYSMAN": "1",
+        "FI_TCP_IFACE": "lo",
+        "TORCH_FR_BUFFER_SIZE": "0",
+        "TORCHDYNAMO_DISABLE": "1",
+        "CCL_TOPO_FABRIC_VERTEX_CONNECTION_CHECK": "0",
+        "VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS": "120"
+      },
+      "notes": [
+        "All 1,199 checkpoint tensors are BF16; no online weight quantization is enabled.",
+        "The checkpoint index contains the complete native one-layer Qwen3.5 MTP tensor set. Depth 1 is the initial default pending the matched depth sweep.",
+        "FULL_DECODE_ONLY uses the qualified breakable XPU graph backend; VLLM_XPU_ENABLE_XPU_GRAPH=0 avoids the slower legacy graph route.",
+        "FP8 E4M3 KV preserves long-context capacity while keeping the BF16 target and draft weights unchanged.",
+        "The profile supplies a 2000-token thinking default for all reasoning efforts except none; an explicit request budget, including null/-1 for unlimited, takes precedence."
+      ]
+    },
+    "qwen38-abliterated-b70-4": {
+      "title": "Qwen3.8-27B uncensored native FP8 on 4 Intel Arc Pro B70",
+      "source": "qwen38-27b-uncensored-fp8",
+      "gpus": 4,
+      "platforms": [
+        "b70"
+      ],
+      "default_quant": "fp8",
+      "summary": "Native offline 128x128 block-FP8 checkpoint with k=3 native MTP, TP4 XPU block-scaled kernels, decode graphs, and FP8 E4M3 KV cache.",
+      "engine": {
+        "tensor_parallel_size": 4,
+        "linear_backend": "xpu",
+        "max_model_len": 262144,
+        "max_num_seqs": 32,
+        "max_num_batched_tokens": 16384,
+        "gpu_memory_utilization": 0.9,
+        "kv_cache_dtype": "fp8_e4m3",
+        "attention_backend": "FLASH_ATTN",
+        "enable_prefix_caching": true,
+        "compilation_config": {
+          "mode": 0,
+          "cudagraph_mode": "FULL_DECODE_ONLY",
+          "cudagraph_capture_sizes": [
+            4,
+            8,
+            12,
+            16,
+            24,
+            32,
+            40,
+            48,
+            64,
+            80,
+            96,
+            128
+          ]
+        },
+        "enable_auto_tool_choice": true,
+        "tool_call_parser": "qwen3_xml",
+        "reasoning_parser": "qwen3",
+        "served_model_name": "Qwen3.8-27B-Uncensored-FP8",
+        "default_chat_template_kwargs": {
+          "thinking": true,
+          "enable_thinking": true,
+          "reasoning_effort": "low"
+        },
+        "override_generation_config": {
+          "thinking_token_budget": 2000
+        }
+      },
+      "speculative": true,
+      "env": {
+        "VLLM_TRITON_USE_TD": "0",
+        "VLLM_USE_BREAKABLE_CUDAGRAPH": "1",
+        "VLLM_XPU_ENABLE_XPU_GRAPH": "0",
+        "VLLM_XPU_GEMMA_NORM_FUSED": "1",
+        "ZES_ENABLE_SYSMAN": "1",
+        "FI_TCP_IFACE": "lo",
+        "TORCH_FR_BUFFER_SIZE": "0",
+        "TORCHDYNAMO_DISABLE": "1",
+        "CCL_TOPO_FABRIC_VERTEX_CONNECTION_CHECK": "0",
+        "VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS": "120",
+        "VLLM_XPU_GRAPH_REPLAY_ORDER": "trail",
+        "VLLM_XPU_TRITON_ATTN_NUM_PAR_SOFTMAX_SEGMENTS": "16"
+      },
+      "notes": [
+        "Disable Triton tensor descriptors on B70: the repaired attention path passed ragged-tail reference tests, and the 2026-09-19 local c8 tool workload measured 97.8 tok/s with descriptors versus 205.5 tok/s without. See perf/optimization_status.md for scope and raw evidence.",
+        "The checkpoint is serialized offline FP8; do not add --quantization fp8, which is reserved here for online conversion of BF16 weights.",
+        "linear_backend=xpu selects XPUFp8BlockScaledMMKernel for the checkpoint 128x128 block scales; benchmark triton as the small-batch fallback.",
+        "FULL_DECODE_ONLY breakable graphs with VLLM_XPU_ENABLE_XPU_GRAPH=0 were validated on TP4 and improved aggregate output throughput at concurrency 1, 8, and 32; keep this mode.",
+        "Native MTP k=3 uses token-width-aware graph sizes; its matched baseline peaked at 72.4, 219.2, and 321.4 aggregate output tok/s for concurrency 1, 8, and 32. The real CVE workload is the promotion gate.",
+        "FP8 E4M3 KV uses weight savings for cache capacity; the checkpoint has no calibrated KV scales, so vLLM uses 1.0.",
+        "The source repository is gated. Fully present local files skip fetching; automatic repair requires an authenticated Hugging Face fetch path.",
+        "The profile supplies a 2000-token thinking default for all reasoning efforts except none; an explicit request budget, including null/-1 for unlimited, takes precedence.",
+        "The 2026-09-19 local c8 workload passed, but subsequent live traffic stalled with sample_tokens RPC timeout. Long-running stability remains unqualified; see docs/deployment/qwen38-b70.md."
+      ]
+    },
+    "qwen38-hauhau-q8-b70-4": {
+      "title": "HauhauCS Qwen3.8-27B Aggressive Q8_K_P on 4 Intel Arc Pro B70",
+      "source": "qwen38-hauhau-aggressive-gguf",
+      "gpus": 4,
+      "platforms": [
+        "b70"
+      ],
+      "default_quant": "Q8_K_P",
+      "summary": "Q8_K_P GGUF target with its embedded NextN MTP head at measured depth 1 and decode graphs on TP4 XPU.",
+      "engine": {
+        "tensor_parallel_size": 4,
+        "quantization": "gguf",
+        "max_model_len": 262144,
+        "max_num_seqs": 32,
+        "max_num_batched_tokens": 16384,
+        "gpu_memory_utilization": 0.9,
+        "kv_cache_dtype": "fp8_e4m3",
+        "attention_backend": "FLASH_ATTN",
+        "enable_prefix_caching": true,
+        "compilation_config": {
+          "mode": 0,
+          "cudagraph_mode": "FULL_DECODE_ONLY",
+          "cudagraph_capture_sizes": [
+            2,
+            4,
+            6,
+            8,
+            12,
+            16,
+            20,
+            24,
+            32,
+            40,
+            48,
+            64
+          ]
+        },
+        "enable_auto_tool_choice": true,
+        "tool_call_parser": "qwen3_coder",
+        "reasoning_parser": "qwen3",
+        "served_model_name": "Qwen3.8-27B-HauhauCS-Aggressive-Q8_K_P",
+        "override_generation_config": {
+          "thinking_token_budget": 2000
+        }
+      },
+      "speculative": true,
+      "env": {
+        "VLLM_USE_BREAKABLE_CUDAGRAPH": "1",
+        "VLLM_XPU_ENABLE_XPU_GRAPH": "0",
+        "ZES_ENABLE_SYSMAN": "1",
+        "FI_TCP_IFACE": "lo",
+        "TORCHDYNAMO_DISABLE": "1",
+        "CCL_TOPO_FABRIC_VERTEX_CONNECTION_CHECK": "0",
+        "VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS": "120"
+      },
+      "notes": [
+        "The Qwen3.5 GGUF adapter maps the appended block as a native Qwen3_5MTP draft while leaving it excluded from the target backbone.",
+        "Embedded MTP defaults to measured depth 1; it beat depth 2 at concurrency 8 and 32 while tying at concurrency 1.",
+        "The FastMTP-32K sidecar is not selected here: its full-vocabulary embedding plus trimmed 32K output head and d2t map need a dedicated vLLM draft model contract.",
+        "FULL_DECODE_ONLY breakable graphs with k=1 verification-width capture sizes improve single-stream throughput while preserving concurrent throughput and MTP acceptance.",
+        "The profile supplies a 2000-token thinking default for all reasoning efforts except none; an explicit request budget, including null/-1 for unlimited, takes precedence."
       ]
     }
   }

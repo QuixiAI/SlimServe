@@ -88,10 +88,13 @@ def test_no_spec_cli_flag_disables_the_resolved_speculator(monkeypatch):
     assert "speculative_config" not in engine_kwargs(seen[0])
 
 
-def test_every_profile_source_names_a_blessed_dspark_download():
+def test_every_speculative_profile_source_names_a_blessed_download():
     sources = registry._registry()["sources"]
     for profile_id in registry.profile_ids():
-        speculator = sources[registry.describe(profile_id)["source"]]["speculator"]
+        profile = registry.describe(profile_id)
+        if not profile["speculative"]:
+            continue
+        speculator = sources[profile["source"]]["speculator"]
         assert speculator.get("base_url", "https://huggingface.co/").startswith(
             "https://huggingface.co/"
         )
@@ -293,6 +296,9 @@ def test_registry_contains_only_the_supported_model_artifacts():
         "dsv4-flash",
         "muse-glimmer",
         "qwen38-27b",
+        "qwen38-27b-abliterated",
+        "qwen38-27b-uncensored-fp8",
+        "qwen38-hauhau-aggressive-gguf",
     }
     glm = data["sources"]["glm52-vision"]
     kimi = data["sources"]["kimi-k3"]
@@ -599,7 +605,17 @@ def test_profiles_use_their_validated_graph_mode():
                 _big_enough(profile_id, platform),
             ).engine
             cudagraph_mode = engine.get("compilation_config", {}).get("cudagraph_mode")
-            if profile_id.startswith("dsv4-") and platform in ("a100", "b70"):
+            if profile_id == "qwen38-hauhau-q8-b70-4":
+                # Native GGUF Q8 + embedded MTP qualified FULL_DECODE_ONLY
+                # breakable graphs on TP4.
+                assert cudagraph_mode == "FULL_DECODE_ONLY", profile_id
+            elif profile_id in (
+                "qwen38-abliterated-b70-4",
+                "qwen38-huihui-bf16-b70-4",
+            ):
+                # Qwen3.8 HF checkpoints use FULL_DECODE_ONLY XPU breakable graphs on TP4.
+                assert cudagraph_mode == "FULL_DECODE_ONLY", profile_id
+            elif profile_id.startswith("dsv4-") and platform in ("a100", "b70"):
                 assert cudagraph_mode in ("PIECEWISE", "FULL_DECODE_ONLY"), profile_id
             elif (
                 profile_id.startswith("dsv4-")
@@ -705,3 +721,78 @@ def test_b70_dsv4_profile_is_tp4_without_a_drafter():
     assert "speculative_config" not in engine_kwargs(plan)
     with pytest.raises(ProfileError):
         resolve("dsv4-xxs-b70-4", "b70", 2, None)
+
+
+def test_qwen38_native_mtp_uses_measured_tp4_depth_and_graph_sizes():
+    plan = resolve("qwen38-abliterated-b70-4", "b70", 4, None)
+    speculative = engine_kwargs(plan)["speculative_config"]
+    assert speculative["model"] == str(plan.entry_file)
+    assert speculative["method"] == "mtp"
+    assert speculative["num_speculative_tokens"] == 3
+    assert speculative["draft_tensor_parallel_size"] == 4
+    assert speculative["use_local_argmax_reduction"] is True
+    assert "CCL_SYCL_ALLREDUCE_LL" not in plan.env
+    assert plan.engine["compilation_config"] == {
+        "mode": 0,
+        "cudagraph_mode": "FULL_DECODE_ONLY",
+        "cudagraph_capture_sizes": [
+            4, 8, 12, 16, 24, 32, 40, 48, 64, 80, 96, 128
+        ],
+    }
+
+
+def test_qwen38_hauhau_q8_uses_embedded_mtp_cold_profile():
+    plan = resolve("qwen38-hauhau-q8-b70-4", "b70", 4, None)
+    speculative = engine_kwargs(plan)["speculative_config"]
+
+    assert plan.speculative is True
+    assert speculative["model"].endswith(
+        "/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF/"
+        "Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q8_K_P.gguf"
+    )
+    assert speculative["method"] == "mtp"
+    assert speculative["num_speculative_tokens"] == 1
+    assert speculative["quantization"] == "gguf"
+    assert speculative["draft_tensor_parallel_size"] == 4
+    assert speculative["use_local_argmax_reduction"] is True
+    assert plan.engine["compilation_config"] == {
+        "mode": 0,
+        "cudagraph_mode": "FULL_DECODE_ONLY",
+        "cudagraph_capture_sizes": [
+            2, 4, 6, 8, 12, 16, 20, 24, 32, 40, 48, 64
+        ],
+    }
+    assert plan.env["VLLM_USE_BREAKABLE_CUDAGRAPH"] == "1"
+    assert plan.env["VLLM_XPU_ENABLE_XPU_GRAPH"] == "0"
+    assert plan.env["TORCHDYNAMO_DISABLE"] == "1"
+
+
+def test_qwen38_huihui_bf16_uses_native_mtp_and_fp8_kv():
+    plan = resolve("qwen38-huihui-bf16-b70-4", "b70", 4, None)
+    speculative = engine_kwargs(plan)["speculative_config"]
+
+    assert plan.quant.name == "bf16"
+    assert plan.entry_file == (
+        registry.cache_root() / "Huihui-Qwen3.8-27B-abliterated"
+    )
+    assert "quantization" not in plan.engine
+    assert plan.engine["kv_cache_dtype"] == "fp8_e4m3"
+    assert plan.engine["shutdown_timeout"] == 120
+    assert engine_kwargs(plan)["shutdown_timeout"] == 120
+    assert speculative == {
+        "model": str(plan.entry_file),
+        "method": "mtp",
+        "num_speculative_tokens": 1,
+        "draft_tensor_parallel_size": 4,
+        "use_local_argmax_reduction": True,
+    }
+    assert plan.engine["compilation_config"] == {
+        "mode": 0,
+        "cudagraph_mode": "FULL_DECODE_ONLY",
+        "cudagraph_capture_sizes": [
+            2, 4, 6, 8, 12, 16, 20, 24, 32, 40, 48, 64
+        ],
+    }
+    assert plan.env["VLLM_USE_BREAKABLE_CUDAGRAPH"] == "1"
+    assert plan.env["VLLM_XPU_ENABLE_XPU_GRAPH"] == "0"
+    assert plan.env["TORCHDYNAMO_DISABLE"] == "1"

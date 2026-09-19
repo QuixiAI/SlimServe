@@ -116,6 +116,8 @@ class ChatParams:
                 default_chat_template_kwargs,
                 self.chat_template_kwargs,
             ),
+            tool_choice=self.tool_choice,
+            response_format=self.response_format,
             media_io_kwargs=merge_media_io_kwargs(
                 default_media_io_kwargs,
                 self.media_io_kwargs,
@@ -129,10 +131,28 @@ class ChatParams:
 
     def get_apply_chat_template_kwargs(self) -> dict[str, Any]:
         """The arguments to pass to `tokenizer.apply_chat_template`."""
-        return merge_kwargs(
+        kwargs = merge_kwargs(
             self.chat_template_kwargs,
             dict(chat_template=self.chat_template, return_dict=False),
         )
+        # Request metadata wins over caller-supplied template kwargs so a
+        # request cannot weaken its enforced tool policy. Templates that do
+        # not declare these variables filter them out before rendering.
+        if self.tool_choice is not None:
+            model_dump = getattr(self.tool_choice, "model_dump", None)
+            kwargs["tool_choice"] = (
+                model_dump(mode="json", exclude_none=True)
+                if callable(model_dump)
+                else self.tool_choice
+            )
+        if self.response_format is not None:
+            model_dump = getattr(self.response_format, "model_dump", None)
+            kwargs["response_format"] = (
+                model_dump(mode="json", exclude_none=True)
+                if callable(model_dump)
+                else self.response_format
+            )
+        return kwargs
 
 
 @dataclass(frozen=True)

@@ -20,6 +20,7 @@ from typing import Any
 from slimserve.term import human_bytes
 
 REGISTRY_PATH = Path(__file__).with_name("profiles.json")
+CHAT_TEMPLATE_DIR = Path(__file__).with_name("chat_templates")
 
 
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -103,6 +104,9 @@ class Quant:
     min_gpus: dict[str, int]
     min_memory_bytes: dict[str, int]
     assembly: dict[str, Any] | None
+    # HF-format checkpoint: sharded safetensors + config/tokenizer, loaded from
+    # the directory rather than a single entry file. GGUF quants leave this off.
+    directory: bool = False
 
     def requirement(self, platform: str) -> int | None:
         """The gating figure for this platform: GPU count or bytes of memory."""
@@ -146,7 +150,19 @@ class Plan:
         """The path handed to the engine as --model."""
         if self.quant.assembly:
             return self.model_dir / self.quant.assembly["output"]
+        if self.quant.directory:
+            # HF-format checkpoints are loaded from the directory, not a single
+            # entry file. GGUF quants name one file (or an assembly output);
+            # these name none, and the `files` list exists purely so the fetcher
+            # can verify and repair them.
+            return self.model_dir
         return self.model_dir / self.quant.files[0]["path"]
+
+    @property
+    def chat_template_file(self) -> Path | None:
+        """Checked-in chat template selected by the model source."""
+        asset = self.source.get("chat_template_asset")
+        return CHAT_TEMPLATE_DIR / asset if asset else None
 
 
 class ProfileError(Exception):
@@ -172,6 +188,7 @@ def _quant(source: dict[str, Any], name: str) -> Quant:
         min_gpus=raw["min_gpus"],
         min_memory_bytes=raw.get("min_memory_bytes") or {},
         assembly=raw.get("assembly"),
+        directory=bool(raw.get("directory", False)),
     )
 
 
@@ -315,6 +332,11 @@ def resolve(
     # platform. A profile sets these keys itself only to opt out.
     for key, value in _SERVING_DEFAULTS.items():
         merged["engine"].setdefault(key, copy.deepcopy(value))
+
+    if template_asset := source.get("chat_template_asset"):
+        merged["engine"].setdefault(
+            "chat_template", str(CHAT_TEMPLATE_DIR / template_asset)
+        )
 
     return Plan(
         profile_id=profile_id,
