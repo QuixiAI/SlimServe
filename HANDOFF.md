@@ -160,6 +160,12 @@ by default (QC_FP8_GATED=1): the shared experts' side stream is not the
 decode critical path. Rule confirmed twice today: a bandwidth kernel's
 dependent-launch trigger goes AFTER its main loop, or the dependent's
 CTAs squat on the SMs while it streams (P9 29.3 -> 24.8 us, P15 217 -> 226).
+Measured launch floor (notebook "The launch floor of this card"): 0.76 us
+per dependent kernel inside a CUDA graph, so the ~1100 launches of a c1
+step are ~0.84 ms of pure dispatch latency (19 % of the step; the same
+absolute at c8/c16). That, plus each kernel's 1-3 us of prologue and
+tail, is the ~2 ms between the record and its physics floor and the
+target of the layer-level fusion design.
 
 <!--
 The campaign handoffs in this file cover different

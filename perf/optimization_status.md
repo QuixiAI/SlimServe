@@ -30808,3 +30808,15 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   (median 289), c8 821.3 799.1 833.3 832.7 (827), c16 1159.3 1137.0 1127.7
   1149.0 (1143) - inside their draws. Default set to off in
   DeepseekV2MLP._fp8_gated_enabled (QC_FP8_GATED=1 enables).
+
+- THE LAUNCH FLOOR OF THIS CARD (2026-09-18 17:50 PDT, `$S/p8/bench_launch_floor.py`):
+  a CUDA graph of N dependent tiny kernels (an 8-element in-place add)
+  replays at 0.76 us per launch at N = 256 / 1024 / 2048 (195 / 777 / 1551
+  us per replay; eager launches cost 4.0 us each on the host). The c1 step
+  is ~1100 launches: ~0.84 ms of the 4.4 ms step is dispatch and
+  dependency latency alone, before each kernel's own prologue and tail
+  (1-3 us for the real ones), and the same ~0.8 ms sits in every c8/c16
+  step. Against the ~2.1 ms gap between the c1 step and its physics floor
+  (bytes at the card's rate + the PCIe all-reduce floor ~ 2.3 ms), that is
+  the number a layer-level fusion (far fewer launches per layer) can
+  recover; no kernel on the existing boundaries can.
