@@ -26198,3 +26198,14 @@ Phases, by value over risk:
   live server is dominated by noise and competing traffic (110-162 across
   runs today), so the c1 gap is not established. Single-stream decode with
   ignore_eos: 141-187 tok/s.
+
+
+## 2026-09-19 - Emit stable Qwen tool arguments when each call closes
+
+- Status: retained for review.
+- Baseline: `origin/main`; forward-port from the B70 serving integration.
+- Change: Avoid emitting JSON prefixes invalidated by repeated XML parameter names; retain incremental tool headers and custom-tool conversion.
+- Correctness: 39 argument-prefix tests passed; 17 existing custom-tool tests passed and four GLM tests failed identically on untouched main with local XGrammar 0.2.7.
+- Results: no new throughput measurement or hardware qualification claimed.
+- Decision: submit as a focused PR; preserve current-main behavior outside this fix.
+- Raw artifacts: local test output; no traffic captures or model data committed.
