@@ -28,7 +28,7 @@ git worktree add ../SlimServe-b70-review origin/feat/b70-qwen38-serving
 | `e26bf185f3` | Mask ragged tensor-descriptor tails in Triton attention | `review/b70-07-attention` | `review/b70-06-tool-protocol` |
 | `a76a5b0746` | Register reproducible Qwen3.8 B70 profiles and tool template | `review/b70-08-profiles` | `review/b70-07-attention` |
 
-The final documentation/benchmark commit follows the profile commit. Each
+The initial documentation/benchmark commit follows the profile commit. Each
 numbered review branch contains the preceding stack. Opening a PR against its
 immediate predecessor shows only that logical change. Merging these directly
 into a different codebase still requires a forward port; no conflict-free claim
@@ -71,3 +71,67 @@ Native SYCL code was not rebuilt or numerically requalified during this pass.
 The source base's working tree and staged index were preserved. The unrelated
 local edit removing commit-authorship guidance from CLAUDE.md is intentionally
 not part of this stack.
+
+## Follow-up correctness commits
+
+All of these are on the published integration branch; each is independently
+cherry-pickable with the existing protocol/profile dependencies above.
+
+| Commit | Change | Review head | Review base |
+| --- | --- | --- | --- |
+| `aae9efe33` | Empty/multipart assistant history and refusal handling | `review/b70-10-assistant-history` | `review/b70-09-deployment-evidence` |
+| `12856ae2a` | Typed generation-error SSE and background failure storage | `review/b70-11-stream-errors` | `review/b70-10-assistant-history` |
+| `88ebacda1` | Stable Qwen argument JSON emitted at tool-call closure | `review/b70-12-qwen-arguments` | `review/b70-11-stream-errors` |
+| `811839379` | Canonical streamed items retained in terminal Responses | `review/b70-13-response-parity` | `review/b70-12-qwen-arguments` |
+
+The fourth review diff also contains an intervening handoff documentation commit.
+Cherry-pick the listed source commit alone when preparing a source-only PR.
+Further protocol receipts and validation are documented in
+[qwen38-b70-protocol-followup.md](qwen38-b70-protocol-followup.md).
+
+### Chat-template precedent
+
+The Qwen template/profile/package integration follows merged
+[PR #33](https://github.com/QuixiAI/SlimServe/pull/33), commit `6fb5ac23a`,
+which followed GLM compatibility [PR #32](https://github.com/QuixiAI/SlimServe/pull/32).
+The Qwen-specific asset is checked in, included in package data, selected through
+`chat_template_asset`, and receives authoritative request-level tool choice.
+It renders required/named/none/auto policy, explicit strictness guidance, reasoning
+effort, and thinking enable/disable using Qwen's native ChatML/XML tokens.
+It does not copy GLM's model-specific default of disabling thinking for tool calls.
+Six existing Qwen template policy/history tests passed during the follow-up audit;
+startup logs confirm the live profile loads this asset.
+
+### Pull and prepare a PR elsewhere
+
+```bash
+git fetch origin feat/b70-qwen38-serving 'refs/heads/review/b70-*:refs/remotes/origin/review/b70-*'
+git switch -c b70-review origin/feat/b70-qwen38-serving
+git log --oneline origin/review/b70-base..HEAD
+```
+
+Use the saved base to review only this stack. To target current `main`, create a
+new branch there and forward-port selected commits with their prerequisites;
+do not merge the entire historical branch and its unrelated base history.
+The live source remains in its original dirty checkout; the isolated review
+checkout is the source of commits. The original unrelated CLAUDE.md edit stays
+outside this stack. Generated binaries, model weights, credentials, local service
+secrets, and raw traffic are excluded.
+
+### Diagnostic tooling and latest validation
+
+`review/b70-14-serving-diagnostics` packages the optional proxy and compact audit
+scripts under `tools/serving_diagnostics/`; see its README for portable commands.
+No captures or credentials are included. Its 19 CPU fixture tests passed.
+The current integration head also includes this guide and profile-note updates.
+
+The 2026-09-19 audit compared every modified/untracked live source file with this
+review checkout: 61 matched byte-for-byte and none was absent. Remaining differences
+were the documented profile-scoped budgets/shutdown/replay settings, bounded
+semantic-prefix refinement and tests, newer Responses test fixtures, added notebook
+notes, and the deliberately excluded unrelated CLAUDE.md edit.
+
+Post-fix capture snapshot: 34 completed Responses, 63 paired tool calls, zero item-ID,
+call-ID, argument, or status mismatches and zero HTTP errors. Four other streams
+lacked terminal events and one failed; the full coding evaluation remains ongoing.
+This is evidence for the protocol fixes, not full correctness/soak qualification.

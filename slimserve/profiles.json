@@ -1787,7 +1787,7 @@
         "The checkpoint is serialized offline FP8; do not add --quantization fp8, which is reserved here for online conversion of BF16 weights.",
         "linear_backend=xpu selects XPUFp8BlockScaledMMKernel for the checkpoint 128x128 block scales; benchmark triton as the small-batch fallback.",
         "FULL_DECODE_ONLY breakable graphs with VLLM_XPU_ENABLE_XPU_GRAPH=0 were validated on TP4 and improved aggregate output throughput at concurrency 1, 8, and 32; keep this mode.",
-        "Native MTP k=3 uses token-width-aware graph sizes; its matched baseline peaked at 72.4, 219.2, and 321.4 aggregate output tok/s for concurrency 1, 8, and 32. The real CVE workload is the promotion gate.",
+        "Native MTP k=3 uses token-width-aware graph sizes; its matched baseline peaked at 72.4, 219.2, and 321.4 aggregate output tok/s for concurrency 1, 8, and 32. The full coding evaluation is the current promotion gate; earlier synthetic measurements are not a correctness qualification.",
         "FP8 E4M3 KV uses weight savings for cache capacity; the checkpoint has no calibrated KV scales, so vLLM uses 1.0.",
         "The source repository is gated. Fully present local files skip fetching; automatic repair requires an authenticated Hugging Face fetch path.",
         "The profile supplies a 2000-token thinking default for all reasoning efforts except none; an explicit request budget, including null/-1 for unlimited, takes precedence.",
