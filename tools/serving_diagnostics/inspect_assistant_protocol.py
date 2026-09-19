@@ -224,9 +224,49 @@ def inspect_record(record):
         if key.lower() in {"content-type", "content-encoding"}
     }
     response["body_chars"] = len(body) if isinstance(body, str) else None
-    # The proxy currently records only total request elapsed time, not chunk
-    # arrival times. Never infer TTFT from an SSE sequence number or count.
+    # Older records lack timing. Transport chunks are not model-token events;
+    # never infer token latency from an SSE sequence number or byte count.
     response["first_chunk_ms"] = record.get("first_chunk_ms")
+    transport = {}
+    for key in (
+        "upstream_headers_ms",
+        "last_chunk_ms",
+        "downstream_disconnect_ms",
+        "downstream_send_error_ms",
+        "upstream_chunks_received",
+        "upstream_bytes_received",
+        "downstream_chunks_sent",
+        "downstream_bytes_sent",
+        "downstream_complete",
+        "downstream_disconnect",
+        "cancelled",
+    ):
+        if key in record:
+            value = record[key]
+            transport[key] = value if isinstance(value, (int, float, bool)) else None
+    for key, allowed in (
+        (
+            "termination_reason",
+            {
+                "complete",
+                "upstream_error",
+                "downstream_disconnect",
+                "downstream_send_error",
+                "cancelled",
+                "asgi_error",
+                "interrupted",
+                "client_abandoned_input",
+            },
+        ),
+        ("upstream_state", {"not_started", "streaming", "eof", "cancelled", "error"}),
+    ):
+        if key in record:
+            value = record[key]
+            transport[key] = (
+                value if isinstance(value, str) and value in allowed else "other"
+            )
+    if transport:
+        response["transport"] = transport
     stream = isinstance(body, str) and (
         any(
             "text/event-stream" in str(value)
