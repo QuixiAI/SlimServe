@@ -530,8 +530,16 @@ class SpeculativeConfig:
             hf_config.update(
                 {"n_predict": n_predict, "architectures": ["Exaone4_5_MTP"]}
             )
-        if hf_config.model_type in ("qwen3_5", "qwen3_5_moe"):
-            is_moe = hf_config.model_type == "qwen3_5_moe"
+        if hf_config.model_type in (
+            "qwen3_5",
+            "qwen3_5_moe",
+            "qwen3_5_text",
+            "qwen3_5_moe_text",
+        ):
+            # GGUF text-only checkpoints build the text config directly,
+            # while HF multimodal checkpoints wrap it in qwen3_5. Both carry
+            # the same embedded MTP layout.
+            is_moe = hf_config.model_type in ("qwen3_5_moe", "qwen3_5_moe_text")
             hf_config.model_type = "qwen3_5_mtp"
             n_predict = getattr(hf_config, "mtp_num_hidden_layers", None)
             hf_config.update(
