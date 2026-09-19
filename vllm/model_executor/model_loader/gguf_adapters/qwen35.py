@@ -144,6 +144,14 @@ def _vision_linear_modules(depth: int) -> list[str]:
     return names
 
 
+_MTP_EXTRA_RENAMES = {
+    "nextn.eh_proj.weight": "fc.weight",
+    "nextn.enorm.weight": "pre_fc_norm_embedding.weight",
+    "nextn.hnorm.weight": "pre_fc_norm_hidden.weight",
+    "nextn.shared_head_norm.weight": "norm.weight",
+}
+
+
 def _untile_v_head_axis(
     tensor: torch.Tensor,
     *,
@@ -199,11 +207,36 @@ class Qwen35GGUFAdapter(GGUFWeightsAdapter):
         # The config was built from this same GGUF; nothing to patch.
         return hf_config
 
+    @staticmethod
+    def _is_mtp_model(model_config: ModelConfig) -> bool:
+        config = model_config.hf_config
+        architectures = getattr(config, "architectures", None) or []
+        return (
+            getattr(config, "model_type", None) == "qwen3_5_mtp"
+            or "Qwen3_5MTP" in architectures
+            or "Qwen3_5MoeMTP" in architectures
+        )
+
     def build_name_map(self, model_config: ModelConfig) -> dict[str, str]:
         config = model_config.hf_config
         text_config = (
             config.get_text_config() if hasattr(config, "get_text_config") else config
         )
+        if self._is_mtp_model(model_config):
+            # The appended GGUF block is numbered after the target backbone,
+            # while Qwen3_5MTP numbers its compact draft layers from zero.
+            mtp_idx = int(text_config.num_hidden_layers)
+            name_map = {
+                "token_embd.weight": "model.embed_tokens.weight",
+                "output.weight": "lm_head.weight",
+            }
+            per_layer = {**_COMMON_BLK_RENAMES, **_FULL_ATTN_BLK_RENAMES}
+            for gguf_part, hf_part in per_layer.items():
+                name_map[f"blk.{mtp_idx}.{gguf_part}"] = f"mtp.layers.0.{hf_part}"
+            for gguf_part, hf_part in _MTP_EXTRA_RENAMES.items():
+                name_map[f"blk.{mtp_idx}.{gguf_part}"] = f"mtp.{hf_part}"
+            return name_map
+
         # When the mmproj was found the config is the composite
         # Qwen3_5ForConditionalGeneration; the text half lives under
         # `language_model.` (Muse-Glimmer pattern).

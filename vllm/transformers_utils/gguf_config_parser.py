@@ -13,6 +13,7 @@ nothing at the metadata level. Standalone DSpark drafts use the `dflash` or
 `dflash-draft` schemas and carry no tokenizer vocabulary.
 """
 
+import copy
 from pathlib import Path
 
 from transformers import PretrainedConfig
@@ -99,4 +100,9 @@ class GGUFConfigParser(ConfigParserBase):
             config = build_qwen35_config_from_gguf(str(model))
         else:
             raise ValueError(f"Unsupported GGUF architecture: {architecture}")
+        # GGUF config builders cache the expensive metadata-derived config.
+        # ModelConfig applies HF overrides in place after parsing; embedded
+        # draft construction therefore must not receive the same mutable
+        # object as the already-live target ModelConfig.
+        config = copy.deepcopy(config)
         return config.to_dict(), config

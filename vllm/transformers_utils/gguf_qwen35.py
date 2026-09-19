@@ -197,6 +197,10 @@ def build_qwen35_config_from_gguf(gguf_path: str) -> Any:
     cfg.attn_output_gate = True
     cfg.output_gate_type = "swish"
     cfg.mamba_ssm_dtype = "float32"
+    # Preserve the appended NextN depth for SpeculativeConfig's MTP rewrite.
+    # The target loader still exposes only ``num_layers`` backbone blocks;
+    # the draft loader uses this value to instantiate the appended block(s).
+    cfg.mtp_num_hidden_layers = nextn
     cfg.architectures = ["Qwen3_5ForCausalLM"]
     # llama.cpp's converter (conversion/qwen.py,
     # _LinearAttentionVReorderBase) reorders every per-V-head GDN tensor
