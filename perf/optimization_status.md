@@ -26198,3 +26198,14 @@ Phases, by value over risk:
   live server is dominated by noise and competing traffic (110-162 across
   runs today), so the c1 gap is not established. Single-stream decode with
   ignore_eos: 141-187 tok/s.
+
+
+## 2026-09-19 - Mask unwritten tensor-descriptor tails before attention accumulation
+
+- Status: retained for review.
+- Baseline: `origin/main`; forward-port from the B70 serving integration.
+- Change: Zero invalid logical-prefix K/V positions after descriptor loads so unwritten NaNs cannot contaminate attention through zero-times-NaN products.
+- Correctness: Ruff passed; all eight XPU numerical regression cases collected and skipped locally because no XPU is available. No native/GPU requalification.
+- Results: no new throughput measurement or hardware qualification claimed.
+- Decision: submit as a focused PR; preserve current-main behavior outside this fix.
+- Raw artifacts: local test output; no traffic captures or model data committed.

@@ -464,6 +464,16 @@ def kernel_unified_attention(
                 HEAD_SIZE,
                 HEAD_SIZE_PADDED,
             )
+            # Descriptors bound loads by the allocated page, not the logical
+            # sequence prefix. Unwritten tail slots can hold NaN; masking only
+            # the scores still lets 0 * NaN poison the P @ V accumulation.
+            # Match the pointer path's masked loads and preserve FP8/BF16 dtype.
+            K_load = tl.where(
+                tile_mask[None, :], K_load, tl.full((), 0, K_load.dtype)
+            )
+            V_load = tl.where(
+                tile_mask[:, None], V_load, tl.full((), 0, V_load.dtype)
+            )
         else:
             v_offset = (
                 physical_block_idx[:, None] * stride_v_cache_0
