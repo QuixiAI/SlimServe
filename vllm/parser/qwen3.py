@@ -207,7 +207,11 @@ def qwen3_config(
         },
         arg_converter=_qwen3_arg_converter,
         custom_tool_arg_converter=_qwen3_custom_input,
-        stream_arg_deltas=True,
+        # XML parameter names may repeat, including under the non-strict
+        # grammar. Conversion keeps the last value, so an earlier JSON
+        # prefix is not stable. Emit arguments once the call closes; tool
+        # headers, reasoning, and normal content still stream incrementally.
+        stream_arg_deltas=False,
         strip_trailing_reasoning_whitespace=False,
         tool_args_json=False,
     )
