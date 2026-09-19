@@ -407,6 +407,14 @@ class Scheduler(SchedulerInterface):
             if self.mamba_partial_cache_hit
             else 0
         )
+        semantic_stop = min(
+            (
+                boundary // block_size * block_size
+                for boundary in request.semantic_cache_boundaries
+                if start < boundary // block_size * block_size < end
+            ),
+            default=0,
+        )
         stops = (
             # Resumed mid-block (fine-grained partial hash hit): re-align to
             # the block grid before running on, so the crossed boundary's
@@ -427,6 +435,10 @@ class Scheduler(SchedulerInterface):
             start + (request.shared_prefix_boundary - start) // block_size * block_size
             if start < request.shared_prefix_boundary < end
             else 0,
+            # Renderer-proven chat message/content-part boundary, floored to
+            # the previous materializable KDA block state. Ending the chunk
+            # here makes that recurrent state observable as a checkpoint.
+            semantic_stop,
         )
         # Stop at the earliest mandatory position strictly inside the chunk.
         end = min((s for s in stops if start < s < end), default=end)

@@ -95,6 +95,14 @@ class _PromptOptions(TypedDict):
     Optional cache salt to be used for prefix caching.
     """
 
+    semantic_cache_boundaries: NotRequired[list[int]]
+    """Exact token offsets immediately after chat messages/content parts.
+
+    These offsets are renderer-produced hints.  The engine validates them
+    against the final tokenized prompt before using them as recurrent-state
+    checkpoint locations.
+    """
+
 
 class TextPrompt(_PromptOptions):
     """Schema for a text prompt."""

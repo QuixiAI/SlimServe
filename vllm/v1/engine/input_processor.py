@@ -317,6 +317,26 @@ class InputProcessor:
             prompt_embeds = None
             prompt_is_token_ids = None
 
+        prompt_len = length_from_prompt_token_ids_or_embeds(
+            prompt_token_ids, prompt_embeds
+        )
+        raw_semantic_boundaries = decoder_inputs.get("semantic_cache_boundaries")
+        semantic_cache_boundaries = None
+        if raw_semantic_boundaries:
+            # Renderer hints cross an IPC/API boundary.  Normalize here so a
+            # malformed custom EngineInput cannot steer chunking backwards or
+            # outside the actual processed prompt (especially after truncation
+            # or multimodal placeholder expansion).
+            semantic_cache_boundaries = sorted(
+                {
+                    boundary
+                    for boundary in raw_semantic_boundaries
+                    if isinstance(boundary, int)
+                    and not isinstance(boundary, bool)
+                    and 0 < boundary <= prompt_len
+                }
+            )
+
         sampling_params = None
         pooling_params = None
         if isinstance(params, SamplingParams):
@@ -381,6 +401,7 @@ class InputProcessor:
             prompt_token_ids=prompt_token_ids,
             prompt_embeds=prompt_embeds,
             prompt_is_token_ids=prompt_is_token_ids,
+            semantic_cache_boundaries=semantic_cache_boundaries,
             mm_features=mm_features,
             sampling_params=sampling_params,
             pooling_params=pooling_params,
