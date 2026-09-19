@@ -786,6 +786,7 @@ class OpenAIServingResponses(GenerateBaseServing):
         tokenizer: TokenizerLike,
         request_metadata: RequestResponseMetadata,
         created_time: int | None = None,
+        streamed_output: list[ResponseOutputItem] | None = None,
     ) -> ErrorResponse | ResponsesResponse:
         if created_time is None:
             created_time = int(time.time())
@@ -862,12 +863,21 @@ class OpenAIServingResponses(GenerateBaseServing):
             # Check if generation was stopped due to max_tokens
             if final_output.finish_reason == "length":
                 status = "incomplete"
+            elif final_output.finish_reason == "abort":
+                status = "cancelled"
 
-            output = self._make_response_output_items(
-                request,
-                final_output,
-                tokenizer,
-                parser=context.response_parser,
+            # The stream already assigned call IDs and serialized arguments.
+            # Reparsing can replace an incomplete streamed call with different,
+            # apparently valid JSON. Its finalized items are authoritative.
+            output = (
+                streamed_output
+                if streamed_output is not None
+                else self._make_response_output_items(
+                    request,
+                    final_output,
+                    tokenizer,
+                    parser=context.response_parser,
+                )
             )
 
             if request.enable_response_messages:
@@ -881,8 +891,9 @@ class OpenAIServingResponses(GenerateBaseServing):
         invalid_function_arguments = False
         for item in output:
             # Custom tool calls carry freeform input and are deliberately exempt.
-            if item.type == "function_call" and not valid_function_call_arguments(
-                item.arguments
+            if item.type == "function_call" and (
+                not valid_function_call_arguments(item.arguments)
+                or (streamed_output is not None and item.status == "incomplete")
             ):
                 item.status = "incomplete"
                 invalid_function_arguments = True
@@ -902,7 +913,12 @@ class OpenAIServingResponses(GenerateBaseServing):
         )
         if missing_required_tool_call:
             status = "failed"
-        if status == "incomplete" and output and output[-1].type == "function_call":
+        if (
+            streamed_output is None
+            and status == "incomplete"
+            and output
+            and output[-1].type == "function_call"
+        ):
             # The last active call was interrupted, even if its current argument
             # prefix happens to be parseable (for example, a complete object
             # without the model's closing tool envelope).
@@ -1582,6 +1598,9 @@ class OpenAIServingResponses(GenerateBaseServing):
                 )
             )
 
+            streamed_output: list[ResponseOutputItem] | None = (
+                [] if isinstance(context, SimpleContext) else None
+            )
             try:
                 async for event_data in processor(
                     request,
@@ -1594,6 +1613,11 @@ class OpenAIServingResponses(GenerateBaseServing):
                     created_time,
                     _increment_sequence_number_and_return,
                 ):
+                    if (
+                        streamed_output is not None
+                        and event_data.type == "response.output_item.done"
+                    ):
+                        streamed_output.append(event_data.item)
                     yield event_data
             except GenerationError as e:
                 yield await failed_event(str(e))
@@ -1615,6 +1639,7 @@ class OpenAIServingResponses(GenerateBaseServing):
                     tokenizer,
                     request_metadata,
                     created_time=created_time,
+                    streamed_output=streamed_output,
                 )
             except GenerationError as e:
                 yield await failed_event(str(e))
