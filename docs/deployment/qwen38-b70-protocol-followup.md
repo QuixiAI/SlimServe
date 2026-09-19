@@ -18,8 +18,9 @@ after restart at approximately 22:13 UTC. FP8, TP4, MTP k=3, and the profile's
   streamed value; the final-prefix guard silently discarded the suffix, leaving
   invalid JSON. This fix retains last-value semantics and incremental reasoning,
   content, and headers, but defers partial argument previews. 158 CPU tests passed.
-  Committed in the review checkout ONLY; not applied to live or restarted yet.
-  Connection of this reproduced bug to the original HTTP400 is still unproven.
+  Applied to live source for the restart requested at 22:33:13 UTC.
+  Duplicate XML remains a synthetic reproduction; the captured inconsistency
+  below is independently established.
 
 The live benign regression replayed an assistant message with content=[] and
 requested a required tool call: HTTP200, completed, one JSON-object argument.
@@ -79,8 +80,63 @@ deltas; KV use; preemptions; prefix-cache hits/queries; speculative acceptance;
 queue/prefill/decode durations. Treat server interval TPS as diagnostic only.
 Separate resumed-attempt counters from inherited usage/sample errors.
 
-Next: finish observing attempt 2, then apply only the Qwen parser commit to live
-and restart in a coordinated window. Validate it through the same coding load,
-compare malformed JSON/terminal failures and exact-token performance, and trace
-the shared cancellation boundary if it recurs. Do not restart/relaunch a run
-merely because the local agent turn ends. Credentials and payloads stay out of Git.
+## Confirmed live failure and follow-up fix
+
+Later capture inspection proved the HTTP400 chain. A streamed call carried invalid
+20-character arguments, with output_item.done correctly marked incomplete and no
+arguments.done. The terminal response nevertheless claimed completed, rebuilding
+that call with different item/call IDs and valid empty-object arguments. The next
+request replayed the original invalid arguments, labeled completed, and received
+HTTP400. Thus the stream/final server mismatch is proven independently of the
+synthetic repeated-XML test.
+
+All 85 paired tool calls in the initial attempt-2 identity audit regenerated IDs;
+three additionally changed incomplete arguments/status into completed calls.
+`811839379` makes finalized streamed items authoritative for SimpleContext terminal
+output, preserving IDs, arguments, order, status, and stored retrieval. It removes
+the second full parse. Invalid/incomplete calls fail on normal stop; token exhaustion
+remains incomplete and cancellation remains cancelled. 221 CPU tests passed across
+the relevant parser/Responses suite, including real parser-to-SSE parity, multiple
+calls, truncation, storage, and cancellation. These counts overlap earlier suites.
+
+Both this fix and Qwen argument buffering were applied to live source. Backend
+restart requested 2026-09-19T22:33:13.650769Z; proxy remained on8000. Treat the
+restart as a hard measurement boundary, excluding downtime from comparisons and
+handling the generation-token counter reset. The initial failed-attempt snapshots
+above are historical; consult the updated report for current counts.
+
+No concatenated `{...}{...}` argument bodies were found in the audited window:
+98 assembled streams, 90 item-done arguments, and 193 replayed assistant argument
+strings (overlapping representations). This is bounded absence evidence, not proof
+that the earlier duplication bug can never recur.
+
+Additional local evidence:
+
+- ~/qwen38-deploy/code-agent-errors-20260919/STREAM-FINAL-REPLAY-FINDINGS.md
+- ~/qwen38-deploy/code-agent-errors-20260919/replay-json400-correlation.json
+- ~/qwen38-deploy/code-agent-errors-20260919/stream-final-identity-attempt2.json
+- ~/qwen38-deploy/code-agent-errors-20260919/concatenated-json-audit.json
+- ~/qwen38-deploy/code-agent-errors-20260919/canonical-stream-restart.json
+- ~/qwen38-deploy/code-agent-errors-20260919/check_stream_replay.py
+- ~/qwen38-deploy/traffic-proxy/audit_stream_final_identity.py
+
+The identity auditor and compact inspectors have 19 passing fixture tests. They
+print protocol metadata and fingerprints, not payload text.
+
+Next: validate after startup through the same coding load, compare malformed JSON,
+identity/status consistency, terminal failures, and exact-token performance. Trace
+the shared cancellation boundary if it recurs. Do not restart/relaunch a run merely
+because the local agent turn ends. Credentials and payloads stay out of Git.
+
+## Live deployment validation
+
+Backend API PID1156825 reached proxy health200 at 2026-09-19T22:36:35.504300Z.
+At22:36:52.590944Z the bounded stream/replay regression passed: exact equality of
+all streamed item-done objects and terminal output, one valid completed tool call,
+and HTTP200/completed when replaying those same items into the next request.
+
+Attempt2's circuit breaker interrupted it23.23s after the restart request, with
+84calls/44successful/40failed and no scored tasks. Those maintenance failures are
+not post-fix correctness measurements. Resume was requested only after health and
+the live replay regression passed, retaining the existing coding run/artifacts.
+The full workload is still required to qualify the fixes and any throughput claim.
