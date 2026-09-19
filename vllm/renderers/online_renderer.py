@@ -60,32 +60,57 @@ _TEXT_ONLY_CONTENT_PARTS = frozenset(
 
 
 def _semantic_message_prefixes(messages: list[Any]) -> list[list[Any]]:
-    """Build safe chat prefixes ending at message/content-part boundaries.
+    """Build at most sixteen recent text-only semantic prefix candidates.
 
-    Whole-message boundaries are always eligible. Content-part boundaries
-    are emitted only when every part of that message is textual; replaying a
-    truncated image/audio message merely to discover an offset would repeat
-    media I/O and can change multimodal placeholder expansion.
+    Select boundaries before copying history, keeping discovery linear in the
+    input size and copying at most sixteen prefixes. Multimodal histories are
+    deliberately excluded: even a whole-message replay repeats media I/O and
+    placeholder expansion. They retain the existing ordinary prefix cache.
     """
-    prefixes: list[list[Any]] = []
-    for message_idx, message in enumerate(messages):
+    first_user = None
+    for index, message in enumerate(messages):
         if not isinstance(message, dict):
             continue
+        if first_user is None and message.get("role") == "user":
+            first_user = index
         content = message.get("content")
-        if isinstance(content, list) and len(content) > 1 and all(
-            isinstance(part, dict)
-            and part.get("type") in _TEXT_ONLY_CONTENT_PARTS
+        if isinstance(content, list) and not all(
+            isinstance(part, dict) and part.get("type") in _TEXT_ONLY_CONTENT_PARTS
             for part in content
         ):
-            for part_end in range(1, len(content)):
-                partial = deepcopy(message)
-                partial["content"] = deepcopy(content[:part_end])
-                prefixes.append(deepcopy(messages[:message_idx]) + [partial])
-        prefixes.append(deepcopy(messages[: message_idx + 1]))
+            return []
 
-    # Very long content arrays must not turn rendering into unbounded
-    # quadratic CPU work. Deepest boundaries have the highest restore value.
-    return prefixes[-_SEMANTIC_BOUNDARY_MAX_CANDIDATES:]
+    # Some templates reject system/developer-only conversations. Every
+    # selected candidate must contain a user message to be renderable.
+    if first_user is None:
+        return []
+
+    candidates: list[tuple[int, int | None]] = []
+    for message_idx in range(len(messages) - 1, first_user - 1, -1):
+        message = messages[message_idx]
+        if not isinstance(message, dict):
+            continue
+        candidates.append((message_idx, None))
+        if len(candidates) == _SEMANTIC_BOUNDARY_MAX_CANDIDATES:
+            break
+        content = message.get("content")
+        if isinstance(content, list):
+            for part_end in range(len(content) - 1, 0, -1):
+                candidates.append((message_idx, part_end))
+                if len(candidates) == _SEMANTIC_BOUNDARY_MAX_CANDIDATES:
+                    break
+        if len(candidates) == _SEMANTIC_BOUNDARY_MAX_CANDIDATES:
+            break
+
+    prefixes: list[list[Any]] = []
+    for message_idx, part_end in reversed(candidates):
+        prefix = messages[: message_idx + 1]
+        if part_end is not None:
+            partial = dict(messages[message_idx])
+            partial["content"] = partial["content"][:part_end]
+            prefix[-1] = partial
+        prefixes.append(deepcopy(prefix))
+    return prefixes
 
 
 def _common_token_prefix_len(left: Sequence[int], right: Sequence[int]) -> int:

@@ -26179,3 +26179,14 @@ Phases, by value over risk:
   leg engines 3.63/3.65 avg running (was 2.71/4.63), restores 9.6K (was
   20.1K), recall 112/112 (was 105/106), turns 704 (was 671); 2048 leg
   3.46/3.50, migrated=0 in both. Commit d6af7171b.
+
+
+## 2026-09-19 - Bound semantic checkpoint copies before rendering history
+
+- Status: retained for review.
+- Baseline: `origin/feat/semantic-cache`; forward-port from the B70 serving integration.
+- Change: Choose at most 16 recent text boundaries before deep copying and skip multimodal replay and system-only prefixes; preserve the complete checkpoint hint pipeline from PR #34.
+- Correctness: 17 boundary and checkpoint IPC/scheduler tests passed on CPU.
+- Results: no new throughput measurement or hardware qualification claimed.
+- Decision: submit as a focused PR; preserve current-main behavior outside this fix.
+- Raw artifacts: local test output; no traffic captures or model data committed.
