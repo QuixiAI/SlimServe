@@ -43,3 +43,15 @@ def test_apple_probe_falls_back_to_sysconf_when_sysctl_is_sandboxed(monkeypatch)
         count=1,
         memory_bytes=128 * 1024**3,
     )
+
+
+def test_xpu_smi_probe_detects_b70s(monkeypatch):
+    row = "| 0         | Device Name: Intel(R) Arc(TM) Pro B70 Graphics    |\n"
+
+    def fake_run(*args, **kwargs):
+        return SimpleNamespace(returncode=0, stdout=row * 4)
+
+    monkeypatch.setattr(hardware.subprocess, "run", fake_run)
+
+    assert hardware._probe_intel_xpu() == ("Intel(R) Arc(TM) Pro B70 Graphics", 4)
+    assert hardware._classify("Intel(R) Arc(TM) Pro B70 Graphics") == "b70"
