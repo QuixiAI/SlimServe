@@ -888,6 +888,20 @@ class OpenAIServingResponses(GenerateBaseServing):
                 invalid_function_arguments = True
         if invalid_function_arguments and status == "completed":
             status = "failed"
+        # SimpleContext cannot execute built-in tools internally, so a required
+        # call must be present in the returned items. Other contexts may have
+        # already executed a built-in call before producing their final answer.
+        missing_required_tool_call = (
+            status == "completed"
+            and isinstance(context, SimpleContext)
+            and sampling_params.structured_outputs is not None
+            and sampling_params.structured_outputs._required_tool_call
+            and not any(
+                item.type in ("function_call", "custom_tool_call") for item in output
+            )
+        )
+        if missing_required_tool_call:
+            status = "failed"
         if status == "incomplete" and output and output[-1].type == "function_call":
             # The last active call was interrupted, even if its current argument
             # prefix happens to be parseable (for example, a complete object
@@ -958,6 +972,11 @@ class OpenAIServingResponses(GenerateBaseServing):
             response.error = ResponseError(
                 code="server_error",
                 message="Model generated incomplete or invalid JSON function arguments",
+            )
+        elif missing_required_tool_call:
+            response.error = ResponseError(
+                code="server_error",
+                message="Model completed without the required tool call",
             )
 
         if request.store:

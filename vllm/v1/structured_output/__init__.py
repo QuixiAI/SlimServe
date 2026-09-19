@@ -280,6 +280,7 @@ class StructuredOutputManager:
         # masks for each request, one for each possible bonus token position.
         # These are stored inline in the tensor and unpacked by the gpu runner.
         cumulative_index = 0
+        reasoning_stop_rows: list[tuple[int, set[int]]] = []
 
         # Optimized parallel filling of bitmasks for
         # non-spec, large-batch-size cases
@@ -299,7 +300,15 @@ class StructuredOutputManager:
                     assert isinstance(grammar, StructuredOutputGrammar)
 
                 apply_bitmask = self.should_fill_bitmask(request)
+                required_tool = structured_output_request.params._required_tool_call
+                stop_ids = (
+                    request.sampling_params.all_stop_token_ids
+                    if required_tool and request.sampling_params is not None
+                    else set()
+                )
                 batch.append((grammar, cumulative_index, apply_bitmask))
+                if not apply_bitmask and stop_ids:
+                    reasoning_stop_rows.append((cumulative_index, stop_ids))
                 if len(batch) == self.fill_bitmask_parallel_batch_size:
                     promises.append(self._async_submit_fill_bitmask(batch))
                     batch = []
@@ -323,6 +332,12 @@ class StructuredOutputManager:
                 if TYPE_CHECKING:
                     assert isinstance(grammar, StructuredOutputGrammar)
                 apply_bitmask = self.should_fill_bitmask(request)
+                required_tool = structured_output_request.params._required_tool_call
+                stop_ids = (
+                    request.sampling_params.all_stop_token_ids
+                    if required_tool and request.sampling_params is not None
+                    else set()
+                )
 
                 reasoner = self._get_reasoner(request)
                 detect_reasoning_end = (
@@ -338,6 +353,8 @@ class StructuredOutputManager:
                 req_tokens = scheduled_spec_decode_tokens.get(req_id, ())
                 for i, token in enumerate(req_tokens):
                     self._fill_bitmasks(((grammar, cumulative_index, apply_bitmask),))
+                    if not apply_bitmask and stop_ids:
+                        reasoning_stop_rows.append((cumulative_index, stop_ids))
                     advance_grammar = apply_bitmask
                     if token == -1:
                         apply_bitmask = False
@@ -387,6 +404,8 @@ class StructuredOutputManager:
                     #   should_advance.
                     bonus_apply = self.should_fill_bitmask(request) or apply_bitmask
                     self._fill_bitmasks(((grammar, cumulative_index, bonus_apply),))
+                    if not bonus_apply and stop_ids:
+                        reasoning_stop_rows.append((cumulative_index, stop_ids))
                     cumulative_index += 1
                 if state_advancements > 0:
                     grammar.rollback(state_advancements)
@@ -401,7 +420,18 @@ class StructuredOutputManager:
         assert self._apply_rows is not None
         # Copied because the backing buffer is reused on the next step.
         apply_rows = self._apply_rows[:cumulative_index].copy()
-        return bitmask_tensor.numpy(), apply_rows
+        bitmask_array = bitmask_tensor.numpy()
+        # Required calls may reason freely, but cannot stop before the tool
+        # grammar becomes active. Mark these rows for the worker to apply even
+        # though their masks were initially filled as unrestricted reasoning.
+        for row, stop_ids in reasoning_stop_rows:
+            for token in stop_ids:
+                word, bit = divmod(token, 32)
+                if 0 <= word < bitmask_array.shape[1]:
+                    clear_bit = 0x7FFFFFFF if bit == 31 else ~(1 << bit)
+                    bitmask_array[row, word] &= clear_bit
+                    apply_rows[row] = True
+        return bitmask_array, apply_rows
 
     def should_fill_bitmask(self, request: "Request") -> bool:
         # NOTE (Hanchen) if enable_in_reasoning is True, it means that
