@@ -409,6 +409,7 @@ def test_registry_contains_only_the_supported_model_artifacts():
         "glm53f-nvfp4",
         "glm53f-gguf",
         "qwen38-27b-uncensored-fp8",
+        "qwen38-hauhau-aggressive-gguf",
     }
     glm = data["sources"]["glm52-vision"]
     kimi = data["sources"]["kimi-k3"]
