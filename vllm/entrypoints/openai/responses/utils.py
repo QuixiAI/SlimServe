@@ -205,13 +205,12 @@ def construct_input_messages(
         for output_item in prev_response_output:
             # NOTE: We skip the reasoning output.
             if isinstance(output_item, ResponseOutputMessage):
-                for content in output_item.content:
-                    messages.append(
-                        {
-                            "role": "assistant",
-                            "content": content.text,
-                        }
-                    )
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": _response_output_message_text(output_item),
+                    }
+                )
             elif isinstance(output_item, ResponseCustomToolCall):
                 messages.append(
                     _construct_message_from_response_item(output_item)  # type: ignore[arg-type]
@@ -243,6 +242,18 @@ def construct_chat_messages_with_tool_call(
             messages.append(message)
 
     return messages
+
+
+def _response_output_message_text(item: ResponseOutputMessage) -> str:
+    """Preserve every text/refusal part, including a valid empty message.
+
+    Refusal text belongs in the assistant's history just like visible output
+    text. Concatenation preserves part order without inventing separators.
+    """
+    return "".join(
+        part.text if isinstance(part, ResponseOutputText) else part.refusal
+        for part in item.content
+    )
 
 
 def _construct_message_from_response_item(
@@ -335,7 +346,7 @@ def _construct_message_from_response_item(
             "reasoning": reasoning,
         }
     elif isinstance(item, ResponseOutputMessage):
-        output_text = item.content[0].text
+        output_text = _response_output_message_text(item)
         if prev_assistant_msg:
             previous_content = prev_assistant_msg.get("content")
             if previous_content is None:
