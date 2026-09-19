@@ -5184,3 +5184,84 @@ fastest measured. It does drop full-length concurrency to 6.31x against
 max_num_seqs=32, so a workload that actually fills 256k contexts on many
 concurrent requests would preempt; TurboQuant KV is the lever there and is
 untested here.
+
+## Huihui BF16 TP4 qualification blocked by Xe resets (2026-09-18 23:35 EDT)
+
+The third downloaded Qwen3.8 configuration is complete at
+`/home/alex/models/Huihui-Qwen3.8-27B-abliterated`: 18/18 safetensor shards,
+55,562,855,904 indexed bytes, and 1,199 tensors, all BF16. Its config declares
+`mtp_num_hidden_layers=1`, and the index contains all 15 expected native
+`mtp.*` tensors (fusion projection, three norms, and the full layer-0 attention
+and MLP). This matches the fork's `Qwen3_5MTP` loader contract.
+
+A dedicated `qwen38-huihui-bf16-b70-4` profile now records TP4, unquantized BF16
+weights, FP8 E4M3 KV, `FULL_DECODE_ONLY` breakable graphs, and native embedded
+MTP k=1. It is intentionally gated as `in-progress` after the live failure below.
+The profile resolves offline and the focused suite passes 52/52 tests.
+
+The eager/no-MTP arm reached API readiness and passed all five deterministic
+chat canaries (`Paris`, `391`, exact phrase, JSON, and prime list). The matched
+742-input/128-output benchmark then hung in its first rung warmup before emitting
+any valid c1/c8/c32 result. The engine logged `No available shared memory
+broadcast block found in 60 seconds` once per minute for more than four minutes.
+The zero-byte `eager-nospec-bench.log` therefore means no valid throughput row
+exists; it is not a missing successful result.
+
+The graph/no-MTP cold boot was aborted. At 23:23:02 the Xe driver logged the same
+faulted address (`0x000080abffcc4000`) on PCI devices `0000:0d:00.0` and
+`0000:95:00.0`; 0d reported a BCS engine memory CAT error and 95 reset its BCS
+engine. During the subsequent boot, ranks 1-3 loaded 12.78 GiB each and reached
+KV sizing, while rank 0 remained CPU-spinning before load completion and the API
+never became ready. Teardown caused another BCS reset on 0d at 23:31:42. No MTP
+depth arms were attempted after this hardware/runtime failure.
+
+All four B70 devices remained visible to PyTorch after teardown. The promoted
+Q8 service was restored once and is healthy on port 8001: all four ResidentLab
+ranks report `ok: true`, chat canaries pass 5/5, FP8 KV capacity is 1,255,871
+tokens, and its restored MTP counters were 31 accepted of 32 proposed tokens.
+The kernel log after Q8 start at 23:32:20 contains no further Xe CAT/reset event.
+
+Artifacts: `/home/alex/qwen38-deploy/bf16-qualification-20260918-231558/`.
+The concise driver receipt is `kernel-xe-faults-concise.log`; eager liveness and
+graph rank-0 evidence are in `eager-nospec-engine-before-stop.log` and
+`graph-nospec-boot1-rank0-spin.log`. Do not retry BF16 until the copy-engine
+failure is isolated and a clean boot can complete without a driver reset.
+
+
+## 2026-09-19 — Qwen3.8 FP8 B70 tool correctness and attention TD selection
+
+- Status: retained; final deployment verification recorded in the linked handoff.
+- Working tree: `c6d985940` plus preserved existing local changes.
+- Scope: `qwen38-abliterated-b70-4`, OrcaRouter native block-128 FP8, four Intel Arc Pro B70, TP4, FP8 E4M3 KV, MTP k=3, FULL_DECODE_ONLY, 2,000-token thinking cap. Profile command: `.venv/bin/python -m slimserve.cli qwen38-abliterated-b70-4 --serve --host 127.0.0.1 --port 8001 --yes`; public capture proxy remains on 8000.
+- Hardware/runtime: driver 1.15.39122+14, kernel 7.0.0-31-generic, PyTorch 2.15.0.dev20260815+xpu, Xeon 654, 36 logical CPUs, 124 GiB host RAM. Clocks/power were not locked.
+- Baseline: repaired `kernel_unified_attention` with `VLLM_TRITON_USE_TD=1`, 16 softmax segments. The original unrepaired TD-on run failed a tool round and is excluded from speed comparisons.
+- Hypothesis: pointer loads improve the B70 long-context draft-attention path. Isolated c8/12K and 16K kernel times were 3.620/4.959 ms with TD vs 2.619/3.490 ms without. Segment counts 4/8/32/64, tile32, and warps2/8 regressed; retain 16 segments and default launch geometry.
+- Kernel correctness fix: TD K/V loads respected allocation bounds but not the logical prefix; NaN tail slots contaminated P@V through 0*NaN. Mask invalid loaded K/V to typed zero. Eight ragged finite/poisoned-padding TD-on/off qlen1/4 tests pass CPU FP32 reference (atol .003, rtol .02). This proves the defect, not that it caused every historic generation failure.
+- Protocol fixes: non-strict tool calls use generic JSON-object grammar; only explicit strict:true keeps the declared schema. Required/named calls mask early reasoning stop tokens, including speculative rows. Responses report incomplete/failed for truncation/malformed or missing required calls, without a repair loop. Qwen initial thinking spans now count toward reasoning usage. Incompatible assistant structured output plus tool grammar returns HTTP400 instead of silently dropping a constraint; plain text options remain supported.
+- Workload: benign local inventory, 240 records, ~10,176 first-input tokens and ~11K follow-ups, c8, two required tool rounds, strict unset, greedy seed17, max_output_tokens3072. Endpoint `/v1/responses`, streaming. This is not an external Evalhub/CVE result.
+- Measurement: restart before each arm, one full cold/warm-up workload excluded, then one measured warm TD-on run and two measured warm TD-off runs. First warm runs logged zero JIT warnings or engine errors. TPS = exact reported output tokens / full workload wall time, including reasoning. Requests are identical; generated text/token counts vary. One baseline warm sample limits uncertainty estimates; this is not a FLOPs-ceiling or all-workload claim.
+
+| Run | Output tokens | Wall seconds | Output tok/s | Correctness |
+|---|---:|---:|---:|---|
+| td-on-fixed-c8 | 19414 | 305.63 | 63.52 | 16/16, 0 errors |
+| td-on-fixed-warm-c8 | 21510 | 219.83 | 97.85 | 16/16, 0 errors |
+| td-off-fixed-c8 | 19672 | 137.20 | 143.38 | 16/16, 0 errors |
+| td-off-fixed-warm-c8 | 18748 | 91.21 | 205.54 | 16/16, 0 errors |
+| td-off-fixed-warm-repeat-c8 | 20341 | 97.03 | 209.63 | 16/16, 0 errors |
+
+- Results: warm TD-off 205.54–209.63 tok/s vs TD-on 97.85 tok/s (2.10–2.14x). All five repaired runs completed 16/16 rounds; exact-window capture audits found no malformed completed arguments, required-call omissions, or streaming delta/done mismatches.
+- Validation: original integrated CPU suite 133 passed; final review subset 81 passed including 22 new conflict tests; profile suite 52 passed after promotion. These counts overlap and must not be summed. Eight GPU attention tests passed. Final live results are linked below.
+- Decision: retain `VLLM_TRITON_USE_TD=0` only in this B70 profile; remove the temporary `80-attention-ab.conf` override. Keep the existing 16-segment override, target FLASH_ATTN route, MTP depth, quantization, and thinking budget. Source fixes remain uncommitted with the preserved worktree.
+- Raw artifacts: `perf/results/2026-09-19/qwen-tool-throughput/` (JSON, exact-window audits, warm JIT/error logs); `qwen38-attention-isolation/` (kernel measurements/reference tests); `qwen-required-correctness/` (six live checks). Run `benchmarks/benchmark_qwen_tool_protocol.py --concurrency 8 --turns 2 --records 240 --output <path>` using `.venv/bin/python`.
+- Handoff and monitor counters: `/home/alex/qwen38-deploy/HANDOFF-2026-09-19-CORRECTNESS-THROUGHPUT.md`. No matching new Xe reset/PCIe faults in the inspected A/B kernel-log window.
+
+
+## 2026-09-19 — B70 review packaging and live stability regression
+
+- Status: source/profile review stack prepared; long-running stability remains unqualified.
+- Source: tested c6d985940 plus dirty-worktree changes preserved in feat/b70-qwen38-serving. Original checkout/index unchanged; isolated review checkout adds bounded semantic-prefix copying, skips multimodal prefix replay, and scopes the 2K thinking/shutdown defaults to registered profiles.
+- Portability: profile now records graph replay trail and16 attention segments previously set by systemd drop-ins. Package includes the tool template and authenticated Hugging Face fetching, but not credentials or checkpoint data.
+- Correctness: 28 hardware/model CPU contract tests and61 profile/fetch/template tests passed on isolated source. Combined protocol/budget/cache validation:173 CPU tests passed (262 across the three non-overlapping commands); details in review guide. Native Q8 tests are dispatch mocks, not fresh numerical GPU validation.
+- Live regression: eight active requests stopped progressing at16:11:39 EDT, then sample_tokens RPC timed out16:16:38; KV13.18%, no preemptions or contemporaneous Xe/PCIe/AER faults. Thus the earlier local c8 benchmark is not a soak qualification.
+- Recovery: first restart stalled rank3 before model loading at a scalar tensor creation; Python/native stacks showed Intel Level Zero event wait. After stopping device users, a targeted Xe GT0 reset on PCIaa:00.0 restored all4 ranks and health at16:33. Root cause is unresolved; no automatic reset loop was added.
+- Artifacts: docs/deployment/qwen38-b70{,-review-stack}.md; local incident receipts /home/alex/qwen38-deploy/live-throughput-20260919/. No raw traffic or automation credentials are committed.
