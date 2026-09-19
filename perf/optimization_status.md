@@ -26198,3 +26198,14 @@ Phases, by value over risk:
   live server is dominated by noise and competing traffic (110-162 across
   runs today), so the c1 gap is not established. Single-stream decode with
   ignore_eos: 141-187 tok/s.
+
+
+## 2026-09-19 - Restore grouped GDN head layout when loading Qwen GGUF
+
+- Status: retained for review.
+- Baseline: `origin/main`; forward-port from the B70 serving integration.
+- Change: Untile per-value-head tensors and packed Q8 columns before tensor-parallel slicing, preserving current-main vision loading and independent quantization-type shard metadata.
+- Correctness: Eight CPU quantized-layout and fused-shard tests passed; live model parity remains unqualified.
+- Results: no new throughput measurement or hardware qualification claimed.
+- Decision: submit as a focused PR; preserve current-main behavior outside this fix.
+- Raw artifacts: local test output; no traffic captures or model data committed.

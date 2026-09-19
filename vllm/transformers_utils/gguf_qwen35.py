@@ -204,10 +204,11 @@ def build_qwen35_config_from_gguf(gguf_path: str) -> Any:
     # channels, out_proj columns) from HF grouped order
     # [G0v0 G0v1 G0v2, G1v0, ...] to ggml tiled-broadcast order
     # [G0v0 G1v0 ... G15v0, G0v1, ...] whenever num_k_heads != num_v_heads.
-    # The layout is self-consistent, but the q/k -> v-head pairing becomes
-    # i_k = i_hv % num_k_heads (tile) instead of HF's
-    # i_k = i_hv // (num_v_heads // num_k_heads) (repeat_interleave).
-    # The GDN core must expand q/k with tile semantics for these weights.
+    # The on-disk q/k -> v-head pairing is i_k = i_hv % num_k_heads
+    # (tile), rather than HF's grouped i_k = i_hv // (num_v_heads /
+    # num_k_heads). The GGUF adapter restores every affected tensor to HF
+    # grouped order before TP slicing, then clears the runtime layout flag.
+    cfg.gguf_gdn_tiled_weights = True
     cfg.gdn_tiled_v_head_layout = True
     logger.info(
         "Built qwen35 config from GGUF: %d layers (%d linear, %d full, "

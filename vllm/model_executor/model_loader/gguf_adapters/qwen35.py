@@ -144,6 +144,54 @@ def _vision_linear_modules(depth: int) -> list[str]:
     return names
 
 
+def _untile_v_head_axis(
+    tensor: torch.Tensor,
+    *,
+    axis: int,
+    num_k_heads: int,
+    num_v_heads: int,
+    values_per_head: int,
+) -> torch.Tensor:
+    """Restore llama.cpp's [repeat, K-head] tiling to HF [K-head, repeat]."""
+    repeats = num_v_heads // num_k_heads
+    assert repeats * num_k_heads == num_v_heads
+    moved = tensor.movedim(axis, 0)
+    expected = num_v_heads * values_per_head
+    assert moved.shape[0] == expected, (moved.shape, expected)
+    rest = moved.shape[1:]
+    grouped = (
+        moved.reshape(repeats, num_k_heads, values_per_head, *rest)
+        .transpose(0, 1)
+        .reshape(expected, *rest)
+    )
+    return grouped.movedim(0, axis).contiguous()
+
+
+def _untile_packed_v_head_columns(
+    qweight: torch.Tensor,
+    *,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_dim: int,
+    weight_type: str,
+) -> torch.Tensor:
+    """Untile input-head columns without decoding aligned GGUF quant blocks."""
+    quant_type = getattr(gguf.GGMLQuantizationType, weight_type)
+    block_size, type_size = gguf.GGML_QUANT_SIZES[quant_type]
+    if head_dim % block_size:
+        raise ValueError(
+            f"cannot untile {weight_type} columns: head_dim={head_dim} is not "
+            f"aligned to quant block_size={block_size}"
+        )
+    return _untile_v_head_axis(
+        qweight,
+        axis=1,
+        num_k_heads=num_k_heads,
+        num_v_heads=num_v_heads,
+        values_per_head=head_dim // block_size * type_size,
+    )
+
+
 class Qwen35GGUFAdapter(GGUFWeightsAdapter):
     """The qwen35 hybrid target GGUF (dense Qwen3.5 family)."""
 
@@ -187,6 +235,22 @@ class Qwen35GGUFAdapter(GGUFWeightsAdapter):
         weight_type_map = self.get_weight_type_map(
             model_path, spec.gguf_to_hf_name_map or {}
         )
+        self._weight_type_map = weight_type_map
+        text_config = model_config.hf_config.get_text_config()
+        self._untile_v_heads = bool(
+            getattr(
+                text_config,
+                "gguf_gdn_tiled_weights",
+                getattr(text_config, "gdn_tiled_v_head_layout", False),
+            )
+        )
+        # Preserve the on-disk convention if this cached config object is used
+        # for another loader after the runtime flag below has been cleared.
+        text_config.gguf_gdn_tiled_weights = self._untile_v_heads
+        # Restore the HF grouped layout in the adapter so every runtime,
+        # including XPU's optimized GDN kernel, can use hv // (HV/H).
+        if self._untile_v_heads:
+            text_config.gdn_tiled_v_head_layout = False
         self._dequant_stems = {
             name.removesuffix(".weight")
             for name, weight_type in weight_type_map.items()
@@ -259,11 +323,23 @@ class Qwen35GGUFAdapter(GGUFWeightsAdapter):
                 for shard in ("q", "k", "v"):
                     yield (
                         f"{stem[: -len('in_proj_qkv')]}in_proj_{shard}_shard.{leaf}",
-                        weight,
+                        # WeightsMapper records shard_id on the tensor object.
+                        # Each shard needs its own scalar rather than three
+                        # aliases whose shard_id is overwritten by the last
+                        # mapping.
+                        weight.clone(),
                     )
                 return
             assert weight.shape[0] == 2 * key_dim + value_dim, (name, weight.shape)
-            splits = torch.split(weight, [key_dim, key_dim, value_dim], dim=0)
+            splits = list(torch.split(weight, [key_dim, key_dim, value_dim], dim=0))
+            if getattr(self, "_untile_v_heads", False):
+                splits[2] = _untile_v_head_axis(
+                    splits[2],
+                    axis=0,
+                    num_k_heads=text_config.linear_num_key_heads,
+                    num_v_heads=text_config.linear_num_value_heads,
+                    values_per_head=text_config.linear_value_head_dim,
+                )
             for shard, part in zip(("q", "k", "v"), splits):
                 yield (
                     f"{stem[: -len('in_proj_qkv')]}in_proj_{shard}_shard.{leaf}",
@@ -287,6 +363,10 @@ class Qwen35GGUFAdapter(GGUFWeightsAdapter):
             if name.rsplit(".", 1)[0].endswith("linear_attn.in_proj_qkv"):
                 yield from split_qkv(name, weight)
                 continue
+            if getattr(self, "_untile_v_heads", False) and not name.endswith(
+                ".qweight_type"
+            ):
+                weight = self._untile_gdn_weight(name, weight, text_config)
             yield name, weight
 
         if getattr(model_config.hf_config, "vision_config", None) is not None:
@@ -343,6 +423,67 @@ class Qwen35GGUFAdapter(GGUFWeightsAdapter):
         fused = torch.stack([taps[name] for name in _PATCH_EMBD_TAPS], dim=2)
         yield "visual.patch_embed.proj.weight", fused
         logger.info("Loaded %d vision tensors from mmproj", count)
+
+    def _untile_gdn_weight(
+        self, name: str, weight: torch.Tensor, config
+    ) -> torch.Tensor:
+        num_k = config.linear_num_key_heads
+        num_v = config.linear_num_value_heads
+        head_dim = config.linear_value_head_dim
+        if name.endswith(".qweight"):
+            stem = name.removesuffix(".qweight")
+        elif name.endswith(".weight"):
+            stem = name.removesuffix(".weight")
+        else:
+            stem = name
+
+        row_chunks = {
+            "linear_attn.in_proj_z": head_dim,
+            "linear_attn.in_proj_b": 1,
+            "linear_attn.in_proj_a": 1,
+            "linear_attn.A_log": 1,
+            "linear_attn.dt_bias": 1,
+        }
+        for suffix, chunk in row_chunks.items():
+            if stem.endswith(suffix):
+                return _untile_v_head_axis(
+                    weight,
+                    axis=0,
+                    num_k_heads=num_k,
+                    num_v_heads=num_v,
+                    values_per_head=chunk,
+                )
+
+        if stem.endswith("linear_attn.conv1d"):
+            key_dim = num_k * config.linear_key_head_dim
+            q, k, v = torch.split(weight, [key_dim, key_dim, num_v * head_dim], dim=0)
+            v = _untile_v_head_axis(
+                v,
+                axis=0,
+                num_k_heads=num_k,
+                num_v_heads=num_v,
+                values_per_head=head_dim,
+            )
+            return torch.cat((q, k, v), dim=0)
+
+        if stem.endswith("linear_attn.out_proj"):
+            if name.endswith(".qweight"):
+                weight_type = self._weight_type_map[stem + ".weight"]
+                return _untile_packed_v_head_columns(
+                    weight,
+                    num_k_heads=num_k,
+                    num_v_heads=num_v,
+                    head_dim=head_dim,
+                    weight_type=weight_type,
+                )
+            return _untile_v_head_axis(
+                weight,
+                axis=1,
+                num_k_heads=num_k,
+                num_v_heads=num_v,
+                values_per_head=head_dim,
+            )
+        return weight
 
     def transform_weight(self, hf_name: str, weight: torch.Tensor) -> torch.Tensor:
         if hf_name.endswith("linear_attn.conv1d.weight") and weight.dim() == 2:
