@@ -23,7 +23,6 @@ from openai.types.responses.response_error import ResponseError
 from openai.types.responses.response_output_text import Logprob, LogprobTopLogprob
 from openai.types.responses.tool import Mcp, Tool
 from openai_harmony import Message as OpenAIHarmonyMessage
-from pydantic import TypeAdapter
 
 from vllm import envs
 from vllm.config.utils import replace
@@ -1542,7 +1541,32 @@ class OpenAIServingResponses(GenerateBaseServing):
                 output=[],
                 status="in_progress",
                 usage=None,
-            ).model_dump(mode="json", by_alias=True)
+            )
+
+            async def failed_event(message: str) -> ResponseFailedEvent:
+                # HTTP error envelopes are not Responses SSE events. Build a
+                # terminal response directly, without parsing failed generation
+                # output again and potentially masking the original error.
+                response = initial_response.model_copy(
+                    update={
+                        "status": "failed",
+                        "error": ResponseError(code="server_error", message=message),
+                    }
+                )
+                if request.store:
+                    async with self.response_store_lock:
+                        stored_response = self.response_store.get(response.id)
+                        if (
+                            stored_response is None
+                            or stored_response.status != "cancelled"
+                        ):
+                            self.response_store[response.id] = response
+                return _increment_sequence_number_and_return(
+                    ResponseFailedEvent(
+                        type="response.failed", sequence_number=-1, response=response
+                    )
+                )
+
             yield _increment_sequence_number_and_return(
                 ResponseCreatedEvent(
                     type="response.created",
@@ -1572,10 +1596,7 @@ class OpenAIServingResponses(GenerateBaseServing):
                 ):
                     yield event_data
             except GenerationError as e:
-                error_json = self._convert_generation_error_to_streaming_response(e)
-                yield _increment_sequence_number_and_return(
-                    TypeAdapter(StreamingResponsesResponse).validate_json(error_json)
-                )
+                yield await failed_event(str(e))
                 return
 
             async def empty_async_generator():
@@ -1584,19 +1605,22 @@ class OpenAIServingResponses(GenerateBaseServing):
                 if False:
                     yield
 
-            final_response = await self.responses_full_generator(
-                request,
-                sampling_params,
-                empty_async_generator(),
-                context,
-                model_name,
-                tokenizer,
-                request_metadata,
-                created_time=created_time,
-            )
+            try:
+                final_response = await self.responses_full_generator(
+                    request,
+                    sampling_params,
+                    empty_async_generator(),
+                    context,
+                    model_name,
+                    tokenizer,
+                    request_metadata,
+                    created_time=created_time,
+                )
+            except GenerationError as e:
+                yield await failed_event(str(e))
+                return
             if isinstance(final_response, ErrorResponse):
-                # A finalization failure must not be serialized as completion.
-                yield final_response
+                yield await failed_event(final_response.error.message)
                 return
             if final_response.status == "cancelled":
                 # Cancellation is exposed through retrieval; Responses defines
