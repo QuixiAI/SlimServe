@@ -152,6 +152,16 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             )
 
         self.num_par_softmax_segments = NUM_PAR_SOFTMAX_SEGMENTS
+        if current_platform.is_xpu():
+            self.num_par_softmax_segments = (
+                envs.VLLM_XPU_TRITON_ATTN_NUM_PAR_SOFTMAX_SEGMENTS
+            )
+            if self.num_par_softmax_segments not in (4, 8, 16):
+                raise ValueError(
+                    "VLLM_XPU_TRITON_ATTN_NUM_PAR_SOFTMAX_SEGMENTS must be "
+                    "one of 4, 8, or 16, got "
+                    f"{self.num_par_softmax_segments}"
+                )
         headdim_padded = next_power_of_2(self.headdim)
         self.softmax_segm_output = torch.empty(
             (

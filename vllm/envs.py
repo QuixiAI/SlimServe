@@ -88,6 +88,7 @@ if TYPE_CHECKING:
     VLLM_FLOAT32_MATMUL_PRECISION: Literal["highest", "high", "medium"] = "highest"
     VLLM_BATCH_INVARIANT: bool = False
     VLLM_TRITON_USE_TD: bool | None = None
+    VLLM_XPU_TRITON_ATTN_NUM_PAR_SOFTMAX_SEGMENTS: int = 16
     # Deprecated alias of VLLM_TRITON_USE_TD (removed in v0.25).
     VLLM_TRITON_ATTN_USE_TD: bool | None = None
     VLLM_GPU_SYNC_CHECK: Literal["warn", "error"] | None = None
@@ -581,6 +582,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ``0`` forces TD off.  Useful for A/B benchmarking the TD path.
     "VLLM_TRITON_USE_TD": lambda: {"1": True, "0": False}.get(
         os.getenv("VLLM_TRITON_USE_TD", "").strip()
+    ),
+    # Parallel segments in the Triton unified-attention 3D softmax path.
+    # This is XPU-scoped because other platforms retain the upstream default.
+    "VLLM_XPU_TRITON_ATTN_NUM_PAR_SOFTMAX_SEGMENTS": lambda: int(
+        os.getenv("VLLM_XPU_TRITON_ATTN_NUM_PAR_SOFTMAX_SEGMENTS", "16")
     ),
     # If set, enable PyTorch's GPU<->CPU synchronization debug mode around
     # the worker's `execute_model` and `sample_tokens` calls. Valid values
