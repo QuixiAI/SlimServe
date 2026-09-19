@@ -1378,5 +1378,9 @@ inside the pair, which is the best-understood code on the branch), F5, F3,
 F4. Together they remove ~450 of the ~1100 launches per c1 step and are
 sized at +12-18 % c1, +5-7 % c8/c16 - the "leaps and bounds" that remain
 before the physics floor, at the cost of a persistent/cooperative kernel
-style the branch has not used yet. A cooperative launch inside a captured
-graph must be verified on this driver first (a 20-line probe before F1).
+style the branch has not used yet. Verified 18:05 PDT (`$S/p9/coop_probe.cu`):
+a cooperative kernel with two `grid.sync()` phases captures into a CUDA
+graph and replays correctly on this driver through both
+`cudaLaunchCooperativeKernel` and `cudaLaunchKernelEx` with the
+cooperative attribute (188 x 256 threads, neighbour reads across the sync,
+replay counter exact), so F1 has no launch-model blocker.
