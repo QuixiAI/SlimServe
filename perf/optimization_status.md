@@ -5184,3 +5184,14 @@ fastest measured. It does drop full-length concurrency to 6.31x against
 max_num_seqs=32, so a workload that actually fills 256k contexts on many
 concurrent requests would preempt; TurboQuant KV is the lever there and is
 untested here.
+
+
+## 2026-09-19 - Reuse split Q8 weights in XPU decode kernels
+
+- Status: retained for review.
+- Baseline: `origin/xpu/qwen38-b70-parity`; forward-port from the B70 serving integration.
+- Change: Repack uniform Q8 weights into aligned scale/quant planes without increasing storage, reuse decoded weights across small batches, and preserve correct large-batch dequantization.
+- Correctness: Five CPU layout/dispatch tests passed with mocked native entrypoints. SYCL build, numerical GPU parity and serving throughput remain pending.
+- Results: no new throughput measurement or hardware qualification claimed.
+- Decision: submit as a focused PR; preserve current-main behavior outside this fix.
+- Raw artifacts: local test output; no traffic captures or model data committed.

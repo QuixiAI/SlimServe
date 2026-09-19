@@ -11,7 +11,11 @@ dropped: this targets gfx942 with the HIP kernels in
 
 from .config import GGUFConfig
 from .fused_moe import GGUFMoEMethod, fused_moe_gguf
-from .linear import GGUFLinearMethod, fused_mul_mat_gguf
+from .linear import (
+    GGUFLinearMethod,
+    fused_mul_mat_gguf,
+    fused_mul_mat_gguf_split_q8,
+)
 from .params import (
     GGUFUninitializedParameter,
     GGUFUninitializedWeightParameter,
@@ -51,5 +55,6 @@ __all__ = [
     "apply_gguf_embedding",
     "fused_moe_gguf",
     "fused_mul_mat_gguf",
+    "fused_mul_mat_gguf_split_q8",
     "is_layer_skipped_gguf",
 ]

@@ -278,6 +278,32 @@ def _fused_mul_mat_gguf_fake(
     return torch.empty(x.shape[0], qweight.shape[0], dtype=x.dtype, device=x.device)
 
 
+def _fused_mul_mat_gguf_split_q8(
+    x: torch.Tensor, qweight: torch.Tensor
+) -> torch.Tensor:
+    """Matmul for the XPU byte-neutral split Q8_0 layout.
+
+    Small decode batches read aligned int8 planes directly. Larger batches
+    dequantize from the split planes into the existing shape-keyed scratch and
+    use the platform dense GEMM. No raw-GGML kernel may consume this tensor.
+    """
+    rows = qweight.shape[0]
+    cols = qweight.shape[1] // 34 * 32
+    if x.shape[0] == 0:
+        return torch.empty(0, rows, dtype=x.dtype, device=x.device)
+    if x.shape[0] <= 16:
+        return ops.ggml_mul_mat_vec_split_q8(qweight, x, rows)
+    weight = _q8_0_dequant_scratch(qweight, rows, cols, x.dtype)
+    ops.ggml_dequantize_split_q8_into(qweight, rows, cols, weight)
+    return x @ weight.T
+
+
+def _fused_mul_mat_gguf_split_q8_fake(
+    x: torch.Tensor, qweight: torch.Tensor
+) -> torch.Tensor:
+    return torch.empty(x.shape[0], qweight.shape[0], dtype=x.dtype, device=x.device)
+
+
 try:
     direct_register_custom_op(
         op_name="_fused_mul_mat_gguf",
@@ -285,6 +311,12 @@ try:
         fake_impl=_fused_mul_mat_gguf_fake,
     )
     fused_mul_mat_gguf = torch.ops.vllm._fused_mul_mat_gguf
+    direct_register_custom_op(
+        op_name="_fused_mul_mat_gguf_split_q8",
+        op_func=_fused_mul_mat_gguf_split_q8,
+        fake_impl=_fused_mul_mat_gguf_split_q8_fake,
+    )
+    fused_mul_mat_gguf_split_q8 = torch.ops.vllm._fused_mul_mat_gguf_split_q8
 except AttributeError as error:
     raise error
 
@@ -368,8 +400,45 @@ class GGUFLinearMethod(LinearMethodBase):
                 f"Unsupported GGUF quantization type {qweight_type} in layer {layer}."
             )
         self._create_padded_weight_param(layer)
+        self._create_xpu_q8_split_weight(layer)
         self._create_dsv4_aligned_q8_weight(layer)
         self._create_muse_u4_weight(layer)
+
+    def _create_xpu_q8_split_weight(self, layer: torch.nn.Module) -> None:
+        """Replace uniform Q8_0 storage with byte-neutral aligned planes.
+
+        This runs after adapter transforms and merged-shard padding, so row
+        order is final. The Parameter object and all loader/shard metadata are
+        preserved; only its same-sized storage is replaced.
+        """
+        if not current_platform.is_xpu():
+            return
+        if os.environ.get("VLLM_XPU_GGUF_Q8_SPLIT", "1").lower() in (
+            "0",
+            "false",
+            "off",
+            "no",
+        ):
+            return
+        fallback_type = layer.qweight_type.weight_type
+        shard_types = list(layer.qweight_type.shard_weight_type.values())
+        weight_types = shard_types or [fallback_type]
+        if not weight_types or len(set(weight_types)) != 1:
+            return
+        if weight_types[0] != int(WeightType.Q8_0):
+            return
+        qweight = layer.qweight
+        if qweight.dim() != 2 or qweight.shape[1] % 34 != 0:
+            return
+        rows = qweight.shape[0]
+        cols = qweight.shape[1] // 34 * 32
+        # The native kernel uses two 16-byte quant loads per block.
+        if (rows * (cols // 32) * 2) % 16 != 0:
+            return
+        split = ops.ggml_repack_q8_0_split(qweight, rows, cols)
+        qweight.data = split
+        qweight.gguf_layout = "q8_0_split"
+        layer._xpu_q8_split = True
 
     def _create_muse_u4_weight(self, layer: torch.nn.Module) -> None:
         """Load-time uint4-native repack for single-shard Q4_K layers (Metal).
@@ -485,6 +554,13 @@ class GGUFLinearMethod(LinearMethodBase):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         from . import fused_mul_mat_gguf as fused_mul_mat_gguf_op
+        from . import fused_mul_mat_gguf_split_q8 as split_q8_op
+
+        if getattr(layer, "_xpu_q8_split", False):
+            out = split_q8_op(x, layer.qweight)
+            if bias is not None:
+                out.add_(bias)
+            return out
 
         u4 = getattr(layer, "_muse_u4_wu", None)
         if u4 is not None and 9 <= x.shape[0] <= 32:
@@ -566,6 +642,14 @@ class GGUFLinearMethod(LinearMethodBase):
         quant_input: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if getattr(layer, "_xpu_q8_split", False):
+            from . import fused_mul_mat_gguf_split_q8 as split_q8_op
+
+            out = split_q8_op(x, layer.qweight)
+            if bias is not None:
+                out.add_(bias)
+            return out
+
         aligned = getattr(layer, "_dsv4_q8_aligned", None)
         if aligned is not None and x.shape[0] <= 8:
             rows = layer.qweight.shape[0]
