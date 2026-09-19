@@ -26198,3 +26198,14 @@ Phases, by value over risk:
   live server is dominated by noise and competing traffic (110-162 across
   runs today), so the c1 gap is not established. Single-stream decode with
   ignore_eos: 141-187 tok/s.
+
+
+## 2026-09-19 - Constrain non-strict tool calls to valid JSON objects
+
+- Status: retained for review.
+- Baseline: `origin/main`; forward-port from the B70 serving integration.
+- Change: Constrain automatic function envelopes and JSON syntax while reserving declared argument-schema enforcement for explicit strict tools.
+- Correctness: Eight grammar tests passed, including byte-token compilation with the real XGrammar matcher and Qwen parser round-trip.
+- Results: no new throughput measurement or hardware qualification claimed.
+- Decision: submit as a focused PR; preserve current-main behavior outside this fix.
+- Raw artifacts: local test output; no traffic captures or model data committed.
