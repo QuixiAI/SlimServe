@@ -153,6 +153,13 @@ own; switches QC_KDA_DIRECT_OUT / QC_MOE_OUTPUT_ALIAS): plain 227.5 /
 774-778 / 1118-1119 (+37 / +13 / +16 % on the control), spec level-to-up
 on a six-pass c16 A/B. CodeRabbit round 10 (eight findings on 649c319a5)
 fixed in the same push; the loop continues from there.
+P15 (17:44 PDT): a gated variant of the fp8 decode GEMM (the shared
+experts' gate/up GEMM with silu(clamp(gate)) * clamp(up) in its epilogue,
+`decode_gemm_fp8_gated`, 12 tests) measured level and its MLP hook is off
+by default (QC_FP8_GATED=1): the shared experts' side stream is not the
+decode critical path. Rule confirmed twice today: a bandwidth kernel's
+dependent-launch trigger goes AFTER its main loop, or the dependent's
+CTAs squat on the SMs while it streams (P9 29.3 -> 24.8 us, P15 217 -> 226).
 
 <!--
 The campaign handoffs in this file cover different

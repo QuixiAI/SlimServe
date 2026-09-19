@@ -1333,3 +1333,20 @@ Raw: serving `$S/serve-logs/ab-p10-{nospec,spec}.out`, `ab-p10{r,off}-c1spec.out
 rounds `$S/profile-state-p9d-prof/` (before) and the routing microbench
 `$S/p9/mb.cu` / `mb_route.cu` outputs in the notebook entry "P10 the router
 folded into gemv1".
+
+### 14.3 Where the day ends (2026-09-18 17:45 PDT)
+
+Record (no extra environment): plain 227.5 / 774-778 / 1118-1119 tok/s
+(+37 / +13 / +16 % on the control), spec c1 ~280 (eight-pass median), c8
+801-831, c16 1113-1133 (+7 / +10-13 / +11-13 %). Landed today: P9 (the
+NVFP4 decode MoE pair), P10 (the router folded into it), P14 (the two
+per-layer copies). Measured level and left opt-in or reverted: P11
+(cluster split-K), P12 (c16 draft length), P13a (NVFP4 MTP experts), P15
+(gated shared-expert GEMM). What separates every shape from its physics
+floor now is the per-layer launch chain (~25 launches per layer against
+~50 us of bytes; c1 ~2.3 ms per step of bytes and PCIe against 4.4 ms
+measured): the next step change needs a layer-level fusion design
+(attention glue + all-reduce transition + router + experts in far fewer
+launches), not another kernel on the existing boundaries. Smaller items
+still open: the drafter's lm_head (a draft-only NVFP4 copy), P5's candidate
+gather (spec only), the pair's last ~4.5 us per layer to the card's rate.
