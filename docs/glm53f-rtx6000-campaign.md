@@ -1328,3 +1328,8 @@ route_align launch off the decode critical path: plain c1 222.0 (+1.7 %),
 c8 spec 831 (+1.3 %), c1 spec level on an eight-pass A/B with unchanged
 acceptance. Record: plain 222.0 / 767-770 / 1110-1113 (+33 / +12 / +15 %
 on the control), spec c1 ~283 (eight-pass median) / c8 831 / c16 1130.
+Raw: serving `$S/serve-logs/ab-p10-{nospec,spec}.out`, `ab-p10{r,off}-c1spec.out`
+(bench JSON under `perf/results/2026-09-18/p10-*-pass*/`), the profiled c1
+rounds `$S/profile-state-p9d-prof/` (before) and the routing microbench
+`$S/p9/mb.cu` / `mb_route.cu` outputs in the notebook entry "P10 the router
+folded into gemv1".

@@ -211,8 +211,9 @@ __global__ void __launch_bounds__(WARPS * 32) fp8_decode_gemm_kernel(
     }
 }
 
-// QC_PDL=1 launches every decode GEMM with programmatic stream serialization
-// (read once per process). Off by default until the serving arm qualifies it.
+// QC_PDL selects the decode GEMM launch mode (read once per process, see
+// bf16_decode_gemm.cuh: 0 off; 1 line-hint prefetch; 2 bulk L2 prefetch;
+// 3 real loads; 4 attribute, trigger and wait only). Default 4.
 // QC_FP8_WIDE: experiment switch for the N >= 2048 configuration (0 = the
 // shipped 32 rows / 128-byte chunks / 4 stages; 1..6 see launch_auto). A
 // chunk must divide K, so wide chunks fall back when K is not a multiple.

@@ -29,6 +29,24 @@ E, K, N, TOPK = 16, 4096, 512, 8   # the record's per-rank expert geometry, fewe
 E2M1 = [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6]
 
 
+@pytest.fixture(autouse=True)
+def _fresh_decode_pair_state():
+    """The dispatch keeps process-wide state (the announce flags, the
+    pair-active flag that makes glm_route_align defer routing, a pending
+    deferred entry): reset it around every test so none inherits another's."""
+    from vllm.model_executor.layers.fused_moe.router import glm_route_align
+
+    def reset():
+        marlin_moe._qc_nvfp4_decode_announced = False
+        marlin_moe._qc_nvfp4_decode_pair_active = False
+        marlin_moe._qc_nvfp4_decode_declined_once = False
+        glm_route_align._deferred = None
+
+    reset()
+    yield
+    reset()
+
+
 def dequant(u8: torch.Tensor, sc: torch.Tensor, gs: float) -> torch.Tensor:
     """[E, rows, cols/2] packed e2m1 (even element in the low nibble) x
     [E, rows, cols/16] e4m3 scales x global -> [E, rows, cols] fp32."""
@@ -46,19 +64,19 @@ class Layer:
         w2 = torch.randint(0, 256, (E, K, N // 2), dtype=torch.uint8, device=DEV)
         s2 = (torch.rand(E, K, N // 16, device=DEV) * 2 + 0.5).to(torch.float8_e4m3fn)
         self.W13, self.W2 = dequant(w13, s13, gs), dequant(w2, s2, gs)
-        l = types.SimpleNamespace()
-        l.moe_config = types.SimpleNamespace(
+        layer = types.SimpleNamespace()
+        layer.moe_config = types.SimpleNamespace(
             num_experts=E, hidden_dim=K, intermediate_size_per_partition=N
         )
-        l.params_dtype = torch.bfloat16
-        l.w13_weight, l.w13_weight_scale = w13.clone(), s13.clone()
-        l.w13_weight_scale_2 = torch.tensor(gs, device=DEV)
-        l.w2_weight, l.w2_weight_scale = w2.clone(), s2.clone()
-        l.w2_weight_scale_2 = torch.tensor(gs, device=DEV)
-        prepare_moe_fp4_layer_for_marlin(l)
-        self.l = l
-        self.s13 = l.w13_weight_scale.view(torch.uint8)
-        self.s2 = l.w2_weight_scale.view(torch.uint8)
+        layer.params_dtype = torch.bfloat16
+        layer.w13_weight, layer.w13_weight_scale = w13.clone(), s13.clone()
+        layer.w13_weight_scale_2 = torch.tensor(gs, device=DEV)
+        layer.w2_weight, layer.w2_weight_scale = w2.clone(), s2.clone()
+        layer.w2_weight_scale_2 = torch.tensor(gs, device=DEV)
+        prepare_moe_fp4_layer_for_marlin(layer)
+        self.l = layer
+        self.s13 = layer.w13_weight_scale.view(torch.uint8)
+        self.s2 = layer.w2_weight_scale.view(torch.uint8)
 
     def reference(self, x, ids, w, clamp=None):
         m = x.shape[0]

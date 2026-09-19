@@ -23,6 +23,7 @@ from vllm.forward_context import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import combine_shared
+from vllm.model_executor.layers.fused_moe.router import glm_route_align
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
@@ -742,6 +743,7 @@ class MoERunner(MoERunnerInterface):
             raise
         finally:
             combine_shared.clear()
+            glm_route_align.clear_deferred()
 
         if deferred is None:
             self._maybe_apply_shared_experts(

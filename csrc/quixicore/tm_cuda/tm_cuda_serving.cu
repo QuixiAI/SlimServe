@@ -2040,11 +2040,14 @@ static void launch_nvfp4_gemv1(const __nv_bfloat16* x, int ldx, const int32_t* b
     // the staged row + the ring (+ the folded router's choice/score arrays)
     const size_t dyn = size_t(K) * 2 + tms::nvfp4dec::gemv1_ring_bytes<NJ, KT>() + (logits != nullptr ? size_t(2 * E) * 4 : 0);
     TORCH_CHECK(dyn <= 99 * 1024, "nvfp4_moe_gemv1: nj/stages too wide for shared memory (", dyn, " B)");
-    static size_t granted = 0;          // dynamic smem crosses 48 KB for the wide configs (sm_120: 99 KB opt-in)
-    if (dyn > granted) {
+    // dynamic smem crosses 48 KB for the wide configs (sm_120: 99 KB opt-in); the
+    // attribute is per device and per function, so the granted size is cached per device.
+    static thread_local std::array<size_t, 64> granted{};
+    const int slot = SmemOptIn::slot();
+    if (dyn > granted[slot]) {
         tms::decode_gemm::check_cuda_status(cudaFuncSetAttribute(tms::nvfp4dec::nvfp4_moe_gemv1_kernel<NJ, KT>,
                                                                  cudaFuncAttributeMaxDynamicSharedMemorySize, int(dyn)));
-        granted = dyn;
+        granted[slot] = dyn;
     }
     const int pdl = tms::decode_gemm::pdl_mode();
     if (pdl) {
@@ -2069,11 +2072,14 @@ static void launch_nvfp4_gemv2(const __nv_bfloat16* act, const int32_t* b, const
     const dim3 grid(D / (16 * NJ), M, split);
     const size_t dyn = size_t(top_k / split) * Ki * 2 + tms::nvfp4dec::gemv2_ring_bytes<NJ, KT>();   // the CTA's rows + the ring
     TORCH_CHECK(dyn <= 99 * 1024, "nvfp4_moe_gemv2: nj/stages too wide for shared memory (", dyn, " B)");
-    static size_t granted = 0;          // dynamic smem crosses 48 KB for the wide configs (sm_120: 99 KB opt-in)
-    if (dyn > granted) {
+    // dynamic smem crosses 48 KB for the wide configs (sm_120: 99 KB opt-in); the
+    // attribute is per device and per function, so the granted size is cached per device.
+    static thread_local std::array<size_t, 64> granted{};
+    const int slot = SmemOptIn::slot();
+    if (dyn > granted[slot]) {
         tms::decode_gemm::check_cuda_status(cudaFuncSetAttribute(tms::nvfp4dec::nvfp4_moe_gemv2_kernel<NJ, KT>,
                                                                  cudaFuncAttributeMaxDynamicSharedMemorySize, int(dyn)));
-        granted = dyn;
+        granted[slot] = dyn;
     }
     const int pdl = tms::decode_gemm::pdl_mode();
     if (pdl || split > 1) {

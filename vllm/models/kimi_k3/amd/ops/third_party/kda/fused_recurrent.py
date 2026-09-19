@@ -794,8 +794,11 @@ def fused_recurrent_kda_packed_decode(
     initial_state: torch.Tensor,
     state_indices: torch.Tensor,
     scale: float | None = None,
+    out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run one-token KDA decode directly from packed post-conv QKV."""
+    """Run one-token KDA decode directly from packed post-conv QKV. ``out``
+    ([1, B, H, V], contiguous) receives the read-out in place; without it a
+    fresh tensor is returned (and the caller copies it once more)."""
     if mixed_qkv.ndim != 2 or mixed_qkv.stride(-1) != 1:
         raise ValueError("`mixed_qkv` must be 2D and contiguous in its last dim.")
     if raw_g.ndim != 4 or raw_g.shape[0] != 1:
@@ -855,7 +858,10 @@ def fused_recurrent_kda_packed_decode(
     if scale is None:
         scale = K**-0.5
 
-    out = torch.empty((1, B, H, V), dtype=mixed_qkv.dtype, device=device)
+    if out is None:
+        out = torch.empty((1, B, H, V), dtype=mixed_qkv.dtype, device=device)
+    elif out.shape != (1, B, H, V) or not out.is_contiguous() or out.dtype != mixed_qkv.dtype:
+        raise ValueError("`out` must be a contiguous [1, B, H, V] tensor of the input dtype.")
     grid = (cdiv(V, BV), B * H)
     fused_recurrent_kda_packed_decode_kernel[grid](
         mixed_qkv=mixed_qkv,

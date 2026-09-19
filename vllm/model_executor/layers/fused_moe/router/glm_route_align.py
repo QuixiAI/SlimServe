@@ -81,6 +81,13 @@ def pending_deferred() -> bool:
     return _deferred is not None
 
 
+def clear_deferred() -> None:
+    """Drop a never-consumed entry (the runner's cleanup after a failed
+    forward), so a later batch does not inherit it."""
+    global _deferred
+    _deferred = None
+
+
 def materialize(entry: DeferredRouting) -> None:
     """Route the batch now (the pair is not serving it): fills the handed-out
     tensors in place and publishes the Marlin alignment."""

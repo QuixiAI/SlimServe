@@ -30708,3 +30708,59 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   candidate gather, -50 us per gather, four per c1 spec step): ~-0.35 ms
   of the 8.6 ms c1 spec step (+4 %), ~2 % at c8/c16 spec; the sampling and
   MTP-layer launch chains are the rest and are latency, not bytes.
+
+- PHASE 8 / P14 THE TWO PER-LAYER COPIES (2026-09-18 16:30-16:40 PDT).
+  The c1 trace of the 15:35 record (`$S/profile-state-p9d-prof`) carries two
+  `memcpy32_post` per KDA layer per step, 0.7-0.8 us each and a launch gap
+  around each, 77 per step: one between the KDA recurrence and its gated
+  norm, one between the pair's gemv2 and the all-reduce transition (neighbour
+  counts over the trace: 272 and 328 occurrences). Sources, by reading the
+  paths: (1) `fused_recurrent_kda_packed_decode` allocates its read-out and
+  the attention forward copies it into `core_attn_out` afterwards - the
+  wrapper takes an `out` now and a pure decode batch (no speculative rows)
+  reads out straight into `core_attn_out[:, :n]`; (2) the modular MoE
+  kernel's finalize copies the experts' `fused_out` into the op's output
+  buffer unless the two alias, and the alias shortcut was ROCm-only (AITER's
+  fused MoE) - on CUDA it now aliases whenever the experts implementation
+  reduces on its own (`TopKWeightAndReduceNoOP`: Marlin's moe_sum, the
+  NVFP4 decode pair), so gemv2 / moe_sum_add write the op's output directly
+  and finalize's self-copy is skipped. Expected: ~2 x (0.75 us + gap) x 34
+  KDA layers + 42 MoE layers ~ 0.1 ms per step at every shape (c1 +2 %, c8
+  +1 %, c16 +0.7 %). Kernel tests (decode pair, KDA chain parity) pass.
+  Serving: `$S/p8/chain_p14.sh` (plain with gates + canaries, then spec four
+  passes; references p10-nospec 15:16, p10-spec 15:21).
+  P14 SERVING (16:40-16:53 PDT, `$S/p8/chain_p14.sh`): plain c1 227.7 /
+  227.3, c8 774.0 / 777.6, c16 1117.6 / 1119.2 against the 15:16 round's
+  221.9 / 222.0, 770.4 / 767.0, 1113.0 / 1110.0: c1 +2.5 %, c8 +1 %, c16
+  +0.6 % (as sized). Gates (4) -2.435 / -2.464 / -2.423 / -2.436, canaries
+  PASS. Spec, four passes: c1 260.4 278.4 292.6 280.1 (median 279; the
+  eight-pass reference 283), c8 733.6 788.9 812.7 827.7 (median 801; 15:21
+  round 831 with a 733 first pass this time), c16 1079.0 1078.2 1111.2
+  1153.7 (median 1095; 15:21 round 1130). The spec batches do not take the
+  changed KDA branch (speculative rows read out through their own path),
+  and the MoE alias applies to every batch; a second c8/c16 spec arm
+  (`ab2.sh p14b-spec`) reads the draw again before the decision.
+  Six-pass c16 spec A/B (17:00-17:08 PDT, `$S/p8/chain_p14c.sh`; switches
+  QC_MOE_OUTPUT_ALIAS=0 QC_KDA_DIRECT_OUT=0 restore both copies):
+  | arm | c16 spec passes 1..6 | median | accepted per draft |
+  |---|---|---|---|
+  | copies removed (default) | 1095.2 1110.3 1135.9 1129.5 1161.5 1159.4 | 1133 | 1.135 |
+  | copies restored | 1078.9 1140.0 1127.8 1069.0 1118.1 1108.1 | 1113 | 1.101 |
+  Level-to-positive; the 1095 / 1078 medians of the two four-pass boots
+  were draws. DECISION: retained. RECORD 2026-09-18 17:08 PDT (no extra
+  environment): plain 227.5 / 774-778 / 1118-1119 (+37 / +13 / +16 % on the
+  control's 166.5 / 687.9 / 966.8), spec medians c1 ~280 (eight passes),
+  c8 ~801-831, c16 ~1113-1133 (+7 / +10-13 / +11-13 % on the control's
+  MTP-3 260.8 / 732.1 / 1005.8).
+
+- CODERABBIT ROUND 10 (2026-09-18 23:57Z on 649c319a5, requested after the
+  Phase 8 push): eight findings, all fixed in the next commit. Marlin's PDL
+  launch gated on sm_90+ with its cudaLaunchKernelEx status checked
+  (`marlin_pdl_supported`); the pair launchers' shared-memory opt-in cached
+  per device (`SmemOptIn::slot`); the QC_PDL comment in fp8_decode_gemm.cuh
+  brought to the mode-4 default; `glm_route_align.clear_deferred()` at the
+  MoE runner's cleanup boundary (a deferred entry a failed forward left
+  behind would have raised on the next batch); the decode-pair test resets
+  the dispatch's process-wide flags around every test (autouse fixture) and
+  drops an ambiguous local name, as does the swap-set test; the campaign
+  doc's P10 record names its raw artifacts.

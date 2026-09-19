@@ -147,6 +147,12 @@ card's rate. The fixed ~2 ms per step of per-layer launch latency (about
 25 launches per layer against ~50 us of bytes) is what separates every
 shape from its physics floor (c1 ~2.3 ms per step against 4.5) and needs a
 layer-level fusion design, not another kernel.
+P14 (17:08 PDT) removed the two per-layer copies (the KDA read-out written
+in place, the MoE output aliased on CUDA when the experts reduce on their
+own; switches QC_KDA_DIRECT_OUT / QC_MOE_OUTPUT_ALIAS): plain 227.5 /
+774-778 / 1118-1119 (+37 / +13 / +16 % on the control), spec level-to-up
+on a six-pass c16 A/B. CodeRabbit round 10 (eight findings on 649c319a5)
+fixed in the same push; the loop continues from there.
 
 <!--
 The campaign handoffs in this file cover different

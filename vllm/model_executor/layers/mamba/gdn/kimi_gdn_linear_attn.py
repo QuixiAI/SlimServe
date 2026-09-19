@@ -1,3 +1,5 @@
+import os
+import functools
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
@@ -52,6 +54,12 @@ from ..ops.gather_initial_states import gather_initial_states
 _KDA_GATE_LOGBOUND_MIN = -5.0
 # V split of the fused chain's recurrence kernel (blocks per request x head).
 _KDA_CHAIN_SPLIT = int(__import__("os").environ.get("QC_KDA_SPLIT", "4"))
+
+
+@functools.cache
+def _kda_direct_out() -> bool:
+    # QC_KDA_DIRECT_OUT=0 restores the read-out copy (A/B switch).
+    return os.environ.get("QC_KDA_DIRECT_OUT", "1") != "0"
 
 
 def _apply_kda_output_norm(
@@ -980,6 +988,10 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                     validate_data=True,
                     out=packed_conv_out,
                 )
+                # A pure decode batch reads out straight into core_attn_out
+                # (one D2D copy per layer per step otherwise: 0.7 us in the
+                # 2026-09-18 c1 trace); a mixed batch merges by index below.
+                direct = core_attn_out_spec is None and _kda_direct_out()   # the spec rows (if any) ran above
                 core_attn_out_non_spec, _ = fused_recurrent_kda_packed_decode(
                     mixed_qkv=mixed_qkv_ns,
                     raw_g=g1_ns,
@@ -989,6 +1001,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                     lower_bound=self.gate_lower_bound,
                     initial_state=recurrent_state,
                     state_indices=decode_conv_indices,
+                    out=core_attn_out[:, :num_actual_tokens] if direct else None,
                 )
 
         # ---------- merge spec and non-spec outputs ----------
@@ -1003,9 +1016,10 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             merged.index_copy_(1, non_spec_token_indx, core_attn_out_non_spec)
             core_attn_out[0, :num_actual_tokens] = merged[0, :num_actual_tokens]
         elif core_attn_out_non_spec is not None:
-            core_attn_out[0, :num_actual_tokens] = core_attn_out_non_spec[
-                0, :num_actual_tokens
-            ]
+            if core_attn_out_non_spec.data_ptr() != core_attn_out.data_ptr():
+                core_attn_out[0, :num_actual_tokens] = core_attn_out_non_spec[
+                    0, :num_actual_tokens
+                ]
         else:
             assert core_attn_out_spec is not None
         _apply_kda_output_norm(self.o_norm, core_attn_out, g2)

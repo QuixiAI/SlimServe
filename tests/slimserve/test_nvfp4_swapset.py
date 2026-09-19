@@ -24,7 +24,7 @@ def _manifest(tmp_path):
         "file": "nvfp4-swapset.safetensors",
         "families": sorted({mod for _, mod in modules}),
         "tensors": tensors,
-        "modules": [f"layers.{l}.{mod}" for l, mod in modules],
+        "modules": [f"layers.{layer}.{mod}" for layer, mod in modules],
         "shards": shards,
         "config_group": ns.config_group(modules),
     }
