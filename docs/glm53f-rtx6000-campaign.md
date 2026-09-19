@@ -1350,3 +1350,33 @@ measured): the next step change needs a layer-level fusion design
 launches), not another kernel on the existing boundaries. Smaller items
 still open: the drafter's lm_head (a draft-only NVFP4 copy), P5's candidate
 gather (spec only), the pair's last ~4.5 us per layer to the card's rate.
+
+## 15. Next phase: the layer-level fusion plan (drafted 2026-09-18 18:00 PDT)
+
+Basis: the c1 step is ~1100 launches at 0.76 us of dispatch latency each
+(section 14.3, notebook "The launch floor of this card") plus 1-3 us of
+prologue and tail per real kernel; the bytes need ~1.75 ms and the PCIe
+all-reduces ~0.54 ms per step, the step is 4.4 ms. A KDA layer today is
+~25 launches (in_proj, six attention-glue kernels, o_proj, transition +
+sinkhorn, router GEMV, the pair, the shared expert's three, transition +
+sinkhorn, copies and norms); an MLA layer about the same with the sparse
+attention chain. Every item below is scored by launches removed per layer
+(x 34 KDA / 11 MLA / 42 MoE), each worth ~0.76 us of dispatch plus the
+removed kernel's fixed cost, and by what it does NOT change (bytes stay
+the same; the mandate's A/B rules apply unchanged).
+
+| item | fusion | launches removed per step | expected | risk / precedent |
+|---|---|---|---|---|
+| F1 the KDA attention block as one kernel | gate pair + conv update + recurrence + gated norm (+ the slice copy) in ONE cooperative kernel per layer: grid-wide phases with `cg::grid_group::sync` (cooperative launch inside the CUDA graph), the conv and gate phases wide (one CTA per head per row), the recurrence as P1's split-V blocks, the norm in the last phase | 5 x 34 = 170 | -0.2..0.3 ms at c1 (+5-7 %), ~-0.2 ms at c8/c16 (+2 %) | P1's two-kernel chain lost because its phases serialised inside 16-64 blocks; a grid-synced kernel keeps each phase as wide as today's kernels. Parity test exists (`test_kda_decode_chain.py`) |
+| F2 the shared expert inside the pair | the shared gate_up (fp8, block-scaled) streamed by gemv1's CTAs beside the routed experts with the clamped SiLU in the same epilogue; the shared down inside gemv2 beside the routed down, the moe_sum_add fold already there | 3 x 42 = 126 and the side stream | -0.1..0.15 ms at c1 (+2-3 %; the two streams stop contending for SMs), nothing at c8/c16 (Marlin serves those rows) | P15 showed the shared branch is not the critical path at one token; the gain is the contention and the launches, sized from the 15:35 timeline (gemv1 16.9 us in situ vs 13.5 cold) |
+| F3 the transition chain | sinkhorn_deferred + the router GEMV + the following norm into the all-reduce transition's tail (the transition already owns the residual streams; the router GEMV is 2.4 MB per layer, one CTA per 8 experts) | 2-3 x 45 = 90-135 | -0.1 ms at every shape (+2 % c1, +1 % c8/c16) | D5's kernel is the most-reworked piece of the branch; every change there needs its phase-stamp A/B |
+| F4 the decode GEMM chains | o_proj + the transition's first phase; q_b / kv_b / indexer wq_b of an MLA layer in one launch (three weights, one grid) | ~2 x 45 | -0.05..0.1 ms | the fp8 decode GEMM launcher already takes a config per shape; a multi-weight grid is a small extension |
+| F5 the drafter step | the MTP layer's ~25 launches + lm_head + all-gather + ~25 sampling kernels: P5's candidate gather, a draft-only NVFP4 lm_head, the sampler's device-to-host copies removed | ~3 x 30 per c1 spec step | c1 spec +5-8 %, c8/c16 spec +2-3 % | spec only; the acceptance counters are the gate |
+
+Order: F1 (largest, self-contained, parity test in place), F2 (kernel work
+inside the pair, which is the best-understood code on the branch), F5, F3,
+F4. Together they remove ~450 of the ~1100 launches per c1 step and are
+sized at +12-18 % c1, +5-7 % c8/c16 - the "leaps and bounds" that remain
+before the physics floor, at the cost of a persistent/cooperative kernel
+style the branch has not used yet. A cooperative launch inside a captured
+graph must be verified on this driver first (a 20-line probe before F1).
