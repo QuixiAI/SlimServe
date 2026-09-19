@@ -1,0 +1,21 @@
+# Install only after the recipe's qualification gate has been cleared.
+# Adapt checkout/cache paths and GPU ordinals; optional proxy listens separately.
+[Unit]
+Description=SlimServe Qwen3.8 native FP8 on four Intel Arc Pro B70 cards
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/SlimServe
+Environment=SLIMSERVE_CACHE=%h/models
+Environment=ZE_AFFINITY_MASK=0,1,2,3
+# Kernel, replay, attention and thinking defaults belong to the profile.
+# Keep oneAPI compiler setup and private credentials out of this example.
+ExecStart=%h/SlimServe/.venv/bin/python -m slimserve.cli qwen38-uncensored-fp8-4 --serve --host 127.0.0.1 --port 8001 --yes
+Restart=on-failure
+RestartSec=60s
+TimeoutStopSec=180s
+
+[Install]
+WantedBy=default.target
