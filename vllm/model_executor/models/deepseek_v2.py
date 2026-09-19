@@ -342,7 +342,7 @@ def _fused_gate_up_act(mlp: "DeepseekV2MLP", x: torch.Tensor) -> torch.Tensor | 
         return None
     x2 = x.reshape(-1, x.shape[-1])
     n, k = weight.shape
-    if x2.shape[0] > DECODE_GEMM_MAX_TOKENS or n % 64 or not decode_gemm_fp8_supports(n, k):
+    if x2.shape[0] == 0 or x2.shape[0] > DECODE_GEMM_MAX_TOKENS or n % 64 or not decode_gemm_fp8_supports(n, k):
         return None
     if scale.shape != ((n + 127) // 128, k // 128):
         return None
