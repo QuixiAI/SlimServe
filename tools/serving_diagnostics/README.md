@@ -68,11 +68,21 @@ model response. A background capture record may follow a downstream disconnect;
 missing terminal events can therefore mean cancellation or a transport/model
 failure. The existing records do not distinguish all of those causes.
 
-Only total request elapsed time is recorded. Per-chunk arrival times and true
-first-token latency cannot be reconstructed from event counts or sequence
-numbers. `first_chunk_ms: null` means unavailable. Aggregate elapsed time sums
-request durations and is not benchmark wall time. Captures can be truncated at
-the configured byte limit; the analyzers flag this separately.
+New captures record upstream header, first/last chunk, observed downstream
+disconnect, and send-error timings as monotonic milliseconds from request start.
+They also record upstream received and downstream successfully sent chunk/byte
+counts, upstream state, and a termination reason. Successful ASGI sends do not
+prove client receipt. First transport bytes are not necessarily first model tokens.
+Older captures lack these timings; null means unavailable. Aggregate elapsed time
+sums request durations and is not benchmark wall time. Captures can be truncated
+at the configured byte limit; analyzers flag this separately.
+
+Capture finalization runs once even after stream errors or cancellation. Cleanup
+is shielded with a bounded 10-second explicit upstream close; close failures are
+recorded. This lifecycle uses asyncio, matching the Uvicorn deployment. The proxy
+preserves raw response bytes and duplicate response headers; it adds no heartbeat
+or synthetic model events. A disconnected, unfinished request body is recorded
+as client-abandoned input (499), not a model-generation failure.
 
 Capture files contain request/response bodies, including user messages, tool
 results, and generated code. Header and selected JSON-key redaction are not a
@@ -86,5 +96,8 @@ instead of those payloads.
 python -m unittest discover -s tools/serving_diagnostics -p 'test_*.py' -q
 ```
 
-The 19 benign fixtures cover JSON syntax, empty assistant history, payload-free
+The 19 analyzer fixtures cover JSON syntax, empty assistant history, payload-free
 display, truncation, missing terminal events, and streamed/final call mismatches.
+
+Eleven additional ASGI lifecycle fixtures cover EOF, byte/header fidelity, upstream
+errors, downstream disconnect/send failure, cancellation, and cleanup.
