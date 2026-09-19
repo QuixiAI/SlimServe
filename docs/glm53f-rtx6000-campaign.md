@@ -1367,7 +1367,7 @@ the same; the mandate's A/B rules apply unchanged).
 
 | item | fusion | launches removed per step | expected | risk / precedent |
 |---|---|---|---|---|
-| F1 the KDA attention block as one kernel | gate pair + conv update + recurrence + gated norm (+ the slice copy) in ONE cooperative kernel per layer: grid-wide phases with `cg::grid_group::sync` (cooperative launch inside the CUDA graph), the conv and gate phases wide (one CTA per head per row), the recurrence as P1's split-V blocks, the norm in the last phase | 5 x 34 = 170 | -0.2..0.3 ms at c1 (+5-7 %), ~-0.2 ms at c8/c16 (+2 %) | P1's two-kernel chain lost because its phases serialised inside 16-64 blocks; a grid-synced kernel keeps each phase as wide as today's kernels. Parity test exists (`test_kda_decode_chain.py`) |
+| F1 the KDA attention block as one kernel | gate pair + conv update + recurrence + gated norm (+ the slice copy) in ONE cooperative kernel per layer: grid-wide phases with `cg::grid_group::sync` (cooperative launch inside the CUDA graph, verified), the conv and gate phases wide, the recurrence as P1's split-V blocks, the norm in the last phase | 5 x 34 = 170 | -0.1 ms at c1 (+2.5 %), ~-0.1 ms at c8/c16 (+1 %): P1's graph-replay measurement puts the four Triton kernels at 5.6 us per layer at one row (the trace's 8.5 us is dependent-launch accounting), so a ~2.5 us single kernel recovers ~3 us | P1's two-kernel chain lost because its phases serialised inside 16-64 blocks; a grid-synced kernel keeps each phase as wide as today's kernels, and pays ~1 us per grid sync. Parity test exists (`test_kda_decode_chain.py`) |
 | F2 the shared expert inside the pair | the shared gate_up (fp8, block-scaled) streamed by gemv1's CTAs beside the routed experts with the clamped SiLU in the same epilogue; the shared down inside gemv2 beside the routed down, the moe_sum_add fold already there | 3 x 42 = 126 and the side stream | -0.1..0.15 ms at c1 (+2-3 %; the two streams stop contending for SMs), nothing at c8/c16 (Marlin serves those rows) | P15 showed the shared branch is not the critical path at one token; the gain is the contention and the launches, sized from the 15:35 timeline (gemv1 16.9 us in situ vs 13.5 cold) |
 | F3 the transition chain | sinkhorn_deferred + the router GEMV + the following norm into the all-reduce transition's tail (the transition already owns the residual streams; the router GEMV is 2.4 MB per layer, one CTA per 8 experts) | 2-3 x 45 = 90-135 | -0.1 ms at every shape (+2 % c1, +1 % c8/c16) | D5's kernel is the most-reworked piece of the branch; every change there needs its phase-stamp A/B |
 | F4 the decode GEMM chains | o_proj + the transition's first phase; q_b / kv_b / indexer wq_b of an MLA layer in one launch (three weights, one grid) | ~2 x 45 | -0.05..0.1 ms | the fp8 decode GEMM launcher already takes a config per shape; a multi-weight grid is a small extension |
@@ -1376,7 +1376,8 @@ the same; the mandate's A/B rules apply unchanged).
 Order: F1 (largest, self-contained, parity test in place), F2 (kernel work
 inside the pair, which is the best-understood code on the branch), F5, F3,
 F4. Together they remove ~450 of the ~1100 launches per c1 step and are
-sized at +12-18 % c1, +5-7 % c8/c16 - the "leaps and bounds" that remain
+sized at +8-12 % c1, +4-5 % c8/c16 (F1 corrected from the graph-replay
+numbers) - the remaining "leaps and bounds"
 before the physics floor, at the cost of a persistent/cooperative kernel
 style the branch has not used yet. Verified 18:05 PDT (`$S/p9/coop_probe.cu`):
 a cooperative kernel with two `grid.sync()` phases captures into a CUDA
