@@ -208,6 +208,24 @@ class _Qwen38DumpState:
 # --- END TEMPORARY DIAGNOSTIC -----------------------------------------------
 
 
+def _qwen35_mlp_kind(config: object) -> str:
+    """Resolve dense versus MoE independently of the MTP model-type rewrite."""
+    if isinstance(config, Qwen3_5MoeTextConfig):
+        return "moe"
+    if isinstance(config, Qwen3_5TextConfig):
+        return "dense"
+
+    model_type = getattr(config, "model_type", None)
+    if model_type == "qwen3_5_moe_text":
+        return "moe"
+    if model_type == "qwen3_5_text":
+        return "dense"
+    if model_type == "qwen3_5_mtp":
+        architectures = getattr(config, "architectures", None) or []
+        return "moe" if "Qwen3_5MoeMTP" in architectures else "dense"
+    raise ValueError(f"Invalid model_type {model_type}")
+
+
 class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
     def __init__(
         self,
@@ -243,14 +261,15 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
         else:
             raise ValueError(f"Invalid layer_type {self.layer_type}")
 
-        # NOTE: Determine the MLP type based on the model type
-        # Qwen3.5 use all layers for MLP / Qwen3.5-MoE use sparse MoE blocks
-        if config.model_type == "qwen3_5_moe_text":
+        # SpeculativeConfig rewrites both dense and MoE MTP drafts to the
+        # shared qwen3_5_mtp model type. Preserve the concrete config class as
+        # the authority for selecting the decoder's feed-forward block.
+        if _qwen35_mlp_kind(config) == "moe":
             self.mlp = Qwen3NextSparseMoeBlock(
                 vllm_config=vllm_config,
                 prefix=f"{prefix}.mlp",
             )
-        elif config.model_type == "qwen3_5_text":
+        else:
             self.mlp = Qwen3NextMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
@@ -258,8 +277,6 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
             )
-        else:
-            raise ValueError(f"Invalid model_type {config.model_type}")
 
         self.input_layernorm = Qwen3_5RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -305,6 +322,16 @@ class Qwen3_5Model(Qwen3NextModel):
             ".in_proj_z": (".in_proj_qkvz", 3),
             ".in_proj_b": (".in_proj_ba", 0),
             ".in_proj_a": (".in_proj_ba", 1),
+            # GGUF stores Q/K/V in one row-concatenated quantized tensor.
+            # Qwen35GGUFAdapter slices it on row boundaries and gives the
+            # pieces private names so each piece reaches the merged GGUF
+            # parameter with a scalar shard id. Sending the original
+            # in_proj_qkv name through the tuple mapping above would attach
+            # one (0, 1, 2) id to the entire packed byte tensor, which the
+            # GGUF parameter loader cannot split safely.
+            ".in_proj_q_shard": (".in_proj_qkvz", 0),
+            ".in_proj_k_shard": (".in_proj_qkvz", 1),
+            ".in_proj_v_shard": (".in_proj_qkvz", 2),
         }
     )
 
@@ -374,8 +401,10 @@ class Qwen3_5Model(Qwen3NextModel):
 class Qwen3_5ForCausalLMBase(
     nn.Module,
     HasInnerState,
+    IsHybrid,
     SupportsEagle3,
     SupportsLoRA,
+    SupportsMRoPE,
     SupportsPP,
 ):
     packed_modules_mapping = {
@@ -431,6 +460,68 @@ class Qwen3_5ForCausalLMBase(
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
+
+    def get_mrope_input_positions(
+        self,
+        input_tokens: list[int],
+        mm_features: list["MultiModalFeatureSpec"],
+    ) -> tuple[torch.Tensor, int]:
+        """Return three identical position axes for the text-only model.
+
+        Qwen3.5 uses interleaved M-RoPE even in its text backbone. The GGUF
+        config therefore enables the runner's M-RoPE state, while this causal
+        LM class accepts no image or video features. For text, temporal,
+        height, and width positions all reduce to the token sequence and the
+        position delta is zero.
+        """
+        if mm_features:
+            raise NotImplementedError(
+                "Qwen3_5ForCausalLM is text-only; multimodal M-RoPE positions "
+                "require the Qwen VL wrapper."
+            )
+        text_len = len(input_tokens)
+        positions = (
+            torch.arange(text_len, dtype=torch.long).unsqueeze(0).expand(3, -1).clone()
+        )
+        return positions, 0
+
+    @classmethod
+    def get_mamba_state_dtype_from_config(
+        cls,
+        vllm_config: "VllmConfig",
+    ) -> tuple[torch.dtype, torch.dtype]:
+        return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
+            vllm_config.model_config.dtype,
+            vllm_config.cache_config.mamba_cache_dtype,
+            vllm_config.cache_config.mamba_ssm_cache_dtype,
+        )
+
+    @classmethod
+    def get_mamba_state_shape_from_config(
+        cls, vllm_config: "VllmConfig"
+    ) -> tuple[tuple[int, int], tuple[int, int, int]]:
+        parallel_config = vllm_config.parallel_config
+        hf_config = vllm_config.model_config.hf_text_config
+        num_spec = (
+            vllm_config.speculative_config.num_speculative_tokens
+            if vllm_config.speculative_config
+            else 0
+        )
+        return MambaStateShapeCalculator.gated_delta_net_state_shape(
+            parallel_config.tensor_parallel_size,
+            hf_config.linear_num_key_heads,
+            hf_config.linear_num_value_heads,
+            hf_config.linear_key_head_dim,
+            hf_config.linear_value_head_dim,
+            hf_config.linear_conv_kernel_dim,
+            num_spec,
+        )
+
+    @classmethod
+    def get_mamba_state_copy_func(
+        cls,
+    ) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
+        return MambaStateCopyFuncCalculator.gated_delta_net_state_copy_func()
 
     def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
         self.model.aux_hidden_state_layers = layers

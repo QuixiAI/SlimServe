@@ -132,6 +132,10 @@ def build_qwen35_config_from_gguf(gguf_path: str) -> Any:
     cfg.attn_output_gate = True
     cfg.output_gate_type = "swish"
     cfg.mamba_ssm_dtype = "float32"
+    # Preserve the appended NextN depth for SpeculativeConfig's MTP rewrite.
+    # The target loader still exposes only ``num_layers`` backbone blocks;
+    # the draft loader uses this value to instantiate the appended block(s).
+    cfg.mtp_num_hidden_layers = nextn
     cfg.architectures = ["Qwen3_5ForCausalLM"]
     # llama.cpp's converter (conversion/qwen.py,
     # _LinearAttentionVReorderBase) reorders every per-V-head GDN tensor
@@ -139,10 +143,11 @@ def build_qwen35_config_from_gguf(gguf_path: str) -> Any:
     # channels, out_proj columns) from HF grouped order
     # [G0v0 G0v1 G0v2, G1v0, ...] to ggml tiled-broadcast order
     # [G0v0 G1v0 ... G15v0, G0v1, ...] whenever num_k_heads != num_v_heads.
-    # The layout is self-consistent, but the q/k -> v-head pairing becomes
-    # i_k = i_hv % num_k_heads (tile) instead of HF's
-    # i_k = i_hv // (num_v_heads // num_k_heads) (repeat_interleave).
-    # The GDN core must expand q/k with tile semantics for these weights.
+    # The on-disk q/k -> v-head pairing is i_k = i_hv % num_k_heads
+    # (tile), rather than HF's grouped i_k = i_hv // (num_v_heads /
+    # num_k_heads). The GGUF adapter restores every affected tensor to HF
+    # grouped order before TP slicing, then clears the runtime layout flag.
+    cfg.gguf_gdn_tiled_weights = True
     cfg.gdn_tiled_v_head_layout = True
     logger.info(
         "Built qwen35 config from GGUF: %d layers (%d linear, %d full, "

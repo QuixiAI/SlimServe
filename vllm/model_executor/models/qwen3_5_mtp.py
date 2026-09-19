@@ -48,6 +48,32 @@ from .utils import (
 logger = init_logger(__name__)
 
 
+def _clear_stale_mtp_attention_context(
+    vllm_config: VllmConfig, prefix: str
+) -> tuple[str, ...]:
+    """Remove pre-registered draft layers before constructing the real MTP model.
+
+    Target and draft models intentionally share CompilationConfig so the runner
+    can discover both cache families. GGUF draft preparation can leave the MTP
+    attention prefix registered before the weight-bearing draft is built; the
+    Attention constructor correctly rejects that duplicate. Only entries under
+    this draft model's private prefix are stale and safe to replace here.
+    """
+    context = vllm_config.compilation_config.static_forward_context
+    layer_prefix = f"{prefix}.layers."
+    stale = tuple(name for name in context if name.startswith(layer_prefix))
+    for name in stale:
+        del context[name]
+    if stale:
+        logger.warning(
+            "Cleared %d stale Qwen3.5 MTP attention registrations before "
+            "draft construction: %s",
+            len(stale),
+            stale,
+        )
+    return stale
+
+
 @support_torch_compile(
     dynamic_arg_dims={
         "input_ids": 0,
@@ -101,6 +127,7 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
             prefix=f"{prefix}.fc",
         )
 
+        _clear_stale_mtp_attention_context(vllm_config, prefix)
         self.layers = torch.nn.ModuleList(
             Qwen3_5DecoderLayer(
                 vllm_config,

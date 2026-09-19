@@ -1412,6 +1412,11 @@ class SpecDecodeBaseProposer:
             target_language_model = cast(
                 SupportsMultiModal, target_model
             ).get_language_model()
+        elif hasattr(target_model, "get_language_model"):
+            # Text-only wrappers over VLM-layout checkpoints (Qwen3.5 in this
+            # fork) still expose the inner causal LM, but intentionally do not
+            # implement the multimodal interface. Share from that inner model.
+            target_language_model = target_model.get_language_model()
         else:
             target_language_model = target_model
 
