@@ -87,6 +87,28 @@ def ggml_dequantize_into(
     torch.ops._C.ggml_dequantize_into(W, quant_type, m, n, out)
 
 
+def ggml_repack_q8_0_split(W: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
+    if not _is_xpu():
+        raise NotImplementedError("split-plane Q8_0 repack is XPU-only")
+    return _xpu_qc().ggml_repack_q8_0_split(W, rows, cols)
+
+
+def ggml_mul_mat_vec_split_q8(
+    W: torch.Tensor, X: torch.Tensor, rows: int
+) -> torch.Tensor:
+    if not _is_xpu():
+        raise NotImplementedError("split-plane Q8_0 GEMV is XPU-only")
+    return _xpu_qc().ggml_mul_mat_vec_split_q8(W, X, rows)
+
+
+def ggml_dequantize_split_q8_into(
+    W: torch.Tensor, rows: int, cols: int, out: torch.Tensor
+) -> None:
+    if not _is_xpu():
+        raise NotImplementedError("split-plane Q8_0 dequant is XPU-only")
+    _xpu_qc().ggml_dequantize_split_q8_into(W, rows, cols, out)
+
+
 def ggml_mul_mat_vec_a8(
     W: torch.Tensor, X: torch.Tensor, quant_type: int, row: int
 ) -> torch.Tensor:

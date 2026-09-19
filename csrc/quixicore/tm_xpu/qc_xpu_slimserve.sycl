@@ -141,6 +141,57 @@ torch::Tensor ggml_dequantize(torch::Tensor W, int64_t quant_type, int64_t m, in
   return out;
 }
 
+torch::Tensor ggml_repack_q8_0_split(torch::Tensor W, int64_t rows,
+                                     int64_t cols) {
+  check_weight(W);
+  TORCH_CHECK(W.dim() == 2 && W.size(0) == rows,
+              "quixicore-xpu q8 split: expected W [rows, packed-K]");
+  TORCH_CHECK(cols % 32 == 0 && W.size(1) == cols / 32 * 34,
+              "quixicore-xpu q8 split: packed width does not match K");
+  TORCH_CHECK((rows * (cols / 32) * 2) % 16 == 0,
+              "quixicore-xpu q8 split: quant plane is not 16-byte aligned");
+  auto split = torch::empty_like(W);
+  qx::ops::q8_split_repack(
+      queue_of(W), W.data_ptr(), split.data_ptr(),
+      static_cast<std::size_t>(rows), static_cast<std::size_t>(cols), false);
+  return split;
+}
+
+torch::Tensor ggml_mul_mat_vec_split_q8(torch::Tensor W, torch::Tensor X,
+                                        int64_t rows) {
+  check_weight(W);
+  TORCH_CHECK(W.dim() == 2 && W.size(0) == rows,
+              "quixicore-xpu q8 split: expected W [rows, packed-K]");
+  TORCH_CHECK(X.is_xpu() && X.dim() == 2 && X.size(0) >= 1 &&
+                  X.size(0) <= 16,
+              "quixicore-xpu q8 split: X must be [1..16, K] on XPU");
+  auto x = X.contiguous();
+  const int64_t R = x.size(0), K = x.size(1);
+  TORCH_CHECK(K % 32 == 0 && W.size(1) == K / 32 * 34,
+              "quixicore-xpu q8 split: packed width does not match K");
+  auto y = torch::empty({R, rows}, x.options());
+  qx::ops::q8_split_gemv(
+      queue_of(x), W.data_ptr(), x.data_ptr(), y.data_ptr(),
+      static_cast<std::size_t>(R), static_cast<std::size_t>(rows),
+      static_cast<std::size_t>(K), act_dtype(x), false);
+  return y;
+}
+
+void ggml_dequantize_split_q8_into(torch::Tensor W, int64_t rows,
+                                   int64_t cols, torch::Tensor out) {
+  check_weight(W);
+  TORCH_CHECK(W.dim() == 2 && W.size(0) == rows &&
+                  W.size(1) == cols / 32 * 34 && cols % 32 == 0,
+              "quixicore-xpu q8 split: invalid packed dimensions");
+  TORCH_CHECK(out.is_xpu() && out.is_contiguous() &&
+                  out.numel() == rows * cols,
+              "quixicore-xpu q8 split: invalid dequant output");
+  qx::ops::q8_split_dequantize(
+      queue_of(out), W.data_ptr(), out.data_ptr(),
+      static_cast<std::size_t>(rows), static_cast<std::size_t>(cols),
+      act_dtype(out), false);
+}
+
 // ---- UVA: an XPU-typed view over pinned host memory ------------------------
 // Pinned host allocations on XPU are USM host memory, addressable from device
 // kernels; the shared V1 runner keeps small input-prep buffers there
@@ -207,6 +258,12 @@ void register_slimserve_ops(pybind11::module_& m) {
   m.def("ggml_moe_a8_vec", &ggml_moe_a8_vec, "GGUF routed expert GEMV");
   m.def("ggml_dequantize", &ggml_dequantize, "GGUF dequantize to a dense tensor");
   m.def("ggml_dequantize_into", &ggml_dequantize_into, "GGUF dequantize into an existing tensor");
+  m.def("ggml_repack_q8_0_split", &ggml_repack_q8_0_split,
+        "Repack raw Q8_0 blocks into byte-neutral scale/quant planes");
+  m.def("ggml_mul_mat_vec_split_q8", &ggml_mul_mat_vec_split_q8,
+        "Q8_0 split-plane GEMV for batches 1..16");
+  m.def("ggml_dequantize_split_q8_into", &ggml_dequantize_split_q8_into,
+        "Dequantize split-plane Q8_0 into an existing tensor");
   m.def("ggml_supports", &ggml_supports, "Whether a ggml type is supported by these kernels");
   m.def("weak_ref_tensor", &weak_ref_tensor, "Non-owning alias of an XPU tensor");
   m.def("get_xpu_view_from_cpu_tensor", &get_xpu_view_from_cpu_tensor,
