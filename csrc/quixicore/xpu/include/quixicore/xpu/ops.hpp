@@ -986,6 +986,14 @@ void gguf_routed_gemv(sycl::queue& q, const void* w, const void* x, void* y,
 void gguf_dequantize(sycl::queue& q, const void* w, void* out, std::size_t N,
                      std::size_t K, int ggml_type, DType out_dt,
                      const std::uint64_t* iq2xxs_grid_dev, bool blocking = true);
+void q8_split_repack(sycl::queue& q, const void* raw, void* split,
+                     std::size_t N, std::size_t K, bool blocking = true);
+void q8_split_gemv(sycl::queue& q, const void* split, const void* x, void* y,
+                   std::size_t R, std::size_t N, std::size_t K, DType act_dt,
+                   bool blocking = true);
+void q8_split_dequantize(sycl::queue& q, const void* split, void* out,
+                         std::size_t N, std::size_t K, DType out_dt,
+                         bool blocking = true);
 
 // Per-token symmetric int8 activation quantization. `x` [rows, dim] dtype dt ->
 // `q` [rows, dim] int8 + `scale` [rows] fp32, where scale = rowmax(|x|)/127 and

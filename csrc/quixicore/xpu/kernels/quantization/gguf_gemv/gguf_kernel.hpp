@@ -36,4 +36,15 @@ sycl::event gguf_dequantize_sycl(sycl::queue& q, const void* w, void* out,
                                  std::size_t N, std::size_t K, int ggml_type,
                                  DType out_dt, const std::uint64_t* iq2xxs_grid_dev);
 
+// Byte-neutral Q8_0 split layout: fp16 scales [N,K/32], followed by aligned
+// int8 quants [N,K] in one allocation.
+sycl::event q8_split_repack_sycl(sycl::queue& q, const void* raw, void* split,
+                                 std::size_t N, std::size_t K);
+sycl::event q8_split_gemv_sycl(sycl::queue& q, const void* split, const void* x,
+                               void* y, std::size_t R, std::size_t N,
+                               std::size_t K, DType act_dt);
+sycl::event q8_split_dequantize_sycl(sycl::queue& q, const void* split,
+                                     void* out, std::size_t N, std::size_t K,
+                                     DType out_dt);
+
 }  // namespace quixicore::xpu::kernels
