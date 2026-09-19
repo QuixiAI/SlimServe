@@ -22,6 +22,7 @@ from vllm.entrypoints.openai.engine.protocol import (
     FunctionDefinition,
 )
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
+from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
 from vllm.parser.metrics import record_tool_parser_invocation
 from vllm.parser.utils import count_history_tool_calls
@@ -538,14 +539,32 @@ class DelegatingParser(Parser):
         if structure_tag is None:
             return request
 
+        # The tool grammar leaves ordinary assistant text unconstrained. It
+        # cannot enforce a separate output schema, so do not silently discard
+        # that caller constraint when installing the tool grammar.
+        if isinstance(request, ResponsesRequest):
+            response_format = request.text.format if request.text else None
+            format_parameter = "text.format"
+        else:
+            response_format = request.response_format
+            format_parameter = "response_format"
+        if response_format is not None and response_format.type != "text":
+            raise VLLMValidationError(
+                "Assistant structured output cannot be combined with tool-call "
+                "grammar; use tool_choice='none' for structured assistant output",
+                parameter=format_parameter,
+            )
+        if request.structured_outputs is not None:
+            raise VLLMValidationError(
+                "structured_outputs cannot be combined with tool-call grammar; "
+                "use tool_choice='none' for structured assistant output",
+                parameter="structured_outputs",
+            )
+
         structural_tag = json.dumps(structure_tag.model_dump())
         request.structured_outputs = StructuredOutputsParams(
             structural_tag=structural_tag,
         )
-        if isinstance(request, ResponsesRequest):
-            request.text = None
-        else:
-            request.response_format = None
         return request
 
     def extract_reasoning_streaming(

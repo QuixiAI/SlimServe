@@ -26209,3 +26209,14 @@ Phases, by value over risk:
 - Results: no new throughput measurement or hardware qualification claimed.
 - Decision: submit as a focused PR; preserve current-main behavior outside this fix.
 - Raw artifacts: local test output; no traffic captures or model data committed.
+
+
+## 2026-09-19 - Reject conflicting assistant schemas before installing tool grammar
+
+- Status: retained for review.
+- Baseline: `fix/tool-json-grammar`; forward-port from the B70 serving integration.
+- Change: Reject assistant JSON/schema constraints that the tool grammar cannot enforce, without mutating the request; keep ordinary text format metadata.
+- Correctness: 22 schema-conflict tests and eight inherited grammar tests passed on CPU.
+- Results: no new throughput measurement or hardware qualification claimed.
+- Decision: submit as a focused PR; preserve current-main behavior outside this fix.
+- Raw artifacts: local test output; no traffic captures or model data committed.
