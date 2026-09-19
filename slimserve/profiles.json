@@ -1632,6 +1632,172 @@
           ]
         }
       }
+    },
+    "qwen38-27b-abliterated": {
+      "title": "Qwen3.8-27B BF16",
+      "modalities": [
+        "text",
+        "image"
+      ],
+      "repo": "huihui-ai/Huihui-Qwen3.8-27B-abliterated",
+      "base_url": "https://huggingface.co/huihui-ai/Huihui-Qwen3.8-27B-abliterated/resolve/main",
+      "local_dir": "Huihui-Qwen3.8-27B-abliterated",
+      "shared_note": "Native vision-language BF16 checkpoint with embedded MTP. Main retains its vision tower and processor assets; text and image qualification is required.",
+      "speculator": {
+        "repo": "huihui-ai/Huihui-Qwen3.8-27B-abliterated",
+        "base_url": "https://huggingface.co/huihui-ai/Huihui-Qwen3.8-27B-abliterated/resolve/main",
+        "local_dir": "Huihui-Qwen3.8-27B-abliterated",
+        "engine": {
+          "method": "mtp",
+          "num_speculative_tokens": 1,
+          "draft_tensor_parallel_size": 4,
+          "use_local_argmax_reduction": true,
+          "kv_cache_dtype": "fp8"
+        },
+        "note": "The BF16 checkpoint contains one native Qwen3.5 MTP layer. Depth 1 is the conservative qualification default; the benchmark matrix measures deeper reuse before promotion."
+      },
+      "quants": {
+        "bf16": {
+          "title": "Unquantised bf16 (HF safetensors, 18 shards)",
+          "bytes": 55586059962,
+          "summary": "Full-precision weights. Chosen over NVFP4 because NVFP4 measurably degraded this model's capability on B70 (2026-09-14).",
+          "min_gpus": {
+            "b70": 4
+          },
+          "min_memory_bytes": {},
+          "files": [
+            {
+              "path": ".gitattributes",
+              "bytes": 1570
+            },
+            {
+              "path": "LICENSE",
+              "bytes": 11544
+            },
+            {
+              "path": "README.md",
+              "bytes": 10671
+            },
+            {
+              "path": "chat_template.jinja",
+              "bytes": 8952
+            },
+            {
+              "path": "config.json",
+              "bytes": 4312
+            },
+            {
+              "path": "crc32.txt",
+              "bytes": 238
+            },
+            {
+              "path": "generation_config.json",
+              "bytes": 202
+            },
+            {
+              "path": "merges.txt",
+              "bytes": 3353259
+            },
+            {
+              "path": "model-00001-of-00018.safetensors",
+              "bytes": 3966730520
+            },
+            {
+              "path": "model-00002-of-00018.safetensors",
+              "bytes": 3043080296
+            },
+            {
+              "path": "model-00003-of-00018.safetensors",
+              "bytes": 2542796928
+            },
+            {
+              "path": "model-00004-of-00018.safetensors",
+              "bytes": 3988973120
+            },
+            {
+              "path": "model-00005-of-00018.safetensors",
+              "bytes": 2099339832
+            },
+            {
+              "path": "model-00006-of-00018.safetensors",
+              "bytes": 3979553664
+            },
+            {
+              "path": "model-00007-of-00018.safetensors",
+              "bytes": 2108759312
+            },
+            {
+              "path": "model-00008-of-00018.safetensors",
+              "bytes": 3979553664
+            },
+            {
+              "path": "model-00009-of-00018.safetensors",
+              "bytes": 2108759312
+            },
+            {
+              "path": "model-00010-of-00018.safetensors",
+              "bytes": 3979553664
+            },
+            {
+              "path": "model-00011-of-00018.safetensors",
+              "bytes": 2108759312
+            },
+            {
+              "path": "model-00012-of-00018.safetensors",
+              "bytes": 3979553664
+            },
+            {
+              "path": "model-00013-of-00018.safetensors",
+              "bytes": 2108759312
+            },
+            {
+              "path": "model-00014-of-00018.safetensors",
+              "bytes": 3979553664
+            },
+            {
+              "path": "model-00015-of-00018.safetensors",
+              "bytes": 2108759312
+            },
+            {
+              "path": "model-00016-of-00018.safetensors",
+              "bytes": 3979564008
+            },
+            {
+              "path": "model-00017-of-00018.safetensors",
+              "bytes": 2108759312
+            },
+            {
+              "path": "model-00018-of-00018.safetensors",
+              "bytes": 3392197320
+            },
+            {
+              "path": "model.safetensors.index.json",
+              "bytes": 112216
+            },
+            {
+              "path": "preprocessor_config.json",
+              "bytes": 390
+            },
+            {
+              "path": "tokenizer.json",
+              "bytes": 12809320
+            },
+            {
+              "path": "tokenizer_config.json",
+              "bytes": 17928
+            },
+            {
+              "path": "video_preprocessor_config.json",
+              "bytes": 385
+            },
+            {
+              "path": "vocab.json",
+              "bytes": 6722759
+            }
+          ]
+        }
+      },
+      "format": "safetensors"
     }
   },
   "platforms": {
@@ -3420,6 +3586,78 @@
           "status": "in-progress",
           "status_reason": "Forward-ported B70 recipe awaits current-main hardware qualification",
           "status_detail": "Historical B70 serving evidence does not qualify this forward port. Merge the XPU and serving prerequisites, then validate cold boot, text/image canaries, native MTP, correctness and sustained load before promotion."
+        }
+      }
+    },
+    "qwen38-bf16-4": {
+      "title": "Qwen3.8-27B BF16 on 4 Intel Arc Pro B70",
+      "source": "qwen38-27b-abliterated",
+      "gpus": 4,
+      "summary": "Native BF16 checkpoint with embedded MTP, TP4 decode graphs, and FP8 E4M3 KV cache; live qualification is gated after Xe copy-engine resets.",
+      "speculative": true,
+      "variants": {
+        "b70": {
+          "status": "in-progress",
+          "status_reason": "Forward-ported B70 recipe awaits current-main hardware qualification",
+          "status_detail": "The checkpoint and native MTP tensor contract validate offline, and eager chat canaries passed, but the first matched benchmark hung. The following graph boot coincided with Xe BCS memory CAT errors and engine resets on two cards, then rank 0 stalled during load. A second reset occurred during teardown. Keep this profile gated until the XPU copy-engine failure is isolated and a clean cold boot, canaries, and matched throughput matrix pass.",
+          "default_quant": "bf16",
+          "engine": {
+            "tensor_parallel_size": 4,
+            "shutdown_timeout": 120,
+            "max_model_len": 262144,
+            "max_num_seqs": 32,
+            "max_num_batched_tokens": 16384,
+            "gpu_memory_utilization": 0.9,
+            "kv_cache_dtype": "fp8_e4m3",
+            "attention_backend": "FLASH_ATTN",
+            "enable_prefix_caching": true,
+            "compilation_config": {
+              "mode": 0,
+              "cudagraph_mode": "FULL_DECODE_ONLY",
+              "cudagraph_capture_sizes": [
+                2,
+                4,
+                6,
+                8,
+                12,
+                16,
+                20,
+                24,
+                32,
+                40,
+                48,
+                64
+              ],
+              "max_cudagraph_capture_size": 64
+            },
+            "enable_auto_tool_choice": true,
+            "tool_call_parser": "qwen3_coder",
+            "reasoning_parser": "qwen3",
+            "served_model_name": "Qwen3.8-27B-BF16",
+            "override_generation_config": {
+              "thinking_token_budget": 2000
+            }
+          },
+          "env": {
+            "VLLM_USE_BREAKABLE_CUDAGRAPH": "1",
+            "VLLM_XPU_ENABLE_XPU_GRAPH": "0",
+            "VLLM_XPU_GEMMA_NORM_FUSED": "1",
+            "ZES_ENABLE_SYSMAN": "1",
+            "FI_TCP_IFACE": "lo",
+            "TORCH_FR_BUFFER_SIZE": "0",
+            "TORCHDYNAMO_DISABLE": "1",
+            "CCL_TOPO_FABRIC_VERTEX_CONNECTION_CHECK": "0",
+            "VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS": "120"
+          },
+          "notes": [
+            "All 1,199 checkpoint tensors are BF16; no online weight quantization is enabled.",
+            "The checkpoint index contains the complete native one-layer Qwen3.5 MTP tensor set. Depth 1 is the initial default pending the matched depth sweep.",
+            "FULL_DECODE_ONLY uses the qualified breakable XPU graph backend; VLLM_XPU_ENABLE_XPU_GRAPH=0 avoids the slower legacy graph route.",
+            "FP8 E4M3 KV preserves long-context capacity while keeping the BF16 target and draft weights unchanged.",
+            "The profile supplies a 2000-token thinking default for all reasoning efforts except none; an explicit request budget, including -1 for unlimited, takes precedence.",
+            "This recipe is gated pending fresh qualification on current main; earlier measurements apply only to the saved B70 integration checkout."
+          ],
+          "platform": "b70"
         }
       }
     }

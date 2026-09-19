@@ -26231,3 +26231,14 @@ Phases, by value over risk:
 - Results: no new throughput measurement or hardware qualification claimed.
 - Decision: submit as a focused PR; preserve current-main behavior outside this fix.
 - Raw artifacts: local test output; no traffic captures or model data committed.
+
+
+## 2026-09-19 - Register a gated Qwen3.8-27B BF16 recipe for B70
+
+- Status: retained for review.
+- Baseline: `feat/qwen38-b70-q8-profile`; forward-port from the B70 serving integration.
+- Change: Keep the BF16 target and native draft in one checkpoint, retain vision assets and FP8 KV, and preserve the explicit qualification gate in the current variant registry.
+- Correctness: 75 registry and recipe checks passed on CPU; live BF16 serving remains gated after historical Xe copy-engine faults.
+- Results: no new throughput measurement or hardware qualification claimed.
+- Decision: submit as a focused PR; preserve current-main behavior outside this fix.
+- Raw artifacts: local test output; no traffic captures or model data committed.
