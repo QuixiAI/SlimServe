@@ -152,7 +152,9 @@ in place, the MoE output aliased on CUDA when the experts reduce on their
 own; switches QC_KDA_DIRECT_OUT / QC_MOE_OUTPUT_ALIAS): plain 227.5 /
 774-778 / 1118-1119 (+37 / +13 / +16 % on the control), spec level-to-up
 on a six-pass c16 A/B. CodeRabbit round 10 (eight findings on 649c319a5)
-fixed in the same push; the loop continues from there.
+fixed in the same push; round 11 (one finding) fixed in e55faac2c; round 12
+(02:17Z, on b9e91a3c0) found nothing: the PR passes automated review at
+that head with zero open threads.
 P15 (17:44 PDT): a gated variant of the fp8 decode GEMM (the shared
 experts' gate/up GEMM with silu(clamp(gate)) * clamp(up) in its epilogue,
 `decode_gemm_fp8_gated`, 12 tests) measured level and its MLP hook is off
