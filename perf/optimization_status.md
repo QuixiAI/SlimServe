@@ -30764,3 +30764,47 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   the dispatch's process-wide flags around every test (autouse fixture) and
   drops an ambiguous local name, as does the swap-set test; the campaign
   doc's P10 record names its raw artifacts.
+
+- PHASE 8 / P15 THE SHARED EXPERTS' ACTIVATION FOLDED INTO THEIR GATE/UP GEMM
+  (2026-09-18 17:10-17:25 PDT; `fp8_decode_gemm.cuh` template flag GATED,
+  binding `decode_gemm_fp8_gated`, `DeepseekV2MLP._fused_gate_up_act`,
+  QC_FP8_GATED=0 restores the two launches; 12 new cases in
+  `tests/kernels/test_quixicore_decode_gemm_fp8.py`).
+  Sizing (the 15:35 c1 timeline): per MoE layer the shared expert runs on
+  the side stream as fp8 gate_up 7.8 us -> Triton clamp-SiLU-mul 4.2 ->
+  fp8 down 8.9 = 20.9 us, in parallel with route + gemv1 = 18.9 us on the
+  main stream, and gemv2 waits for both: the shared branch is the layer's
+  critical path by ~2 us, and the two branches contend for the same SMs
+  (the shared GEMMs read at 0.23-0.54 TB/s in situ against 0.66-0.70 cold).
+  Change: the decode GEMM's CTA takes NT/2 gate rows and their NT/2 up rows
+  of the merged [gate; up] weight (no relayout; both scale rows loaded) and
+  its epilogue writes silu(min(gate, limit)) * clamp(up, +/- limit) into
+  [M, N/2] - one launch for the shared experts' gate/up + activation at
+  M <= 16, the dense MLP layers included. Expected: -4 us on the shared
+  branch, the layer shortened by ~2 us until the main branch dominates
+  (~+2 % c1; c8/c16 have Marlin on the main branch and gain nothing).
+  Serving: `$S/p8/chain_p15.sh` (below).
+  First round (17:23-17:28 PDT, `$S/p8/chain_p15.sh`, plain): c1 217.4 /
+  217.4 against 227.7 / 227.3 (-4.4 %), c8 778.1 / 779.8 and c16 1120.2 /
+  1121.4 (+0.3 %), gates and canaries clean. The P9 lesson again: the fp8
+  decode GEMM fires its dependent-launch trigger at entry; the Triton
+  activation used to sit between the gate/up GEMM and the down GEMM, and
+  with it gone the down GEMM's CTAs launched at the gate/up GEMM's entry
+  and sat on the SMs while it and gemv1 streamed. The GATED variant now
+  triggers after its main loop (the plain variant keeps the early trigger
+  its own chains were qualified with). Second round: `chain_p15b.sh`.
+  Second round (17:34-17:39 PDT, `$S/p8/chain_p15b.sh`, late trigger):
+  plain c1 226.2 / 226.4, c8 779.1 / 775.6, c16 1115.0 / 1110.9 against
+  227.7 / 227.3, 774.0 / 777.6, 1117.6 / 1119.2: c1 -0.5 %, c8 +0.3 %, c16
+  -0.4 % - level. Gates (4) -2.419 / -2.447 / -2.428 / -2.479, canaries
+  PASS. With the trigger no longer distorting the picture, the shared
+  branch is not the layer's critical path at one token and the folded
+  launch buys nothing; the small in-situ cost is the gated CTA's two row
+  spans and two scale rows. DECISION: level; the GATED kernel variant and
+  its binding stay (tested, `decode_gemm_fp8_gated`), the MLP hook defaults
+  OFF (QC_FP8_GATED=1 enables it for an A/B); the record's environment is
+  unchanged.
+  Spec, four passes (17:39-17:44 PDT, gated on): c1 282.9 295.4 331.4 270.4
+  (median 289), c8 821.3 799.1 833.3 832.7 (827), c16 1159.3 1137.0 1127.7
+  1149.0 (1143) - inside their draws. Default set to off in
+  DeepseekV2MLP._fp8_gated_enabled (QC_FP8_GATED=1 enables).

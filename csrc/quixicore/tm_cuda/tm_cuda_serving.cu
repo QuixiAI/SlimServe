@@ -215,6 +215,31 @@ static torch::Tensor py_decode_gemm_fp8(torch::Tensor x, torch::Tensor weight, t
     return out;
 }
 
+// The gated variant: merged [gate; up] weight [N, K] -> silu(clamp(gate)) * clamp(up) [M, N/2]
+// (the shared experts' gate/up GEMM with silu_and_mul_with_clamp folded in; block scales).
+static torch::Tensor py_decode_gemm_fp8_gated(torch::Tensor x, torch::Tensor weight, torch::Tensor scale, double clamp) {
+    CK(x); CK(weight); CK(scale);
+    TORCH_CHECK(weight.device() == x.device() && scale.device() == x.device(),
+                "decode_gemm_fp8_gated: weight and scale must be on the x device");
+    TORCH_CHECK(x.scalar_type() == torch::kBFloat16, "decode_gemm_fp8_gated: bf16 x");
+    TORCH_CHECK(weight.scalar_type() == torch::kFloat8_e4m3fn, "decode_gemm_fp8_gated: float8_e4m3fn weight");
+    TORCH_CHECK(scale.scalar_type() == torch::kFloat32, "decode_gemm_fp8_gated: fp32 block scales");
+    TORCH_CHECK(x.dim() == 2 && weight.dim() == 2 && x.size(1) == weight.size(1),
+                "decode_gemm_fp8_gated: x [M, K], weight [N, K]");
+    const int M = int(x.size(0)), K = int(x.size(1)), N = int(weight.size(0));
+    TORCH_CHECK(decode_gemm_fp8::supports(M, N, K) && N % 64 == 0,
+                "decode_gemm_fp8_gated: unsupported shape M=", M, " N=", N, " K=", K, " (N % 64)");
+    TORCH_CHECK(scale.dim() == 2 && scale.size(0) == (N + decode_gemm_fp8::SB - 1) / decode_gemm_fp8::SB &&
+                    scale.size(1) == K / decode_gemm_fp8::SB,
+                "decode_gemm_fp8_gated: block scales [ceil(N/128), K/128]");
+    const c10::cuda::CUDAGuard guard(x.device());
+    auto out = torch::empty({M, N / 2}, x.options());
+    decode_gemm_fp8::launch_auto<__nv_bfloat16, false, true>(
+        bp(x), static_cast<const uint8_t*>(weight.data_ptr()), fp(scale), nullptr, bpm(out), M, N, K, stream(), float(clamp));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+
 #if !defined(USE_ROCM)
 // GLM-5.3 decode: the tensor-parallel all-reduce of `inp` ([T, 4096] bf16 TP
 // partial) fused with the mHC transition. With a staging buffer the input is
@@ -3287,6 +3312,9 @@ void init_serving(py::module_& m) {
     m.def("decode_gemm", &py_decode_gemm, py::arg("x"), py::arg("weight"),
           py::arg("bias") = py::none(), py::arg("fp32_out") = false,
           "bf16 M<=16 GEMM on tensor cores: x @ weight^T (+ bias), fp32 accumulation");
+    m.def("decode_gemm_fp8_gated", &py_decode_gemm_fp8_gated, py::arg("x"), py::arg("weight"), py::arg("scale"),
+          py::arg("clamp") = -1.0,
+          "bf16 x FP8 merged [gate; up] weights (128x128 fp32 block scales), M<=16: silu(clamp(gate)) * clamp(up) [M, N/2]");
     m.def("decode_gemm_fp8", &py_decode_gemm_fp8, py::arg("x"), py::arg("weight"), py::arg("scale"),
           py::arg("bias") = py::none(), py::arg("fp32_out") = false,
           "bf16 x FP8 weights (e4m3 with 128x128 fp32 block scales, or one fp32 scale per row), "

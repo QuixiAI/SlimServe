@@ -72,22 +72,35 @@ struct Cfg {
 
 // CHANNEL: one fp32 scale per weight row ([N]) instead of the 128x128 block
 // scales; each lane keeps the scales of the rows its B fragments cover.
-template <int NT, int WARPS, int KCHUNK, int STAGES, typename OutT, bool CHANNEL = false>
+// GATED: the block's NT rows are NT/2 gate rows (n0h + r) and their NT/2 up rows
+// (N/2 + n0h + r) of a merged [gate; up] weight, and the epilogue writes
+// silu(clamp(gate)) * clamp(up) (silu_and_mul_with_clamp's act-first form,
+// clamp < 0 for none) into out[M][N/2]: the shared experts' activation launch
+// folded into their gate/up GEMM.
+template <int NT, int WARPS, int KCHUNK, int STAGES, typename OutT, bool CHANNEL = false, bool GATED = false>
 __global__ void __launch_bounds__(WARPS * 32) fp8_decode_gemm_kernel(
         const __nv_bfloat16* __restrict__ x,     // [M, K]
         const uint8_t* __restrict__ w,           // [N, K] e4m3
         const float* __restrict__ scale,         // [ceil(N/128), K/128], or [N] when CHANNEL
         const float* __restrict__ bias,          // [N] or nullptr
-        OutT* __restrict__ out,                  // [M, N]
-        int M, int N, int K, int pdl) {
+        OutT* __restrict__ out,                  // [M, N] (GATED: [M, N/2])
+        int M, int N, int K, float clamp, int pdl) {
     using C = Cfg<NT, WARPS, KCHUNK, STAGES>;
     extern __shared__ __align__(16) unsigned char smem_raw[];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int n0 = blockIdx.x * NT;
+    const int n0h = blockIdx.x * (NT / 2);                       // GATED: the block's first gate row
+    auto row_of = [&](int r) { return GATED ? (r < NT / 2 ? n0h + r : N / 2 + n0h + (r - NT / 2)) : n0 + r; };
     const int nchunks = K / KCHUNK;
-    const float* srow = scale + size_t(n0 / SB) * (K / SB);   // this block's scale row: one value per scale block
+    // this block's scale row(s): one value per scale block (GATED: the gate rows' and the up rows')
+    const float* srow = scale + size_t((GATED ? n0h : n0) / SB) * (K / SB);
+    const float* srow_u = GATED ? scale + size_t((N / 2 + n0h) / SB) * (K / SB) : srow;
     if (pdl) {
-        pdl_trigger();
+        // GATED (the shared experts gate/up + activation) triggers after its stream
+        // instead: its dependent is the shared down GEMM, whose early-launched CTAs
+        // would otherwise sit on the SMs while this kernel and the routed experts
+        // stream (c1 plain 227.5 -> 217.4 with the trigger here, 2026-09-18).
+        if constexpr (!GATED) pdl_trigger();
         // The weight slice does not depend on the predecessor: request every
         // 128-byte line of the block's NT rows (NT * K bytes) into L2 now, so
         // the staged cp.async loads below hit L2 once the activation is ready.
@@ -96,18 +109,18 @@ __global__ void __launch_bounds__(WARPS * 32) fp8_decode_gemm_kernel(
             // launch overlap only: no prefetch
         } else if (pdl == 2) {
             // one bulk prefetch per row (K bytes, contiguous)
-            if (tid < NT) prefetch_bulk_l2(w + size_t(min(n0 + tid, N - 1)) * K, uint32_t(row_bytes));
+            if (tid < NT) prefetch_bulk_l2(w + size_t(min(row_of(tid), N - 1)) * K, uint32_t(row_bytes));
         } else {
             const size_t lines_per_row = row_bytes / 128;
             for (size_t i = tid; i < size_t(NT) * lines_per_row; i += C::THREADS) {
                 const int r = int(i / lines_per_row);
                 const size_t off = (i - size_t(r) * lines_per_row) * 128;
-                const int n = min(n0 + r, N - 1);
+                const int n = min(row_of(r), N - 1);
                 if (pdl == 3) touch_l2(w + size_t(n) * K + off);
                 else prefetch_l2(w + size_t(n) * K + off);
             }
         }
-        if constexpr (!CHANNEL) { if (tid == 0) prefetch_l2(srow); }   // one line holds the row's scales
+        if constexpr (!CHANNEL) { if (tid == 0) { prefetch_l2(srow); if (GATED) prefetch_l2(srow_u); } }   // one line holds the row's scales
         pdl_wait();
     }
 
@@ -126,7 +139,7 @@ __global__ void __launch_bounds__(WARPS * 32) fp8_decode_gemm_kernel(
         }
         for (int i = tid; i < NT * C::WVEC; i += C::THREADS) {
             const int r = i / C::WVEC, v = i - r * C::WVEC;
-            const int n = min(n0 + r, N - 1);
+            const int n = min(row_of(r), N - 1);
             cp_async16(smem_u32(ws + r * C::WROW + v * 16), w + size_t(n) * K + k0 + v * 16, true);
         }
     };
@@ -143,7 +156,7 @@ __global__ void __launch_bounds__(WARPS * 32) fp8_decode_gemm_kernel(
     float row_scale[C::NTILES];
     if constexpr (CHANNEL) {
 #pragma unroll
-        for (int j = 0; j < C::NTILES; ++j) row_scale[j] = __ldg(scale + min(n0 + 8 * j + bn, N - 1));
+        for (int j = 0; j < C::NTILES; ++j) row_scale[j] = __ldg(scale + min(row_of(8 * j + bn), N - 1));
     }
 
 #pragma unroll
@@ -163,10 +176,13 @@ __global__ void __launch_bounds__(WARPS * 32) fp8_decode_gemm_kernel(
         const int s = c % STAGES;
         const uint32_t xs = smem_u32(stage_x(s));
         const unsigned char* ws = stage_w(s);
-        float chunk_scale[C::SCALES_PER_CHUNK];
+        float chunk_scale[C::SCALES_PER_CHUNK], chunk_scale_u[C::SCALES_PER_CHUNK];
         if constexpr (!CHANNEL) {
 #pragma unroll
-            for (int q = 0; q < C::SCALES_PER_CHUNK; ++q) chunk_scale[q] = __ldg(srow + c * C::SCALES_PER_CHUNK + q);
+            for (int q = 0; q < C::SCALES_PER_CHUNK; ++q) {
+                chunk_scale[q] = __ldg(srow + c * C::SCALES_PER_CHUNK + q);
+                if constexpr (GATED) chunk_scale_u[q] = __ldg(srow_u + c * C::SCALES_PER_CHUNK + q);
+            }
         }
 #pragma unroll
         for (int step = warp; step < C::KSTEPS; step += WARPS) {
@@ -178,13 +194,15 @@ __global__ void __launch_bounds__(WARPS * 32) fp8_decode_gemm_kernel(
                 const unsigned char* p = ws + (8 * j + bn) * C::WROW + k0 + bk;
                 const uint16_t lo = *reinterpret_cast<const uint16_t*>(p);
                 const uint16_t hi = *reinterpret_cast<const uint16_t*>(p + 8);
-                const float s = CHANNEL ? row_scale[j] : chunk_scale[k0 / SB];
+                const float s = CHANNEL ? row_scale[j]
+                                        : ((GATED && 8 * j + bn >= NT / 2) ? chunk_scale_u[k0 / SB] : chunk_scale[k0 / SB]);
                 mma_bf16_16816(acc[j], a, e4m3x2_scaled_to_bf16x2(lo, s), e4m3x2_scaled_to_bf16x2(hi, s));
             }
         }
     }
 
     cp_async_wait<0>();
+    if constexpr (GATED) { if (pdl) pdl_trigger(); }
     __syncthreads();
     float* red = reinterpret_cast<float*>(smem_raw);   // [WARPS][MT][NT]
     {
@@ -200,6 +218,28 @@ __global__ void __launch_bounds__(WARPS * 32) fp8_decode_gemm_kernel(
         }
     }
     __syncthreads();
+    if constexpr (GATED) {
+        constexpr int NH = NT / 2;
+        const int Nh = N / 2;
+        for (int i = tid; i < MT * NH; i += C::THREADS) {
+            const int m = i / NH, n = i - m * NH;
+            if (m >= M || n0h + n >= Nh) continue;
+            float g = 0.0f, u = 0.0f;
+#pragma unroll
+            for (int wv = 0; wv < WARPS; ++wv) {
+                g += red[wv * (MT * NT) + m * NT + n];
+                u += red[wv * (MT * NT) + m * NT + NH + n];
+            }
+            if (bias != nullptr) { g += bias[n0h + n]; u += bias[Nh + n0h + n]; }
+            if (clamp >= 0.0f) {
+                g = fminf(g, clamp);
+                u = fmaxf(fminf(u, clamp), -clamp);
+            }
+            const float v = g / (1.0f + __expf(-g)) * u;
+            out[size_t(m) * Nh + n0h + n] = to_out<OutT>(v);
+        }
+        return;
+    }
     for (int i = tid; i < MT * NT; i += C::THREADS) {
         const int m = i / NT, n = i - m * NT;
         if (m >= M || n0 + n >= N) continue;
@@ -227,11 +267,11 @@ inline int wide_cfg(int K) {
     return (K % kchunk == 0) ? v : 0;
 }
 
-template <int NT, int WARPS, int KCHUNK, int STAGES, typename OutT, bool CHANNEL = false>
+template <int NT, int WARPS, int KCHUNK, int STAGES, typename OutT, bool CHANNEL = false, bool GATED = false>
 static inline void launch(const __nv_bfloat16* x, const uint8_t* w, const float* scale, const float* bias, OutT* out,
-                   int M, int N, int K, cudaStream_t stream) {
+                   int M, int N, int K, cudaStream_t stream, float clamp = -1.0f) {
     using C = Cfg<NT, WARPS, KCHUNK, STAGES>;
-    auto kern = fp8_decode_gemm_kernel<NT, WARPS, KCHUNK, STAGES, OutT, CHANNEL>;
+    auto kern = fp8_decode_gemm_kernel<NT, WARPS, KCHUNK, STAGES, OutT, CHANNEL, GATED>;
     // The cache belongs to this module's kernel and the current device.
     // An external inline function's GNU_UNIQUE flag can be coalesced across
     // DSOs even though their CUDA kernel handles require separate setup.
@@ -255,9 +295,9 @@ static inline void launch(const __nv_bfloat16* x, const uint8_t* w, const float*
         attr[0].val.programmaticStreamSerializationAllowed = 1;
         cfg.attrs = attr;
         cfg.numAttrs = 1;
-        check_cuda_status(cudaLaunchKernelEx(&cfg, kern, x, w, scale, bias, out, M, N, K, pdl_mode()));
+        check_cuda_status(cudaLaunchKernelEx(&cfg, kern, x, w, scale, bias, out, M, N, K, clamp, pdl_mode()));
     } else {
-        kern<<<blocks, C::THREADS, C::SMEM_BYTES, stream>>>(x, w, scale, bias, out, M, N, K, 0);
+        kern<<<blocks, C::THREADS, C::SMEM_BYTES, stream>>>(x, w, scale, bias, out, M, N, K, clamp, 0);
     }
 }
 
@@ -273,25 +313,25 @@ static inline void launch(const __nv_bfloat16* x, const uint8_t* w, const float*
 // bf16 6.8-8.5), but in the serving trace the 4-stage kernel takes 20-23 us next to Marlin where the 8-stage
 // one takes 7-8 us (notebook 2026-09-07, swap-set part 2 follow-up); deeper prefetch keeps more bytes in
 // flight while the SMs are shared. The 16-row branch follows by analogy pending a profiled c16 round.
-template <typename OutT, bool CHANNEL = false>
+template <typename OutT, bool CHANNEL = false, bool GATED = false>
 inline void launch_auto(const __nv_bfloat16* x, const uint8_t* w, const float* scale, const float* bias, OutT* out,
-                        int M, int N, int K, cudaStream_t stream) {
+                        int M, int N, int K, cudaStream_t stream, float clamp = -1.0f) {
     // Under programmatic dependent launch the weight slice is L2-resident by
     // the time the wait returns, and the pipeline's per-chunk round trip is
     // the limit: eight stages keep seven chunks in flight instead of three.
     if (N >= 2048) {
         switch (wide_cfg(K)) {
-            case 1: launch<32, 8, 256, 4, OutT, CHANNEL>(x, w, scale, bias, out, M, N, K, stream); return;
-            case 2: launch<32, 8, 256, 3, OutT, CHANNEL>(x, w, scale, bias, out, M, N, K, stream); return;
-            case 3: launch<32, 8, 512, 2, OutT, CHANNEL>(x, w, scale, bias, out, M, N, K, stream); return;
-            case 4: launch<32, 8, 128, 8, OutT, CHANNEL>(x, w, scale, bias, out, M, N, K, stream); return;
-            case 5: launch<16, 8, 256, 4, OutT, CHANNEL>(x, w, scale, bias, out, M, N, K, stream); return;
-            case 6: launch<16, 8, 512, 2, OutT, CHANNEL>(x, w, scale, bias, out, M, N, K, stream); return;
-            default: launch<32, 8, 128, 4, OutT, CHANNEL>(x, w, scale, bias, out, M, N, K, stream); return;
+            case 1: launch<32, 8, 256, 4, OutT, CHANNEL, GATED>(x, w, scale, bias, out, M, N, K, stream, clamp); return;
+            case 2: launch<32, 8, 256, 3, OutT, CHANNEL, GATED>(x, w, scale, bias, out, M, N, K, stream, clamp); return;
+            case 3: launch<32, 8, 512, 2, OutT, CHANNEL, GATED>(x, w, scale, bias, out, M, N, K, stream, clamp); return;
+            case 4: launch<32, 8, 128, 8, OutT, CHANNEL, GATED>(x, w, scale, bias, out, M, N, K, stream, clamp); return;
+            case 5: launch<16, 8, 256, 4, OutT, CHANNEL, GATED>(x, w, scale, bias, out, M, N, K, stream, clamp); return;
+            case 6: launch<16, 8, 512, 2, OutT, CHANNEL, GATED>(x, w, scale, bias, out, M, N, K, stream, clamp); return;
+            default: launch<32, 8, 128, 4, OutT, CHANNEL, GATED>(x, w, scale, bias, out, M, N, K, stream, clamp); return;
         }
     }
-    else if (M <= 8) launch<8, 8, 128, 8, OutT, CHANNEL>(x, w, scale, bias, out, M, N, K, stream);
-    else launch<16, 8, 128, 8, OutT, CHANNEL>(x, w, scale, bias, out, M, N, K, stream);
+    else if (M <= 8) launch<8, 8, 128, 8, OutT, CHANNEL, GATED>(x, w, scale, bias, out, M, N, K, stream, clamp);
+    else launch<16, 8, 128, 8, OutT, CHANNEL, GATED>(x, w, scale, bias, out, M, N, K, stream, clamp);
 }
 
 // N up to the vocabulary shard of a channel-scaled LM head (GLM-5.3-Flash at

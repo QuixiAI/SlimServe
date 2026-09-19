@@ -201,3 +201,30 @@ def test_channel_fp8_op_kernel_and_cutlass_branches() -> None:
             # W8A8: the per-token e4m3 activations round at 2^-4.
             assert ((out.float() - ref).abs() / scale).max().item() < 2**-4
     assert maybe_quixicore_fp8_channel_linear(x, w.t(), scheme_scale, None) is None
+
+
+@pytest.mark.parametrize("m", [1, 8, 16])
+@pytest.mark.parametrize("n", [1024, 2048])
+@pytest.mark.parametrize("clamp", [None, 10.0])
+def test_gated_epilogue_matches_silu_and_mul_with_clamp(m: int, n: int, clamp: float | None) -> None:
+    """The merged [gate; up] GEMM with the activation folded in, against the
+    two-step reference (dequantized GEMM, then silu(clamp(gate)) * clamp(up))."""
+    if not quixicore_ops.has_decode_gemm_fp8_gated():
+        pytest.skip("no decode_gemm_fp8_gated binding")
+    k = 4096
+    torch.manual_seed(n + m)
+    w = torch.randn(n, k, device="cuda") * 0.05
+    q, s = block_quant(w)
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16) * 3
+    gu = x.float() @ dequant_bf16(q, s).float().t()
+    gate, up = gu[:, : n // 2], gu[:, n // 2 :]
+    if clamp is not None:
+        gate = gate.clamp(max=clamp)
+        up = up.clamp(min=-clamp, max=clamp)
+    ref = torch.nn.functional.silu(gate) * up
+    out = quixicore_ops.decode_gemm_fp8_gated(x, q, s, clamp)
+    assert out.shape == (m, n // 2) and out.dtype == torch.bfloat16
+    err = (out.float() - ref).abs().max() / ref.abs().max().clamp(min=1e-6)
+    assert err < 2**-6, err
+    if clamp is not None:
+        assert not torch.allclose(ref, torch.nn.functional.silu(gu[:, : n // 2]) * gu[:, n // 2 :]), "clamp must bite"

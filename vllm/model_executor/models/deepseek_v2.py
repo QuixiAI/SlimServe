@@ -28,6 +28,8 @@ import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
 
+import functools
+import os
 import torch
 from torch import nn
 from transformers import DeepseekV2Config, DeepseekV3Config
@@ -281,10 +283,75 @@ class DeepseekV2MLP(nn.Module):
         self.act_fn = silu_and_mul(swiglu_limit)
 
     def forward(self, x):
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        fused = _fused_gate_up_act(self, x)
+        if fused is None:
+            gate_up, _ = self.gate_up_proj(x)
+            x = self.act_fn(gate_up)
+        else:
+            x = fused
         x, _ = self.down_proj(x)
         return x
+
+
+@functools.cache
+def _fp8_gated_enabled() -> bool:
+    """QC_FP8_GATED=1 folds the activation into the gate/up GEMM (one launch).
+    Off by default: measured level on the rtx6000 record (2026-09-18, notebook
+    "P15"): the shared experts run on a side stream that is not the decode
+    layer's critical path, so the saved launch buys nothing there."""
+    return os.environ.get("QC_FP8_GATED", "0") == "1"
+
+
+def _fused_gate_up_act(mlp: "DeepseekV2MLP", x: torch.Tensor) -> torch.Tensor | None:
+    """silu(clamp(gate)) * clamp(up) in the gate/up GEMM's epilogue for a decode
+    batch on the QuixiCore block-FP8 decode GEMM (the shared experts and the
+    dense MLP at M <= 16): one launch instead of the GEMM plus the activation
+    kernel. None when the layer, the batch or the platform is not the kernel's."""
+    if not _fp8_gated_enabled() or not current_platform.is_cuda():
+        return None
+    from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
+    from vllm.model_executor.layers.utils import (
+        DECODE_GEMM_MAX_TOKENS,
+        decode_gemm_fp8_enabled,
+        decode_gemm_fp8_supports,
+    )
+
+    act = mlp.act_fn
+    if isinstance(act, SiluAndMulWithClamp):
+        if act.alpha != 1.0 or act.beta != 0.0:
+            return None
+        clamp = act.swiglu_limit
+    elif isinstance(act, SiluAndMul):
+        clamp = None
+    else:
+        return None
+    layer = mlp.gate_up_proj
+    weight = getattr(layer, "weight", None)
+    scale = getattr(layer, "weight_scale", None)
+    if (
+        weight is None
+        or scale is None
+        or getattr(layer, "bias", None) is not None
+        or weight.dtype != torch.float8_e4m3fn
+        or weight.dim() != 2
+        or scale.dtype != torch.float32
+        or scale.dim() != 2
+        or x.dtype != torch.bfloat16
+        or not decode_gemm_fp8_enabled()
+    ):
+        return None
+    x2 = x.reshape(-1, x.shape[-1])
+    n, k = weight.shape
+    if x2.shape[0] > DECODE_GEMM_MAX_TOKENS or n % 64 or not decode_gemm_fp8_supports(n, k):
+        return None
+    if scale.shape != ((n + 127) // 128, k // 128):
+        return None
+    from vllm.quixicore.ops import quixicore_ops
+
+    if not quixicore_ops.has_decode_gemm_fp8_gated():
+        return None
+    out = quixicore_ops.decode_gemm_fp8_gated(x2.contiguous(), weight, scale, clamp)
+    return out.view(*x.shape[:-1], n // 2)
 
 
 def _fused_ar_rms_norm(

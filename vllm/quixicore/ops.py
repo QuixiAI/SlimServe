@@ -149,6 +149,24 @@ class quixicore_ops:
         128 >= 512)."""
         return _qc().decode_gemm_fp8(x, weight, scale, bias, fp32_out)
 
+    @staticmethod
+    def has_decode_gemm_fp8_gated() -> bool:
+        return quixicore_ops.is_available() and hasattr(_qc(), "decode_gemm_fp8_gated")
+
+    @staticmethod
+    def decode_gemm_fp8_gated(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        scale: torch.Tensor,
+        clamp_limit: float | None = None,
+    ) -> torch.Tensor:
+        """The decode GEMM over a merged [gate; up] block-FP8 weight [N, K] with
+        silu_and_mul_with_clamp folded into its epilogue: returns
+        silu(clamp(gate)) * clamp(up) as bf16 [M, N/2] (clamp_limit None =
+        plain SiLU * up). M <= 16, N % 64 == 0."""
+        clamp = -1.0 if clamp_limit is None else float(clamp_limit)
+        return _qc().decode_gemm_fp8_gated(x, weight, scale, clamp)
+
     # ------------------------------------------------------------------
     # DeepSeek-V4 multi-stream residual mixing (Ampere decode path)
     # ------------------------------------------------------------------
