@@ -277,6 +277,10 @@ class Executor(ABC):
         """Shutdown the executor."""
         self.collective_rpc("shutdown")
 
+    def notify_shutdown_requested(self) -> None:
+        """Mark executor process exits as expected before teardown starts."""
+        return
+
     def init_kv_output_aggregator(self, connector: "KVConnectorBase") -> None:
         """Init KVOutputAggregator"""
         self.kv_output_aggregator = KVOutputAggregator.from_connector(

@@ -1374,6 +1374,12 @@ class EngineCoreProc(EngineCore):
                     "[shutdown] EngineCore: trigger received signal=%s",
                     signal_name,
                 )
+                # Workers may receive a service-manager signal at nearly the
+                # same time as the EngineCore. Mark their exits as expected
+                # before the main loop can remain blocked on an outstanding
+                # executor future. This state is deliberately separate from
+                # executor cleanup so the later shutdown still runs.
+                engine_core.model_executor.notify_shutdown_requested()
                 engine_core.shutdown_state = EngineShutdownState.REQUESTED
                 signal_callback.trigger()
 
