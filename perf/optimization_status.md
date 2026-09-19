@@ -26220,3 +26220,14 @@ Phases, by value over risk:
 - Results: no new throughput measurement or hardware qualification claimed.
 - Decision: submit as a focused PR; preserve current-main behavior outside this fix.
 - Raw artifacts: local test output; no traffic captures or model data committed.
+
+
+## 2026-09-19 - Prevent required tool requests from stopping during reasoning
+
+- Status: retained for review.
+- Baseline: `fix/responses-generation-errors`; forward-port from the B70 serving integration.
+- Change: Mask stop IDs until the required tool grammar activates, including speculative and parallel rows; propagate required/named/allowed-tools policy and fail Responses that omit the required call.
+- Correctness: 12 required-tool mask/metadata tests and 47 Responses completion/error tests passed on CPU.
+- Results: no new throughput measurement or hardware qualification claimed.
+- Decision: submit as a focused PR; preserve current-main behavior outside this fix.
+- Raw artifacts: local test output; no traffic captures or model data committed.

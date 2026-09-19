@@ -191,6 +191,9 @@ class StructuredOutputsParams:
     whitespace_pattern: str | None = None
     structural_tag: str | None = None
 
+    # Internal tool-parser metadata retained across IPC and dataclass replacement.
+    _required_tool_call: bool = False
+
     _backend: str | None = field(default=None, init=False)
     """CAUTION: Should only be set by Processor._validate_structured_output"""
     _backend_was_auto: bool = field(default=False, init=False)

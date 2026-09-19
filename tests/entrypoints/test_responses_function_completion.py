@@ -10,6 +10,7 @@ import pytest
 from openai.types.responses import (
     ResponseCustomToolCall,
     ResponseFunctionToolCall,
+    ResponseReasoningItem,
 )
 
 from vllm.entrypoints.openai.engine.protocol import (
@@ -28,7 +29,7 @@ from vllm.entrypoints.openai.responses.streaming_events import (
     emit_simple_tool_call_open,
 )
 from vllm.outputs import CompletionOutput, RequestOutput
-from vllm.sampling_params import SamplingParams
+from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 
 
 @pytest.mark.parametrize(
@@ -248,5 +249,60 @@ def test_stream_processor_flush_respects_finish_reason(
         ]
         assert bool(done) == completed
         assert events[-1].item.status == ("completed" if completed else "incomplete")
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("output_kind", ["empty", "reasoning", "function", "custom"])
+@pytest.mark.parametrize(
+    ("required", "finish_reason"),
+    [(True, "stop"), (False, "stop"), (None, "stop"), (True, "length")],
+)
+def test_required_call_completion_safeguard(output_kind, required, finish_reason):
+    async def run():
+        outputs = {
+            "empty": [],
+            "reasoning": [
+                ResponseReasoningItem(type="reasoning", id="rs_test", summary=[])
+            ],
+            "function": [
+                ResponseFunctionToolCall(
+                    type="function_call",
+                    name="lookup",
+                    call_id="call_test",
+                    arguments="{}",
+                    status="completed",
+                )
+            ],
+            "custom": [
+                ResponseCustomToolCall(
+                    type="custom_tool_call",
+                    name="python",
+                    call_id="call_test",
+                    input="print('hello')",
+                )
+            ],
+        }
+        serving = make_serving(outputs[output_kind])
+        args = list(request_args(make_context(finish_reason)))
+        if required is not None:
+            args[1].structured_outputs = StructuredOutputsParams(
+                json_object=True, _required_tool_call=required
+            )
+        response = await serving.responses_full_generator(*args)
+        missing_call = required and output_kind in ("empty", "reasoning")
+        expected_status = (
+            "incomplete"
+            if finish_reason == "length"
+            else "failed"
+            if missing_call
+            else "completed"
+        )
+        assert response.status == expected_status
+        if expected_status == "failed":
+            assert response.error.code == "server_error"
+            assert "required tool call" in response.error.message
+        else:
+            assert response.error is None
 
     asyncio.run(run())

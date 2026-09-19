@@ -541,6 +541,10 @@ class DelegatingParser(Parser):
         structural_tag = json.dumps(structure_tag.model_dump())
         request.structured_outputs = StructuredOutputsParams(
             structural_tag=structural_tag,
+            _required_tool_call=(
+                tool_choice_mode(request.tool_choice) == "required"
+                or named_tool_choice_name(request.tool_choice) is not None
+            ),
         )
         if isinstance(request, ResponsesRequest):
             request.text = None
