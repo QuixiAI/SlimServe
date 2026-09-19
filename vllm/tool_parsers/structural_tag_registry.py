@@ -84,17 +84,6 @@ def register_vllm_structural_tag(model: str):
     return decorator
 
 
-def _any_tool_strict(
-    tools: Sequence[ChatCompletionToolsParam | ResponsesTool],
-) -> bool:
-    for tool in tools:
-        if isinstance(tool, FunctionTool) and tool.strict is True:
-            return True
-        if isinstance(tool, ChatCompletionToolsParam) and tool.function.strict is True:
-            return True
-    return False
-
-
 def get_model_structural_tag(
     model: str,
     tools: Sequence[ChatCompletionToolsParam | ResponsesTool] | None,
@@ -104,9 +93,6 @@ def get_model_structural_tag(
     """Build a structural tag with xgrammar's builtin model templates."""
 
     if not tools or tool_choice == "none":
-        return None
-
-    if tool_choice == "auto" and not _any_tool_strict(tools):
         return None
 
     dumped_tools = [_dump_tool_for_xgrammar(tool) for tool in tools]
@@ -145,13 +131,26 @@ def _dump_tool_for_xgrammar(
         function: dict[str, Any] = {"name": tool.name}
         if tool.description is not None:
             function["description"] = tool.description
-        if tool.parameters is not None:
-            function["parameters"] = tool.parameters
-        if tool.strict is not None:
-            function["strict"] = tool.strict
+        # XGrammar treats an omitted ``strict`` flag as schema-strict, while
+        # the OpenAI protocol reserves schema adherence for explicit
+        # ``strict: true``. Keep the tool envelope and JSON syntax constrained
+        # for non-strict tools, but allow any JSON object as their arguments.
+        function["parameters"] = (
+            tool.parameters
+            if tool.strict is True and tool.parameters is not None
+            else {"type": "object", "additionalProperties": True}
+        )
+        function["strict"] = True
         return {"type": "function", "function": function}
     dumped_tool = tool.model_dump(mode="json", exclude_none=True)
     if isinstance(tool, ChatCompletionToolsParam):
+        function = dumped_tool["function"]
+        function["parameters"] = (
+            tool.function.parameters
+            if tool.function.strict is True and tool.function.parameters is not None
+            else {"type": "object", "additionalProperties": True}
+        )
+        function["strict"] = True
         return dumped_tool
     return dict(dumped_tool)
 

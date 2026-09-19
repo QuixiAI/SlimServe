@@ -177,10 +177,18 @@ class XgrammarGrammar(StructuredOutputGrammar):
 
         Returns the prefix list of tokens that are accepted by the FSM.
         """
+        if self._is_terminated:
+            return []
+
         accepted_tokens = []
         for token in tokens:
             if self.matcher.accept_token(token):
                 accepted_tokens.append(token)
+                # A speculative suffix can continue after the grammar stop
+                # token. The suffix is unreachable and probing it makes
+                # xgrammar warn that a terminated matcher is being advanced.
+                if self.matcher.is_terminated():
+                    break
             else:
                 break
         if len(accepted_tokens) > 0:

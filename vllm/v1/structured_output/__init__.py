@@ -238,6 +238,7 @@ class StructuredOutputManager:
         # masks for each request, one for each possible bonus token position.
         # These are stored inline in the tensor and unpacked by the gpu runner.
         cumulative_index = 0
+        reasoning_stop_rows: list[tuple[int, set[int]]] = []
 
         # Optimized parallel filling of bitmasks for
         # non-spec, large-batch-size cases
@@ -257,7 +258,15 @@ class StructuredOutputManager:
                     assert isinstance(grammar, StructuredOutputGrammar)
 
                 apply_bitmask = self.should_fill_bitmask(request)
+                required_tool = structured_output_request.params._required_tool_call
+                stop_ids = (
+                    request.sampling_params.all_stop_token_ids
+                    if required_tool and request.sampling_params is not None
+                    else set()
+                )
                 batch.append((grammar, cumulative_index, apply_bitmask))
+                if not apply_bitmask and stop_ids:
+                    reasoning_stop_rows.append((cumulative_index, stop_ids))
                 if len(batch) == self.fill_bitmask_parallel_batch_size:
                     promises.append(self._async_submit_fill_bitmask(batch))
                     batch = []
@@ -281,6 +290,12 @@ class StructuredOutputManager:
                 if TYPE_CHECKING:
                     assert isinstance(grammar, StructuredOutputGrammar)
                 apply_bitmask = self.should_fill_bitmask(request)
+                required_tool = structured_output_request.params._required_tool_call
+                stop_ids = (
+                    request.sampling_params.all_stop_token_ids
+                    if required_tool and request.sampling_params is not None
+                    else set()
+                )
 
                 reasoner = self._get_reasoner(request)
                 detect_reasoning_end = (
@@ -293,9 +308,18 @@ class StructuredOutputManager:
 
                 state_advancements = 0
                 post_reasoning_end_in_window = False
+                # Drafts in this window were proposed before a reasoning-end
+                # marker made the grammar active. Once one of those drafts is
+                # invalid, every later draft row is unreachable: speculative
+                # verification stops at the first rejection and samples a
+                # replacement there. Do not advance the simulated matcher
+                # along an impossible suffix.
+                draft_path_valid = True
                 req_tokens = scheduled_spec_decode_tokens.get(req_id, ())
                 for i, token in enumerate(req_tokens):
                     self._fill_bitmasks(((grammar, cumulative_index, apply_bitmask),))
+                    if not apply_bitmask and stop_ids:
+                        reasoning_stop_rows.append((cumulative_index, stop_ids))
                     advance_grammar = apply_bitmask
                     if token == -1:
                         apply_bitmask = False
@@ -321,14 +345,26 @@ class StructuredOutputManager:
                             apply_bitmask = True
                             advance_grammar = False
                             post_reasoning_end_in_window = True
-                    if advance_grammar and not grammar.is_terminated():
-                        accepted = grammar.accept_tokens(req_id, [token])
-                        if accepted:
+                    if (
+                        advance_grammar
+                        and draft_path_valid
+                        and not grammar.is_terminated()
+                    ):
+                        if (
+                            post_reasoning_end_in_window
+                            and not grammar.validate_tokens([token])
+                        ):
+                            # Rejection is expected here because these drafts
+                            # were made while reasoning was still unconstrained.
+                            # validate_tokens is non-mutating and silent.
+                            draft_path_valid = False
+                        else:
+                            accepted = grammar.accept_tokens(req_id, [token])
+                            if not accepted:
+                                raise AssertionError(
+                                    (token, req_id, scheduled_spec_decode_tokens)
+                                )
                             state_advancements += 1
-                        elif not post_reasoning_end_in_window:
-                            raise AssertionError(
-                                (token, req_id, scheduled_spec_decode_tokens)
-                            )
                     cumulative_index += 1
                 # Diffusion LLMs don't sample a bonus token after the
                 # scheduled positions, so skip its bitmask in that case.
@@ -345,6 +381,8 @@ class StructuredOutputManager:
                     #   should_advance.
                     bonus_apply = self.should_fill_bitmask(request) or apply_bitmask
                     self._fill_bitmasks(((grammar, cumulative_index, bonus_apply),))
+                    if not bonus_apply and stop_ids:
+                        reasoning_stop_rows.append((cumulative_index, stop_ids))
                     cumulative_index += 1
                 if state_advancements > 0:
                     grammar.rollback(state_advancements)
@@ -356,7 +394,18 @@ class StructuredOutputManager:
         # After finishing with the xgrammar operations, we convert to
         # np.ndarray, because that is much more efficient for serialization
         # and deserialization when sending this to the GPU workers.
-        return bitmask_tensor.numpy()
+        bitmask_array = bitmask_tensor.numpy()
+        # Reasoning may be free text, but required/named tools cannot end the
+        # turn before their grammar becomes active. Apply this to every draft
+        # and bonus row, including a reasoning boundary inside an MTP window.
+        # Once reasoning ends, the grammar owns EOS eligibility again.
+        for row, stop_ids in reasoning_stop_rows:
+            for token in stop_ids:
+                word, bit = divmod(token, 32)
+                if 0 <= word < bitmask_array.shape[1]:
+                    clear_bit = 0x7FFFFFFF if bit == 31 else ~(1 << bit)
+                    bitmask_array[row, word] &= clear_bit
+        return bitmask_array
 
     def should_fill_bitmask(self, request: "Request") -> bool:
         # NOTE (Hanchen) if enable_in_reasoning is True, it means that

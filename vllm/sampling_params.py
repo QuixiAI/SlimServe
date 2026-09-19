@@ -61,6 +61,18 @@ ThinkingTokenBudget = Annotated[
 ]
 
 
+def thinking_token_budget_for_reasoning_effort(
+    reasoning_effort: str | None,
+    default_budget: int | None = None,
+) -> int | None:
+    """Resolve omitted request budgets from this deployment's configuration.
+
+    Effort ``none`` disables thinking. Other effort levels inherit the model's
+    configured budget, leaving unconfigured deployments unlimited.
+    """
+    return 0 if reasoning_effort == "none" else default_budget
+
+
 class SamplingType(IntEnum):
     GREEDY = 0
     RANDOM = 1
@@ -81,6 +93,9 @@ class StructuredOutputsParams:
     disable_additional_properties: bool = False
     whitespace_pattern: str | None = None
     structural_tag: str | None = None
+
+    # Set by the tool parser; preserve across serialization/dataclasses.replace.
+    _required_tool_call: bool = False
 
     _backend: str | None = field(default=None, init=False)
     """CAUTION: Should only be set by Processor._validate_structured_output"""
