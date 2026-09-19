@@ -52,6 +52,28 @@ void gguf_dequantize(sycl::queue& q, const void* w, void* out, std::size_t N,
   if (blocking) ev.wait();
 }
 
+void q8_split_repack(sycl::queue& q, const void* raw, void* split,
+                     std::size_t N, std::size_t K, bool blocking) {
+  sycl::event ev = kernels::q8_split_repack_sycl(q, raw, split, N, K);
+  if (blocking) ev.wait();
+}
+
+void q8_split_gemv(sycl::queue& q, const void* split, const void* x, void* y,
+                   std::size_t R, std::size_t N, std::size_t K, DType act_dt,
+                   bool blocking) {
+  sycl::event ev =
+      kernels::q8_split_gemv_sycl(q, split, x, y, R, N, K, act_dt);
+  if (blocking) ev.wait();
+}
+
+void q8_split_dequantize(sycl::queue& q, const void* split, void* out,
+                         std::size_t N, std::size_t K, DType out_dt,
+                         bool blocking) {
+  sycl::event ev =
+      kernels::q8_split_dequantize_sycl(q, split, out, N, K, out_dt);
+  if (blocking) ev.wait();
+}
+
 void mxfp4_gemv(sycl::queue& q, const void* w_packed, const void* block_scales,
                 const void* x, void* y, std::size_t N, std::size_t K,
                 DType act_dt, Variant variant, bool blocking) {
