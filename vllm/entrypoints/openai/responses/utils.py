@@ -352,6 +352,10 @@ def _construct_message_from_response_item(
             if previous_content is None:
                 prev_assistant_msg["content"] = output_text
                 return None
+            if output_text == "":
+                # A trailing empty streamed item carries no new content. Keep
+                # tool results attached to the preceding assistant tool turn.
+                return None
         return {
             "role": "assistant",
             "content": output_text,
@@ -382,6 +386,8 @@ def _construct_message_from_response_item(
         text: str | None = None
         if isinstance(content, str):
             text = content
+        elif content == []:
+            text = ""
         elif isinstance(content, list) and content:
             text = content[0].get("text")
         if text is not None:
@@ -389,6 +395,8 @@ def _construct_message_from_response_item(
                 previous_content = prev_assistant_msg.get("content")
                 if previous_content is None:
                     prev_assistant_msg["content"] = text
+                    return None
+                if text == "" and (not isinstance(content, list) or len(content) <= 1):
                     return None
             return {"role": "assistant", "content": text}
     return item  # type: ignore[arg-type]
