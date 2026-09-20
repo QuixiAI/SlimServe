@@ -26278,3 +26278,14 @@ Phases, by value over risk:
 - Results: no new throughput measurement or hardware qualification claimed.
 - Decision: submit as a focused PR; preserve current-main behavior outside this fix.
 - Raw artifacts: local test output; no traffic captures or model data committed.
+
+
+## 2026-09-19 - Preserve streamed item identity in terminal Responses output
+
+- Status: retained for review.
+- Baseline: `fix/required-tool-reasoning-stop`; forward-port from the B70 serving integration.
+- Change: Use finalized streamed items as terminal output so item IDs, call IDs, arguments and statuses match events already delivered; preserve cancellation.
+- Correctness: 16 stream/final identity cases and 47 inherited completion/error cases passed on CPU.
+- Results: no new throughput measurement or hardware qualification claimed.
+- Decision: submit as a focused PR; preserve current-main behavior outside this fix.
+- Raw artifacts: local test output; no traffic captures or model data committed.

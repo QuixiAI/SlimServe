@@ -10,6 +10,7 @@ import pytest
 from openai.types.responses import (
     ResponseCustomToolCall,
     ResponseFunctionToolCall,
+    ResponseOutputItemDoneEvent,
     ResponseReasoningItem,
 )
 
@@ -148,11 +149,17 @@ def test_final_response_matches_stream_terminal_event(arguments, finish_reason, 
         if status == "incomplete":
             assert response.incomplete_details.reason == "max_output_tokens"
 
-        async def no_events(*args):
-            if False:
-                yield
+        async def finalized_items(*args):
+            yield args[-1](
+                ResponseOutputItemDoneEvent(
+                    type="response.output_item.done",
+                    sequence_number=-1,
+                    output_index=0,
+                    item=response.output[0],
+                )
+            )
 
-        serving._process_simple_streaming_events = no_events
+        serving._process_simple_streaming_events = finalized_items
         events = [
             event
             async for event in serving.responses_stream_generator(
