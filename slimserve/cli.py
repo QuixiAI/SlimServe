@@ -100,6 +100,11 @@ def _parser() -> argparse.ArgumentParser:
         "--dry-run", action="store_true", help="print the resolved plan and stop"
     )
     parser.add_argument(
+        "--allow-in-progress",
+        action="store_true",
+        help="qualify the selected in-progress profile on supported hardware",
+    )
+    parser.add_argument(
         "--engine-log",
         help="write the engine's own log here instead of discarding it",
     )
@@ -136,6 +141,7 @@ def _help() -> None:
         ("--download-only", "Fetch the weights and stop."),
         ("-y, --yes", "Do not ask before downloading."),
         ("--dry-run", "Print the resolved plan and stop."),
+        ("--allow-in-progress", "Qualify the selected in-progress profile explicitly."),
         ("--engine-log FILE", "Keep the engine's own log instead of discarding it."),
         ("--torch-profile-dir DIR", "Capture a bounded engine profile trace."),
         (
@@ -322,7 +328,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
     if args.serve and args.prompt:
-        parser.error("--prompt runs one conversation and cannot be combined with --serve")
+        parser.error(
+            "--prompt runs one conversation and cannot be combined with --serve"
+        )
 
     if args.help:
         _help()
@@ -345,7 +353,7 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
     try:
-        registry.describe(profile_id)
+        profile = registry.describe(profile_id)
     except ProfileError as error:
         term.fail(str(error))
         return 2
@@ -357,10 +365,23 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     if blocked := registry.profile_blocked(profile_id, machine.platform):
-        term.die(
-            f"{profile_id} is not ready on "
-            f"{registry.platform_title(machine.platform)}: {blocked}. "
-            f"{registry.profile_blocked_detail(profile_id, machine.platform)}"
+        record = profile["variants"].get(machine.platform, {})
+        qualification_allowed = (
+            args.allow_in_progress
+            and not registry.platform_blocked(machine.platform)
+            and record.get("status", profile.get("status", "supported"))
+            == "in-progress"
+        )
+        if not qualification_allowed:
+            term.die(
+                f"{profile_id} is not ready on "
+                f"{registry.platform_title(machine.platform)}: {blocked}. "
+                f"{registry.profile_blocked_detail(profile_id, machine.platform)}"
+            )
+        term.warn(
+            f"qualification override: {profile_id} remains in-progress on "
+            f"{registry.platform_title(machine.platform)}; hardware qualification "
+            "is not complete."
         )
 
     quant = args.quant
