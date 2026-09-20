@@ -5,7 +5,7 @@ import asyncio
 import time
 from collections import deque
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping, Sequence
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, aclosing
 from copy import copy
 from http import HTTPStatus
 from typing import Any, Final
@@ -697,10 +697,11 @@ class OpenAIServingResponses(GenerateBaseServing):
                 reasoning_parser_kwargs=reasoning_parser_kwargs,
             )
 
-            async for res in generator:
-                context.append_output(res)
-                # NOTE(woosuk): The stop condition is handled by the engine.
-                yield context
+            async with aclosing(generator):
+                async for res in generator:
+                    context.append_output(res)
+                    # NOTE(woosuk): The stop condition is handled by the engine.
+                    yield context
 
             if not context.need_builtin_tool_call():
                 # The model did not ask for a tool call, so we're done.
@@ -796,6 +797,7 @@ class OpenAIServingResponses(GenerateBaseServing):
             created_time = int(time.time())
 
         async with AsyncExitStack() as exit_stack:
+            await exit_stack.enter_async_context(aclosing(result_generator))
             try:
                 await self._initialize_tool_sessions(request, context, exit_stack)
                 async for _ in result_generator:
@@ -1526,9 +1528,6 @@ class OpenAIServingResponses(GenerateBaseServing):
         request_metadata: RequestResponseMetadata,
         created_time: int | None = None,
     ) -> AsyncGenerator[StreamingResponsesResponse, None]:
-        # TODO:
-        # 1. Handle disconnect
-
         created_time = created_time or int(time.time())
 
         sequence_number = 0
@@ -1544,6 +1543,9 @@ class OpenAIServingResponses(GenerateBaseServing):
             return event
 
         async with AsyncExitStack() as exit_stack:
+            # Own the generation iterator independently of where the event
+            # processor is suspended when the client disconnects.
+            await exit_stack.enter_async_context(aclosing(result_generator))
             if self.use_harmony:
                 # TODO: in streaming, we noticed this bug:
                 # https://github.com/vllm-project/vllm/issues/25697
@@ -1606,7 +1608,7 @@ class OpenAIServingResponses(GenerateBaseServing):
                 [] if isinstance(context, SimpleContext) else None
             )
             try:
-                async for event_data in processor(
+                events = processor(
                     request,
                     sampling_params,
                     result_generator,
@@ -1616,7 +1618,9 @@ class OpenAIServingResponses(GenerateBaseServing):
                     request_metadata,
                     created_time,
                     _increment_sequence_number_and_return,
-                ):
+                )
+                await exit_stack.enter_async_context(aclosing(events))
+                async for event_data in events:
                     if (
                         streamed_output is not None
                         and event_data.type == "response.output_item.done"

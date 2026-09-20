@@ -47,7 +47,8 @@ def test_load_aware_sse_preserves_events_status_and_headers(monkeypatch, load_tr
             return original
 
         response = await route(raw_request=request)
-        assert response is original
+        assert isinstance(response, StreamingResponse)
+        assert response.raw_headers is original.raw_headers
         assert response.status_code == 207
         assert response.headers["x-fixture"] == "preserved"
         assert await anext(response.body_iterator) == events[0]

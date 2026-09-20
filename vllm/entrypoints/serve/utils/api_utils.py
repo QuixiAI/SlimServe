@@ -5,6 +5,7 @@ import asyncio
 import dataclasses
 import functools
 import os
+import sys
 from argparse import Namespace
 from collections.abc import AsyncIterable, AsyncIterator
 from contextlib import suppress
@@ -12,11 +13,13 @@ from logging import Logger
 from string import Template
 from typing import Any, TypeVar
 
+import anyio
 import regex as re
 from fastapi import Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask, BackgroundTasks
+from starlette.types import Receive, Scope, Send
 
 from vllm import envs
 from vllm.engine.arg_utils import EngineArgs
@@ -30,6 +33,7 @@ logger = init_logger(__name__)
 
 _SSEItem = TypeVar("_SSEItem")
 SSE_KEEPALIVE_INTERVAL_SECONDS = 30.0
+SSE_CLEANUP_TIMEOUT_SECONDS = 5.0
 
 VLLM_SUBCMD_PARSER_EPILOG = (
     "For full list:            vllm {subcmd} --help=all\n"
@@ -137,15 +141,90 @@ async def sse_with_keepalive(
                 return
             yield item
     finally:
+        await _close_sse_stream(iterator, pending)
+
+
+async def _close_sse_stream(iterator, pending=None) -> None:
+    """Finish cancellation outside the response's cancelled AnyIO scope.
+
+    A second cancellation while awaiting ``pending`` can interrupt the engine's
+    abort send. Cancel it once, and shield its cleanup until the deadline;
+    only a timeout escalates to cancellation of the abort cleanup itself.
+    Cleanup errors must not replace a stream/send exception already in flight.
+    """
+
+    original_exception = sys.exception()
+
+    async def close() -> None:
+        try:
+            if pending is not None:
+                if not pending.done():
+                    pending.cancel()
+                with suppress(asyncio.CancelledError, StopAsyncIteration):
+                    await asyncio.shield(pending)
+        finally:
+            aclose = getattr(iterator, "aclose", None)
+            if aclose is not None:
+                await aclose()
+
+    task = asyncio.create_task(close())
+    cancelled = None
+
+    async def wait_for_cleanup(tasks, timeout: float) -> None:
+        nonlocal cancelled
+        deadline = asyncio.get_running_loop().time() + timeout
+        with anyio.CancelScope(shield=True):
+            while any(not task.done() for task in tasks):
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    break
+                try:
+                    # Do not forward repeated cancellation into the source's
+                    # in-progress abort cleanup.
+                    await asyncio.wait(tasks, timeout=remaining)
+                except asyncio.CancelledError as exc:
+                    cancelled = exc
+
+    await wait_for_cleanup({task}, SSE_CLEANUP_TIMEOUT_SECONDS)
+
+    def consume_result(done: asyncio.Task) -> None:
+        try:
+            done.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("SSE stream cleanup failed")
+
+    if task.done():
+        consume_result(task)
+    else:
+        # The graceful abort deadline has expired. Cancel and briefly drain
+        # cooperative tasks rather than leaving a shielded anext detached.
+        # A source that ignores cancellation cannot be forcibly terminated.
+        remaining_tasks = {task}
         if pending is not None and not pending.done():
             pending.cancel()
-            with suppress(asyncio.CancelledError, StopAsyncIteration):
-                await pending
+            remaining_tasks.add(pending)
+        task.cancel()
+        await wait_for_cleanup(remaining_tasks, min(1.0, SSE_CLEANUP_TIMEOUT_SECONDS))
+        for remaining_task in remaining_tasks:
+            if remaining_task.done():
+                consume_result(remaining_task)
+            else:
+                remaining_task.add_done_callback(consume_result)
+        logger.warning("SSE stream cleanup exceeded %.1fs", SSE_CLEANUP_TIMEOUT_SECONDS)
+    if cancelled is not None and original_exception is None:
+        raise cancelled
 
-        close = getattr(iterator, "aclose", None)
-        if close is not None:
-            with suppress(asyncio.CancelledError):
-                await close()
+
+class _SSEKeepaliveResponse(StreamingResponse):
+    """Own iterator cleanup even when Starlette stops during ASGI send."""
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            await _close_sse_stream(self.body_iterator)
 
 
 def load_aware_call(func):
@@ -179,7 +258,15 @@ def load_aware_call(func):
             isinstance(response, StreamingResponse)
             and response.media_type == "text/event-stream"
         ):
-            response.body_iterator = sse_with_keepalive(response.body_iterator)
+            original_response = response
+            response = _SSEKeepaliveResponse(
+                content=sse_with_keepalive(original_response.body_iterator),
+                status_code=original_response.status_code,
+                media_type=original_response.media_type,
+                background=original_response.background,
+            )
+            # Preserve duplicate headers (e.g. Set-Cookie) and exact wire values.
+            response.raw_headers = original_response.raw_headers
 
         if not load_tracking:
             return response
