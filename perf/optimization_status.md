@@ -1,5 +1,53 @@
 # SlimServe Optimization Status
 
+## 2026-09-20 - B70 coding-load slowdown after main integration
+
+- Status: in progress; sustained qualification has not passed.
+- Scope: four Intel Arc Pro B70 GPUs, `qwen38-uncensored-fp8-4`, native
+  FP8 weights and FP8 KV, TP4, MTP k=3, 2,000-token thinking default.
+  Runtime source `cf149880cd`, based on main `d79030d5ac`.
+- Baseline: concurrency-matched early Evalhub diagnostic intervals measured
+  161.54 aggregate generation tok/s on attempt 7 and 158.51 on attempt 8.
+  These are counter deltas with eight active requests, not identical-prompt
+  benchmarks; they do not establish a controlled 1.9% regression.
+- Observation: at 03:29:40 UTC, 32 requests were running and 11 waiting,
+  with 93.23% KV use and no preemptions. A 30.01-second counter window
+  measured 86.80 generation tok/s, no prompt processing, and 10.26% MTP
+  draft-token acceptance. The engine had not restarted since readiness.
+- Hypothesis: very long overlapping requests dominate the current slowdown.
+  At 03:19, proxy lifecycle records had 37 unfinished requests, including
+  13 excess copies of repeated full request bodies. All 113 Evalhub-like
+  requests omitted max_output_tokens; captured response metadata allowed
+  239,398–253,372 output tokens. Unfinished logs alone do not prove socket
+  liveness; a later socket count was consistent with the larger backlog.
+- Kernel audit: FP8 scaled-mm, graph replay and native XPU GDN paths remain
+  selected. The current-main fused Mamba postprocess tile count and 8.27% smaller
+  KV pool remain candidates for controlled investigation; neither is a
+  demonstrated cause of this slowdown.
+- Correctness: isolated ASGI disconnect tests reproduced interrupted abort
+  cleanup and delayed iterator closure. This is a separate defect; it is
+  not required to explain the observed unfinished-request occupancy.
+- Follow-up: cancellation commit `d7517c031b` passed 344 protocol CPU tests,
+  including route-to-AsyncLLM abort ownership with mocked transport and
+  retained generator references. It is not deployed or live-qualified.
+- Kernel candidate refinement: active V1 speculative postprocess uses 16
+  temporal tiles, giving 49,152 CTAs/rank at c32 for 48 GDN layers and two
+  states, versus 3,072 at tile 1. Even no-copy requests repeat decision loads
+  across tiles. State size is fixed; boundary-crossing fraction matters.
+  V1 precopy does not pass align_ctx and still uses batch_memcpy. No GPU
+  A/B ran against live traffic; tile counts remain an unmeasured candidate.
+- Decision: cancellation ownership tests passed; deployment remains pending. Bound
+  output and fix upstream retry disposal before treating the saturated run
+  as a kernel benchmark. No output cap or speculative setting was changed
+  for this observation. The existing generation-config max_new_tokens
+  override is a hard ceiling, including explicit request budgets; it must
+  not be described as an overridable default.
+- Raw artifacts on the deployment host:
+  `/home/alex/qwen38-deploy/pr-integration-20260920/throughput-review/`
+  (`fresh-rate-2.json`, `c8-comparison.json`, `PROXY-LIFECYCLE-FINDINGS.md`),
+  and `../kernel-regression-audit.md`. These diagnostics contain aggregate
+  counters and lifecycle metadata; no prompt/tool bodies are included.
+
 ## 2026-09-11 - Native quantized prefill GEMM on Metal; FP8-KV directive state; two walls found
 
 - Directive (operator): CT weights stay in native quantized form ALWAYS -
