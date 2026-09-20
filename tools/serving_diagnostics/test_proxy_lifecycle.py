@@ -138,6 +138,46 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         await response.finish()
         self.record(stream)
 
+    async def test_final_send_disconnect_does_not_cancel_accepted_completion(self):
+        stream = FixtureStream()
+        response = await self.response(stream)
+
+        async def send(message):
+            self.sent.append(message)
+            if message["type"] == "http.response.body" and not message["more_body"]:
+                self.queue.put_nowait({"type": "http.disconnect"})
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
+
+        await response(self.scope, self.queue.get, send)
+        record = self.record(stream)
+        self.assertEqual(record["termination_reason"], "complete")
+        self.assertTrue(record["downstream_complete"])
+        self.assertTrue(record["downstream_disconnect"])
+        self.assertTrue(record["downstream_disconnect_during_final_send"])
+
+    async def test_failed_final_send_still_reports_original_error_after_disconnect(
+        self,
+    ):
+        stream = FixtureStream()
+        response = await self.response(stream)
+        error = OSError("fixture final send failure")
+
+        async def send(message):
+            if message["type"] == "http.response.body" and not message["more_body"]:
+                self.queue.put_nowait({"type": "http.disconnect"})
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
+                raise error
+
+        with self.assertRaises(OSError) as caught:
+            await response(self.scope, self.queue.get, send)
+        self.assertIs(caught.exception, error)
+        record = self.record(stream)
+        self.assertEqual(record["termination_reason"], "downstream_send_error")
+        self.assertFalse(record["downstream_complete"])
+        self.assertTrue(record["downstream_disconnect"])
+
     async def test_capture_limit_does_not_truncate_wire(self):
         stream = FixtureStream()
         with patch.object(proxy, "CAPTURE_LIMIT", 3):

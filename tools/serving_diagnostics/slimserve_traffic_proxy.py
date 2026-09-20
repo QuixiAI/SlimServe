@@ -176,8 +176,13 @@ class CapturedStreamingResponse(StreamingResponse):
     async def __call__(self, scope, receive, send):
         state = self.lifecycle
         primary_error = None
+        final_send_in_progress = False
 
         async def observed_send(message):
+            nonlocal final_send_in_progress
+            final_send_in_progress = message[
+                "type"
+            ] == "http.response.body" and not message.get("more_body", False)
             try:
                 await send(message)
             except anyio.get_cancelled_exc_class():
@@ -195,6 +200,7 @@ class CapturedStreamingResponse(StreamingResponse):
                     state["downstream_bytes_sent"] += len(body)
                 if not message.get("more_body", False):
                     state["downstream_complete"] = True
+            final_send_in_progress = False
 
         try:
             # Observe disconnect on ASGI 2.4+ even while upstream stalls.
@@ -210,7 +216,16 @@ class CapturedStreamingResponse(StreamingResponse):
                                     (time.monotonic() - self.started_monotonic) * 1000,
                                     3,
                                 )
-                                group.cancel_scope.cancel()
+                                # ASGI servers may expose http.disconnect as
+                                # soon as the final body is accepted, before
+                                # send() returns. Let that send report success
+                                # or failure rather than cancelling it here.
+                                if final_send_in_progress:
+                                    state["downstream_disconnect_during_final_send"] = (
+                                        True
+                                    )
+                                elif not state["downstream_complete"]:
+                                    group.cancel_scope.cancel()
                                 return
 
                     group.start_soon(disconnect)
@@ -363,6 +378,7 @@ async def proxy(request: Request) -> Response:
         "downstream_complete": False,
         "downstream_disconnect": False,
         "downstream_disconnect_ms": None,
+        "downstream_disconnect_during_final_send": False,
         "downstream_send_error_ms": None,
         "cancelled": False,
     }
@@ -415,6 +431,8 @@ async def proxy(request: Request) -> Response:
         finally:
             if lifecycle.get("downstream_send_error"):
                 reason = "downstream_send_error"
+            elif lifecycle["downstream_complete"]:
+                reason = "complete"
             elif lifecycle["downstream_disconnect"]:
                 reason = "downstream_disconnect"
             elif lifecycle.get("upstream_error"):
@@ -423,8 +441,6 @@ async def proxy(request: Request) -> Response:
                 reason = "cancelled"
             elif lifecycle.get("asgi_error"):
                 reason = "asgi_error"
-            elif lifecycle["downstream_complete"]:
-                reason = "complete"
             else:
                 reason = "interrupted"
             event = {
