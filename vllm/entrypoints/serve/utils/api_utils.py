@@ -6,9 +6,11 @@ import dataclasses
 import functools
 import os
 from argparse import Namespace
+from collections.abc import AsyncIterable, AsyncIterator
+from contextlib import suppress
 from logging import Logger
 from string import Template
-from typing import Any
+from typing import Any, TypeVar
 
 import regex as re
 from fastapi import Request
@@ -25,6 +27,9 @@ from vllm.platforms import current_platform
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 logger = init_logger(__name__)
+
+_SSEItem = TypeVar("_SSEItem")
+SSE_KEEPALIVE_INTERVAL_SECONDS = 30.0
 
 VLLM_SUBCMD_PARSER_EPILOG = (
     "For full list:            vllm {subcmd} --help=all\n"
@@ -98,6 +103,51 @@ def decrement_server_load(request: Request):
     request.app.state.server_load_metrics -= 1
 
 
+async def sse_with_keepalive(
+    content: AsyncIterable[_SSEItem],
+    interval_seconds: float = SSE_KEEPALIVE_INTERVAL_SECONDS,
+) -> AsyncIterator[_SSEItem | str]:
+    """Emit an SSE comment when an upstream stream is temporarily silent.
+
+    The pending ``__anext__`` call must survive a heartbeat timeout. Using
+    ``asyncio.wait_for`` here would cancel it and can close the model-output
+    generator on the first quiet interval. SSE clients ignore comment lines,
+    while proxies still observe bytes on the connection.
+    """
+    if interval_seconds <= 0:
+        raise ValueError("SSE keepalive interval must be positive")
+
+    iterator = aiter(content)
+    pending: asyncio.Future[_SSEItem] | None = None
+    try:
+        while True:
+            if pending is None:
+                pending = asyncio.ensure_future(anext(iterator))
+
+            done, _ = await asyncio.wait({pending}, timeout=interval_seconds)
+            if not done:
+                yield ": keepalive\n\n"
+                continue
+
+            completed = pending
+            pending = None
+            try:
+                item = completed.result()
+            except StopAsyncIteration:
+                return
+            yield item
+    finally:
+        if pending is not None and not pending.done():
+            pending.cancel()
+            with suppress(asyncio.CancelledError, StopAsyncIteration):
+                await pending
+
+        close = getattr(iterator, "aclose", None)
+        if close is not None:
+            with suppress(asyncio.CancelledError):
+                await close()
+
+
 def load_aware_call(func):
     @functools.wraps(func)
     async def wrapper(*args, **kwargs):
@@ -108,19 +158,31 @@ def load_aware_call(func):
                 "raw_request required when server load tracking is enabled"
             )
 
-        if not getattr(raw_request.app.state, "enable_server_load_tracking", False):
-            return await func(*args, **kwargs)
+        load_tracking = getattr(
+            raw_request.app.state, "enable_server_load_tracking", False
+        )
 
-        # ensure the counter exists
-        if not hasattr(raw_request.app.state, "server_load_metrics"):
-            raw_request.app.state.server_load_metrics = 0
+        if load_tracking:
+            # ensure the counter exists
+            if not hasattr(raw_request.app.state, "server_load_metrics"):
+                raw_request.app.state.server_load_metrics = 0
 
-        raw_request.app.state.server_load_metrics += 1
+            raw_request.app.state.server_load_metrics += 1
         try:
             response = await func(*args, **kwargs)
         except Exception:
-            raw_request.app.state.server_load_metrics -= 1
+            if load_tracking:
+                raw_request.app.state.server_load_metrics -= 1
             raise
+
+        if (
+            isinstance(response, StreamingResponse)
+            and response.media_type == "text/event-stream"
+        ):
+            response.body_iterator = sse_with_keepalive(response.body_iterator)
+
+        if not load_tracking:
+            return response
 
         if isinstance(response, (JSONResponse, StreamingResponse)):
             if response.background is None:
