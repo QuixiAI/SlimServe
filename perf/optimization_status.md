@@ -26198,3 +26198,14 @@ Phases, by value over risk:
   live server is dominated by noise and competing traffic (110-162 across
   runs today), so the c1 gap is not established. Single-stream decode with
   ignore_eos: 141-187 tok/s.
+
+
+## 2026-09-19 - Respect grammar masks when enforcing thinking budgets
+
+- Status: retained for review.
+- Baseline: `origin/main`; forward-port from the B70 serving integration.
+- Change: Forward-port af784bf19 while retaining main natural-close semantics; preserve prohibited logits in both sampler implementations and avoid duplicate closers across speculative and split-token boundaries.
+- Correctness: 85 CPU budget and grammar regression tests passed, including real XGrammar masks, plain/target/bonus rows, simulated ROCm indexing, V2 closing/nudging and existing natural-close tests; Ruff passed. CPU transfer helpers were stubbed to avoid the local accelerator pinned allocator.
+- Results: no new throughput measurement or hardware qualification claimed.
+- Decision: submit as a focused PR; preserve current-main behavior outside this fix.
+- Raw artifacts: local test output; no traffic captures or model data committed.

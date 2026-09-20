@@ -407,3 +407,33 @@ def test_explicit_minus_one_budget_is_inactive():
     st.apply_staged_writes()
     run_tokens(st, 0, [10, 11, 12])
     assert forced_now(st, 0) is None
+
+
+@pytest.mark.parametrize("speculative", [False, True])
+@pytest.mark.parametrize("nudge", [False, True])
+def test_grammar_mask_wins_over_close_and_nudge_forcing(speculative, nudge):
+    st = make_state(nudge=NUDGE if nudge else (), fraction=0.5)
+    for slot in (0, 1):
+        st.add_request(slot, [START], sp(2 if nudge else 0))
+    st.add_request(2, [START], sp(None))
+    st.apply_staged_writes()
+    if nudge:
+        for slot in (0, 1):
+            step(st, slot, 10)
+    spans = [3, 1, 1] if speculative else [1, 1, 1]
+    tokens = [0, 12, 13, 0, 0] if speculative else [0, 0, 0]
+    batch = make_batch([0, 1, 2], spans, tokens)
+    forced = NUDGE[0] if nudge else END
+    logits = torch.zeros(sum(spans), VOCAB, device=DEV)
+    logits[0, forced] = -torch.inf
+    before = logits.clone()
+    st.apply_mask(logits, batch)
+    sync()
+    # Preserve allowed alternatives and the original prohibition in this row.
+    assert torch.equal(logits[0], before[0])
+    # An allowed forced token in another request still takes effect.
+    allowed_row = spans[0]
+    assert logits[allowed_row].argmax().item() == forced
+    assert torch.isneginf(logits[allowed_row]).sum().item() == VOCAB - 1
+    # A request with no budget stays unchanged.
+    assert torch.equal(logits[-1], before[-1])
