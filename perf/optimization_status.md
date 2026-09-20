@@ -26224,6 +26224,12 @@ Phases, by value over risk:
 - Baseline: `origin/main`; forward-port from the B70 serving integration.
 - Change: Do not probe unreachable speculative suffixes after the grammar matcher terminates.
 - Correctness: Two XGrammar stop-token regression tests passed on CPU.
+## 2026-09-19 - Stop advancing rejected drafts across reasoning boundaries
+
+- Status: retained for review.
+- Baseline: `origin/main`; forward-port from the B70 serving integration.
+- Change: After reasoning ends inside a draft window, stop simulating the grammar after its first invalid draft and roll back only accepted advances.
+- Correctness: Three reasoning-boundary speculative-decoding tests passed on CPU.
 - Results: no new throughput measurement or hardware qualification claimed.
 - Decision: submit as a focused PR; preserve current-main behavior outside this fix.
 - Raw artifacts: local test output; no traffic captures or model data committed.
