@@ -26331,3 +26331,14 @@ Phases, by value over risk:
 - Results: no new throughput measurement or hardware qualification claimed.
 - Decision: submit as a focused PR; preserve current-main behavior outside this fix.
 - Raw artifacts: local test output; no traffic captures or model data committed.
+
+
+## 2026-09-19 - Register a gated Qwen3.8 FP8 recipe for four B70 GPUs
+
+- Status: retained for review.
+- Baseline: `feat/intel-b70-detection`; forward-port from the B70 serving integration.
+- Change: Use the current variant registry, pinned safetensors, native MTP with FP8 draft KV, verification-width graph sizes and the Qwen tool template; retain the recipe behind a qualification gate.
+- Correctness: 73 registry and FP8 recipe checks passed on CPU; current-main B70 serving remains unqualified.
+- Results: no new throughput measurement or hardware qualification claimed.
+- Decision: submit as a focused PR; preserve current-main behavior outside this fix.
+- Raw artifacts: local test output; no traffic captures or model data committed.
