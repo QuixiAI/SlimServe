@@ -73,6 +73,26 @@ def ensure_xpu_runtime_env() -> None:
         os.environ["LD_LIBRARY_PATH"] = ":".join([lib_dir, *parts])
 
 
+def disable_ur_tracing() -> None:
+    """Disable UR/XPTI interception before this process initializes XPU kernels.
+
+    The historical B70 hang investigation found tracing enabled in workers
+    even when the launching shell disabled it. Runtime imports can populate
+    these variables after exec, so clear them in each process (including
+    spawned workers) before kernel registration. This retains the original
+    workaround's policy of clearing the entire UR layer selection.
+    """
+    for var in (
+        "UR_ENABLE_LAYERS",
+        "XPTI_TRACE_ENABLE",
+        "XPTI_SUBSCRIBERS",
+        "XPTI_FRAMEWORK_DISPATCHER",
+    ):
+        if os.environ.get(var):
+            logger.info_once("XPU: clearing %s (UR tracing layer).", var)
+        os.environ[var] = "0" if var == "XPTI_TRACE_ENABLE" else ""
+
+
 def xpu_is_available() -> bool:
     try:
         return torch.xpu.is_available() and torch.xpu.device_count() > 0
@@ -94,6 +114,9 @@ class XPUPlatform(Platform):
 
     @classmethod
     def import_kernels(cls) -> None:
+        # Runs in every worker (spawned included) before any device work, which
+        # is the only place the UR tracing layer can actually be turned off.
+        disable_ur_tracing()
         # No vllm._C on XPU: the CUDA/HIP stable-ABI extension does not exist
         # here. The elementwise ops the shared layers call through
         # torch.ops._C are registered in Python (spawned workers included).

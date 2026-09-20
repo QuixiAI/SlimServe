@@ -5184,3 +5184,14 @@ fastest measured. It does drop full-length concurrency to 6.31x against
 max_num_seqs=32, so a workload that actually fills 256k contexts on many
 concurrent requests would preempt; TurboQuant KV is the lever there and is
 untested here.
+
+
+## 2026-09-19 - Disable UR/XPTI tracing before XPU kernel initialization
+
+- Status: retained for review.
+- Baseline: `origin/xpu/qwen38-b70-parity`; forward-port from the B70 serving integration.
+- Change: Forward-port c6d985940 as a separate workaround: clear UR layer selection and XPTI variables inside every process before XPU kernel registration, including settings populated after exec.
+- Correctness: Three CPU environment and mocked kernel-registration tests passed, including idempotence and initialization order. No new Ruff diagnostics; five platform-file findings are inherited unchanged from #21. Live XPU startup and sustained-load qualification remain pending.
+- Results: no new throughput measurement or hardware qualification claimed.
+- Decision: submit as a focused PR; preserve current-main behavior outside this fix.
+- Raw artifacts: local test output; no traffic captures or model data committed.
