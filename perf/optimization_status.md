@@ -31231,3 +31231,9 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   backend (rejected for decode, on no profile, ~1000 lines; the b12x DMA
   all-reduce is separate and live) and the level opt-ins (QC_FP8_GATED, F2,
   F5a) and F1.
+- CODERABBIT ROUND 15 (2026-09-20 21:56Z / 22:00Z on 2170b9778): not
+  reviewed. `@coderabbitai review` answered "Incremental review skipped"
+  and `@coderabbitai full review` "148 files exceed the limit of 100", so
+  the merge and the cleanup commit carry the local validation above and no
+  bot review; the last reviewed head stays 55d4c64d5. PR is MERGEABLE /
+  CLEAN against upstream d79030d5a.
