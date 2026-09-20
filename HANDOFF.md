@@ -4,7 +4,7 @@
 > Metal. Earlier TurboQuant directives and measurements below are historical.
 > See `perf/optimization_status.md` for current validation evidence.
 
-# HANDOFF — GLM-5.3-Flash NVFP4 on 4x RTX PRO 6000 Blackwell (`glm53f-nvfp4-4` / `rtx6000`), branch `glm53f-rtx6000` (PR #29 open; Phase 9, the section-15 fusion items, closed 2026-09-20)
+# HANDOFF — GLM-5.3-Flash NVFP4 on 4x RTX PRO 6000 Blackwell (`glm53f-nvfp4-4` / `rtx6000`), branch `glm53f-rtx6000` (PR #29 open, passes automated review at 55d4c64d5 after CodeRabbit rounds 13-14; Phase 9, the section-15 fusion items, closed 2026-09-20)
 
 STATE 2026-09-20 00:30 PDT (tree 6ea3ede34, the record's own environment,
 notebook "Phase 9 / the final numbers"): plain c1 228.5 / c8 776 / c16
