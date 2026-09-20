@@ -84,7 +84,7 @@ def test_no_spec_cli_flag_disables_the_resolved_speculator(monkeypatch):
 
     monkeypatch.setattr(cli, "_chat", _capture_chat)
 
-    assert cli.main(["dsv4-q4ktail-2", "--quant", "IQ2_XXS", "--no-spec"]) == 0
+    assert cli.main(["dsv4-q4ktail-2", "--quant", "IQ2_XXS", "--no-spec", "--chat"]) == 0
     assert len(seen) == 1
     assert seen[0].speculative is False
     assert "speculative_config" not in engine_kwargs(seen[0])
@@ -124,7 +124,7 @@ def test_spec_cli_opt_in_keeps_registered_glm_defaults(monkeypatch):
         return 0
 
     monkeypatch.setattr(cli, "_chat", record_chat)
-    assert cli.main(["glm53f-nvfp4-4", "--quant", "NVFP4", "--spec"]) == 0
+    assert cli.main(["glm53f-nvfp4-4", "--quant", "NVFP4", "--spec", "--chat"]) == 0
     assert len(seen) == 1 and seen[0].speculative
     config = engine_kwargs(seen[0])["speculative_config"]
     # incoai/GLM-5.3-Flash-DFlash2 (block 8): up to 7 drafts per verify.
@@ -134,6 +134,23 @@ def test_spec_cli_opt_in_keeps_registered_glm_defaults(monkeypatch):
         config.get("revision") == "bf582e4eacc1810f76656d1811693ff6c6737d2a"
     )
     assert not plan.speculative
+
+
+def test_glm53_profiles_select_glm53_tool_calling_compatibility():
+    cases = (
+        ("glm53f-nvfp4-4", "a100", 4, 0),
+        ("glm53f-nvfp4-8", "a100", 8, 0),
+        ("glm53f-q2-1", "metal", 1, 128 * (1 << 30)),
+    )
+    for profile_id, platform, gpus, memory_bytes in cases:
+        plan = resolve(
+            profile_id,
+            platform,
+            gpus,
+            None,
+            memory_bytes=memory_bytes,
+        )
+        assert plan.env["VLLM_TOOL_CALLING_PROFILE"] == "glm53"
 
 
 def test_spec_cli_flags_are_mutually_exclusive():
@@ -390,6 +407,7 @@ def test_registry_contains_only_the_supported_model_artifacts():
         "qwen38-flash-next-fp8",
         "qwen38-flash-next-nvfp4",
         "glm53f-nvfp4",
+        "glm53f-gguf",
     }
     glm = data["sources"]["glm52-vision"]
     kimi = data["sources"]["kimi-k3"]

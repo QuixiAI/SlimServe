@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """slimserve — run one of the tested configurations, and nothing else.
 
-    slimserve                 pick a profile, then chat
-    slimserve glm52-q2k-2         chat on that profile
-    slimserve k3-xxs-6 --serve    OpenAI-compatible endpoint instead of the prompt
+    slimserve                     pick a profile, then serve it
+    slimserve glm52-q2k-2         OpenAI-compatible endpoint on that profile
+    slimserve k3-xxs-6 --chat     talk to it in this terminal instead
 
 Every legal configuration lives in profiles.json. The CLI's job is to refuse
 anything that is not in there, before a 244 GiB load discovers it the hard way.
@@ -38,8 +38,28 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("-h", "--help", action="store_true", help="show this help")
     parser.add_argument("--list", action="store_true", help="list every profile")
     parser.add_argument("--quant", help="quant to serve; profile default otherwise")
+    parser.add_argument(
+        "--model",
+        metavar="DIR_OR_REPO",
+        help="serve this checkpoint instead of the profile's registered one "
+        "(local directory or Hugging Face repo id); the profile's engine "
+        "arguments, drafter and kernels are unchanged, and a checkpoint whose "
+        "architecture or quantization differs is refused",
+    )
     parser.add_argument("-p", "--prompt", help="run one prompt and exit")
-    parser.add_argument("--serve", action="store_true", help="open an HTTP endpoint")
+    # Serving is what this tool is for, so it is the default. --serve stays
+    # accepted (and does nothing) because scripts, units and docs pass it.
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--serve",
+        action="store_true",
+        help="accepted for compatibility; serving is the default",
+    )
+    mode.add_argument(
+        "--chat",
+        action="store_true",
+        help="talk to the model in this terminal instead of serving",
+    )
     speculation = parser.add_mutually_exclusive_group()
     speculation.add_argument(
         "--spec",
@@ -106,11 +126,12 @@ def _help() -> None:
     for flag, description in (
         ("--quant NAME", "Quant to serve. Profile default otherwise."),
         ("-p, --prompt TEXT", "Run one prompt and exit."),
-        ("--serve", "OpenAI-compatible endpoint instead of the prompt."),
+        ("--serve", "Accepted for compatibility; serving is the default."),
+        ("--chat", "Talk to the model here instead of serving."),
         ("--spec", "Opt in to the profile's registered speculative decoder."),
         ("--no-spec", "Disable speculative decoding for performance diagnosis."),
-        ("--host HOST", "Bind address for --serve. Default: 127.0.0.1"),
-        ("--port N", "Bind port for --serve. Default: 8000"),
+        ("--host HOST", "Bind address for the endpoint. Default: 127.0.0.1"),
+        ("--port N", "Bind port for the endpoint. Default: 8000"),
         ("--cache DIR", "Model directory. Default: $SLIMSERVE_CACHE or ~/models"),
         ("--download-only", "Fetch the weights and stop."),
         ("-y, --yes", "Do not ask before downloading."),
@@ -127,9 +148,9 @@ def _help() -> None:
     print("\nExamples:")
     for label, command in (
         ("pick a profile", "slimserve"),
-        ("chat", "slimserve glm52-q2k-2"),
+        ("serve", "slimserve glm52-q2k-4 --port 8000"),
+        ("chat", "slimserve glm52-q2k-2 --chat"),
         ("one shot", 'slimserve k3-xxs-6 -p "What is 2 + 2?"'),
-        ("serve", "slimserve glm52-q2k-4 --serve --port 8000"),
         ("higher quality", "slimserve glm52-q2k-4 --quant Q4_K"),
     ):
         print(f"  {label:<16} {term.paint(command, term.CYAN, out)}")
@@ -277,7 +298,7 @@ def _show(plan: Plan) -> None:
 
 
 def _chat(plan: Plan, prompt: str | None, log_path: str | None) -> int:
-    """Start a private engine, then talk to it over the same API `--serve` opens.
+    """Start a private engine, then talk to it over the API serving exposes.
 
     Going through HTTP is what gives the prompt token-by-token streaming, and it
     means an interactive answer and a served answer come from one code path.
@@ -300,6 +321,8 @@ def _chat(plan: Plan, prompt: str | None, log_path: str | None) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
+    if args.serve and args.prompt:
+        parser.error("--prompt runs one conversation and cannot be combined with --serve")
 
     if args.help:
         _help()
@@ -364,6 +387,15 @@ def main(argv: list[str] | None = None) -> int:
         term.fail(str(error))
         return 2
 
+    if args.model:
+        try:
+            plan = registry.replace_override(
+                plan, registry.parse_model_override(args.model)
+            )
+        except ProfileError as error:
+            term.fail(str(error))
+            return 2
+
     if args.no_spec:
         plan = replace(plan, speculative=False)
     elif args.spec:
@@ -418,16 +450,38 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as error:
         term.fail(str(error))
         return 1
+
+    if plan.model_override is not None:
+        # The profile's engine arguments, kernel flags, KV layout and drafter
+        # were qualified against its registered checkpoint. Serve a different
+        # one only when the model itself is interchangeable.
+        try:
+            problems = registry.override_conflicts(
+                plan.registered_model_dir, plan.model_dir
+            )
+        except ProfileError as error:
+            term.fail(str(error))
+            return 2
+        if problems:
+            term.fail(
+                f"{plan.model_override.spec} is not interchangeable with "
+                f"{plan.profile_id}'s model:\n  " + "\n  ".join(problems)
+            )
+            return 2
+        term.note(
+            f"serving {plan.model_override.spec} in place of "
+            f"{plan.source['title']}; profile configuration unchanged"
+        )
     if args.download_only:
         term.ok(f"ready: {plan.entry_file}")
         return 0
 
-    if args.serve:
-        from slimserve.server import exec_server
+    if args.chat or args.prompt:
+        return _chat(plan, args.prompt, args.engine_log)
 
-        return exec_server(plan, args.host, args.port)
+    from slimserve.server import exec_server
 
-    return _chat(plan, args.prompt, args.engine_log)
+    return exec_server(plan, args.host, args.port)
 
 
 if __name__ == "__main__":
