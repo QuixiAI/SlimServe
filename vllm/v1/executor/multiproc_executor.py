@@ -44,7 +44,7 @@ from vllm.envs import enable_envs_cache
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.tracing import instrument, maybe_init_worker_tracer
-from vllm.utils import numa_utils
+from vllm.utils import numa_utils, worker_progress
 from vllm.utils.network_utils import (
     get_distributed_init_method,
     get_ip,
@@ -999,7 +999,8 @@ class WorkerProc:
         """
         if isinstance(output, AsyncModelRunnerOutput):
             try:
-                output = output.get_output()
+                with worker_progress.phase_scope(worker_progress.Phase.ASYNC_OUTPUT):
+                    output = output.get_output()
             except Exception as e:
                 logger.exception("Error getting async model runner output")
                 output = e
@@ -1042,6 +1043,7 @@ class WorkerProc:
     def worker_busy_loop(self):
         """Main busy loop for Multiprocessing Workers"""
         assert self.rpc_broadcast_mq is not None
+        worker_progress.initialize_worker_progress(self.rank)
         while True:
             method, args, kwargs, output_rank = self.rpc_broadcast_mq.dequeue(
                 indefinite=True
@@ -1052,7 +1054,8 @@ class WorkerProc:
                 elif isinstance(method, bytes):
                     func = partial(cloudpickle.loads(method), self.worker)
 
-                output = func(*args, **kwargs)
+                with worker_progress.rpc_scope(method):
+                    output = func(*args, **kwargs)
 
                 if output_rank is None or self.rank == output_rank:
                     self.handle_output(output)
