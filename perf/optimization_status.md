@@ -26206,6 +26206,12 @@ Phases, by value over risk:
 - Baseline: `origin/main`; forward-port from the B70 serving integration.
 - Change: Replay every text and refusal part as one assistant message, including empty content; preserve current custom-tool history handling.
 - Correctness: 20 assistant-history regression tests passed on CPU.
+## 2026-09-19 - Count Qwen reasoning opened by the chat template
+
+- Status: retained for review.
+- Baseline: `origin/main`; forward-port from the B70 serving integration.
+- Change: Count the implicit initial reasoning span and stop at reasoning or tool delimiters.
+- Correctness: 12 Qwen reasoning-usage regression tests passed on CPU.
 - Results: no new throughput measurement or hardware qualification claimed.
 - Decision: submit as a focused PR; preserve current-main behavior outside this fix.
 - Raw artifacts: local test output; no traffic captures or model data committed.
