@@ -26301,3 +26301,13 @@ Phases, by value over risk:
 - Results: no new throughput measurement or hardware qualification claimed.
 - Decision: submit as a focused PR; preserve current-main behavior outside this fix.
 - Raw artifacts: local test output; no traffic captures or model data committed.
+
+## 2026-09-19 - Allow XPU deployments to tune Triton softmax segment count
+
+- Status: retained for review.
+- Baseline: `origin/main`; forward-port from the B70 serving integration.
+- Change: Expose the existing 4/8/16 segment choices through an XPU-only environment setting, retaining 16 by default and rejecting unsupported values.
+- Correctness: Ruff and Python compilation passed; GPU attention allocation and numerical/performance validation remain pending.
+- Results: no new throughput measurement or hardware qualification claimed.
+- Decision: submit as a focused PR; preserve current-main behavior outside this fix.
+- Raw artifacts: local test output; no traffic captures or model data committed.
