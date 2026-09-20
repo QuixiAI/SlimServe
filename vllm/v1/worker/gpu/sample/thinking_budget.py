@@ -393,7 +393,12 @@ class ThinkingBudgetState:
             nudge_done, torch.ones_like(s["nudged"]), s["nudged"]
         )
         s["eprog"] = torch.where(
-            enter_forcing | enter_nudging | to_waiting | to_waitn | s_match | nudge_done,
+            enter_forcing
+            | enter_nudging
+            | to_waiting
+            | to_waitn
+            | s_match
+            | nudge_done,
             torch.zeros_like(s["eprog"]),
             s["eprog"],
         )
@@ -476,9 +481,12 @@ class ThinkingBudgetState:
         # Shape-static masked writes: whole-row -inf where forced, then the
         # forced column restored to 0. The scatter runs over every row with
         # a fixed [num_rows] shape; unforced rows write back their own value.
-        logits.masked_fill_(force.unsqueeze(1), _NEG_INF)
         rows_all = torch.arange(num_rows, device=self.device)
         cur = logits[rows_all, ftok]
+        # Grammar constraints take precedence over both closing and nudging.
+        # If they prohibit the forced token, leave the entire row unchanged.
+        force &= ~torch.isneginf(cur)
+        logits.masked_fill_(force.unsqueeze(1), _NEG_INF)
         logits[rows_all, ftok] = torch.where(force, torch.zeros_like(cur), cur)
 
     def update_state(
