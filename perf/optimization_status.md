@@ -5265,3 +5265,21 @@ failure is isolated and a clean boot can complete without a driver reset.
 - Live regression: eight active requests stopped progressing at16:11:39 EDT, then sample_tokens RPC timed out16:16:38; KV13.18%, no preemptions or contemporaneous Xe/PCIe/AER faults. Thus the earlier local c8 benchmark is not a soak qualification.
 - Recovery: first restart stalled rank3 before model loading at a scalar tensor creation; Python/native stacks showed Intel Level Zero event wait. After stopping device users, a targeted Xe GT0 reset on PCIaa:00.0 restored all4 ranks and health at16:33. Root cause is unresolved; no automatic reset loop was added.
 - Artifacts: docs/deployment/qwen38-b70{,-review-stack}.md; local incident receipts /home/alex/qwen38-deploy/live-throughput-20260919/. No raw traffic or automation credentials are committed.
+
+
+## 2026-09-20 - Qwen B70 whole-engine stall diagnostics
+
+- Status: in progress; root cause unresolved.
+- Scope: qwen38-abliterated-b70-4, native FP8, TP4, FP8 KV, MTP k=3, 2K thinking cap.
+- Baseline: coding Evalhub attempt 5 stalled after the grammar/budget fix; seven
+  successful calls, nine failed, no scored tasks. Exact generation counter stopped
+  at 27,854 with eight requests running, followed by sample_tokens RPC timeout.
+- Hypothesis: per-worker Python/native stacks before teardown distinguish compute,
+  TP collective, previous-output/draft-copy waits, and output-thread synchronization.
+- Change: optional read-only watchdog; no model, kernel, graph, or scheduling change.
+- Correctness: 22 CPU detector/discovery/sanitization tests plus 13 subtests passed;
+  live idle sampling verified. Stack collection validated on an idle worker.
+- Results: no new throughput claim. Resume the same coding run with capture armed.
+- Decision: retain diagnostics; do not describe timeout/restart as a kernel fix.
+- Raw artifacts on intc0: ~/qwen38-deploy/midstream-drops-20260919/
+  (ATTEMPT5-STALL.md, attempt5-progress.json, progress-watchdog.jsonl).
