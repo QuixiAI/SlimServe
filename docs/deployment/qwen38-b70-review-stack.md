@@ -154,3 +154,24 @@ the budget fix, so engine stability is not qualified. Attempt 6 repeats the same
 serving configuration with stack capture armed. The watchdog does not alter model
 execution or reset devices. Native stack attachment can briefly pause a target
 only when the measured no-progress threshold is reached.
+
+
+### Minimal reliability deployment, 2026-09-20
+
+Keep the existing B70 serving foundation. The only newly integrated GitHub PR is
+[#35](https://github.com/QuixiAI/SlimServe/pull/35), the existing SSE keepalive patch
+`c0694198c`, applied as `89a808d2ea`; router/load-tracking regressions are
+`57ab2b62ff`. Both original and integration CPU fixtures pass (7 tests). The live
+Responses checks passed for tool JSON, terminal parity and the thinking boundary.
+
+Before this deployment, five attempt-6 streams disconnected after125.24–125.29s
+without outgoing bytes while the engine continued progress. PR35 supplies SSE
+comment bytes every30s without cancelling the pending model iterator. This
+addresses transport inactivity; forwarding through the real gateway and coding
+load remains the validation gate. The separate whole-engine timeout remains
+unresolved and the read-only all-worker stack watchdog stays armed.
+
+The proxy completion/disconnect classification fix `a42ba2257` is now deployed.
+The worker phase recorder `75f6c18297` is committed, opt-in, and not enabled in
+this boot. A fresh main-based integration checkout was prepared but not deployed;
+the user selected the existing serving stack instead. No unrelated PRs were added.
