@@ -31151,3 +31151,12 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   (the draft-only NVFP4 lm_head) is the one item in the record. The
   physics floor stands where section 14.3 left it: the c1 step is bytes
   (1.75 ms) + PCIe all-reduce (0.54 ms) + what dependent launch cannot hide.
+  TTFT, second sample (00:30-00:33 PDT, `ttft_run.sh final-ttft2`): cold 32K
+  2.852 s, 128K 11.763 s; warm 0.083 / 0.278 s - the same as the first
+  (2.840 / 11.767). Against the 2.70 / 11.2 s the PR table carried from
+  2026-09-15/17 that is +5 %; the day's changes are decode-side (the KDA
+  block declines prefill batches, the fused shared slot and the draft head
+  are off or drafter-only), so the difference belongs to the 2026-09-17
+  evening series (the bf16 KDA state of P8, the in_proj NVFP4 sidecar) or to
+  run variation; recorded as an open check for the next prefill pass rather
+  than resolved here.

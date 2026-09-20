@@ -11,8 +11,10 @@ notebook "Phase 9 / the final numbers"): plain c1 228.5 / c8 776 / c16
 1128 tok/s (control 166.5 / 687.9 / 966.8: +37 / +13 / +17 %); `--spec`
 eight-pass medians 304 / 819 / 1141 (control MTP-3 260.8 / 732.1 / 1005.8:
 +17 / +12 / +13 %); cold TTFT 32K 2.84 s, 128K 11.77 s (control 2.93 /
-14.9), warm 0.084 / 0.267 s; four gates in band, canaries pass, 0.981
-accepted per draft. Phase 9 (campaign doc section 16) built the section-15
+14.9), warm 0.084 / 0.267 s (a second sample 2.85 / 11.76, 0.083 / 0.278: +5 % on
+the week's earlier 2.70 / 11.2 cold figures, an open check for the next
+prefill pass - today's changes are decode-side); four gates in band,
+canaries pass, 0.981 accepted per draft. Phase 9 (campaign doc section 16) built the section-15
 items: F1 the KDA decode block (level, on, removable), F2 the shared expert
 as expert 288 (level, +0.01 nats, opt-in), F5a the candidate draft sampler
 (bit-exact, level, opt-in), F5b the drafter's NVFP4 lm_head (in the
