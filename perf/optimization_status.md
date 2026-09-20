@@ -26286,6 +26286,12 @@ Phases, by value over risk:
 - Baseline: `fix/required-tool-reasoning-stop`; forward-port from the B70 serving integration.
 - Change: Use finalized streamed items as terminal output so item IDs, call IDs, arguments and statuses match events already delivered; preserve cancellation.
 - Correctness: 16 stream/final identity cases and 47 inherited completion/error cases passed on CPU.
+## 2026-09-19 - Honor thinking budgets in Responses sampling parameters
+
+- Status: retained for review.
+- Baseline: `origin/main`; forward-port from the B70 serving integration.
+- Change: Use the existing Chat Completions budget resolver for Responses, including profile effort defaults, explicit disabling and completion-token ceilings.
+- Correctness: 13 Responses budget precedence, effort-map, token-ceiling and invalid-input tests passed on CPU.
 - Results: no new throughput measurement or hardware qualification claimed.
 - Decision: submit as a focused PR; preserve current-main behavior outside this fix.
 - Raw artifacts: local test output; no traffic captures or model data committed.

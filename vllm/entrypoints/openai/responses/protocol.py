@@ -75,8 +75,10 @@ from vllm.logger import init_logger
 from vllm.renderers import ChatParams, TokenizeParams, merge_kwargs
 from vllm.sampling_params import (
     RequestOutputKind,
+    RequestThinkingTokenBudget,
     SamplingParams,
     StructuredOutputsParams,
+    get_effective_thinking_token_budget,
 )
 from vllm.utils import random_uuid
 
@@ -307,6 +309,7 @@ class ResponsesRequest(OpenAIBaseModel):
             "Will be accessible by the template."
         ),
     )
+    thinking_token_budget: RequestThinkingTokenBudget = None
     # --8<-- [end:responses-extra-params]
 
     def build_chat_params(
@@ -413,6 +416,7 @@ class ResponsesRequest(OpenAIBaseModel):
         self,
         default_max_tokens: int,
         default_sampling_params: dict | None = None,
+        default_reasoning_effort: str | None = None,
     ) -> SamplingParams:
         if self.max_output_tokens is None:
             max_tokens = default_max_tokens
@@ -473,6 +477,13 @@ class ResponsesRequest(OpenAIBaseModel):
             skip_clone=True,  # Created fresh per request, safe to skip clone
             skip_special_tokens=self.skip_special_tokens,
             include_stop_str_in_output=self.include_stop_str_in_output,
+            thinking_token_budget=get_effective_thinking_token_budget(
+                self.thinking_token_budget,
+                max_tokens,
+                default_sampling_params,
+                (None if self.reasoning is None else self.reasoning.effort)
+                or default_reasoning_effort,
+            ),
         )
 
     def is_include_output_logprobs(self) -> bool:
