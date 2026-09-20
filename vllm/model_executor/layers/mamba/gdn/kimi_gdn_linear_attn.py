@@ -112,9 +112,9 @@ def _use_kda_block() -> bool:
     if os.environ.get("QC_KDA_BLOCK", "1") == "0" or not current_platform.is_cuda():
         return False
     try:
-        from vllm.quixicore.ops import _qc
+        from vllm.quixicore.ops import quixicore_ops
 
-        return hasattr(_qc(), "kda_block_decode")
+        return quixicore_ops.has_kda_block()
     except ImportError:
         return False
 
@@ -656,9 +656,8 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         conv_state, recurrent_state = self.kv_cache
         served = m.num_prefills == 0 and spec_rows <= 8
         if served:
-            from vllm.quixicore.ops import _qc
+            from vllm.quixicore.ops import quixicore_ops as qc
 
-            qc = _qc()
             pairs = max(m.num_spec_decodes, m.num_decodes) * self.local_num_heads
             served = qc.kda_block_serves(
                 pairs,

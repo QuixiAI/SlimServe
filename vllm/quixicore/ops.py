@@ -2091,6 +2091,24 @@ class quixicore_ops:
 
     @staticmethod
     @cache
+    def has_kda_block() -> bool:
+        return quixicore_ops.is_available() and hasattr(_qc(), "kda_block_decode")
+
+    @staticmethod
+    def kda_block_serves(pairs: int, max_rows: int, conv_bf16: bool, state_bf16: bool) -> bool:
+        """Whether the fused KDA decode block takes a batch of `pairs`
+        (request, head) pairs of up to `max_rows` rows in one wave of clusters."""
+        return _qc().kda_block_serves(pairs, max_rows, conv_bf16, state_bf16)
+
+    @staticmethod
+    def kda_block_decode(mixed_qkv: torch.Tensor, **kwargs) -> None:
+        """The fused KDA decode block (kda_decode_block.cuh): conv update, gate
+        GEMVs, L2 norms, the gated delta recurrence and the gated RMS norm for
+        decode rows, written to `out`. Keyword arguments as the binding's."""
+        _qc().kda_block_decode(mixed_qkv, **kwargs)
+
+    @staticmethod
+    @cache
     def has_v2_candidate_draft() -> bool:
         return quixicore_ops.is_available() and hasattr(_qc(), "v2_candidate_draft")
 

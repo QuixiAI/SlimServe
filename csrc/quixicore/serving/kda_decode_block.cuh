@@ -27,11 +27,10 @@
 // 16 heads over 128 SMs (the c1 case: the gate weights, conv history and
 // state stream from 128 SMs at once), while this part keeps at most ~2
 // cluster blocks resident per SM whatever their size (measured
-// cudaOccupancyMaxActiveClusters: 46 clusters of 8 on 188 SMs), so a batch of
-// many requests runs as one block of 1024 threads per (request, head) with
-// plain block barriers (CL = 1) and fills the SMs in one or two waves. The
-// launcher picks the widest CL whose active-cluster capacity holds the whole
-// batch in one wave.
+// cudaOccupancyMaxActiveClusters: 46 clusters of 8, 94 of 4 on 188 SMs). The
+// launcher picks the widest of CL 8 and CL 4 whose active-cluster capacity
+// holds the whole batch in one wave and declines larger batches, which the
+// Triton chain serves.
 //
 // Rows are speculative or plain decode: R requests of up to TT rows each
 // (cu_seqlens), conv state rolled by the accepted count like the Triton update
@@ -108,13 +107,9 @@ __device__ __forceinline__ void block_launch_dependents() {
 #endif
 }
 
-template <int CL>
-__device__ __forceinline__ void pair_sync(cooperative_groups::cluster_group& cluster) {
-    if constexpr (CL > 1) cluster.sync(); else __syncthreads();
-}
-template <int CL, typename T>
+template <typename T>
 __device__ __forceinline__ const T* peer(cooperative_groups::cluster_group& cluster, const T* p, int rank) {
-    if constexpr (CL > 1) return cluster.map_shared_rank(p, rank); else return p;
+    return cluster.map_shared_rank(p, rank);
 }
 
 template <typename CT, typename ST, int TT, int CL>
@@ -144,14 +139,14 @@ __global__ void __launch_bounds__(Geom<CL>::THREADS) kda_block_kernel(
     constexpr int KEEP = TT + CONV_W - 2;            // conv history columns a request can touch
     namespace cg = cooperative_groups;
     cg::cluster_group cluster = cg::this_cluster();
-    const int b = CL > 1 ? int(cluster.block_rank()) : 0;
+    const int b = int(cluster.block_rank());
     const int rh = blockIdx.x / CL;
     const int r = rh / H, h = rh - r * H;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     __shared__ float s_x[TT][CONV_PER];              // this block's conv outputs (bf16-rounded)
     __shared__ float s_g[TT][GATE_PER];              // this block's gate outputs: exp(gate) | g2 (bf16-rounded)
     // The staged gate inputs (f_a, g_a) are dead once the GEMV is done, before
-    // the first pair_sync; the gathered q / k reuse their buffers.
+    // the first cluster.sync(); the gathered q / k reuse their buffers.
     __shared__ __align__(16) float s_ab[2][TT][HD];
     float (*s_fa)[HD] = s_ab[0];
     float (*s_ga)[HD] = s_ab[1];
@@ -293,20 +288,20 @@ __global__ void __launch_bounds__(Geom<CL>::THREADS) kda_block_kernel(
             }
         }
     }
-    pair_sync<CL>(cluster);                          // every block's conv and gate slices are visible
+    cluster.sync();                          // every block's conv and gate slices are visible
     // ---- gather the head's operands from the peers ----
     for (int i = tid; i < len * HD; i += THREADS) {
         const int t = i / HD, d = i - t * HD;
         const int cq = d, ck = HD + d;
-        s_q[t][d] = peer<CL>(cluster, &s_x[0][0], cq / CONV_PER)[t * CONV_PER + cq % CONV_PER];
-        s_k[t][d] = peer<CL>(cluster, &s_x[0][0], ck / CONV_PER)[t * CONV_PER + ck % CONV_PER];
-        s_ge[t][d] = peer<CL>(cluster, &s_g[0][0], d / GATE_PER)[t * GATE_PER + d % GATE_PER];
+        s_q[t][d] = peer(cluster, &s_x[0][0], cq / CONV_PER)[t * CONV_PER + cq % CONV_PER];
+        s_k[t][d] = peer(cluster, &s_x[0][0], ck / CONV_PER)[t * CONV_PER + ck % CONV_PER];
+        s_ge[t][d] = peer(cluster, &s_g[0][0], d / GATE_PER)[t * GATE_PER + d % GATE_PER];
     }
     for (int i = tid; i < len * ROWS; i += THREADS) {
         const int t = i / ROWS, j = i - t * ROWS;
         const int cv = 2 * HD + b * ROWS + j, og = HD + b * ROWS + j;
-        s_v[t][j] = peer<CL>(cluster, &s_x[0][0], cv / CONV_PER)[t * CONV_PER + cv % CONV_PER];
-        s_g2[t][j] = peer<CL>(cluster, &s_g[0][0], og / GATE_PER)[t * GATE_PER + og % GATE_PER];
+        s_v[t][j] = peer(cluster, &s_x[0][0], cv / CONV_PER)[t * CONV_PER + cv % CONV_PER];
+        s_g2[t][j] = peer(cluster, &s_g[0][0], og / GATE_PER)[t * GATE_PER + og % GATE_PER];
     }
     __syncthreads();
     // ---- q / k L2 norms: pair p = (t, q|k), one warp each ----
@@ -370,20 +365,20 @@ __global__ void __launch_bounds__(Geom<CL>::THREADS) kda_block_kernel(
         }
     }
     if (pdl) block_launch_dependents();              // after the main work: the dependent's CTAs must not squat on the SMs
-    pair_sync<CL>(cluster);                          // every block's s_ss partials are complete
+    cluster.sync();                          // every block's s_ss partials are complete
     // ---- gated RMS norm of this block's columns with the cluster-wide sum of squares ----
     for (int i = tid; i < len * ROWS; i += THREADS) {
         const int t = i / ROWS, j = i - t * ROWS;
         float ss = 0.0f;
 #pragma unroll
-        for (int p = 0; p < CL; ++p) ss += peer<CL>(cluster, &s_ss[0], p)[t];
+        for (int p = 0; p < CL; ++p) ss += peer(cluster, &s_ss[0], p)[t];
         const float rstd = 1.0f / sqrtf(ss / float(HD) + eps);
         const int d = b * ROWS + j;
         const float w = __bfloat162float(norm_w[d]);
         out[int64_t(bos + t) * stride_out + int64_t(h) * HD + d] =
             __float2bfloat16_rn(s_y[t][j] * rstd * w * sigm(s_g2[t][j]));
     }
-    if constexpr (CL > 1) cluster.sync();            // peers keep their shared memory until everyone has read it
+    cluster.sync();  // peers keep their shared memory until everyone has read it
 }
 
 }  // namespace tms::kda_block

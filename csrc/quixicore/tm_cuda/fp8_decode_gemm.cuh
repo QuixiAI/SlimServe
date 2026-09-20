@@ -254,18 +254,6 @@ __global__ void __launch_bounds__(WARPS * 32) fp8_decode_gemm_kernel(
 // QC_PDL selects the decode GEMM launch mode (read once per process, see
 // bf16_decode_gemm.cuh: 0 off; 1 line-hint prefetch; 2 bulk L2 prefetch;
 // 3 real loads; 4 attribute, trigger and wait only). Default 4.
-// QC_FP8_WIDE: experiment switch for the N >= 2048 configuration (0 = the
-// shipped 32 rows / 128-byte chunks / 4 stages; 1..6 see launch_auto). A
-// chunk must divide K, so wide chunks fall back when K is not a multiple.
-inline int wide_cfg(int K) {
-    static const int v = [] {
-        const char* e = std::getenv("QC_FP8_WIDE");
-        return e != nullptr ? std::atoi(e) : 0;
-    }();
-    if (v == 0) return 0;
-    const int kchunk = (v == 3 || v == 6) ? 512 : (v == 4 ? 128 : 256);
-    return (K % kchunk == 0) ? v : 0;
-}
 
 template <int NT, int WARPS, int KCHUNK, int STAGES, typename OutT, bool CHANNEL = false, bool GATED = false>
 static inline void launch(const __nv_bfloat16* x, const uint8_t* w, const float* scale, const float* bias, OutT* out,
@@ -316,20 +304,10 @@ static inline void launch(const __nv_bfloat16* x, const uint8_t* w, const float*
 template <typename OutT, bool CHANNEL = false, bool GATED = false>
 inline void launch_auto(const __nv_bfloat16* x, const uint8_t* w, const float* scale, const float* bias, OutT* out,
                         int M, int N, int K, cudaStream_t stream, float clamp = -1.0f) {
+    if (N >= 2048) launch<32, 8, 128, 4, OutT, CHANNEL, GATED>(x, w, scale, bias, out, M, N, K, stream, clamp);
     // Under programmatic dependent launch the weight slice is L2-resident by
     // the time the wait returns, and the pipeline's per-chunk round trip is
     // the limit: eight stages keep seven chunks in flight instead of three.
-    if (N >= 2048) {
-        switch (wide_cfg(K)) {
-            case 1: launch<32, 8, 256, 4, OutT, CHANNEL, GATED>(x, w, scale, bias, out, M, N, K, stream, clamp); return;
-            case 2: launch<32, 8, 256, 3, OutT, CHANNEL, GATED>(x, w, scale, bias, out, M, N, K, stream, clamp); return;
-            case 3: launch<32, 8, 512, 2, OutT, CHANNEL, GATED>(x, w, scale, bias, out, M, N, K, stream, clamp); return;
-            case 4: launch<32, 8, 128, 8, OutT, CHANNEL, GATED>(x, w, scale, bias, out, M, N, K, stream, clamp); return;
-            case 5: launch<16, 8, 256, 4, OutT, CHANNEL, GATED>(x, w, scale, bias, out, M, N, K, stream, clamp); return;
-            case 6: launch<16, 8, 512, 2, OutT, CHANNEL, GATED>(x, w, scale, bias, out, M, N, K, stream, clamp); return;
-            default: launch<32, 8, 128, 4, OutT, CHANNEL, GATED>(x, w, scale, bias, out, M, N, K, stream, clamp); return;
-        }
-    }
     else if (M <= 8) launch<8, 8, 128, 8, OutT, CHANNEL, GATED>(x, w, scale, bias, out, M, N, K, stream, clamp);
     else launch<16, 8, 128, 8, OutT, CHANNEL, GATED>(x, w, scale, bias, out, M, N, K, stream, clamp);
 }

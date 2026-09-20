@@ -15,33 +15,9 @@ import torch.nn as nn
 from vllm.model_executor.custom_op import CustomOp
 from vllm.triton_utils import tl, triton
 
-# Programmatic dependent launch (Phase 8 / P2): when QC_PDL is set the decode
-# kernels are launched with the programmatic-serialization attribute and start
-# with a trigger for their own successor plus a wait for their predecessor
-# (both no-ops without the attribute; kept out of the kernel entirely on
-# non-CUDA targets and for the A/B baseline through the PDL constexpr).
-def _pdl_enabled() -> bool:
-    import os
-    if os.environ.get("QC_PDL", "4") == "0":
-        return False
-    try:
-        import torch
-        return torch.cuda.is_available() and torch.version.hip is None
-    except Exception:
-        return False
-
-
-_PDL = _pdl_enabled()
-if _PDL:
-    from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
-else:
-    @triton.jit
-    def gdc_launch_dependents():
-        pass
-
-    @triton.jit
-    def gdc_wait():
-        pass
+# Programmatic dependent launch: see vllm/triton_utils/pdl.py.
+from vllm.triton_utils.pdl import PDL as _PDL  # noqa: E402
+from vllm.triton_utils.pdl import gdc_launch_dependents, gdc_wait  # noqa: E402, F401
 
 from vllm.utils.math_utils import RCP_LN2, cdiv, next_power_of_2
 

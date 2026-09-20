@@ -159,7 +159,7 @@ def _qc_nvfp4_prefill_applicable(
 # default 32); 0 keeps Marlin for every batch. QC_NVFP4_DECODE_NJ (1/2/4) is the
 # column-group width per CTA (16 * nj columns), default by batch (4 to 16 rows, else 2); QC_NVFP4_DECODE_STAGES
 # (4/8) the depth of the cp.async ring, default 4; QC_NVFP4_DECODE_SPLIT gemv2's cluster split over a token's
-# experts, default by batch (2 up to 8 rows, else 1).
+# experts, default 2 for a single token (rows <= top_k, an uneven split allowed), else 1.
 @functools.cache
 def _qc_nvfp4_decode_rows() -> int:
     if os.environ.get("QC_NVFP4_DECODE", "1") == "0":

@@ -1527,3 +1527,31 @@ count. (3) The remaining gap to the physics floor (bytes 1.75 ms + PCIe
 prologue/tail and the all-reduce chain, which only a different execution
 model (persistent megakernel per layer, or fewer, wider all-reduces) can
 touch - out of this phase's scope and recorded here for the next.
+
+## 17. Switch reference
+
+Every environment switch the campaign added, read once per process. None is
+deploy configuration; the record's environment in `slimserve/profiles.json`
+sets only the sidecar and all-reduce entries named there. "Kill switch"
+means default on, `0` restores the previous path for an A/B.
+
+| switch | default | meaning |
+|---|---|---|
+| `QC_PDL` | 4 | programmatic dependent launch mode of the decode kernels (Triton KDA chain, decode GEMMs, Marlin, KDA block); `0` off |
+| `QC_KDA_BLOCK` | 1 | kill switch: the fused KDA decode block (F1) |
+| `QC_KDA_DIRECT_OUT` | 1 | kill switch: KDA output norm written straight to the layer output |
+| `QC_MOE_OUTPUT_ALIAS` | 1 | kill switch: the MoE result aliased to the caller's buffer |
+| `QC_NVFP4_DECODE` | 1 | kill switch: the NVFP4 decode MoE pair (`0` keeps Marlin for every batch) |
+| `QC_NVFP4_DECODE_ROUTE` | 1 | kill switch: the folded router (deferred routing) in front of the pair |
+| `QC_NVFP4_DECODE_ROWS` / `_NJ` / `_STAGES` / `_SPLIT` | 32 / by batch / 4 / by batch | kernel tuning pins for the pair (assignment rows served, column-group width, cp.async ring depth, gemv2 cluster split) |
+| `QC_FP8_GATED` | 0 | opt-in: gate_up + SiLU fused into the fp8 decode GEMM (measured level) |
+| `QC_DRAFT_CANDIDATES` | 0 | opt-in: the candidate draft sampler (F5a, bit-exact, measured level) |
+| `QC_MHC_RS` | 5 | rows from which the fused mHC all-reduce uses the reduce-scatter exchange (read in `custom_all_reduce.cuh` and `custom_all_reduce.py`; keep both in step) |
+| `QC_MHC_SLAB_TOKENS` / `QC_MHC_PERSISTENT_MIN_TOKENS` | 2048 / 128 | kernel tuning: mHC prefill slab length; batch from which the persistent kernel takes over |
+| `SLIMSERVE_DECODE_GEMM` / `SLIMSERVE_DECODE_GEMM_FP8` | 1 / 1 | kill switches: the bf16 and fp8 decode GEMMs behind the dense linears |
+| `SLIMSERVE_FP8_SWAPSET` / `SLIMSERVE_NVFP4_SWAPSET` / `SLIMSERVE_NVFP4_FAMILIES` | record | sidecar selection (file stem beside the checkpoint) and the NVFP4 families served from it |
+| `SLIMSERVE_NVFP4_DRAFT_LMHEAD` | record | the drafter's own NVFP4 lm_head sidecar (F5b) |
+| `SLIMSERVE_NVFP4_SHARED_SWAPSET` | unset | opt-in: the shared expert as fused expert E (F2, measured level) |
+| `SLIMSERVE_NVFP4_MTP_SWAPSET` | unset | opt-in: NVFP4 MTP layer sidecar |
+| `SLIMSERVE_F32_OVERRIDES` | 1 | kill switch: the fp32 overrides file beside the checkpoint (`slimserve/f32_overrides.py`), used when present |
+

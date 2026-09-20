@@ -31204,3 +31204,30 @@ than PyPI 1.3.0), and the FP8 GEMMs.
 - CODERABBIT ROUND 14 (2026-09-20 08:59Z on 55d4c64d5): a real run, no
   review body, no inline comments, zero open threads, head status "Review
   completed" - the PR passes automated review at 55d4c64d5.
+- MERGE WITH UPSTREAM d79030d5a (2026-09-20, 226cbaaaf): the PR had gone
+  CONFLICTING (this notebook only; both sides kept). Upstream's GLM-5.3
+  tool-calling chat template now serves the rtx6000 record; its
+  `tool_calling_profile` stays unset here (validated on a100/metal only, and
+  it defaults tool requests to non-thinking - operator's call). tests/slimserve
+  171/171 (upstream fixed the four test_profiles failures). Validation
+  (ab2 merge-nospec / merge-spec): canaries text/tool/image pass, gates
+  -2.468 / -2.433, plain 228.6 / 779.4 / 1108.8 and 228.7 / 775.7 / 1118.7,
+  spec four passes c1 253-355, c8 733-869, c16 1064-1207, 0.992 per draft.
+- CLEANUP PASS (2026-09-20, read-only audit of the whole branch diff, then
+  edits): mtp_hash_factor was never called - the MTP sidecar now enters the
+  compile hash with the other four; the KDA block's CL = 1 branches and
+  helper templates removed (only CL 8 / 4 exist); the rejected QC_FP8_WIDE
+  configurations removed from the fp8 decode GEMM (six instantiations per
+  OutT / CHANNEL / GATED); the QC_PDL parse that four Triton modules
+  duplicated lives in vllm/triton_utils/pdl.py; kda_block_* go through
+  ops.py wrappers like every other kernel; stale split comment; campaign doc
+  section 17 lists every switch with its default; HANDOFF names no host
+  path. Audit found no uncalled binding, no debug residue, no host config in
+  code. Both extensions rebuilt; 430 passed over the touched suites.
+  Validation (ab2 clean-nospec / clean-spec): canaries pass, gates -2.462 /
+  -2.460, plain 228.8 / 775.8 / 1118.2 and 228.6 / 780.5 / 1115.2, spec
+  four passes c1 272-331, c8 752-839, c16 1080-1127, 0.974 per draft -
+  level with the record. Left for the operator: the b12x native MoE
+  backend (rejected for decode, on no profile, ~1000 lines; the b12x DMA
+  all-reduce is separate and live) and the level opt-ins (QC_FP8_GATED, F2,
+  F5a) and F1.

@@ -4,7 +4,7 @@
 > Metal. Earlier TurboQuant directives and measurements below are historical.
 > See `perf/optimization_status.md` for current validation evidence.
 
-# HANDOFF — GLM-5.3-Flash NVFP4 on 4x RTX PRO 6000 Blackwell (`glm53f-nvfp4-4` / `rtx6000`), branch `glm53f-rtx6000` (PR #29 open, passes automated review at 55d4c64d5 after CodeRabbit rounds 13-14; Phase 9, the section-15 fusion items, closed 2026-09-20)
+# HANDOFF — GLM-5.3-Flash NVFP4 on 4x RTX PRO 6000 Blackwell (`glm53f-nvfp4-4` / `rtx6000`), branch `glm53f-rtx6000` (PR #29 open, passed automated review at 55d4c64d5 after CodeRabbit rounds 13-14, since merged with upstream d79030d5a and put through the cleanup pass - notebook 2026-09-20, switch list in campaign doc section 17; Phase 9, the section-15 fusion items, closed 2026-09-20. Operator's open calls: the b12x native MoE backend (rejected, unused) and the level opt-ins)
 
 STATE 2026-09-20 00:30 PDT (tree 6ea3ede34, the record's own environment,
 notebook "Phase 9 / the final numbers"): plain c1 228.5 / c8 776 / c16
@@ -57,8 +57,8 @@ passes, exact): no speculation c1 191.4 / 196.5, c8 734.2 / 730.2, c16
 The record's prefill all-reduce path needs the `b12x` package (PyPI,
 Apache-2.0, 1.3.0 validated); without it the DMA ring is skipped with a
 warning and the prefill numbers above do not hold.
-Obsolete sidecars on /raid (not deleted, operator's call): in
-/raid/weights/GLM-5.3-Flash-NVFP4/, `fp8-swapset-kda-tp4.{safetensors,json}`
+Obsolete sidecars beside the checkpoint on the bench box (not deleted,
+operator's call): `fp8-swapset-kda-tp4.{safetensors,json}`
 (6.8 GB), `fp8-swapset-dense.*` (2.4 GB) and `fp8-swapset.*` (6.7 GB) are
 superseded by `fp8-swapset-lmhead.*` (7.3 GB, the record's sidecar).
 PR #29 passed automated review at c67d2452f on 2026-09-17 (nine CodeRabbit
