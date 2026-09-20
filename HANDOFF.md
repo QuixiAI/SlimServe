@@ -42,8 +42,13 @@ rounds, every finding addressed; merged with upstream main 02fb15fc1).
 Phase 8 so far (2026-09-17 evening, local commits after the reviewed head;
 the notebook entries "PHASE 8 / ..."): PDL mode 4 and the reduce-scatter mHC
 transition are code defaults (+1.5 / +1.9 / +4.2 % plain); the fused KDA
-decode chain was built, parity-tested and rejected (never faster under
-graph replay + PDL; opt-in QC_KDA_CHAIN=1 until the cleanup pass); the
+decode chain (two launches) was built, parity-tested and rejected, and on
+2026-09-19 replaced outright by the KDA decode BLOCK (Phase 9 / F1: one
+cluster launch per KDA layer, `kda_block_decode`, default on, QC_KDA_BLOCK=0
+restores the Triton kernels; it serves batches up to about five requests
+and declines the rest to the Triton chain; LEVEL in serving - the launches
+it removes were already hidden by dependent launch, so the cleanup pass
+may drop it); the
 NVFP4 dense sidecar landed for the KDA in_proj family only
 (`SLIMSERVE_NVFP4_SWAPSET=nvfp4-swapset-inproj` on the record, +3 / +2 /
 +0.5 % plain for 0.012 nats per token; the other families cost 0.028 for

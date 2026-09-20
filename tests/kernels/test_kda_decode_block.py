@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""The fused KDA decode chain (kda_chain_decode: conv + gate GEMVs + recurrence
-+ gated RMS norm in two launches) against the Triton chain the KDA layer runs
-otherwise: kda_gate_pair, causal_conv1d_update, fused_recurrent_kda,
+"""The fused KDA decode block (kda_block_decode: conv + gate GEMVs + recurrence
++ gated RMS norm in one cluster launch) against the Triton chain the KDA layer
+runs otherwise: kda_gate_pair, causal_conv1d_update, fused_recurrent_kda,
 FusedRMSNormGated. Speculative rows (accepted-count conv roll, per-row state
-columns) and plain decode rows, bf16 and fp32 conv states, every V split."""
+columns) and plain decode rows, bf16 and fp32 conv and SSM states, clusters
+of 8 and 4 and the automatic pick, and the serves() boundary."""
 
 import pytest
 import torch
@@ -30,7 +31,7 @@ LB = -5.0
 EPS = 1e-5
 
 
-def _inputs(R, T, state_len, conv_dtype, seed, pad=48, ragged=False):
+def _inputs(R, T, state_len, conv_dtype, seed, pad=48, ragged=False, state_dtype=torch.float32):
     torch.manual_seed(seed)
     dev = "cuda"
     lens = torch.full((R,), T, dtype=torch.int64)
@@ -51,7 +52,7 @@ def _inputs(R, T, state_len, conv_dtype, seed, pad=48, ragged=False):
     slots = R * (T + 1) + 4
     conv_sd = (torch.randn(slots, state_len, dim, device=dev) * 0.5).to(conv_dtype)
     conv_w = torch.randn(dim, 4, device=dev) * 0.3
-    ssm = torch.randn(slots, H, D, D, device=dev) * 0.1
+    ssm = (torch.randn(slots, H, D, D, device=dev) * 0.1).to(state_dtype)
     norm_w = (1.0 + 0.1 * torch.randn(D, device=dev)).to(torch.bfloat16)
     if T == 1:
         sidx = (1 + torch.arange(N, device=dev)).to(torch.int32)
@@ -92,31 +93,51 @@ def _reference(i):
     return y, conv_state.transpose(-1, -2), ssm
 
 
-def _fused(i, split):
+def _fused(i, cl):
+    """cl 8 or 4 pins the cluster size, 0 lets the launcher pick."""
     conv_state = i["conv_sd"].clone().transpose(-1, -2)
     ssm = i["ssm"].clone()
     out = torch.empty(1, i["N"], H, D, device="cuda", dtype=torch.bfloat16)
-    qc.kda_chain_decode(i["mixed"], conv_state, i["conv_w"], i["conv_idx"], i["f_a"], i["g_a"], i["f_w"], i["g_w"],
+    qc.kda_block_decode(i["mixed"], conv_state, i["conv_w"], i["conv_idx"], i["f_a"], i["g_a"], i["f_w"], i["g_w"],
                         i["beta"], i["A_log"], i["dt_bias"], ssm, i["sidx"], i["cu"], i["acc"], i["norm_w"], out,
-                        D**-0.5, LB, True, EPS, split)
+                        D**-0.5, LB, True, EPS, cl)
     return out, conv_state.transpose(-1, -2), ssm
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("conv_dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("split", [1, 2, 4])
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("cl", [8, 4, 0])
 @pytest.mark.parametrize("ragged", [False, True])
-@pytest.mark.parametrize("R,T,state_len", [(1, 1, 3), (16, 1, 3), (3, 1, 6), (1, 4, 6), (8, 4, 6), (5, 3, 5), (4, 8, 10), (16, 4, 6)])
-def test_chain_matches_triton(R, T, state_len, split, conv_dtype, ragged):
+@pytest.mark.parametrize("R,T,state_len", [(1, 1, 3), (5, 1, 3), (3, 1, 6), (1, 4, 6), (5, 4, 6), (5, 3, 5), (4, 8, 10), (2, 4, 6)])
+def test_block_matches_triton(R, T, state_len, cl, state_dtype, conv_dtype, ragged):
     if ragged and (T == 1 or R < 2):
         pytest.skip("ragged needs several multi-row requests")
-    i = _inputs(R, T, state_len, conv_dtype, seed=R * 100 + T * 10 + state_len, ragged=ragged)
+    i = _inputs(R, T, state_len, conv_dtype, seed=R * 100 + T * 10 + state_len, ragged=ragged, state_dtype=state_dtype)
     y_ref, conv_ref, ssm_ref = _reference(i)
-    y, conv, ssm = _fused(i, split)
+    y, conv, ssm = _fused(i, cl)
     torch.cuda.synchronize()
     torch.testing.assert_close(conv, conv_ref, rtol=0, atol=0)
     # The gate GEMV's fp32 summation order differs from Triton's tree sum, so a
     # g1 value on a bf16 rounding boundary can flip one ulp (0.4 %) and scale
-    # its state column by that much; everything else is bit-for-bit.
-    torch.testing.assert_close(ssm, ssm_ref, rtol=1e-2, atol=1e-3)
+    # its state column by that much; everything else is bit-for-bit (a bf16
+    # state adds its own half-ulp on every stored element).
+    if state_dtype == torch.bfloat16:
+        torch.testing.assert_close(ssm.float(), ssm_ref.float(), rtol=2e-2, atol=2e-3)
+    else:
+        torch.testing.assert_close(ssm, ssm_ref, rtol=1e-2, atol=1e-3)
     torch.testing.assert_close(y.float(), y_ref.float(), rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_serves_boundary():
+    """The block takes a batch only while it fits one wave of clusters of 8
+    or 4, and refuses to launch past that (the layer keeps its Triton chain)."""
+    assert qc.kda_block_serves(H, 1, True, True)
+    assert qc.kda_block_serves(2 * H, 4, True, True)
+    assert not qc.kda_block_serves(64 * H, 1, True, True)
+    assert not qc.kda_block_serves(H, 9, True, True)
+    assert not qc.kda_block_serves(0, 1, True, True)
+    i = _inputs(64, 1, 3, torch.bfloat16, seed=7, state_dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError, match="exceed one wave"):
+        _fused(i, 0)

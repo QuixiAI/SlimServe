@@ -1143,12 +1143,15 @@ is worked top to bottom.
 
 Item detail:
 
-- **P1 (closed).** Built as `kda_chain_decode` (opt-in QC_KDA_CHAIN=1, parity test
-  `tests/kernels/test_kda_decode_chain.py`); rejected on the microbench and
-  kept only as a diagnostic until the cleanup pass. The lesson for every
-  later item: measure the replaced kernels in a graph with PDL on before
-  fusing - launch gaps are already hidden, and a fused kernel must have a
-  shorter critical path than the sum of the wide kernels it replaces.
+- **P1 (closed; superseded by F1 on 2026-09-19).** Built as `kda_chain_decode`
+  (two launches, parity test `tests/kernels/test_kda_decode_chain.py`);
+  rejected on the microbench and kept as a diagnostic until the KDA decode
+  block (section 15, F1: one cluster launch per layer, `kda_block_decode`,
+  `tests/kernels/test_kda_decode_block.py`) beat it at every shape, at which
+  point the chain and its switches were deleted. The lesson for every later
+  item: measure the replaced kernels in a graph with PDL on before fusing -
+  launch gaps are already hidden, and a fused kernel must have a shorter
+  critical path than the sum of the wide kernels it replaces.
 - **P1b (design fixed 2026-09-17 21:00 PDT; parked behind P8).** Only the
   34 target KDA layers are involved (the MTP drafter is MLA). Per request
   per layer per speculative step the state moves once in and T times out
@@ -1367,7 +1370,7 @@ the same; the mandate's A/B rules apply unchanged).
 
 | item | fusion | launches removed per step | expected | risk / precedent |
 |---|---|---|---|---|
-| F1 the KDA attention block as one kernel | gate pair + conv update + recurrence + gated norm (+ the slice copy) in ONE cooperative kernel per layer: grid-wide phases with `cg::grid_group::sync` (cooperative launch inside the CUDA graph, verified), the conv and gate phases wide, the recurrence as P1's split-V blocks, the norm in the last phase | 5 x 34 = 170 | -0.1 ms at c1 (+2.5 %), ~-0.1 ms at c8/c16 (+1 %): P1's graph-replay measurement puts the four Triton kernels at 5.6 us per layer at one row (the trace's 8.5 us is dependent-launch accounting), so a ~2.5 us single kernel recovers ~3 us | P1's two-kernel chain lost because its phases serialised inside 16-64 blocks; a grid-synced kernel keeps each phase as wide as today's kernels, and pays ~1 us per grid sync. Parity test exists (`test_kda_decode_chain.py`) |
+| F1 the KDA attention block as one kernel | gate pair + conv update + recurrence + gated norm in ONE launch per layer: BUILT 2026-09-19 as a thread-block CLUSTER per (request, head) (1024 threads as CL blocks of 1024/CL; phases as wide as today's kernels, DSMEM hand-offs, no scratch, no grid barrier) rather than the cooperative grid sketched here, see the note below the table | 3 x 34 = 102 (P14 had already removed the slice copy) | measured cold, bf16 state: -2.4 us per layer at c1 (2.44 vs 4.85), -2.1 us at c1 x 4 spec rows; the block DECLINES batches past one wave of clusters (about five requests) where the state-bandwidth-bound Triton chain is level or better, so nothing at c8/c16 (notebook "Phase 9 / F1") | a cooperative grid was not needed: cluster.sync costs a fraction of grid.sync and needs no co-residency of the whole grid; the constraint that appeared instead is this part's ~2 resident cluster blocks per SM (cudaOccupancyMaxActiveClusters 46 of 8 / 94 of 4), hence the per-call cluster size and the serves() boundary |
 | F2 the shared expert inside the pair | the shared gate_up (fp8, block-scaled) streamed by gemv1's CTAs beside the routed experts with the clamped SiLU in the same epilogue; the shared down inside gemv2 beside the routed down, the moe_sum_add fold already there | 3 x 42 = 126 and the side stream | -0.1..0.15 ms at c1 (+2-3 %; the two streams stop contending for SMs), nothing at c8/c16 (Marlin serves those rows) | P15 showed the shared branch is not the critical path at one token; the gain is the contention and the launches, sized from the 15:35 timeline (gemv1 16.9 us in situ vs 13.5 cold) |
 | F3 the transition chain | sinkhorn_deferred + the router GEMV + the following norm into the all-reduce transition's tail (the transition already owns the residual streams; the router GEMV is 2.4 MB per layer, one CTA per 8 experts) | 2-3 x 45 = 90-135 | -0.1 ms at every shape (+2 % c1, +1 % c8/c16) | D5's kernel is the most-reworked piece of the branch; every change there needs its phase-stamp A/B |
 | F4 the decode GEMM chains | o_proj + the transition's first phase; q_b / kv_b / indexer wq_b of an MLA layer in one launch (three weights, one grid) | ~2 x 45 | -0.05..0.1 ms | the fp8 decode GEMM launcher already takes a config per shape; a multi-weight grid is a small extension |
@@ -1375,7 +1378,56 @@ the same; the mandate's A/B rules apply unchanged).
 
 Order: F1 (largest, self-contained, parity test in place), F2 (kernel work
 inside the pair, which is the best-understood code on the branch), F5, F3,
-F4. Together they remove ~450 of the ~1100 launches per c1 step and are
+F4. F1 note (2026-09-19): the table's sizing assumed the block helps at
+every shape; measured, the launches it removes only show at c1 (and c1
+spec), because at c8/c16 the KDA glue is bandwidth-bound on the recurrent
+state (halved by the bf16 state of item P8) and the four launches hide
+under it. The c1 lever is real (-0.08 ms of the 4.4 ms step from 34
+layers); the c8/c16 expectation of +1 % is withdrawn for F1.
+F1 SERVING VERDICT (22:25 PDT): LEVEL at every shape against the
+same-session reference with the block off (plain 228.5 / 228.6 vs 228.8 /
+228.7 at c1; spec eight-pass medians 296 vs 294), gates and canaries in
+band; the c1 profile shows 926 launches per step instead of 1028 and the
+wall step unchanged. The four launches the block removes were already
+hidden: under programmatic dependent launch inside the graph the chain's
+kernels dispatch while their predecessor runs, and only the cold microbench
+(back-to-back behind an L2 flush) pays them. The block stays on as the
+KDA decode path (parity-tested, fewer graph nodes; QC_KDA_BLOCK=0 restores
+the Triton kernels) and is a candidate for removal at the cleanup pass.
+The general lesson revises this table: the launch floor measured in
+section 14.3 is the cost of NON-PDL dependent launches, and the serving
+step's chains mostly run under PDL, so F3 and F4 (launch-count fusions)
+are not expected to pay at c1 either; what is left is bytes and
+contention (F2) and the drafter's non-PDL sampler chain (F5).
+
+F2 revised design (2026-09-19 22:10 PDT, before building): the shared expert
+has exactly a routed expert's per-rank shape (intermediate 2048 / TP4 = 512,
+K 4096), so the fold is not an fp8 path inside the pair but THE SHARED EXPERT
+AS EXPERT 288 - a 289th NVFP4 expert in the same Marlin layout, appended to
+every token's slots with weight 1.0 (the routed scaling of 2.5 stays on the
+eight routed slots). What it removes per MoE layer: the side stream and its
+three launches (gate_up 7.8 us, act 4.2, down 8.9 on the 15:35 timeline),
+the two streams' contention for DRAM (gemv1 16.9 us in situ against 13.5
+cold), and half of the shared bytes (6 MB fp8 -> 3 MB e2m1); what it adds is
+one more slot in gemv1/gemv2 (~1.9 us of bytes at c1) and one more expert row
+in Marlin at c8/c16 (where the shared expert's rows are grouped like any
+other expert's). Upper bound at c1: the MoE layer from ~26 us to ~22.4
+(-3.6 x 42 = 0.15 ms, +3.4 %); c8/c16 +0.5..1 %; prefill routes the whole
+batch through expert 288 in the grouped GEMM (TTFT measured). Plumbing, all
+precedented on the branch: the sidecar builder mirrors `build_mtp_experts`
+(the checkpoint's BF16 `mlp.shared_experts.*` -> NVFP4 emitted as
+`mlp.experts.288.*`, the fp8 swap-set's shared-expert modules dropped from
+its group); `determine_expert_counts` already appends
+`num_fused_shared_experts` slots for the AITER path (weights allocated for
+E + 1, `expert_map_manager` maps them) - it needs a CUDA gate keyed on the
+sidecar; `DeepseekV2MoE` then builds no shared MLP for those layers; the
+route_align kernel and the pair's folded router write the fixed slot
+themselves (the AITER `inject_shared_expert_weights` is ROCm-only); the
+prefill router appends it with a cat. Quality is gated like P6 (four gates,
+all-position mean; the shared expert is exercised on every token, so its
+NVFP4 error is the one to measure).
+
+Together they remove ~450 of the ~1100 launches per c1 step and are
 sized at +8-12 % c1, +4-5 % c8/c16 (F1 corrected from the graph-replay
 numbers) - the remaining "leaps and bounds"
 before the physics floor, at the cost of a persistent/cooperative kernel

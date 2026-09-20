@@ -2,7 +2,7 @@
 // kernels (kernels/serving/*_kernels.cuh). Registered into the _C module by
 // init_serving(m), called from tm_cuda_ext.cu's PYBIND11_MODULE.
 #include "kda_decode_kernels.cuh"
-#include "kda_decode_chain.cuh"
+#include "kda_decode_block.cuh"
 #include "skinny_gemm_ampere.cuh"
 #include "w8a16_gemm_ampere.cuh"
 #include "nvfp4_moe_prefill_ampere.cuh"
@@ -2490,61 +2490,34 @@ static void py_kda_spec_commit(torch::Tensor k, torch::Tensor v, torch::Tensor r
     launch_kda_spec<2>(k, k, v, raw_g, raw_beta, A_log, dt_bias, state, cu_seqlens, state_indices, prev_accepted,
                        new_accepted, boundary_row, c10::nullopt, 1.0, lower_bound, use_lower_bound);
 }
-// KDA decode chain (serving/kda_decode_chain.cuh): conv + gate GEMVs + norms, then the
-// recurrence + gated RMS norm, two launches per layer under programmatic dependent launch.
-static bool kda_chain_pdl() {
+// KDA decode block (serving/kda_decode_block.cuh): the whole decode glue of a KDA
+// layer in one launch, 1024 threads per (request, head) as a cluster of CL blocks.
+// The widest cluster whose resident capacity (cudaOccupancyMaxActiveClusters, per
+// device and instantiation) holds the batch in one wave is used: 8, else 4, else
+// the block declines (kda_block_serves) and the layer runs its Triton chain,
+// which is at least as fast once the batch is bandwidth-bound on the state.
+static bool kda_block_pdl() {
     static const bool on = [] { const char* e = std::getenv("QC_PDL"); return e == nullptr || e[0] != '0'; }();
     return on;
 }
-template <typename K, typename... Args>
-static void kda_chain_launch(K kern, int grid, int block, Args... args) {
-    cudaLaunchConfig_t cfg = {};
-    cfg.gridDim = dim3(grid); cfg.blockDim = dim3(block); cfg.dynamicSmemBytes = 0; cfg.stream = stream();
-    cudaLaunchAttribute attr[1];
-    attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attr[0].val.programmaticStreamSerializationAllowed = 1;
-    cfg.attrs = attr; cfg.numAttrs = kda_chain_pdl() ? 1 : 0;
-    C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, kern, args...));
-}
-template <typename CT, int TT>
-static void kda_chain_pre_launch(int grid, const torch::Tensor& mixed, torch::Tensor& conv_state,
-        const torch::Tensor& conv_w, const torch::Tensor& conv_idx, const torch::Tensor& f_a, const torch::Tensor& g_a,
+struct KdaBlockArgs { int N, H, R, max_rows, stride_idx; const int* cu; const int* acc; bool cbf, sbf; };
+static KdaBlockArgs kda_block_check(const char* fn, const torch::Tensor& mixed_qkv, const torch::Tensor& conv_state,
+        const torch::Tensor& conv_weight, const torch::Tensor& conv_idx, const torch::Tensor& f_a, const torch::Tensor& g_a,
         const torch::Tensor& f_w, const torch::Tensor& g_w, const torch::Tensor& raw_beta, const torch::Tensor& A_log,
-        const torch::Tensor& dt_bias, const int* cu, const int* acc, tms::kda_chain::ChainScratch sc, int H,
-        double scale, double lower_bound, bool use_lower_bound) {
-    kda_chain_launch(tms::kda_chain::kda_chain_pre_kernel<CT, TT>, grid, tms::kda_chain::PRE_THREADS,
-        bp(mixed), reinterpret_cast<CT*>(conv_state.data_ptr()), fp(conv_w), conv_idx.data_ptr<int>(),
-        bp(f_a), bp(g_a), bp(f_w), bp(g_w), bp(raw_beta), fp(A_log), fp(dt_bias), cu, acc, sc, H,
-        mixed.stride(0), f_a.stride(0), g_a.stride(0), raw_beta.stride(1),
-        conv_state.stride(0), conv_state.stride(1), conv_state.stride(2), int(conv_idx.stride(0)),
-        float(scale), float(lower_bound), use_lower_bound ? 1 : 0);
-}
-template <int TT, int SPLIT>
-static void kda_chain_rec_launch(int grid, tms::kda_chain::ChainScratch sc, torch::Tensor& state,
-        const torch::Tensor& state_indices, int stride_idx, const int* cu, const int* acc,
-        const torch::Tensor& norm_w, torch::Tensor& out, int H, double eps) {
-    kda_chain_launch(tms::kda_chain::kda_chain_rec_kernel<TT, SPLIT>, grid, 32 * (tms::kda_chain::HD / SPLIT / 8),
-        sc, fpm(state), state_indices.data_ptr<int>(), cu, acc, bp(norm_w), bpm(out), H, state.stride(0),
-        stride_idx, out.stride(1), float(eps));
-}
-static void py_kda_chain_decode(torch::Tensor mixed_qkv, torch::Tensor conv_state, torch::Tensor conv_weight,
-        torch::Tensor conv_idx, torch::Tensor f_a, torch::Tensor g_a, torch::Tensor f_w, torch::Tensor g_w,
-        torch::Tensor raw_beta, torch::Tensor A_log, torch::Tensor dt_bias, torch::Tensor state,
-        torch::Tensor state_indices, c10::optional<torch::Tensor> cu_seqlens, c10::optional<torch::Tensor> accepted,
-        torch::Tensor norm_w, torch::Tensor out, double scale, double lower_bound, bool use_lower_bound,
-        double eps, int64_t split) {
-    using namespace tms::kda_chain;
-    const char* fn = "kda_chain_decode";
+        const torch::Tensor& dt_bias, const torch::Tensor& state, const torch::Tensor& state_indices,
+        const c10::optional<torch::Tensor>& cu_seqlens, const c10::optional<torch::Tensor>& accepted,
+        const torch::Tensor& norm_w, const torch::Tensor& out) {
+    using namespace tms::kda_block;
     for (const torch::Tensor* t : {&conv_state, &conv_weight, &conv_idx, &f_a, &g_a, &f_w, &g_w, &raw_beta, &A_log,
                                    &dt_bias, &state, &state_indices, &norm_w, &out})
         require_device(mixed_qkv, *t, fn, "operand");
     if (cu_seqlens) require_device(mixed_qkv, *cu_seqlens, fn, "cu_seqlens");
     if (accepted) require_device(mixed_qkv, *accepted, fn, "accepted");
-    const c10::cuda::CUDAGuard guard(mixed_qkv.device());
     TORCH_CHECK(mixed_qkv.is_cuda() && mixed_qkv.dim() == 2 && mixed_qkv.stride(1) == 1 &&
                 mixed_qkv.scalar_type() == torch::kBFloat16, fn, ": mixed_qkv [N, C] bf16, unit inner stride");
-    TORCH_CHECK(state.dim() == 4 && state.scalar_type() == torch::kFloat && state.size(2) == HD && state.size(3) == HD &&
-                state.stride(1) == HD * HD && state.stride(2) == HD && state.stride(3) == 1, fn, ": state [slots, H, 128, 128] fp32");
+    const bool sbf = state.scalar_type() == torch::kBFloat16;
+    TORCH_CHECK(state.dim() == 4 && (sbf || state.scalar_type() == torch::kFloat) && state.size(2) == HD && state.size(3) == HD &&
+                state.stride(1) == HD * HD && state.stride(2) == HD && state.stride(3) == 1, fn, ": state [slots, H, 128, 128] fp32 or bf16");
     const int N = mixed_qkv.size(0), H = state.size(1);
     TORCH_CHECK(mixed_qkv.size(1) >= 3 * H * HD, fn, ": packed qkv width");
     TORCH_CHECK(conv_state.dim() == 3 && conv_state.size(1) == 3 * H * HD && conv_state.size(2) >= CONV_W - 1,
@@ -2583,29 +2556,109 @@ static void py_kda_chain_decode(torch::Tensor mixed_qkv, torch::Tensor conv_stat
         TORCH_CHECK(accepted->scalar_type() == torch::kInt && accepted->is_contiguous() && accepted->numel() >= R, fn, ": accepted [R] int32");
         acc = accepted->data_ptr<int>();
     }
-    TORCH_CHECK(split == 1 || split == 2 || split == 4, fn, ": split in {1, 2, 4}");
-    if (N == 0) return;
-    auto f32 = mixed_qkv.options().dtype(torch::kFloat);
-    auto ops_t = torch::empty({N, H, 4, HD}, f32);
-    auto beta_t = torch::empty({N, H}, f32);
-    auto g2_t = torch::empty({N, H, HD}, mixed_qkv.options());
-    auto o_t = torch::empty({N, H, HD}, f32);
-    auto ss_t = torch::empty({N, H}, f32);
-    auto cnt_t = torch::empty({R * H}, mixed_qkv.options().dtype(torch::kInt));
-    ChainScratch sc{fpm(ops_t), fpm(beta_t), bpm(g2_t), fpm(o_t), fpm(ss_t), cnt_t.data_ptr<int>()};
-    const int grid = R * H;
     const bool cbf = conv_state.scalar_type() == torch::kBFloat16;
     TORCH_CHECK(cbf || conv_state.scalar_type() == torch::kFloat, fn, ": conv_state bf16 or fp32");
-#define KDA_CHAIN_PRE(CT, TT) kda_chain_pre_launch<CT, TT>(grid, mixed_qkv, conv_state, conv_weight, conv_idx, f_a, g_a, f_w, g_w, raw_beta, A_log, dt_bias, cu, acc, sc, H, scale, lower_bound, use_lower_bound)
-#define KDA_CHAIN_REC(TT, SP) kda_chain_rec_launch<TT, SP>(grid * SP, sc, state, state_indices, stride_idx, cu, acc, norm_w, out, H, eps)
-#define KDA_CHAIN_BOTH(TT)                                                                        \
-    if (cbf) { KDA_CHAIN_PRE(__nv_bfloat16, TT); } else { KDA_CHAIN_PRE(float, TT); }              \
-    if (split == 4) { KDA_CHAIN_REC(TT, 4); } else if (split == 2) { KDA_CHAIN_REC(TT, 2); } else { KDA_CHAIN_REC(TT, 1); }
-    if (max_rows <= 1) { KDA_CHAIN_BOTH(1); } else if (max_rows <= 4) { KDA_CHAIN_BOTH(4); } else { KDA_CHAIN_BOTH(8); }
-#undef KDA_CHAIN_BOTH
-#undef KDA_CHAIN_REC
-#undef KDA_CHAIN_PRE
+    return KdaBlockArgs{N, H, R, max_rows, stride_idx, cu, acc, cbf, sbf};
 }
+template <typename CT, typename ST, int TT, int CL>
+static int kda_block_capacity() {
+    // Clusters of CL blocks of this instantiation resident at once on the current
+    // device (the cache is per instantiation: the template parameters, not the
+    // kernel's pointer type, which every CL shares).
+    using namespace tms::kda_block;
+    static thread_local std::array<int, 64> cache{};
+    const int dev = SmemOptIn::slot();
+    if (cache[dev] > 0) return cache[dev];
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = dim3(unsigned(CL)); cfg.blockDim = dim3(unsigned(Geom<CL>::THREADS));
+    cudaLaunchAttribute attr[1];
+    attr[0].id = cudaLaunchAttributeClusterDimension;
+    attr[0].val.clusterDim.x = unsigned(CL); attr[0].val.clusterDim.y = 1; attr[0].val.clusterDim.z = 1;
+    cfg.attrs = attr; cfg.numAttrs = 1;
+    int cap = 0;
+    C10_CUDA_CHECK(cudaOccupancyMaxActiveClusters(&cap, kda_block_kernel<CT, ST, TT, CL>, &cfg));
+    cache[dev] = std::max(cap, 1);
+    return cache[dev];
+}
+// The cluster size that holds `pairs` (request, head) pairs in one wave: 8, 4, or 0 (declined).
+// `pin` 8 or 4 forces one (tests); anything else is automatic.
+template <typename CT, typename ST, int TT>
+static int kda_block_pick_cl(int pairs, int pin) {
+    if (pin == 8 || pin == 4) return pin;
+    if (pairs <= kda_block_capacity<CT, ST, TT, 8>()) return 8;
+    if (pairs <= kda_block_capacity<CT, ST, TT, 4>()) return 4;
+    return 0;
+}
+template <typename CT, typename ST, int TT, int CL>
+static void kda_block_launch(int pairs, const torch::Tensor& mixed, torch::Tensor& conv_state,
+        const torch::Tensor& conv_w, const torch::Tensor& conv_idx, const torch::Tensor& f_a, const torch::Tensor& g_a,
+        const torch::Tensor& f_w, const torch::Tensor& g_w, const torch::Tensor& raw_beta, const torch::Tensor& A_log,
+        const torch::Tensor& dt_bias, const int* cu, const int* acc, torch::Tensor& state,
+        const torch::Tensor& state_indices, int stride_idx, const torch::Tensor& norm_w, torch::Tensor& out, int H,
+        double scale, double lower_bound, bool use_lower_bound, double eps) {
+    using namespace tms::kda_block;
+    constexpr int THREADS = Geom<CL>::THREADS;
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = dim3(unsigned(pairs * CL)); cfg.blockDim = dim3(THREADS); cfg.dynamicSmemBytes = 0; cfg.stream = stream();
+    cudaLaunchAttribute attr[2];
+    attr[0].id = cudaLaunchAttributeClusterDimension;
+    attr[0].val.clusterDim.x = CL; attr[0].val.clusterDim.y = 1; attr[0].val.clusterDim.z = 1;
+    attr[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr[1].val.programmaticStreamSerializationAllowed = 1;
+    const bool pdl = kda_block_pdl();
+    cfg.attrs = attr; cfg.numAttrs = pdl ? 2 : 1;
+    C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, kda_block_kernel<CT, ST, TT, CL>,
+        bp(mixed), reinterpret_cast<CT*>(conv_state.data_ptr()), fp(conv_w), conv_idx.data_ptr<int>(),
+        bp(f_a), bp(g_a), bp(f_w), bp(g_w), bp(raw_beta), fp(A_log), fp(dt_bias), cu, acc,
+        reinterpret_cast<ST*>(state.data_ptr()), state_indices.data_ptr<int>(), bp(norm_w), bpm(out), H,
+        mixed.stride(0), f_a.stride(0), g_a.stride(0), raw_beta.stride(1),
+        conv_state.stride(0), conv_state.stride(1), conv_state.stride(2), int(conv_idx.stride(0)),
+        state.stride(0), stride_idx, out.stride(1),
+        float(scale), float(lower_bound), use_lower_bound ? 1 : 0, float(eps), pdl ? 1 : 0));
+}
+// The four dtype instantiations of one TT: conv state x SSM state, bf16 or fp32.
+#define KDA_BLOCK_DTYPES(TT, cbf, sbf, X)                                                          \
+    if (cbf) { if (sbf) { X(__nv_bfloat16, __nv_bfloat16, TT); } else { X(__nv_bfloat16, float, TT); } } \
+    else     { if (sbf) { X(float, __nv_bfloat16, TT); } else { X(float, float, TT); } }
+#define KDA_BLOCK_ROWS(max_rows, cbf, sbf, X)                                                      \
+    if ((max_rows) <= 1) { KDA_BLOCK_DTYPES(1, cbf, sbf, X) } else if ((max_rows) <= 4) { KDA_BLOCK_DTYPES(4, cbf, sbf, X) } \
+    else { KDA_BLOCK_DTYPES(8, cbf, sbf, X) }
+static bool py_kda_block_serves(int64_t pairs, int64_t max_rows, bool conv_bf16, bool state_bf16) {
+    // Whether kda_block_decode takes a batch of `pairs` (request, head) pairs of up to
+    // `max_rows` rows each in one wave; the caller runs its Triton chain otherwise.
+    using namespace tms::kda_block;
+    if (pairs <= 0 || max_rows < 1 || max_rows > MAX_T) return false;
+    int cl = 0;
+#define KDA_BLOCK_PICK(CT, ST, TT) cl = kda_block_pick_cl<CT, ST, TT>(int(pairs), 0);
+    KDA_BLOCK_ROWS(max_rows, conv_bf16, state_bf16, KDA_BLOCK_PICK)
+#undef KDA_BLOCK_PICK
+    return cl != 0;
+}
+static void py_kda_block_decode(torch::Tensor mixed_qkv, torch::Tensor conv_state, torch::Tensor conv_weight,
+        torch::Tensor conv_idx, torch::Tensor f_a, torch::Tensor g_a, torch::Tensor f_w, torch::Tensor g_w,
+        torch::Tensor raw_beta, torch::Tensor A_log, torch::Tensor dt_bias, torch::Tensor state,
+        torch::Tensor state_indices, c10::optional<torch::Tensor> cu_seqlens, c10::optional<torch::Tensor> accepted,
+        torch::Tensor norm_w, torch::Tensor out, double scale, double lower_bound, bool use_lower_bound,
+        double eps, int64_t cl) {
+    const char* fn = "kda_block_decode";
+    const c10::cuda::CUDAGuard guard(mixed_qkv.device());
+    const KdaBlockArgs a = kda_block_check(fn, mixed_qkv, conv_state, conv_weight, conv_idx, f_a, g_a, f_w, g_w, raw_beta,
+                                           A_log, dt_bias, state, state_indices, cu_seqlens, accepted, norm_w, out);
+    if (a.N == 0) return;
+    const int pairs = a.R * a.H;
+#define KDA_BLOCK(CT, ST, TT, CL) kda_block_launch<CT, ST, TT, CL>(pairs, mixed_qkv, conv_state, conv_weight, conv_idx, f_a, g_a, f_w, g_w, raw_beta, A_log, dt_bias, a.cu, a.acc, state, state_indices, a.stride_idx, norm_w, out, a.H, scale, lower_bound, use_lower_bound, eps)
+#define KDA_BLOCK_CL(CT, ST, TT)                                                                  \
+    switch (kda_block_pick_cl<CT, ST, TT>(pairs, int(cl))) {                                      \
+        case 8: KDA_BLOCK(CT, ST, TT, 8); break;                                                  \
+        case 4: KDA_BLOCK(CT, ST, TT, 4); break;                                                  \
+        default: TORCH_CHECK(false, fn, ": ", pairs, " (request, head) pairs exceed one wave; ask kda_block_serves first"); \
+    }
+    KDA_BLOCK_ROWS(a.max_rows, a.cbf, a.sbf, KDA_BLOCK_CL)
+#undef KDA_BLOCK_CL
+#undef KDA_BLOCK
+}
+#undef KDA_BLOCK_ROWS
+#undef KDA_BLOCK_DTYPES
 static torch::Tensor py_kda_decode(torch::Tensor mixed_qkv, torch::Tensor raw_g,
         torch::Tensor raw_beta, torch::Tensor A_log, torch::Tensor dt_bias,
         torch::Tensor state, torch::Tensor state_indices, double scale,
@@ -3504,12 +3557,14 @@ void init_serving(py::module_& m) {
           py::arg("A_log"), py::arg("dt_bias"), py::arg("state"), py::arg("cu_seqlens"), py::arg("state_indices"),
           py::arg("prev_accepted"), py::arg("new_accepted"), py::arg("boundary_row"), py::arg("lower_bound"),
           py::arg("use_lower_bound"), "KDA speculative deferred commit: replay accepted rows, store committed/boundary states");
-    m.def("kda_chain_decode", &py_kda_chain_decode, py::arg("mixed_qkv"), py::arg("conv_state"), py::arg("conv_weight"),
+    m.def("kda_block_serves", &py_kda_block_serves, py::arg("pairs"), py::arg("max_rows"), py::arg("conv_bf16"),
+          py::arg("state_bf16"), "Whether kda_block_decode takes a batch of (request, head) pairs in one wave");
+    m.def("kda_block_decode", &py_kda_block_decode, py::arg("mixed_qkv"), py::arg("conv_state"), py::arg("conv_weight"),
           py::arg("conv_idx"), py::arg("f_a"), py::arg("g_a"), py::arg("f_w"), py::arg("g_w"), py::arg("raw_beta"),
           py::arg("A_log"), py::arg("dt_bias"), py::arg("state"), py::arg("state_indices"), py::arg("cu_seqlens") = py::none(),
           py::arg("accepted") = py::none(), py::arg("norm_w"), py::arg("out"), py::arg("scale"), py::arg("lower_bound"),
-          py::arg("use_lower_bound"), py::arg("eps") = 1e-5, py::arg("split") = 4,
-          "KDA decode chain (K=V=128): conv + gate GEMVs + recurrence + gated RMS norm, two launches, per-row state stores");
+          py::arg("use_lower_bound"), py::arg("eps") = 1e-5, py::arg("cl") = 0,
+          "KDA decode block (K=V=128): conv + gate GEMVs + recurrence + gated RMS norm in one cluster launch, per-row state stores");
     m.def("kda_decode", &py_kda_decode, py::arg("mixed_qkv"), py::arg("raw_g"),
           py::arg("raw_beta"), py::arg("A_log"), py::arg("dt_bias"), py::arg("state"),
           py::arg("state_indices"), py::arg("scale"), py::arg("lower_bound"),

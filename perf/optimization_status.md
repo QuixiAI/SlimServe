@@ -30820,3 +30820,109 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   (bytes at the card's rate + the PCIe all-reduce floor ~ 2.3 ms), that is
   the number a layer-level fusion (far fewer launches per layer) can
   recover; no kernel on the existing boundaries can.
+
+- PHASE 9 / F1: THE KDA DECODE BLOCK - ONE LAUNCH PER KDA LAYER (2026-09-19
+  21:20-22:00 PDT; the first item of campaign doc section 15). Built as
+  `csrc/quixicore/serving/kda_decode_block.cuh` (`kda_block_decode` /
+  `kda_block_serves` in `_quixicore_C`, Python op `vllm::kda_attention_block`
+  replacing the P1 chain's op; QC_KDA_BLOCK=0 restores the four Triton
+  kernels; parity `tests/kernels/test_kda_decode_block.py`, 145 cases: plain
+  and speculative rows, ragged lengths, bf16/fp32 conv AND SSM states,
+  clusters of 8 and 4 and the automatic pick, the serves() boundary). The
+  P1 two-kernel chain (`kda_decode_chain.cuh`, `kda_chain_decode`,
+  QC_KDA_CHAIN, QC_KDA_SPLIT) is deleted: the block is faster than it at
+  every shape, so it had no remaining use.
+  DESIGN. One (request, head) pair is served by 1024 threads as a
+  thread-block CLUSTER of CL blocks (not the cooperative grid section 15
+  sketched): phase A - each block does 3*128/CL conv channels (Triton's
+  exact history roll) and 2*128/CL of the f_b/g_b gate GEMV outputs (4 lanes
+  per output, 8 KB of weights per block at CL 8, all loads issued up front),
+  with the block's SSM state rows loaded into registers at the very top so
+  that read overlaps the phase; cluster.sync(); every block gathers q, k,
+  exp(gate) of all rows and its own V rows and output-gate columns over
+  distributed shared memory, q/k L2 norms; phase B - the delta rule over
+  the block's 128/CL state rows (8 lanes per row, 16 interleaved columns in
+  registers), per-row state stores, read-outs and sum-of-squares partials in
+  smem; cluster.sync(); each block norms its own columns with the
+  cluster-wide sum; cluster.sync() before exit. No global scratch, no atomic
+  counter, no grid barrier; PDL wait at entry, trigger after the recurrence.
+  The staged gate inputs are dead after the GEMV, so the gathered q/k reuse
+  their smem (one 1024-thread block at TT 8 would otherwise exceed 48 KB).
+  TWO PROBES that shaped it (`$S/p9/cluster_rate.cu`, `cluster_occ.cu`,
+  `block_occ.cu`): (1) cluster dispatch itself is cheap on this part (2048
+  empty 128-thread blocks: 1.24 us plain, 1.55 us as clusters of 8, +0.7 us
+  with a cluster.sync each); (2) cudaOccupancyMaxActiveClusters reports 46
+  clusters of 8 (368 blocks, ~2 per SM) for the real kernel at every TT,
+  and 94 of 4, 188 of 2, 376 of 1 - i.e. ~2 cluster blocks resident per SM
+  regardless of size or register count - so a 16-request batch as 2048
+  cluster-of-8 blocks runs in 5.6 waves of a ~3.5 us latency chain (the
+  first cut: 32 us hot at R 16 against Triton's 12, and linear in R from
+  R 3). CL is therefore a template parameter with 1024/CL threads per block
+  and the launcher picks the widest cluster whose measured capacity holds
+  the batch in one wave (8 up to 46 pairs = 2 requests at 16 heads, 4 up to
+  94 = 5 requests), else it DECLINES (`kda_block_serves`) and the layer runs
+  its Triton chain: past one wave the batch is bandwidth-bound on the state
+  and the chain is level or better (fp32-state cold, R 8/16 plain: block
+  11.4-11.7 / 23.5 vs Triton 11.7 / 23.0; R 16 x 4 spec: 56.7 vs 56.5 at
+  CL 2, 64 at CL 1). CL 2 and 1 variants were measured (level) and removed.
+  MICROBENCH (GPU 1, CUDA-graph replay, us per layer call, H 16; "cold" =
+  256 MB L2 flush before every call, subtracted; raw
+  perf/results/2026-09-19/f1-kda-block/): with the record's bf16 SSM state
+  | rows | cold: triton | block | hot: triton | block |
+  |---|---|---|---|---|
+  | 1 x 1 | 4.85 | 2.44 (CL 8) | 5.03 | 4.77 |
+  | 2 x 1 | 4.77 | 2.98 (8) | 5.44 | 5.42 |
+  | 3 x 1 | 5.14 | 3.44 (4) | 6.39 | 6.18 |
+  | 4 x 1 | 5.42 | 3.91 (4) | 6.23 | 6.46 |
+  | 5 x 1 | 5.33 | 4.65 (4) | 6.46 | 6.61 |
+  | 6+ x 1 | declined (5.95 / 6.85 / 12.31 at 6 / 8 / 16) | | | |
+  | 1 x 4 (spec) | 9.18 | 7.07 (8) | 9.52 | 8.93 |
+  | 2 x 4 | 9.38 | 7.25 (8) | 10.79 | 10.74 |
+  | 3 x 4 | 10.13 | 9.31 (4) | 11.39 | 12.17 |
+  | 4 x 4 | 10.22 | 9.38 (4) | 11.55 | 12.42 |
+  | 5 x 4 | 10.37 | 10.09 (4) | 12.43 | 12.76 |
+  | 6+ x 4 | declined (12.27 / 14.82 / 29.83 at 6 / 8 / 16) | | | |
+  Cold is the serving regime (34 layers of state and 1.75 GB of weights per
+  step evict L2): -2.4 us per layer at one request, -2.1 us at one request
+  x 4 spec rows, -1.5..1.8 us at 2-4 requests; 34 layers x 2.4 us = 0.08 ms
+  of the 4.4 ms c1 step (+1.9 % expected), nothing at c8/c16 (declined, as
+  the section-15 sizing already put those at ~1 % and the bf16 state has
+  since halved the bytes the chain hides its launches under).
+  Clusters of 8 pinned past two requests lose (3 x 1 cold 8.17 vs 3.44 at
+  CL 4), which is the second wave - the capacity rule is the design.
+  Serving arms: `$S/p9/chain_f1.sh` - f1-nospec (2 passes, 4 gates,
+  canaries), f1-spec (8 passes), f1off-{nospec,spec} (QC_KDA_BLOCK=0, the
+  same-session references).
+  F1 SERVING (2026-09-19 21:55-22:25 PDT, `$S/p9/chain_f1.sh`, one boot per
+  arm, exact on every run; raw perf/results/2026-09-19/f1{,off}-{nospec,spec}-pass*/,
+  gates f1-nospec-gate{1..4}.json, f1off-nospec-gate{1,2}.json):
+  | arm | c1 | c8 | c16 |
+  |---|---|---|---|
+  | f1-nospec (block on) | 228.5 / 228.6 | 780.9 / 772.0 | 1117.5 / 1126.3 |
+  | f1off-nospec (QC_KDA_BLOCK=0) | 228.8 / 228.7 | 782.9 / 777.1 | 1121.7 / 1125.9 |
+  | f1-spec, 8 passes (median) | 296.4 (253.9-355.2) | 809.5 (771.8-881.8) | 1094 (1030-1140) |
+  | f1off-spec, 8 passes (median) | 293.5 (265.9-342.4) | 835 (755.8-903.2) | 1130 (1067-1163) |
+  LEVEL at every shape (c8/c16 never use the block; the spec draws are
+  inside their spread). Gates (4) -2.503 / -2.437 / -2.466 / -2.477 against
+  -2.428 / -2.441, canaries PASS. The c1 profile arm (f1-prof, STATE=1):
+  wall/step 4.225 ms at 926 launches per step (1028 before: the 3 x 34
+  removed), kda_block_kernel 6.7 us x 32 per step in the trace against the
+  four Triton kernels' 2.5 + 2.0 + 1.9 + 4.1 = 10.5 - and the wall step
+  unchanged. WHY: the four launches the block removes were already hidden.
+  Inside the graph, under programmatic dependent launch, each of the chain's
+  kernels is dispatched while its predecessor still runs, so the step pays
+  their work, not their launches; the cold microbench replays the chain
+  back to back behind an L2 flush and pays every launch, which is where its
+  2.4 us per layer came from (P1's lesson, now measured from the other
+  side). DECISION: level; the block stays on as the KDA layers' decode path
+  (parity-tested, 102 fewer graph nodes per step, the spec c1 median +1 %
+  inside its draw) with QC_KDA_BLOCK=0 as the switch; it is a candidate
+  for removal in the cleanup pass if the operator prefers the smaller
+  tree. CONSEQUENCE for the section-15 plan: launch-count fusions at c1
+  (F3 the transition chain, F4 the GEMM chains) are not expected to pay
+  either - the launch floor measured in "The launch floor of this card" is
+  the cost of a graph of NON-PDL dependent tiny kernels, and the serving
+  step's chains mostly run under PDL. What remains on that list is bytes
+  and contention (F2: the shared expert as expert 288, halving its bytes
+  and removing the side stream) and the drafter's non-PDL sampler chain
+  (F5).

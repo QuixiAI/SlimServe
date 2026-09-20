@@ -18,6 +18,7 @@ from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig
 from vllm.distributed import divide, get_tensor_model_parallel_rank
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 from vllm.model_executor.model_loader.weight_utils import (
@@ -50,10 +51,10 @@ from ..mamba_utils import (
 from ..ops.causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 from ..ops.gather_initial_states import gather_initial_states
 
+logger = init_logger(__name__)
+
 # Empirical lower bound for the KDA gate to avoid numerical underflow.
 _KDA_GATE_LOGBOUND_MIN = -5.0
-# V split of the fused chain's recurrence kernel (blocks per request x head).
-_KDA_CHAIN_SPLIT = int(__import__("os").environ.get("QC_KDA_SPLIT", "4"))
 
 
 @functools.cache
@@ -97,23 +98,51 @@ def _materialize_kda_gate_and_beta(
     return gate, raw_beta.float().sigmoid()
 
 
-def _use_kda_chain() -> bool:
-    """The fused decode chain (QuixiCore kda_chain_decode: conv + gate GEMVs
-    + recurrence + gated RMS norm in two launches per layer) on CUDA. Opt-in
-    diagnostic (QC_KDA_CHAIN=1): measured 2026-09-17 on sm_120 it is never
-    faster than the four Triton kernels under graph replay with dependent
-    launch (perf/optimization_status.md, "Phase 8 / P1"), so the Triton chain
-    stays the serving path."""
+def _use_kda_block() -> bool:
+    """The fused decode block (QuixiCore kda_block_decode: conv + gate GEMVs
+    + recurrence + gated RMS norm in one cluster launch per layer) on CUDA.
+    Default on; QC_KDA_BLOCK=0 keeps the four Triton kernels. The block takes
+    a batch only while it fits one wave of clusters (kda_block_serves: up to
+    about five requests at 16 heads on sm_120), where it is 1.5-3.5 us per
+    layer faster than the Triton chain (perf/optimization_status.md,
+    "Phase 9 / F1"); larger batches are bandwidth-bound on the state and
+    keep the Triton chain."""
     import os
 
-    if os.environ.get("QC_KDA_CHAIN", "0") != "1" or not current_platform.is_cuda():
+    if os.environ.get("QC_KDA_BLOCK", "1") == "0" or not current_platform.is_cuda():
         return False
     try:
         from vllm.quixicore.ops import _qc
 
-        return hasattr(_qc(), "kda_chain_decode")
+        return hasattr(_qc(), "kda_block_decode")
     except ImportError:
         return False
+
+
+_kda_block_announced: set[bool] = set()
+
+
+def _kda_block_announce(served: bool, pairs: int, rows: int) -> None:
+    """One boot-log line per outcome, so a serving log shows whether the
+    block ran or the batch went back to the Triton chain and why."""
+    if served in _kda_block_announced:
+        return
+    _kda_block_announced.add(served)
+    if served:
+        logger.info(
+            "Using the QuixiCore KDA decode block (first batch: %d request x head "
+            "pairs, up to %d rows per request)",
+            pairs,
+            rows,
+        )
+    else:
+        logger.info(
+            "QuixiCore KDA decode block not used for a decode batch of %d request "
+            "x head pairs (up to %d rows): past one wave of clusters, the Triton "
+            "chain serves it",
+            pairs,
+            rows,
+        )
 
 
 def _use_recurrent_kda_prefill() -> bool:
@@ -484,13 +513,13 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             and self.g_b_proj.weight.dtype == torch.bfloat16
         )
         self.o_norm = FusedRMSNormGated(self.head_dim, activation="sigmoid")
-        # The fused decode chain takes the paired-gate inputs (f_a, g_a) and
-        # runs the whole decode glue of the layer in two launches.
-        self.use_kda_chain = (
+        # The fused decode block takes the paired-gate inputs (f_a, g_a) and
+        # runs the whole decode glue of the layer in one launch.
+        self.use_kda_block = (
             self.use_paired_gate_projection
             and self.conv_size == 4
             and self.head_dim == 128
-            and _use_kda_chain()
+            and _use_kda_block()
         )
         self.o_proj = RowParallelLinear(
             self.projection_size,
@@ -555,13 +584,13 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 start = get_tensor_model_parallel_rank() * self.local_num_heads
                 beta = beta[..., start : start + self.local_num_heads]
             g_a = projected[3] if self.fuse_gate_a else self.g_a_proj(hidden_states)[0]
-            if self.use_kda_chain:
+            if self.use_kda_block:
                 core_attn_out = torch.empty(
                     (1, num_tokens, self.local_num_heads, self.head_dim),
                     dtype=hidden_states.dtype,
                     device=hidden_states.device,
                 )
-                torch.ops.vllm.kda_attention_chain(
+                torch.ops.vllm.kda_attention_block(
                     mixed_qkv, f_a, g_a, beta.unsqueeze(0), core_attn_out, self.prefix
                 )
                 core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
@@ -599,7 +628,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         output[:] = self.o_proj(core_attn_out)[0]
 
     @eager_break_during_capture
-    def _forward_chain(
+    def _forward_block(
         self,
         mixed_qkv: torch.Tensor,
         f_a: torch.Tensor,
@@ -607,8 +636,10 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         beta: torch.Tensor,
         core_attn_out: torch.Tensor,
     ) -> None:
-        """Decode batches through kda_chain_decode; anything else (prefill,
-        more than 8 rows per request) through the gate pair and _forward."""
+        """Decode batches the block takes (kda_block_serves) run through
+        kda_block_decode; anything else (prefill, more than 8 rows per
+        request, a batch past one wave of clusters) through the gate pair and
+        _forward."""
         forward_context = get_forward_context()
         attn_metadata_raw = forward_context.attn_metadata
         if attn_metadata_raw is None:
@@ -622,7 +653,21 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             and m.spec_state_indices_tensor is not None
             else 1
         )
-        if m.num_prefills > 0 or spec_rows > 8:
+        conv_state, recurrent_state = self.kv_cache
+        served = m.num_prefills == 0 and spec_rows <= 8
+        if served:
+            from vllm.quixicore.ops import _qc
+
+            qc = _qc()
+            pairs = max(m.num_spec_decodes, m.num_decodes) * self.local_num_heads
+            served = qc.kda_block_serves(
+                pairs,
+                spec_rows,
+                conv_state.dtype == torch.bfloat16,
+                recurrent_state.dtype == torch.bfloat16,
+            )
+            _kda_block_announce(served, pairs, spec_rows)
+        if not served:
             g1, g2 = torch.ops.vllm.kda_gate_pair(
                 f_a, g_a, self.f_b_proj.weight, self.g_b_proj.weight
             )
@@ -632,15 +677,11 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 mixed_qkv=mixed_qkv, g1=g1, g2=g2, beta=beta, core_attn_out=core_attn_out
             )
             return
-        from vllm.quixicore.ops import _qc
-
-        qc = _qc()
         num_actual_tokens = m.num_actual_tokens
         mixed_qkv = mixed_qkv[:num_actual_tokens]
         f_a = f_a[:num_actual_tokens]
         g_a = g_a[:num_actual_tokens]
         beta = beta[:, :num_actual_tokens]
-        conv_state, recurrent_state = self.kv_cache
         if not is_conv_state_dim_first():
             conv_state = conv_state.transpose(-1, -2)
         conv_weights = self.conv1d.weight.view(
@@ -660,7 +701,6 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             lower_bound=lower_bound if lower_bound is not None else 0.0,
             use_lower_bound=lower_bound is not None,
             eps=self.o_norm.eps,
-            split=_KDA_CHAIN_SPLIT,
         )
         spec_out = non_spec_out = None
         mixed_batch = m.spec_sequence_masks is not None and m.num_decodes > 0
@@ -683,7 +723,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             else:
                 rows = (mixed_qkv, f_a, g_a, beta)
                 spec_out = core_attn_out[:, :num_actual_tokens]
-            qc.kda_chain_decode(
+            qc.kda_block_decode(
                 rows[0],
                 conv_idx=m.spec_state_indices_tensor[:, 0][: m.num_spec_decodes],
                 f_a=rows[1],
@@ -714,7 +754,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 rows = (mixed_qkv, f_a, g_a, beta)
                 non_spec_out = core_attn_out[:, :num_actual_tokens]
             n_rows = rows[0].size(0)
-            qc.kda_chain_decode(
+            qc.kda_block_decode(
                 rows[0],
                 conv_idx=m.non_spec_state_indices_tensor[:n_rows],
                 f_a=rows[1],
@@ -1058,7 +1098,7 @@ direct_register_custom_op(
 )
 
 
-def kda_attention_chain(
+def kda_attention_block(
     mixed_qkv: torch.Tensor,
     f_a: torch.Tensor,
     g_a: torch.Tensor,
@@ -1067,12 +1107,12 @@ def kda_attention_chain(
     layer_name: str,
 ) -> None:
     layer = get_forward_context().no_compile_layers[layer_name]
-    layer._forward_chain(
+    layer._forward_block(
         mixed_qkv=mixed_qkv, f_a=f_a, g_a=g_a, beta=beta, core_attn_out=core_attn_out
     )
 
 
-def kda_attention_chain_fake(
+def kda_attention_block_fake(
     mixed_qkv: torch.Tensor,
     f_a: torch.Tensor,
     g_a: torch.Tensor,
@@ -1084,8 +1124,8 @@ def kda_attention_chain_fake(
 
 
 direct_register_custom_op(
-    op_name="kda_attention_chain",
-    op_func=kda_attention_chain,
+    op_name="kda_attention_block",
+    op_func=kda_attention_block,
     mutates_args=["core_attn_out"],
-    fake_impl=kda_attention_chain_fake,
+    fake_impl=kda_attention_block_fake,
 )
