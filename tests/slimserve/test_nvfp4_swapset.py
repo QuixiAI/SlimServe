@@ -97,6 +97,38 @@ def test_shared_expert_sidecar_build_and_manifest(tmp_path, monkeypatch):
     assert "layers.45.mlp.shared_experts.down_proj" not in ns.claimed_modules(str(tmp_path))
 
 
+def test_draft_lm_head_sidecar_build_and_manifest(tmp_path, monkeypatch):
+    """The drafter's NVFP4 lm_head: the checkpoint's BF16 head quantized under
+    the draft-only module name, its config group targeting that name alone,
+    and the serving-side helpers."""
+    from safetensors.torch import load_file, save_file
+
+    torch.manual_seed(1)
+    w = torch.randn(96, 64).to(torch.bfloat16)
+    save_file({"lm_head.weight": w}, str(tmp_path / "model-00001-of-00001.safetensors"))
+    out = ns.build_draft_lm_head(str(tmp_path), None)
+    assert out.name == f"{ns.DRAFT_LMHEAD_STEM}.safetensors"
+    with open(tmp_path / f"{ns.DRAFT_LMHEAD_STEM}.json") as fh:
+        manifest = json.load(fh)
+    assert manifest["kind"] == "draft_lm_head" and manifest["source"] == "lm_head.weight"
+    assert manifest["config_group"]["targets"] == [r"re:.*draft_head$"]
+    assert manifest["config_group"]["weights"]["group_size"] == 16
+    tensors = load_file(str(out))
+    assert set(tensors) == {"draft_head.weight_packed", "draft_head.weight_scale", "draft_head.weight_global_scale"}
+    err = (ns.dequant_nvfp4(tensors["draft_head.weight_packed"], tensors["draft_head.weight_scale"],
+                            tensors["draft_head.weight_global_scale"]) - w.float()).norm() / w.float().norm()
+    assert err < 0.2
+    monkeypatch.delenv(ns.DRAFT_LMHEAD_ENV, raising=False)
+    assert ns.load_draft_lmhead_manifest(str(tmp_path)) is None
+    assert ns.draft_lmhead_hash_factor(str(tmp_path)) == "nvfp4_draft_lmhead=off"
+    monkeypatch.setenv(ns.DRAFT_LMHEAD_ENV, "1")
+    assert ns.load_draft_lmhead_manifest(str(tmp_path))["file"] == out.name
+    cfg = {"quant_method": "compressed-tensors", "config_groups": {}}
+    assert ns.apply_draft_lmhead_config_group(str(tmp_path), cfg)
+    assert cfg["config_groups"][ns.DRAFT_LMHEAD_GROUP]["targets"] == [r"re:.*draft_head$"]
+    assert ns.draft_lmhead_hash_factor(str(tmp_path)).startswith("nvfp4_draft_lmhead=")
+
+
 def test_off_by_default(tmp_path, monkeypatch):
     _manifest(tmp_path)
     monkeypatch.delenv(ns.SWAPSET_ENV, raising=False)

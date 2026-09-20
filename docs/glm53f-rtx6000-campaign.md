@@ -1460,6 +1460,15 @@ the draws). The shared branch was already hidden behind the pair, and the
 ninth slot costs the pair what the branch cost. Retained opt-in
 (`SLIMSERVE_NVFP4_SHARED_SWAPSET=nvfp4-swapset-shared`), not in the record.
 
+F5a VERDICT (23:47 PDT, notebook "Phase 9 / F5a"): built and bit-exact
+against the full draft path (13 cases), LEVEL within what the harness can
+resolve (the eight-pass c1 spec medians of this session span 275-334 on
+identical code; the profile arms' per-window wall and GPU span disagree by
+1-2 % in opposite directions). What it removed per draft step (the logits
+all-gather and the vocab-wide cut) it spent on the shard top-k, two small
+gathers and their eager launches. Opt-in (QC_DRAFT_CANDIDATES=1). F5b, the
+draft-only NVFP4 lm_head, is in its arm (`SLIMSERVE_NVFP4_DRAFT_LMHEAD`).
+
 Together they remove ~450 of the ~1100 launches per c1 step and are
 sized at +8-12 % c1, +4-5 % c8/c16 (F1 corrected from the graph-replay
 numbers) - the remaining "leaps and bounds"

@@ -8,6 +8,7 @@ expert loader, but retain GLM's NoPE pooled indexer and its weight names.
 Serving profiles remain non-speculative until end-to-end acceptance.
 """
 
+import os
 from collections.abc import Iterable
 
 import torch
@@ -15,10 +16,13 @@ from torch import nn
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.logger import init_logger
-from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.sequence import IntermediateTensors
 
@@ -152,6 +156,80 @@ class Glm5NextMultiTokenPredictor(DeepSeekMultiTokenPredictor):
             prefix=maybe_prefix(prefix, "embed_tokens"),
         )
         self.logits_processor = LogitsProcessor(config.vocab_size)
+        # A draft-only NVFP4 lm_head (slimserve.nvfp4_swapset --draft-lm-head,
+        # SLIMSERVE_NVFP4_DRAFT_LMHEAD): the drafter's logits come from it
+        # instead of the target's shared fp8 head; the verifier's head and
+        # the output distribution are untouched, only the acceptance rate can
+        # move.
+        from slimserve.nvfp4_swapset import (
+            DRAFT_LMHEAD_ENV,
+            DRAFT_LMHEAD_MODULE,
+            load_draft_lmhead_manifest,
+        )
+
+        self.draft_lm_head: ParallelLMHead | None = None
+        model_path = vllm_config.speculative_config.draft_model_config.model
+        self._draft_lmhead_manifest = load_draft_lmhead_manifest(model_path)
+        if self._draft_lmhead_manifest is None and os.environ.get(DRAFT_LMHEAD_ENV, "0") not in ("", "0"):
+            logger.warning(
+                "glm5_next_mtp: %s=%s selects a draft lm_head sidecar but %s has none; the drafter "
+                "shares the target's head (build it with python -m slimserve.nvfp4_swapset --draft-lm-head)",
+                DRAFT_LMHEAD_ENV, os.environ.get(DRAFT_LMHEAD_ENV), model_path,
+            )
+        if self._draft_lmhead_manifest is not None:
+            self.draft_lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=vllm_config.quant_config,
+                prefix=maybe_prefix(prefix, DRAFT_LMHEAD_MODULE),
+            )
+
+    def _head(self, mtp_layer):
+        return self.draft_lm_head if self.draft_lm_head is not None else mtp_layer.shared_head.head
+
+    def compute_logits(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        current_step_idx = spec_step_idx % self.num_mtp_layers
+        mtp_layer = self.layers[str(self.mtp_start_layer_idx + current_step_idx)]
+        return self.logits_processor(self._head(mtp_layer), mtp_layer.shared_head(hidden_states))
+
+    def compute_local_logits(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> tuple[torch.Tensor, int]:
+        current_step_idx = spec_step_idx % self.num_mtp_layers
+        mtp_layer = self.layers[str(self.mtp_start_layer_idx + current_step_idx)]
+        return self.logits_processor.get_local_logits(
+            self._head(mtp_layer), mtp_layer.shared_head(hidden_states)
+        )
+
+    def load_draft_lm_head(self) -> set[str]:
+        """The sidecar's packed tensors into the draft head's parameters."""
+        manifest = self._draft_lmhead_manifest
+        if manifest is None or self.draft_lm_head is None:
+            return set()
+        import os
+
+        from safetensors.torch import load_file
+
+        file = os.path.join(os.path.dirname(manifest["path"]), manifest["file"])
+        tensors = load_file(file)
+        params = dict(self.draft_lm_head.named_parameters())
+        loaded: set[str] = set()
+        for name in manifest["tensors"]:
+            pname = name.split(".", 1)[1]
+            param = params[pname]
+            loader = getattr(param, "weight_loader", default_weight_loader)
+            loader(param, tensors[name])
+            loaded.add(name)
+        logger.info(
+            "glm5_next_mtp: NVFP4 draft lm_head from %s (the target keeps its own head)", file
+        )
+        return loaded
 
     def forward(
         self,
@@ -195,7 +273,6 @@ def _with_mtp_experts_sidecar(
     import os
 
     from slimserve.nvfp4_swapset import MTP_ENV, load_mtp_manifest
-
     from vllm.model_executor.models.glm5_next import iter_with_overrides
 
     manifest = load_mtp_manifest(model_path)
@@ -286,4 +363,5 @@ class Glm5NextMTP(DeepSeekMTP):
                     yield name, weight
 
         loaded = super().load_weights(normalized_weights())
+        loaded |= {"model." + n for n in self.model.load_draft_lm_head()}
         return loaded | loaded_indexer

@@ -282,6 +282,10 @@ def get_quant_config(
     from slimserve.nvfp4_swapset import apply_mtp_config_group
 
     apply_mtp_config_group(model_config.model, hf_quant_config)
+    # The drafter's own NVFP4 lm_head (slimserve.nvfp4_swapset --draft-lm-head).
+    from slimserve.nvfp4_swapset import apply_draft_lmhead_config_group
+
+    apply_draft_lmhead_config_group(model_config.model, hf_quant_config)
 
     # Pipe information about heads to enable TP-aware loading of attn_head scales
     if (

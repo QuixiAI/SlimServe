@@ -570,7 +570,7 @@ class VllmConfig:
         )
         from slimserve.fp8_swapset import hash_factor
         from slimserve.nvfp4_swapset import hash_factor as nvfp4_hash_factor
-        from slimserve.nvfp4_swapset import shared_hash_factor
+        from slimserve.nvfp4_swapset import draft_lmhead_hash_factor, shared_hash_factor
 
         vllm_factors.append(
             hash_factor(self.model_config.model if self.model_config else None)
@@ -580,6 +580,9 @@ class VllmConfig:
         )
         vllm_factors.append(
             shared_hash_factor(self.model_config.model if self.model_config else None)
+        )
+        vllm_factors.append(
+            draft_lmhead_hash_factor(self.model_config.model if self.model_config else None)
         )
         factors.append(vllm_factors)
 

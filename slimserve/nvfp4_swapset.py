@@ -344,7 +344,12 @@ def main() -> None:
     ap.add_argument("--mtp-experts", action="store_true", help=f"build the MTP layer's experts sidecar ({MTP_STEM}) instead")
     ap.add_argument("--shared-experts", action="store_true",
                     help=f"build the shared-expert sidecar ({SHARED_STEM}: each sparse layer's shared expert as one more NVFP4 expert) instead")
+    ap.add_argument("--draft-lm-head", action="store_true",
+                    help=f"build the drafter's NVFP4 lm_head sidecar ({DRAFT_LMHEAD_STEM}) instead")
     args = ap.parse_args()
+    if args.draft_lm_head:
+        build_draft_lm_head(args.model, args.out)
+        return
     if args.mtp_experts:
         build_mtp_experts(args.model, args.out, args.skip_layer)
         return
@@ -605,6 +610,97 @@ def shared_hash_factor(model_path: str | None) -> str:
     with open(manifest["path"], "rb") as fh:
         digest = hashlib.sha256(fh.read()).hexdigest()[:16]
     return f"nvfp4_shared_swapset={digest}"
+
+
+# ------------------------------------------------- a draft-only lm_head
+# The MTP drafter shares the target's lm_head (fp8 channel through the FP8
+# swap-set: 158 MB per rank, 104 us per draft step at c1). This sidecar is an
+# NVFP4 copy of the checkpoint's BF16 lm_head for the DRAFTER alone (79 MB
+# per rank through Marlin's W4A16 path); the target keeps its head, so the
+# output distribution is untouched and only the acceptance rate can move.
+#     python -m slimserve.nvfp4_swapset --model <dir> --draft-lm-head
+# Serving: ``SLIMSERVE_NVFP4_DRAFT_LMHEAD=nvfp4-swapset-draft-lmhead`` (a
+# manifest stem next to the checkpoint; unset or 0 = off).
+DRAFT_LMHEAD_ENV = "SLIMSERVE_NVFP4_DRAFT_LMHEAD"
+DRAFT_LMHEAD_STEM = "nvfp4-swapset-draft-lmhead"
+DRAFT_LMHEAD_GROUP = "slimserve_nvfp4_draft_lm_head"
+DRAFT_LMHEAD_MODULE = "draft_head"   # must not end in "lm_head": the FP8 swap-set's head group targets re:.*lm_head$
+
+
+def build_draft_lm_head(model_dir: str, out: str | None) -> Path:
+    converted = _headers(model_dir)
+    name = "lm_head.weight"
+    if name not in converted or converted[name][0]["dtype"] != "BF16":
+        raise SystemExit(f"{name}: not a BF16 tensor of the checkpoint")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    w = _read(*converted[name]).to(device)
+    gs = global_scale_for([w]).to(device)
+    packed, scale = quantize_nvfp4(w, gs)
+    err = (dequant_nvfp4(packed, scale, gs) - w.float()).norm() / w.float().norm().clamp(min=1e-12)
+    tensors = {
+        f"{DRAFT_LMHEAD_MODULE}.weight_packed": packed.cpu(),
+        f"{DRAFT_LMHEAD_MODULE}.weight_scale": scale.cpu(),
+        f"{DRAFT_LMHEAD_MODULE}.weight_global_scale": gs.reshape(1).cpu().clone(),
+    }
+    from safetensors.torch import save_file
+
+    out_path = Path(out or os.path.join(model_dir, DRAFT_LMHEAD_STEM + ".safetensors"))
+    save_file(tensors, str(out_path), metadata={"purpose": "NVFP4 (W4A16, group 16) copy of lm_head for the MTP drafter only"})
+    manifest = {
+        "file": out_path.name,
+        "kind": "draft_lm_head",
+        "source": name,
+        "tensors": sorted(tensors),
+        "config_group": config_group([(0, DRAFT_LMHEAD_MODULE)]) | {"targets": [rf"re:.*{DRAFT_LMHEAD_MODULE}$"]},
+    }
+    manifest_file = out_path.with_suffix(".json")
+    with open(manifest_file, "w") as fh:
+        json.dump(manifest, fh, indent=1)
+    nbytes = sum(t.numel() * t.element_size() for t in tensors.values())
+    print(f"{len(tensors)} tensors, {nbytes} bytes -> {out_path}; manifest {manifest_file}")
+    print(f"  lm_head rel Frobenius error {err.item():.4f}")
+    return out_path
+
+
+def draft_lmhead_manifest_path(model_path: str | None) -> str | None:
+    choice = os.environ.get(DRAFT_LMHEAD_ENV, "0")
+    if not model_path or choice in ("", "0"):
+        return None
+    stem = DRAFT_LMHEAD_STEM if choice == "1" else choice
+    path = os.path.join(model_path, f"{stem}.json")
+    return path if os.path.isfile(path) else None
+
+
+def load_draft_lmhead_manifest(model_path: str | None) -> dict | None:
+    path = draft_lmhead_manifest_path(model_path)
+    if path is None:
+        return None
+    with open(path) as fh:
+        manifest = json.load(fh)
+    manifest["path"] = path
+    return manifest
+
+
+def apply_draft_lmhead_config_group(model_path: str | None, hf_quant_config: dict | None) -> bool:
+    """Add the draft head's NVFP4A16 config group (its target is the module's
+    own name, so nothing else matches it)."""
+    manifest = load_draft_lmhead_manifest(model_path)
+    if manifest is None or not hf_quant_config:
+        return False
+    if hf_quant_config.get("quant_method") != "compressed-tensors":
+        raise ValueError(f"{manifest['path']}: the sidecar needs a compressed-tensors model")
+    groups = hf_quant_config.setdefault("config_groups", {})
+    groups[DRAFT_LMHEAD_GROUP] = manifest["config_group"]
+    return True
+
+
+def draft_lmhead_hash_factor(model_path: str | None) -> str:
+    manifest = load_draft_lmhead_manifest(model_path)
+    if manifest is None:
+        return "nvfp4_draft_lmhead=off"
+    with open(manifest["path"], "rb") as fh:
+        digest = hashlib.sha256(fh.read()).hexdigest()[:16]
+    return f"nvfp4_draft_lmhead={digest}"
 
 
 if __name__ == "__main__":

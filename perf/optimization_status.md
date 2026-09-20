@@ -31104,3 +31104,22 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   test; a native shard-window kernel plus a single packed gather would
   reclaim ~30 us per draft step (+1 % c1 spec), below what the harness can
   see, and is left as a note (`$S/p9/f5/f5c_window.py`).
+  F5b SERVING (2026-09-19 23:56 - 2026-09-20 00:09 PDT, `$S/p9/chain_f5b.sh`;
+  two aborted boots first: a module named `draft_lm_head` was claimed by the
+  FP8 swap-set's head group `re:.*lm_head$` and built with fp8 parameters -
+  the module is `draft_head` now; raw perf/results/2026-09-20/f5b-spec-pass*/,
+  profile-state-f5b-prof): canaries text/tool/image PASS, 0.977 accepted per
+  draft (the reference boots 0.968-0.993).
+  | arm | c1 (8-pass median, range) | c8 | c16 |
+  |---|---|---|---|
+  | f5b-spec (draft head NVFP4) | 329.9 (292.2-372.1) | 820 (740.0-890.4) | 1115 (1077.8-1158.2) |
+  | f5off-spec (reference, 23:33) | 301.7 (256.7-358.6) | 816.6 | 1142 |
+  The c1 spec profile arm shows the mechanism: the fp8 lm_head cutlass GEMM
+  (102 us per call) falls from 0.8 to 0.2 calls per profiled step - the
+  target's own - and the draft steps run the head through Marlin's dense
+  W4A16 kernel (~50 us). DECISION: RETAINED IN THE RECORD
+  (`SLIMSERVE_NVFP4_DRAFT_LMHEAD=nvfp4-swapset-draft-lmhead` in the
+  rtx6000 profile's environment, with a note): a drafter-only change that
+  cannot move the output distribution, acceptance unchanged, -79 MB of
+  weight per draft step, the c1 spec median +9 % in the direction of the
+  -50 us x 3 sizing (the median's own spread is wider than the effect).
