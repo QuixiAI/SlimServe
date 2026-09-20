@@ -181,6 +181,16 @@ if (VLLM_TARGET_DEVICE STREQUAL "metal")
 endif()
 
 #
+# Intel XPU likewise: no CUDA/HIP language, no hipify. The vendored
+# QuixiCore-XPU SYCL tree becomes one shared op library plus the pybind
+# binding, all handled in cmake/xpu.cmake (needs icpx as CMAKE_CXX_COMPILER).
+#
+if (VLLM_TARGET_DEVICE STREQUAL "xpu")
+  include(${CMAKE_CURRENT_LIST_DIR}/cmake/xpu.cmake)
+  return()
+endif()
+
+#
 # Forward the non-CUDA device extensions to external CMake scripts.
 #
 # Only ROCm is supported here; the CPU extension and its sources are gone.

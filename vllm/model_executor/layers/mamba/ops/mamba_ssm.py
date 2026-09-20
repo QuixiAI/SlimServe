@@ -23,7 +23,10 @@ from vllm.utils.platform_utils import get_device_name_as_file_name
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 if current_platform.is_xpu():
-    from vllm._xpu_ops import xpu_ops
+    try:
+        from vllm._xpu_ops import xpu_ops
+    except ImportError:  # vllm-xpu-kernels not installed (QuixiCore-XPU build)
+        xpu_ops = None
 
 logger = init_logger(__name__)
 

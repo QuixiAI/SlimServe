@@ -26342,3 +26342,46 @@ Phases, by value over risk:
 - Results: no new throughput measurement or hardware qualification claimed.
 - Decision: submit as a focused PR; preserve current-main behavior outside this fix.
 - Raw artifacts: local test output; no traffic captures or model data committed.
+
+## 2026-09-20: current-main Intel B70 foundation forward-port
+
+Baseline: main d79030d5ac has shared XPU FP8/GDN kernels but no selectable XPU
+platform, worker, or native build. The candidate selectively ports XPU-owned
+sources and required shared graph/affinity/kernel hooks from ff9dfeba39,
+7af0a50f30 and c6d9859403 (historical PR21); it does not merge the historical
+branch or replace current-main Qwen multimodal, GDN, budget or Mamba code.
+Main already implements signed high-address Mamba pointers and current Qwen
+interfaces. The native binding requires its existing dispatch/SYCL dependency
+closure; unrelated shared DSV4/NVFP4/model rewrites are omitted.
+
+Validation on the B70 host: six CPU contracts pass (affinity mask restoration,
+DP offset/bounds, graph tensor address stability/type checking, stream restore,
+environment registration). XPUWorker, full Qwen3.5 and MTP model imports pass;
+Torch reports the rms_norm XPU dispatch key. The isolated native build compiles
+81 SYCL translation units and the pybind, spinloop and filesystem extensions
+against Torch2.15.0.dev20260815+xpu with icpx2026.1, oneDNN2026.0 and TBB2023.1.
+Fresh extensions import from the candidate worktree and expose graph/current-
+stream-sync/UVA/weak-reference APIs. No pip install or live environment mutation.
+No GPU numerical execution or serving throughput measured in this forward-port
+step; real TP4 FP8+MTP workload qualification remains required. The historical
+UR tracing workaround does not establish resolution of later recurring stalls.
+Raw build/configure/import logs: /tmp/b70-xpu-port-{configure,build,install}.log.
+
+Reproduce native build without sourcing oneAPI into a serving shell:
+
+```bash
+PATH=/opt/intel/oneapi/compiler/2026.1/bin:/home/alex/SlimServe/.venv/bin:/usr/bin:/bin \
+cmake -S . -B build/xpu -G Ninja \
+  -DCMAKE_MAKE_PROGRAM=/home/alex/SlimServe/.venv/bin/ninja \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DCMAKE_CXX_COMPILER=/opt/intel/oneapi/compiler/2026.1/bin/icpx \
+  -DVLLM_TARGET_DEVICE=xpu \
+  -DVLLM_PYTHON_EXECUTABLE=/home/alex/SlimServe/.venv/bin/python \
+  -Ddnnl_DIR=/opt/intel/oneapi/dnnl/2026.0/lib/cmake/dnnl \
+  -DTBB_DIR=/opt/intel/oneapi/tbb/2023.1/lib/cmake/tbb \
+  -DCMAKE_INSTALL_PREFIX="$PWD"
+/home/alex/SlimServe/.venv/bin/cmake --build build/xpu --target _quixicore_C spinloop fs_io_C -j12
+/home/alex/SlimServe/.venv/bin/cmake --install build/xpu --component _quixicore_C
+/home/alex/SlimServe/.venv/bin/cmake --install build/xpu --component spinloop
+/home/alex/SlimServe/.venv/bin/cmake --install build/xpu --component fs_io_C
+```

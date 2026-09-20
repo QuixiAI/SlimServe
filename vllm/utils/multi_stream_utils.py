@@ -34,7 +34,7 @@ def _record_result_to_current_stream(result: Any) -> Any:
     current = torch.cuda.current_stream()
 
     def _record(item: Any) -> None:
-        if isinstance(item, torch.Tensor) and item.is_cuda:
+        if isinstance(item, torch.Tensor) and item.device.type in ("cuda", "xpu"):
             item.record_stream(current)
         elif isinstance(item, (tuple, list)):
             for sub in item:

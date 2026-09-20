@@ -28,12 +28,19 @@ if current_platform.is_cuda():
 
 elif current_platform.is_xpu():
     from vllm import _custom_ops as ops
-    from vllm._xpu_ops import xpu_ops
 
     reshape_and_cache_flash = ops.reshape_and_cache_flash
-    flash_attn_varlen_func = xpu_ops.flash_attn_varlen_func  # type: ignore[assignment]
     compile_flash_attn_varlen_func_from_specs = None  # type: ignore[assignment]
-    get_scheduler_metadata = xpu_ops.get_scheduler_metadata  # type: ignore[assignment]
+    try:
+        from vllm._xpu_ops import xpu_ops
+
+        flash_attn_varlen_func = xpu_ops.flash_attn_varlen_func  # type: ignore[assignment]
+        get_scheduler_metadata = xpu_ops.get_scheduler_metadata  # type: ignore[assignment]
+    except ImportError:
+        # No vllm-xpu-kernels flash-attn: this fork's XPU path serves through
+        # TRITON_ATTN / the DSV4 sparse-MLA Triton kernels.
+        flash_attn_varlen_func = None  # type: ignore[assignment]
+        get_scheduler_metadata = None  # type: ignore[assignment]
 elif current_platform.is_rocm():
     try:
         from flash_attn import flash_attn_varlen_func  # type: ignore[no-redef]
