@@ -1839,8 +1839,10 @@ class quixicore_ops:
         """Decode MoE down projection with the top-k combine (fp32, slot
         order) and the optional shared-expert add folded in: out[M, D] bf16.
         topk_weights None means the weights already sit on the input; split
-        (1/2/3/4/8, dividing top_k) spreads a token's experts over a cluster of
-        CTAs summed in rank order."""
+        (1/2/3/4/8, at most top_k) spreads a token's experts over a cluster of
+        CTAs summed in rank order: each rank takes ceil(top_k / split) slots
+        and the last rank the remainder (nine slots split in two are five and
+        four)."""
         return _qc().nvfp4_moe_gemv2(act, b, s, g, topk_ids, topk_weights, shared, out, nj, stages, split)
 
     @staticmethod

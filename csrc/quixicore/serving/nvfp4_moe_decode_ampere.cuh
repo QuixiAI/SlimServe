@@ -450,7 +450,10 @@ __global__ void __launch_bounds__(THREADS) nvfp4_moe_gemv2_kernel(
     const int nt = cg / (4 / NJ), j0 = (cg % (4 / NJ)) * NJ;
     const int col0 = 64 * nt + 16 * j0;
     if (pdl) pdl_wait();                             // act, topk_ids, weights, shared: all from predecessors
-    // The token's experts and weights (top_k <= 64).
+    // The token's experts and weights (top_k <= 64). Every slot of the rows area
+    // gets a sentinel first: a trailing rank of an uneven split can own no slot
+    // at all (top_k 5, split 4), and the producer still reads s_e[0] to set up.
+    if (tid < kmax) { s_e[tid] = -1; s_w[tid] = 0.0f; }
     if (tid < kper) {
         const int s = m * top_k + k0 + tid;
         const int e = topk_ids[s];

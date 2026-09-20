@@ -30868,6 +30868,7 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   MICROBENCH (GPU 1, CUDA-graph replay, us per layer call, H 16; "cold" =
   256 MB L2 flush before every call, subtracted; raw
   perf/results/2026-09-19/f1-kda-block/): with the record's bf16 SSM state
+
   | rows | cold: triton | block | hot: triton | block |
   |---|---|---|---|---|
   | 1 x 1 | 4.85 | 2.44 (CL 8) | 5.03 | 4.77 |
@@ -30882,6 +30883,7 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   | 4 x 4 | 10.22 | 9.38 (4) | 11.55 | 12.42 |
   | 5 x 4 | 10.37 | 10.09 (4) | 12.43 | 12.76 |
   | 6+ x 4 | declined (12.27 / 14.82 / 29.83 at 6 / 8 / 16) | | | |
+
   Cold is the serving regime (34 layers of state and 1.75 GB of weights per
   step evict L2): -2.4 us per layer at one request, -2.1 us at one request
   x 4 spec rows, -1.5..1.8 us at 2-4 requests; 34 layers x 2.4 us = 0.08 ms
@@ -30896,12 +30898,14 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   F1 SERVING (2026-09-19 21:55-22:25 PDT, `$S/p9/chain_f1.sh`, one boot per
   arm, exact on every run; raw perf/results/2026-09-19/f1{,off}-{nospec,spec}-pass*/,
   gates f1-nospec-gate{1..4}.json, f1off-nospec-gate{1,2}.json):
+
   | arm | c1 | c8 | c16 |
   |---|---|---|---|
   | f1-nospec (block on) | 228.5 / 228.6 | 780.9 / 772.0 | 1117.5 / 1126.3 |
   | f1off-nospec (QC_KDA_BLOCK=0) | 228.8 / 228.7 | 782.9 / 777.1 | 1121.7 / 1125.9 |
   | f1-spec, 8 passes (median) | 296.4 (253.9-355.2) | 809.5 (771.8-881.8) | 1094 (1030-1140) |
   | f1off-spec, 8 passes (median) | 293.5 (265.9-342.4) | 835 (755.8-903.2) | 1130 (1067-1163) |
+
   LEVEL at every shape (c8/c16 never use the block; the spec draws are
   inside their spread). Gates (4) -2.503 / -2.437 / -2.466 / -2.477 against
   -2.428 / -2.441, canaries PASS. The c1 profile arm (f1-prof, STATE=1):
@@ -30976,10 +30980,12 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   perf/results/2026-09-19/f2-nospec-pass{1,2}/, f2-nospec-gate{1..4}.json):
   the sidecar loads ("42 layers served as expert 288"), the pair serves
   "2 x top-9", canaries text/tool/image PASS.
+
   | arm | c1 | c8 | c16 | gates all-position mean (`$S/p8/gate_allpos.py`) |
   |---|---|---|---|---|
   | f1-nospec (reference boot) | 228.5 / 228.6 | 780.9 / 772.0 | 1117.5 / 1126.3 | -3.2720 -3.2639 -3.2755 -3.2795 (mean -3.2727) |
   | f2-nospec (shared expert as expert 288) | 224.4 / 224.1 | 774.9 / 781.4 | 1116.4 / 1119.0 | -3.2600 -3.2646 -3.2626 -3.2639 (mean -3.2628) |
+
   QUALITY: +0.010 nats per token better than the reference boot (the shared
   expert is quantized from the checkpoint's BF16 rather than served through
   the fp8 swap-set's e4m3 copy), needle margins 12.3-14.7 / 16.3-20.3 vs
@@ -31014,12 +31020,14 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   four experts; raw perf/results/2026-09-19/f2b-{nospec,spec}-pass*/,
   f2b-nospec-gate{1,2}.json): canaries PASS, gates all-position -3.2668 /
   -3.2631 (reference boots -3.2727 / -3.268).
+
   | arm | c1 | c8 | c16 |
   |---|---|---|---|
   | f2b-nospec | 228.9 / 228.6 | 786.3 / 781.3 | 1099.9 / 1111.2 |
   | reference f1-nospec / f1off-nospec | 228.5 / 228.6, 228.8 / 228.7 | 780.9 / 772.0, 782.9 / 777.1 | 1117.5 / 1126.3, 1121.7 / 1125.9 |
   | f2b-spec, 8 passes (median, range) | 293.2 (256.6-343.8) | 826.5 (817.0-897.7) | 1133 (1077.9-1205.7) |
   | reference f1-spec / f1off-spec medians | 296.4 / 293.5 | 809.5 / 835 | 1094 / 1130 |
+
   VERDICT: LEVEL in throughput at every shape (plain c1 level with the
   split restored, c8 +1 %, c16 -1 %: at sixteen rows Marlin's extra expert
   block sits on the critical path while the fp8 shared GEMMs it replaces ran
@@ -31085,10 +31093,12 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   perf/results/2026-09-19/f5{,off}-spec-pass*/, profile-state-f5{,off}-prof):
   the path announces itself on every rank ("Drafting from 128 gathered
   top-32 candidates per token"), canaries PASS.
+
   | arm | c1 (8-pass median, range) | c8 | c16 | accepted per draft |
   |---|---|---|---|---|
   | f5-spec (candidates) | 275.0 (248.9-362.6) | 809 (725.5-869.4) | 1118 (1046.5-1175.7) | 0.976 |
   | f5off-spec (full path) | 301.7 (256.7-358.6) | 816.6 (714.1-862.3) | 1142 (1087.9-1184.7) | 0.993 |
+
   c1 spec profile arms (STATE=1, one boot each): candidates 1.823 ms per
   graph window, GPU span 5.12 ms per step, 788 launches per step; full path
   1.802 ms, 5.24 ms, 820 launches; the boots accepted different streams
@@ -31110,10 +31120,12 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   the module is `draft_head` now; raw perf/results/2026-09-20/f5b-spec-pass*/,
   profile-state-f5b-prof): canaries text/tool/image PASS, 0.977 accepted per
   draft (the reference boots 0.968-0.993).
+
   | arm | c1 (8-pass median, range) | c8 | c16 |
   |---|---|---|---|
   | f5b-spec (draft head NVFP4) | 329.9 (292.2-372.1) | 820 (740.0-890.4) | 1115 (1077.8-1158.2) |
   | f5off-spec (reference, 23:33) | 301.7 (256.7-358.6) | 816.6 | 1142 |
+
   The c1 spec profile arm shows the mechanism: the fp8 lm_head cutlass GEMM
   (102 us per call) falls from 0.8 to 0.2 calls per profiled step - the
   target's own - and the draft steps run the head through Marlin's dense
@@ -31128,11 +31140,13 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   6ea3ede34, the record's own environment, `$S/p9/chain_final.sh`; raw
   perf/results/2026-09-20/final-{nospec,spec}-pass*/, final-nospec-gate{1..4}.json,
   `$S/serve-logs/ttft-final-ttft.txt`):
+
   | shape | plain | spec (8-pass median, range) | control (jovian r28.1 B12X) plain / MTP-3 | vs control |
   |---|---|---|---|---|
   | c1 | 228.5 / 228.7 | 304.4 (275.4-343.0) | 166.5 / 260.8 | +37 % / +17 % |
   | c8 | 776.1 / 775.7 | 818.7 (739.4-846.5) | 687.9 / 732.1 | +13 % / +12 % |
   | c16 | 1127.6 / 1122.7 | 1140.9 (1070.1-1184.4) | 966.8 / 1005.8 | +17 % / +13 % |
+
   Cold TTFT 32K 2.84 s, 128K 11.77 s (control 2.93 / 14.9: -3 % / -21 %);
   warm (prefix-cached) 0.084 / 0.267 s. Gates (4) -2.432 / -2.457 / -2.449
   / -2.463 (all-position -3.264..-3.271), canaries text/tool/image PASS,
@@ -31160,3 +31174,11 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   evening series (the bf16 KDA state of P8, the in_proj NVFP4 sidecar) or to
   run variation; recorded as an open check for the next prefill pass rather
   than resolved here.
+
+- CODERABBIT ROUND 13 (2026-09-20 07:56Z on 7508c69a9): three findings, all
+  fixed - gemv2's uneven split left a trailing rank with no slot reading an
+  uninitialised expert sentinel in its producer set-up (no dereference
+  followed, but undefined; the rows area's sentinels are now written for
+  every rank, and the pair test covers nine slots over eight ranks), the
+  new notebook tables lacked blank lines around them (markdownlint), and
+  the gemv2 wrapper's docstring still said the split had to divide top_k.

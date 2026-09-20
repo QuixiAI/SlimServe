@@ -310,6 +310,12 @@ def test_folded_router_fixed_expert_slot(m: int) -> None:
     assert marlin_moe._qc_nvfp4_decode_split(9, 9) == 2
     assert marlin_moe._qc_nvfp4_decode_split(8, 8) == 2
     assert marlin_moe._qc_nvfp4_decode_split(18, 9) == 1
+    # A split larger than the slots' even share leaves trailing ranks with no
+    # slot at all (nine slots over eight ranks: 2, 2, 2, 2, 1, 0, 0, 0); they
+    # contribute zero and the sum is unchanged.
+    out8 = torch.empty(m, K, device=DEV, dtype=torch.bfloat16)
+    quixicore_ops.nvfp4_moe_gemv2(act, lay.l.w2_weight, lay.s2, lay.l.w2_weight_scale_2, ids, w, None, out8, split=8)
+    assert rel(out8, out_ref) < 2**-6
     # The fixed expert must be the last one, and needs the folded router.
     with pytest.raises(RuntimeError):
         quixicore_ops.nvfp4_moe_gemv1(
