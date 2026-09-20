@@ -565,6 +565,20 @@ class ThinkingBudgetStateHolder:
                     }
                 )
 
+    def _draft_prefix_ends_thinking(
+        self, state: dict[str, Any], prefix_length: int
+    ) -> bool:
+        """Detect a natural closer before a speculative prediction position.
+
+        This only gates that position; rejected drafts must not permanently
+        change the committed reasoning state. Include a short output tail for
+        end markers split across committed tokens and the draft prefix.
+        """
+        overlap = len(self.think_end_token_ids) - 1
+        tail = state["output_tok_ids"][-overlap:] if overlap > 0 else []
+        prefix = tail + state["spec_token_ids"][:prefix_length]
+        return self._find_last_sequence_index(prefix, self.think_end_token_ids) >= 0
+
     def _apply_forcing_to_logits(
         self,
         logits: torch.Tensor,
@@ -600,6 +614,10 @@ class ThinkingBudgetStateHolder:
                 continue
             state = self._state[seq_idx]
             if state.get("in_end", False):
+                if predict_bonus_token and self._draft_prefix_ends_thinking(
+                    state, len(state["spec_token_ids"])
+                ):
+                    continue
                 # logits processor in spec mode are called twice
                 # once for bonus token logits and
                 # second time for the target logits
@@ -621,6 +639,10 @@ class ThinkingBudgetStateHolder:
                         continue
                     end_count = state.get("end_count", 0)
                     for force_idx in force_index:
+                        if not predict_bonus_token and self._draft_prefix_ends_thinking(
+                            state, force_idx
+                        ):
+                            continue
                         if end_count < len(self.think_end_token_ids):
                             mask_idx = self.cu_num_tokens[seq_idx] + force_idx
                             if (
@@ -641,7 +663,7 @@ class ThinkingBudgetStateHolder:
         if active_indices_cpu:
             device = logits.device
             if current_platform.is_rocm() and logits.is_contiguous():
-                # Flattened index_fill avoids ROCm faults seen with 2-D
+                # Flattened indexing avoids ROCm faults seen with 2-D
                 # advanced-indexing writes on the thinking-budget path.
                 vocab_size = logits.shape[1]
                 flat_indices_cpu = [
@@ -651,11 +673,19 @@ class ThinkingBudgetStateHolder:
                 flat_indices = async_tensor_h2d(
                     flat_indices_cpu, dtype=torch.long, device=device
                 )
-                logits.view(-1).index_fill_(0, flat_indices, 1e9)
+                previous = logits.view(-1).index_select(0, flat_indices)
+                # Grammar and allowed-token masks were applied before sampling.
+                # A budget may boost an allowed closer, never resurrect one
+                # those constraints prohibited. Keep all other logits intact.
+                forced = torch.where(torch.isneginf(previous), previous, 1e9)
+                logits.view(-1).index_copy_(0, flat_indices, forced)
             elif current_platform.is_rocm():
                 fill = logits.new_tensor(1e9)
                 for row, token in zip(active_indices_cpu, force_tokens_cpu):
-                    logits[row, token] = fill
+                    previous = logits[row, token]
+                    logits[row, token] = torch.where(
+                        torch.isneginf(previous), previous, fill
+                    )
             else:
                 active_indices = async_tensor_h2d(
                     active_indices_cpu, dtype=torch.long, device=device
@@ -664,7 +694,8 @@ class ThinkingBudgetStateHolder:
                     force_tokens_cpu, dtype=torch.long, device=device
                 )
                 # Avoid CPU->GPU sync.
-                fill = logits.new_full((len(active_indices_cpu),), 1e9)
+                previous = logits[active_indices, force_tokens]
+                fill = torch.where(torch.isneginf(previous), previous, 1e9)
                 logits.index_put_((active_indices, force_tokens), fill)
 
         return logits
