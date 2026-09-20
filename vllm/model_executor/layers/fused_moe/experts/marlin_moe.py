@@ -192,16 +192,19 @@ def _qc_nvfp4_decode_split_env() -> int:
     return int(os.environ.get("QC_NVFP4_DECODE_SPLIT", "0"))
 
 
-def _qc_nvfp4_decode_split(rows: int) -> int:
+def _qc_nvfp4_decode_split(rows: int, topk: int) -> int:
     """gemv2's cluster split over a token's experts. Cold under the record's PDL
     mode a split of 2 takes the one-token gemv2 from 11.1 to 8.4 us (64 -> 128
     CTAs, half the serial chain) and loses from two tokens up (12.7 -> 16.7 at
-    2 x 8), so it serves single-token batches only. QC_NVFP4_DECODE_SPLIT pins
-    one value (1/2/4/8, dividing top_k)."""
+    2 x 8), so it serves single-token batches only. The ranks take
+    ceil(top_k / split) slots each (nine slots, the shared expert riding as
+    expert E, split five and four: a split of 3 would be 192 CTAs on 188 SMs
+    and a tail wave, 13.3 us against 12.3 unsplit). QC_NVFP4_DECODE_SPLIT
+    pins one value (1/2/3/4/8, at most top_k)."""
     forced = _qc_nvfp4_decode_split_env()
     if forced:
-        return forced
-    return 2 if rows <= 8 else 1
+        return forced if forced <= topk else 1
+    return 2 if rows <= topk else 1
 
 
 def _qc_nvfp4_decode_applicable(
@@ -351,6 +354,7 @@ def _qc_nvfp4_decode_moe(
         quixicore_ops.nvfp4_moe_gemv1(
             hidden_states, w1, w1_scale.view(torch.uint8), global_scale1, ids, act, nj, stages, clamp_limit,
             routing.logits, routing.bias, routing.scoring, routing.scaling, routing.renormalize, topk_weights,
+            routing.fixed,
         )
     else:
         ids = topk_ids if topk_ids.dtype == torch.int32 else topk_ids.to(torch.int32)
@@ -372,9 +376,7 @@ def _qc_nvfp4_decode_moe(
         shared_out = shared.output
         shared.folded = True
     weights = None if apply_router_weight_on_input else topk_weights.contiguous()
-    split = _qc_nvfp4_decode_split(M * topk)
-    if topk % split:
-        split = 1
+    split = _qc_nvfp4_decode_split(M * topk, topk)
     quixicore_ops.nvfp4_moe_gemv2(
         act, w2, w2_scale.view(torch.uint8), global_scale2, ids, weights, shared_out, output, nj, stages, split
     )

@@ -79,11 +79,11 @@ class Layer:
         self.s2 = layer.w2_weight_scale.view(torch.uint8)
 
     def reference(self, x, ids, w, clamp=None):
-        m = x.shape[0]
-        act = torch.empty(m * TOPK, N, device=DEV)
+        m, slots = ids.shape
+        act = torch.empty(m * slots, N, device=DEV)
         out = torch.zeros(m, K, device=DEV)
         for t in range(m):
-            for k in range(TOPK):
+            for k in range(slots):
                 e = int(ids[t, k])
                 gu = x[t].float() @ self.W13[e].t()
                 gate, up = gu[:N], gu[N:]
@@ -91,7 +91,7 @@ class Layer:
                     gate = gate.clamp(max=clamp)
                     up = up.clamp(min=-clamp, max=clamp)
                 a = torch.nn.functional.silu(gate) * up
-                act[t * TOPK + k] = a
+                act[t * slots + k] = a
                 out[t] += w[t, k] * (a.to(torch.bfloat16).float() @ self.W2[e].t())
         return act, out
 
@@ -272,6 +272,52 @@ def test_gemv1_folded_router_matches_route_align_selection(m: int) -> None:
     )
     assert bool(((ids >= 0) & (ids < E)).all())
     assert len(set(ids[0].tolist())) == TOPK
+
+
+@pytest.mark.parametrize("m", [1, 3])
+def test_folded_router_fixed_expert_slot(m: int) -> None:
+    """A fused shared expert: the last expert (E - 1) as every token's last
+    slot at weight 1.0, the routed slots from logits over E - 1 experts;
+    gemv1 writes the ids/weights, gemv2 combines all top_k + 1 slots."""
+    lay = Layer(9)
+    g = torch.Generator(device=DEV).manual_seed(41 + m)
+    x = torch.randn(m, K, device=DEV, dtype=torch.bfloat16, generator=g)
+    logits = torch.randn(m, E - 1, device=DEV, generator=g) * 2
+    bias = torch.randn(E - 1, device=DEV, generator=g) * 0.5
+    ids_ref, w_ref = reference_routing(logits, bias, scaling=2.5)
+    ids_ref = torch.cat([ids_ref, torch.full((m, 1), E - 1, device=DEV, dtype=torch.int32)], dim=1)
+    w_ref = torch.cat([w_ref, torch.ones(m, 1, device=DEV)], dim=1)
+    act_ref, out_ref = lay.reference(x, ids_ref, w_ref, clamp=10.0)
+    slots = TOPK + 1
+    ids = torch.full((m, slots), -7, device=DEV, dtype=torch.int32)
+    w = torch.zeros(m, slots, device=DEV, dtype=torch.float32)
+    act = torch.empty(m * slots, N, device=DEV, dtype=torch.bfloat16)
+    quixicore_ops.nvfp4_moe_gemv1(
+        x, lay.l.w13_weight, lay.s13, lay.l.w13_weight_scale_2, ids, act, clamp_limit=10.0,
+        logits=logits, bias=bias, scoring=0, scaling=2.5, renormalize=True, topk_weights=w, fixed_expert=E - 1,
+    )
+    assert torch.equal(ids, ids_ref), (ids, ids_ref)
+    assert torch.allclose(w, w_ref, rtol=1e-5, atol=1e-6)
+    assert rel(act, act_ref) < 2**-7
+    out = torch.empty(m, K, device=DEV, dtype=torch.bfloat16)
+    quixicore_ops.nvfp4_moe_gemv2(act, lay.l.w2_weight, lay.s2, lay.l.w2_weight_scale_2, ids, w, None, out)
+    assert rel(out, out_ref) < 2**-6
+    # Nine slots over a cluster: split 2 takes five and four experts, split 3 three each.
+    for split in (2, 3):
+        outs = torch.empty(m, K, device=DEV, dtype=torch.bfloat16)
+        quixicore_ops.nvfp4_moe_gemv2(act, lay.l.w2_weight, lay.s2, lay.l.w2_weight_scale_2, ids, w, None, outs, split=split)
+        assert rel(outs, out_ref) < 2**-6, split
+    assert marlin_moe._qc_nvfp4_decode_split(9, 9) == 2
+    assert marlin_moe._qc_nvfp4_decode_split(8, 8) == 2
+    assert marlin_moe._qc_nvfp4_decode_split(18, 9) == 1
+    # The fixed expert must be the last one, and needs the folded router.
+    with pytest.raises(RuntimeError):
+        quixicore_ops.nvfp4_moe_gemv1(
+            x, lay.l.w13_weight, lay.s13, lay.l.w13_weight_scale_2, ids, act, clamp_limit=10.0,
+            logits=logits, bias=bias, scoring=0, scaling=2.5, renormalize=True, topk_weights=w, fixed_expert=E - 2,
+        )
+    with pytest.raises(RuntimeError):
+        quixicore_ops.nvfp4_moe_gemv1(x, lay.l.w13_weight, lay.s13, lay.l.w13_weight_scale_2, ids, act, fixed_expert=E - 1)
 
 
 def test_deferred_routing_through_fused_marlin_moe(monkeypatch) -> None:

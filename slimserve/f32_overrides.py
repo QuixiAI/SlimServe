@@ -62,7 +62,7 @@ def _shards(model_dir: str) -> list[str]:
         path
         for path in glob.glob(os.path.join(model_dir, "*.safetensors"))
         if os.path.basename(path) != OVERRIDES_FILE
-        and not os.path.basename(path).startswith("fp8-swapset")
+        and not os.path.basename(path).startswith(("fp8-swapset", "nvfp4-swapset"))
     )
 
 

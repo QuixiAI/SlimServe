@@ -1427,6 +1427,39 @@ prefill router appends it with a cat. Quality is gated like P6 (four gates,
 all-position mean; the shared expert is exercised on every token, so its
 NVFP4 error is the one to measure).
 
+F5 revised design (2026-09-19 22:40 PDT, from the code): the record's
+drafter samples PROBABILISTICALLY (`draft_sample_method: probabilistic`,
+`draft_top_k_top_p: true`, `rejection_sample_method: block`), so the
+sharded-argmax path vLLM already carries (`LogitsProcessor.get_top_tokens`,
+`use_local_argmax_reduction`) does not apply; each draft step all-gathers
+the full [T, 154880] logits (61 us at c1), samples over the full vocabulary
+with temperature and exponential noise, and keeps the [T, vocab] draft
+probabilities for the block rejection sampler, whose residual reads them
+over the whole vocabulary. F5a, the candidate gather (P5): per rank the
+top-k of its vocab shard (k = the batch's largest request top_k, 20 on the
+bench; a request without top_k or with logprobs falls back to the full
+gather), an all-gather of [T, tp, k, 2] fp32, the global top-k of the
+tp x k candidates, temperature + noise sampling over those k logits, and
+the k probabilities scattered into a zeroed [T, vocab] tensor - exact
+under top-k masking, and the rejection kernels see the same draft
+distribution they see today. F5b, a draft-only NVFP4 lm_head: the MTP
+head shares the target's fp8-channel lm_head (158 MB per rank per draft
+step, 104 us); a second head module quantized through the sidecar (79 MB)
+is used only for drafting, so it can only move the acceptance rate, never
+the output distribution - the acceptance counters are its whole gate.
+Sized at c1 spec: -61 -> ~-10 us and -104 -> ~-55 us per draft step, x 3
+draft steps = ~-0.3 ms of the 8.6 ms step (+3.5 %); ~+1.5 % at c8/c16
+spec (one or two draft steps at 8-16 rows). Order: F5a (no new weights,
+exactness provable in a unit test), then F5b.
+
+F2 VERDICT (23:20 PDT, notebook "Phase 9 / F2"): built as designed and
+correct end to end (canaries, gates +0.01 nats better than the reference
+boot), LEVEL in throughput at every shape (plain c1 level once gemv2's
+cluster split took five and four experts, c8 +1 %, c16 -1 %, spec inside
+the draws). The shared branch was already hidden behind the pair, and the
+ninth slot costs the pair what the branch cost. Retained opt-in
+(`SLIMSERVE_NVFP4_SHARED_SWAPSET=nvfp4-swapset-shared`), not in the record.
+
 Together they remove ~450 of the ~1100 launches per c1 step and are
 sized at +8-12 % c1, +4-5 % c8/c16 (F1 corrected from the graph-replay
 numbers) - the remaining "leaps and bounds"

@@ -63,6 +63,9 @@ class DeferredRouting:
     block_size: int
     max_padded: int
     max_blocks: int
+    # The fixed expert appended to every token's slots at weight 1.0 (a shared
+    # expert served as expert E of E + 1), or -1.
+    fixed: int = -1
 
 
 _deferred: DeferredRouting | None = None
@@ -101,6 +104,7 @@ def materialize(entry: DeferredRouting) -> None:
         entry.block_size,
         entry.max_padded,
         entry.max_blocks,
+        entry.fixed,
     )
     entry.topk_ids.copy_(ids)
     entry.topk_weights.copy_(weights)
@@ -137,37 +141,46 @@ def eligible(router, router_logits: torch.Tensor, indices_type) -> bool:
         and bias.dtype == torch.float32
         and bias.is_contiguous()
         and bias.shape == (router_logits.shape[1],)
-        and getattr(router, "num_fused_shared_experts", 0) == 0
+        # At most one fused shared expert: the kernel appends it as a fixed slot.
+        and getattr(router, "num_fused_shared_experts", 0) in (0, 1)
+        and getattr(router, "shared_expert_weight", 1.0) == 1.0
         and indices_type in (None, torch.int32)
     )
 
 
 def route(router, router_logits: torch.Tensor):
     num_tokens, num_experts = router_logits.shape
+    # A fused shared expert is expert `num_experts` of the weights and the last
+    # of every token's slots at weight 1.0 (the routed scaling stays on the
+    # routed slots); the alignment then spans num_experts + 1 experts.
+    n_fixed = getattr(router, "num_fused_shared_experts", 0)
+    fixed = num_experts if n_fixed else -1
+    slots = router.top_k + n_fixed
+    aligned_experts = num_experts + n_fixed
     # fused_marlin_moe's block size for this batch (bf16 activations) and
     # moe_align_block_size's buffer geometry, from their own definitions.
     from vllm.model_executor.layers.fused_moe.experts.marlin_moe import (
         marlin_moe_block_size_m,
     )
 
-    block_size = marlin_moe_block_size_m(num_tokens, router.top_k, num_experts, None)
+    block_size = marlin_moe_block_size_m(num_tokens, slots, aligned_experts, None)
     max_padded, max_blocks = moe_align_block_size_geometry(
-        num_tokens * router.top_k, num_experts, block_size
+        num_tokens * slots, aligned_experts, block_size
     )
     from vllm.model_executor.layers.fused_moe.experts.marlin_moe import (
         nvfp4_decode_pair_serves,
     )
 
-    if nvfp4_decode_pair_serves(num_tokens * router.top_k):
+    if nvfp4_decode_pair_serves(num_tokens * slots):
         # The pair's gemv1 routes the batch itself (one launch fewer on the
         # decode critical path); hand out the tensors it will write.
         global _deferred
-        ids = torch.empty((num_tokens, router.top_k), dtype=torch.int32, device=router_logits.device)
-        weights = torch.empty((num_tokens, router.top_k), dtype=torch.float32, device=router_logits.device)
+        ids = torch.empty((num_tokens, slots), dtype=torch.int32, device=router_logits.device)
+        weights = torch.empty((num_tokens, slots), dtype=torch.float32, device=router_logits.device)
         _deferred = DeferredRouting(
             ids, weights, router_logits, router.e_score_correction_bias.data, router.top_k,
             SCORING[router.scoring_func], bool(router.renormalize), float(router.routed_scaling_factor),
-            block_size, max_padded, max_blocks,
+            block_size, max_padded, max_blocks, fixed,
         )
         return weights, ids
     weights, ids, sorted_ids, expert_ids, post_pad = torch.ops.vllm.glm_route_align(
@@ -180,6 +193,7 @@ def route(router, router_logits: torch.Tensor):
         block_size,
         max_padded,
         max_blocks,
+        fixed,
     )
     publish(RoutingAlignment(ids, sorted_ids, expert_ids, post_pad, block_size))
     return weights, ids
@@ -195,6 +209,7 @@ def _glm_route_align_impl(
     block_size: int,
     max_padded: int,
     max_blocks: int,
+    fixed: int = -1,
 ) -> list[torch.Tensor]:
     return quixicore_ops.glm_route_align(
         logits,
@@ -206,6 +221,7 @@ def _glm_route_align_impl(
         block_size,
         max_padded,
         max_blocks,
+        fixed,
     )
 
 
@@ -219,11 +235,13 @@ def _glm_route_align_fake(
     block_size: int,
     max_padded: int,
     max_blocks: int,
+    fixed: int = -1,
 ) -> list[torch.Tensor]:
     i32 = logits.new_empty(0, dtype=torch.int32)
+    slots = topk + (1 if fixed >= 0 else 0)
     return [
-        logits.new_empty((logits.shape[0], topk)),
-        i32.new_empty((logits.shape[0], topk)),
+        logits.new_empty((logits.shape[0], slots)),
+        i32.new_empty((logits.shape[0], slots)),
         i32.new_empty((max_padded,)),
         i32.new_empty((max_blocks,)),
         i32.new_empty((1,)),

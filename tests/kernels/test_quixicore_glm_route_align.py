@@ -94,6 +94,47 @@ def test_glm_route_align_matches_router_and_alignment(tokens):
     assert max_blocks == triton.cdiv(max_padded, block_size)
 
 
+@pytest.mark.parametrize("tokens", [1, 3, 16])
+def test_glm_route_align_fixed_expert_slot(tokens):
+    """A fused shared expert: expert E appended to every token's slots at
+    weight 1.0 after the routed top-k (renormalized and scaled), and aligned
+    over E + 1 experts like any other."""
+    torch.manual_seed(2)
+    logits = (torch.randn(tokens, E, device=DEV) * 2).float()
+    bias = (torch.randn(E, device=DEV) * 0.5).float()
+    hidden = torch.randn(tokens, H, device=DEV, dtype=torch.bfloat16)
+    slots, experts = K + 1, E + 1
+    block_size = marlin_moe_block_size_m(tokens, slots, experts, None)
+    max_padded, max_blocks = moe_align_block_size_geometry(tokens * slots, experts, block_size)
+    w, ids, sorted_ids, expert_ids, post_pad = torch.ops.vllm.glm_route_align(
+        logits, bias, K, glm_route_align.SCORING["sigmoid"], True, SCALE, block_size, max_padded, max_blocks, E,
+    )
+    assert ids.shape == (tokens, slots) and w.shape == (tokens, slots)
+    assert bool((ids[:, K] == E).all()) and bool((w[:, K] == 1.0).all())
+    ref_w, ref_ids = grouped_topk(
+        hidden_states=hidden, gating_output=logits, topk=K, renormalize=True, num_expert_group=1,
+        topk_group=1, scoring_func="sigmoid", routed_scaling_factor=SCALE, e_score_correction_bias=bias,
+    )
+    ordered, permutation = ids[:, :K].sort(dim=1)
+    ref_ordered, ref_permutation = ref_ids.to(torch.int32).sort(dim=1)
+    assert torch.equal(ordered, ref_ordered)
+    torch.testing.assert_close(
+        w[:, :K].gather(1, permutation), ref_w.gather(1, ref_permutation), atol=1e-6, rtol=1e-6
+    )
+    full_ids = torch.cat([ref_ids.to(torch.int32), torch.full((tokens, 1), E, device=DEV, dtype=torch.int32)], dim=1)
+    ref_sorted, ref_experts, ref_pad = moe_align_block_size(
+        full_ids, block_size, experts, None, ignore_invalid_experts=True
+    )
+    assert int(post_pad.item()) == int(ref_pad.item())
+    assert _blocks(sorted_ids, expert_ids, post_pad, block_size, tokens * slots) == _blocks(
+        ref_sorted, ref_experts, ref_pad, block_size, tokens * slots
+    )
+    with pytest.raises(RuntimeError):
+        torch.ops.vllm.glm_route_align(
+            logits, bias, K, glm_route_align.SCORING["sigmoid"], True, SCALE, block_size, max_padded, max_blocks, E + 1,
+        )
+
+
 def _non_finite_cases(tokens):
     torch.manual_seed(1)
     base = (torch.randn(tokens, E, device=DEV) * 2).float()

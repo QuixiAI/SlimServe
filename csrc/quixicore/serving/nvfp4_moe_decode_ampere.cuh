@@ -306,7 +306,7 @@ __global__ void __launch_bounds__(THREADS) nvfp4_moe_gemv1_kernel(
         int32_t* __restrict__ topk_ids, __nv_bfloat16* __restrict__ act,
         int top_k, int N, int K, int E, int gstride, float clamp,
         const float* __restrict__ logits, const float* __restrict__ bias, int scoring, float scaling, int renorm,
-        float* __restrict__ topk_w, int pdl) {
+        float* __restrict__ topk_w, int fixed, int pdl) {
     using T = TileBytes<NJ>;
     constexpr int WTILE = 2 * T::TILE;            // the warp's gate + up tiles of one chunk
     constexpr int STAGE = WARPS * WTILE;
@@ -332,10 +332,19 @@ __global__ void __launch_bounds__(THREADS) nvfp4_moe_gemv1_kernel(
     }
     int e;
     if (logits != nullptr) {
-        float* choice = reinterpret_cast<float*>(dyn + size_t(K) * 2 + gemv1_ring_bytes<NJ, STAGES>());
+        // The folded router: the routed slots come from the logits (El wide: the
+        // fixed expert, if any, is expert E - 1 and has no logit); the fixed slot
+        // is the last of a token's slots and carries weight 1.0.
+        const int routed_k = fixed >= 0 ? top_k - 1 : top_k, El = fixed >= 0 ? E - 1 : E;
+        const int k = s - token * top_k;
         float w;
-        e = route_slot(logits + size_t(token) * E, bias, E, scoring, scaling, renorm, top_k, s - token * top_k,
-                       choice, choice + E, w, tid, lane, warp);
+        if (k >= routed_k) {
+            e = fixed; w = 1.0f;
+        } else {
+            float* choice = reinterpret_cast<float*>(dyn + size_t(K) * 2 + gemv1_ring_bytes<NJ, STAGES>());
+            e = route_slot(logits + size_t(token) * El, bias, El, scoring, scaling, renorm, routed_k, k,
+                           choice, choice + El, w, tid, lane, warp);
+        }
         if (cg == 0 && tid == 0) { topk_ids[s] = e; topk_w[s] = w; }
     } else {
         e = topk_ids[s];
@@ -410,7 +419,7 @@ __global__ void __launch_bounds__(THREADS) nvfp4_moe_gemv1_kernel(
 //   act [M*top_k][Ki] bf16, B int32 [E][Ki/16][D*2], S uint8 [E][Ki/16][D], G fp32 [E] or [1],
 //   topk_ids int32 [M*top_k], topk_w fp32 [M*top_k] or nullptr (weights already on the input),
 //   shared [M][D] bf16 or nullptr, out [M][D] bf16. grid (D / (16 NJ), M), dynamic smem
-//   top_k * Ki * 2 (the token's rows) + gemv2_ring_bytes. Ki % CHUNK_K == 0, top_k <= 64. The chunk sequence is
+//   ceil(top_k / split) * Ki * 2 (the CTA's rows) + gemv2_ring_bytes. Ki % CHUNK_K == 0, top_k <= 64. The chunk sequence is
 //   (slot, chunk-of-Ki) flattened, so the ring streams across expert boundaries.
 template <int NJ, int STAGES>
 __global__ void __launch_bounds__(THREADS) nvfp4_moe_gemv2_kernel(
@@ -429,12 +438,14 @@ __global__ void __launch_bounds__(THREADS) nvfp4_moe_gemv2_kernel(
     const __nv_bfloat16* as = reinterpret_cast<const __nv_bfloat16*>(dyn);
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int m = blockIdx.y;
-    // Launched as a cluster of `split` CTAs along z, each takes top_k / split of the
-    // token's slots and rank 0 sums the ranks' column sums in rank order (DSMEM).
+    // Launched as a cluster of `split` CTAs along z, each takes ceil(top_k / split)
+    // of the token's slots (the last rank the remainder: nine slots split in two
+    // are five and four) and rank 0 sums the ranks' column sums in rank order (DSMEM).
     cooperative_groups::cluster_group cluster = cooperative_groups::this_cluster();
     const int split = int(cluster.num_blocks()), rank = int(cluster.block_rank());
-    const int kper = top_k / split, k0 = rank * kper;
-    unsigned char* ring = dyn + size_t(kper) * Ki * 2;
+    const int kmax = (top_k + split - 1) / split, k0 = rank * kmax;
+    const int kper = max(min(kmax, top_k - k0), 0);
+    unsigned char* ring = dyn + size_t(kmax) * Ki * 2;   // the rows area is sized for the fullest rank
     const int cg = blockIdx.x;
     const int nt = cg / (4 / NJ), j0 = (cg % (4 / NJ)) * NJ;
     const int col0 = 64 * nt + 16 * j0;

@@ -157,6 +157,49 @@ def _load_nvfp4_swapset(
     return consume, extras
 
 
+def _load_nvfp4_shared_swapset(
+    model_path: str | None,
+) -> tuple[dict[str, torch.Tensor | None], dict[str, torch.Tensor]]:
+    """(checkpoint weights to consume, NVFP4 tensors to inject) from the
+    shared-expert sidecar (``slimserve.nvfp4_swapset --shared-experts``) when
+    ``SLIMSERVE_NVFP4_SHARED_SWAPSET`` selects one: each served layer's BF16
+    ``mlp.shared_experts.*`` shards are consumed and the sidecar's packed
+    expert-E tensors take their place under ``mlp.experts.E.*``."""
+    import os
+
+    from slimserve.nvfp4_swapset import SHARED_ENV, load_shared_manifest
+
+    manifest = load_shared_manifest(model_path)
+    if manifest is None:
+        if os.environ.get(SHARED_ENV, "0") not in ("", "0") and model_path:
+            logger.warning(
+                "glm5_next: %s=%s selects a shared-expert sidecar but %s has none; "
+                "serving the shared experts as they are (build it with "
+                "python -m slimserve.nvfp4_swapset --shared-experts)",
+                SHARED_ENV,
+                os.environ.get(SHARED_ENV),
+                model_path,
+            )
+        return {}, {}
+    from safetensors.torch import load_file
+
+    file = os.path.join(os.path.dirname(manifest["path"]), manifest["file"])
+    tensors = load_file(file)
+    wanted = set(manifest["tensors"])
+    missing = wanted - set(tensors)
+    if missing:
+        raise ValueError(f"{file}: {len(missing)} manifest tensors missing, e.g. {sorted(missing)[0]}")
+    extras = {k: tensors[k] for k in wanted}
+    consume: dict[str, torch.Tensor | None] = {name: None for name in manifest["consume"]}
+    logger.info(
+        "glm5_next: NVFP4 shared-expert sidecar from %s: %d layers served as expert %d",
+        file,
+        len(manifest["layers"]),
+        manifest["expert"],
+    )
+    return consume, extras
+
+
 def _load_f32_overrides(model_path: str | None) -> dict[str, torch.Tensor]:
     """Tensors to substitute for the checkpoint's copies, keyed by HF name.
 
@@ -975,21 +1018,24 @@ class Glm5NextForCausalLM(
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         num_text_layers = self.config.num_hidden_layers
+        model_path = self._model_path
+        shared_consume, shared_tensors = _load_nvfp4_shared_swapset(model_path)
         expert_params_mapping = fused_moe_make_expert_params_mapping(
             self,
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.n_routed_experts,
+            # The shared-expert sidecar adds expert E to its layers.
+            num_experts=self.config.n_routed_experts + (1 if shared_tensors else 0),
         )
         params_dict = dict(self.named_parameters())
         loaded: set[str] = set()
-        model_path = self._model_path
         weights = iter_with_overrides(weights, _load_f32_overrides(model_path))
         fp8_weights, fp8_scales = _load_fp8_swapset(model_path)
         weights = iter_with_overrides(weights, fp8_weights, fp8_scales, strict=True)
         nvfp4_consume, nvfp4_tensors = _load_nvfp4_swapset(model_path)
         weights = iter_with_overrides(weights, nvfp4_consume, nvfp4_tensors, strict=True)
+        weights = iter_with_overrides(weights, shared_consume, shared_tensors, strict=True)
         for name, weight in weights:
             # Vision tower and MTP layer: later phases.
             if name.startswith("model.visual."):

@@ -118,6 +118,28 @@ class FixFunctionalizationPass(VllmInductorPass):
                     mutated_args,
                     args=("out", "a", "b", "a_scales", "b_scales", "bias"),
                 )
+            elif at_target == torch.ops.vllm.moe_forward.default:
+                # (hidden_states!, router_logits, shared_experts_input?,
+                # input_ids?, prequant_input?, layer_name, hidden_dim_unpadded)
+                # -> Tensor: the MoE op of a layer without a shared-expert
+                # module (GLM-5.3 with the shared expert served as expert E).
+                # The op declares hidden_states mutated; its result stays at
+                # getitem[0] and the mutated view resolves to the input.
+                mutated_args = {1: "hidden_states"}
+                self.defunctionalize(
+                    graph,
+                    node,
+                    mutated_args,
+                    args=(
+                        "hidden_states",
+                        "router_logits",
+                        "shared_experts_input",
+                        "input_ids",
+                        "prequant_input",
+                        "layer_name",
+                        "hidden_dim_unpadded",
+                    ),
+                )
             elif (
                 at_target == torch.ops._C.dynamic_per_token_scaled_fp8_quant.default
             ):

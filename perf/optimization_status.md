@@ -30926,3 +30926,113 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   and contention (F2: the shared expert as expert 288, halving its bytes
   and removing the side stream) and the drafter's non-PDL sampler chain
   (F5).
+
+- PHASE 9 / F2: THE SHARED EXPERT AS EXPERT 288 (2026-09-19 22:10-22:35 PDT
+  build; campaign doc section 15 "F2 revised design"). The shared expert of
+  every sparse layer has exactly a routed expert's per-rank shape
+  (intermediate 2048 / TP4 = 512 x K 4096), and at decode it ran as three
+  fp8 launches on a side stream (gate_up 7.8 us, act 4.2, down 8.9 on the
+  15:35 c1 timeline) contending with the NVFP4 pair for DRAM (gemv1 16.9 us
+  in situ vs 13.5 cold). Instead of an fp8 path inside the pair, the shared
+  expert is re-quantized with the experts' NVFP4 recipe and served as one
+  more routed-format expert: sidecar `nvfp4-swapset-shared.{safetensors,json}`
+  (`python -m slimserve.nvfp4_swapset --model <dir> --shared-experts`; 504
+  tensors, 595 MB; rel Frobenius error 0.093 per projection, the other NVFP4
+  families' figure; the MTP layer keeps its own), selected by
+  SLIMSERVE_NVFP4_SHARED_SWAPSET. Plumbing, all on precedents of the branch:
+  the loader consumes the checkpoint's BF16 `mlp.shared_experts.*` (and the
+  fp8 swap-set's copies and scales) and injects `mlp.experts.288.*`, which the
+  checkpoint's NVFP4 experts group already targets; `DeepseekV2MoE` builds no
+  shared MLP for a served layer and asks FusedMoE for one fused shared slot
+  (`fuse_shared_experts`, the AITER fusion's expert-count and weight-slot
+  plumbing reused; the AITER top-k buffer stays AITER-only); the routers
+  append expert 288 to every token's slots at weight 1.0 after the routed
+  top-k is renormalized and scaled by 2.5 - the route_align kernel and the
+  pair's folded router write the fixed slot themselves (`fixed_expert`),
+  the grouped router appends it with a cat at prefill; the Marlin path sees
+  289 experts (the fused count added in the NVFP4 quant method's apply).
+  Per MoE layer this removes the side stream and its three launches, the
+  two streams' DRAM contention and half the shared bytes (6 MB fp8 -> 3 MB
+  e2m1), and adds one slot to gemv1/gemv2 (~1.9 us of bytes at c1) and one
+  expert row to Marlin at c8/c16. Sized at c1: the MoE layer from ~26 us to
+  ~22.4 (-3.6 x 42 = 0.15 ms, +3.4 %); c8/c16 +0.5..1 %; prefill sends the
+  whole batch through expert 288 in the grouped GEMM (TTFT to measure).
+  Tests: `test_quixicore_glm_route_align.py` (fixed slot: ids/weights and
+  the alignment over E + 1 vs the reference), `test_nvfp4_moe_decode.py`
+  (folded router + gemv2 over top_k + 1 slots vs the dequantized reference),
+  `tests/slimserve/test_nvfp4_swapset.py` (the builder on a synthetic
+  checkpoint, manifest, claims, hash factor). Quality gate as P6: four
+  gates' all-position mean against the f1-nospec boot; the shared expert
+  runs on every token in 42 layers, so its NVFP4 error is the one to watch.
+  Serving: `$S/p9/chain_f2.sh` (f2-nospec 2 passes + 4 gates + canaries,
+  f2-spec 8 passes; references f1-nospec / f1-spec of 21:55-22:09).
+  F2 SERVING, FIRST ROUND (2026-09-19 22:30-22:55 PDT, `$S/p9/chain_f2.sh`;
+  three aborted boots first: the fix_functionalization pass had never met
+  `vllm.moe_forward` (a MoE layer without a shared-expert module) - handled
+  now like the other mutating ops; then Marlin saw 288 experts against the
+  289-expert stack and dropped expert 288's assignments as invalid (garbage,
+  gates -8.1) - `RoutedExperts.global_num_experts` now counts the fused
+  shared experts when no expert map redirects the ids; raw
+  perf/results/2026-09-19/f2-nospec-pass{1,2}/, f2-nospec-gate{1..4}.json):
+  the sidecar loads ("42 layers served as expert 288"), the pair serves
+  "2 x top-9", canaries text/tool/image PASS.
+  | arm | c1 | c8 | c16 | gates all-position mean (`$S/p8/gate_allpos.py`) |
+  |---|---|---|---|---|
+  | f1-nospec (reference boot) | 228.5 / 228.6 | 780.9 / 772.0 | 1117.5 / 1126.3 | -3.2720 -3.2639 -3.2755 -3.2795 (mean -3.2727) |
+  | f2-nospec (shared expert as expert 288) | 224.4 / 224.1 | 774.9 / 781.4 | 1116.4 / 1119.0 | -3.2600 -3.2646 -3.2626 -3.2639 (mean -3.2628) |
+  QUALITY: +0.010 nats per token better than the reference boot (the shared
+  expert is quantized from the checkpoint's BF16 rather than served through
+  the fp8 swap-set's e4m3 copy), needle margins 12.3-14.7 / 16.3-20.3 vs
+  11.4-13.1 / 15.8-21.5: the P6 gate passes with margin. THROUGHPUT: c1
+  -1.8 %, c8/c16 level - the pair now runs nine slots per token and the
+  gemv2 cluster split (P9: 2 CTAs over a token's experts, 11.1 -> 8.4 us at
+  one token) requires the split to divide the slot count; 9 % 2 leaves
+  gemv2 unsplit (-2.7 us x 42 layers = -0.11 ms, the size of the loss).
+  Next round: a split of 3 for nine slots (3 CTAs x 3 experts; the kernel's
+  rank-order DSMEM sum is generic in the split) and the c1 spec arm.
+  F2 SPEC, FIRST ROUND (22:50-22:59 PDT, eight passes, `f2-spec`): c1 289.8
+  322.0 352.3 338.5 374.4 360.0 330.0 310.6 (median 334.3) against the
+  reference boots' 296.4 / 293.5 (+13 %); c8 median 836 (810 / 835), c16
+  1124 (1094 / 1130); 0.977 accepted per draft (0.968 / 0.976). The verify
+  pass at four rows now carries 36 assignment rows (4 x 9), past the pair's
+  32-row cap, so Marlin serves it there; the gain is the shared branch and
+  its side stream gone from every one of the 42 layers of a 4-row verify.
+  THE SPLIT (23:00-23:07 PDT, `$S/p9/bench_moe_9slots.py`, GPU 1, cold, the
+  record's PDL mode, one token x nine slots, nj 4; raw
+  perf/results/2026-09-19/f2-9slots-microbench.txt): gemv2 unsplit 11.9 us,
+  a cluster of 3 (three experts each) 13.2 - 64 column groups x 3 = 192 CTAs
+  on 188 SMs, a tail wave - and a cluster of 2 taking five and four experts
+  9.4 us (the eight-slot figures: 11.2 / 8.5). gemv2 now takes
+  ceil(top_k / split) slots per rank with the last rank the remainder (the
+  rows area sized for the fullest rank), the binding accepts any split <=
+  top_k, and the dispatch rule is "2 while the batch is one token, whatever
+  the slot count". Pair total at one token: 24.8 us for nine slots against
+  22.8 for eight - the +1.9 us of the extra expert's bytes, as sized.
+  Second round: `$S/p9/chain_f2b.sh` (plain 2 passes + 2 gates + canaries,
+  spec 8 passes).
+  F2 SECOND ROUND (23:07-23:18 PDT, `$S/p9/chain_f2b.sh`, split 2 as five and
+  four experts; raw perf/results/2026-09-19/f2b-{nospec,spec}-pass*/,
+  f2b-nospec-gate{1,2}.json): canaries PASS, gates all-position -3.2668 /
+  -3.2631 (reference boots -3.2727 / -3.268).
+  | arm | c1 | c8 | c16 |
+  |---|---|---|---|
+  | f2b-nospec | 228.9 / 228.6 | 786.3 / 781.3 | 1099.9 / 1111.2 |
+  | reference f1-nospec / f1off-nospec | 228.5 / 228.6, 228.8 / 228.7 | 780.9 / 772.0, 782.9 / 777.1 | 1117.5 / 1126.3, 1121.7 / 1125.9 |
+  | f2b-spec, 8 passes (median, range) | 293.2 (256.6-343.8) | 826.5 (817.0-897.7) | 1133 (1077.9-1205.7) |
+  | reference f1-spec / f1off-spec medians | 296.4 / 293.5 | 809.5 / 835 | 1094 / 1130 |
+  VERDICT: LEVEL in throughput at every shape (plain c1 level with the
+  split restored, c8 +1 %, c16 -1 %: at sixteen rows Marlin's extra expert
+  block sits on the critical path while the fp8 shared GEMMs it replaces ran
+  on a side stream that was free there; spec inside the draws - the first
+  round's c1 median of 334 was a favourable draw set, the c1 spec passes
+  span 257-374 across the two rounds); QUALITY +0.006..0.010 nats per token
+  better than the reference boot at every gate; 126 MB per rank of weights
+  fewer and the shared side stream gone. DECISION: retained as an OPT-IN
+  sidecar (`SLIMSERVE_NVFP4_SHARED_SWAPSET=nvfp4-swapset-shared`, off in the
+  record's environment), the same footing as P13a; the plumbing (a fused
+  shared-expert slot on CUDA through the routers, the pair and Marlin;
+  `RoutedExperts.global_num_experts` counting fused experts; the
+  functionalization pass handling `vllm.moe_forward`) stays as tested
+  code. The section-15 sizing of +3.4 % at c1 assumed the shared branch's
+  bytes were contending with the pair's; measured, the branch was already
+  hidden and the pair pays for the ninth slot exactly what the branch cost.

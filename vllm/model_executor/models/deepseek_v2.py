@@ -30,6 +30,8 @@ from itertools import islice
 
 import functools
 import os
+import re
+
 import torch
 from torch import nn
 from transformers import DeepseekV2Config, DeepseekV3Config
@@ -376,6 +378,19 @@ def _fused_ar_rms_norm(
     return norm(hidden_states, residual)
 
 
+def _shared_expert_sidecar_serves(prefix: str) -> bool:
+    """Whether the NVFP4 shared-expert sidecar (SLIMSERVE_NVFP4_SHARED_SWAPSET)
+    serves the shared expert of the MoE layer at ``prefix`` as expert E."""
+    from slimserve.nvfp4_swapset import shared_expert_layers
+
+    model_config = get_current_vllm_config().model_config
+    layers = shared_expert_layers(model_config.model if model_config else None)
+    if not layers:
+        return False
+    m = re.search(r"\.layers\.(\d+)\.", prefix)
+    return m is not None and int(m.group(1)) in layers
+
+
 class DeepseekV2MoE(nn.Module):
     def __init__(
         self,
@@ -449,7 +464,15 @@ class DeepseekV2MoE(nn.Module):
             # Accumulates in fp32; avoids bf16->fp32 cast.
             self.gate.set_out_dtype(self.gate.weight.dtype)
 
-        if config.n_shared_experts is None or self.is_fusion_moe_shared_experts_enabled:
+        # The NVFP4 shared-expert sidecar (slimserve.nvfp4_swapset
+        # --shared-experts) serves this layer's shared expert as one more
+        # routed-format expert: no shared MLP, one fused slot per token.
+        self.fuse_shared_expert_sidecar = _shared_expert_sidecar_serves(prefix)
+        if (
+            config.n_shared_experts is None
+            or self.is_fusion_moe_shared_experts_enabled
+            or self.fuse_shared_expert_sidecar
+        ):
             self.shared_experts = None
         else:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
@@ -487,8 +510,9 @@ class DeepseekV2MoE(nn.Module):
             is_sequence_parallel=self.is_sequence_parallel,
             reduce_results=reduce_results,
             n_shared_experts=config.n_shared_experts
-            if self.is_fusion_moe_shared_experts_enabled
+            if self.is_fusion_moe_shared_experts_enabled or self.fuse_shared_expert_sidecar
             else None,
+            fuse_shared_experts=self.fuse_shared_expert_sidecar,
             router_logits_dtype=self.gate.out_dtype,
             swiglu_limit=self.swiglu_limit,
         )

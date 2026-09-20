@@ -81,10 +81,13 @@ class quixicore_ops:
         block_size: int,
         max_padded: int,
         max_blocks: int,
+        fixed_expert: int = -1,
     ) -> list[torch.Tensor]:
         """Fused small-M routing: scored top-k with bias-only selection plus
         the Marlin block alignment, one launch. Returns [topk_weights,
-        topk_ids, sorted_token_ids, expert_ids, num_tokens_post_padded]."""
+        topk_ids, sorted_token_ids, expert_ids, num_tokens_post_padded];
+        fixed_expert >= 0 (it must be E) appends that expert to every token's
+        slots at weight 1.0 and aligns over E + 1 experts."""
         return _qc().glm_route_align(
             logits,
             bias,
@@ -95,6 +98,7 @@ class quixicore_ops:
             block_size,
             max_padded,
             max_blocks,
+            fixed_expert,
         )
 
     @staticmethod
@@ -1800,6 +1804,7 @@ class quixicore_ops:
         scaling: float = 1.0,
         renormalize: bool = True,
         topk_weights: torch.Tensor | None = None,
+        fixed_expert: int = -1,
     ) -> torch.Tensor:
         """Decode MoE gate/up projection + SiLU over the Marlin-packed NVFP4
         experts: one CTA per (assignment slot, 16*nj columns), a `stages`-deep
@@ -1808,10 +1813,13 @@ class quixicore_ops:
         token * top_k + k). With `logits` (fp32 [M, E]) and `bias` (fp32 [E]) the
         router is folded in (glm_route_align's selection: scoring 0 sigmoid / 1
         sqrt-softplus, bias-only top-k, renormalize, scaling) and topk_ids /
-        topk_weights are OUTPUTS written by the kernel."""
+        topk_weights are OUTPUTS written by the kernel; fixed_expert >= 0 (it must
+        be E - 1, the last expert) makes the last slot of every token that expert
+        at weight 1.0, the routed slots coming from logits over E - 1 experts."""
         clamp = -1.0 if clamp_limit is None else float(clamp_limit)
         return _qc().nvfp4_moe_gemv1(
-            x, b, s, g, topk_ids, act, nj, stages, clamp, logits, bias, scoring, scaling, renormalize, topk_weights
+            x, b, s, g, topk_ids, act, nj, stages, clamp, logits, bias, scoring, scaling, renormalize, topk_weights,
+            fixed_expert,
         )
 
     @staticmethod
@@ -1831,7 +1839,7 @@ class quixicore_ops:
         """Decode MoE down projection with the top-k combine (fp32, slot
         order) and the optional shared-expert add folded in: out[M, D] bf16.
         topk_weights None means the weights already sit on the input; split
-        (1/2/4/8, dividing top_k) spreads a token's experts over a cluster of
+        (1/2/3/4/8, dividing top_k) spreads a token's experts over a cluster of
         CTAs summed in rank order."""
         return _qc().nvfp4_moe_gemv2(act, b, s, g, topk_ids, topk_weights, shared, out, nj, stages, split)
 

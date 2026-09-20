@@ -48,7 +48,10 @@ cluster launch per KDA layer, `kda_block_decode`, default on, QC_KDA_BLOCK=0
 restores the Triton kernels; it serves batches up to about five requests
 and declines the rest to the Triton chain; LEVEL in serving - the launches
 it removes were already hidden by dependent launch, so the cleanup pass
-may drop it); the
+may drop it); F2, the shared expert served as expert 288 through an NVFP4
+sidecar (`python -m slimserve.nvfp4_swapset --shared-experts`,
+`SLIMSERVE_NVFP4_SHARED_SWAPSET=nvfp4-swapset-shared`): correct, +0.01
+nats better, LEVEL in throughput, retained opt-in like P13a; the
 NVFP4 dense sidecar landed for the KDA in_proj family only
 (`SLIMSERVE_NVFP4_SWAPSET=nvfp4-swapset-inproj` on the record, +3 / +2 /
 +0.5 % plain for 0.012 nats per token; the other families cost 0.028 for

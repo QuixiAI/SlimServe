@@ -284,6 +284,26 @@ class GroupedTopKRouter(BaseRouter):
             routed_scaling_factor=self.routed_scaling_factor,
         )
 
+    def _append_fused_shared(
+        self, topk_weights: torch.Tensor, topk_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Fused shared experts on CUDA: the slots [global, global + n) at
+        weight 1.0 after every token's routed slots (renormalized and scaled).
+        AITER's grouped top-k writes them itself."""
+        n = self.num_fused_shared_experts
+        if n == 0 or rocm_aiter_ops.is_fused_moe_enabled():
+            return topk_weights, topk_ids
+        m = topk_ids.shape[0]
+        base = self.global_num_experts
+        shared_ids = torch.arange(
+            base, base + n, dtype=topk_ids.dtype, device=topk_ids.device
+        ).expand(m, n)
+        shared_w = torch.ones((m, n), dtype=topk_weights.dtype, device=topk_weights.device)
+        return (
+            torch.cat([topk_weights, shared_w], dim=-1),
+            torch.cat([topk_ids, shared_ids], dim=-1),
+        )
+
     def _compute_routing(
         self,
         hidden_states: torch.Tensor,
@@ -326,7 +346,7 @@ class GroupedTopKRouter(BaseRouter):
                     renormalize=self.renormalize,
                     indices_type=indices_type,
                 )
-            return topk_weights, topk_ids
+            return self._append_fused_shared(topk_weights, topk_ids)
 
         # Select grouped_topk implementation
         if rocm_aiter_ops.is_fused_moe_enabled():
@@ -351,4 +371,4 @@ class GroupedTopKRouter(BaseRouter):
             e_score_correction_bias=self.e_score_correction_bias,
         )
 
-        return topk_weights, topk_ids
+        return self._append_fused_shared(topk_weights, topk_ids)

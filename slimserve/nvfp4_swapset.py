@@ -269,9 +269,15 @@ def load_manifest(model_path: str | None) -> dict | None:
 
 
 def claimed_modules(model_path: str | None) -> set[str]:
-    """``layers.N.<module>`` names the sidecar serves (empty when off)."""
+    """``layers.N.<module>`` names the sidecars serve (empty when off): the
+    dense families of the NVFP4 sidecar and the shared experts the
+    shared-expert sidecar turns into routed-format experts."""
     manifest = load_manifest(model_path)
-    return set(manifest["modules"]) if manifest else set()
+    claimed = set(manifest["modules"]) if manifest else set()
+    shared = load_shared_manifest(model_path)
+    if shared:
+        claimed |= set(shared["modules"])
+    return claimed
 
 
 def apply_config_group(model_path: str | None, hf_quant_config: dict | None, fp8_group_name: str | None) -> bool:
@@ -279,13 +285,20 @@ def apply_config_group(model_path: str | None, hf_quant_config: dict | None, fp8
     out of the FP8 swap-set's group targets (the FP8 group is keyed by
     ``fp8_group_name`` when present)."""
     manifest = load_manifest(model_path)
-    if manifest is None or not hf_quant_config or not manifest["modules"]:
+    dense = manifest is not None and bool(manifest["modules"])
+    # The shared-expert sidecar claims its layers' shared-expert modules too
+    # (served as expert E through the checkpoint's own NVFP4 experts group).
+    shared = load_shared_manifest(model_path)
+    claimed: set[str] = set(shared["modules"]) if shared else set()
+    if dense:
+        claimed |= set(manifest["modules"])
+    if not claimed or not hf_quant_config:
         return False
     if hf_quant_config.get("quant_method") != "compressed-tensors":
-        raise ValueError(f"{manifest['path']}: the sidecar needs a compressed-tensors model")
+        raise ValueError(f"{(manifest or shared)['path']}: the sidecar needs a compressed-tensors model")
     groups = hf_quant_config.setdefault("config_groups", {})
-    groups[GROUP_NAME] = manifest["config_group"]
-    claimed = set(manifest["modules"])
+    if dense:
+        groups[GROUP_NAME] = manifest["config_group"]
     ignore = hf_quant_config.get("ignore")
     if ignore:
         hf_quant_config["ignore"] = [
@@ -329,9 +342,14 @@ def main() -> None:
     ap.add_argument("--skip-layer", type=int, default=45, help="layer to leave alone (the MTP layer)")
     ap.add_argument("--families", default=",".join(FAMILIES), help="comma-separated vLLM module suffixes")
     ap.add_argument("--mtp-experts", action="store_true", help=f"build the MTP layer's experts sidecar ({MTP_STEM}) instead")
+    ap.add_argument("--shared-experts", action="store_true",
+                    help=f"build the shared-expert sidecar ({SHARED_STEM}: each sparse layer's shared expert as one more NVFP4 expert) instead")
     args = ap.parse_args()
     if args.mtp_experts:
         build_mtp_experts(args.model, args.out, args.skip_layer)
+        return
+    if args.shared_experts:
+        build_shared_experts(args.model, args.out, args.skip_layer)
         return
     families = [f.strip() for f in args.families.split(",") if f.strip()]
     unknown = set(families) - set(FAMILIES)
@@ -475,6 +493,118 @@ def mtp_hash_factor(model_path: str | None) -> str:
     with open(manifest["path"], "rb") as fh:
         digest = hashlib.sha256(fh.read()).hexdigest()[:16]
     return f"nvfp4_mtp_swapset={digest}"
+
+
+# ------------------------------------------------- the shared experts as experts
+# GLM-5.3-Flash's shared expert has exactly a routed expert's per-rank shape
+# (intermediate 2048), and at decode it ran as three fp8 launches on a side
+# stream that contends with the NVFP4 decode pair for DRAM. This sidecar
+# re-quantizes every sparse layer's shared expert with the experts' NVFP4
+# recipe and emits it as expert index E (= n_routed_experts) of that layer, so
+# the layer serves it as one more routed-format expert: the router appends it
+# to every token's slots at weight 1.0 (the routed scaling stays on the routed
+# slots) and the MoE kernels see E + 1 experts. The fp8 swap-set's
+# shared-expert modules are dropped for those layers.
+#     python -m slimserve.nvfp4_swapset --model <dir> --shared-experts
+# Serving: ``SLIMSERVE_NVFP4_SHARED_SWAPSET=nvfp4-swapset-shared`` (a manifest
+# stem next to the checkpoint; unset or 0 = off).
+SHARED_ENV = "SLIMSERVE_NVFP4_SHARED_SWAPSET"
+SHARED_STEM = "nvfp4-swapset-shared"
+_SHARED_RE = re.compile(r"^(?P<prefix>.*\.layers\.)(?P<layer>\d+)\.mlp\.shared_experts\.(?P<proj>gate_proj|up_proj|down_proj)\.weight$")
+
+
+def build_shared_experts(model_dir: str, out: str | None, skip_layer: int | None) -> Path:
+    with open(os.path.join(model_dir, "config.json")) as fh:
+        cfg = json.load(fh)
+    cfg = cfg.get("text_config", cfg)
+    expert = int(cfg["n_routed_experts"])
+    converted = _headers(model_dir)
+    layers: dict[int, dict[str, tuple[str, str]]] = defaultdict(dict)
+    for name, (entry, *_rest) in converted.items():
+        m = _SHARED_RE.match(name)
+        if m is None or entry["dtype"] != "BF16" or int(m.group("layer")) == skip_layer:
+            continue
+        layers[int(m.group("layer"))][m.group("proj")] = (m.group("prefix"), name)
+    if not layers:
+        raise SystemExit("no BF16 shared experts found")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    tensors: dict[str, torch.Tensor] = {}
+    consume: list[str] = []
+    qerr: dict[str, list[float]] = defaultdict(list)
+    for layer in sorted(layers):
+        projs = layers[layer]
+        if set(projs) != {"gate_proj", "up_proj", "down_proj"}:
+            raise SystemExit(f"layer {layer}: incomplete shared expert {sorted(projs)}")
+        ws = {p: _read(*converted[n]).to(device) for p, (_, n) in projs.items()}
+        gs13 = global_scale_for([ws["gate_proj"], ws["up_proj"]]).to(device)
+        gs2 = global_scale_for([ws["down_proj"]]).to(device)
+        for proj, (prefix, name) in projs.items():
+            gs = gs2 if proj == "down_proj" else gs13
+            packed, scale = quantize_nvfp4(ws[proj], gs)
+            err = (dequant_nvfp4(packed, scale, gs) - ws[proj].float()).norm() / ws[proj].float().norm().clamp(min=1e-12)
+            qerr[proj].append(err.item())
+            base = f"{prefix}{layer}.mlp.experts.{expert}.{proj}"
+            tensors[base + ".weight_packed"] = packed.cpu()
+            tensors[base + ".weight_scale"] = scale.cpu()
+            tensors[base + ".weight_global_scale"] = gs.reshape(1).cpu().clone()
+            tensors[base + ".input_global_scale"] = torch.ones(1, dtype=torch.float32)
+            consume.append(name)
+        del ws
+    from safetensors.torch import save_file
+
+    out_path = Path(out or os.path.join(model_dir, SHARED_STEM + ".safetensors"))
+    save_file(tensors, str(out_path), metadata={"purpose": f"NVFP4 (W4A16, group 16) sidecar: each sparse layer's shared expert as expert {expert}"})
+    manifest = {
+        "file": out_path.name,
+        "kind": "shared_experts",
+        "expert": expert,
+        "layers": sorted(layers),
+        "tensors": sorted(tensors),
+        "consume": sorted(consume),
+        "modules": [f"layers.{layer}.mlp.shared_experts.{m}" for layer in sorted(layers) for m in ("gate_up_proj", "down_proj")],
+    }
+    manifest_file = out_path.with_suffix(".json")
+    with open(manifest_file, "w") as fh:
+        json.dump(manifest, fh, indent=1)
+    nbytes = sum(t.numel() * t.element_size() for t in tensors.values())
+    print(f"{len(tensors)} tensors, {nbytes} bytes -> {out_path}; manifest {manifest_file}")
+    for proj, rows in sorted(qerr.items()):
+        print(f"  {proj:12s} n={len(rows):3d} rel Frobenius error mean {sum(rows) / len(rows):.4f} max {max(rows):.4f}")
+    return out_path
+
+
+def shared_manifest_path(model_path: str | None) -> str | None:
+    choice = os.environ.get(SHARED_ENV, "0")
+    if not model_path or choice in ("", "0"):
+        return None
+    stem = SHARED_STEM if choice == "1" else choice
+    path = os.path.join(model_path, f"{stem}.json")
+    return path if os.path.isfile(path) else None
+
+
+def load_shared_manifest(model_path: str | None) -> dict | None:
+    path = shared_manifest_path(model_path)
+    if path is None:
+        return None
+    with open(path) as fh:
+        manifest = json.load(fh)
+    manifest["path"] = path
+    return manifest
+
+
+def shared_expert_layers(model_path: str | None) -> set[int]:
+    """Layers whose shared expert the sidecar serves as expert E (empty when off)."""
+    manifest = load_shared_manifest(model_path)
+    return set(manifest["layers"]) if manifest else set()
+
+
+def shared_hash_factor(model_path: str | None) -> str:
+    manifest = load_shared_manifest(model_path)
+    if manifest is None:
+        return "nvfp4_shared_swapset=off"
+    with open(manifest["path"], "rb") as fh:
+        digest = hashlib.sha256(fh.read()).hexdigest()[:16]
+    return f"nvfp4_shared_swapset={digest}"
 
 
 if __name__ == "__main__":

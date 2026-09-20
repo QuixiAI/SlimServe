@@ -9,10 +9,14 @@
 // The selection is total over non-finite inputs: vLLM's dummy runs (graph-capture
 // warmups, the sampler warmup) feed NaN activations, so a NaN score ranks below
 // every finite score, a selected expert is marked -inf, and ties go to the lowest
-// index. Every expert id is therefore in [0, E) and the block layout is valid
-// (valid entries first, then padding) whatever the input. Marlin takes the first
-// num_valid entries of a block as tokens, so an id of E would alias the padding
-// value numel as a row and touch one row past the activations.
+// index. Every routed expert id is therefore in [0, E) and the block layout is
+// valid (valid entries first, then padding) whatever the input. Marlin takes the
+// first num_valid entries of a block as tokens, so an id past the experts would
+// alias the padding value numel as a row and touch one row past the activations.
+//
+// A fixed expert (`fixed` >= 0, the shared expert served as expert E of E + 1)
+// is appended to every token's slots with weight 1.0 after the routed top-k is
+// renormalized and scaled, and takes part in the alignment like any expert.
 //
 // Assignments of one expert are scattered into its range with an atomic cursor,
 // so their order within the expert's blocks is unspecified. Every assignment's
@@ -46,19 +50,21 @@ __global__ __launch_bounds__(THREADS) void route_align_kernel(
         int32_t* __restrict__ sorted_token_ids,// [max_padded]
         int32_t* __restrict__ expert_ids,      // [max_blocks]
         int32_t* __restrict__ num_tokens_post_pad,
-        int M, int scoring, float scaling, bool renormalize, int block_size,
+        int M, int fixed, int scoring, float scaling, bool renormalize, int block_size,
         int max_padded, int max_blocks) {
-    static_assert(E <= THREADS, "one thread per expert for the scan");
+    static_assert(E + 1 <= THREADS, "one thread per expert (plus the fixed one) for the scan");
     static_assert((E + 31) / 32 > TOPK, "every lane must keep an unselected candidate");
     __shared__ float choice[MAX_TOKENS][E];   // biased scores, -inf once selected
     __shared__ float score[MAX_TOKENS][E];    // unbiased scores (weights)
-    __shared__ int counts[E];
-    __shared__ int cursor[E];
-    __shared__ int cumsum[E + 1];
+    __shared__ int counts[E + 1];
+    __shared__ int cursor[E + 1];
+    __shared__ int cumsum[E + 2];
     __shared__ int sel[MAX_TOKENS][TOPK];      // selected experts, always < E
     __shared__ typename cub::BlockScan<int, THREADS>::TempStorage scan_tmp;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-    const int numel = M * TOPK;
+    const int slots = TOPK + (fixed >= 0 ? 1 : 0);   // per token: the routed top-k, then the fixed expert
+    const int NE = E + (fixed >= 0 ? 1 : 0);         // experts taking part in the alignment
+    const int numel = M * slots;
 
     // A. scores for every (token, expert); a NaN choice ranks below every
     // finite one (-FLT_MAX) but above a selected expert (-inf).
@@ -69,7 +75,7 @@ __global__ __launch_bounds__(THREADS) void route_align_kernel(
         const float c = s + bias[e];
         choice[m][e] = (c == c) ? c : -FLT_MAX;
     }
-    if (tid < E) { counts[tid] = 0; cursor[tid] = 0; }
+    if (tid < NE) { counts[tid] = 0; cursor[tid] = 0; }
     __syncthreads();
 
     // B. top-k per token, one warp per token: TOPK rounds of warp argmax.
@@ -104,9 +110,14 @@ __global__ __launch_bounds__(THREADS) void route_align_kernel(
 #pragma unroll
             for (int k = 0; k < TOPK; ++k) {
                 const int e = sel[m][k];
-                topk_ids[m * TOPK + k] = e;
-                topk_weights[m * TOPK + k] = score[m][e] * inv * scaling;
+                topk_ids[m * slots + k] = e;
+                topk_weights[m * slots + k] = score[m][e] * inv * scaling;
                 atomicAdd(&counts[e], 1);
+            }
+            if (fixed >= 0) {
+                topk_ids[m * slots + TOPK] = fixed;
+                topk_weights[m * slots + TOPK] = 1.0f;
+                atomicAdd(&counts[fixed], 1);
             }
         }
     }
@@ -114,21 +125,22 @@ __global__ __launch_bounds__(THREADS) void route_align_kernel(
 
     // C. alignment: per-expert padded counts, exclusive scan, block expert ids.
     int padded = 0;
-    if (tid < E) padded = ((counts[tid] + block_size - 1) / block_size) * block_size;
+    if (tid < NE) padded = ((counts[tid] + block_size - 1) / block_size) * block_size;
     int excl = 0, total = 0;
     cub::BlockScan<int, THREADS>(scan_tmp).ExclusiveSum(padded, excl, total);
-    if (tid < E) cumsum[tid] = excl;
-    if (tid == 0) { cumsum[E] = total; num_tokens_post_pad[0] = total; }
+    if (tid < NE) cumsum[tid] = excl;
+    if (tid == 0) { cumsum[NE] = total; num_tokens_post_pad[0] = total; }
     __syncthreads();
     for (int i = tid; i < max_padded; i += THREADS) sorted_token_ids[i] = numel;
-    if (tid < E) {
+    if (tid < NE) {
         for (int i = cumsum[tid]; i < cumsum[tid + 1]; i += block_size) expert_ids[i / block_size] = tid;
     }
     for (int b = total / block_size + tid; b < max_blocks; b += THREADS) expert_ids[b] = -1;
     __syncthreads();
     // D. scatter every assignment into its expert's range.
     for (int a = tid; a < numel; a += THREADS) {
-        const int e = sel[a / TOPK][a - (a / TOPK) * TOPK];
+        const int m = a / slots, k = a - m * slots;
+        const int e = (k < TOPK) ? sel[m][k] : fixed;
         const int pos = cumsum[e] + atomicAdd(&cursor[e], 1);
         sorted_token_ids[pos] = a;
     }
