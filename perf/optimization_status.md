@@ -26198,3 +26198,14 @@ Phases, by value over risk:
   live server is dominated by noise and competing traffic (110-162 across
   runs today), so the c1 gap is not established. Single-stream decode with
   ignore_eos: 141-187 tok/s.
+
+
+## 2026-09-19 - Preserve empty and multipart Responses assistant history
+
+- Status: retained for review.
+- Baseline: `origin/main`; forward-port from the B70 serving integration.
+- Change: Replay every text and refusal part as one assistant message, including empty content; preserve current custom-tool history handling.
+- Correctness: 20 assistant-history regression tests passed on CPU.
+- Results: no new throughput measurement or hardware qualification claimed.
+- Decision: submit as a focused PR; preserve current-main behavior outside this fix.
+- Raw artifacts: local test output; no traffic captures or model data committed.
