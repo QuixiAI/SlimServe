@@ -101,3 +101,32 @@ display, truncation, missing terminal events, and streamed/final call mismatches
 
 Eleven additional ASGI lifecycle fixtures cover EOF, byte/header fidelity, upstream
 errors, downstream disconnect/send failure, cancellation, and cleanup.
+
+## Token-progress watchdog
+
+`watch_progress.py` observes loopback metrics every five seconds. With requests
+running, 45 seconds without prompt or generation counter progress triggers one
+read-only snapshot per stall. Recovery, idle periods, and counter/creation-epoch
+resets rearm detection. Missing metrics are reported separately.
+
+```bash
+python tools/serving_diagnostics/watch_progress.py \
+  --service-unit slimserve-abliterated.service \
+  --journal-unit slimserve-abliterated.service \
+  --duration 3600 --output /private/path/progress.jsonl \
+  --py-spy /absolute/path/to/py-spy --sudo-py-spy
+```
+
+The user service MainPID is discovered anew at each stall. Alternatively, use
+`--pid PID` for a fixed process-tree root. Optional py-spy captures native/Python
+frames without locals, prioritizing workers before engine/API helpers, up to 12
+processes. Explicit `--sudo-py-spy` enables `sudo -n` only for stack capture when
+ptrace permissions require it. Process arguments, environment, journal payloads,
+and model text are excluded. Output files have mode 0600. No restart or GPU reset
+is performed.
+
+Capturing stacks can briefly pause each target. Snapshots run inline, so sampling
+pauses during bounded diagnostic subprocesses; each stack attempt has an eight
+second limit, subject to the overall one-hour run limit. Start under a service
+manager to survive the invoking terminal. The detector is diagnostic, not proof
+of a deadlock: unusually long prefill can also cross the threshold.
