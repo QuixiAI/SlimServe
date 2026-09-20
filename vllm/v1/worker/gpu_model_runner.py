@@ -120,7 +120,7 @@ from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 from vllm.tracing import instrument
-from vllm.utils import length_from_prompt_token_ids_or_embeds
+from vllm.utils import length_from_prompt_token_ids_or_embeds, worker_progress
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.nvtx_pytorch_hooks import PytHooks
@@ -3698,7 +3698,8 @@ class GPUModelRunner(
         sampling_metadata = self.input_batch.sampling_metadata
         # Update output token ids with tokens sampled in last step
         # if async scheduling and required by current sampling params.
-        self.input_batch.update_async_output_token_ids()
+        with worker_progress.phase_scope(worker_progress.Phase.PRIOR_OUTPUT):
+            self.input_batch.update_async_output_token_ids()
         if spec_decode_metadata is None:
             return self.sampler(
                 logits=logits,
@@ -3708,7 +3709,8 @@ class GPUModelRunner(
         # Update spec_token_ids with real draft tokens from pre step only when
         # output_token_ids is needed (penalties or bad_words are in use).
         if self.use_async_scheduling and self._draft_token_req_ids is not None:
-            draft_token_ids_cpu, _ = self._get_draft_token_ids_cpu()
+            with worker_progress.phase_scope(worker_progress.Phase.PRIOR_DRAFT):
+                draft_token_ids_cpu, _ = self._get_draft_token_ids_cpu()
             self.input_batch.update_async_spec_token_ids(draft_token_ids_cpu)
 
         draft_probs = self._get_spec_decode_draft_probs(spec_decode_metadata)
@@ -4629,7 +4631,10 @@ class GPUModelRunner(
                 scheduler_output, grammar_output, self.input_batch, logits
             )
 
-        with record_function_or_nullcontext("gpu_model_runner: sample"):
+        with (
+            record_function_or_nullcontext("gpu_model_runner: sample"),
+            worker_progress.phase_scope(worker_progress.Phase.SAMPLE),
+        ):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
         self._update_states_after_model_execute(
@@ -4654,7 +4659,10 @@ class GPUModelRunner(
 
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
-            with record_function_or_nullcontext("gpu_model_runner: draft"):
+            with (
+                record_function_or_nullcontext("gpu_model_runner: draft"),
+                worker_progress.phase_scope(worker_progress.Phase.MTP),
+            ):
                 self._draft_token_ids = self.propose_draft_token_ids(
                     scheduler_output,
                     sampled_token_ids,
@@ -4666,7 +4674,8 @@ class GPUModelRunner(
                     spec_decode_common_attn_metadata,
                     slot_mappings,
                 )
-                self._copy_draft_token_ids_to_cpu(scheduler_output)
+                with worker_progress.phase_scope(worker_progress.Phase.DRAFT_COPY):
+                    self._copy_draft_token_ids_to_cpu(scheduler_output)
 
         spec_config = self.speculative_config
         draft_after_bookkeeping = False

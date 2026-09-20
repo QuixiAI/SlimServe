@@ -46,6 +46,7 @@ if TYPE_CHECKING:
     NO_COLOR: bool = False
     VLLM_LOG_STATS_INTERVAL: float = 10.0
     VLLM_TRACE_FUNCTION: int = 0
+    VLLM_WORKER_PROGRESS_DIR: str | None = None
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
     VLLM_PP_LAYER_PARTITION: str | None = None
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
@@ -809,6 +810,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If set to 1, vllm will trace function calls
     # Useful for debugging
     "VLLM_TRACE_FUNCTION": lambda: int(os.getenv("VLLM_TRACE_FUNCTION", "0")),
+    # Optional fixed-size, payload-free worker phase diagnostics.
+    "VLLM_WORKER_PROGRESS_DIR": lambda: os.getenv("VLLM_WORKER_PROGRESS_DIR"),
     # Whether to use the FlashInfer top-k / top-p sampler on CUDA. Enabled
     # by default when the hardware supports it — set to 0 to opt out
     # explicitly, which forces the PyTorch-native (Triton for bs>=8) path.
@@ -2120,6 +2123,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_USE_MODELSCOPE",
         "VLLM_RINGBUFFER_WARNING_INTERVAL",
         "VLLM_DEBUG_DUMP_PATH",
+        "VLLM_WORKER_PROGRESS_DIR",
         "VLLM_PORT",
         "VLLM_CACHE_ROOT",
         # Runtime memory-plan persistence; does not affect compiled graphs.
