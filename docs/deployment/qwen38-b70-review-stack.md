@@ -135,3 +135,22 @@ Post-fix capture snapshot: 34 completed Responses, 63 paired tool calls, zero it
 call-ID, argument, or status mismatches and zero HTTP errors. Four other streams
 lacked terminal events and one failed; the full coding evaluation remains ongoing.
 This is evidence for the protocol fixes, not full correctness/soak qualification.
+
+
+### Engine-stall follow-up, 2026-09-20
+
+Additional independently reviewable commits on the integration branch:
+
+| Commit | Change | Live state |
+| --- | --- | --- |
+| `af784bf19` | Preserve grammar masks and natural speculative reasoning closure at the cap | Deployed |
+| `4c41dad47` | Keep trailing empty assistant replay items attached to their tool turn | Deployed |
+| `c94d343d2` | Proxy stream lifecycle instrumentation | Deployed |
+| `230ec4817` | Token-progress watchdog with per-worker native stacks | Running as a separate read-only service |
+| `a42ba2257` | Correct post-completion proxy disconnect classification | Tested; pending proxy reload |
+
+Coding evaluation attempt 5 still hit a whole-engine sample_tokens timeout after
+the budget fix, so engine stability is not qualified. Attempt 6 repeats the same
+serving configuration with stack capture armed. The watchdog does not alter model
+execution or reset devices. Native stack attachment can briefly pause a target
+only when the measured no-progress threshold is reached.
