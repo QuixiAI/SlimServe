@@ -26242,3 +26242,14 @@ Phases, by value over risk:
 - Results: no new throughput measurement or hardware qualification claimed.
 - Decision: submit as a focused PR; preserve current-main behavior outside this fix.
 - Raw artifacts: local test output; no traffic captures or model data committed.
+
+
+## 2026-09-20 - Use BF16 target KV with XPU FlashAttention for Qwen3.8-27B
+
+- Status: retained for review.
+- Baseline: `feat/qwen38-b70-bf16-profile`; forward-port from the B70 serving integration.
+- Change: Forward-port 74707d01b7 with its required BF16-KV prerequisite 476237a583; the existing profile already selects FLASH_ATTN, so change target storage to bfloat16 and document the native dispatch dependency and increased cache footprint.
+- Correctness: 73 CPU profile/registry checks passed, including resolved and serialized BF16 KV/FLASH_ATTN settings, preserved FP8 draft KV and the qualification gate. Ruff passed; live XPU capacity, accuracy and sustained serving remain unqualified.
+- Results: no new throughput measurement or hardware qualification claimed.
+- Decision: submit as a focused PR; preserve current-main behavior outside this fix.
+- Raw artifacts: local test output; no traffic captures or model data committed.

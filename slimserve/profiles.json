@@ -3593,7 +3593,7 @@
       "title": "Qwen3.8-27B BF16 on 4 Intel Arc Pro B70",
       "source": "qwen38-27b-abliterated",
       "gpus": 4,
-      "summary": "Native BF16 checkpoint with embedded MTP, TP4 decode graphs, and FP8 E4M3 KV cache; live qualification is gated after Xe copy-engine resets.",
+      "summary": "Native BF16 checkpoint with embedded MTP, TP4 decode graphs, BF16 target KV and FP8 draft KV; live qualification remains gated.",
       "speculative": true,
       "variants": {
         "b70": {
@@ -3608,7 +3608,7 @@
             "max_num_seqs": 32,
             "max_num_batched_tokens": 16384,
             "gpu_memory_utilization": 0.9,
-            "kv_cache_dtype": "fp8_e4m3",
+            "kv_cache_dtype": "bfloat16",
             "attention_backend": "FLASH_ATTN",
             "enable_prefix_caching": true,
             "compilation_config": {
@@ -3653,7 +3653,7 @@
             "All 1,199 checkpoint tensors are BF16; no online weight quantization is enabled.",
             "The checkpoint index contains the complete native one-layer Qwen3.5 MTP tensor set. Depth 1 is the initial default pending the matched depth sweep.",
             "FULL_DECODE_ONLY uses the qualified breakable XPU graph backend; VLLM_XPU_ENABLE_XPU_GRAPH=0 avoids the slower legacy graph route.",
-            "FP8 E4M3 KV preserves long-context capacity while keeping the BF16 target and draft weights unchanged.",
+            "Target KV uses bfloat16 with XPU FLASH_ATTN; native MTP draft KV remains fp8. Explicit BF16 cache storage requires the BF16-to-BF16 dispatch in QuixiAI/vllm-xpu-kernels. Target cache storage doubles versus FP8, so requalify context capacity and sustained text/image serving before clearing the gate.",
             "The profile supplies a 2000-token thinking default for all reasoning efforts except none; an explicit request budget, including -1 for unlimited, takes precedence.",
             "This recipe is gated pending fresh qualification on current main; earlier measurements apply only to the saved B70 integration checkout."
           ],

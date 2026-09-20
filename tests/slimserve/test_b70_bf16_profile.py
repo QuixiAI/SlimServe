@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-from slimserve.engine import engine_kwargs
+from slimserve.engine import engine_kwargs, serve_argv
 from slimserve.registry import files_for, profile_blocked, resolve
 
 
@@ -11,6 +11,11 @@ def test_b70_bf16_recipe_preserves_vision_and_qualification_gate(tmp_path, monke
     assert plan.entry_file == plan.model_dir
     assert plan.source["modalities"] == ["text", "image"]
     assert "quantization" not in plan.engine
+    assert plan.engine["kv_cache_dtype"] == "bfloat16"
+    assert plan.engine["attention_backend"] == "FLASH_ATTN"
+    argv = serve_argv(plan, "127.0.0.1", 8000)
+    assert argv[argv.index("--kv-cache-dtype") + 1] == "bfloat16"
+    assert argv[argv.index("--attention-backend") + 1] == "FLASH_ATTN"
     plan.model_dir.mkdir(parents=True)
     draft = engine_kwargs(plan)["speculative_config"]
     assert draft["model"] == str(plan.entry_file)
