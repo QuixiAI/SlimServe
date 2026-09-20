@@ -183,6 +183,10 @@ class WorkerBase:
         """Clean up resources held by the worker."""
         return
 
+    def prepare_shutdown(self) -> None:
+        """Quiesce device work before the executor starts process teardown."""
+        return
+
 
 class WorkerWrapperBase:
     """

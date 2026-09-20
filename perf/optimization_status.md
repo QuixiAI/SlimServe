@@ -26385,3 +26385,12 @@ cmake -S . -B build/xpu -G Ninja \
 /home/alex/SlimServe/.venv/bin/cmake --install build/xpu --component spinloop
 /home/alex/SlimServe/.venv/bin/cmake --install build/xpu --component fs_io_C
 ```
+
+### Current-main XPU coordinated shutdown
+
+Forward-port PR63 (292c84e76c) after the selective XPU foundation. Workers
+acknowledge current-stream draining before the executor closes their liveness
+pipes; expected-exit state is separate from cleanup, which retains its remaining
+timeout budget. Seven lifecycle/ordering CPU tests pass (13 with foundation
+contracts). Device-hang shutdown safety still needs live qualification; no
+throughput claim or live change is made here.
