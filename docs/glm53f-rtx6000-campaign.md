@@ -1469,6 +1469,12 @@ all-gather and the vocab-wide cut) it spent on the shard top-k, two small
 gathers and their eager launches. Opt-in (QC_DRAFT_CANDIDATES=1). F5b, the
 draft-only NVFP4 lm_head, is in its arm (`SLIMSERVE_NVFP4_DRAFT_LMHEAD`).
 
+F5b VERDICT (2026-09-20 00:10 PDT, notebook "Phase 9 / F5b"): the drafter's
+NVFP4 head halves the head bytes per draft step (the fp8 head GEMM leaves
+the draft steps in the profile), acceptance unchanged (0.977 per draft),
+canaries pass, c1 spec median 330 against 302. IN THE RECORD
+(`SLIMSERVE_NVFP4_DRAFT_LMHEAD=nvfp4-swapset-draft-lmhead`, profile note).
+
 Together they remove ~450 of the ~1100 launches per c1 step and are
 sized at +8-12 % c1, +4-5 % c8/c16 (F1 corrected from the graph-replay
 numbers) - the remaining "leaps and bounds"
@@ -1479,3 +1485,45 @@ graph and replays correctly on this driver through both
 `cudaLaunchCooperativeKernel` and `cudaLaunchKernelEx` with the
 cooperative attribute (188 x 256 threads, neighbour reads across the sync,
 replay counter exact), so F1 has no launch-model blocker.
+
+## 16. Phase 9 (2026-09-19/20): the section-15 items, measured, and the final numbers
+
+Built in the order the plan gave, each with its parity or exactness test,
+cold microbench, serving arms against same-session references, gates and
+canaries (notebook "Phase 9 / F1 .. F5b"):
+
+| item | built as | correctness | serving | disposition |
+|---|---|---|---|---|
+| F1 KDA decode block | one cluster launch per KDA layer (clusters of 8 / 4 by batch, DSMEM hand-offs; `kda_decode_block.cuh`) | 145 parity cases vs the Triton chain | LEVEL (228.5 vs 228.8 c1; the removed launches were already hidden by dependent launch) | on, QC_KDA_BLOCK=0 restores; removable |
+| F2 shared expert as expert 288 | NVFP4 sidecar + fused shared slot through route_align, the pair and Marlin | canaries, gates +0.01 nats BETTER | LEVEL (plain c1 level once gemv2 split five and four, c8 +1 %, c16 -1 %; spec inside the draws) | opt-in `SLIMSERVE_NVFP4_SHARED_SWAPSET` |
+| F3, F4 launch-count fusions | not built | - | the F1 lesson: launches under PDL in the graph cost nothing to remove | withdrawn |
+| F5a candidate draft sampler | per-shard top-32 gathered, the native cut and Gumbel draw reproduced (`candidate_draft.cuh`) | bit-exact vs the full path (13 cases) | LEVEL within what the harness resolves | opt-in QC_DRAFT_CANDIDATES=1 |
+| F5b draft-only NVFP4 lm_head | sidecar, the drafter's own head module | acceptance unchanged, canaries | c1 spec median 330 vs 302; the fp8 head GEMM leaves the draft steps | IN THE RECORD |
+
+Final numbers (tree 6ea3ede34, the record's environment, exact-token
+1000/300, 2026-09-20 00:12-00:30 PDT):
+
+| | c1 | c8 | c16 | cold TTFT 32K | cold TTFT 128K |
+|---|---|---|---|---|---|
+| control (voipmonitor jovian r28.1 B12X), plain / MTP-3 | 166.5 / 260.8 | 687.9 / 732.1 | 966.8 / 1005.8 | 2.93 s | 14.9 s |
+| record, plain (two passes) | 228.5 / 228.7 | 776.1 / 775.7 | 1127.6 / 1122.7 | 2.84 s | 11.77 s |
+| record, `--spec` (eight-pass median, range) | 304.4 (275-343) | 818.7 (739-847) | 1140.9 (1070-1184) | | |
+| record vs control | +37 % / +17 % | +13 % / +12 % | +17 % / +13 % | -3 % | -21 % |
+
+Warm (prefix-cached) TTFT 0.084 s at 32K, 0.267 s at 128K. Four gates in
+band (all-position -3.262..-3.275), canaries text/tool/image pass, 0.981
+accepted per draft.
+
+Lessons that revise the plan's premises: (1) the launch floor of 14.3 is the
+cost of dependent launches WITHOUT programmatic dependent launch; inside
+the serving graph the chains run under PDL and a fused kernel that only
+removes launches is level - a cold back-to-back microbench pays every
+launch and misleads (P1 said this from the trace side, F1 from the other).
+(2) The eight-pass c1 spec median cannot resolve +-7 % (275-334 on
+identical code in one session; per-boot acceptance 0.968-0.993); drafter
+changes are judged by the acceptance counters and the profile's launch
+count. (3) The remaining gap to the physics floor (bytes 1.75 ms + PCIe
+0.54 ms against the 4.4 ms c1 step) is not launches; it is the per-kernel
+prologue/tail and the all-reduce chain, which only a different execution
+model (persistent megakernel per layer, or fewer, wider all-reduces) can
+touch - out of this phase's scope and recorded here for the next.

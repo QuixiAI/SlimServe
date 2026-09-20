@@ -31123,3 +31123,31 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   cannot move the output distribution, acceptance unchanged, -79 MB of
   weight per draft step, the c1 spec median +9 % in the direction of the
   -50 us x 3 sizing (the median's own spread is wider than the effect).
+
+- PHASE 9 / THE FINAL NUMBERS OF THE PHASE (2026-09-20 00:12-00:30 PDT, tree
+  6ea3ede34, the record's own environment, `$S/p9/chain_final.sh`; raw
+  perf/results/2026-09-20/final-{nospec,spec}-pass*/, final-nospec-gate{1..4}.json,
+  `$S/serve-logs/ttft-final-ttft.txt`):
+  | shape | plain | spec (8-pass median, range) | control (jovian r28.1 B12X) plain / MTP-3 | vs control |
+  |---|---|---|---|---|
+  | c1 | 228.5 / 228.7 | 304.4 (275.4-343.0) | 166.5 / 260.8 | +37 % / +17 % |
+  | c8 | 776.1 / 775.7 | 818.7 (739.4-846.5) | 687.9 / 732.1 | +13 % / +12 % |
+  | c16 | 1127.6 / 1122.7 | 1140.9 (1070.1-1184.4) | 966.8 / 1005.8 | +17 % / +13 % |
+  Cold TTFT 32K 2.84 s, 128K 11.77 s (control 2.93 / 14.9: -3 % / -21 %);
+  warm (prefix-cached) 0.084 / 0.267 s. Gates (4) -2.432 / -2.457 / -2.449
+  / -2.463 (all-position -3.264..-3.271), canaries text/tool/image PASS,
+  0.981 accepted per draft. Against the 2026-09-18 17:08 record (227.5 /
+  774-778 / 1118-1119; spec ~280 / 801-831 / 1113-1133): plain level (the
+  day's fusions were level, as recorded), spec c1 +9 % by median (the F5b
+  draft head; the median's spread is wider than that), c8/c16 spec inside
+  their draws.
+  Phase 9 in one paragraph: of section 15's five items, F1 (the KDA decode
+  block) and F2 (the shared expert as expert 288) were built, parity-tested
+  and measured LEVEL - the launches they remove are already hidden by
+  dependent launch inside the graph, and the shared branch was already off
+  the critical path; F3 and F4 were not built for the same reason (the
+  launch floor of section 14.3 is the cost of NON-PDL dependent launches);
+  F5a (the candidate draft sampler) was built bit-exact and is level; F5b
+  (the draft-only NVFP4 lm_head) is the one item in the record. The
+  physics floor stands where section 14.3 left it: the c1 step is bytes
+  (1.75 ms) + PCIe all-reduce (0.54 ms) + what dependent launch cannot hide.

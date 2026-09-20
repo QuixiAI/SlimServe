@@ -4,7 +4,29 @@
 > Metal. Earlier TurboQuant directives and measurements below are historical.
 > See `perf/optimization_status.md` for current validation evidence.
 
-# HANDOFF — GLM-5.3-Flash NVFP4 on 4x RTX PRO 6000 Blackwell (`glm53f-nvfp4-4` / `rtx6000`), branch `glm53f-rtx6000` (PR #29 open and review-clean; Phase 8, the floor campaign, open since 2026-09-17)
+# HANDOFF — GLM-5.3-Flash NVFP4 on 4x RTX PRO 6000 Blackwell (`glm53f-nvfp4-4` / `rtx6000`), branch `glm53f-rtx6000` (PR #29 open; Phase 9, the section-15 fusion items, closed 2026-09-20)
+
+STATE 2026-09-20 00:30 PDT (tree 6ea3ede34, the record's own environment,
+notebook "Phase 9 / the final numbers"): plain c1 228.5 / c8 776 / c16
+1128 tok/s (control 166.5 / 687.9 / 966.8: +37 / +13 / +17 %); `--spec`
+eight-pass medians 304 / 819 / 1141 (control MTP-3 260.8 / 732.1 / 1005.8:
++17 / +12 / +13 %); cold TTFT 32K 2.84 s, 128K 11.77 s (control 2.93 /
+14.9), warm 0.084 / 0.267 s; four gates in band, canaries pass, 0.981
+accepted per draft. Phase 9 (campaign doc section 16) built the section-15
+items: F1 the KDA decode block (level, on, removable), F2 the shared expert
+as expert 288 (level, +0.01 nats, opt-in), F5a the candidate draft sampler
+(bit-exact, level, opt-in), F5b the drafter's NVFP4 lm_head (in the
+record); F3/F4 withdrawn - launches under dependent launch inside the
+graph cost nothing to remove. Pre-existing failing tests in
+tests/slimserve/test_profiles.py (identical on the reviewed head):
+test_every_profile_source_names_a_blessed_dspark_download,
+test_metal_smoke_accepts_registered_variant_drafters,
+test_registry_contains_only_the_supported_model_artifacts,
+test_quantized_main_kv_is_an_explicit_validated_choice. Sidecars the record
+needs next to the checkpoint: `nvfp4-swapset-inproj`, `fp8-swapset-mla`,
+`nvfp4-swapset-draft-lmhead` (`python -m slimserve.nvfp4_swapset --model
+<dir> --draft-lm-head`); optional: `nvfp4-swapset-shared`,
+`nvfp4-swapset-mtp`.
 
 The regimen, rubric, the log of every phase and the next command are in
 `docs/glm53f-rtx6000-campaign.md` (sections 12b and 12c are the log, 13 the
