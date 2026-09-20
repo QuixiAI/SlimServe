@@ -26292,6 +26292,12 @@ Phases, by value over risk:
 - Baseline: `origin/main`; forward-port from the B70 serving integration.
 - Change: Use the existing Chat Completions budget resolver for Responses, including profile effort defaults, explicit disabling and completion-token ceilings.
 - Correctness: 13 Responses budget precedence, effort-map, token-ceiling and invalid-input tests passed on CPU.
+## 2026-09-19 - Add a Qwen tool-policy chat template with native thinking tokens
+
+- Status: retained for review.
+- Baseline: `origin/main`; forward-port from the B70 serving integration.
+- Change: Render required/named/none/auto tool policy and reasoning hints while preserving native Qwen thinking, tool history and vision placeholders.
+- Correctness: Seven Qwen policy/history/vision-placeholder tests and the existing GLM asset test passed on CPU; existing package-data glob includes the asset.
 - Results: no new throughput measurement or hardware qualification claimed.
 - Decision: submit as a focused PR; preserve current-main behavior outside this fix.
 - Raw artifacts: local test output; no traffic captures or model data committed.
