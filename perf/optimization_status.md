@@ -26256,3 +26256,14 @@ Phases, by value over risk:
 - Results: no new throughput measurement or hardware qualification claimed.
 - Decision: submit as a focused PR; preserve current-main behavior outside this fix.
 - Raw artifacts: local test output; no traffic captures or model data committed.
+
+
+## 2026-09-19 - Emit typed Responses failure events for generation errors
+
+- Status: retained for review.
+- Baseline: `fix/responses-incomplete-tools`; forward-port from the B70 serving integration.
+- Change: Preserve the original generation or finalization error in a typed response.failed event and stored response, with monotonic event sequence numbers.
+- Correctness: Eight generation-error SSE/storage cases and 23 inherited completion tests passed on CPU.
+- Results: no new throughput measurement or hardware qualification claimed.
+- Decision: submit as a focused PR; preserve current-main behavior outside this fix.
+- Raw artifacts: local test output; no traffic captures or model data committed.
