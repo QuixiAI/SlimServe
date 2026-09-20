@@ -26311,3 +26311,13 @@ Phases, by value over risk:
 - Results: no new throughput measurement or hardware qualification claimed.
 - Decision: submit as a focused PR; preserve current-main behavior outside this fix.
 - Raw artifacts: local test output; no traffic captures or model data committed.
+
+## 2026-09-19 - Authenticate registered Hugging Face downloads without losing resume headers
+
+- Status: retained for review.
+- Baseline: `origin/main`; forward-port from the B70 serving integration.
+- Change: Add host-scoped Hugging Face authentication for registered artifacts while preserving explicit override headers and byte-range resumption.
+- Correctness: Four fetch-auth tests and 13 model-override tests passed on CPU.
+- Results: no new throughput measurement or hardware qualification claimed.
+- Decision: submit as a focused PR; preserve current-main behavior outside this fix.
+- Raw artifacts: local test output; no traffic captures or model data committed.

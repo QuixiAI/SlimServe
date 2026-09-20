@@ -14,6 +14,7 @@ import hashlib
 import shutil
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from slimserve import term
 from slimserve.registry import ModelOverride, Plan, ProfileError, cache_root, files_for
@@ -155,6 +156,28 @@ def free_bytes(path: Path) -> int:
     return shutil.disk_usage(probe).free
 
 
+def _request_headers(
+    url: str, have: int, explicit: dict[str, str] | None = None
+) -> dict[str, str]:
+    headers = dict(explicit or {})
+    if have:
+        headers["Range"] = f"bytes={have}-"
+    parsed = urlsplit(url)
+    if (
+        parsed.scheme == "https"
+        and parsed.hostname == "huggingface.co"
+        and "authorization" not in {key.lower() for key in headers}
+    ):
+        # get_token observes HF_TOKEN and the token saved by `hf auth login`.
+        # requests strips Authorization if Hugging Face redirects the download
+        # to a CDN host, so the credential remains scoped to huggingface.co.
+        from huggingface_hub import get_token
+
+        if token := get_token():
+            headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
 def _download(entry: dict[str, Any], dest: Path) -> None:
     """Fetch one file, resuming a partial `.part` if there is one."""
     import requests
@@ -175,9 +198,7 @@ def _download(entry: dict[str, Any], dest: Path) -> None:
         _finalize(part, dest, entry, done)
         return
 
-    headers = dict(entry.get("headers") or {})
-    if have:
-        headers["Range"] = f"bytes={have}-"
+    headers = _request_headers(entry["url"], have, entry.get("headers"))
     with requests.get(
         entry["url"], headers=headers, stream=True, timeout=60
     ) as response:
