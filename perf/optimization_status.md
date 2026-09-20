@@ -26401,3 +26401,20 @@ Forward-port PR64 (54b64dab6c) independently of the native foundation: HSA
 startup probes run only for ROCm workers. The XPU path no longer allocates
 64MiB pinned staging and calls a CUDA synchronization alias during model load.
 The CPU platform-gating regression passes; no throughput measurement here.
+
+### Quantization discovery must not import unrelated device models
+
+Full Qwen FP8 engine-config resolution exposed an existing main import boundary:
+quantization override lookup imports deepseek_v4 for DeepseekV4FP8Config, whose
+package immediately imports the hardware model. The old XPU DSV4 tree references
+a missing xpu_sparse_decode_fp8 module, blocking unrelated Qwen configuration.
+Model-class exports now load on first attribute lookup; all existing per-platform
+model selection is preserved. No DSV4 model support claim is added. A subprocess
+regression rejects any device-model import during quant-config resolution.
+
+Configuration-only validation now passes for the actual local Qwen FP8 target:
+TP4,262144 context,32 sequences,16384 batch tokens,FP8 E4M3 KV,linear_backend=xpu,
+FULL_DECODE_ONLY,async scheduling and native MTP3. XPU RMSNorm IR priority resolves
+to xpu_kernels before native. Validation used the new integration Python
+environment with candidate PYTHONPATH, offline model metadata and no weight load
+or engine start. Raw command/log: /tmp/b70-xpu-port-config-audit.{py,log}.

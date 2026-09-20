@@ -19,27 +19,46 @@ def _is_cuda_ampere() -> bool:
     return capability is not None and capability.major == 8
 
 
-# Pick the per-platform implementation. The NVIDIA branch is the static
-# default that mypy sees; the ROCm/XPU/Ampere branches override at runtime and
-# are kept type-compatible via ``# type: ignore[assignment]``. A100 takes the
-# AMD-family implementation because the Hopper/Blackwell NVIDIA DSv4 attention
-# classes require sparse-MLA kernels that do not support sm80.
-if current_platform.is_rocm() or current_platform.is_metal() or _is_cuda_ampere():
-    from .amd.dspark import (  # type: ignore[assignment]
-        DSparkDeepseekV4ForCausalLM,
+def __getattr__(name: str):
+    """Load model code only when the registry requests a model class.
+
+    Quantization override discovery imports this package for its FP8 config
+    while resolving other model families. It must not import a hardware model
+    implementation or its optional native dependencies as a side effect.
+    """
+    if name not in {
+        "DSparkDeepseekV4ForCausalLM",
+        "DeepseekV4ForCausalLM",
+        "DeepSeekV4MTP",
+    }:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+    # Preserve platform selection. A100 uses the AMD-family implementation
+    # because NVIDIA DSv4 sparse-MLA kernels do not support sm80.
+    if current_platform.is_rocm() or current_platform.is_metal() or _is_cuda_ampere():
+        from .amd.dspark import (  # type: ignore[assignment]
+            DSparkDeepseekV4ForCausalLM,
+        )
+        from .amd.model import DeepseekV4ForCausalLM
+        from .amd.mtp import DeepSeekV4MTP
+    elif current_platform.is_xpu():
+        from .xpu.dspark import DSparkDeepseekV4ForCausalLM  # type: ignore[assignment]
+        from .xpu.model import DeepseekV4ForCausalLM  # type: ignore[assignment]
+        from .xpu.mtp import DeepSeekV4MTP  # type: ignore[assignment]
+    else:
+        from .nvidia.dspark import (  # type: ignore[assignment]
+            DSparkDeepseekV4ForCausalLM,
+        )
+        from .nvidia.model import DeepseekV4ForCausalLM  # type: ignore[assignment]
+        from .nvidia.mtp import DeepSeekV4MTP  # type: ignore[assignment]
+
+    globals().update(
+        DSparkDeepseekV4ForCausalLM=DSparkDeepseekV4ForCausalLM,
+        DeepseekV4ForCausalLM=DeepseekV4ForCausalLM,
+        DeepSeekV4MTP=DeepSeekV4MTP,
     )
-    from .amd.model import DeepseekV4ForCausalLM
-    from .amd.mtp import DeepSeekV4MTP
-elif current_platform.is_xpu():
-    from .xpu.dspark import DSparkDeepseekV4ForCausalLM  # type: ignore[assignment]
-    from .xpu.model import DeepseekV4ForCausalLM  # type: ignore[assignment]
-    from .xpu.mtp import DeepSeekV4MTP  # type: ignore[assignment]
-else:
-    from .nvidia.dspark import (  # type: ignore[assignment]
-        DSparkDeepseekV4ForCausalLM,
-    )
-    from .nvidia.model import DeepseekV4ForCausalLM  # type: ignore[assignment]
-    from .nvidia.mtp import DeepSeekV4MTP  # type: ignore[assignment]
+    return globals()[name]
+
 
 __all__ = [
     "DSparkDeepseekV4ForCausalLM",
