@@ -26394,3 +26394,10 @@ pipes; expected-exit state is separate from cleanup, which retains its remaining
 timeout budget. Seven lifecycle/ordering CPU tests pass (13 with foundation
 contracts). Device-hang shutdown safety still needs live qualification; no
 throughput claim or live change is made here.
+
+### Restrict host-staging probes to ROCm
+
+Forward-port PR64 (54b64dab6c) independently of the native foundation: HSA
+startup probes run only for ROCm workers. The XPU path no longer allocates
+64MiB pinned staging and calls a CUDA synchronization alias during model load.
+The CPU platform-gating regression passes; no throughput measurement here.

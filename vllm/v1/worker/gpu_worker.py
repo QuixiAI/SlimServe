@@ -86,6 +86,12 @@ from .utils import request_memory
 
 logger = init_logger(__name__)
 
+
+def _should_warm_hsa_host_staging() -> bool:
+    """Return whether the ROCm-specific host staging probe should run."""
+    return current_platform.is_rocm()
+
+
 if TYPE_CHECKING:
     from vllm.device_allocator.sleep_mode_backend import SleepModeBackend
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
@@ -438,19 +444,22 @@ class Worker(WorkerBase):
     # to hijack tensor allocation.
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
         bootstamp(f"worker[{self.rank}]: load_model start")
-        # The first pageable host-to-device copy after the KV cache is
-        # allocated stalls ~15 s inside the HSA runtime while it establishes
-        # host staging memory. Do that work now, before ~168 GiB of VRAM and
-        # the checkpoint's page cache are in the way.
-        _t = time.perf_counter()
-        _staging = torch.empty(64 << 20, dtype=torch.uint8, pin_memory=True)
-        torch.tensor([0], dtype=torch.int32).to(self.device)
-        torch.cuda.synchronize()
-        del _staging
-        bootstamp(
-            f"worker[{self.rank}]: host staging warmed in "
-            f"{time.perf_counter() - _t:.2f}s"
-        )
+        if _should_warm_hsa_host_staging():
+            # The first pageable host-to-device copy after the KV cache is
+            # allocated stalls ~15 s inside the HSA runtime while it establishes
+            # host staging memory. Do that work now, before ~168 GiB of VRAM and
+            # the checkpoint's page cache are in the way. This probe is ROCm/HSA
+            # specific: allocating pinned memory and synchronizing a CUDA alias
+            # here is unsafe on XPU during a multi-rank model load.
+            _t = time.perf_counter()
+            _staging = torch.empty(64 << 20, dtype=torch.uint8, pin_memory=True)
+            torch.tensor([0], dtype=torch.int32).to(self.device)
+            torch.cuda.synchronize()
+            del _staging
+            bootstamp(
+                f"worker[{self.rank}]: host staging warmed in "
+                f"{time.perf_counter() - _t:.2f}s"
+            )
 
         # Loading allocates millions of tracked objects, so the automatic
         # collector keeps rescanning the whole model graph: measured 147 ms per
@@ -706,13 +715,14 @@ class Worker(WorkerBase):
         with self._maybe_get_memory_pool_context(tag="kv_cache"):
             self.model_runner.initialize_kv_cache(kv_cache_config)
         bootstamp(f"worker[{self.rank}]: KV cache allocated")
-        _t = time.perf_counter()
-        torch.tensor([0], dtype=torch.int32).to(self.device)
-        self.model_runner._sync_device()
-        bootstamp(
-            f"worker[{self.rank}]: first pageable H2D after KV alloc took "
-            f"{time.perf_counter() - _t:.2f}s"
-        )
+        if _should_warm_hsa_host_staging():
+            _t = time.perf_counter()
+            torch.tensor([0], dtype=torch.int32).to(self.device)
+            self.model_runner._sync_device()
+            bootstamp(
+                f"worker[{self.rank}]: first pageable H2D after KV alloc took "
+                f"{time.perf_counter() - _t:.2f}s"
+            )
 
         if self.model_config.enable_return_routed_experts:
             self.model_runner.init_routed_experts_capturer()
