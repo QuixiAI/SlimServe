@@ -26218,6 +26218,12 @@ Phases, by value over risk:
 - Baseline: `origin/main`; forward-port from the B70 serving integration.
 - Change: Avoid emitting JSON prefixes invalidated by repeated XML parameter names; retain incremental tool headers and custom-tool conversion.
 - Correctness: 39 argument-prefix tests passed; 17 existing custom-tool tests passed and four GLM tests failed identically on untouched main with local XGrammar 0.2.7.
+## 2026-09-19 - Stop speculative grammar validation at the stop token
+
+- Status: retained for review.
+- Baseline: `origin/main`; forward-port from the B70 serving integration.
+- Change: Do not probe unreachable speculative suffixes after the grammar matcher terminates.
+- Correctness: Two XGrammar stop-token regression tests passed on CPU.
 - Results: no new throughput measurement or hardware qualification claimed.
 - Decision: submit as a focused PR; preserve current-main behavior outside this fix.
 - Raw artifacts: local test output; no traffic captures or model data committed.
