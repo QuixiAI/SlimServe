@@ -2,9 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Responses output must remain usable as next-turn assistant history."""
 
+from pathlib import Path
+
 import pytest
 from openai.types.responses import ResponseOutputMessage
+from transformers.utils.chat_template_utils import render_jinja_template
 
+from vllm.entrypoints.chat_utils import _postprocess_messages
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.entrypoints.openai.responses.utils import construct_input_messages
 
@@ -146,3 +150,167 @@ def test_assistant_content_merges_with_reasoning_and_tool_calls(
         },
         {"role": "user", "content": "Summarize."},
     ]
+
+
+TEMPLATE = (
+    Path(__file__).parents[2] / "slimserve/chat_templates/qwen38_tool_calling.jinja"
+)
+
+
+def render_history(messages):
+    # This is the same argument decoding stage used by the chat renderer.
+    _postprocess_messages(messages)
+    rendered, _ = render_jinja_template(
+        conversations=[messages],
+        tools=[
+            {
+                "type": "function",
+                "function": {"name": "inventory", "parameters": {"type": "object"}},
+            }
+        ],
+        chat_template=TEMPLATE.read_text(),
+        add_generation_prompt=True,
+        enable_thinking=True,
+    )
+    return rendered[0]
+
+
+def history_call(index):
+    return {
+        "type": "function_call",
+        "id": f"fc_{index}",
+        "call_id": f"call_{index}",
+        "name": "inventory",
+        "arguments": '{"section":"books"}',
+        "status": "completed",
+    }
+
+
+def history_with_trailing_item(item):
+    return [
+        {"role": "user", "content": "Check inventory."},
+        history_call(1),
+        output_message(
+            [
+                {
+                    "type": "output_text",
+                    "text": "Checking inventory. ",
+                    "annotations": [],
+                },
+                {"type": "refusal", "refusal": "I cannot edit stock."},
+            ]
+        ),
+        history_call(2),
+        item,
+        {"type": "function_call_output", "call_id": "call_1", "output": "Three books."},
+        {"type": "function_call_output", "call_id": "call_2", "output": "Four books."},
+        {"role": "user", "content": "Summarize."},
+    ]
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        [],
+        [{"type": "output_text", "text": "", "annotations": []}],
+        [{"type": "refusal", "refusal": ""}],
+    ],
+)
+@pytest.mark.parametrize("status", ["in_progress", "completed", "incomplete"])
+def test_empty_trailing_output_keeps_tool_results_attached_through_template(
+    content, status
+):
+    trailing = {**output_message(content), "id": "msg_empty", "status": status}
+    request = ResponsesRequest.model_validate(
+        {
+            "model": "test-model",
+            "input": history_with_trailing_item(trailing),
+        }
+    )
+    assert isinstance(request.input[4], ResponseOutputMessage)
+    messages = construct_input_messages(request_input=request.input)
+    assert [m["role"] for m in messages] == [
+        "user",
+        "assistant",
+        "tool",
+        "tool",
+        "user",
+    ]
+    assert messages[1]["content"] == "Checking inventory. I cannot edit stock."
+    assert [call["id"] for call in messages[1]["tool_calls"]] == ["call_1", "call_2"]
+    prompt = render_history(messages)
+    assert prompt.count("<function=inventory>") == 2
+    assert "Three books." in prompt and "Four books." in prompt
+    assert "Checking inventory. I cannot edit stock." in prompt
+
+
+@pytest.mark.parametrize("content", ["", [], [{"type": "output_text", "text": ""}]])
+def test_raw_dict_empty_trailing_message_does_not_detach_tools(content):
+    # The converter also accepts dictionary history; keep this fallback aligned
+    # with the typed Responses API path without changing nonempty boundaries.
+    request = ResponsesRequest.model_validate(
+        {
+            "model": "test-model",
+            "input": history_with_trailing_item(output_message([])),
+        }
+    )
+    request.input[4] = {"role": "assistant", "content": content}
+    messages = construct_input_messages(request_input=request.input)
+    assert [m["role"] for m in messages] == [
+        "user",
+        "assistant",
+        "tool",
+        "tool",
+        "user",
+    ]
+    assert render_history(messages).count("<function=inventory>") == 2
+
+
+@pytest.mark.parametrize(
+    "content, expected",
+    [
+        (
+            [{"type": "output_text", "text": "Another turn.", "annotations": []}],
+            "Another turn.",
+        ),
+        ([{"type": "refusal", "refusal": "Cannot edit."}], "Cannot edit."),
+        ([{"type": "output_text", "text": " ", "annotations": []}], " "),
+    ],
+)
+def test_nonempty_followup_retains_separate_assistant_boundary(content, expected):
+    request = ResponsesRequest.model_validate(
+        {
+            "model": "test-model",
+            "input": [
+                output_message(
+                    [{"type": "output_text", "text": "First.", "annotations": []}]
+                ),
+                {**output_message(content), "id": "msg_next"},
+            ],
+        }
+    )
+    assert construct_input_messages(request_input=request.input) == [
+        {"role": "assistant", "content": "First."},
+        {"role": "assistant", "content": expected},
+    ]
+
+
+def test_empty_message_does_not_fabricate_a_call_for_orphan_tool_result():
+    request = ResponsesRequest.model_validate(
+        {
+            "model": "test-model",
+            "input": [
+                {"role": "user", "content": "Check inventory."},
+                output_message([]),
+                {
+                    "type": "function_call_output",
+                    "call_id": "missing_call",
+                    "output": "Three books.",
+                },
+            ],
+        }
+    )
+    messages = construct_input_messages(request_input=request.input)
+    assert messages[1] == {"role": "assistant", "content": ""}
+    with pytest.raises(Exception, match="must immediately follow"):
+        render_history(messages)
