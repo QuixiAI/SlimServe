@@ -225,6 +225,19 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         )
         return logits
 
+    def compute_local_logits(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> tuple[torch.Tensor, int]:
+        """This rank's vocab shard of the draft logits and its first global id
+        (the candidate draft sampler's input; no tensor-parallel gather)."""
+        current_step_idx = spec_step_idx % self.num_mtp_layers
+        mtp_layer = self.layers[str(self.mtp_start_layer_idx + current_step_idx)]
+        return self.logits_processor.get_local_logits(
+            mtp_layer.shared_head.head, mtp_layer.shared_head(hidden_states)
+        )
+
 
 @support_torch_compile
 class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
@@ -282,6 +295,13 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
         spec_step_idx: int = 0,
     ) -> torch.Tensor | None:
         return self.model.compute_logits(hidden_states, spec_step_idx)
+
+    def compute_local_logits(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> tuple[torch.Tensor, int]:
+        return self.model.compute_local_logits(hidden_states, spec_step_idx)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         rocm_aiter_moe_shared_expert_enabled = (

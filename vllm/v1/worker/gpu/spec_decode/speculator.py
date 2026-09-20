@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from typing import Any
@@ -13,6 +14,7 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.quixicore.ops import quixicore_ops
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.worker.gpu.attn_utils import (
@@ -23,7 +25,11 @@ from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.sample import topk_sample
-from vllm.v1.worker.gpu.sample.gumbel import apply_temperature, gumbel_sample
+from vllm.v1.worker.gpu.sample.gumbel import (
+    DRAFT_NOISE_SALT,
+    apply_temperature,
+    gumbel_sample,
+)
 from vllm.v1.worker.gpu.sample.states import SamplingStates
 from vllm.v1.worker.utils import AttentionGroup
 
@@ -173,6 +179,20 @@ class DraftModelSpeculator(BaseSpeculator):
         # temperature-only.
         self.draft_top_k_top_p = self.speculative_config.draft_top_k_top_p
         self._draft_mask: tuple[bool, bool, bool] | None = None
+        # F5a: the candidate draft sampler. When every request's top-k fits
+        # the native cutoff, the draft token is drawn from the top-K of each
+        # rank's vocab shard gathered across TP ([T, tp x K] instead of the
+        # [T, vocab] logits all-gather) with the same cut, processed row and
+        # (seed, pos, token)-keyed noise as the full path. Opt-in
+        # (QC_DRAFT_CANDIDATES=1): measured level on the rtx6000 record
+        # (2026-09-19, notebook "Phase 9 / F5a") - the shard top-k and the two
+        # small gathers cost what the one logits gather and the vocab-wide
+        # cut saved.
+        self.use_candidate_draft = (
+            os.environ.get("QC_DRAFT_CANDIDATES", "0") == "1"
+            and quixicore_ops.has_v2_candidate_draft()
+        )
+        self._candidate_draft_announced = False
         self.draft_tokens = torch.zeros(
             self.max_num_reqs,
             self.num_speculative_steps,
@@ -366,6 +386,17 @@ class DraftModelSpeculator(BaseSpeculator):
         draft_logits: torch.Tensor | None,
     ) -> torch.Tensor:
         if draft_logits is not None:
+            if (
+                self._draft_mask is not None
+                and self._draft_mask[0]
+                and self._draft_mask[1]
+                and self.use_candidate_draft
+                and self.sampling_states is not None
+                and hasattr(self.model, "compute_local_logits")
+            ):
+                return self._candidate_sample_draft(
+                    hidden_states, positions, idx_mapping, temperature, seeds, draft_step, draft_logits
+                )
             logits = self.model.compute_logits(hidden_states)  # type: ignore[operator]
             apply_temp = True
             if self._draft_mask is not None:
@@ -389,6 +420,52 @@ class DraftModelSpeculator(BaseSpeculator):
                 is_drafting=True,
             )
         return self._greedy_sample_draft(hidden_states)
+
+    def _candidate_sample_draft(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        idx_mapping: torch.Tensor,
+        temperature: torch.Tensor,
+        seeds: torch.Tensor,
+        draft_step: torch.Tensor,
+        draft_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        """The full path's draw from the ranks' top-K candidates: every token
+        a request's top-k (<= K) can keep is among them, so the cut, the
+        processed row and the noise per token id are the same."""
+        from vllm.distributed import tensor_model_parallel_all_gather
+
+        assert self._draft_mask is not None and self.sampling_states is not None
+        states = self.sampling_states
+        local, vocab_start = self.model.compute_local_logits(hidden_states)  # type: ignore[operator]
+        k = min(topk_sample.MAX_TOP_K, local.shape[-1])
+        vals, ids = local.float().topk(k, dim=-1)
+        ids = (ids + vocab_start).to(torch.int32)
+        if local.shape[-1] < self.vocab_size:
+            vals = tensor_model_parallel_all_gather(vals, dim=-1)
+            ids = tensor_model_parallel_all_gather(ids, dim=-1)
+        if not self._candidate_draft_announced:
+            self._candidate_draft_announced = True
+            logger.info(
+                "Drafting from %d gathered top-%d candidates per token instead of the "
+                "[T, %d] logits all-gather (QC_DRAFT_CANDIDATES=1)",
+                vals.shape[-1], k, self.vocab_size,
+            )
+        return quixicore_ops.v2_candidate_draft(
+            vals.contiguous(),
+            ids.contiguous(),
+            states.top_k.gpu,
+            states.top_p.gpu if self._draft_mask[2] else None,
+            idx_mapping,
+            seeds,
+            positions + (1 + DRAFT_NOISE_SALT),
+            temperature,
+            self.vocab_size,
+            draft_logits,
+            draft_step,
+            self.use_fp64_gumbel,
+        )
 
     def _mask_draft_logits(
         self,

@@ -31036,3 +31036,71 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   code. The section-15 sizing of +3.4 % at c1 assumed the shared branch's
   bytes were contending with the pair's; measured, the branch was already
   hidden and the pair pays for the ninth slot exactly what the branch cost.
+
+- PHASE 9 / F5a: THE CANDIDATE DRAFT SAMPLER (2026-09-19 22:40-23:25 PDT;
+  campaign doc section 15 "F5 revised design"). The record's drafter
+  samples probabilistically under the request's top-k / top-p (`draft_top_k_top_p`,
+  block rejection sampler, V2 runner): each draft step all-gathered the
+  full [T, 154880] logits (61 us at c1), tempered and cut them with the
+  native mask (three kernels over the vocabulary), drew with the
+  (seed, pos, token)-keyed Gumbel noise and wrote the processed row into
+  the draft-logits buffer the rejection sampler reads. Now
+  (`csrc/quixicore/serving/candidate_draft.cuh`, binding `v2_candidate_draft`,
+  `LogitsProcessor.get_local_logits`, `DeepSeekMTP.compute_local_logits`,
+  `Speculator._candidate_sample_draft`; QC_DRAFT_CANDIDATES=0 restores):
+  when every request's top-k fits the native cutoff (<= 32), each rank
+  takes the top-32 of its own vocab shard, the [T, tp x 32] values and ids
+  are all-gathered, and one block per token tempers, cuts (the native
+  cutoff's rule reproduced: descending (value, id) order, ties at the kth
+  value kept, the double-precision nucleus budget, the lowest-id kth ties
+  dropped first, a maximum always retained), fills the processed row with
+  -inf and the kept candidates, and draws with the same per-token noise -
+  the same draw as the full path, since every token the mask can keep is
+  in the union of the ranks' windows. Exactness test
+  `tests/kernels/test_v2_candidate_draft.py` (13 cases: mixed
+  temperatures incl. greedy rows, top-k 1..32, top-p 0.5..1, fp32 and
+  fp64 noise, two draft steps): sampled tokens and processed rows equal
+  bit for bit to mask_draft_logits + gumbel_sample (the one divergence
+  found and fixed on the way: the native order among equal values is by
+  DESCENDING id). Serving: `$S/p9/chain_f5.sh` (f5-spec 8 passes with
+  canaries, f5off-spec 8 passes); the draws being identical, the
+  acceptance counters must agree between the arms.
+
+- PHASE 9 / F5b: A DRAFT-ONLY NVFP4 LM_HEAD (built 2026-09-19 23:30 PDT,
+  serving arm after F5a's). The MTP drafter shares the target's fp8-channel
+  lm_head (`load_eagle_model` ties `shared_head.head` to it): 158 MB per
+  rank, 104 us per draft step at c1, three draft steps per c1 spec step.
+  Sidecar `nvfp4-swapset-draft-lmhead.{safetensors,json}` (`python -m
+  slimserve.nvfp4_swapset --model <dir> --draft-lm-head`; the checkpoint's
+  BF16 lm_head quantized with the experts' recipe under the module name
+  `draft_lm_head`, 357 MB in all, rel Frobenius error 0.096), selected by
+  SLIMSERVE_NVFP4_DRAFT_LMHEAD: the drafter builds its own `ParallelLMHead`
+  under that name, the config group targets that name alone (Marlin's
+  W4A16 path, 79 MB per rank), `compute_logits` / `compute_local_logits`
+  use it, and the target's head and the output distribution are untouched
+  - only the drafter's acceptance rate can move, so the counters are the
+  whole gate. Expected -50 us per draft step, ~-0.15 ms of the c1 spec
+  step (+1.7 %), ~+0.7 % at c8/c16 spec.
+  F5a SERVING (23:24-23:47 PDT, `$S/p9/chain_f5.sh`, `chain_f5prof.sh`; raw
+  perf/results/2026-09-19/f5{,off}-spec-pass*/, profile-state-f5{,off}-prof):
+  the path announces itself on every rank ("Drafting from 128 gathered
+  top-32 candidates per token"), canaries PASS.
+  | arm | c1 (8-pass median, range) | c8 | c16 | accepted per draft |
+  |---|---|---|---|---|
+  | f5-spec (candidates) | 275.0 (248.9-362.6) | 809 (725.5-869.4) | 1118 (1046.5-1175.7) | 0.976 |
+  | f5off-spec (full path) | 301.7 (256.7-358.6) | 816.6 (714.1-862.3) | 1142 (1087.9-1184.7) | 0.993 |
+  c1 spec profile arms (STATE=1, one boot each): candidates 1.823 ms per
+  graph window, GPU span 5.12 ms per step, 788 launches per step; full path
+  1.802 ms, 5.24 ms, 820 launches; the boots accepted different streams
+  (1.47 vs 1.61 per draft), so neither figure resolves the difference.
+  VERDICT: level within what the harness resolves - the eight-pass c1 spec
+  medians of this session span 275-334 on identical code (the accepted
+  count per boot moves 0.968-0.993 and each pass generates its own text),
+  and the profile's per-window wall differs by 1 % in the opposite
+  direction of its GPU span. What the path removed (one [T, 154880]
+  all-gather and the vocab-wide cut, ~60 us per draft step) it spent on
+  torch's shard top-k, two small all-gathers and their eager launches.
+  DECISION: opt-in (QC_DRAFT_CANDIDATES=1; default off) with its exactness
+  test; a native shard-window kernel plus a single packed gather would
+  reclaim ~30 us per draft step (+1 % c1 spec), below what the harness can
+  see, and is left as a note (`$S/p9/f5/f5c_window.py`).

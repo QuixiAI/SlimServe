@@ -2089,6 +2089,36 @@ class quixicore_ops:
 
     @staticmethod
     @cache
+    def has_v2_candidate_draft() -> bool:
+        return quixicore_ops.is_available() and hasattr(_qc(), "v2_candidate_draft")
+
+    @staticmethod
+    def v2_candidate_draft(
+        cand_logits: torch.Tensor,
+        cand_ids: torch.Tensor,
+        top_k: torch.Tensor,
+        top_p: torch.Tensor | None,
+        expanded_idx_mapping: torch.Tensor,
+        seeds: torch.Tensor,
+        pos: torch.Tensor,
+        temperature: torch.Tensor,
+        vocab_size: int,
+        processed_logits: torch.Tensor | None,
+        processed_logits_col: torch.Tensor | None,
+        use_fp64: bool,
+    ) -> torch.Tensor:
+        """The drafter's next token from the batch's gathered top-k candidates
+        (fp32 [T, C] untempered logits and their global ids): tempered, cut to
+        the request's top-k (ties kept) and top-p like topk_topp_mask, the
+        processed row written into processed_logits[req, col], and drawn with
+        gumbel_sample's (seed, pos, token)-keyed noise. int64 ids [T]."""
+        return _qc().v2_candidate_draft(
+            cand_logits, cand_ids, top_k, top_p, expanded_idx_mapping, seeds, pos, temperature,
+            vocab_size, processed_logits, processed_logits_col, use_fp64,
+        )
+
+    @staticmethod
+    @cache
     def has_topk_sample() -> bool:
         return quixicore_ops.is_available() and hasattr(_qc(), "topk_sample")
 
