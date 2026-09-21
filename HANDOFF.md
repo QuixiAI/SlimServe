@@ -4,7 +4,7 @@
 > Metal. Earlier TurboQuant directives and measurements below are historical.
 > See `perf/optimization_status.md` for current validation evidence.
 
-# HANDOFF — GLM-5.3-Flash NVFP4 on 4x RTX PRO 6000 Blackwell (`glm53f-nvfp4-4` / `rtx6000`), branch `glm53f-rtx6000` (PR #29 open, passed automated review at 55d4c64d5 after CodeRabbit rounds 13-14, since merged with upstream d79030d5a and put through the cleanup pass - notebook 2026-09-20, switch list in campaign doc section 17; Phase 9, the section-15 fusion items, closed 2026-09-20. Operator's open calls: the b12x native MoE backend (rejected, unused) and the level opt-ins)
+# HANDOFF — GLM-5.3-Flash NVFP4 on 4x RTX PRO 6000 Blackwell (`glm53f-nvfp4-4` / `rtx6000`), branch `glm53f-rtx6000` (PR #29 open: passed automated review at 55d4c64d5 after CodeRabbit rounds 13-14; since merged with upstream d79030d5a, put through the cleanup pass and its same-session A/B (level; notebook 2026-09-21), and the rejected b12x native MoE backend removed - the bot cannot review past 100 files, so those commits carry the recorded validation only. Switch list: campaign doc section 17. Phase 9 closed 2026-09-20. `tool_calling_profile` stays unset on this record; PR #85 fixes its thinking default on main.)
 
 STATE 2026-09-20 00:30 PDT (tree 6ea3ede34, the record's own environment,
 notebook "Phase 9 / the final numbers"): plain c1 228.5 / c8 776 / c16
