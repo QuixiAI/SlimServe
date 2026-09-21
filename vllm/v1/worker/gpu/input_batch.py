@@ -86,6 +86,10 @@ class InputBatch:
     num_draft_tokens: int
     # [num_reqs] number of draft tokens scheduled for each request, if any.
     num_draft_tokens_per_req: np.ndarray | None
+    # [total_num_logits] True on draft rows the scheduler padded for a request
+    # the speculator has not drafted for yet; None when there are none. The
+    # rejection sampler verifies them as -1 (always rejected).
+    draft_placeholder_mask: torch.Tensor | None
 
     # [num_reqs + 1]
     query_start_loc: torch.Tensor
@@ -191,6 +195,7 @@ class InputBatch:
             num_tokens_after_padding=num_tokens,
             num_draft_tokens=0,
             num_draft_tokens_per_req=None,
+            draft_placeholder_mask=None,
             query_start_loc=query_start_loc,
             query_start_loc_np=query_start_loc_np,
             seq_lens=seq_lens,

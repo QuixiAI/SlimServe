@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Fused MoE utilities for GPTQ."""
 
+import functools
 import math
 import os
 from collections.abc import Callable
@@ -11,6 +12,8 @@ import torch
 import vllm._custom_ops as ops
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.config import get_current_vllm_config_or_none
+from vllm.model_executor.layers.fused_moe import combine_shared
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import (
     MoEActivation,
     apply_moe_activation,
@@ -27,6 +30,7 @@ from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
     batched_moe_align_block_size,
     moe_align_block_size,
 )
+from vllm.model_executor.layers.fused_moe.router import glm_route_align
 from vllm.model_executor.layers.fused_moe.singleton_alignment import (
     SingletonAlignment,
     make_singleton_alignment,
@@ -57,7 +61,26 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kNvfp4Static,
 )
 from vllm.platforms import current_platform
+from vllm.quixicore.ops import quixicore_ops
 from vllm.scalar_type import ScalarType, scalar_types
+from vllm.utils.torch_utils import current_stream
+
+logger = init_logger(__name__)
+
+
+def marlin_moe_block_size_m(
+    num_tokens: int, topk: int, num_experts: int, input_dtype: torch.dtype | None
+) -> int:
+    """The M block size fused_marlin_moe aligns `num_tokens` (valid tokens per
+    rank) with: the smallest of 8..64 that leaves the expert blocks under 90 %
+    full, at least 16 for 8-bit activations."""
+    # TODO: tune this further for specific models
+    for block_size_m in [8, 16, 32, 48, 64]:
+        if num_tokens * topk / num_experts / block_size_m < 0.9:
+            break
+    if input_dtype is not None and input_dtype.itemsize == 1:
+        block_size_m = max(block_size_m, 16)
+    return block_size_m
 
 
 def _qc_nvfp4_prefill_rows_threshold() -> int:
@@ -70,6 +93,16 @@ def _qc_nvfp4_prefill_rows_threshold() -> int:
 
 def _qc_nvfp4_prefill_stages() -> int:
     return int(os.getenv("VLLM_QC_NVFP4_PREFILL_MOE_STAGES", "2"))
+
+
+@functools.cache
+def _qc_nvfp4_prefill_fits(device_index: int, cfg: int) -> bool:
+    """Whether the device opts in to the shared memory the cfg launches with
+    (three stages need 119 KB; sm_120 opts in to 99 KB)."""
+    need = quixicore_ops.nvfp4_moe_gemm_smem_bytes(cfg)
+    props = torch.cuda.get_device_properties(device_index)
+    have = getattr(props, "shared_memory_per_block_optin", 0)
+    return not (need and have and have < need)
 
 
 def _qc_nvfp4_prefill_applicable(
@@ -102,6 +135,8 @@ def _qc_nvfp4_prefill_applicable(
         return False
     if not hasattr(qc, "nvfp4_moe_gemm"):
         return False
+    if not _qc_nvfp4_prefill_fits(hidden_states.device.index or 0, _qc_nvfp4_prefill_stages()):
+        return False
     if quant_type != scalar_types.float4_e2m1f or global_scale1 is None or global_scale2 is None:
         return False
     if hidden_states.dtype != torch.bfloat16 or input_dtype is not None:
@@ -117,6 +152,235 @@ def _qc_nvfp4_prefill_applicable(
     n2 = w2.size(2) // 2         # w2: n = hidden
     k2 = w2.size(1) * 16         # w2: k = padded intermediate
     return K % 64 == 0 and n13 % 128 == 0 and n2 % 128 == 0 and k2 % 64 == 0
+
+
+# QC_NVFP4_DECODE (read once): the decode MoE pair (nvfp4_moe_decode_ampere.cuh)
+# serves NVFP4 batches of up to QC_NVFP4_DECODE_ROWS assignment rows (M * top_k,
+# default 32); 0 keeps Marlin for every batch. QC_NVFP4_DECODE_NJ (1/2/4) is the
+# column-group width per CTA (16 * nj columns), default by batch (4 to 16 rows, else 2); QC_NVFP4_DECODE_STAGES
+# (4/8) the depth of the cp.async ring, default 4; QC_NVFP4_DECODE_SPLIT gemv2's cluster split over a token's
+# experts, default 2 for a single token (rows <= top_k, an uneven split allowed), else 1.
+@functools.cache
+def _qc_nvfp4_decode_rows() -> int:
+    if os.environ.get("QC_NVFP4_DECODE", "1") == "0":
+        return 0
+    return int(os.environ.get("QC_NVFP4_DECODE_ROWS", "32"))
+
+
+@functools.cache
+def _qc_nvfp4_decode_nj_env() -> int:
+    return int(os.environ.get("QC_NVFP4_DECODE_NJ", "0"))
+
+
+def _qc_nvfp4_decode_nj(rows: int) -> int:
+    """Columns per CTA = 16 * nj. Cold with the record's PDL mode: nj 4 wins up to
+    16 assignment rows (fewer, wider CTAs; 36.5 vs 40.7 us at 2 x 8), nj 2 above
+    (68.5 vs 72.5 at 4 x 8). QC_NVFP4_DECODE_NJ pins one value."""
+    forced = _qc_nvfp4_decode_nj_env()
+    if forced:
+        return forced
+    return 4 if rows <= 16 else 2
+
+
+@functools.cache
+def _qc_nvfp4_decode_stages() -> int:
+    return int(os.environ.get("QC_NVFP4_DECODE_STAGES", "4"))
+
+
+@functools.cache
+def _qc_nvfp4_decode_split_env() -> int:
+    return int(os.environ.get("QC_NVFP4_DECODE_SPLIT", "0"))
+
+
+def _qc_nvfp4_decode_split(rows: int, topk: int) -> int:
+    """gemv2's cluster split over a token's experts. Cold under the record's PDL
+    mode a split of 2 takes the one-token gemv2 from 11.1 to 8.4 us (64 -> 128
+    CTAs, half the serial chain) and loses from two tokens up (12.7 -> 16.7 at
+    2 x 8), so it serves single-token batches only. The ranks take
+    ceil(top_k / split) slots each (nine slots, the shared expert riding as
+    expert E, split five and four: a split of 3 would be 192 CTAs on 188 SMs
+    and a tail wave, 13.3 us against 12.3 unsplit). QC_NVFP4_DECODE_SPLIT
+    pins one value (1/2/3/4/8, at most top_k)."""
+    forced = _qc_nvfp4_decode_split_env()
+    if forced:
+        return forced if forced <= topk else 1
+    return 2 if rows <= topk else 1
+
+
+def _qc_nvfp4_decode_applicable(
+    quant_type: ScalarType,
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    M: int,
+    topk: int,
+    E: int,
+    global_num_experts: int,
+    bias1: torch.Tensor | None,
+    bias2: torch.Tensor | None,
+    global_scale1: torch.Tensor | None,
+    global_scale2: torch.Tensor | None,
+    g_idx1: torch.Tensor | None,
+    w1_zeros: torch.Tensor | None,
+    w2_zeros: torch.Tensor | None,
+    expert_map: torch.Tensor | None,
+    input_dtype: torch.dtype | None,
+    activation: MoEActivation,
+    clamp_limit: float | None,
+    gemm1_alpha: float,
+    gemm1_beta: float,
+) -> bool:
+    rows = _qc_nvfp4_decode_rows()
+    if rows <= 0 or M * topk > rows:
+        return False
+    why = _qc_nvfp4_decode_why_not(
+        quant_type, hidden_states, w1, w2, E, global_num_experts, bias1, bias2, global_scale1,
+        global_scale2, g_idx1, w1_zeros, w2_zeros, expert_map, input_dtype, activation,
+        clamp_limit, gemm1_alpha, gemm1_beta,
+    )
+    if why is not None:
+        _qc_nvfp4_decode_declined(why)
+        return False
+    return True
+
+
+def _qc_nvfp4_decode_why_not(
+    quant_type, hidden_states, w1, w2, E, global_num_experts, bias1, bias2, global_scale1,
+    global_scale2, g_idx1, w1_zeros, w2_zeros, expert_map, input_dtype, activation,
+    clamp_limit, gemm1_alpha, gemm1_beta,
+) -> str | None:
+    """The first reason a small batch stays on Marlin, or None when the pair serves it."""
+    if quant_type != scalar_types.float4_e2m1f:
+        return f"quant type {quant_type}"
+    if global_scale1 is None or global_scale2 is None:
+        return "no global scales"
+    if not (hidden_states.is_cuda and hidden_states.dtype == torch.bfloat16 and input_dtype is None):
+        return f"input {hidden_states.device.type} {hidden_states.dtype} / input_dtype {input_dtype}"
+    if bias1 is not None or bias2 is not None or g_idx1 is not None or w1_zeros is not None or w2_zeros is not None:
+        return "bias / g_idx / zero points"
+    if expert_map is not None or global_num_experts != E:
+        return f"expert_map {expert_map is not None} / global experts {global_num_experts} vs {E}"
+    # SiLU, with silu_and_mul_with_clamp's clamp (GLM-5.3: limit 10) folded into gemv1's epilogue.
+    if activation != MoEActivation.SILU or gemm1_alpha != 1.0 or gemm1_beta != 0.0:
+        return f"activation {activation} alpha {gemm1_alpha} beta {gemm1_beta}"
+    if not quixicore_ops.has_nvfp4_moe_decode():
+        return "binding absent"
+    K = hidden_states.size(1)
+    N = w2.size(1) * 16   # intermediate size per rank
+    stages = _qc_nvfp4_decode_stages()
+    # 256-k chunks, whole ring rounds over K, and N (the down projection's K) in whole chunks.
+    if not (K % (256 * stages) == 0 and N % 256 == 0 and w1.size(2) == 4 * N and w2.size(2) == 2 * K):
+        return f"shapes K {K} N {N} w1 {tuple(w1.shape)} w2 {tuple(w2.shape)}"
+    return None
+
+
+_qc_nvfp4_decode_declined_once = False
+
+
+def _qc_nvfp4_decode_declined(why: str) -> None:
+    global _qc_nvfp4_decode_declined_once
+    if not _qc_nvfp4_decode_declined_once:
+        _qc_nvfp4_decode_declined_once = True
+        logger.info("QuixiCore NVFP4 decode MoE pair not used for a small batch: %s", why)
+
+
+_qc_nvfp4_decode_announced = False
+_qc_nvfp4_decode_pair_active = False   # the pair has served a batch of this model
+
+
+@functools.cache
+def _qc_nvfp4_decode_route_enabled() -> bool:
+    """QC_NVFP4_DECODE_ROUTE=0 keeps the routing in the route_align launch."""
+    return os.environ.get("QC_NVFP4_DECODE_ROUTE", "1") != "0"
+
+
+def nvfp4_decode_pair_serves(rows: int) -> bool:
+    """Whether the NVFP4 decode pair will serve a batch of `rows` assignment
+    rows: it has served one already (the layer shapes qualified) and the batch
+    is under the rows cap. glm_route_align defers the routing to gemv1 then."""
+    return (
+        _qc_nvfp4_decode_route_enabled()
+        and _qc_nvfp4_decode_pair_active
+        and 0 < rows <= _qc_nvfp4_decode_rows()
+    )
+
+
+def _qc_nvfp4_decode_announce(M: int, topk: int) -> None:
+    global _qc_nvfp4_decode_announced, _qc_nvfp4_decode_pair_active
+    _qc_nvfp4_decode_pair_active = True
+    if not _qc_nvfp4_decode_announced:
+        _qc_nvfp4_decode_announced = True
+        logger.info(
+            "Using the QuixiCore NVFP4 decode MoE pair (first batch %d x top-%d; rows cap %d, nj %d, stages %d)",
+            M, topk, _qc_nvfp4_decode_rows(), _qc_nvfp4_decode_nj(M * topk), _qc_nvfp4_decode_stages(),
+        )
+
+
+def _qc_nvfp4_decode_moe(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    global_scale1: torch.Tensor,
+    global_scale2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    apply_router_weight_on_input: bool,
+    intermediate_cache2: torch.Tensor | None,
+    output: torch.Tensor | None,
+    clamp_limit: float | None = None,
+    routing: glm_route_align.DeferredRouting | None = None,
+) -> torch.Tensor:
+    """The decode pair: gate/up + SiLU into the [M * top_k, N] intermediate,
+    then down + top-k combine (+ the runner's shared-expert output when it
+    published one for this batch) into output [M, K]. With `routing` gemv1
+    computes the top-k from the router logits and writes topk_ids /
+    topk_weights itself."""
+    M, K = hidden_states.shape
+    topk = topk_ids.size(1)
+    N = w2.size(1) * 16
+    nj = _qc_nvfp4_decode_nj(M * topk)
+    stages = _qc_nvfp4_decode_stages()
+    if intermediate_cache2 is None:
+        act = torch.empty((M * topk, N), device=hidden_states.device, dtype=torch.bfloat16)
+    else:
+        act = _resize_cache(intermediate_cache2, (M * topk, N))
+    if output is None:
+        output = torch.empty_like(hidden_states)
+    if routing is not None:
+        ids = routing.topk_ids
+        topk_weights = routing.topk_weights
+        quixicore_ops.nvfp4_moe_gemv1(
+            hidden_states, w1, w1_scale.view(torch.uint8), global_scale1, ids, act, nj, stages, clamp_limit,
+            routing.logits, routing.bias, routing.scoring, routing.scaling, routing.renormalize, topk_weights,
+            routing.fixed,
+        )
+    else:
+        ids = topk_ids if topk_ids.dtype == torch.int32 else topk_ids.to(torch.int32)
+        ids = ids.contiguous()
+        quixicore_ops.nvfp4_moe_gemv1(
+            hidden_states, w1, w1_scale.view(torch.uint8), global_scale1, ids, act, nj, stages, clamp_limit
+        )
+    shared = combine_shared.consume(topk_ids)
+    shared_out = None
+    if (
+        shared is not None
+        and shared.output.dtype == torch.bfloat16
+        and shared.output.shape == output.shape
+        and shared.output.device == output.device
+        and shared.output.is_contiguous()
+    ):
+        if shared.stream is not None:
+            current_stream().wait_stream(shared.stream)
+        shared_out = shared.output
+        shared.folded = True
+    weights = None if apply_router_weight_on_input else topk_weights.contiguous()
+    split = _qc_nvfp4_decode_split(M * topk, topk)
+    quixicore_ops.nvfp4_moe_gemv2(
+        act, w2, w2_scale.view(torch.uint8), global_scale2, ids, weights, shared_out, output, nj, stages, split
+    )
+    return output
 
 
 def _fused_marlin_moe(
@@ -427,14 +691,30 @@ def fused_marlin_moe(
         # Set M to estimated valid tokens per rank
         M = math.ceil(M * E / global_num_experts)
 
-    # M block size selection logic
-    # TODO: tune this further for specific models
-    for block_size_m in [8, 16, 32, 48, 64]:
-        if M * topk / E / block_size_m < 0.9:
-            break
+    block_size_m = marlin_moe_block_size_m(M, topk, E, input_dtype)
 
-    if input_dtype is not None and input_dtype.itemsize == 1:
-        block_size_m = max(block_size_m, 16)
+    if _qc_nvfp4_decode_applicable(
+        quant_type, hidden_states, w1, w2, M, topk, E, global_num_experts, bias1, bias2,
+        global_scale1, global_scale2, g_idx1, w1_zeros, w2_zeros, expert_map, input_dtype,
+        activation, clamp_limit, gemm1_alpha, gemm1_beta,
+    ):
+        assert w1_scale is not None and w2_scale is not None
+        assert global_scale1 is not None and global_scale2 is not None
+        routing = glm_route_align.consume_deferred(topk_ids)
+        if routing is None and glm_route_align.pending_deferred():
+            raise RuntimeError(
+                "nvfp4 decode pair: a deferred routing is pending for another topk_ids tensor; "
+                "the batch's topk_ids must reach fused_marlin_moe unchanged"
+            )
+        _qc_nvfp4_decode_announce(M, topk)
+        return _qc_nvfp4_decode_moe(
+            hidden_states, w1, w2, w1_scale, w2_scale, global_scale1, global_scale2,
+            topk_weights, topk_ids, apply_router_weight_on_input, intermediate_cache2, output,
+            clamp_limit, routing,
+        )
+    deferred = glm_route_align.consume_deferred(topk_ids)
+    if deferred is not None:
+        glm_route_align.materialize(deferred)   # the pair declined this batch: route it now
 
     use_qc_prefill = _qc_nvfp4_prefill_applicable(
         quant_type, hidden_states, w1, w2, M, topk, E, bias1, bias2,
@@ -444,7 +724,19 @@ def fused_marlin_moe(
     if use_qc_prefill:
         block_size_m = 128
 
+    alignment = glm_route_align.consume(topk_ids)
     if (
+        alignment is not None
+        and alignment.block_size == block_size_m
+        and expert_map is None
+        and global_num_experts == E
+    ):
+        # The fused router already aligned this very batch for this block
+        # size: skip moe_align_block_size's kernels and fill.
+        sorted_token_ids = alignment.sorted_token_ids
+        expert_ids = alignment.expert_ids
+        num_tokens_post_padded = alignment.num_tokens_post_padded
+    elif (
         hidden_states.shape[0] == 1
         and expert_map is None
         and global_num_experts == E
@@ -1082,8 +1374,31 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
     ) -> None:
         if expert_map is not None:
             ops.moe_sum(input, output, topk_ids, expert_map)
-        else:
-            ops.moe_sum(input, output)
+            return
+        shared = combine_shared.consume(topk_ids)
+        if (
+            shared is not None
+            and quixicore_ops.has_moe_sum_add()
+            and input.is_cuda
+            and input.dtype == torch.bfloat16
+            and shared.output.dtype == torch.bfloat16
+            and shared.output.shape == output.shape
+            and shared.output.device == output.device
+            and input.is_contiguous()
+            and output.is_contiguous()
+            and shared.output.is_contiguous()
+            and input.data_ptr() % 16 == 0
+            and output.data_ptr() % 16 == 0
+            and shared.output.data_ptr() % 16 == 0
+        ):
+            # The runner published this batch's shared-expert output: fold it
+            # into the sum, one launch instead of moe_sum and the runner's add.
+            if shared.stream is not None:
+                current_stream().wait_stream(shared.stream)
+            quixicore_ops.moe_sum_add(input, shared.output, output)
+            shared.folded = True
+            return
+        ops.moe_sum(input, output)
 
 
 class BatchedMarlinExperts(MarlinExpertsBase):

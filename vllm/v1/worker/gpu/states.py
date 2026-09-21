@@ -76,6 +76,12 @@ class RequestState:
             device=device,
         )
 
+        # Whether the speculator has drafted for the slot since the request
+        # was added. The scheduler pads a newcomer whose prompt has one token
+        # left to the batch's speculative width before any draft exists; the
+        # runner hands those rows to the sampler as placeholders to reject.
+        self.has_draft_tokens = np.zeros(self.max_num_reqs, dtype=bool)
+
         self.next_prefill_tokens = torch.zeros(
             self.max_num_reqs, dtype=torch.int32, device=device
         )
@@ -111,6 +117,7 @@ class RequestState:
         self.num_computed_tokens.stage_write_elem(req_idx, num_computed_tokens)
 
         self.draft_tokens[req_idx].zero_()
+        self.has_draft_tokens[req_idx] = False
 
     def apply_staged_writes(self) -> None:
         self.prompt_len.copy_to_uva()

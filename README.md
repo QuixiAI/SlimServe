@@ -1069,6 +1069,10 @@ uv pip install -e . --torch-backend=auto     # C++/HIP changes
 VLLM_USE_PRECOMPILED=1 uv pip install -e .   # Python-only changes
 ```
 
+The `rtx6000` records' PCIe DMA-ring all-reduce needs the optional `b12x`
+package (`uv pip install b12x`); without it the ring is skipped with a warning
+and prefill all-reduces stay on the stock kernels.
+
 On Apple Silicon the same `uv pip install -e .` builds the `_quixicore_C`
 extension and compiles the QuixiCore Metal kernel library
 (`vllm/quixicore_metal.metallib`) with the system Metal toolchain; no ROCm

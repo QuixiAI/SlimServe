@@ -9,6 +9,11 @@ import numpy as np
 import torch
 
 from vllm.triton_utils import tl, triton
+
+# Programmatic dependent launch: see vllm/triton_utils/pdl.py.
+from vllm.triton_utils.pdl import PDL as _PDL  # noqa: E402
+from vllm.triton_utils.pdl import gdc_launch_dependents, gdc_wait  # noqa: E402, F401
+
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
 
 
@@ -789,7 +794,12 @@ def _causal_conv1d_update_kernel(
     NP2_STATELEN: tl.constexpr,
     HAS_NULL_BLOCK: tl.constexpr,
     BLOCK_N: tl.constexpr,
+
+    PDL: tl.constexpr = False,
 ):
+    if PDL:
+        gdc_launch_dependents()
+        gdc_wait()
     # ruff: noqa: E501
     idx_seq = tl.program_id(0)
     if idx_seq >= batch:
@@ -1245,6 +1255,9 @@ def causal_conv1d_update(
         NP2_STATELEN=np2_statelen,
         HAS_NULL_BLOCK=null_block_id is not None,
         BLOCK_N=256,
+    
+        PDL=_PDL,
+        launch_pdl=_PDL,
     )
     if unsqueeze:
         out = out.squeeze(-1)

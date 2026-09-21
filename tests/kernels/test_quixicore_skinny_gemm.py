@@ -18,6 +18,11 @@ SHAPES = [(4096, 6144), (4096, 1536), (1536, 4096), (4096, 512), (512, 8192), (1
 def test_skinny_gemm_matches_fp32_reference(m, k, n, cfg):
     if cfg == 1 and m <= 64:
         pytest.skip("cfg 1 is the M > 64 tile")
+    need = qc.skinny_gemm_smem_bytes(cfg, m)
+    have = torch.cuda.get_device_properties(torch.cuda.current_device()).shared_memory_per_block_optin
+    if need > have:
+        # cfg 1's BN128 / 3-stage tile is 110,592 B: sm_120 opts in to 101,376.
+        pytest.skip(f"cfg {cfg} needs {need} B of shared memory; the device opts in to {have}")
     torch.manual_seed(m * 1000 + k + n)
     x = (torch.randn(m, k, device="cuda") * 0.5).to(torch.bfloat16)
     w = (torch.randn(n, k, device="cuda") * 0.05).to(torch.bfloat16)

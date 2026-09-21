@@ -2,11 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
 from collections import Counter, defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from itertools import product
 from typing import Any, NamedTuple, Protocol
 
+import numpy as np
 import torch
 import torch.nn as nn
 from tqdm import tqdm
@@ -109,6 +110,40 @@ def get_uniform_token_count(
     ):
         return max_query_len
     return None
+
+
+def uniform_token_count_with_prefills(
+    uniform_token_count: int | None,
+    num_scheduled_tokens: Mapping[str, int],
+    req_id_to_index: Mapping[str, int],
+    num_computed_prefill_tokens: np.ndarray,
+    prefill_len: np.ndarray,
+) -> int | None:
+    """Drop the uniform token count when the batch holds a still-prefilling
+    request the FULL decode graph cannot serve.
+
+    Shape alone cannot distinguish a decode batch from one that contains
+    mid-prefill requests: a fresh 1-token prompt, or a prompt/tail chunk
+    exactly as wide as a (spec-)decode step, produces the same token counts.
+    FULL decode graphs replay capture-time decode kernels, which read
+    sampled-token and state slots such a request has never written (garbage
+    logits; occasionally an illegal memory access). One case is exact: a
+    1-token chunk that completes a prompt whose earlier tokens are computed
+    (the prompt tail of a prefix-cache replay) has its recurrent and conv
+    state at that position and reads no sampled token, and the recurrent
+    builders run it as a one-token decode flush.
+    """
+    if uniform_token_count is None:
+        return None
+    for req_id, num_new in num_scheduled_tokens.items():
+        idx = req_id_to_index[req_id]
+        computed = int(num_computed_prefill_tokens[idx])
+        total = int(prefill_len[idx])
+        if computed >= total:
+            continue
+        if uniform_token_count != 1 or computed == 0 or computed + num_new != total:
+            return None
+    return uniform_token_count
 
 
 class CudaGraphManager:
@@ -261,6 +296,14 @@ class CudaGraphManager:
                 decode_query_lens = [self.decode_query_len]
         else:
             decode_query_lens = [self.decode_query_len]
+        if self.decode_query_len > 1 and 1 not in decode_query_lens:
+            # A speculative engine also runs 1-token uniform batches: the
+            # prompt tail of a prefix-cache replay (the request's earlier
+            # tokens are cached, it carries no draft yet) and a decode whose
+            # draft was empty. The builders serve those through their plain
+            # decode path, and a 1-wide graph keeps them off the eager path
+            # (an eager tail step costs ~100 ms against a ~10 ms replay).
+            decode_query_lens.append(1)
 
         for num_tokens, num_active_loras in product(
             capture_sizes, self.lora_capture_cases

@@ -4,6 +4,8 @@
 // init_m6(m).
 #include "../quant/turboquant.cuh"
 #include "../serving/v2_sample_kernels.cuh"
+#include "../serving/topk_sample_kernels.cuh"
+#include "../serving/candidate_draft.cuh"
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 
@@ -134,6 +136,55 @@ static void launch_v2_gumbel(torch::Tensor& local_argmax,
     }
 }
 
+// F5a: the drafter's token from the batch's gathered top-k candidates (see
+// serving/candidate_draft.cuh): the full path's draw without the full-vocab logits.
+static torch::Tensor py_v2_candidate_draft(torch::Tensor cand_logits, torch::Tensor cand_ids,
+        torch::Tensor top_k, c10::optional<torch::Tensor> top_p, torch::Tensor expanded_idx_mapping,
+        torch::Tensor seeds, torch::Tensor pos, torch::Tensor temperature, int64_t vocab_size,
+        c10::optional<torch::Tensor> processed_logits, c10::optional<torch::Tensor> processed_logits_col,
+        bool use_fp64) {
+    M6CK(cand_logits); M6CK(cand_ids); M6CK(top_k); M6CK(expanded_idx_mapping); M6CK(seeds); M6CK(pos); M6CK(temperature);
+    TORCH_CHECK(cand_logits.dim() == 2 && cand_logits.scalar_type() == torch::kFloat32 && cand_logits.is_contiguous(),
+                "v2_candidate_draft: cand_logits fp32 [T, C] contiguous");
+    TORCH_CHECK(cand_ids.sizes() == cand_logits.sizes() && cand_ids.scalar_type() == torch::kInt32 && cand_ids.is_contiguous(),
+                "v2_candidate_draft: cand_ids int32 [T, C] contiguous");
+    const int T = cand_logits.size(0), C = cand_logits.size(1);
+    TORCH_CHECK(C >= 1 && C <= tmv2s::CAND_THREADS, "v2_candidate_draft: 1 <= C <= 128 candidates");
+    TORCH_CHECK(top_k.scalar_type() == torch::kInt32 && expanded_idx_mapping.scalar_type() == torch::kInt32 &&
+                seeds.scalar_type() == torch::kInt64 && pos.scalar_type() == torch::kInt64 &&
+                temperature.scalar_type() == torch::kFloat32, "v2_candidate_draft: dtypes");
+    TORCH_CHECK(expanded_idx_mapping.numel() >= T && pos.numel() >= T, "v2_candidate_draft: per-token inputs");
+    const float* tp = nullptr;
+    if (top_p) { M6CK(top_p.value()); TORCH_CHECK(top_p->scalar_type() == torch::kFloat32, "top_p fp32"); tp = top_p->data_ptr<float>(); }
+    float* pl = nullptr; int64_t pl_stride = 0; const int64_t* col = nullptr; int per_token_col = 0;
+    if (processed_logits) {
+        M6CK(processed_logits.value());
+        TORCH_CHECK(processed_logits->scalar_type() == torch::kFloat32, "v2_candidate_draft: processed_logits fp32");
+        pl = processed_logits->data_ptr<float>(); pl_stride = processed_logits->stride(0);
+        if (processed_logits_col) {
+            M6CK(processed_logits_col.value());
+            TORCH_CHECK(processed_logits_col->scalar_type() == torch::kInt64, "v2_candidate_draft: col int64");
+            col = processed_logits_col->data_ptr<int64_t>();
+            per_token_col = processed_logits_col->dim() > 0 ? 1 : 0;
+        }
+    }
+    auto out = torch::empty({T}, cand_logits.options().dtype(torch::kInt64));
+    if (T == 0) return out;
+    if (use_fp64) {
+        tmv2s::v2_candidate_draft_k<double><<<T, tmv2s::CAND_THREADS, 0, m6st()>>>(
+            cand_logits.data_ptr<float>(), cand_ids.data_ptr<int32_t>(), C, top_k.data_ptr<int32_t>(), tp,
+            expanded_idx_mapping.data_ptr<int32_t>(), seeds.data_ptr<int64_t>(), pos.data_ptr<int64_t>(),
+            temperature.data_ptr<float>(), int(vocab_size), pl, pl_stride, col, per_token_col, out.data_ptr<int64_t>());
+    } else {
+        tmv2s::v2_candidate_draft_k<float><<<T, tmv2s::CAND_THREADS, 0, m6st()>>>(
+            cand_logits.data_ptr<float>(), cand_ids.data_ptr<int32_t>(), C, top_k.data_ptr<int32_t>(), tp,
+            expanded_idx_mapping.data_ptr<int32_t>(), seeds.data_ptr<int64_t>(), pos.data_ptr<int64_t>(),
+            temperature.data_ptr<float>(), int(vocab_size), pl, pl_stride, col, per_token_col, out.data_ptr<int64_t>());
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+
 static void py_v2_gumbel_sample(torch::Tensor local_argmax,
         torch::Tensor local_max, c10::optional<torch::Tensor> processed_logits,
         c10::optional<torch::Tensor> processed_logits_col, torch::Tensor logits,
@@ -164,6 +215,106 @@ static void py_v2_gumbel_sample(torch::Tensor local_argmax,
                 pl_stride, col_ptr, per_token_col, logits, expanded_idx_mapping,
                 seeds, pos, temperature, apply_temperature, V, grid, s);
     });
+}
+
+// ---- fused top-k / top-p / Gumbel-max sampling (serving/topk_sample_kernels.cuh) ----
+// logits fp32 [B, V] (unit inner stride), top_k int32 [B] in [1, 32], top_p fp32 [B]
+// or none, expanded_idx_mapping int32 [B] (-1 = no request), seeds int64 per
+// request state, pos int64 [B]. Returns int64 token ids [B].
+static torch::Tensor py_topk_sample(torch::Tensor logits, torch::Tensor top_k,
+        c10::optional<torch::Tensor> top_p, torch::Tensor expanded_idx_mapping,
+        torch::Tensor seeds, torch::Tensor pos, bool use_fp64) {
+    using namespace tmv2s::topk_sample;
+    TORCH_CHECK(logits.is_cuda() && logits.dim() == 2 && logits.scalar_type() == torch::kFloat32 &&
+                logits.stride(1) == 1, "topk_sample: fp32 [B, V] logits with unit inner stride");
+    M6CK(top_k); M6CK(expanded_idx_mapping); M6CK(seeds); M6CK(pos);
+    const int B = logits.size(0), V = logits.size(1);
+    TORCH_CHECK(V >= NB * K, "topk_sample: vocabulary smaller than the candidate window");
+    TORCH_CHECK(top_k.scalar_type() == torch::kInt32 && top_k.numel() == B, "topk_sample: int32 top_k [B]");
+    TORCH_CHECK(expanded_idx_mapping.scalar_type() == torch::kInt32 && expanded_idx_mapping.numel() == B,
+                "topk_sample: int32 expanded_idx_mapping [B]");
+    TORCH_CHECK(seeds.scalar_type() == torch::kInt64, "topk_sample: int64 seeds");
+    TORCH_CHECK(pos.scalar_type() == torch::kInt64 && pos.numel() == B, "topk_sample: int64 pos [B]");
+    const float* p_ptr = nullptr;
+    if (top_p.has_value()) {
+        const torch::Tensor& p_t = *top_p;
+        M6CK(p_t);
+        TORCH_CHECK(p_t.scalar_type() == torch::kFloat32 && p_t.numel() == B, "topk_sample: fp32 top_p [B]");
+        p_ptr = p_t.data_ptr<float>();
+    }
+    auto out = torch::empty({B}, logits.options().dtype(torch::kInt64));
+    if (B == 0) return out;
+    auto cand_val = torch::empty({B, NB * K}, logits.options());
+    auto cand_idx = torch::empty({B, NB * K}, logits.options().dtype(torch::kInt32));
+    auto thresholds = torch::empty({B, NB}, logits.options());
+    auto omitted = torch::empty({B, NB}, cand_idx.options());
+    auto prefixes = torch::empty({B, NB}, cand_idx.options());
+    auto cutoff_storage = torch::empty({B, int64_t(sizeof(RowCutoff))}, logits.options().dtype(torch::kUInt8));
+    auto* cutoffs = reinterpret_cast<RowCutoff*>(cutoff_storage.data_ptr<uint8_t>());
+    auto part_score = torch::empty({B, NB}, logits.options().dtype(use_fp64 ? torch::kDouble : torch::kFloat));
+    auto part_id = torch::empty({B, NB}, cand_idx.options());
+    auto s = m6st();
+    candidates_kernel<<<dim3(NB, B), THREADS, 0, s>>>(
+        logits.data_ptr<float>(), logits.stride(0), V, cand_val.data_ptr<float>(), cand_idx.data_ptr<int>(),
+        thresholds.data_ptr<float>(), omitted.data_ptr<int>());
+    cutoff_kernel<<<B, MERGE_THREADS, 0, s>>>(
+        cand_val.data_ptr<float>(), cand_idx.data_ptr<int>(), thresholds.data_ptr<float>(),
+        omitted.data_ptr<int>(), top_k.data_ptr<int>(), p_ptr, cutoffs, prefixes.data_ptr<int>());
+    if (use_fp64) {
+        sample_partitions_kernel<double><<<dim3(NB, B), SAMPLE_THREADS, 0, s>>>(
+            logits.data_ptr<float>(), logits.stride(0), V, expanded_idx_mapping.data_ptr<int>(),
+            seeds.data_ptr<int64_t>(), pos.data_ptr<int64_t>(), cutoffs, prefixes.data_ptr<int>(),
+            part_score.data_ptr<double>(), part_id.data_ptr<int>());
+        finish_kernel<double><<<B, 32, 0, s>>>(
+            part_score.data_ptr<double>(), part_id.data_ptr<int>(), out.data_ptr<int64_t>());
+    } else {
+        sample_partitions_kernel<float><<<dim3(NB, B), SAMPLE_THREADS, 0, s>>>(
+            logits.data_ptr<float>(), logits.stride(0), V, expanded_idx_mapping.data_ptr<int>(),
+            seeds.data_ptr<int64_t>(), pos.data_ptr<int64_t>(), cutoffs, prefixes.data_ptr<int>(),
+            part_score.data_ptr<float>(), part_id.data_ptr<int>());
+        finish_kernel<float><<<B, 32, 0, s>>>(
+            part_score.data_ptr<float>(), part_id.data_ptr<int>(), out.data_ptr<int64_t>());
+    }
+    return out;
+}
+
+// ---- top-k / top-p mask in place (serving/topk_sample_kernels.cuh passes 1, 2 and the mask pass) ----
+// logits fp32 [B, V] (unit inner stride), top_k int32 [B] in [1, 32], top_p fp32 [B] or none.
+// Writes -inf over every token the cutoff drops; the retained set is the one
+// topk_sample would draw from.
+static void py_topk_topp_mask(torch::Tensor logits, torch::Tensor top_k,
+        c10::optional<torch::Tensor> top_p) {
+    using namespace tmv2s::topk_sample;
+    TORCH_CHECK(logits.is_cuda() && logits.dim() == 2 && logits.scalar_type() == torch::kFloat32 &&
+                logits.stride(1) == 1, "topk_topp_mask: fp32 [B, V] logits with unit inner stride");
+    M6CK(top_k);
+    const int B = logits.size(0), V = logits.size(1);
+    TORCH_CHECK(V >= NB * K, "topk_topp_mask: vocabulary smaller than the candidate window");
+    TORCH_CHECK(top_k.scalar_type() == torch::kInt32 && top_k.numel() == B, "topk_topp_mask: int32 top_k [B]");
+    const float* p_ptr = nullptr;
+    if (top_p.has_value()) {
+        const torch::Tensor& p_t = *top_p;
+        M6CK(p_t);
+        TORCH_CHECK(p_t.scalar_type() == torch::kFloat32 && p_t.numel() == B, "topk_topp_mask: fp32 top_p [B]");
+        p_ptr = p_t.data_ptr<float>();
+    }
+    if (B == 0) return;
+    auto cand_val = torch::empty({B, NB * K}, logits.options());
+    auto cand_idx = torch::empty({B, NB * K}, logits.options().dtype(torch::kInt32));
+    auto thresholds = torch::empty({B, NB}, logits.options());
+    auto omitted = torch::empty({B, NB}, cand_idx.options());
+    auto prefixes = torch::empty({B, NB}, cand_idx.options());
+    auto cutoff_storage = torch::empty({B, int64_t(sizeof(RowCutoff))}, logits.options().dtype(torch::kUInt8));
+    auto* cutoffs = reinterpret_cast<RowCutoff*>(cutoff_storage.data_ptr<uint8_t>());
+    auto s = m6st();
+    candidates_kernel<<<dim3(NB, B), THREADS, 0, s>>>(
+        logits.data_ptr<float>(), logits.stride(0), V, cand_val.data_ptr<float>(), cand_idx.data_ptr<int>(),
+        thresholds.data_ptr<float>(), omitted.data_ptr<int>());
+    cutoff_kernel<<<B, MERGE_THREADS, 0, s>>>(
+        cand_val.data_ptr<float>(), cand_idx.data_ptr<int>(), thresholds.data_ptr<float>(),
+        omitted.data_ptr<int>(), top_k.data_ptr<int>(), p_ptr, cutoffs, prefixes.data_ptr<int>());
+    mask_partitions_kernel<<<dim3(NB, B), SAMPLE_THREADS, 0, s>>>(
+        logits.data_ptr<float>(), logits.stride(0), V, cutoffs, prefixes.data_ptr<int>());
 }
 
 static void py_v2_topk_log_softmax(torch::Tensor out, torch::Tensor logits,
@@ -480,6 +631,19 @@ void init_m6(py::module_& m) {
           py::arg("expanded_idx_mapping"), py::arg("seeds"), py::arg("pos"),
           py::arg("temperature"), py::arg("apply_temperature"),
           py::arg("per_token_col"));
+    m.def("v2_candidate_draft", &py_v2_candidate_draft, py::arg("cand_logits"), py::arg("cand_ids"),
+          py::arg("top_k"), py::arg("top_p"), py::arg("expanded_idx_mapping"), py::arg("seeds"),
+          py::arg("pos"), py::arg("temperature"), py::arg("vocab_size"), py::arg("processed_logits"),
+          py::arg("processed_logits_col"), py::arg("use_fp64"),
+          "Draft token from gathered top-k candidates: temper, top-k (ties kept) / top-p cut, "
+          "(seed, pos, token)-keyed Gumbel draw, the processed row written; int64 ids [T]");
+    m.def("topk_sample", &py_topk_sample, py::arg("logits"), py::arg("top_k"),
+          py::arg("top_p"), py::arg("expanded_idx_mapping"), py::arg("seeds"),
+          py::arg("pos"), py::arg("use_fp64"),
+          "Fused top-k (<= 32, ties kept) / top-p / Gumbel-max sampling; int64 ids [B]");
+    m.def("topk_topp_mask", &py_topk_topp_mask, py::arg("logits"), py::arg("top_k"),
+          py::arg("top_p"),
+          "In-place top-k (<= 32, ties kept) / top-p mask: -inf over the dropped tokens");
     m.def("v2_topk_log_softmax", &py_v2_topk_log_softmax);
     m.def("v2_ranks", &py_v2_ranks);
     m.def("v2_fill_logprob_token_ids", &py_v2_fill_logprob_token_ids);

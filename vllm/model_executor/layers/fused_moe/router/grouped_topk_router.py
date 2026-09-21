@@ -16,6 +16,7 @@ from vllm.model_executor.layers.fused_moe.config import (
 from vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe import (
     rocm_aiter_grouped_topk,
 )
+from vllm.model_executor.layers.fused_moe.router import glm_route_align
 from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
 from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
     fused_topk_bias,
@@ -283,6 +284,26 @@ class GroupedTopKRouter(BaseRouter):
             routed_scaling_factor=self.routed_scaling_factor,
         )
 
+    def _append_fused_shared(
+        self, topk_weights: torch.Tensor, topk_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Fused shared experts on CUDA: the slots [global, global + n) at
+        weight 1.0 after every token's routed slots (renormalized and scaled).
+        AITER's grouped top-k writes them itself."""
+        n = self.num_fused_shared_experts
+        if n == 0 or rocm_aiter_ops.is_fused_moe_enabled():
+            return topk_weights, topk_ids
+        m = topk_ids.shape[0]
+        base = self.global_num_experts
+        shared_ids = torch.arange(
+            base, base + n, dtype=topk_ids.dtype, device=topk_ids.device
+        ).expand(m, n)
+        shared_w = torch.ones((m, n), dtype=topk_weights.dtype, device=topk_weights.device)
+        return (
+            torch.cat([topk_weights, shared_w], dim=-1),
+            torch.cat([topk_ids, shared_ids], dim=-1),
+        )
+
     def _compute_routing(
         self,
         hidden_states: torch.Tensor,
@@ -292,6 +313,10 @@ class GroupedTopKRouter(BaseRouter):
         input_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute routing using grouped top-k."""
+        if glm_route_align.eligible(self, router_logits, indices_type):
+            # One launch: the top-k plus the Marlin block alignment, which
+            # fused_marlin_moe consumes for this batch.
+            return glm_route_align.route(self, router_logits)
 
         def valid_grouping() -> bool:
             # Check if num_experts is greater than num_expert_group
@@ -321,7 +346,7 @@ class GroupedTopKRouter(BaseRouter):
                     renormalize=self.renormalize,
                     indices_type=indices_type,
                 )
-            return topk_weights, topk_ids
+            return self._append_fused_shared(topk_weights, topk_ids)
 
         # Select grouped_topk implementation
         if rocm_aiter_ops.is_fused_moe_enabled():
@@ -346,4 +371,4 @@ class GroupedTopKRouter(BaseRouter):
             e_score_correction_bias=self.e_score_correction_bias,
         )
 
-        return topk_weights, topk_ids
+        return self._append_fused_shared(topk_weights, topk_ids)

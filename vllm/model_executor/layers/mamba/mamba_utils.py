@@ -133,9 +133,17 @@ class MambaStateDtypeCalculator:
         cls,
         model_dtype: ModelDType | torch.dtype,
         mamba_cache_dtype: MambaDType,
+        mamba_ssm_cache_dtype: MambaDType = "auto",
     ) -> tuple[torch.dtype, torch.dtype]:
+        """(conv state, recurrent state). The recurrent state stays fp32
+        unless ``mamba_ssm_cache_dtype`` names another dtype: the KDA
+        kernels load it to fp32 and store through the tensor's dtype, so a
+        bf16 state halves the per-step state traffic (one read and one
+        store per row per layer) at the cost of one rounding per step."""
         state_dtype = get_kv_cache_torch_dtype(mamba_cache_dtype, model_dtype)
-        return (state_dtype, torch.float32)
+        if mamba_ssm_cache_dtype == "auto":
+            return (state_dtype, torch.float32)
+        return (state_dtype, STR_DTYPE_TO_TORCH_DTYPE[mamba_ssm_cache_dtype])
 
 
 class MambaStateShapeCalculator:

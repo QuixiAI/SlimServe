@@ -37,6 +37,9 @@ namespace vllm {
 
 // Maximal number of blocks in allreduce kernel.
 constexpr int kMaxBlocks = 64;
+// Block cap of the GLM-5.3 fused transition (token chunks x dimension
+// blocks); it has its own barrier slots below.
+constexpr int kMhcMaxBlocks = 256;
 
 // Default number of blocks in allreduce kernel.
 #ifndef USE_ROCM
@@ -62,6 +65,11 @@ struct Signal {
   alignas(128) FlagType start[kMaxBlocks][8];
   alignas(128) FlagType end[kMaxBlocks][8];
   alignas(128) FlagType _flag[kMaxBlocks];  // incremental flags for each rank
+  // GLM-5.3 fused transition barriers (glm5_mhc_allreduce.cuh), one slot
+  // per block of its larger grid.
+  alignas(128) FlagType mhc_start[kMhcMaxBlocks][8];
+  alignas(128) FlagType mhc_end[kMhcMaxBlocks][8];
+  alignas(128) FlagType mhc_flag[kMhcMaxBlocks];
   // DSV4 TP-owned mHC projection state. Urgent coefficients are published
   // before the existing end epoch; deferred coefficients are published by the
   // auxiliary stream and made visible by the next existing start epoch.
@@ -112,6 +120,17 @@ struct packed_t {
 };
 
 #define DINLINE __device__ __forceinline__
+
+// Programmatic dependent launch: let the kernel queued behind this one on the
+// stream begin its prologue now (it still blocks in griddepcontrol.wait until
+// this grid has fully completed before touching anything we produce). No-op
+// unless the successor was launched with the programmatic-serialization
+// attribute; no-op below sm_90.
+DINLINE void pdl_launch_dependents() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
+}
 
 // scalar cast functions
 DINLINE float upcast_s(half val) { return __half2float(val); }
@@ -336,6 +355,7 @@ __global__ void __launch_bounds__(512, 1)
   // note: we don't reorder the address so the accumulation order is the same
   // for all ranks, ensuring bitwise identical results
   auto dp = *_dp;
+  pdl_launch_dependents();
   barrier_at_start<ngpus>(sg, self_sg, rank);
   // do the actual reduction
   for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size;
@@ -365,6 +385,7 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_norm_1stage(
   P* out_v = (P*)result;
   const P* w_v = (const P*)weight;
   const int hidden_size = vec_hidden_size * P::size;
+  pdl_launch_dependents();
   barrier_at_start<ngpus>(sg, self_sg, rank);
   for (int token = blockIdx.x; token < num_tokens; token += gridDim.x) {
     const int base = token * vec_hidden_size;
@@ -407,6 +428,7 @@ DINLINE P* get_tmp_buf(Signal* sg) {
 
 #if !defined(USE_ROCM)
 #include "quixicore/serving/mhc_allreduce_ampere.cuh"
+#include "quixicore/serving/glm5_mhc_allreduce.cuh"
 #include "quixicore/serving/dsv4_q2_mhc_ampere.cuh"
 #include "quixicore/serving/mhc_channel_owned_ampere.cuh"
 #include "quixicore/serving/tp_output_owned_ampere.cuh"
@@ -435,6 +457,7 @@ __global__ void __launch_bounds__(512, 1)
     tmps[i] = get_tmp_buf<P>(sg.signals[target]);
   }
   auto tmp_out = tmps[0];
+  pdl_launch_dependents();
   barrier_at_start<ngpus>(sg, self_sg, rank);
 
   // stage 1: reduce scatter
@@ -512,6 +535,13 @@ class CustomAllreduce {
   cudaEvent_t dsv4_q2_progress_done_ = nullptr;
   bool dsv4_mhc_deferred_pending_ = false;
   bool dsv4_q2_progress_enabled_ = false;
+  // GLM-5.3 deferred sinkhorn: forked onto a low-priority stream after each
+  // fused transition, joined before the next consumer (wait_glm5_mhc).
+  cudaStream_t glm5_mhc_stream_ = nullptr;
+  cudaEvent_t glm5_mhc_fork_ = nullptr;
+  cudaEvent_t glm5_mhc_done_ = nullptr;
+  bool glm5_mhc_pending_ = false;
+  bool glm5_mhc_pending_captured_ = false;
 #endif
 
   /**
@@ -1231,6 +1261,116 @@ class CustomAllreduce {
   }
 #endif
 
+#if !defined(USE_ROCM)
+  // GLM-5.3 decode: the TP all-reduce of `input` ([num_tokens, 4096] bf16,
+  // registered or captured like every custom all-reduce input) fused with the
+  // mHC transition; see quixicore/serving/glm5_mhc_allreduce.cuh.
+  // QC_MHC_RS=<tokens>: from that many tokens the fused site exchanges by
+  // reduce-scatter + all-gather (read once per process; 0 = off).
+  static int glm5_mhc_rs_min_tokens() {
+    static const int v = [] {
+      const char* e = std::getenv("QC_MHC_RS");
+      return e != nullptr ? std::atoi(e) : 5;   // default: reduce-scatter exchange from 5 rows (record, 2026-09-17)
+    }();
+    return v;
+  }
+
+  template <bool FUSED_NORM>
+  void allreduce_glm5_mhc(
+      cudaStream_t stream, nv_bfloat16* input, const nv_bfloat16* residual,
+      const float* post_mix, const float* comb_mix, const float* fn,
+      nv_bfloat16* residual_out, float* partial, unsigned int* arrivals,
+      const float* scale, const float* base, float* next_post,
+      float* next_comb, nv_bfloat16* layer_input,
+      const nv_bfloat16* norm_weight, float rms_eps, float hc_eps,
+      float post_multiplier, int sinkhorn_repeat, float norm_eps,
+      int num_tokens) {
+    if (num_tokens <= 0 || num_tokens > glm5_mhc_ar::MAX_TOKENS) {
+      throw std::runtime_error("GLM mHC all-reduce serves 1.." +
+                               std::to_string(glm5_mhc_ar::MAX_TOKENS) +
+                               " tokens");
+    }
+    RankData* ptrs = resolve_rank_data(stream, input);
+    if (glm5_mhc_stream_ == nullptr) {
+      int least_priority = 0;
+      int greatest_priority = 0;
+      CUDACHECK(cudaDeviceGetStreamPriorityRange(&least_priority,
+                                                &greatest_priority));
+      CUDACHECK(cudaStreamCreateWithPriority(
+          &glm5_mhc_stream_, cudaStreamNonBlocking, least_priority));
+      CUDACHECK(cudaEventCreateWithFlags(&glm5_mhc_fork_,
+                                        cudaEventDisableTiming));
+      CUDACHECK(cudaEventCreateWithFlags(&glm5_mhc_done_,
+                                        cudaEventDisableTiming));
+    }
+    // comb_mix is the previous site's deferred output.
+    wait_glm5_mhc(stream);
+    const int mhc_chunks = glm5_mhc_ar::token_chunks(num_tokens);
+    // Reduce-scatter exchange from QC_MHC_RS tokens up (0 = never; the
+    // one-shot peer reads stay the path below it).
+    const bool rs = glm5_mhc_rs_min_tokens() > 0 &&
+                    num_tokens >= glm5_mhc_rs_min_tokens();
+#define GLM5_MHC_AR_LAUNCH(NGPU, RS)                                          \
+  glm5_mhc_ar::allreduce_transition<NGPU, FUSED_NORM, RS>                    \
+      <<<glm5_mhc_ar::NBLOCKS * mhc_chunks, glm5_mhc_ar::THREADS, 0,         \
+         stream>>>(                                                           \
+          ptrs, sg_, self_sg_, residual, post_mix, comb_mix, fn,             \
+          residual_out, partial, arrivals, scale, base, next_post,           \
+          next_comb, layer_input, norm_weight, rms_eps, hc_eps,              \
+          post_multiplier, sinkhorn_repeat, norm_eps, rank_, num_tokens)
+    switch (world_size_) {
+      case 2:
+        if (rs) GLM5_MHC_AR_LAUNCH(2, true); else GLM5_MHC_AR_LAUNCH(2, false);
+        break;
+      case 4:
+        if (rs) GLM5_MHC_AR_LAUNCH(4, true); else GLM5_MHC_AR_LAUNCH(4, false);
+        break;
+      case 8:
+        if (rs) GLM5_MHC_AR_LAUNCH(8, true); else GLM5_MHC_AR_LAUNCH(8, false);
+        break;
+      default:
+        throw std::runtime_error(
+            "GLM mHC all-reduce supports world sizes 2, 4 and 8");
+    }
+#undef GLM5_MHC_AR_LAUNCH
+    CUDACHECK(cudaGetLastError());
+    CUDACHECK(cudaEventRecord(glm5_mhc_fork_, stream));
+    CUDACHECK(cudaStreamWaitEvent(glm5_mhc_stream_, glm5_mhc_fork_, 0));
+    glm5_mhc_ar::sinkhorn_deferred<<<1, glm5_mhc_ar::DEFERRED_THREADS, 0,
+                                     glm5_mhc_stream_>>>(
+        next_comb, num_tokens, hc_eps, sinkhorn_repeat);
+    CUDACHECK(cudaGetLastError());
+    CUDACHECK(cudaEventRecord(glm5_mhc_done_, glm5_mhc_stream_));
+    glm5_mhc_pending_ = true;
+    glm5_mhc_pending_captured_ = stream_capturing(stream);
+  }
+
+  static bool stream_capturing(cudaStream_t stream) {
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+    CUDACHECK(cudaStreamIsCapturing(stream, &status));
+    return status != cudaStreamCaptureStatusNone;
+  }
+
+  // Order `stream` behind the pending deferred sinkhorn, if any. Every
+  // consumer of a fused site's comb output calls this first (the model's
+  // forward ends with one), so eager work is joined before a capture starts
+  // and captured work before the capture ends; crossing that boundary with
+  // a pending sinkhorn is a caller bug, reported rather than deadlocked.
+  void wait_glm5_mhc(cudaStream_t stream) {
+    if (!glm5_mhc_pending_) return;
+    if (stream_capturing(stream) != glm5_mhc_pending_captured_) {
+      throw std::runtime_error(
+          glm5_mhc_pending_captured_
+              ? "GLM mHC deferred sinkhorn left unjoined at the end of a "
+                "CUDA graph capture"
+              : "GLM mHC deferred sinkhorn from eager work still pending "
+                "when a CUDA graph capture started");
+    }
+    CUDACHECK(cudaStreamWaitEvent(stream, glm5_mhc_done_, 0));
+    glm5_mhc_pending_ = false;
+  }
+#endif
+
   ~CustomAllreduce() {
 #if !defined(USE_ROCM)
     if (dsv4_q2_progress_stream_ != nullptr) {
@@ -1244,6 +1384,12 @@ class CustomAllreduce {
       CUDACHECK(cudaEventDestroy(dsv4_mhc_urgent_done_));
       CUDACHECK(cudaEventDestroy(dsv4_mhc_deferred_done_));
       CUDACHECK(cudaStreamDestroy(dsv4_mhc_deferred_stream_));
+    }
+    if (glm5_mhc_stream_ != nullptr) {
+      CUDACHECK(cudaStreamSynchronize(glm5_mhc_stream_));
+      CUDACHECK(cudaEventDestroy(glm5_mhc_fork_));
+      CUDACHECK(cudaEventDestroy(glm5_mhc_done_));
+      CUDACHECK(cudaStreamDestroy(glm5_mhc_stream_));
     }
 #endif
     for (auto [_, ptr] : ipc_handles_) {

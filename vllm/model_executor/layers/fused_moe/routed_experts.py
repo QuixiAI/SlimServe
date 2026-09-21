@@ -52,6 +52,16 @@ class RoutedExperts(PluggableLayer):
     - Executing routed experts via quant_method.apply()
     """
 
+    def _kernel_num_experts(self, moe_config: FusedMoEConfig) -> int:
+        """The expert count the MoE kernels index: the routed experts, plus
+        the fused shared experts that sit after them in this rank's weight
+        stack when no expert map redirects the ids (GLM-5.3's shared expert
+        served as expert E). With expert parallelism the map handles them."""
+        num = moe_config.num_experts
+        if self.expert_map_manager.expert_map is None:
+            num += self.expert_map_manager.num_fused_shared_experts
+        return num
+
     def __init__(
         self,
         layer_name: str,
@@ -89,7 +99,7 @@ class RoutedExperts(PluggableLayer):
         self.ckpt_up_proj_name = ckpt_up_proj_name
         self.expert_map_manager = expert_map_manager
         self.hidden_size = moe_config.hidden_dim
-        self.global_num_experts = moe_config.num_experts
+        self.global_num_experts = self._kernel_num_experts(moe_config)
         self.local_num_experts = moe_config.num_local_experts
         self.params_dtype = params_dtype
 
@@ -182,7 +192,7 @@ class RoutedExperts(PluggableLayer):
     # TODO(bnell): Hack for elastic_ep. Get rid of this
     def _set_moe_config(self, new_moe_config: FusedMoEConfig):
         self.moe_config = new_moe_config
-        self.global_num_experts = new_moe_config.num_experts
+        self.global_num_experts = self._kernel_num_experts(new_moe_config)
         # local experts?
 
     def _get_quant_method(
@@ -290,7 +300,7 @@ class RoutedExperts(PluggableLayer):
         # reinitializes routing tables internally.
         self.expert_map_manager.update(
             self.moe_config.moe_parallel_config,
-            global_num_experts=self.global_num_experts,
+            global_num_experts=self.moe_config.num_experts,
         )
 
         # Update local attributes from ExpertMapManager

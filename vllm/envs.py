@@ -147,7 +147,10 @@ if TYPE_CHECKING:
     VLLM_QWEN4_EXP_FP8_MAIN_KV: bool = False
     VLLM_QWEN4_EXP_TQ_MAIN_KV: bool = False
     VLLM_CUSTOM_AR_ALLOW_PCIE: bool = False
+    VLLM_CUSTOM_AR_MAX_SIZE_MB: int = 8
     VLLM_CUSTOM_AR_PCIE_MAX_BYTES: int = 0
+    VLLM_B12X_DMA_AR_MIN_MB: int = 0
+    VLLM_B12X_DMA_AR_MAX_MB: int = 128
     VLLM_QWEN4_EXP_SKINNY_GEMM: bool = False
     VLLM_QWEN4_EXP_SKINNY_W8: bool = False
     VLLM_GDN_DECODE_KERNEL: Literal["cuda", "triton"] = "cuda"
@@ -1291,12 +1294,32 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_CUSTOM_AR_ALLOW_PCIE": lambda: (
         os.getenv("VLLM_CUSTOM_AR_ALLOW_PCIE", "False").lower() in ("true", "1")
     ),
+    # Custom all-reduce buffer cap in MiB; messages above it fall back to
+    # NCCL. 8 covers decode; a prefill chunk's [tokens, hidden] reduce is
+    # larger (57 MB at 7001 tokens x 4096 bf16) and NCCL's PCIe ring ran it
+    # at 15 GB/s on rtx6000 (notebook 2026-09-07 "Prefill attribution").
+    "VLLM_CUSTOM_AR_MAX_SIZE_MB": lambda: int(
+        os.getenv("VLLM_CUSTOM_AR_MAX_SIZE_MB", "8")
+    ),
     # PCIe-only custom allreduce: payloads above this many bytes fall back to
     # NCCL (0 = no extra cap). The one-shot kernel reads every peer's slice,
     # so it wins only at decode-size payloads: on 4x RTX 3090 (PCIe P2P)
     # 24-25 us vs NCCL 40 us at <=16 KiB, 50+ us from 40 KiB up.
     "VLLM_CUSTOM_AR_PCIE_MAX_BYTES": lambda: int(
         os.getenv("VLLM_CUSTOM_AR_PCIE_MAX_BYTES", "0")
+    ),
+    # b12x PCIe DMA-ring all-reduce (copy-engine reduce-scatter + all-gather
+    # between peers) for eager messages of at least this many MiB; 0 leaves
+    # it off. On 4x RTX PRO 6000 (PCIe 5, no NVLink) it beats the custom
+    # two-shot kernel from ~24 MiB up: 930 us against 1308 us at 33.6 MB,
+    # 1572 against 2230 at 57.3 MB (prefill chunk reductions; notebook
+    # 2026-09-14). Never taken inside a CUDA graph capture.
+    "VLLM_B12X_DMA_AR_MIN_MB": lambda: int(os.getenv("VLLM_B12X_DMA_AR_MIN_MB", "0")),
+    # Largest message the DMA ring stages (its per-rank scratch is 1.5x
+    # this, allocated per communicator); larger reductions fall through to
+    # the custom kernel or NCCL. 128 MiB covers 16K-token chunks.
+    "VLLM_B12X_DMA_AR_MAX_MB": lambda: int(
+        os.getenv("VLLM_B12X_DMA_AR_MAX_MB", "128")
     ),
     # Qwen4Exp on SM 8.6: route the bf16 decode projections through the
     # weight-stationary Triton skinny GEMMs (models/qwen4_exp/nvidia/

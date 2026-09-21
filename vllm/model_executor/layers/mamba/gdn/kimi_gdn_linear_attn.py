@@ -1,3 +1,5 @@
+import os
+import functools
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
@@ -16,13 +18,17 @@ from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig
 from vllm.distributed import divide, get_tensor_model_parallel_rank
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
 )
-from vllm.model_executor.parameter import BasevLLMParameter
+from vllm.model_executor.parameter import (
+    BasevLLMParameter,
+    BlockQuantScaleParameter,
+)
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
@@ -45,8 +51,16 @@ from ..mamba_utils import (
 from ..ops.causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 from ..ops.gather_initial_states import gather_initial_states
 
+logger = init_logger(__name__)
+
 # Empirical lower bound for the KDA gate to avoid numerical underflow.
 _KDA_GATE_LOGBOUND_MIN = -5.0
+
+
+@functools.cache
+def _kda_direct_out() -> bool:
+    # QC_KDA_DIRECT_OUT=0 restores the read-out copy (A/B switch).
+    return os.environ.get("QC_KDA_DIRECT_OUT", "1") != "0"
 
 
 def _apply_kda_output_norm(
@@ -82,6 +96,53 @@ def _materialize_kda_gate_and_beta(
     else:
         gate = -decay * F.softplus(gate_input)
     return gate, raw_beta.float().sigmoid()
+
+
+def _use_kda_block() -> bool:
+    """The fused decode block (QuixiCore kda_block_decode: conv + gate GEMVs
+    + recurrence + gated RMS norm in one cluster launch per layer) on CUDA.
+    Default on; QC_KDA_BLOCK=0 keeps the four Triton kernels. The block takes
+    a batch only while it fits one wave of clusters (kda_block_serves: up to
+    about five requests at 16 heads on sm_120), where it is 1.5-3.5 us per
+    layer faster than the Triton chain (perf/optimization_status.md,
+    "Phase 9 / F1"); larger batches are bandwidth-bound on the state and
+    keep the Triton chain."""
+    import os
+
+    if os.environ.get("QC_KDA_BLOCK", "1") == "0" or not current_platform.is_cuda():
+        return False
+    try:
+        from vllm.quixicore.ops import quixicore_ops
+
+        return quixicore_ops.has_kda_block()
+    except ImportError:
+        return False
+
+
+_kda_block_announced: set[bool] = set()
+
+
+def _kda_block_announce(served: bool, pairs: int, rows: int) -> None:
+    """One boot-log line per outcome, so a serving log shows whether the
+    block ran or the batch went back to the Triton chain and why."""
+    if served in _kda_block_announced:
+        return
+    _kda_block_announced.add(served)
+    if served:
+        logger.info(
+            "Using the QuixiCore KDA decode block (first batch: %d request x head "
+            "pairs, up to %d rows per request)",
+            pairs,
+            rows,
+        )
+    else:
+        logger.info(
+            "QuixiCore KDA decode block not used for a decode batch of %d request "
+            "x head pairs (up to %d rows): past one wave of clusters, the Triton "
+            "chain serves it",
+            pairs,
+            rows,
+        )
 
 
 def _use_recurrent_kda_prefill() -> bool:
@@ -185,6 +246,7 @@ class _KimiGDNMergedColumnParallelLinear(MergedColumnParallelLinear):
         output_sizes: list[int],
         replicated_shard_id: int | tuple[int, ...],
         tp_size: int,
+        padded_shard: tuple[int, int] | None = None,
         **kwargs,
     ) -> None:
         self.replicated_shard_ids = (
@@ -192,10 +254,31 @@ class _KimiGDNMergedColumnParallelLinear(MergedColumnParallelLinear):
             if isinstance(replicated_shard_id, int)
             else replicated_shard_id
         )
+        # (shard id, rows): a replicated shard whose checkpoint tensor has
+        # fewer rows than its slot; the loader zero-pads it (block-quantized
+        # merged weights need every shard to fill whole scale blocks).
+        self.padded_shard = padded_shard
         output_sizes = output_sizes.copy()
         for shard_id in self.replicated_shard_ids:
             output_sizes[shard_id] *= tp_size
         super().__init__(input_size, output_sizes, **kwargs)
+
+    def _pad_shard(
+        self, param: torch.Tensor, loaded_weight: torch.Tensor, loaded_shard_id
+    ) -> torch.Tensor:
+        if self.padded_shard is None or loaded_shard_id != self.padded_shard[0]:
+            return loaded_weight
+        if isinstance(param, BlockQuantScaleParameter) or loaded_weight.dim() < 2:
+            return loaded_weight  # one scale row already covers the block
+        output_dim = getattr(param, "output_dim", 0)
+        short = self.padded_shard[1] - loaded_weight.shape[output_dim]
+        if short <= 0:
+            return loaded_weight
+        pad_shape = list(loaded_weight.shape)
+        pad_shape[output_dim] = short
+        return torch.cat(
+            [loaded_weight, loaded_weight.new_zeros(pad_shape)], dim=output_dim
+        )
 
     def weight_loader(
         self,
@@ -209,6 +292,7 @@ class _KimiGDNMergedColumnParallelLinear(MergedColumnParallelLinear):
             self.tp_rank = 0
             if param_tp_rank is not None:
                 param.tp_rank = 0
+        loaded_weight = self._pad_shard(param, loaded_weight, loaded_shard_id)
         try:
             super().weight_loader(param, loaded_weight, loaded_shard_id)
         finally:
@@ -228,6 +312,7 @@ class _KimiGDNMergedColumnParallelLinear(MergedColumnParallelLinear):
             self.tp_rank = 0
             if param_tp_rank is not None:
                 param.tp_rank = 0
+        loaded_weight = self._pad_shard(param, loaded_weight, loaded_shard_id)
         try:
             super().weight_loader_v2(param, loaded_weight, loaded_shard_id)
         finally:
@@ -244,7 +329,9 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         if self.model_config is None or self.cache_config is None:
             raise ValueError("model_config and cache_config must be set")
         return MambaStateDtypeCalculator.kda_state_dtype(
-            self.model_config.dtype, self.cache_config.mamba_cache_dtype
+            self.model_config.dtype,
+            self.cache_config.mamba_cache_dtype,
+            self.cache_config.mamba_ssm_cache_dtype,
         )
 
     def get_state_shape(
@@ -264,6 +351,8 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         vllm_config: VllmConfig,
         prefix: str = "",
         fuse_gate_a: bool = False,
+        beta_block_rows: int | None = None,
+        reduce_results: bool = True,
     ) -> None:
         super().__init__(config, vllm_config, prefix)
 
@@ -307,17 +396,36 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.in_proj_padding = 0
             if self.fuse_gate_a:
                 in_proj_output_sizes.append(self.head_dim)
+        # Block-quantized merged projection (GLM-5.3-Flash FP8 swap-set): the
+        # beta shard is one row per head, smaller than a 128-row scale block
+        # and unsplittable by the block-scale loader, so it becomes a
+        # replicated whole block of rows (the checkpoint's [num_heads, K]
+        # zero-padded on load) and each rank reads its heads from it. Every
+        # shard of the merged weight then fills whole scale blocks.
+        self.beta_block_rows = beta_block_rows
+        replicated = (4, 5) if self.fuse_gate_a else 4
+        padded_shard = None
+        if beta_block_rows is not None:
+            assert not self.use_full_rank_gate, "whole-block beta: low-rank gate only"
+            assert beta_block_rows >= self.num_heads
+            in_proj_output_sizes[3] = beta_block_rows
+            replicated = (3, 4, 5) if self.fuse_gate_a else (3, 4)
+            padded_shard = (3, beta_block_rows)
         self.in_proj_qkvgfab = _KimiGDNMergedColumnParallelLinear(
             self.hidden_size,
             in_proj_output_sizes,
-            replicated_shard_id=(4, 5) if self.fuse_gate_a else 4,
+            replicated_shard_id=replicated,
             tp_size=self.tp_size,
+            padded_shard=padded_shard,
             bias=False,
             quant_config=self.quant_config,
             prefix=f"{prefix}.in_proj_qkvgfab",
         )
         if self.in_proj_padding:
-            self.in_proj_qkvgfab.weight.data[-self.in_proj_padding :].zero_()
+            # Quantized (packed) projections carry their own parameter names;
+            # their padding rows are zero-filled by the sidecar loader.
+            if hasattr(self.in_proj_qkvgfab, "weight"):
+                self.in_proj_qkvgfab.weight.data[-self.in_proj_padding :].zero_()
 
         self.f_b_proj = ColumnParallelLinear(
             self.head_dim,
@@ -405,12 +513,21 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             and self.g_b_proj.weight.dtype == torch.bfloat16
         )
         self.o_norm = FusedRMSNormGated(self.head_dim, activation="sigmoid")
+        # The fused decode block takes the paired-gate inputs (f_a, g_a) and
+        # runs the whole decode glue of the layer in one launch.
+        self.use_kda_block = (
+            self.use_paired_gate_projection
+            and self.conv_size == 4
+            and self.head_dim == 128
+            and _use_kda_block()
+        )
         self.o_proj = RowParallelLinear(
             self.projection_size,
             self.hidden_size,
             bias=False,
             quant_config=self.quant_config,
             prefix=f"{prefix}.o_proj",
+            reduce_results=reduce_results,
         )
 
         compilation_config = vllm_config.compilation_config
@@ -455,14 +572,30 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         else:
             split_sizes = [
                 3 * self.local_projection_size,
-                self.local_num_heads,
+                self.beta_block_rows or self.local_num_heads,
                 self.head_dim,
             ]
             if self.fuse_gate_a:
                 split_sizes.append(self.head_dim)
             projected = projected_qkvgfab.split(split_sizes, dim=-1)
             mixed_qkv, beta, f_a = projected[:3]
+            if self.beta_block_rows is not None:
+                # Replicated whole-block beta: this rank's heads.
+                start = get_tensor_model_parallel_rank() * self.local_num_heads
+                beta = beta[..., start : start + self.local_num_heads]
             g_a = projected[3] if self.fuse_gate_a else self.g_a_proj(hidden_states)[0]
+            if self.use_kda_block:
+                core_attn_out = torch.empty(
+                    (1, num_tokens, self.local_num_heads, self.head_dim),
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device,
+                )
+                torch.ops.vllm.kda_attention_block(
+                    mixed_qkv, f_a, g_a, beta.unsqueeze(0), core_attn_out, self.prefix
+                )
+                core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
+                output[:] = self.o_proj(core_attn_out)[0]
+                return
             if self.use_paired_gate_projection:
                 g1, g_proj_states = torch.ops.vllm.kda_gate_pair(
                     f_a, g_a, self.f_b_proj.weight, self.g_b_proj.weight
@@ -493,6 +626,150 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
         core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
         output[:] = self.o_proj(core_attn_out)[0]
+
+    @eager_break_during_capture
+    def _forward_block(
+        self,
+        mixed_qkv: torch.Tensor,
+        f_a: torch.Tensor,
+        g_a: torch.Tensor,
+        beta: torch.Tensor,
+        core_attn_out: torch.Tensor,
+    ) -> None:
+        """Decode batches the block takes (kda_block_serves) run through
+        kda_block_decode; anything else (prefill, more than 8 rows per
+        request, a batch past one wave of clusters) through the gate pair and
+        _forward."""
+        forward_context = get_forward_context()
+        attn_metadata_raw = forward_context.attn_metadata
+        if attn_metadata_raw is None:
+            return
+        assert isinstance(attn_metadata_raw, dict)
+        m = attn_metadata_raw[self.prefix]
+        assert isinstance(m, GDNAttentionMetadata)
+        spec_rows = (
+            m.spec_state_indices_tensor.size(-1)
+            if m.spec_sequence_masks is not None
+            and m.spec_state_indices_tensor is not None
+            else 1
+        )
+        conv_state, recurrent_state = self.kv_cache
+        served = m.num_prefills == 0 and spec_rows <= 8
+        if served:
+            from vllm.quixicore.ops import quixicore_ops as qc
+
+            pairs = max(m.num_spec_decodes, m.num_decodes) * self.local_num_heads
+            served = qc.kda_block_serves(
+                pairs,
+                spec_rows,
+                conv_state.dtype == torch.bfloat16,
+                recurrent_state.dtype == torch.bfloat16,
+            )
+            _kda_block_announce(served, pairs, spec_rows)
+        if not served:
+            g1, g2 = torch.ops.vllm.kda_gate_pair(
+                f_a, g_a, self.f_b_proj.weight, self.g_b_proj.weight
+            )
+            g1 = rearrange(g1, "n (h d) -> 1 n h d", d=self.head_dim)
+            g2 = rearrange(g2, "n (h d) -> n h d", d=self.head_dim)
+            self._forward(
+                mixed_qkv=mixed_qkv, g1=g1, g2=g2, beta=beta, core_attn_out=core_attn_out
+            )
+            return
+        num_actual_tokens = m.num_actual_tokens
+        mixed_qkv = mixed_qkv[:num_actual_tokens]
+        f_a = f_a[:num_actual_tokens]
+        g_a = g_a[:num_actual_tokens]
+        beta = beta[:, :num_actual_tokens]
+        if not is_conv_state_dim_first():
+            conv_state = conv_state.transpose(-1, -2)
+        conv_weights = self.conv1d.weight.view(
+            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+        )
+        lower_bound = self.gate_lower_bound
+        common = dict(
+            conv_state=conv_state,
+            conv_weight=conv_weights,
+            f_w=self.f_b_proj.weight,
+            g_w=self.g_b_proj.weight,
+            A_log=self.A_log,
+            dt_bias=self.dt_bias,
+            state=recurrent_state,
+            norm_w=self.o_norm.weight,
+            scale=self.head_dim**-0.5,
+            lower_bound=lower_bound if lower_bound is not None else 0.0,
+            use_lower_bound=lower_bound is not None,
+            eps=self.o_norm.eps,
+        )
+        spec_out = non_spec_out = None
+        mixed_batch = m.spec_sequence_masks is not None and m.num_decodes > 0
+        if m.spec_sequence_masks is not None:
+            assert m.spec_state_indices_tensor is not None
+            assert m.spec_query_start_loc is not None
+            if mixed_batch:
+                idx = m.spec_token_indx
+                rows = (
+                    mixed_qkv.index_select(0, idx),
+                    f_a.index_select(0, idx),
+                    g_a.index_select(0, idx),
+                    beta.index_select(1, idx),
+                )
+                spec_out = torch.empty(
+                    (1, rows[0].size(0), self.local_num_heads, self.head_dim),
+                    dtype=core_attn_out.dtype,
+                    device=core_attn_out.device,
+                )
+            else:
+                rows = (mixed_qkv, f_a, g_a, beta)
+                spec_out = core_attn_out[:, :num_actual_tokens]
+            qc.kda_block_decode(
+                rows[0],
+                conv_idx=m.spec_state_indices_tensor[:, 0][: m.num_spec_decodes],
+                f_a=rows[1],
+                g_a=rows[2],
+                raw_beta=rows[3],
+                state_indices=m.spec_state_indices_tensor,
+                cu_seqlens=m.spec_query_start_loc[: m.num_spec_decodes + 1],
+                accepted=m.num_accepted_tokens,
+                out=spec_out,
+                **common,
+            )
+        if m.spec_sequence_masks is None or mixed_batch:
+            assert m.non_spec_state_indices_tensor is not None
+            if mixed_batch:
+                idx = m.non_spec_token_indx
+                rows = (
+                    mixed_qkv.index_select(0, idx),
+                    f_a.index_select(0, idx),
+                    g_a.index_select(0, idx),
+                    beta.index_select(1, idx),
+                )
+                non_spec_out = torch.empty(
+                    (1, rows[0].size(0), self.local_num_heads, self.head_dim),
+                    dtype=core_attn_out.dtype,
+                    device=core_attn_out.device,
+                )
+            else:
+                rows = (mixed_qkv, f_a, g_a, beta)
+                non_spec_out = core_attn_out[:, :num_actual_tokens]
+            n_rows = rows[0].size(0)
+            qc.kda_block_decode(
+                rows[0],
+                conv_idx=m.non_spec_state_indices_tensor[:n_rows],
+                f_a=rows[1],
+                g_a=rows[2],
+                raw_beta=rows[3],
+                state_indices=m.non_spec_state_indices_tensor[:n_rows],
+                cu_seqlens=None,
+                accepted=None,
+                out=non_spec_out,
+                **common,
+            )
+        if mixed_batch:
+            assert spec_out is not None and non_spec_out is not None
+            merged = core_attn_out[0, :num_actual_tokens]
+            merged.index_copy_(0, m.spec_token_indx, spec_out[0])
+            merged.index_copy_(0, m.non_spec_token_indx, non_spec_out[0])
 
     @eager_break_during_capture
     def _forward(
@@ -721,8 +998,10 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                         use_qk_l2norm_in_kernel=True,
                         cu_seqlens=non_spec_query_start_loc,
                     )
+                    # The chunk kernel returns fp32 states; the cache may be
+                    # bf16 (mamba_ssm_cache_dtype), so store through its dtype.
                     recurrent_state[non_spec_state_indices_tensor] = (
-                        last_recurrent_state
+                        last_recurrent_state.to(recurrent_state.dtype)
                     )
 
             else:
@@ -748,6 +1027,10 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                     validate_data=True,
                     out=packed_conv_out,
                 )
+                # A pure decode batch reads out straight into core_attn_out
+                # (one D2D copy per layer per step otherwise: 0.7 us in the
+                # 2026-09-18 c1 trace); a mixed batch merges by index below.
+                direct = core_attn_out_spec is None and _kda_direct_out()   # the spec rows (if any) ran above
                 core_attn_out_non_spec, _ = fused_recurrent_kda_packed_decode(
                     mixed_qkv=mixed_qkv_ns,
                     raw_g=g1_ns,
@@ -757,6 +1040,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                     lower_bound=self.gate_lower_bound,
                     initial_state=recurrent_state,
                     state_indices=decode_conv_indices,
+                    out=core_attn_out[:, :num_actual_tokens] if direct else None,
                 )
 
         # ---------- merge spec and non-spec outputs ----------
@@ -771,9 +1055,10 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             merged.index_copy_(1, non_spec_token_indx, core_attn_out_non_spec)
             core_attn_out[0, :num_actual_tokens] = merged[0, :num_actual_tokens]
         elif core_attn_out_non_spec is not None:
-            core_attn_out[0, :num_actual_tokens] = core_attn_out_non_spec[
-                0, :num_actual_tokens
-            ]
+            if core_attn_out_non_spec.data_ptr() != core_attn_out.data_ptr():
+                core_attn_out[0, :num_actual_tokens] = core_attn_out_non_spec[
+                    0, :num_actual_tokens
+                ]
         else:
             assert core_attn_out_spec is not None
         _apply_kda_output_norm(self.o_norm, core_attn_out, g2)
@@ -809,4 +1094,37 @@ direct_register_custom_op(
     op_func=kda_attention,
     mutates_args=["core_attn_out"],
     fake_impl=kda_attention_fake,
+)
+
+
+def kda_attention_block(
+    mixed_qkv: torch.Tensor,
+    f_a: torch.Tensor,
+    g_a: torch.Tensor,
+    beta: torch.Tensor,
+    core_attn_out: torch.Tensor,
+    layer_name: str,
+) -> None:
+    layer = get_forward_context().no_compile_layers[layer_name]
+    layer._forward_block(
+        mixed_qkv=mixed_qkv, f_a=f_a, g_a=g_a, beta=beta, core_attn_out=core_attn_out
+    )
+
+
+def kda_attention_block_fake(
+    mixed_qkv: torch.Tensor,
+    f_a: torch.Tensor,
+    g_a: torch.Tensor,
+    beta: torch.Tensor,
+    core_attn_out: torch.Tensor,
+    layer_name: str,
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="kda_attention_block",
+    op_func=kda_attention_block,
+    mutates_args=["core_attn_out"],
+    fake_impl=kda_attention_block_fake,
 )

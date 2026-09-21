@@ -11,6 +11,11 @@ import torch
 import torch.nn.functional as F
 
 from vllm.triton_utils import tl, triton
+
+# Programmatic dependent launch: see vllm/triton_utils/pdl.py.
+from vllm.triton_utils.pdl import PDL as _PDL  # noqa: E402
+from vllm.triton_utils.pdl import gdc_launch_dependents, gdc_wait  # noqa: E402, F401
+
 from vllm.utils.torch_utils import direct_register_custom_op
 
 
@@ -28,7 +33,12 @@ def _gate_pair_kernel(
     SG: tl.constexpr,
     BM: tl.constexpr,
     BN: tl.constexpr,
+
+    PDL: tl.constexpr = False,
 ):
+    if PDL:
+        gdc_launch_dependents()
+        gdc_wait()
     group = tl.program_id(2)
     ap = tl.where(group == 0, AF, AG)
     wp = tl.where(group == 0, WF, WG)
@@ -90,6 +100,9 @@ def kda_gate_pair(
         16,
         bn,
         num_warps=4,
+    
+        PDL=_PDL,
+        launch_pdl=_PDL,
     )
     return out_f, out_g
 

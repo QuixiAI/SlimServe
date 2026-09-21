@@ -12,6 +12,11 @@ import torch
 
 from vllm.third_party.flash_linear_attention.ops.op import exp, log
 from vllm.triton_utils import tl, triton
+
+# Programmatic dependent launch: see vllm/triton_utils/pdl.py.
+from vllm.triton_utils.pdl import PDL as _PDL  # noqa: E402
+from vllm.triton_utils.pdl import gdc_launch_dependents, gdc_wait  # noqa: E402, F401
+
 from vllm.utils.math_utils import cdiv, next_power_of_2
 
 
@@ -167,7 +172,12 @@ def fused_recurrent_kda_fwd_kernel(
     USE_LOWER_BOUND: tl.constexpr,
     num_stages: tl.constexpr,
     STORE_STATES: tl.constexpr = True,
+
+    PDL: tl.constexpr = False,
 ):
+    if PDL:
+        gdc_launch_dependents()
+        gdc_wait()
     pid = tl.program_id(0)
     i_v = pid % tl.cdiv(V, BV)
     i_nh = pid // tl.cdiv(V, BV)
@@ -331,7 +341,12 @@ def fused_recurrent_kda_commit_kernel(
     HAS_DT_BIAS: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
     num_stages: tl.constexpr,
+
+    PDL: tl.constexpr = False,
 ):
+    if PDL:
+        gdc_launch_dependents()
+        gdc_wait()
     """Deferred commit for the speculative path: replay the ACCEPTED rows of
     the step from the state the forward started at and store only what the
     next step and the align bookkeeping read - the state after the last
@@ -483,6 +498,9 @@ def fused_recurrent_kda_commit(
         APPLY_BETA_SIGMOID=True,
         num_warps=num_warps,
         num_stages=2,
+    
+        PDL=_PDL,
+        launch_pdl=_PDL,
     )
 
 def fused_recurrent_kda_fwd(
@@ -580,6 +598,9 @@ def fused_recurrent_kda_fwd(
         num_warps=num_warps,
         num_stages=2,
         STORE_STATES=store_states,
+    
+        PDL=_PDL,
+        launch_pdl=_PDL,
     )
     return out, initial_state
 
@@ -667,7 +688,12 @@ def fused_recurrent_kda_packed_decode_kernel(
     BV: tl.constexpr,
     SOFTPLUS_THRESHOLD: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
+
+    PDL: tl.constexpr = False,
 ):
+    if PDL:
+        gdc_launch_dependents()
+        gdc_wait()
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
 
@@ -744,8 +770,11 @@ def fused_recurrent_kda_packed_decode(
     initial_state: torch.Tensor,
     state_indices: torch.Tensor,
     scale: float | None = None,
+    out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run one-token KDA decode directly from packed post-conv QKV."""
+    """Run one-token KDA decode directly from packed post-conv QKV. ``out``
+    ([1, B, H, V], contiguous) receives the read-out in place; without it a
+    fresh tensor is returned (and the caller copies it once more)."""
     if mixed_qkv.ndim != 2 or mixed_qkv.stride(-1) != 1:
         raise ValueError("`mixed_qkv` must be 2D and contiguous in its last dim.")
     if raw_g.ndim != 4 or raw_g.shape[0] != 1:
@@ -805,7 +834,10 @@ def fused_recurrent_kda_packed_decode(
     if scale is None:
         scale = K**-0.5
 
-    out = torch.empty((1, B, H, V), dtype=mixed_qkv.dtype, device=device)
+    if out is None:
+        out = torch.empty((1, B, H, V), dtype=mixed_qkv.dtype, device=device)
+    elif out.shape != (1, B, H, V) or not out.is_contiguous() or out.dtype != mixed_qkv.dtype:
+        raise ValueError("`out` must be a contiguous [1, B, H, V] tensor of the input dtype.")
     grid = (cdiv(V, BV), B * H)
     fused_recurrent_kda_packed_decode_kernel[grid](
         mixed_qkv=mixed_qkv,
@@ -831,5 +863,8 @@ def fused_recurrent_kda_packed_decode(
         USE_LOWER_BOUND=lower_bound is not None,
         num_warps=decode_warps,
         num_stages=2,
+    
+        PDL=_PDL,
+        launch_pdl=_PDL,
     )
     return out, initial_state

@@ -40,7 +40,9 @@ def _config(
             max_cudagraph_capture_size=max_capture,
         ),
         parallel_config=SimpleNamespace(
-            data_parallel_size=1, tensor_parallel_size=1
+            data_parallel_size=1,
+            data_parallel_replicate_moe=False,
+            tensor_parallel_size=1,
         ),
         speculative_config=speculative,
         num_speculative_tokens=num_spec_tokens,
@@ -57,13 +59,20 @@ def manager_factory(monkeypatch):
         Mock(return_value=None),
     )
 
-    def build(decode_query_len, schedule=None, num_spec_tokens=2,
-              capture_sizes=None, max_capture=128, max_num_seqs=32):
+    def build(
+        decode_query_len,
+        schedule=None,
+        num_spec_tokens=2,
+        capture_sizes=None,
+        max_capture=128,
+        max_num_seqs=32,
+    ):
         if capture_sizes is None:
             capture_sizes = [1, 2, 4, 8] + list(range(16, max_capture + 1, 8))
         mgr = CudaGraphManager(
-            _config(capture_sizes, max_capture, max_num_seqs, schedule,
-                    num_spec_tokens),
+            _config(
+                capture_sizes, max_capture, max_num_seqs, schedule, num_spec_tokens
+            ),
             torch.device("cpu"),
             CUDAGraphMode.FULL_DECODE_ONLY,
             decode_query_len,
@@ -92,8 +101,7 @@ def test_dynamic_schedule_padding_crosses_family_boundaries(manager_factory):
     """The 60-token qlen-3 case: the nearest capture key belongs to the
     qlen-4 family, but a compatible qlen-3 graph exists two slots up."""
     schedule = [[1, 4, 3], [5, 32, 2]]
-    mgr = manager_factory(decode_query_len=4, schedule=schedule,
-                          num_spec_tokens=3)
+    mgr = manager_factory(decode_query_len=4, schedule=schedule, num_spec_tokens=3)
     desc = mgr.dispatch(20, 60, 3, 0)
     assert desc.cg_mode == CUDAGraphMode.FULL, "qlen-3 batch fell to eager"
     assert desc.uniform_token_count == 3
@@ -126,6 +134,30 @@ def test_dynamic_schedule_padding_crosses_family_boundaries(manager_factory):
                 )
 
 
+def test_spec_manager_serves_one_token_batches(manager_factory):
+    """A speculative target manager (query length 1+k) also captures 1-wide
+    graphs: the prompt tail of a prefix-cache replay and an empty-draft
+    decode are 1-token uniform batches, and ran eager without one."""
+    mgr = manager_factory(decode_query_len=4, num_spec_tokens=3, max_num_seqs=16)
+    desc = mgr.dispatch(1, 1, 1, 0)
+    assert desc.cg_mode == CUDAGraphMode.FULL
+    assert desc.uniform_token_count == 1 and desc.num_tokens == 1
+    desc = mgr.dispatch(16, 16, 1, 0)
+    assert desc.cg_mode == CUDAGraphMode.FULL
+    assert desc.uniform_token_count == 1 and desc.num_reqs == 16
+    # The 1-wide family stops at the request ceiling.
+    one_wide = {
+        d.num_tokens
+        for descs in mgr._candidates.values()
+        for d in descs
+        if d.cg_mode == CUDAGraphMode.FULL and d.uniform_token_count == 1
+    }
+    assert one_wide == {1, 2, 4, 8, 16}
+    # The (1+k)-wide family is untouched.
+    desc = mgr.dispatch(4, 16, 4, 0)
+    assert desc.cg_mode == CUDAGraphMode.FULL and desc.uniform_token_count == 4
+
+
 def test_non_uniform_batch_is_eager_in_full_decode_only(manager_factory):
     mgr = manager_factory(decode_query_len=3)
     desc = mgr.dispatch(20, 61, None, 0)
@@ -133,8 +165,11 @@ def test_non_uniform_batch_is_eager_in_full_decode_only(manager_factory):
 
 
 def test_over_ceiling_is_eager(manager_factory):
-    mgr = manager_factory(decode_query_len=3, max_capture=64,
-                          capture_sizes=[1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64])
+    mgr = manager_factory(
+        decode_query_len=3,
+        max_capture=64,
+        capture_sizes=[1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64],
+    )
     desc = mgr.dispatch(32, 96, 3, 0)
     assert desc.cg_mode == CUDAGraphMode.NONE
 
@@ -143,8 +178,7 @@ def test_drafter_manager_survives_dynamic_schedule(manager_factory):
     """The drafter's manager (query length 1, smaller than the schedule's
     implied lengths) must not derive zero/negative query lengths."""
     schedule = [[1, 4, 3], [5, 32, 2]]
-    mgr = manager_factory(decode_query_len=1, schedule=schedule,
-                          num_spec_tokens=3)
+    mgr = manager_factory(decode_query_len=1, schedule=schedule, num_spec_tokens=3)
     desc = mgr.dispatch(8, 8, 1, 0)
     assert desc.cg_mode == CUDAGraphMode.FULL
     assert desc.uniform_token_count == 1

@@ -1,0 +1,1558 @@
+# GLM-5.3-Flash NVFP4 on 4x RTX PRO 6000 Blackwell (sm_120): campaign handoff
+
+Status: CAMPAIGN COMPLETE 2026-09-12 (Phases 0-6; section 12b is the log,
+section 13 the next command). Branch `glm53f-rtx6000`, cut from `upstream/main`
+2b355117e (QuixiAI/SlimServe, 2026-09-11), merged with upstream/main 9d76a981b
+on 2026-09-12. Sections 0-11 are the regimen, rubric and roadmap as written
+before the work; where a result overrides them, the log wins. The
+running notebook is `perf/optimization_status.md`, record rows go in
+`perf/baseline_status.md`, raw logs under `perf/results/YYYY-MM-DD/<run-id>/`.
+
+Owner of the machine and the decisions: the operator (auroter). Commit identity
+for this branch: `Auroter <auroter@users.noreply.github.com>`, no co-author or
+assistance trailers, no mention of automated assistance (CLAUDE.md names Eric
+Hartford as the sole author for his own commits; on this box the operator's
+identity is used, per the operator's 2026-09-09 instruction).
+
+## 0. Mission
+
+Serve **GLM-5.3-Flash** from **`RedHatAI/GLM-5.3-Flash-NVFP4`** (NVFP4 group-16
+routed experts, FP8 tail layer, BF16 backbone as shipped) on **tinybox** (4x
+RTX PRO 6000 Blackwell Workstation, sm_120, PCIe 5 x16, no NVLink, driver
+610.43.02 = CUDA 13.3 since 2026-09-11) through a new `rtx6000` record of the registry profile
+`glm53f-nvfp4-4`, and make that record the fastest way to run this model,
+quant and card combination anywhere: decode (single-stream and concurrent) and
+prefill both measured, both beating the published external stacks, with the
+QuixiCore kernels tuned for exactly this hardware.
+
+The operator's definition of the work (2026-09-11): research-led kernel
+optimization, prioritized by expected end-to-end gain, tested only to validate
+that a change helps, journaled the way the earlier campaigns were journaled,
+carried as far as it practically goes without diminishing-returns sweeps or
+validation-for-its-own-sake, and finished with a reviewable PR.
+
+"Done" means: a Phase 6 PR against `QuixiAI/SlimServe` main that carries the
+`rtx6000` record, its kernels, their tests, and notebook entries with the
+retained numbers; every retained kernel ported to QuixiCore-CUDA; and a
+baseline row that beats the local B12X control in every cell on our own
+protocol and the physics-derived targets in section 4 where the notebook
+proves they are reachable.
+
+## 1. The previous campaign (Codex, 2026-09-04 to 2026-09-11): what to keep
+
+The prior agent ran on the deleted branch `glm53-flash-sm120` (277 commits
+past upstream/main, 365 files, 83K lines added). Its five closed review PRs
+(#24 to #28 on QuixiAI/SlimServe) are still fetchable as
+`refs/pull/{24,25,26,27,28}/head`; locally they are `upstream/pr/24` (tip
+24561e742) and `upstream/pr/26` (kernels). The early state (Sep 4, 28 commits)
+survives as the local branch `glm53-flash-sm120-mtp`. Nothing from it is on
+this branch.
+
+### 1a. What it measured (rtx6000 record, no speculation, exact-token 1000/300, aggregate output tok/s c1 / c8 / c16)
+
+| step | change | c1 | c8 | c16 | how measured |
+|---|---|---:|---:|---:|---|
+| Phase 0 | a100 kernel set built for 12.0f; BF16 backbone, Marlin W4A16 experts, NCCL ring AR | 104.8 | 431.4 | 591.0 | two passes, one boot |
+| 1 | F32 sidecar (native F32 router bias, KDA A_log/dt_bias, mHC base/scale; RedHatAI downcast them) | neutral | neutral | neutral | quality +0.03 nats |
+| 2 | KDA o_norm through the Triton kernel instead of the decomposed forward | 110.1 | 444.6 | 603.0 | +5.0 / +3.0 / +2.0 % |
+| 3 | g_a folded into in_proj; f_b + g_b as one strided bmm | 112.0 | 446.3 | 607.9 | launch count |
+| 4 | router gate through a QuixiCore bf16-in/fp32-out GEMV; indexer wk/gate/weights_proj folded into fused_qkv_a | 113.3 | 456.3 | 609.9 | +1.0 / +1.3 % |
+| 5 | fused small-M routing + Marlin alignment (`glm_route_align`), Marlin workspace once per device, `moe_sum_add` combine | ~113 | ~456 | ~610 | profiler pair: -81 -37 -80 launches, -2 % step |
+| 6 | bf16 M<=16 tensor-core decode GEMM on backbone projections (in place of cuBLAS) | 117.4 | 467.4 | 617.5 | +1.5 / +1.3 / +0.7 % like-state |
+| 7 | FP8 swap-set: ZAI's native e4m3 block-128 tensors for dense MLP, shared experts, DSA q_b/o_proj, on a W8A16 decode GEMM | 123.8 | 478.2 | 627.5 | +5.5 / +2.0 / +1.1 % |
+| 8 | vLLM custom all-reduce over PCIe P2P (`VLLM_CUSTOM_AR_ALLOW_PCIE=1`; 5.1 us vs NCCL 11.2 us per reduction) | 137.4 | 499 | 657 | +11.0 / +4.4 / +4.7 % |
+| 9 | self-quantized FP8 KDA in_proj/o_proj (ZAI kept them BF16; NLL gate passed at -0.014 nats) | ~152 | ~519 | ~679 | +10.6 / +4.5 / +2.6 % |
+| 10 | small-k sampler fix; mHC cooperative launch for T<=8 as default | ~157 | ~531 | ~685 | predicted from pairs |
+| 11 | sparse MLA decode: 32/64-token partitions + one-thread-per-channel reducer | **162.8** | **534.5** | **691.0** | +3.7 / +0.7 / +0.9 %; best fast-state boot |
+| 12 | custom AR max size 8 -> 64 MiB (prefill chunks stop falling back to NCCL) | 162.8 | 550.4 | 698.0 | c8 prefill -14 % |
+| final | merged-tree cold-prefix protocol (E2E incl. prefill, three repeats) | 156.8 | 577.5 | 781.7 | different protocol; not comparable to the rows above |
+
+Prefill: TP-row-sharded indexer prefill (from vLLM #54951) cut cold 128K
+engine TTFT from 10.66 s to 10.01 s; the H16 BF16 swapAB sparse prefill took
+another 0.3 to 0.5 %. Cold 32K TTFT ended at ~2.5 s.
+
+Rejected with evidence (do not repeat without a new hypothesis): cooperative
+mHC for T<=8 (neutral), output-parallel mHC partials, mHC + RMSNorm fusion,
+tensor-core mHC (quality gate), 8 MiB next-weight prefetch during the KDA
+output (c8/c16 -4.4 %), whole-head KDA conv/state/norm fusion (regressed),
+fused radix pool ordering (latency), a decode-shaped NVFP4 expert GEMM
+microbench that lost to Marlin, MTP k=3 as the default (Foundry 8-wide
+c8 -20 %, prose exact-token -15 to -30 %), DFlash2 in the B12X image (lost to
+MTP-3 there), shared-expert down back to BF16 (neutral).
+
+### 1b. What went wrong
+
+Every throughput gain above landed between the evening of Sep 4 and the
+morning of Sep 8. From Sep 8 on, the notebook grew by roughly 100 entries about
+reproducibility audits, sampler tie semantics, quality-score variation
+root-causing (MoE reduction order, indexer top-k ordering, layer-23 cutoff
+ties), deterministic-reduction diagnostics, prompt-score chunking, graph
+observers, B12X control re-runs, and then three days of PR splitting and
+CodeRabbit review. Throughput did not move after Sep 8 (162.8 -> 156.8 on a
+stricter protocol). The operator deleted the branch for that reason. The
+rules in section 6 exist so it does not happen again.
+
+### 1c. What survives on disk and is safe to reuse
+
+- Checkpoints: `/raid/weights/GLM-5.3-Flash-NVFP4` (RedHatAI, 191 GB, with
+  `model_mtp.safetensors`), `/raid/weights/GLM-5.3-Flash` (ZAI native FP8,
+  306 GB), and the sidecars next to the RedHatAI dir:
+  `f32-overrides.safetensors` (1.2 MB) and `fp8-swapset.{safetensors,json}`
+  (7.2 GB, 157 native FP8 weights + scales). `/raid/weights/
+  GLM-5.3-Flash-NVFP4-FP8-KDA-TP4/` is the symlinked recipe dir for the FP8-KDA
+  variant (recipe id `glm53-redhatai-nvfp4-fp8-kda-tp4-v1`). These are data
+  artifacts, verified bit-exact at build time; reusing them costs nothing.
+- Scratch harness under `~/.local/scratch/slimserve-glm53/`: `serve.sh`
+  (profile launcher under a 150G memory scope), `bench.sh` (exact-token
+  shapes), `ab.sh` (boot, two passes, gates, state label, stop), `gate.py`
+  (NLL on 8 fixed slices + needle margins), `prof_pair.sh` + `prof_run.py` +
+  `step_attrib.py` + `gap_locate.py` (same-tree profiler pairs), `rebuild.sh`
+  and `native_incremental.sh` (the 12.0f build recipes that worked),
+  `post_rebuild_validate.sh`, `prompt-source.txt`, the CUTLASS v4.4.2
+  checkout, and the B12X control drivers (`control.sh`, `control-bench.sh`).
+  The scripts refer to the old profile name `glm53-nvfp4-4` and to harness
+  flags that upstream's `benchmark_dsv4_exact.py` does not have; Phase 0
+  adapts them, it does not rewrite them.
+- Docker image `voipmonitor/vllm:jovian-judgement-community-20260904-r24`
+  (the B12X control) is pulled.
+- Venv `~/venvs/slimserve-glm53-flash` (torch 2.13.0+cu130) is linked as
+  `.venv`. The `.so` files in `vllm/` were built from the deleted branch's
+  `csrc` and are STALE for this tree: rebuild before any serving.
+
+### 1d. Salvage verdict (code read 2026-09-11)
+
+Operator's answer: "if there's kernel pieces that work then great, we can
+use them; I don't care about throwing away code." The five closed PRs added
+~83K lines; the serving-path code worth carrying is about 1,500. The four
+kernel headers were read in full: they are small, clean and built like the
+repo's own Ampere kernels (cp.async staging, ldmatrix, mma.sync m16n8k16,
+one shared-memory reduction, total over bad inputs).
+
+KEEP, re-landed one commit at a time and re-measured on this tree:
+
+| piece | lines | verdict |
+|---|---:|---|
+| `bf16_decode_gemm.cuh` | 234 | weight-streaming M<=16 tensor-core GEMM; +1.5 % alone, and the base of the FP8 kernel |
+| `fp8_decode_gemm.cuh` | 212 | same pipeline, exact e4m3 -> f16x2 conversion, one 128x128 scale per K chunk; W8A16 output bit-identical to a BF16 dequant; the kernel behind +5.5 % and +10.6 % c1 |
+| `glm_moe_routing.cuh` | 173 | fused scoring / top-8 / renorm / Marlin alignment in one block, NaN-total; drop the `STABLE_ALIGNMENT` template branch (a determinism diagnostic) |
+| `glm_moe_combine.cuh` | 80 | fused routed sum + shared-expert add |
+| decode-linear custom op in `layers/utils.py` | ~180 | correct compile-opaque pattern with the compile-cache factor |
+| `fp8_swapset.py`, `f32_overrides.py` builders + the `glm5_next.py` loader hooks | ~600 | keep; the KDA self-quant bakes a TP4-specific beta-shard layout into the artifact (fine for a per-platform record; note it in the record) |
+| indexer fold (wk / kpool gate / weights_proj into `fused_qkv_a_proj`) | +71/-23 | not upstream; re-apply from the exported patch |
+| Marlin workspace allocated once per device | ~15 | upstream still allocates per call; re-implement |
+| sparse MLA partition 32 (B<=8) / 64 rule + channel reducer selection | ~30 | upstream's `_bf16_partition` is a 128-token scratch-cap rule and no binding uses `paged_attention_reduce_channels`; re-implement from the notebook |
+| tests `test_quixicore_decode_gemm{,_fp8}.py`, `test_quixicore_glm_route_align.py`, `test_quixicore_moe_sum_add.py`, `test_f32_overrides.py` | ~600 | with their kernels |
+| bring-up patch (platform `rtx6000`, record, DeepGEMM cmake guard) | ~75 | Phase 0 |
+
+ALREADY UPSTREAM (only an env or a capability gate is needed): custom
+all-reduce over PCIe and its size cap (`VLLM_CUSTOM_AR_ALLOW_PCIE`,
+`VLLM_CUSTOM_AR_PCIE_MAX_BYTES`); the FP32 router GEMV (`dsv4_router_gemm`,
+gated to SM80 and 288 experts: widen after parity); KDA o_norm through
+Triton, g_a merged into in_proj, paired f_b / g_b.
+
+DROP: the small-k sampler (`topk_sample.cuh` 413 lines + 200 in
+`sampler.cu`: a tie-handling argument, not a measured throughput item;
+revisit only if the Phase 0 trace ranks sampling); the mHC last-block
+variant (neutral); H16 swapAB sparse prefill and tensor-core mHC prefill
+(0.3-0.5 % TTFT; the latter failed its quality gate); `glm_moe_stable_align.cuh`;
+the publish/consume-by-tensor-identity routing wiring (rewrite the ~60
+lines); `weight_recipe.py`'s recipe-directory mechanism; every
+`slimserve/*_journal.py`, `*_diagnostic.py`, `canonical_moe.py`,
+`glm53_ordering.py`, `reduction_receipts.py`, `rmsnorm_*.py`,
+`prompt_score_*.py`, `index_journal.py`; the campaign harnesses and the
+notebook history.
+
+Exported copies of the KEEP set: `~/.local/scratch/slimserve-glm53/salvage/`
+(`csrc/`, `python/`, `patches/`). The local branch and the fetched PR refs
+are deleted; the PR heads remain on GitHub as `refs/pull/{24..28}/head`.
+
+## 2. Where the tree stands (upstream/main 2b355117e, 2026-09-11)
+
+(As found on 2026-09-11; the branch merged upstream/main 9d76a981b on
+2026-09-12, see section 12b.)
+
+GLM-5.3-Flash on A100 (`glm53f-nvfp4-4` TP4, `glm53f-nvfp4-8` TP4 x DP2 with
+replicated MoE) is an active campaign on the 8x A100 box; its handoff is the
+last section of `HANDOFF.md`. Present and validated there:
+
+- `vllm/model_executor/models/glm5_next.py` (mHC sites, EAGLE-3 aux taps for
+  DFlash2, torch.compile with `kda_attention` as an opaque op, MTP block for
+  the checkpoint head), `glm5_next_indexer.py` (pooled indexer, compact
+  cache, TP row sharding), `kimi_gdn_linear_attn.py` (KDA with the merged
+  in-projection, paired gates, Triton o_norm), `quixicore_mla_sparse` backend
+  with `vllm/quixicore/sparse_mla_tc.py` (tensor-core NoPE sparse decode).
+- QuixiCore serving kernels under `csrc/quixicore/serving/`: `mla_kernels.cuh`
+  (partitioned sparse NoPE decode, P128 with a 512 MB scratch gate),
+  `paged_attn_v2_kernels.cuh` (reducers incl. `paged_attention_reduce_channels`),
+  `mhc_ampere.cuh` / `mhc_channel_owned_ampere.cuh` / `mhc_allreduce_ampere.cuh`,
+  `dsv4_router_ampere.cuh` / `dsv4_projection_ampere.cuh` (bf16-in fp32-out
+  GEMVs), `indexer_logits_mma.cuh`, `glm53f_warp_histogram.cuh`, the DSV4
+  Marlin-lesson quant kernels under `quant/`. All compiled for
+  `QUIXICORE_ARCHS = 8.0;8.6;8.9;9.0;10.0;11.0;12.0` intersected with
+  `TORCH_CUDA_ARCH_LIST`, so `12.0f` builds without CMake changes
+  (`tools/build_deepgemm_C.py` is absent and the DeepGEMM target must be
+  guarded, as 6b062ad3f did).
+- Registry: profile ids are `glm53f-nvfp4-4` / `glm53f-nvfp4-8` (renamed
+  2026-09-06; plain `glm53` is the 743B model). Source `glm53f-nvfp4` names
+  the RedHatAI checkpoint and the `incoai/GLM-5.3-Flash-DFlash2` drafter
+  (cc-by-nc-nd-4.0, block 8, taps layers 5/14/24/33/42, served through the V2
+  DFlash2 speculator). A100 record engine: TP4, EP off, Marlin experts,
+  `QUIXICORE_MLA_SPARSE` + `sparse_mla_force_mqa`, block 64, `kv_cache_dtype
+  auto` (bf16) with a per-layer fp8 opt-in for the sparse MLA layers,
+  FULL_DECODE_ONLY graphs, prefix caching, host + NVMe KV tier, thinking
+  budget 2000, and the `additional_config` switches
+  `glm5_next_{compact_indexer_cache, shared_indexer_scratch,
+  singleton_marlin_alignment, mhc_projection_overlap, singleton_pool_update,
+  sparse_tc_decode, indexer_row_shard}`.
+- A100 numbers (exact-token 1000/300, warmed, median of three): TP4 87.4 /
+  368.4 / 502.9 (c1/c8/c16, corrected router, 2026-09-09); TP8 DFlash2 k=3
+  record 153.6 / 495.0 / 687.3 / 879.5 (c32) / 1074.5 (c64) vs its non-spec
+  109.9 / 494.6 / 676.0.
+
+Missing or gated for sm_120 (each is a Phase 0/1 item):
+
+- No `rtx6000` platform in `slimserve/hardware.py:_classify` or
+  `profiles.json`, no `min_gpus.rtx6000`, no variant record.
+- SM80-only predicates that must be qualified, not blindly widened:
+  `glm5_next_indexer.py` (row sharding "requires SM80"; compact cache
+  "qualified only on SM80"), `glm5_next.py:366` (norm fused inside the mHC
+  transition only on the measured SM80 path), `vllm/quixicore/sparse_mla_tc.py`
+  (SM80 tensor-core sparse decode), the fp8 split cap in the sparse TC decode
+  (SPLIT=128 exceeds sm80 smem; sm_120 has LESS: 99 KB opt-in vs 163 KB).
+- Every ~90 per-step all-reduce runs on the pynccl ring unless the custom AR
+  escape hatch is set (world 4 without NVLink disables it by default).
+- Standing policy (CLAUDE.md, 2026-09-10): V2 model runner only (V1 is
+  deprecated); FP8 is the only permitted KV quantization, TurboQuant is
+  prohibited; prefix caching, tool calling and thinking are always on; never
+  greedy sampling in a profile.
+
+## 3. Hardware and physics (measured 2026-09-04 unless marked)
+
+RTX PRO 6000 Blackwell Workstation: 188 SMs, 128 MiB L2, 100 KB smem per SM
+(99 KB opt-in per block), 96 GB GDDR7 at 1.79 TB/s nominal (~1.6 TB/s
+practical streaming, lm_head measured 1.58-1.63), 3090 MHz boost, 600 W.
+Topology: GPU0-GPU1 and GPU2-GPU3 under one host bridge each (PHB), cross
+pairs through the root complex (NODE); P2P reads work on every pair (52 GB/s,
+8 KB copy 9.5 us). Host: EPYC 9334 32c/64t, one NUMA node, 188 GB RAM,
+earlyoom active. CUDA 12.8 / 13.0 / 13.2 toolkits. Driver 610.43.02 (CUDA
+13.3 branch) since 2026-09-11: Ubuntu's own `nvidia-driver-610-open` with
+the prebuilt signed modules `linux-modules-nvidia-610-open-7.0.0-31-generic`
+for the HWE kernel, no DKMS (the DKMS build fails on every 7.0.0-2x kernel;
+the box ran Ubuntu's prebuilt 580.173.02 the same way from 2026-09-01).
+`/etc/apt/preferences.d/nvidia-driver-ubuntu-only` pins every driver
+package from the NVIDIA CUDA repo to -1 so apt never swaps in its
+DKMS-based builds; unattended-upgrades blacklists `nvidia-`/`libnvidia-`.
+Secure boot off. Rollback: `~/.local/scratch/slimserve-glm53/driver-580-rollback.sh`.
+Post-upgrade smoke: all four cards P2P-reachable, bf16 8192^3 matmul
+426-433 TFLOP/s per card, no throttle reasons, `vllm._C_stable_libtorch`
+imports. The box-wide `NCCL_P2P_DISABLE=1` was removed from
+`~/.config/fish/conf.d/tinybox-env.fish` the same day.
+
+GLM-5.3-Flash: 45 layers (3 dense FFN 12288, 42 MoE: 288 routed experts
+top-8 at intermediate 2048 = 25.2M params each, plus one shared expert), 34
+KDA linear-attention layers (64 x 128 heads, 2 MiB state per layer per
+sequence), 11 DSA sparse-MLA layers (64 heads, 256 nope, no RoPE,
+kv_lora_rank 512, indexer 32 x 128 with 4x key pooling, top-2048), mHC
+hyper-connections (4 residual streams), vocab 154,880, one MTP layer, 1M
+positions.
+
+Bytes per token per GPU at TP4 and the resulting no-speculation c1 ceiling:
+
+| backbone format | experts/GPU | backbone/GPU | per GPU | floor/step | c1 ceiling |
+|---|---|---|---|---|---|
+| RedHatAI as shipped (BF16 backbone) | 1.19 GB | 4.59 GB | 5.78 GB | 3.2 ms | ~310 tok/s |
+| + native FP8 dense/shared/DSA (swap-set) | 1.19 | 3.87 | 5.05 | 2.8 | ~355 |
+| + FP8 KDA q/k/v/o (self-quantized) | 1.19 | 2.72 | 3.91 | 2.2 | ~460 |
+| + kv_b and lm_head FP8 | 1.19 | 2.52 | 3.71 | 2.1 | ~480 |
+| NVFP4 everything | 1.19 | ~1.3 | ~2.5 | 1.4 | ~720 |
+
+At c8 the routed experts dominate: up to 64 distinct experts per layer x 3.4
+MiB per rank x 42 layers = 9.1 GB per rank = 5.1 ms per step at nominal
+bandwidth; Marlin W4A16 was measured AT that floor (5.17 ms). So the c8
+no-speculation ceiling with an FP8 backbone is about 7.3 ms per step, ~1100
+tok/s, and only overlap, launch count, mHC and the M=8 GEMM efficiency move
+it; at c1 the experts are 1.1 ms against a 0.63 ms floor (63 %) and a
+decode-shaped kernel is worth ~0.4 ms.
+
+Communication: ~90 all-reduces per step (2 per layer). NCCL ring LL over P2P
+is 10.3-11.2 us at c1 (0.93-1.0 ms/step); vLLM's custom AR over P2P is 5.1
+us (0.46 ms/step); a one-shot PCIe-IPC kernel might reach 3-4 us. Prefill
+chunks above the custom-AR size cap fall back to NCCL (37 % of a 7K-token
+prefill step until the cap was raised).
+
+Where the last measured fast-state c1 step went (5.53 ms at 162.8 tok/s):
+FP8 decode GEMMs 1.87 ms (176 launches), Marlin experts ~1.1, mHC 0.78 (91
+sites x 8.5 us for ~1.5 MB each: latency, not bytes), custom AR 0.46, bf16
+GEMMs 0.24, pooled indexer 0.20, KDA recurrent+conv ~0.2, sparse MLA 0.13,
+launch tail ~0.5, in-step idle 0.18. Against a 2.2 ms byte floor the
+engineering target for c1 is 3.2-3.5 ms (285-310 tok/s) before speculation.
+
+## 4. Controls, bars and targets
+
+All numbers are exact-token `benchmarks/benchmark_dsv4_exact.py` at 1000 in
+/ 300 out, temperature 1.0 / top-p 0.95 / top-k 20, seed 42, warmed, aggregate
+output tok/s at c1 / c8 / c16 unless stated. Protocol matters: the published
+B12X table is 30 s context-zero cells with other serving active, which is not
+our shape.
+
+| line | c1 | c8 | c16 | source |
+|---|---:|---:|---:|---|
+| B12X R24 published, no spec (their protocol) | 169.9 | 737.8 | - | rtx6kpro, 2026-09-04 |
+| B12X R24 published, MTP-3 | 247.8 | 903.2 | - | 2.50 accepted/step |
+| B12X R24 on this box, handicapped (NCCL over SHM), our protocol | 134.0 | 483.7 | 598.6 | notebook 2026-09-04 |
+| B12X R28.1 on this box, cold-prefix E2E protocol | 132.6 | 466.7 | 589.3 | Codex review doc |
+| A100 TP4 `glm53f-nvfp4-4` | 87.4 | 368.4 | 502.9 | 2026-09-09 |
+| A100 TP4xDP2 `glm53f-nvfp4-8`, DFlash2 k=3 | 153.6 | 495.0 | 687.3 | 2026-09-10 |
+| Codex best, no spec (fast-state boot) | 162.8 | 534.5 | 691.0 | 2026-09-08 |
+| yhfgyyf vLLM fork, TP4, FP8 KV, MTP-5, 8K in / 512 out | 158 | - | - | prefill 9.9K tok/s; 2026-09-07 |
+| SGLang cookbook (FP8, 4x PRO 6000) | 63.7 | - | - | rtx6kpro |
+
+Gates for this campaign (in order of strictness):
+
+1. Floor (mandatory): beat the local B12X control in every cell on our
+   protocol. Measured 2026-09-11 on r28.1, unhandicapped, median of three:
+   no speculation 166.5 / 687.9 / 966.8 at c1 / c8 / c16; MTP-3 260.8 /
+   732.1 / 1005.8. Our Phase 0 baseline is 113.3 / 449.2 / 611.0 (0.68 /
+   0.65 / 0.63 of the control) and DFlash2 153.6 / 330.9 / 340.3.
+2. Target (no speculation): c1 >= 250, c8 >= 750, c16 >= 1050, cold 32K
+   TTFT <= 2.0 s, cold 128K TTFT <= 8 s (Phase 0 measured 11.8 s / 124 s;
+   the control does 2.93 s / 14.9 s on the same prompts).
+   The decode targets are 65-75 % of the physics ceilings in section 3
+   with the FP8 backbone; c8 / c16 were raised above the control on
+   2026-09-11.
+3. Target (with the chosen speculator, on the Foundry-like structured
+   workload and on prose): c1 >= 320 where acceptance supports it; c8 no
+   worse than no-spec (the schedule turns speculation off above the batch
+   size where it loses, as the A100 record does).
+4. Stretch: the published B12X MTP-3 numbers on their protocol, measured
+   with the same protocol on our stack.
+5. Sanity: TP2 vs TP4 on the same build >= 1.5x at c8 (CLAUDE.md gate; TP2
+   is a measurement, not a record); c8/c1 ratio >= 3.5 at NVFP4.
+
+## 5. Research digest (borrow / avoid), refreshed 2026-09-11
+
+Borrow, with the exact precedent to read before implementing:
+
+- vLLM #53906 (merged 09-03): native GLM-5.3-Flash incl. the MTP draft model;
+  #55214 the missing `__init__.py`. Upstream SlimServe already has the MTP
+  block and the DFlash2 path; use these only to cross-check.
+- vLLM issue #53963 (2026-08-26, open): GLM's rope-free sparse MLA has no
+  SM120 path in stock vLLM (fp8_ds_mla asserts pe_dim 64; BF16 lane excluded;
+  kernel shape guard). SlimServe's QuixiCore NoPE kernel is the answer; the
+  community fork `yhfgyyf/vllm-deepseek-v4-sm89` (Apache-2.0, updated
+  2026-09-07) ships a `FLASHINFER_MLA_SPARSE_SM120` backend with FP8 KV for
+  GLM and reports 158-199 tok/s decode with MTP-5 and 9.9K tok/s prefill at
+  TP4: the closest external comparison on this exact card, read its kernel
+  choices for the sparse path and its KV layout.
+- vLLM #55277 (open) + flashinfer #4802 (merged 09-03, `GLM53_NOPE`, decode
+  14.9 -> 11.3 us) + #4947: the SM120 sparse NoPE MLA path and the
+  `fp8_ds_mla` row layout for pe_dim 0. A/B partner for our kernel; also the
+  reference for FP8 KV on the NoPE row.
+- vLLM #53576 (merged 09-01, tested on 4x RTX 6000 Pro TP4): FlashInfer
+  PCIe-IPC all-reduce (`VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC=1`, FlashInfer
+  > 0.6.17 nightly wheels). Ceiling ~0.25 ms/step over the custom AR we
+  already run at 5.1 us; Phase 2, after the cheaper levers. Never build
+  FlashInfer from source on this box.
+- KDA: flashinfer #4709 (merged 09-03) `fused_kda_decode` (conv + SiLU +
+  recurrent update + gated RMSNorm in one SM100 launch, 1.5-5.9x), vLLM #55364
+  (open) FlashInfer KDA decode 2.47x at bs1, #54697 (merged) overlapped low-M
+  KDA projections, SGLang #37744 qkvbfg 6 -> 2 GEMMs per KDA layer. The
+  fused-decode structure is the Phase 2 KDA item; keep the FP32 forward
+  substitution (FlashKDA R21 emitted non-finite values without it).
+- vLLM #40082 (merged 2026-05-20): FlashInfer b12x fused MoE
+  (`flashinfer_cutedsl_sm12x`) and FP4 GEMM (`flashinfer-b12x`) for
+  SM120/121, CuTe DSL warp-level MMA tuned for small-M decode; needs
+  nvidia-cutlass-dsl 4.4.2 exactly. This is the W4A4 expert path B12X uses.
+  Our vLLM base predates it; port only the kernel idea (weight-streaming
+  small-M FP4 with adaptive tiles), not the backend, and gate on the U+FFFD
+  and exact-token checks because CUTLASS grouped FP4 on SM120 produced
+  garbage in stock vLLM (cutlass #3096, vLLM #54150; a patched native path ran
+  39 tok/s vs Marlin 46-49 there).
+- vLLM #55170 (open): CUTLASS W4A4 over W4A16 for NVFP4 linears on SM120,
+  +23.8 % on RTX PRO 6000 Max-Q; flashinfer #4718 sm12x NVFP4 MoE retune;
+  #4013 drops tiles over 101 KB smem. Prefill-side references.
+- vLLM #54951 (draft, TP-sharded indexer prefill): already in SlimServe
+  (SM80-gated). vLLM #54110 (persistent top-k fallback for < 128 KiB smem,
+  tested with GLM-5.3-Flash MTP): read for the sm_120 smem budget.
+- local-inference-lab/vllm #576: `cp.async.bulk.prefetch.L2` of next weights
+  during reduction windows (+7 % c1 at bf16). Codex's 8 MiB variant regressed
+  c8/c16; only a next-layer variant with a measured overlap window qualifies.
+- llama.cpp #27970 (gather-then-dense FA over indexer-selected KV, 2.2x at 1M)
+  and #27917 (MTP acceptance per position 0.92 / 0.81 / 0.60 / 0.44 / 0.35:
+  depth 3 is the sweet spot). exllamav3 #330: BF16 I/O on the decode GEMM.
+- B12X recipe (rtx6kpro `models/glm5.md`, qualified 2026-09-04): TP4 DCP1,
+  ModelOpt NVFP4 W4A4 experts, FP8 KV (packed NVFP4 KV selectable),
+  FULL_AND_PIECEWISE graphs, 4,096 target tokens per step, compute-share
+  fairness 0.4, MTP depth 3 or DFlash2 depth 7 (ModelOpt MXFP8 drafter),
+  two MoE paths by concurrency.
+- barrydeen/glm53-flash-dgx-spark (sm_121, 2x GB10): patch stack for NVFP4
+  at 262K with fp8 KV and DFlash2; the closest open recipe for the DFlash2 +
+  fp8 KV combination on the 12.x family.
+- In-repo precedents to read before each phase: `csrc/quixicore/
+  a100_glm52_design.md` (Marlin lessons: layout-only repack, in-register scale
+  decode, cp.async staging, tensor cores for M >= 2, fusion of decode nodes),
+  `dsv4_ampere_design.md` and `perf/dsv4_a100_kernel_history.md` (what was
+  measured slower: output-owned hidden state, channel-residual mHC, fused
+  shared-expert publication, cooperative peer consumption, indexer head
+  sharding, top-512 radix, projection bundling), `perf/metal_m1ultra_*`
+  (the campaign shape the operator wants: research, ranked items, one entry
+  per experiment), the A100 GLM-5.3 entries of 2026-09-07..10 in
+  `perf/optimization_status.md` (KDA norm/projection fusion, SIMT mHC, FP32
+  router, compact indexer, sparse-TC decode, prefill row map).
+
+Avoid (measured or documented dead ends):
+
+- Re-writing cuBLAS-class dense BF16 GEMMs for their own sake: SGLang #37899
+  measured +4 % op-level and ~0 % end to end. The lever is bytes (FP8) and
+  launch count; the M<=16 decode GEMM was worth 1.5 %, not more.
+- Fused all-reduce + mHC transition: rejected on A100 (85.5/421 vs 84/413);
+  the mHC math is replicated on every rank, so the win is ownership, not
+  merging two kernels.
+- EP experts: 4-6 % slower than TP experts at every A100 config.
+- ModelOpt NVFP4 checkpoints (LibertAIDAI, dealignai): U+FFFD emission on 4x
+  PRO 6000 (vLLM #54150); ModelOpt weight-only MoE input_scale folded to zero
+  (#54189). RedHatAI compressed-tensors was clean. The checkpoint is fixed.
+- FP8 KV on SM120 through SGLang's path: garbled output or stops after one
+  token (rtx6kpro notes). Our fp8 NoPE-row kernel is a different path but
+  gets the same gate.
+- Torch's P2P assumption is wrong for some PCIe sm_120 copies (exllamav3
+  #333). Validate every peer copy path explicitly.
+- Reduction order changes acceptance (SGLang #37746). Measure acceptance
+  before and after any all-reduce change.
+- Hybrid page alignment (#54458) inflates blocks and collapses prefix-cache
+  hits; check the block geometry when KV groups change (speculation adds
+  groups).
+- flashinfer #4827: sm12x MoE workspace use-after-free under CUDA graphs on
+  GLM-5.3-Flash TP2. Any FlashInfer MoE path gets a graph-replay soak.
+- Measurement anti-patterns: `--ignore-eos` TPS, synthetic repeated-token
+  prompts, interval logs as benchmarks, MoE microbenchmarks with random
+  `topk_ids`, sums as fingerprints, TPS without acceptance for spec runs,
+  env-gated A/B arms under torch.compile (the compile cache key ignores
+  private env; A/B via distinct code or `graph_factors`).
+
+## 6. The regimen
+
+This is the loop, in the order the operator described it. Each roadmap item
+in section 9 goes through it once.
+
+1. Research (time box: 1 hour per item, 1 day for the campaign's initial
+   pass). Name the precedent: a PR, a kernel in a reference tree
+   (`~/llama.cpp`, `~/ds4`, `~/QuixiCore/*`, vLLM Marlin, FlashInfer), or a
+   SlimServe notebook entry from another platform. State what transfers to
+   this hardware and what does not (smem 99 KB, 188 SMs, PCIe topology).
+2. Rank by expected end-to-end gain, computed from the current step
+   attribution (kernel ms per step per class, launches per step), not from
+   isolated kernel speedups. Re-rank after every phase from a fresh profiler
+   pair.
+3. Design note (10 lines, in the notebook entry's Hypothesis): what changes,
+   what the trace should show afterwards, the expected ms/step, the
+   correctness contract (bit-exact, summation order, or a gate).
+4. Implement in `csrc/quixicore/` (kernels) and the model/layer files; keep
+   the old path selectable through one kill switch that is also a compile
+   cache factor (`graph_factors`), and remove the switch once the change is
+   retained and rebuilt.
+5. Correctness: parity test in `tests/kernels/` against an fp32 reference on
+   the real shapes (existing pattern:
+   `tests/kernels/test_quixicore_sparse_mla_bf16.py`); microbench at the real
+   serving shapes with weights rotated past L2 and launches inside a captured
+   graph (`gemm16_bench.py` pattern); report GB/s against 1.79 TB/s.
+6. End to end, through the profile only: one profiler pair for launch-count
+   changes; one exact-token boot per arm (two when the expected delta is under
+   3 %); the state label on every boot; the quality gate on the candidate
+   boot; the canaries. Compare like-state boots only.
+7. Notebook entry (Status / Scope / Baseline / Hypothesis / Change /
+   Correctness / Results / Decision / Raw artifacts) and a commit, retained
+   or rejected. Rejections are one paragraph.
+8. Next item. Do not stop the loop at a commit; stop at a phase gate (section
+   9) for the operator's review, or when a decision listed in section 11 is
+   needed.
+
+Rules that come from the previous campaign's failure:
+
+- No validation campaign without a retained change to validate. One gate set
+  per retained change (section 7). Reproducibility, determinism, sampler
+  semantics and scoring-tool audits are out of scope unless a gate fails,
+  and then the fix is time-boxed to half a day and the gate is re-run once.
+- No diagnostic tooling in the repo. Instruments live in
+  `~/.local/scratch/slimserve-glm53/`; the repo gets kernels, their tests,
+  profile records and notebook entries. Failed experiments are removed from
+  the serving code, not left behind switches.
+- Sweeps are not the method. A sweep is at most one hour of microbench over
+  at most three parameters after the design has been chosen from research
+  (tile rows x stages, partition size, a launch table). Never a serving sweep
+  of configurations.
+- Every item has a time box (section 9) and a stop rule: if the profiler
+  pair shows under 1 % and the exact-token boot is neutral, park it with a
+  one-paragraph entry and move on. Parked items are revisited only with a new
+  hypothesis.
+- A day with no change to a kernel or the serving path is a red flag. Report
+  it in the notebook with the reason and the decision that unblocks it.
+- The B12X control is re-run once per phase at most, and only on the same
+  protocol as our number of the day.
+- Speculation numbers always carry accepted tokens per step and the step
+  rate (tok/s divided by mean accepted length); acceptance is measured on the
+  operator's real workload shape (structured JSON, thinking on, 8-wide) as
+  well as on the prose harness.
+
+## 7. Measurement protocol (exact commands)
+
+Serve (the only recorded path):
+
+```bash
+# operator env (kept in ~/.local/scratch/slimserve-glm53/serve.sh, not in the repo)
+export SLIMSERVE_CACHE=/raid/weights
+export CUDA_HOME=/usr/local/cuda-13.0 PATH=/usr/local/cuda-13.0/bin:$PATH
+export VLLM_CACHE_ROOT=/home/tiny/.local/scratch/slimserve-glm53/vllm-cache
+export TMPDIR=/home/tiny/.local/scratch/slimserve-glm53/tmp
+.venv/bin/python -m slimserve.cli glm53f-nvfp4-4 --dry-run          # inspect the rtx6000 record
+systemd-run --user --scope -p MemoryMax=150G --quiet -- \
+  .venv/bin/python -m slimserve.cli glm53f-nvfp4-4 --serve --host 127.0.0.1 --port 8000 -y [--no-spec] [--torch-profile-dir DIR]
+```
+
+Throughput (repo canonical shapes; c1, c8, c16 at 1000/300, plus 1000/2000
+at c1 and c8 once per phase; upstream's harness flags, `--help` first):
+
+```bash
+.venv/bin/python benchmarks/benchmark_dsv4_exact.py \
+  --model /raid/weights/GLM-5.3-Flash-NVFP4 \
+  --source /home/tiny/.local/scratch/slimserve-glm53/prompt-source.txt \
+  --url http://127.0.0.1:8000/v1/completions \
+  --concurrency 8 --input-tokens 1000 --output-tokens 300 \
+  --temperature 1.0 --top-p 0.95 --top-k 20 --seed 42
+```
+
+Three warmed repeats per cell, median reported, spread recorded (upstream's
+A100 protocol); the second and third repeats are APC-hot. Raw JSON and the
+completions go under `perf/results/YYYY-MM-DD/<run-id>/` with `run.txt`
+(commit, dirty count, `nvidia-smi` clocks/power per shape).
+
+Boot state label (mandatory on every recorded boot): one profiled c1 round
+after the benches (`prof_run.py` + `gap_locate.py`); in-step idle under ~0.2
+ms with custom AR is the fast state. Arms are compared like-state; a
+slow-state boot is reported, not averaged, and a slow boot on a quiet host is
+the next thing to profile. Log load average and top CPU processes at every
+pass (`ab.sh` does this).
+
+Profiler pair (decision instrument for anything expected under ~3 %):
+`prof_pair.sh <label> "<envA>" "<envB>"`, one c1 capture per arm, full decode
+steps only, compare GPU span, kernel busy, in-graph gaps and launches per
+step (`step_attrib.py`). Per-class tables go in the notebook.
+
+Correctness gates before a change is retained:
+
+- `gate.py --out perf/results/<date>/<run>-gate.json`: mean prompt logprob on
+  8 fixed 512+32-token slices (band on this stack: -2.407..-2.478 nats,
+  within-boot jitter 0.02-0.03, so deltas under 0.03 are noise) and needle
+  margins at 1K and 7K (pass/fail).
+- Text (+reasoning), image and tool canaries through the chat endpoint; 0
+  U+FFFD across the benchmark completions; repeated-window degeneration check.
+- Kernel parity tests in `tests/kernels/` for every kernel change; sanitizer
+  (`compute-sanitizer --tool memcheck` and `racecheck`) on new kernels once.
+- Speculative runs: accepted per step from the server counters and a
+  degeneration guard on every run.
+- Once per phase: the deep-context leg (needle recall to 131K through the
+  profile; the A100 harness `benchmarks/benchmark_wildchat_deepcontext.py`),
+  and when the KV tier is enabled, forced-eviction acceptance with
+  `VLLM_KV_TIER_VERIFY=1` (0/N mismatches is the pass, not marker recall).
+
+Build (Codex's working recipes; 73 min full, ~90 s incremental):
+
+```bash
+# full editable rebuild (no serving or benches while it runs)
+CUDA_HOME=/usr/local/cuda-13.0 TORCH_CUDA_ARCH_LIST=12.0f MAX_JOBS=8 NVCC_THREADS=2 CMAKE_BUILD_TYPE=Release \
+VLLM_CUTLASS_SRC_DIR=/home/tiny/.local/scratch/slimserve-glm53/cutlass TMPDIR=/home/tiny/.local/scratch/slimserve-glm53/tmp \
+systemd-run --user --scope -p MemoryMax=120G --quiet -- \
+  ~/.local/bin/uv pip install --python .venv/bin/python -e . --no-build-isolation -v
+# incremental _quixicore_C in a persistent cmake dir: ~/.local/scratch/slimserve-glm53/native_incremental.sh [_quixicore_C]
+# then: python -c "import vllm._C_stable_libtorch, vllm._quixicore_C" and the kernel tests on GPU 0
+```
+
+## 8. Rubric
+
+Retain a change only if all of these hold:
+
+1. Correctness: parity test passes; gate mean within the band or better;
+   canaries pass; exact-token `exact:true` in every cell; no U+FFFD; for spec
+   runs, acceptance recorded and no degeneration.
+2. Throughput: c1 and c8 on the canonical shape within noise or better
+   between like-state boots, c16 not regressed beyond the spread; the
+   profiler pair shows the mechanism the hypothesis named (fewer launches,
+   shorter class, smaller gaps). A change that is faster for a reason other
+   than its hypothesis is a finding, not a retained change, until the reason
+   is understood.
+3. Prefill: cold 32K and 128K TTFT not regressed (once per phase, and for any
+   change that touches prefill).
+4. Code: one kill switch or none; no second copy of a serving path; no
+   diagnostic-only branches; the switch is a compile-cache factor; a test
+   exists for the shape gate (which M, N, K, dtype take the new path).
+5. Notebook: the entry exists with raw artifact paths before the commit.
+
+Reject (and record) when any of the above fails after the time box. Park
+when neutral. Never retain on a best-of-boots number.
+
+PR readiness (Phase 6): every retained change has its entry; the record row
+in `perf/baseline_status.md` is measured on the PR's tree with three repeats;
+the `rtx6000` record's notes state what each setting is and why; the
+registry tests pass (`tests/slimserve/`); kernel tests pass on GPU 0; no
+scratch paths, host names or deploy config in the diff; under ~100 files per
+PR (split by layer if larger: kernels, serving integration, record +
+notebook); commits authored as Auroter with no trailers.
+
+## 9. Roadmap
+
+Time boxes are working days on this machine; the loop in section 6 applies
+to every item. Expected gains are against the last attribution (section 3)
+and are re-derived from the Phase 0 trace before Phase 1 starts.
+
+### Phase 0: branch, build, platform, baseline (1 day)
+
+1. Native build of this tree for `12.0f` (full rebuild; the `.so` files in
+   `vllm/` are from the deleted branch). Re-apply the DeepGEMM cmake guard.
+   Smoke `import vllm._C_stable_libtorch, vllm._quixicore_C`; run the
+   existing GLM kernel tests on GPU 0 (`tests/kernels/test_quixicore_sparse_mla_bf16.py`,
+   `tests/glm5_next/`), noting which are SM80-gated.
+2. Platform `rtx6000` (`hardware.py:_classify` on "rtx pro 6000",
+   `profiles.json` platform with compute capability [12, 0] and the notes
+   from 6b062ad3f, `min_gpus.rtx6000: 4` on the NVFP4 quant) and the
+   `glm53f-nvfp4-4` `rtx6000` variant record: TP4, EP off, Marlin experts,
+   `QUIXICORE_MLA_SPARSE` + `sparse_mla_force_mqa`, block 64, bf16 KV,
+   FULL_DECODE_ONLY capture 64, max_num_seqs 16, prefix caching, thinking
+   budget 2000, parsers glm47, vision on, speculation off for the baseline,
+   no KV tier yet, every `glm5_next_*` additional-config switch off until
+   qualified. Registry tests pass (`test_a_profile_is_one_config_per_platform`).
+3. Environment audit, recorded in the entry: `NCCL_P2P_DISABLE` (Codex found
+   `~/.config/fish/conf.d/*.fish` exporting it box-wide, which forces NCCL
+   through host SHM), CPU governor, GPU clocks and power limits, `nvidia-smi
+   topo -p2p r`, free host RAM, earlyoom threshold.
+4. Baseline through the profile: three warmed repeats of c1/c8/c16 at
+   1000/300, 1000/2000 at c1 and c8, cold 32K and 128K TTFT, state label,
+   gate, canaries, one profiler pair capture (c1 and c8) for the attribution
+   table. Record in `perf/baseline_status.md`.
+5. Fresh B12X control on the same protocol with the newest image (R24 is
+   pulled; check rtx6kpro for a newer tag), unhandicapped: the 610 driver
+   matches the image's CUDA 13.3, so run it without `NCCL_CUMEM_ENABLE=0`,
+   `NCCL_P2P_DISABLE=1` or `B12X_PCIE_ALLREDUCE=0`.
+
+Exit: profile healthy, baseline row written with the attribution, every
+SM80-gated feature listed with its sm_120 status (works / needs smem
+retune / not applicable).
+
+### Phase 1: bytes and the cheap fixed-overhead wins (2 days)
+
+Re-land from the previous campaign, one commit and one entry each, each
+re-measured (expected gains are Codex's like-state deltas):
+
+1. F32 sidecar loader hook (correctness; neutral).
+2. Custom all-reduce over PCIe on the record env (+11 % c1) and the AR size
+   cap for prefill chunks (-14 % c8 prefill); both knobs exist upstream
+   (`VLLM_CUSTOM_AR_ALLOW_PCIE`, `VLLM_CUSTOM_AR_PCIE_MAX_BYTES`), so this is
+   record env plus a measurement.
+3. bf16 M<=16 decode GEMM custom op (+1.5 % c1).
+4. FP8 swap-set (dense/shared/DSA; +5.5 % c1) then FP8 KDA projections
+   (+10.6 % c1, NLL gate mandatory; ZAI kept these BF16).
+5. Sparse MLA partition rule + channel reducer (+3.7 % c1).
+6. Fused routing + alignment, combine, Marlin workspace (-160 launches).
+7. Qualify upstream's SM80-gated wins on sm_120 by measurement, widening each
+   predicate only after its parity test and smem check: FP32 router, SIMT mHC
+   with fused norm, compact indexer cache, sparse tensor-core decode, TP
+   indexer row sharding.
+8. FP8 (e4m3) main KV for the 11 sparse MLA layers (upstream's per-layer
+   opt-in) on the NoPE row: parity, the U+FFFD and needle gates, then the
+   deep-context leg. Small decode gain at 1K context; the win is capacity and
+   long-context prefill, and it is the only permitted KV quantization.
+
+Exit: like-state c1 >= 165, c8 >= 540, c16 >= 700 (the previous campaign's
+best, now on upstream's tree with its A100 wins on top); FP8 KV decision
+recorded; fresh attribution.
+
+### Phase 2: fixed overhead, the decode-step levers (3-4 days)
+
+Ranked by ms per step at c1 from the section 3 attribution; re-rank from the
+Phase 1 trace.
+
+1. mHC transition (0.78 ms at c1, 1.13 ms at c8 where T>1 sites run three
+   launches): one launch per site at every T with the partials and the
+   Sinkhorn tail in one block per token where co-residency allows, or the
+   DSV4 channel-ownership form fused into the custom all-reduce (each rank
+   transitions 4096/TP channels; `mhc_channel_owned_ampere.cuh` and
+   `mhc_allreduce_ampere.cuh` are the precedents, `VLLM_DSV4_TP_OWNERSHIP`).
+   Target 8.5 -> 3-4 us per site: -0.4 to -0.5 ms at c1, -0.7 ms at c8.
+   Time box 1.5 days.
+2. Fused KDA decode: in_proj (FP8) -> short conv -> gate -> delta-rule state
+   update -> gated RMSNorm -> o_proj as two or three launches per layer instead
+   of ~11 (flashinfer #4709 `fused_kda_decode` is the structure reference,
+   FP32 substitution kept). Whole-head fusion regressed before; the fusion
+   boundary must be chosen from the trace (projections stay separate if they
+   are at roofline). Target -0.3 ms at c1. Time box 1.5 days.
+3. Launch tail: MoE glue after routing (Marlin workspace fill, act, sum),
+   norm/add fusions, copies around the mHC wrappers; each removed launch is
+   worth its time plus ~0.5 us of dependency latency inside the graph. Target
+   -0.3 ms. Time box 1 day.
+4. M=8/16 GEMM efficiency on the FP8 backbone (c8 lever: the fp8 decode GEMMs
+   at M=8 and the shared-expert shapes under Marlin contention). Target -0.3
+   ms at c8. Time box 0.5 day.
+5. PCIe-IPC one-shot all-reduce (FlashInfer #53576 port, nightly wheels only)
+   only if 1-4 leave the AR as the largest fixed cost; ceiling -0.25 ms.
+
+Exit: c1 >= 220 no-spec, c8 >= 620, launches per step and in-graph gaps
+reported before/after; TP2 vs TP4 sanity measured once.
+
+### Phase 3: speculation (1-2 days)
+
+1. DFlash2 on the V2 runner (upstream's registered speculator; block 8; the
+   compact indexer cache caps k at 5): measure k=3 and k=5 with the A100
+   per-batch schedule pattern (`num_speculative_tokens_per_batch_size`) on the
+   prose harness AND on the operator's structured 8-wide workload; acceptance
+   and step rate recorded. Check hybrid page geometry (#54458) after the
+   drafter adds KV groups.
+2. Checkpoint MTP head (layer 45, in-tree block) as the A/B: k=3, same
+   workloads. Codex measured +17..46 % greedy structured, -15..30 % prose at
+   temp 1.0, -20 % at Foundry c8; upstream measured +6.5 % c1 on A100 V1.
+3. Decision per record: the speculator and schedule that wins the operator's
+   workload without losing c8; license of the DFlash2 drafter (cc-by-nc-nd)
+   is flagged for the operator.
+
+Exit: c1 with speculation >= 300 on the structured workload, c8 >= no-spec,
+acceptance recorded; deep-context leg re-run once because group geometry
+changed.
+
+### Phase 4: sm_120-specific kernels (3-4 days)
+
+1. Decode-shaped NVFP4 expert kernel for M<=16 per expert: weight-streaming
+   over the union of active experts, in-register group-16 scale decode, fused
+   SwiGLU and top-k weighting, cp.async ring retuned for 99 KB smem and 188
+   SMs (`a100_glm52_design.md` and the fused Q4_K decode pair are the
+   precedents; flashinfer sm12x retune #4718 and the b12x CuTe kernel are the
+   external references). Target >= 85 % of 1.79 TB/s at c1 (Marlin is at 63
+   %): -0.4 ms at c1, neutral at c8/c16 where Marlin is already at the byte
+   floor. Two paths by concurrency if the data says so. Gate: exact-token,
+   U+FFFD, graph-replay soak. Time box 2 days.
+2. Head-batched sparse MLA decode: read each selected latent row once for
+   the 16 heads per rank instead of once per head (at c8/c16 the kernel is
+   L2-bound on that re-read: 22-44 us per layer for 1-2 MB of distinct KV);
+   pooled indexer `_pooled_logits_kernel` at 17 us per layer for 1000
+   tokens. Target -0.15 ms at c8, more at long context. Time box 1 day.
+3. lm_head at 89 % of streaming and the remaining bf16 shapes: FP8 lm_head
+   and kv_b (section 3 table, ~0.1 ms) behind the NLL gate. Time box 0.5 day.
+
+Exit: c1 >= 250 no-spec, c8 >= 700, every kernel with parity test,
+microbench GB/s and an e2e entry.
+
+### Phase 5: prefill (2 days)
+
+1. Attribution of a cold 32K and a cold 128K prefill (indexer, sparse
+   attention, Marlin M>=64, all-reduce share, KDA chunked scan).
+2. TP-sharded indexer prefill and the H16 sparse prefill (qualified from the
+   previous campaign's evidence), CUTLASS sm120 block-scaled FP8 GEMMs for
+   the FP8 backbone at prefill, W4A4 tensor-core experts for M>=64 if the
+   gated FP4 path is clean.
+3. Targets: cold 32K TTFT <= 2.0 s, cold 128K <= 8 s, prefill >= 12K tok/s
+   at 32K (yhfgyyf 9.9K, B12X 14.9K).
+
+### Phase 6: retention and PR (1 day)
+
+1. Record row with three repeats on the final tree; `rtx6000` record notes
+   rewritten to state each setting's evidence; kill switches removed for
+   retained changes; failed paths deleted.
+2. Host + NVMe KV tier on this box (188 GB RAM: 32 GiB host per rank + a disk
+   tier under `/raid`), qualified with forced eviction and
+   `VLLM_KV_TIER_VERIFY=1` (operator decision on sizes, section 11).
+3. PR(s) against QuixiAI/SlimServe main, under 100 files each; port retained
+   kernels to QuixiCore-CUDA (`bf16/fp8_decode_gemm.cuh`, routing/combine,
+   mHC, sparse reducer, the NVFP4 decode kernel) with their tests.
+
+## 10. Standing machine constraints
+
+- One GPU workload at a time; no native builds while a server or bench
+  runs; attribute GPU processes by PID lineage. The four GPUs are idle today
+  (Foundry stopped).
+- Venvs under `~/venvs` (never on /raid); scratch, logs, build trees and
+  traces under `~/.local/scratch/slimserve-glm53/` (never /tmp); model weights
+  under `/raid/weights` (`SLIMSERVE_CACHE`); `/raid` has 459 GB free, root
+  161 GB.
+- Prebuilt wheels only for torch (2.13.0+cu130) and FlashInfer (nightly
+  `flashinfer-python` + `-cubin` + `-jit-cache` from flashinfer.ai/whl when a
+  FlashInfer path is tested); never build FlashInfer from source or let it JIT
+  a large kernel set (it exhausts host RAM and has crashed the box).
+- `b12x` (PyPI `b12x==1.3.0`, Apache-2.0; the control's own kernel library)
+  is installed in the venv for the record's PCIe DMA-ring all-reduce
+  (`VLLM_B12X_DMA_AR_MIN_MB`). It is not a SlimServe requirement; the ring is
+  skipped with a warning without it, and the record's prefill numbers do not
+  hold then. (The `moe_backend: b12x` experiment, rejected for decode, was
+  removed in the 2026-09-21 cleanup; the notebook keeps its measurements.)
+- Native builds capped: `MAX_JOBS=8 NVCC_THREADS=2` under
+  `systemd-run --user --scope -p MemoryMax=120G`; serving under 150G;
+  earlyoom is active.
+- Docker only for the image-only B12X control; containerd root is on /raid.
+- Never `pkill -f` a pattern the calling shell contains; kill by PID.
+- Never A/B a compiled path with a private env var; use `graph_factors` or
+  distinct code.
+- Rebuild `_quixicore_C` after any merge that touches `csrc/`; swap the
+  `.so` by rename, never overwrite a mapped file.
+- Commit as Auroter, no trailers; push to `upstream` (QuixiAI) branch
+  `glm53f-rtx6000` when the operator says so; PRs target QuixiAI main.
+
+## 11. Decisions (operator answers recorded 2026-09-11)
+
+1. Salvage: yes, the KEEP set of section 1d, one commit at a time,
+   re-measured. Nothing else from the closed PRs.
+2. Driver upgrade: DONE 2026-09-11 (operator ran
+   `~/.local/scratch/slimserve-glm53/driver-610-install.sh`, rebooted).
+   Reason: the control image is CUDA 13.3.1, whose driver branch is 610; on
+   the 580 driver it ran in minor-version compatibility with NCCL cuMem, P2P
+   and its PCIe all-reduce off. Details of the install in section 10. The
+   whole campaign, including the Phase 0 baseline, runs on 610.43.02.
+3. Speculator: whichever is fastest on the measured workloads. The DFlash2
+   drafter's cc-by-nc-nd license is acceptable for self-hosted and internal
+   use; the campaign may end with two records (DFlash2 for the fastest,
+   the checkpoint's own MTP head as the commercially clean alternative).
+   Phase 3 measures both on the prose harness and the structured 8-wide
+   workload.
+4. KV tier (explained, default chosen): SlimServe's HostTierConnector keeps
+   evicted KV blocks in pinned host RAM and then on disk so long
+   conversations and shared prefixes restore instead of re-prefilling. The
+   A100 records carry 72 GiB per rank of pinned host RAM plus 256 GiB per
+   rank of disk, which does not transfer to a 188 GB host with four ranks.
+   Default for the `rtx6000` record: 32 GiB pinned per rank (128 GiB total)
+   plus a disk tier under `/raid` sized to what is free at Phase 6. It is a
+   completeness item, not a throughput item.
+5. Cleanup: done for the local branch, the fetched PR refs and 32 GB of
+   scratch build products, traces and stale compile cache. Two deletions on
+   `/raid` were blocked by the tool sandbox and are left to the operator:
+   `/raid/scratch/slimserve-glm53` (a 148 KB CMake cache) and
+   `/raid/weights/GLM-5.3-Flash-NVFP4-FP8-KDA-TP4` (a 7.2 GB duplicate of
+   the sidecars that live next to the checkpoint, verified byte-identical,
+   plus symlinks).
+6. Hosting of the FP8 hybrid artifacts (needs an HF org and a name by
+   Phase 6; nothing now). This is not about third parties reproducing the
+   benchmark (they download the RedHatAI quant and run vLLM). It is about
+   the profile working on any RTX PRO 6000 box: `slimserve glm53f-nvfp4-4
+   --serve` downloads what the source names, and the retained record serves
+   157 backbone weights in FP8 that are not in the RedHatAI quant (cut out of
+   ZAI's 306 GB native checkpoint, KDA ones self-quantized). Without
+   publishing them the record only runs here. Decision: publish a hybrid
+   checkpoint on Hugging Face as its own quant (RedHatAI NVFP4 experts +
+   native FP8 dense / shared / DSA / KDA projections + the F32 tensors
+   RedHatAI downcast, ~198 GB), name it as the profile source, and retire
+   the runtime swap-set loader; keep the TP-bound KDA beta rows BF16 so the
+   checkpoint is TP-agnostic. Alternatives rejected: a 7.2 GB sidecar repo
+   (two sources per quant, loader hooks stay) or cutting the tensors from the
+   306 GB native download at first boot.
+
+## 12. Phase 0 log (2026-09-11)
+
+- Build: full `12.0f` rebuild of 4a1065081 (`-gencode arch=compute_120f,code=sm_120f`),
+  406 ninja steps, 73 min under the 120 GB scope (peak host use ~20 GB), all
+  seven extensions rebuilt; `_C_stable_libtorch`, `_moe_C_stable_libtorch`
+  and `_quixicore_C` import. DeepGEMM skipped by the cmake guard (no
+  `tools/build_deepgemm_C.py` on this tree).
+- Kernel tests on GPU 0: `test_quixicore_sparse_mla_bf16.py` 23/23.
+  `tests/glm5_next/`: 911 pass, 24 skip, 58 fail, one collection error.
+  The failures, classified (none blocks the record):
+  - 34 in `test_sparse_tc_candidate` / `test_sparse_tc_workspace`: Triton
+    `OutOfResources`, the sparse tensor-core decode asks 147-163 KB of shared
+    memory against the 99 KB (101,376 B) limit here. Expected: the sm80
+    kernel needs an sm_120 retune; the switch is off on the record.
+  - 5 in `test_sparse_tc_workspace` and 4 in `test_indexer_gather_candidate`:
+    stale tests. The kernel gained `SPLIT`/`FP8` parameters (2b355117e) and
+    the indexer call gained `group=` (c03831133) on 2026-09-11; the tests were
+    last touched 2026-09-10 (ac4cacd37). Upstream, not platform.
+  - 10 in `test_mhc_project_candidate`: one element of 16,384 differs by one
+    bf16 ulp (1.2e-4 abs, 0.5 % rel) against the test's tolerance. Rounding
+    order, not a defect.
+  - 4 in `test_pooled_indexer_parity[length=133]` (the only length that
+    prunes): row 123 selects pool 26 instead of pool 30. Diagnosed with
+    `~/.local/scratch/slimserve-glm53/pool_parity_diag.py`: the kernel's
+    pooled scores deviate from the fp32 reference by up to 0.038 (mean
+    0.012 on scores ~0.9, 1-4 %) over every pool, and the reference's own
+    16th/17th candidates are 0.0006 apart, so the flip is score noise at a
+    near-tie, not a tail-pool rule. Same Triton fp32 code on sm80, so most
+    likely not platform-specific; the precision of `_pooled_logits_kernel`
+    versus the HF reference is a fidelity item for upstream, parked.
+  - Collection error: `test_deepcontext_qualification.py` imports
+    `benchmarks.benchmark_wildchat_deepcontext`, absent on this tree.
+- Registry tests (`tests/slimserve/test_profiles.py`): 63 pass; the 8
+  failures are identical without the rtx6000 record. They come from the
+  Metal profile `glm53f-q2-1`, added by 291fe6e81 (2026-09-11) with
+  `"source": "glm53f-gguf"` that no source defines, plus a missing KV note.
+  Upstream breakage, left alone; the PR must not be read as introducing it.
+- Baseline (details in `perf/optimization_status.md` 2026-09-11): no-spec
+  113.3 / 449.2 / 611.0, long 116.9 / 523.7, cold TTFT 11.8 s / 124 s;
+  DFlash2 153.6 / 330.9 / 340.3 (accepts 1.0-1.7 of 7); control r28.1
+  unhandicapped 166.5 / 687.9 / 966.8 and MTP-3 260.8 / 732.1 / 1005.8,
+  control cold TTFT 2.93 s / 14.9 s (ours 4.0x / 8.3x slower).
+  Gates and canaries pass. Decode: cuBLAS M=1 kernels 41 % of an 8.47 ms
+  step, Marlin 13 %, NCCL AR 11.5 %, mHC 9 %; 1583 launches/step. Prefill at
+  32K: `_pooled_logits_kernel` 57 % of 11.58 s (O(L^2), ~17 TFLOP/s), NCCL
+  14 %, sparse MLA via the decode kernel 11 %, mHC partials 7 %.
+- Roadmap adjustment from Phase 0: indexer prefill scoring (compact cache
+  path, SM80-gated at `glm5_next_indexer.py:125`, or a GEMM-form kernel)
+  joins Phase 1; the native NVFP4 expert kernel moves from Phase 4 to Phase 2
+  (the control's c8 / c16 lead is its B12X FP4 expert path plus fp8 KV);
+  speculation stays Phase 3 with the MTP head as the first arm to measure.
+- Environment audit: driver 610.43.02 / CUDA 13.3 (section 10), CPU
+  governor schedutil (acpi-cpufreq), GPU power limit 600 W, max SM clock
+  3090 MHz, memory clock 14,001 MHz, P2P reads OK on every pair, no NCCL or
+  VLLM overrides in the shell, systemd user session, or fish config; 188 GB
+  RAM, earlyoom at 8 % free.
+
+## 12b. Phases 1-6 log (2026-09-11 .. 2026-09-12)
+
+Every item below has its notebook entry in `perf/optimization_status.md`
+(hypothesis, correctness, three-pass numbers, decision, raw artifacts); this
+is the index. Numbers are exact-token 1000/300 medians, c1 / c8 / c16 tok/s,
+no speculation unless marked.
+
+Decode (Phases 1-2), cumulative on the 113.3 / 449.2 / 611.0 baseline:
+- Item 2, custom all-reduce over PCIe (`VLLM_CUSTOM_AR_ALLOW_PCIE=1`): 122.9 / 468.2 / 640.9. RETAINED.
+- Item 3, bf16 M<=16 tensor-core decode GEMMs on the backbone: 124.0 / 472.0 / 641.4. RETAINED.
+- Item 4a, FP8 swap-set (native e4m3 block tensors for the dense MLP, shared experts, DSA q_b/o_proj): 130.7 / 481.1 / 651.1. RETAINED.
+- Item 4b, FP8 KDA projections (self-quantized) with the extended quality gate: 144.7 / 501.1 / 671.2. RETAINED.
+- Item 5, sparse MLA decode with 32/64-token partitions and the channel-parallel reducer: 149.3 / 501.3 / 677.6. RETAINED.
+- Item 7a, FP32 router logits through cuBLAS bf16 x bf16 -> fp32: 150.8 / 506.2 / 679.0. RETAINED.
+- Item 7b, fused mHC norm: 142.3 / 491.9 / 666.4. REJECTED.
+- Item 8, FP8 main KV on the 11 sparse-MLA layers: 148.2 / 489.5 / 650.6 (c16 -4.7 %). REJECTED (twice: see Phase 6).
+- Item 6, fused route+align and the shared-expert combine on the Marlin MoE path: 154.7 / 510.9 / 682.8. RETAINED.
+- Item 9, split SIMT mHC transition on every CUDA part: 157.6 / 519.6 / 688.8. RETAINED.
+- Item 10, fused top-k / top-p / Gumbel-max sampler: 160.7 / 527.6 / 699.9. RETAINED.
+- Not attempted (time-boxed out): the native sm_120 NVFP4 expert kernel, a fused KDA decode kernel, the sparse tensor-core decode retune for 99 KB of shared memory.
+
+Speculation (Phase 3, `--spec`, DFlash2 drafter): k=3 vs k=5 (180.5 / 464.7 / 635.4 vs 161.9 / 417.6 / 353.8); k=3 probabilistic draft sampling 211.3 / 536.2 / 741.6 (RETAINED); block verification with greedy drafting NEUTRAL; k=3 probabilistic + block 239.0 / 532.0 / 729.2 (RETAINED, the record's `speculative_overrides`). The checkpoint's MTP head is not served by this tree. Foundry structured c8: no-spec 387.4 / 421.7 vs spec 399.4 / 468.6 tok/s (accepted 1.59 / 1.57 per step). Spec-mode c1 spreads +-20 % between passes (a 300-token reply takes ~1.5 s); c8/c16 decide.
+
+Prefill (Phase 5), cold TTFT 32K / 128K from 11.6 s / 124 s:
+- Item P1, compact GLM indexer cache qualified on sm_120: 5.31 s / 22.0 s, decode +2 %. RETAINED. Its follow-up found and fixed two hybrid KV cache coordinator defects (hash-granular hits when a group's block is coarser than the hash block; every manager caches at the hit granularity): the cache had a 0 % prefix hit rate before, warm 32K now 0.17 s (0.36 s under the speculator).
+- Item P2 / P5, TP row-sharded indexer scoring at decode / prefill: within noise. REJECTED, code removed.
+- Item P3, custom all-reduce buffer 64 MiB (`VLLM_CUSTOM_AR_MAX_SIZE_MB=64`): 4.70 s / 19.6 s with P1, c8 +3 %. RETAINED.
+- Item P4, `NCCL_PROTO=Simple`: within noise. REJECTED.
+- Upstream merge (9d76a981b: batched warp-split mHC partials, scheduler and host-tier fixes, fp8 prefill pieces): 4.14 s / 17.2 s, c8 +3.2 %, c16 +4.8 %.
+- Item P6, prefill-shaped sparse MLA tensor-core rows kernel (`sparse_tc_nope_rows`, bf16 latents): cold 32K 4.14 s -> 3.13 s, 128K 17.2 s -> 13.2 s, decode +0.3 / +1.4 / +1.2 %. On the record (`glm5_next_sparse_tc_prefill`).
+- Item 8 again with upstream's fp8 sparse prefill kernel: gate -10.3, the kernel's 116 KB of shared memory does not fit sm_120's 99 KB and the binding launched it unchecked; the binding now fails loudly and the Python side skips the kernel on such devices. REJECTED.
+
+Final record (2026-09-12, tree 4c1e0a90f): no speculation 166.2 / 581.5 / 778.0, cold TTFT 32K 3.14 s, 128K 13.1 s, warm 0.174 s / 0.354 s; `--spec` 218.0 / 598.1 / 848.4, cold 3.16 s / 13.3 s, warm 0.296 s / 0.544 s. Gates in band, canaries pass. Against the unhandicapped B12X control (166.5 / 687.9 / 966.8, MTP-3 260.8 / 732.1 / 1005.8, cold 2.93 s / 14.9 s): c1 at parity without speculation and ahead with it, c8 at 83 %, c16 at 79 %, cold 32K prefill 1.4x slower (was 4.0x).
+
+Phase 6: failed paths deleted (row sharding, the rows kernel's fp8 branch, the diagnosis kill switches), the diff against upstream/main reviewed for dead code and drift, the branch's own hunks formatted with the pinned ruff, notes on the record rewritten, PR opened against QuixiAI/SlimServe main. The four `tests/slimserve/test_profiles.py` failures predate the branch (the Metal `glm53f-q2-1` record's undefined `glm53f-gguf` source and its KV note).
+
+## 12c. Phase 7 and the second decode / prefill blocks (2026-09-12 .. 2026-09-14)
+
+The control (voipmonitor jovian r28.1 on this box, same harness) re-measured
+on 2026-09-12: no speculation 166.5 / 687.9 / 966.8, MTP-3 260.8 / 732.1 /
+1005.8 (five-offset c1 protocol 267.6 at 2.67 accepted per step, 10.0 ms
+per step), cold TTFT 32K 2.93 s, 128K 14.9 s. Every entry is in
+`perf/optimization_status.md` from "2026-09-12: rtx6000 Phase 7" to "Item
+D11"; this is the index (c1 / c8 / c16 tok/s, no speculation unless marked).
+
+Phase 7, the control's decode gap (attribution profiles of both servers, then
+the fixes they pointed at):
+- Item B1, b12x native NVFP4 W4A4 experts at decode: REJECTED (kept for
+  prefill-sized batches only).
+- Item E1, `prefix_match_unit: 64` (hash-granular prefix hits next to the
+  1088-token unified hybrid block): RETAINED. Its follow-up fixed two hybrid
+  KV coordinator defects.
+- Item E2, exact repeats hit P-1 tokens and replay the last token: RETAINED.
+- Item E3, the replayed tail as a promoted decode row on the decode graph,
+  hash-granular hits under speculation: RETAINED (warm TTFT into the
+  control's 30-45 ms range).
+- Item E4, 1-wide decode graphs in the speculative engine and the DFlash
+  context pass inside the drafter's graph: RETAINED.
+- Item E6, native top-k / top-p mask on the verify rows, the drafter's tap
+  projection sharded: RETAINED (spec c1 level with the control).
+
+Second prefill block (cold 32K 3.13 s on the E6 tree):
+- Item P1, persistent partials kernel and token slabs for the mHC transition
+  at prefill: RETAINED (kernel -10 %, TTFT neutral).
+- Item P2, the b12x PCIe DMA-ring all-reduce for prefill-sized messages
+  (`VLLM_B12X_DMA_AR_MIN_MB=24`): RETAINED, cold 32K 3.13 s -> 2.78 s.
+- Item P3, the ring's fp8 all-gather wire (`B12X_PCIE_DMA_FP8=ag`):
+  RETAINED, 2.78 s -> 2.66 s, 128K -5 %.
+- Item P4, bf16 probabilities in the sparse-MLA prefill rows kernel:
+  REJECTED (TTFT neutral).
+
+Second decode block:
+- Item D3, the QuixiCore router GEMV for 288 experts on sm_120: RETAINED
+  (step -1.6 %).
+- Item D1b, the lm_head FP8 channel-wise sidecar (`fp8-swapset-lmhead`):
+  RETAINED (step -1.5 %).
+- Item D4, packed indexer projection and fused mHC norm: RETAINED; the L2
+  weight prefetch: REJECTED in both modes and removed.
+- Item D5, the mHC transition fused into the custom all-reduce
+  (`glm5_next_mhc_allreduce_fusion`, captured decode graphs only): RETAINED
+  (no-spec c1 +4.5 %, spec step -2.8 %). Eager launches of the fused path
+  corrupt later batched steps (mechanism open; the eager path is off).
+- Item D6, the checkpoint's own MTP-3 head on this tree: a split-brain
+  top-k index buffer FIXED; c1 five-offset 276.7 (control +3.4 %), c8 / c16
+  below the control. Served through `speculative_overrides` as the
+  commercially clean alternative.
+- Item D7, the DFlash2 drafter at FP8: REJECTED (step unchanged).
+- Item D9, DFlash2 draft width k = 4 / 5 / 7: REJECTED (k = 3 stays).
+- Item D10, `swiglu_limit` 10.0 in the dense MLP, shared and routed experts:
+  RETAINED (fidelity, throughput neutral: 181.4 / 716.6 / 1019.6 against the
+  same kernels without the clamp, the D4 prefetch-off arm's 181.2 / 718.1;
+  raw `perf/results/2026-09-14/s1-swiglu-{nospec,spec}-pass1/`).
+- Correctness: a newcomer's spec-width padded tail accepted placeholder
+  drafts ("!!!" prefix) and ran as a prefill chunk: FIXED (placeholder rows
+  verified as -1 in every sampler path, the scheduler padding removed;
+  `tests/kernels/test_rejection_sample_placeholder.py`). Every DFlash spec
+  c8 / c16 reading between E3 and this fix was inflated.
+- Item D11, batch-size draft schedules: REJECTED for the record (nothing
+  beats DFlash2 k=3 beyond the pass spread; the MTP head with
+  [[1,4,3],[5,8,1],[9,16,2]] recorded as the alternative).
+
+Closing arms (z1-final, three passes, 2026-09-14) against the control:
+no speculation 196.6 / 729.5 / 1014.3 (+18 / +6 / +5 %); DFlash2 k=3
+five-offset c1 265.5 (-1 %, at 8.63 ms per step against 10.0), c8 692.5
+(-5 %: 2.13-2.21 accepted per step against the control head's 2.43), c16
+1023.2 (+2 %); cold TTFT 32K 2.70 s (-8 %), 128K 11.2 s (-25 %); warm
+0.079 / 0.268 s. Gates in band, 0 of 162 completions carry the garbage or
+placeholder signature. Cleanup: L2 prefetch and the mHC last-block kernel
+removed, the review's 37 items applied, both extensions rebuilt, the
+cleaned tree re-validated (z3 arms, one pass with gates, canaries, TTFT and
+the Foundry structured c8 workload).
+
+Post-closing block (2026-09-14 .. 09-15), the MTP drafter and the
+acceptance audit (the control's head accepts more per step than ours; the
+audit hunts the cause in our tree):
+
+- Item D12, a BF16 draft head for the MTP layer: REJECTED (acceptance
+  unchanged; mechanism removed).
+- Item D14, row selection for the MTP drafter's prefill step (the control's
+  prefill-output compaction): RETAINED (c16 +2-3 %, c1 step -1.3 %, c8
+  within noise).
+- Item D13, index sharing across the MTP draft steps
+  (`index_share_for_mtp_iteration`): the first arm ran with the mechanism
+  inactive (the draft config override pinned it off); re-measured through
+  the record's `speculative_overrides` on the c8 probe (+2 %, level
+  acceptance) and the full protocol (c8 +1.5 %, c16 -2 %, tokens/step 2.254
+  against 2.264): within noise. Hooks kept, NOT enabled on the record.
+- Acceptance audit, parts 1-3 (`$S/acc*_chain.sh`, the c8 probe: 4 prompt
+  offsets x 3 seeds, pooled Prometheus counters): the control's shipped
+  MTP-3 accepts 2.38-2.45 tokens per step against our MTP head's 2.21-2.29
+  and DFlash2's 2.24; at depth 1 the control accepts 0.723 per draft, ours
+  0.676 (c8 774 against 751; offset 0: 780 / 775 against 793 / 786 / 793).
+  EXCLUDED as the cause: the verification rule (block = standard), the FP8
+  swap-set, index sharing, the draft KV dtype (the record's target KV is
+  BF16 and the draft inherits it), the native sampler kernels (Triton
+  paths level), the draft expert kernel (Marlin FP8 W8A16 in both), the
+  hidden-state handoff, the router, the indexer. What remains: the two
+  targets differ (TV 0.19 on the gate text, argmax agreement 74 %; ours is
+  the sharper) - the control's b12x W4A4 experts + fp8_ds_mla latents
+  against our Marlin W4A16 + BF16 KV, not settled on this box. Adopted on
+  the way: the control's draft-noise salt (an output-bias fix, not an
+  acceptance lever).
+- Harness incident (2026-09-14 23:33): killing a queued chain that had
+  already started its arm orphaned that arm; its stop's pattern kill hit
+  the next chain's freshly launched server. `ab2.sh` / `stop_server.sh`
+  now kill by pre-collected PID and wait for the API server. The orphaned
+  arm's data (D13 full protocol) was complete and is what the entry above
+  reports.
+- Item D16, the drafter drawing under the request's top-k / top-p
+  (`draft_top_k_top_p`): RETAINED (exact under rejection sampling; +0.008
+  accepted per draft at k=1, +0.03 tokens per step at k=3). The dead-draw
+  share is about 1 %, not the tenth the gate text suggested: the head is
+  far sharper than the target.
+- Item D17, the draft's own temperature (`draft_temperature_scale`):
+  REJECTED, mechanism removed. The scan peaks at the request's own
+  temperature (0.675 / 0.679 / 0.684 / 0.663 / 0.589 per draft at 0.75 /
+  0.9 / 1.0 / 1.15 / 1.35), so the head is correctly temperature-coupled
+  and its shortfall is distribution shape, not sharpness.
+- Item D15, THE RECORD SWITCH: the checkpoint's own MTP head with the
+  batch-size draft schedule [[1,4,3],[5,8,1],[9,16,2]] and the draft cut
+  is now the `rtx6000` variant's registered drafter (the variant carries
+  its own `speculator` whose `local_dir` is the target's, as the qwen38
+  MTP records do, so the draft model is the target's own directory and no
+  host path enters the repo). Three passes, gates, canaries, TTFT and the
+  Foundry workload: c1 270.0 (five-offset mean) / c8 766.5 / c16 1046.7
+  against the control's 267.6 / 732.1 / 1005.8 (+1 / +5 / +4 %), and level
+  at c8 with the control's best configuration of all (its head at depth 1,
+  ~774). The DFlash2 drafter (cc-by-nc-nd-4.0) stays the a100 variant's.
+
+Closing state (2026-09-15) against the voipmonitor jovian r28.1 control:
+no speculation +18 / +6 / +5 % (196.6 / 729.5 / 1014.3 against 166.5 /
+687.9 / 966.8); with speculation +1 / +5 / +4 % (270.0 / 766.5 / 1046.7
+against 267.6 / 732.1 / 1005.8); cold TTFT -8 % at 32K and -20 to -25 % at
+128K (2.71 s / 11.2-11.9 s against 2.93 s / 14.9 s); warm 0.087 / 0.272 s.
+The tree is ahead of the control at every measured shape.
+
+## 13. Next command
+
+```bash
+cd ~/Lazarus/SlimServe && git branch --show-current   # glm53f-rtx6000
+gh pr view 29 --web                                    # the open PR; CodeRabbit's review is answered
+slimserve glm53f-nvfp4-4 --serve --spec                # the record with its MTP drafter
+```
+
+After the PR, in value order. NOT the native sm_120 NVFP4 expert kernel:
+that item rested on a profile note that counted 2.4 MB per expert per rank
+(gate and up only) when the full per-rank footprint is 3.375 MiB, and with
+the right count the Marlin path moves 107.4 MB per layer in 69 us = 1556
+GB/s against this card's measured 1628 GB/s read ceiling, i.e. 96 % of
+achievable. The expert GEMM is at the memory roofline and no kernel can
+beat it.
+
+What the c1 profile of the shipped record leaves addressable is ~2 ms of
+the 8.80 ms step (the rest is the 6.5 GB it must read): the mHC transition
+math (~0.6 ms/step - 89 fused calls at 12.6 us, of which ~6 us is the PCIe
+all-reduce floor and ~7 us is transition arithmetic), the drafter's bf16
+projections (0.29 ms, 32 cutlass calls at 8.9 us), the vocabulary
+all-gather (0.14 ms) and a tail of 0.1 ms items. That is worth perhaps
+7-9 % at c1 and 4-6 % at c8 in many small validated steps, and it is the
+decode work that remains.
+
+Beside it, and independent of throughput, is the target's quantized numerics, which the acceptance audit leaves
+as the whole remaining draft/target gap (the same MTP head accepts 0.68 per
+draft against our Marlin W4A16 experts + BF16 latents and 0.72 against the
+control's b12x W4A4 + fp8_ds_mla, and the two targets differ by TV 0.19 on
+the gate text). The expert half of that is now answered and negative: the
+native W4A4 path over the control's own kernel library accepts 0.681 per
+draft against our Marlin W4A16's 0.690, level inside the probe's spread and
+12 % slower (notebook, "Acceptance audit, part 4"), so what is left is the
+latent cache format (its per-token-scaled fp8_ds_mla against our BF16
+latents) or the attention path around it, and every point of acceptance is
+worth ~1.5 % at c1; the ~1 ms spec-mode overhead on a k=0 decode step (Item D11) - the
+eager fused-path corruption (Item D5) was re-probed clean on 2026-09-17 and attributed to the
+placeholder-draft bug (notebook "Item D5, re-test"); then the QuixiCore-CUDA port of the
+retained kernels (decode GEMMs, route+align, moe_sum_add, topk_sample, the
+rows kernel, the fused all-reduce transition), a 32-row-Q sm_120 variant of
+the fp8 sparse prefill kernel with a re-measure of FP8 main KV, the host +
+NVMe KV tiers with the eviction-restore acceptance, TP2 vs TP4 once.
+
+## 14. Phase 8: the floor campaign (opened 2026-09-17)
+
+Standard (operator, 2026-09-17): a decisive margin over the control, not a
+win. Basis: the notebook entry "Whole-step physics floor" (2026-09-17). Per
+rank per step the record must read 2.59 GB of dense weights (1.59 ms at the
+measured 1628 GB/s) plus 3.54 MB per touched expert (c1 8, c8 ~57, c16
+~90-104 per layer) and pay 90 all-reduces at a 6 us PCIe floor. Floors and
+measured: c1 2.9 ms (~350 tok/s) against 5.1 (196); c8 7.7 ms (~1040)
+against 10.9 (734); c16 ~11 ms (~1400) against 15.5 (1035); spec c1 5.2 ms
+(~470) against 7.3 (329). The expert GEMM is at 96 % of the card and is not
+in the gap. Every item below names the kernels it replaces, how it is
+verified, and what it is expected to return; each lands as its own arm
+(ruff F, kernel parity test, `ab2.sh` exact bench at c1/c8/c16 in both
+modes, logprob gate in band, canaries, notebook entry, commit) and the plan
+is worked top to bottom.
+
+| item | replaces | expected per step |
+|---|---|---|
+| P1 KDA decode chain, one kernel per layer - CLOSED 2026-09-17, rejected | the four Triton kernels replay in 5.6 us per layer at one row under graphs plus PDL (the trace durations that suggested 17 us were inflated); the fused two-launch chain is slower at every shape, hot or cold (notebook "Phase 8 / P1") | none; superseded by P1b |
+| P1b KDA deferred state commit under speculation | the T per-row state stores of `fused_recurrent_kda` (1 read + T writes of 1 MB per request per layer: 64 MB written per layer at c16, 2.0 ms of DRAM-bound time per step at c16, 0.9 ms at c8) -> forward without stores + a post-sampling commit that stores the accepted column and the boundary column (kernels `kda_spec_fwd` MODE 1 / `kda_spec_commit`, parity-tested 2026-09-12) | -0.8 ms c16 spec (+5 %), -0.4 ms c8 spec (+3.5 %) |
+| P2 programmatic dependent launch on our kernels | the 1-2 us serialization gap before each of the ~300 hot launches per step (fp8 decode GEMM, Marlin, fused all-reduce, route/align, combine, P1) | -0.3..0.6 ms (c1 +6-12 %, c8 +3-6 %) |
+| P3 fused all-reduce + mHC transition above 8 rows | the split pair at T > 8: `cross_device_reduce_2stage` 12.3 + `_mhc_partials` 6.3 + `_mhc_finalize` 5.0 = 23.6 us x 90 sites = 2.1 ms at c8/c16 | -0.9 ms at c8/c16 (+8 % / +6 %) |
+| P4 replicated bf16 MLA-side projections onto the fp8 decode GEMM | `fused_qkv_a_proj` (16.8 MB) + indexer `wq_b`/`wk`/`weights_proj` (14.9 MB) per MLA layer on cuBLAS wmma + splitK (6.2 us per call, ~26 per step) | -0.15 ms (-0.16 GB, fewer launches) |
+| P5 candidate gather instead of the full logits all-gather | `ncclDevKernel_AllGather` over [T, 154880] bf16 (145 us per call at 16 rows, 2 per c8 spec step; 60 us at c1) | -0.1 ms c1, -0.25 ms c8/c16 |
+| P6 NVFP4 dense sidecar (W4A16) | the fp8 stream of KDA in_proj/o_proj (1.19 GB), MLA q_b/o_proj (0.25), kv_b, dense MLP, shared experts: 1.9 GB -> 0.95 GB per rank | -0.58 ms (c1 +13 %, c8 +5 %); canary-gated per module family |
+| P7 L2 prefetch of the next GEMM's weights under the all-reduce | the 6 us PCIe floor x 90 sites that nothing overlaps today (128 MB L2; a KDA in_proj slice is 25 MB) | -0.3..0.5 ms if it holds under graph replay |
+
+Item detail:
+
+- **P1 (closed; superseded by F1 on 2026-09-19).** Built as `kda_chain_decode`
+  (two launches, parity test `tests/kernels/test_kda_decode_chain.py`);
+  rejected on the microbench and kept as a diagnostic until the KDA decode
+  block (section 15, F1: one cluster launch per layer, `kda_block_decode`,
+  `tests/kernels/test_kda_decode_block.py`) beat it at every shape, at which
+  point the chain and its switches were deleted. The lesson for every later
+  item: measure the replaced kernels in a graph with PDL on before fusing -
+  launch gaps are already hidden, and a fused kernel must have a shorter
+  critical path than the sum of the wide kernels it replaces.
+- **P1b (design fixed 2026-09-17 21:00 PDT; parked behind P8).** Only the
+  34 target KDA layers are involved (the MTP drafter is MLA). Per request
+  per layer per speculative step the state moves once in and T times out
+  today (T = rows = drafts + 1: 4 at c1, 2 at c8, 3 at c16 under the
+  record's schedule); with the commit it moves once in and, in the commit,
+  once in and once or twice out. That is 3 against 3 moves at c8 (nothing),
+  3-4 against 4 at c16 (~0.34 ms, +2 %), 3 against 5 at c1 (68 MB, <1 %) -
+  and half of that once the state is bf16 (P8). Kept as the design for
+  when the spec schedule widens; the pieces:
+  (1) `fused_recurrent_kda_fwd_kernel` gets `STORE_INPUTS`: with
+  `STORE_STATES=False` it writes the raw g and beta rows it read into a
+  persistent per-layer buffer (`self._spec_inputs`, [rows_max, H, K+1]
+  bf16, allocated once), and the spec conv writes its k/v output through
+  `out=` into a persistent buffer of the same lifetime, so nothing of the
+  step's graph pool is read after the graph (the pool reuses buffers
+  within a replay). (2) `fused_recurrent_kda_commit_kernel` exists since
+  2026-09-12 (prev_accepted, new_accepted, boundary_row; stores column
+  new_accepted-1 and the boundary column); it becomes a grouped launch
+  over the 34 layers through an int64 pointer table for the per-layer
+  state tensors (Triton `tl.cast(ptr_int, tl.pointer_type(...))`) and a
+  layer stride for the stacked input buffers and A_log/dt_bias, one
+  program per (layer, request, head, v-block). (3) The runner's
+  `_postprocess_mamba...` calls it after `num_accepted_tokens.gpu` is
+  written and before `postprocess_mamba_align_gpu`, with prev_accepted =
+  the metadata's num_accepted_tokens the forward started from,
+  new_accepted = this step's counts, boundary_row = the align kernel's
+  `accept_token_bias` when `needs_copy` (computed once on the GPU from the
+  staged num_computed/num_scheduled/num_draft buffers, shared with the
+  align kernel). Verify: state fingerprints of a 300-token speculative
+  decode against the per-row path (both paths on one boot, env switch),
+  the exact bench at c1/c8/c16 spec, the eviction-restore acceptance with
+  VLLM_KV_TIER_VERIFY=1 (the boundary column feeds the tier).
+- **P1 (a), superseded.** (a) First the cheap probe: the packed decode recurrence already
+  exposes `KDA_DECODE_BV` / `KDA_DECODE_WARPS`; sweep BV 8/16/32 x warps
+  1/2/4/8 at the per-rank shape (H 16, K = V = 128, N 1/8/16) in a
+  microbench and, if a config is ahead, make it the sm_120 default in
+  `vllm/models/kimi_k3/amd/ops/third_party/kda/fused_recurrent.py`. (b)
+  Then the kernel: `kda_decode_fused` in `csrc/quixicore/serving/`, one
+  launch per layer per step: conv-state shift + 4-tap conv + SiLU for the
+  q/k/v channels of each token, q/k L2 normalisation, the gate
+  (`A_log`, `dt_bias`, softplus or the lower-bound sigmoid), the delta-rule
+  state update and read-out with the state read and written once, then the
+  gated RMS norm (`o_norm`, sigmoid(g2)) on the way out. Bound through
+  `tm_cuda_serving.cu`, switched in `kimi_gdn_linear_attn.py` for the
+  non-spec decode path first (the spec multi-query path keeps the Triton
+  chain until the fused kernel takes `num_accepted_tokens`), parity test
+  in `tests/kernels/` against the Triton chain on random states and
+  indices, graph-captured. Verify the state fingerprints across a 300-token
+  decode (the eviction-restore acceptance's fingerprints) and the exact
+  bench.
+- **P2.** `cudaLaunchKernelEx` with
+  `cudaLaunchAttributeProgrammaticStreamSerialization` on our launchers;
+  `cudaGridDependencySynchronize()` at each kernel's first dependent read
+  (after address math and, for the GEMMs, after the weight-tile prefetch
+  that does not depend on the activation) and
+  `cudaTriggerProgrammaticLaunchCompletion()` after the last global read.
+  Verify bit-identical outputs under graph replay and the replay time of a
+  captured step (the profiler's `busy` against `wall`).
+- **P3.** Third iteration of `glm5_mhc_allreduce.cuh`: keep the one-shot
+  exchange, map the transition math over (row, split) CTAs with the fp32
+  partials in shared memory so the per-site cost stops growing with rows;
+  the `bench_mhc_ar.py` microbench decides the crossover, the sparse-suite
+  parity and the exact bench qualify it. Target 14 us per site at
+  T = 16-64.
+- **P4.** Extend `slimserve/fp8_swapset.py` to `fused_qkv_a_proj` (quantize
+  all of its shards, the indexer ones included, so one module carries one
+  scheme) and the indexer projections; the loader already injects
+  block-scaled fp8 for the other families. Same block format, canary-gated.
+- **P5.** In the logits processor / sampler: per-rank top-k (k = the
+  request's top_k, plus the draft tokens under speculation) and the local
+  logsumexp, an all-gather of `[T, tp x (k + 1)]` instead of `[T, vocab]`,
+  merge to the exact global top-k distribution. Exact for top_k <= k_max;
+  fall back to the full gather when logprobs are requested or top_k is
+  unset. The rejection sampler's residual distribution is restricted to
+  the same candidate set, which is exact under top-k masking.
+- **P6 (landed, reduced).** `slimserve/nvfp4_swapset.py`: e2m1 group-16
+  with e4m3 group scales and an fp32 global scale per merged module (the
+  experts' recipe), served as a compressed-tensors NVFP4A16 group through
+  Marlin's dense W4A16 path. Measured per family with the gate's
+  all-position prompt logprob (the token-level canary of the plan cannot be
+  met by the reference against itself: two runs of one boot differ by 0.26
+  nats per token, 87 % top-1 agreement): the KDA in_proj costs 0.012 nats
+  per token and returns +3 % c1 / +2 % c8 / +0.5 % c16 (spec c16 +1.5 %);
+  o_proj / q_b / dense MLP cost 0.028 for +1 % c1; the shared experts lose
+  outright. The record carries the in_proj sidecar only
+  (`SLIMSERVE_NVFP4_SWAPSET=nvfp4-swapset-inproj`). The gain is the byte
+  saving and nothing more: HBM-cold the fp8 in_proj GEMM streams at 1.46
+  TB/s and Marlin at 1.19 TB/s of half the bytes (18.1 vs 12.5 us); a
+  streaming NVFP4 kernel would add 0.08 ms (+1.6 % c1) and is not worth
+  building. A PDL launch for dense Marlin was neutral at 1-16 rows (the byte
+  saving is already fully realized) and reverted; its spec boot's low
+  c8/c16 passes turned out to be inside the spec pass spread (5-7 % on one
+  boot), which now puts spec c8/c16 under the same six-pass rule as c1.
+- **P7.** A side-stream prefetch kernel (`prefetch.global.L2` over the next
+  GEMM's weight slice) ordered before each fused all-reduce inside the
+  capture; measured by graph replay time, kept only if it returns
+  >= 0.2 ms.
+
+Order after the 2026-09-17 evening results (P2 and P3 landed as defaults,
+plain c1/c8/c16 +1.5/+1.9/+4.2 % on the head; P1 closed; P6 landed at +3 /
++2 / +0.5 % with the in_proj family only - the byte lever on the dense
+stream is spent, the plan's +13 % rested on a flush-in-graph microbench
+that overstated the cold rates): P8 landed (bf16 KDA recurrent state, `mamba_ssm_cache_dtype: bfloat16`
+on the record: plain +0.5 / +0.6 / +1.5 %, spec inside its spread with
+c16's best pass at 1141; gates, canaries and the acceptance probe
+unchanged), then P4 (arms running), P5, P7, P1b, each 1-3 %. The
+record after P2/P3/P6 (2026-09-17 21:00 PDT, exact, two passes, record
+boots with no extra environment): plain 198-203 / 756-760 / 1086-1092,
+spec 263-310 / 733-784 / 1026-1081 against
+the control's 166.5 / 687.9 / 966.8 and 267.6 / 732.1 / 1005.8, i.e. +19 /
++10 / +12 % plain and level / +0-7 / +2-7 % with speculation (spec passes
+spread 5-7 % on one boot; six-pass medians before any spec claim). The floors (350 /
+1040 / 1400 plain) stay far: what separates the record from them is
+per-layer latency at 1-16 rows (90 all-reduce sites, the KDA glue, the
+small-shape GEMMs), which the fused-launch items P1/P1b/P7 were meant to
+cut and which P1's measurement showed graph replay + PDL already hides;
+the remaining honest levers are the spec state-write traffic (P1b), the
+logits gather (P5) and the replicated bf16 projections (P4).
+
+Realistic landing if P1b-P6 hold: c1 270-285 tok/s (spec 420-450), c8
+900-920 (spec 1000-1050), c16 1250-1300; against the control +65-70 % / +30
+% / +30 %. The literal floors are 350 / 470 / 1040 / 1240 / 1400. At c16 the
+margin is physically capped near +45 % because the expert stream, which the
+control reads at the same rate, is three quarters of the floor there.
+
+### 14.1 Sizing round of 2026-09-17 22:30 PDT: what is left and the order
+
+The six-pass spec A/B (old record configuration against today's record)
+settled the day: c8 spec level (826.8 vs 826.5), c16 spec +3 % (1063 ->
+1097), plain +6 / +4 / +3 %. Cold rotating microbenches (notebook entry
+"Sizing the next levers") then measured every candidate against the card's
+1.62 TB/s read ceiling:
+
+| item | measured | expected per step |
+|---|---|---|
+| P11 cluster split-K for the fp8/bf16 decode GEMM at small N x K | shared gate_up 5.95 us (0.70 TB/s), shared down 3.16 (0.66), o_proj 7.27 (1.15), q_b 6.06 (1.04): 128 CTAs on 188 SMs, no K split; the shipped config is the best of the seven cold | -0.25..0.3 ms c1 (+5-6 %), -0.3 ms c8 (+3 %), +2 % c16 |
+| P9 fused expert GEMV pair over the Marlin layout at one row (gemm1+SiLU, gemm2+weighted sum) | Marlin MoE at 1 x 8 rows: 28.0 us per layer = 1.01 TB/s (62 % of the ceiling); at 8 rows 1.47, at 16 rows 1.54 TB/s (90-95 %: c8/c16 have no MoE-kernel lever) | -0.38 ms c1 plain (+8 %), ~+1 % c1 spec, 0 at c8+ |
+| P10 router chain in one kernel (router GEMV 3.3 us + top-k 0.9 + route_align 4.0) | 0.35 ms per c1 step at launch latency | -0.17 ms (+3.5 % c1, +1.5 % c8) |
+| P12 the c16 schedule entry | c16 spec 1097 sits below c16 plain 1112; the expert-stream cap with 2 drafts (~1740) is barely above plain's (~1640) | c16 spec + a few % if [9,16,1] or no drafts wins the six-pass A/B |
+| P5 candidate gather | unchanged | +2 % c8 spec |
+
+Order: P11, P9, P10, P12, P5. Launch latency itself is hidden (P1's
+finding); what these items remove is real kernel time at small shapes.
+
+### 14.2 P11 rejected, P9 built (2026-09-18)
+
+P11 (cluster split-K along K for the fp8 decode GEMM, DSMEM fixed-order
+reduce) was implemented, exact and deterministic, and slower than the
+shipped 128-CTA grid at every shape but the shared gate_up at one row
+(5.96 -> 5.39 us); split 4 loses 10-80 %. The small shapes are bound by
+per-CTA fixed cost, not by CTA count; the code is reverted and the lesson
+recorded (notebook "P11 cluster split-K: rejected").
+
+P9 became a two-kernel NVFP4 decode MoE path over the Marlin-packed expert
+tensors in place (`csrc/quixicore/serving/nvfp4_moe_decode_ampere.cuh`):
+gate/up + SiLU, then down + the top-k combine + the shared-expert fold,
+deterministic, dispatched from `fused_marlin_moe` below 32 assignment rows
+(`QC_NVFP4_DECODE=0` restores Marlin). Four kernel rounds took the pair
+from 24.5 to 22.2 us per layer cold at one token against Marlin's 29.3
+(-24 %); -6 / -8 / -3 % at 2 / 4 / 8 tokens. The rounds and their lessons
+(runtime-indexed register arrays, the A-fragment round trip per chunk, the
+issue-bound loop, warps over stages) are in the notebook entry "P9 NVFP4
+decode MoE pair: the kernel rounds". Three serving rounds landed it
+(14:37 PDT): the first found the pair not dispatched (GLM-5.3's SiLU
+carries a clamp limit of 10, now folded into gemv1), the second found the
+early dependent-launch trigger costing the whole gain under PDL (29.3 vs
+24.8 us per layer), the third read plain c1 +3.4 % (late trigger, nj by
+batch), the fourth +5.1 % with gemv2 split over the token's experts as a
+cluster of two at one token: record 218.2 / 764-774 / 1108-1110 (+31 /
++12 / +15 % on the control), spec medians c1 311 (+15 % on Marlin
+in-session), c8 820 (+2 %), c16 1116. Retained as the default; item closed
+at 22.0 us per MoE layer at one token (Marlin 29.0, card ~17.5).
+
+P10 (15:35 PDT): the routing folded into gemv1's prologue (two redux.sync
+reductions per argmax round, the row copy issued ahead of it) takes the
+route_align launch off the decode critical path: plain c1 222.0 (+1.7 %),
+c8 spec 831 (+1.3 %), c1 spec level on an eight-pass A/B with unchanged
+acceptance. Record: plain 222.0 / 767-770 / 1110-1113 (+33 / +12 / +15 %
+on the control), spec c1 ~283 (eight-pass median) / c8 831 / c16 1130.
+Raw: serving `$S/serve-logs/ab-p10-{nospec,spec}.out`, `ab-p10{r,off}-c1spec.out`
+(bench JSON under `perf/results/2026-09-18/p10-*-pass*/`), the profiled c1
+rounds `$S/profile-state-p9d-prof/` (before) and the routing microbench
+`$S/p9/mb.cu` / `mb_route.cu` outputs in the notebook entry "P10 the router
+folded into gemv1".
+
+### 14.3 Where the day ends (2026-09-18 17:45 PDT)
+
+Record (no extra environment): plain 227.5 / 774-778 / 1118-1119 tok/s
+(+37 / +13 / +16 % on the control), spec c1 ~280 (eight-pass median), c8
+801-831, c16 1113-1133 (+7 / +10-13 / +11-13 %). Landed today: P9 (the
+NVFP4 decode MoE pair), P10 (the router folded into it), P14 (the two
+per-layer copies). Measured level and left opt-in or reverted: P11
+(cluster split-K), P12 (c16 draft length), P13a (NVFP4 MTP experts), P15
+(gated shared-expert GEMM). What separates every shape from its physics
+floor now is the per-layer launch chain (~25 launches per layer against
+~50 us of bytes; c1 ~2.3 ms per step of bytes and PCIe against 4.4 ms
+measured): the next step change needs a layer-level fusion design
+(attention glue + all-reduce transition + router + experts in far fewer
+launches), not another kernel on the existing boundaries. Smaller items
+still open: the drafter's lm_head (a draft-only NVFP4 copy), P5's candidate
+gather (spec only), the pair's last ~4.5 us per layer to the card's rate.
+
+## 15. Next phase: the layer-level fusion plan (drafted 2026-09-18 18:00 PDT)
+
+Basis: the c1 step is ~1100 launches at 0.76 us of dispatch latency each
+(section 14.3, notebook "The launch floor of this card") plus 1-3 us of
+prologue and tail per real kernel; the bytes need ~1.75 ms and the PCIe
+all-reduces ~0.54 ms per step, the step is 4.4 ms. A KDA layer today is
+~25 launches (in_proj, six attention-glue kernels, o_proj, transition +
+sinkhorn, router GEMV, the pair, the shared expert's three, transition +
+sinkhorn, copies and norms); an MLA layer about the same with the sparse
+attention chain. Every item below is scored by launches removed per layer
+(x 34 KDA / 11 MLA / 42 MoE), each worth ~0.76 us of dispatch plus the
+removed kernel's fixed cost, and by what it does NOT change (bytes stay
+the same; the mandate's A/B rules apply unchanged).
+
+| item | fusion | launches removed per step | expected | risk / precedent |
+|---|---|---|---|---|
+| F1 the KDA attention block as one kernel | gate pair + conv update + recurrence + gated norm in ONE launch per layer: BUILT 2026-09-19 as a thread-block CLUSTER per (request, head) (1024 threads as CL blocks of 1024/CL; phases as wide as today's kernels, DSMEM hand-offs, no scratch, no grid barrier) rather than the cooperative grid sketched here, see the note below the table | 3 x 34 = 102 (P14 had already removed the slice copy) | measured cold, bf16 state: -2.4 us per layer at c1 (2.44 vs 4.85), -2.1 us at c1 x 4 spec rows; the block DECLINES batches past one wave of clusters (about five requests) where the state-bandwidth-bound Triton chain is level or better, so nothing at c8/c16 (notebook "Phase 9 / F1") | a cooperative grid was not needed: cluster.sync costs a fraction of grid.sync and needs no co-residency of the whole grid; the constraint that appeared instead is this part's ~2 resident cluster blocks per SM (cudaOccupancyMaxActiveClusters 46 of 8 / 94 of 4), hence the per-call cluster size and the serves() boundary |
+| F2 the shared expert inside the pair | the shared gate_up (fp8, block-scaled) streamed by gemv1's CTAs beside the routed experts with the clamped SiLU in the same epilogue; the shared down inside gemv2 beside the routed down, the moe_sum_add fold already there | 3 x 42 = 126 and the side stream | -0.1..0.15 ms at c1 (+2-3 %; the two streams stop contending for SMs), nothing at c8/c16 (Marlin serves those rows) | P15 showed the shared branch is not the critical path at one token; the gain is the contention and the launches, sized from the 15:35 timeline (gemv1 16.9 us in situ vs 13.5 cold) |
+| F3 the transition chain | sinkhorn_deferred + the router GEMV + the following norm into the all-reduce transition's tail (the transition already owns the residual streams; the router GEMV is 2.4 MB per layer, one CTA per 8 experts) | 2-3 x 45 = 90-135 | -0.1 ms at every shape (+2 % c1, +1 % c8/c16) | D5's kernel is the most-reworked piece of the branch; every change there needs its phase-stamp A/B |
+| F4 the decode GEMM chains | o_proj + the transition's first phase; q_b / kv_b / indexer wq_b of an MLA layer in one launch (three weights, one grid) | ~2 x 45 | -0.05..0.1 ms | the fp8 decode GEMM launcher already takes a config per shape; a multi-weight grid is a small extension |
+| F5 the drafter step | the MTP layer's ~25 launches + lm_head + all-gather + ~25 sampling kernels: P5's candidate gather, a draft-only NVFP4 lm_head, the sampler's device-to-host copies removed | ~3 x 30 per c1 spec step | c1 spec +5-8 %, c8/c16 spec +2-3 % | spec only; the acceptance counters are the gate |
+
+Order: F1 (largest, self-contained, parity test in place), F2 (kernel work
+inside the pair, which is the best-understood code on the branch), F5, F3,
+F4. F1 note (2026-09-19): the table's sizing assumed the block helps at
+every shape; measured, the launches it removes only show at c1 (and c1
+spec), because at c8/c16 the KDA glue is bandwidth-bound on the recurrent
+state (halved by the bf16 state of item P8) and the four launches hide
+under it. The c1 lever is real (-0.08 ms of the 4.4 ms step from 34
+layers); the c8/c16 expectation of +1 % is withdrawn for F1.
+F1 SERVING VERDICT (22:25 PDT): LEVEL at every shape against the
+same-session reference with the block off (plain 228.5 / 228.6 vs 228.8 /
+228.7 at c1; spec eight-pass medians 296 vs 294), gates and canaries in
+band; the c1 profile shows 926 launches per step instead of 1028 and the
+wall step unchanged. The four launches the block removes were already
+hidden: under programmatic dependent launch inside the graph the chain's
+kernels dispatch while their predecessor runs, and only the cold microbench
+(back-to-back behind an L2 flush) pays them. The block stays on as the
+KDA decode path (parity-tested, fewer graph nodes; QC_KDA_BLOCK=0 restores
+the Triton kernels) and is a candidate for removal at the cleanup pass.
+The general lesson revises this table: the launch floor measured in
+section 14.3 is the cost of NON-PDL dependent launches, and the serving
+step's chains mostly run under PDL, so F3 and F4 (launch-count fusions)
+are not expected to pay at c1 either; what is left is bytes and
+contention (F2) and the drafter's non-PDL sampler chain (F5).
+
+F2 revised design (2026-09-19 22:10 PDT, before building): the shared expert
+has exactly a routed expert's per-rank shape (intermediate 2048 / TP4 = 512,
+K 4096), so the fold is not an fp8 path inside the pair but THE SHARED EXPERT
+AS EXPERT 288 - a 289th NVFP4 expert in the same Marlin layout, appended to
+every token's slots with weight 1.0 (the routed scaling of 2.5 stays on the
+eight routed slots). What it removes per MoE layer: the side stream and its
+three launches (gate_up 7.8 us, act 4.2, down 8.9 on the 15:35 timeline),
+the two streams' contention for DRAM (gemv1 16.9 us in situ against 13.5
+cold), and half of the shared bytes (6 MB fp8 -> 3 MB e2m1); what it adds is
+one more slot in gemv1/gemv2 (~1.9 us of bytes at c1) and one more expert row
+in Marlin at c8/c16 (where the shared expert's rows are grouped like any
+other expert's). Upper bound at c1: the MoE layer from ~26 us to ~22.4
+(-3.6 x 42 = 0.15 ms, +3.4 %); c8/c16 +0.5..1 %; prefill routes the whole
+batch through expert 288 in the grouped GEMM (TTFT measured). Plumbing, all
+precedented on the branch: the sidecar builder mirrors `build_mtp_experts`
+(the checkpoint's BF16 `mlp.shared_experts.*` -> NVFP4 emitted as
+`mlp.experts.288.*`, the fp8 swap-set's shared-expert modules dropped from
+its group); `determine_expert_counts` already appends
+`num_fused_shared_experts` slots for the AITER path (weights allocated for
+E + 1, `expert_map_manager` maps them) - it needs a CUDA gate keyed on the
+sidecar; `DeepseekV2MoE` then builds no shared MLP for those layers; the
+route_align kernel and the pair's folded router write the fixed slot
+themselves (the AITER `inject_shared_expert_weights` is ROCm-only); the
+prefill router appends it with a cat. Quality is gated like P6 (four gates,
+all-position mean; the shared expert is exercised on every token, so its
+NVFP4 error is the one to measure).
+
+F5 revised design (2026-09-19 22:40 PDT, from the code): the record's
+drafter samples PROBABILISTICALLY (`draft_sample_method: probabilistic`,
+`draft_top_k_top_p: true`, `rejection_sample_method: block`), so the
+sharded-argmax path vLLM already carries (`LogitsProcessor.get_top_tokens`,
+`use_local_argmax_reduction`) does not apply; each draft step all-gathers
+the full [T, 154880] logits (61 us at c1), samples over the full vocabulary
+with temperature and exponential noise, and keeps the [T, vocab] draft
+probabilities for the block rejection sampler, whose residual reads them
+over the whole vocabulary. F5a, the candidate gather (P5): per rank the
+top-k of its vocab shard (k = the batch's largest request top_k, 20 on the
+bench; a request without top_k or with logprobs falls back to the full
+gather), an all-gather of [T, tp, k, 2] fp32, the global top-k of the
+tp x k candidates, temperature + noise sampling over those k logits, and
+the k probabilities scattered into a zeroed [T, vocab] tensor - exact
+under top-k masking, and the rejection kernels see the same draft
+distribution they see today. F5b, a draft-only NVFP4 lm_head: the MTP
+head shares the target's fp8-channel lm_head (158 MB per rank per draft
+step, 104 us); a second head module quantized through the sidecar (79 MB)
+is used only for drafting, so it can only move the acceptance rate, never
+the output distribution - the acceptance counters are its whole gate.
+Sized at c1 spec: -61 -> ~-10 us and -104 -> ~-55 us per draft step, x 3
+draft steps = ~-0.3 ms of the 8.6 ms step (+3.5 %); ~+1.5 % at c8/c16
+spec (one or two draft steps at 8-16 rows). Order: F5a (no new weights,
+exactness provable in a unit test), then F5b.
+
+F2 VERDICT (23:20 PDT, notebook "Phase 9 / F2"): built as designed and
+correct end to end (canaries, gates +0.01 nats better than the reference
+boot), LEVEL in throughput at every shape (plain c1 level once gemv2's
+cluster split took five and four experts, c8 +1 %, c16 -1 %, spec inside
+the draws). The shared branch was already hidden behind the pair, and the
+ninth slot costs the pair what the branch cost. Retained opt-in
+(`SLIMSERVE_NVFP4_SHARED_SWAPSET=nvfp4-swapset-shared`), not in the record.
+
+F5a VERDICT (23:47 PDT, notebook "Phase 9 / F5a"): built and bit-exact
+against the full draft path (13 cases), LEVEL within what the harness can
+resolve (the eight-pass c1 spec medians of this session span 275-334 on
+identical code; the profile arms' per-window wall and GPU span disagree by
+1-2 % in opposite directions). What it removed per draft step (the logits
+all-gather and the vocab-wide cut) it spent on the shard top-k, two small
+gathers and their eager launches. Opt-in (QC_DRAFT_CANDIDATES=1). F5b, the
+draft-only NVFP4 lm_head, is in its arm (`SLIMSERVE_NVFP4_DRAFT_LMHEAD`).
+
+F5b VERDICT (2026-09-20 00:10 PDT, notebook "Phase 9 / F5b"): the drafter's
+NVFP4 head halves the head bytes per draft step (the fp8 head GEMM leaves
+the draft steps in the profile), acceptance unchanged (0.977 per draft),
+canaries pass, c1 spec median 330 against 302. IN THE RECORD
+(`SLIMSERVE_NVFP4_DRAFT_LMHEAD=nvfp4-swapset-draft-lmhead`, profile note).
+
+Together they remove ~450 of the ~1100 launches per c1 step and are
+sized at +8-12 % c1, +4-5 % c8/c16 (F1 corrected from the graph-replay
+numbers) - the remaining "leaps and bounds"
+before the physics floor, at the cost of a persistent/cooperative kernel
+style the branch has not used yet. Verified 18:05 PDT (`$S/p9/coop_probe.cu`):
+a cooperative kernel with two `grid.sync()` phases captures into a CUDA
+graph and replays correctly on this driver through both
+`cudaLaunchCooperativeKernel` and `cudaLaunchKernelEx` with the
+cooperative attribute (188 x 256 threads, neighbour reads across the sync,
+replay counter exact), so F1 has no launch-model blocker.
+
+## 16. Phase 9 (2026-09-19/20): the section-15 items, measured, and the final numbers
+
+Built in the order the plan gave, each with its parity or exactness test,
+cold microbench, serving arms against same-session references, gates and
+canaries (notebook "Phase 9 / F1 .. F5b"):
+
+| item | built as | correctness | serving | disposition |
+|---|---|---|---|---|
+| F1 KDA decode block | one cluster launch per KDA layer (clusters of 8 / 4 by batch, DSMEM hand-offs; `kda_decode_block.cuh`) | 145 parity cases vs the Triton chain | LEVEL (228.5 vs 228.8 c1; the removed launches were already hidden by dependent launch) | on, QC_KDA_BLOCK=0 restores; removable |
+| F2 shared expert as expert 288 | NVFP4 sidecar + fused shared slot through route_align, the pair and Marlin | canaries, gates +0.01 nats BETTER | LEVEL (plain c1 level once gemv2 split five and four, c8 +1 %, c16 -1 %; spec inside the draws) | opt-in `SLIMSERVE_NVFP4_SHARED_SWAPSET` |
+| F3, F4 launch-count fusions | not built | - | the F1 lesson: launches under PDL in the graph cost nothing to remove | withdrawn |
+| F5a candidate draft sampler | per-shard top-32 gathered, the native cut and Gumbel draw reproduced (`candidate_draft.cuh`) | bit-exact vs the full path (13 cases) | LEVEL within what the harness resolves | opt-in QC_DRAFT_CANDIDATES=1 |
+| F5b draft-only NVFP4 lm_head | sidecar, the drafter's own head module | acceptance unchanged, canaries | c1 spec median 330 vs 302; the fp8 head GEMM leaves the draft steps | IN THE RECORD |
+
+Final numbers (tree 6ea3ede34, the record's environment, exact-token
+1000/300, 2026-09-20 00:12-00:30 PDT):
+
+| | c1 | c8 | c16 | cold TTFT 32K | cold TTFT 128K |
+|---|---|---|---|---|---|
+| control (voipmonitor jovian r28.1 B12X), plain / MTP-3 | 166.5 / 260.8 | 687.9 / 732.1 | 966.8 / 1005.8 | 2.93 s | 14.9 s |
+| record, plain (two passes) | 228.5 / 228.7 | 776.1 / 775.7 | 1127.6 / 1122.7 | 2.84 s | 11.77 s |
+| record, `--spec` (eight-pass median, range) | 304.4 (275-343) | 818.7 (739-847) | 1140.9 (1070-1184) | | |
+| record vs control | +37 % / +17 % | +13 % / +12 % | +17 % / +13 % | -3 % | -21 % |
+
+Warm (prefix-cached) TTFT 0.084 s at 32K, 0.267 s at 128K. Four gates in
+band (all-position -3.262..-3.275), canaries text/tool/image pass, 0.981
+accepted per draft.
+
+Lessons that revise the plan's premises: (1) the launch floor of 14.3 is the
+cost of dependent launches WITHOUT programmatic dependent launch; inside
+the serving graph the chains run under PDL and a fused kernel that only
+removes launches is level - a cold back-to-back microbench pays every
+launch and misleads (P1 said this from the trace side, F1 from the other).
+(2) The eight-pass c1 spec median cannot resolve +-7 % (275-334 on
+identical code in one session; per-boot acceptance 0.968-0.993); drafter
+changes are judged by the acceptance counters and the profile's launch
+count. (3) The remaining gap to the physics floor (bytes 1.75 ms + PCIe
+0.54 ms against the 4.4 ms c1 step) is not launches; it is the per-kernel
+prologue/tail and the all-reduce chain, which only a different execution
+model (persistent megakernel per layer, or fewer, wider all-reduces) can
+touch - out of this phase's scope and recorded here for the next.
+
+## 17. Switch reference
+
+Every environment switch the campaign added, read once per process. None is
+deploy configuration; the record's environment in `slimserve/profiles.json`
+sets only the sidecar and all-reduce entries named there. "Kill switch"
+means default on, `0` restores the previous path for an A/B.
+
+| switch | default | meaning |
+|---|---|---|
+| `QC_PDL` | 4 | programmatic dependent launch mode of the decode kernels (Triton KDA chain, decode GEMMs, Marlin, KDA block); `0` off |
+| `QC_KDA_BLOCK` | 1 | kill switch: the fused KDA decode block (F1) |
+| `QC_KDA_DIRECT_OUT` | 1 | kill switch: KDA output norm written straight to the layer output |
+| `QC_MOE_OUTPUT_ALIAS` | 1 | kill switch: the MoE result aliased to the caller's buffer |
+| `QC_NVFP4_DECODE` | 1 | kill switch: the NVFP4 decode MoE pair (`0` keeps Marlin for every batch) |
+| `QC_NVFP4_DECODE_ROUTE` | 1 | kill switch: the folded router (deferred routing) in front of the pair |
+| `QC_NVFP4_DECODE_ROWS` / `_NJ` / `_STAGES` / `_SPLIT` | 32 / by batch / 4 / by batch | kernel tuning pins for the pair (assignment rows served, column-group width, cp.async ring depth, gemv2 cluster split) |
+| `QC_FP8_GATED` | 0 | opt-in: gate_up + SiLU fused into the fp8 decode GEMM (measured level) |
+| `QC_DRAFT_CANDIDATES` | 0 | opt-in: the candidate draft sampler (F5a, bit-exact, measured level) |
+| `QC_MHC_RS` | 5 | rows from which the fused mHC all-reduce uses the reduce-scatter exchange (read in `custom_all_reduce.cuh` and `custom_all_reduce.py`; keep both in step) |
+| `QC_MHC_SLAB_TOKENS` / `QC_MHC_PERSISTENT_MIN_TOKENS` | 2048 / 128 | kernel tuning: mHC prefill slab length; batch from which the persistent kernel takes over |
+| `SLIMSERVE_DECODE_GEMM` / `SLIMSERVE_DECODE_GEMM_FP8` | 1 / 1 | kill switches: the bf16 and fp8 decode GEMMs behind the dense linears |
+| `SLIMSERVE_FP8_SWAPSET` / `SLIMSERVE_NVFP4_SWAPSET` / `SLIMSERVE_NVFP4_FAMILIES` | record | sidecar selection (file stem beside the checkpoint) and the NVFP4 families served from it |
+| `SLIMSERVE_NVFP4_DRAFT_LMHEAD` | record | the drafter's own NVFP4 lm_head sidecar (F5b) |
+| `SLIMSERVE_NVFP4_SHARED_SWAPSET` | unset | opt-in: the shared expert as fused expert E (F2, measured level) |
+| `SLIMSERVE_NVFP4_MTP_SWAPSET` | unset | opt-in: NVFP4 MTP layer sidecar |
+| `SLIMSERVE_F32_OVERRIDES` | 1 | kill switch: the fp32 overrides file beside the checkpoint (`slimserve/f32_overrides.py`), used when present |
+

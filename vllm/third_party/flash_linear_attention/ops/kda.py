@@ -14,6 +14,11 @@ import torch.nn as nn
 
 from vllm.model_executor.custom_op import CustomOp
 from vllm.triton_utils import tl, triton
+
+# Programmatic dependent launch: see vllm/triton_utils/pdl.py.
+from vllm.triton_utils.pdl import PDL as _PDL  # noqa: E402
+from vllm.triton_utils.pdl import gdc_launch_dependents, gdc_wait  # noqa: E402, F401
+
 from vllm.utils.math_utils import RCP_LN2, cdiv, next_power_of_2
 
 from .chunk_delta_h import chunk_gated_delta_rule_fwd_h
@@ -177,7 +182,12 @@ def layer_norm_gated_fwd_kernel(
     HAS_RESIDUAL: tl.constexpr,
     HAS_WEIGHT: tl.constexpr,
     HAS_BIAS: tl.constexpr,
+
+    PDL: tl.constexpr = False,
 ):
+    if PDL:
+        gdc_launch_dependents()
+        gdc_wait()
     i_t = tl.program_id(0)
 
     o_d = tl.arange(0, BD)
@@ -268,7 +278,12 @@ def layer_norm_gated_fwd_kernel1(
     HAS_RESIDUAL: tl.constexpr,
     HAS_WEIGHT: tl.constexpr,
     HAS_BIAS: tl.constexpr,
+
+    PDL: tl.constexpr = False,
 ):
+    if PDL:
+        gdc_launch_dependents()
+        gdc_wait()
     i_t = tl.program_id(0)
     x += i_t * D
     y += i_t * D
@@ -383,7 +398,10 @@ def layer_norm_gated_fwd(
             ACTIVATION=activation,
             IS_RMS_NORM=is_rms_norm,
             num_warps=8,
-        )
+        
+        PDL=_PDL,
+        launch_pdl=_PDL,
+    )
     else:
         layer_norm_gated_fwd_kernel1[(T,)](
             x=x,
@@ -401,7 +419,10 @@ def layer_norm_gated_fwd(
             ACTIVATION=activation,
             IS_RMS_NORM=is_rms_norm,
             num_warps=4,
-        )
+        
+        PDL=_PDL,
+        launch_pdl=_PDL,
+    )
     # residual_out is None if residual is None and residual_dtype == input_dtype
     return y, mean, rstd, residual_out if residual_out is not None else x
 

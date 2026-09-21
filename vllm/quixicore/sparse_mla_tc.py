@@ -208,6 +208,126 @@ def sparse_tc_nope(
     return out
 
 
+@triton.jit
+def _sparse_tc_rows(
+    Q,
+    CACHE,
+    BT,
+    INDICES,
+    TLEN,
+    OUT,
+    BT_STRIDE,
+    PAGE_STRIDE,
+    CACHE_PAGES,
+    SCALE,
+    H: tl.constexpr,
+    BS: tl.constexpr,
+    MAX_TOPK: tl.constexpr,
+    TILE: tl.constexpr,
+):
+    """One program per query token, every head at once, online softmax over
+    the token's index list in TILE-wide gathered tiles: no partition scratch,
+    so it scales to prefill chunks of thousands of rows. Each gathered tile is
+    read once for all heads (the SIMT kernel walks the list once per head).
+    bf16 latents only: an fp8 main KV takes the native fp8 prefill kernel."""
+    row = tl.program_id(0)
+    h, d = tl.arange(0, 16), tl.arange(0, 512)
+    count = tl.minimum(tl.load(TLEN + row), MAX_TOPK)
+    # The query is held transposed ([512, 16]) so the gathered tile is the A
+    # operand of both products and never needs a transposed shared-memory
+    # copy (sm_120 has 99 KB of shared memory per block).
+    q_t = tl.load(
+        Q + (row.to(tl.int64) * H + h[None, :]) * 512 + d[:, None],
+        h[None, :] < H,
+        0,
+    )
+    running_max = tl.full([16], float("-inf"), tl.float32)
+    running_sum = tl.zeros([16], tl.float32)
+    accumulator = tl.zeros([16, 512], tl.float32)
+    for start in range(0, count, TILE):
+        j = start + tl.arange(0, TILE)
+        logical = tl.load(
+            INDICES + row.to(tl.int64) * MAX_TOPK + j,
+            (j < count) & (j < MAX_TOPK),
+            -1,
+        )
+        valid = (j < count) & (logical >= 0) & (logical < BT_STRIDE * BS)
+        page = tl.load(BT + row.to(tl.int64) * BT_STRIDE + logical // BS, valid, -1)
+        valid = valid & (page >= 0) & (page < CACHE_PAGES)
+        kv = tl.load(
+            CACHE
+            + page[:, None].to(tl.int64) * PAGE_STRIDE
+            + (logical[:, None] % BS) * 512
+            + d[None, :],
+            valid[:, None],
+            0,
+        )
+        # scores_t[j, h] for the tile's keys j and the heads h.
+        scores_t = tl.dot(kv, q_t) * SCALE
+        scores_t = tl.where(valid[:, None], scores_t, float("-inf"))
+        new_max = tl.maximum(running_max, tl.max(scores_t, axis=0))
+        safe_max = tl.where(new_max == float("-inf"), 0.0, new_max)
+        rescale = tl.exp(running_max - safe_max)
+        probabilities_t = tl.exp(scores_t - safe_max[None, :])
+        running_sum = running_sum * rescale + tl.sum(probabilities_t, axis=0)
+        accumulator = accumulator * rescale[:, None]
+        high = probabilities_t.to(tl.bfloat16)
+        low = (probabilities_t - high.to(tl.float32)).to(tl.bfloat16)
+        accumulator = tl.dot(tl.trans(high), kv, accumulator)
+        accumulator = tl.dot(tl.trans(low), kv, accumulator)
+        running_max = new_max
+    result = tl.where(running_sum[:, None] > 0, accumulator / running_sum[:, None], 0.0)
+    tl.store(
+        OUT + (row.to(tl.int64) * H + h[:, None]) * 512 + d[None, :],
+        result.to(tl.bfloat16),
+        h[:, None] < H,
+    )
+
+
+def sparse_tc_nope_rows(q, cache, block_table, indices, topk_length, scale, *, tile=64):
+    """Prefill-shaped counterpart of `sparse_tc_nope` for bf16 latents: same
+    numerics (fp32 softmax, split bf16 probabilities), one program per row
+    over the whole index list, no partition scratch. `tile` is the gathered
+    tile width (32 or 64 rows of the latent)."""
+    if tile not in (32, 64):
+        raise ValueError("tile must be 32 or 64")
+    assert q.ndim == 3 and q.shape[1] in (8, 16) and q.shape[2] == 512
+    assert cache.ndim == 3 and cache.shape[2] == 512
+    assert q.dtype == torch.bfloat16 and cache.dtype == torch.bfloat16
+    assert cache.stride()[1:] == (512, 1) and cache.shape[1] > 0
+    assert indices.shape[0] == block_table.shape[0] == q.shape[0]
+    assert topk_length.shape == (q.shape[0],)
+    assert all(t.dtype == torch.int32 for t in (block_table, indices, topk_length))
+    assert all(t.is_contiguous() for t in (q, block_table, indices, topk_length))
+    assert q.is_cuda and all(
+        t.device == q.device for t in (cache, block_table, indices, topk_length)
+    )
+    rows, heads, _ = q.shape
+    out = torch.empty_like(q)
+    if rows == 0:
+        return out
+    assert indices.shape[1] > 0
+    _sparse_tc_rows[(rows,)](
+        q,
+        cache,
+        block_table,
+        indices,
+        topk_length,
+        out,
+        block_table.stride(0),
+        cache.stride(0),
+        cache.shape[0],
+        scale,
+        heads,
+        cache.shape[1],
+        indices.shape[1],
+        tile,
+        num_warps=4,
+        num_stages=1,
+    )
+    return out
+
+
 def compile_only():
     import json
 

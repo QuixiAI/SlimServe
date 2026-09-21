@@ -153,6 +153,26 @@ class LogitsProcessor(PluggableLayer):
             logits = logits[..., : self.org_vocab_size]
         return logits
 
+    def get_local_logits(
+        self,
+        lm_head: VocabParallelEmbedding,
+        hidden_states: torch.Tensor,
+        embedding_bias: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, int]:
+        """This rank's vocab shard of the logits without the tensor-parallel
+        gather ([batch, shard] with the shard's padding at -inf) and the global
+        id of its first column: the candidate draft sampler gathers only the
+        top-k of every shard."""
+        logits = self._apply_head(lm_head, hidden_states, embedding_bias)
+        if self.soft_cap is not None:
+            logits = torch.tanh(logits / self.soft_cap) * self.soft_cap
+        if self.scale != 1.0:
+            logits = logits * self.scale
+        num_pad = lm_head.shard_indices.num_org_vocab_padding
+        if num_pad > 0:
+            logits[..., -num_pad:] = -float("inf")
+        return logits, lm_head.shard_indices.org_vocab_start_index
+
     def get_top_tokens(
         self,
         lm_head: VocabParallelEmbedding,

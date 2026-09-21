@@ -264,6 +264,29 @@ def get_quant_config(
         # compressed-tensors uses a compressions_config
         hf_quant_config = getattr(model_config.hf_config, "compression_config", None)
 
+    # SlimServe FP8 swap-set (slimserve.fp8_swapset): a sidecar next to the
+    # checkpoint that serves the native FP8 block tensors of modules the
+    # conversion left in BF16; its manifest carries the config group that
+    # quantizes exactly those modules, and they leave the ignore list.
+    from slimserve.fp8_swapset import GROUP_NAME as FP8_GROUP_NAME
+    from slimserve.fp8_swapset import apply_config_group
+
+    apply_config_group(model_config.model, hf_quant_config)
+    # SlimServe NVFP4 sidecar (slimserve.nvfp4_swapset): the dense projections
+    # as W4A16 NVFP4; its modules leave the FP8 group and the ignore list.
+    from slimserve.nvfp4_swapset import apply_config_group as apply_nvfp4_group
+
+    apply_nvfp4_group(model_config.model, hf_quant_config, FP8_GROUP_NAME)
+    # The MTP layer's experts re-quantized to NVFP4 (slimserve.nvfp4_swapset
+    # --mtp-experts): they leave their FP8 group for the NVFP4 experts group.
+    from slimserve.nvfp4_swapset import apply_mtp_config_group
+
+    apply_mtp_config_group(model_config.model, hf_quant_config)
+    # The drafter's own NVFP4 lm_head (slimserve.nvfp4_swapset --draft-lm-head).
+    from slimserve.nvfp4_swapset import apply_draft_lmhead_config_group
+
+    apply_draft_lmhead_config_group(model_config.model, hf_quant_config)
+
     # Pipe information about heads to enable TP-aware loading of attn_head scales
     if (
         hf_quant_config is not None

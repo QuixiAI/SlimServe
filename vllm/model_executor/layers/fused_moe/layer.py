@@ -75,6 +75,7 @@ def determine_expert_counts(
     num_redundant_experts: int,
     n_shared_experts: int | None,
     is_act_and_mul: bool,
+    fuse_shared_experts: bool = False,
 ) -> tuple[int, int, int]:
     global_num_experts = num_experts + num_redundant_experts
     logical_num_experts = num_experts
@@ -83,10 +84,14 @@ def determine_expert_counts(
     # VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: either the native aiter fused-MoE
     # path (env + master switch, via is_fusion_moe_shared_experts_enabled) or the
     # backend-neutral router-append path (env alone, independent of the master
-    # switch; e.g. the MM3 triton/flydsl mxfp8 MoE). Gated activations only.
+    # switch; e.g. the MM3 triton/flydsl mxfp8 MoE), or asked for outright by the
+    # model (`fuse_shared_experts`: a shared expert the layer serves as one more
+    # routed-format expert, e.g. GLM-5.3's NVFP4 shared-expert sidecar). Gated
+    # activations only.
     fuse_shared_enabled = (
         rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
         or envs.VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS
+        or fuse_shared_experts
     ) and is_act_and_mul
 
     num_fused_shared_experts = (
@@ -132,6 +137,7 @@ def FusedMoE(
     reduce_results: bool = True,
     ckpt_names: tuple[str, str, str] = ("gate_proj", "down_proj", "up_proj"),
     n_shared_experts: int | None = None,
+    fuse_shared_experts: bool = False,
     router_logits_dtype: torch.dtype | None = None,
     gate: torch.nn.Module | None = None,
     shared_experts: torch.nn.Module | None = None,
@@ -243,6 +249,7 @@ def FusedMoE(
             num_redundant_experts,
             n_shared_experts,
             is_act_and_mul,
+            fuse_shared_experts,
         )
     )
 
