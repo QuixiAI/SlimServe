@@ -31237,3 +31237,23 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   the merge and the cleanup commit carry the local validation above and no
   bot review; the last reviewed head stays 55d4c64d5. PR is MERGEABLE /
   CLEAN against upstream d79030d5a.
+- CLEANUP A/B (2026-09-21, one session, pre-cleanup = 226cbaaaf's code
+  rebuilt, cleaned = 2170b9778; scripts p9/chain_ab_clean.sh,
+  chain_ab_c8.sh, chain_bisect_c8.sh, chain_bisect2_c8.sh). The 2026-09-20
+  four-pass spec arms could not carry a verdict and should not have been
+  called level. Record protocol: plain pre 229.0 / 777.2 / 1113.1 and 228.8
+  / 772.7 / 1123.7, cleaned 229.4 / 786.5 / 1114.1 and 229.3 / 777.6 /
+  1100.4; spec eight-pass medians pre 308 / 832 / 1110, cleaned 307 / 796 /
+  1131 and (second boot) 314 / 814 / 1136. c8 spec followed up at 16 passes
+  per boot, medians: pre-cleanup boots 848.8, 840.4, 828.3; cleaned boots
+  824.7, 831.4; pre-cleanup kernel headers + cleaned Python 822.2; cleaned
+  kernels + pre-cleanup Python 815.1 (acceptance 0.67-0.70 per draft in
+  every arm). Neither half of the cleanup recovers the fast boot, and the
+  pre-cleanup tree's own boots span 828-849, which covers the cleaned
+  boots: DECISION level, cleanup kept. The c8 spec boot-to-boot spread
+  (~+-1.5 % on a 16-pass median) is the resolution limit of this harness;
+  a difference below ~1 % is not excluded. Diff review: the kernel edits
+  remove only constexpr-dead branches (CL is 8 or 4) and an env switch
+  whose default arm is the instantiation now called directly; Python edits
+  add one cached wrapper call per KDA layer on eager steps only (decode
+  replays full graphs).
