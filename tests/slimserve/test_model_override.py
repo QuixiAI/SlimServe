@@ -37,7 +37,7 @@ def test_repo_id_resolves_under_the_cache_root(monkeypatch, tmp_path):
     monkeypatch.setenv("SLIMSERVE_CACHE", str(tmp_path))
     override = parse_model_override("orcarouter/GLM-5.3-Flash-Uncensored-NVFP4")
     assert override.repo == "orcarouter/GLM-5.3-Flash-Uncensored-NVFP4"
-    assert override.directory == tmp_path / "GLM-5.3-Flash-Uncensored-NVFP4"
+    assert override.directory == tmp_path / "orcarouter--GLM-5.3-Flash-Uncensored-NVFP4"
     assert override.base_url.endswith("/GLM-5.3-Flash-Uncensored-NVFP4/resolve/main")
 
 
@@ -110,3 +110,13 @@ def test_a_checkpoint_without_a_config_is_an_error(tmp_path):
     empty.mkdir()
     with pytest.raises(ProfileError):
         registry.override_conflicts(registered, empty)
+
+
+def test_same_repo_name_under_two_owners_never_shares_a_directory(monkeypatch, tmp_path):
+    monkeypatch.setenv("SLIMSERVE_CACHE", str(tmp_path))
+    theirs = parse_model_override("nvidia/GLM-5.3-Flash-NVFP4")
+    ours = parse_model_override("RedHatAI/GLM-5.3-Flash-NVFP4")
+    assert theirs.directory != ours.directory
+    # And neither collides with a registered source's local_dir, which is the
+    # bare repo name.
+    assert theirs.directory.name != "GLM-5.3-Flash-NVFP4"

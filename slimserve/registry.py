@@ -239,7 +239,13 @@ def parse_model_override(spec: str) -> ModelOverride:
             f"--model {spec}: expected a local directory or a Hugging Face "
             "repo id of the form owner/name"
         )
-    return ModelOverride(spec=text, repo=text, directory=cache_root() / parts[1])
+    # The directory carries the owner too. Repos from different owners share
+    # repo names all the time (nvidia/GLM-5.3-Flash-NVFP4 beside
+    # RedHatAI/GLM-5.3-Flash-NVFP4), and keying on the name alone wrote one
+    # checkpoint's files over another's (2026-09-21).
+    return ModelOverride(
+        spec=text, repo=text, directory=cache_root() / f"{parts[0]}--{parts[1]}"
+    )
 
 
 def _config_of(directory: Path) -> dict[str, Any]:
