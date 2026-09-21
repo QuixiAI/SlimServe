@@ -31257,3 +31257,13 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   whose default arm is the instantiation now called directly; Python edits
   add one cached wrapper call per KDA layer on eager steps only (decode
   replays full graphs).
+- B12X NATIVE MOE BACKEND REMOVED (2026-09-21): the `moe_backend: b12x`
+  experiment (Item B1, rejected for decode, on no profile) is deleted -
+  fused_moe/b12x.py, quantization/utils/b12x_moe.py, warmup/b12x_warmup.py,
+  utils/b12x.py, its test, VLLM_B12X_MOE_FP4_FORCE_A16, and the hooks in
+  oracle/nvfp4.py, config/kernel.py, modelopt.py, kernel_warmup.py and
+  gpu_worker.py (those five files are upstream's again). The b12x DMA-ring
+  all-reduce is untouched. Validation (ab2 nob12x-nospec / nob12x-spec):
+  canaries pass, gates -2.441 / -2.457, plain 228.8 / 778.3 / 1119.8 and
+  228.7 / 771.9 / 1116.2, spec eight-pass medians 301.7 / 805.3 / 1125.3,
+  0.975 per draft.

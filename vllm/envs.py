@@ -190,7 +190,6 @@ if TYPE_CHECKING:
     VLLM_RAY_EXTRA_ENV_VAR_PREFIXES_TO_COPY: str = ""
     VLLM_RAY_EXTRA_ENV_VARS_TO_COPY: str = ""
     VLLM_MARLIN_USE_ATOMIC_ADD: bool = False
-    VLLM_B12X_MOE_FP4_FORCE_A16: bool = False
     VLLM_MARLIN_INPUT_DTYPE: Literal["int8", "fp8"] | None = None
     VLLM_HUMMING_ONLINE_QUANT_CONFIG: dict[str, Any] | None = None
     VLLM_HUMMING_INPUT_QUANT_CONFIG: dict[str, Any] | None = None
@@ -1516,11 +1515,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Whether to use atomicAdd reduce in gptq/awq marlin kernel.
     "VLLM_MARLIN_USE_ATOMIC_ADD": lambda: (
         os.environ.get("VLLM_MARLIN_USE_ATOMIC_ADD", "0") == "1"
-    ),
-    # Run the b12x NVFP4 MoE with bf16 activations (inline FP4 weight
-    # dequantization) instead of the checkpoint's FP4 activation recipe.
-    "VLLM_B12X_MOE_FP4_FORCE_A16": lambda: (
-        os.environ.get("VLLM_B12X_MOE_FP4_FORCE_A16", "0") == "1"
     ),
     # The activation dtype for marlin kernel
     "VLLM_MARLIN_INPUT_DTYPE": env_with_choices(
