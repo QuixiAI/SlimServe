@@ -18,13 +18,14 @@ def apply_tool_thinking_compat(
     user_kwargs: Mapping[str, Any],
     extra_kwargs: dict[str, Any],
 ) -> None:
-    """Apply profile-selected thinking defaults for structured tool calls.
+    """Force non-thinking for requests that carry custom/free-form tools.
 
-    GLM-5.3's thinking preamble can consume or corrupt the structural
-    prefix expected by tool parsers. Default native function calls to
-    non-thinking, while still permitting an explicit native-tool opt-in.
-    Custom/free-form tools are always forced to non-thinking because their
-    structural grammar otherwise produces empty or incomplete calls.
+    A custom tool's structural grammar produces empty or incomplete calls
+    behind GLM-5.3's thinking preamble, so those requests render without it.
+    Native function tools keep the serving default (thinking on): whether a
+    request OFFERS tools says nothing about whether the model will call one,
+    and agentic traffic offers tools on every turn, so defaulting those
+    requests to non-thinking would switch reasoning off for all of it.
     """
     if not tools or not glm53_tool_compat_enabled():
         return
@@ -37,8 +38,7 @@ def apply_tool_thinking_compat(
         )
         return getattr(value, "value", value)
 
-    force_disable = any(tool_type(tool) == "custom" for tool in tools)
-    if force_disable or "enable_thinking" not in user_kwargs:
+    if any(tool_type(tool) == "custom" for tool in tools):
         # Set both common switches: enable_thinking is canonical for GLM, and
         # thinking prevents a stale serving default from re-enabling it in a
         # downstream template or compatibility layer.
