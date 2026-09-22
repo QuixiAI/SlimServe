@@ -21,7 +21,10 @@ BASE = {
     "max_position_embeddings": 1048576,
     "n_routed_experts": 288,
     "num_experts_per_tok": 8,
-    "quantization_config": {"quant_method": "compressed-tensors"},
+    "quantization_config": {
+        "quant_method": "compressed-tensors",
+        "config_groups": {"group_0": {"weights": {"num_bits": 4, "type": "float", "group_size": 16}}},
+    },
 }
 
 
@@ -120,3 +123,22 @@ def test_same_repo_name_under_two_owners_never_shares_a_directory(monkeypatch, t
     # And neither collides with a registered source's local_dir, which is the
     # bare repo name.
     assert theirs.directory.name != "GLM-5.3-Flash-NVFP4"
+
+
+def test_modelopt_nvfp4_is_interchangeable_with_compressed_tensors_nvfp4(tmp_path):
+    registered = _model(
+        tmp_path, "registered",
+        quantization_config={
+            "quant_method": "compressed-tensors", "format": "mixed-precision",
+            "config_groups": {"group_0": {"weights": {"num_bits": 4, "type": "float", "group_size": 16},
+                                          "format": "nvfp4-pack-quantized"}},
+        },
+    )
+    modelopt = _model(
+        tmp_path, "modelopt",
+        quantization_config={"quant_method": "modelopt", "quant_algo": "NVFP4",
+                             "config_groups": {"group_0": {"weights": {"num_bits": 4, "type": "float"}}}},
+    )
+    assert registry.override_conflicts(registered, modelopt) == []
+    fp8 = _model(tmp_path, "fp8", quantization_config={"quant_method": "modelopt", "quant_algo": "FP8"})
+    assert any(p.startswith("quantization") for p in registry.override_conflicts(registered, fp8))

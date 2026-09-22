@@ -90,6 +90,7 @@ from vllm.model_executor.models.interfaces import (
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     PPMissingLayer,
+    WeightsMapper,
     is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     make_layers,
@@ -921,6 +922,24 @@ class Glm5NextForConditionalGeneration(
     IsHybrid, SupportsEagle3,
 ):
     """GLM-5.3-Flash: vision tower + hybrid text backbone."""
+
+    # Checkpoint module names -> the module tree this class builds. The model
+    # loader hands this to the quantization config so exclusion lists written
+    # in checkpoint terms match the prefixes the modules report. It matters
+    # for ModelOpt NVFP4 exports (nvidia/GLM-5.3-Flash-NVFP4): ModelOpt
+    # quantizes every Linear by default and keeps attention, shared experts
+    # and routers in bf16 ONLY through its exclude list, so an untranslated
+    # list would push bf16 attention through the NVFP4 path. Compressed-tensors
+    # checkpoints never depended on it (their positive target regex names the
+    # routed experts), which is why the gap went unnoticed until 2026-09-22.
+    # `load_weights` keeps its own prefix map for the tensors themselves.
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "model.language_model.": "language_model.model.",
+            "model.visual.": "visual.",
+            "lm_head.": "language_model.lm_head.",
+        }
+    )
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:

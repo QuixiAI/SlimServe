@@ -287,15 +287,40 @@ def override_conflicts(registered: Path, override: Path) -> list[str]:
         mine, other = ours.get(key), theirs.get(key)
         if mine != other:
             problems.append(f"{key}: profile has {mine!r}, override has {other!r}")
-    mine = (ours.get("quantization_config") or {}).get("quant_algo") or (
-        ours.get("quantization_config") or {}
-    ).get("quant_method")
-    other = (theirs.get("quantization_config") or {}).get("quant_algo") or (
-        theirs.get("quantization_config") or {}
-    ).get("quant_method")
+    mine = _quant_scheme(ours)
+    other = _quant_scheme(theirs)
     if mine != other:
         problems.append(f"quantization: profile has {mine!r}, override has {other!r}")
     return problems
+
+
+def _quant_scheme(config: dict[str, Any]) -> str | None:
+    """The numeric scheme a checkpoint's experts use, container aside.
+
+    compressed-tensors (RedHatAI) and ModelOpt (nvidia) are two serializations
+    of the same NVFP4 arithmetic - e2m1 weights, e4m3 group-16 scales, an fp32
+    global scale - and the fork converts both into the same Marlin kernel
+    format at load, so they are interchangeable under a profile qualified on
+    either. The scheme is what must match; the container is not.
+    """
+    q = config.get("quantization_config")
+    if not q:
+        return None  # an unquantized checkpoint
+    method = q.get("quant_method")
+    algo = q.get("quant_algo")
+    if method == "modelopt":
+        return str(algo or "").upper() or None
+    if method == "compressed-tensors":
+        groups = q.get("config_groups") or {}
+        for group in groups.values():
+            weights = group.get("weights") or {}
+            fmt = group.get("format") or q.get("format")
+            if weights.get("num_bits") == 4 and weights.get("type") == "float":
+                return "NVFP4"
+            if fmt == "float-quantized" and weights.get("num_bits") == 8:
+                return "FP8"
+        return q.get("format")
+    return algo or method
 
 
 class ProfileError(Exception):
