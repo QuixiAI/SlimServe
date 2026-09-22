@@ -26198,3 +26198,30 @@ Phases, by value over risk:
   live server is dominated by noise and competing traffic (110-162 across
   runs today), so the c1 gap is not established. Single-stream decode with
   ignore_eos: 141-187 tok/s.
+- PROD ON nvidia/GLM-5.3-Flash-NVFP4 (2026-09-22, operator directive; the
+  checkpoint is known good and was not modified). ModelOpt NVFP4 export under
+  the glm53f-nvfp4-8 configuration with speculative decoding OFF (operator).
+  Two serving-code fixes were required, both ours: (1) the multimodal
+  wrapper lacked the hf_to_vllm_mapper the loader hands to quantization
+  configs, so ModelOpt's exclude list (checkpoint names) matched nothing and
+  bf16 attention would have gone through the NVFP4 path (f1c14fd78);
+  (2) resolving kv_cache_dtype 'auto' from the checkpoint's
+  kv_cache_quant_algo FP8 reformatted EVERY cache group of this hybrid model
+  - KDA states, indexer pools, the drafter's windows - and the boot died
+  selecting an attention backend for the drafter; hybrid models now keep
+  'auto' and quantize attention KV per layer as before (16050a904). The
+  attention KV IS fp8 e4m3, through glm5_next_main_kv_fp8, same as the
+  record. The export also quantizes the three dense MLPs (RedHat: bf16);
+  they run MarlinNvFp4LinearKernel, first use of that path on this profile.
+  Validation (localhost, prod down): canaries PASS, pool 4,165,129 tokens
+  (record 2,818,758 + the drafter's cache + smaller dense MLPs), exact c1
+  97.8 / c8 563.8; live prod: canaries PASS, c1 97.8 / c8 567.2 (record
+  136 / 572 - the c1 gap is speculation off, c8 at parity). Raw:
+  perf/results/2026-09-21/glm53f-nvidia/, 2026-09-22/glm53f-nvidia-prod/.
+  INCIDENTS: --model keyed its cache directory on the repo name alone and
+  wrote nvidia's shards over the registered RedHat checkpoint twice (the dev
+  tree before d9ba82bbd; then the pinned prod worktree, still on the old
+  commit, during the switch - a 30-min stall and an automatic rollback).
+  Both times only config.json/generation_config.json were overwritten and
+  were restored from the hub cache; weights untouched. Rule: a fix to the
+  override path must move the prod worktree in the same step.
