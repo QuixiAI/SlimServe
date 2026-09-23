@@ -562,6 +562,17 @@ class Glm5NextForCausalLM(
         "lm_head.": "lm_head.",
     }
 
+    # Exports of this model disagree on where the KDA forget gate and the mHC
+    # tensors live. RedHat's and nvidia's keep them flat on the attention
+    # module and the layer; Lazarus-Ai's UnCut NVFP4 keeps the upstream
+    # spelling (a forget_gate submodule, attn_hc/ffn_hc groups). Same tensors,
+    # same shapes - only the path differs, so translate on the way in.
+    hf_to_vllm_substr = {
+        ".self_attn.forget_gate.": ".self_attn.",
+        ".attn_hc.": ".hc_attn_",
+        ".ffn_hc.": ".hc_ffn_",
+    }
+
     # fused/stacked parameter mappings: (target, checkpoint_shard, shard_id)
     stacked_params_mapping = [
         # MLA latent projections
@@ -678,6 +689,31 @@ class Glm5NextForCausalLM(
                     name = new + name[len(pref):]
                     break
             else:
+                continue
+            for old_part, new_part in self.hf_to_vllm_substr.items():
+                if old_part in name:
+                    name = name.replace(old_part, new_part)
+
+            # A pre-fused KDA convolution: one tensor holding q|k|v where the
+            # other exports ship three. The parameter's loader takes one
+            # projection at a time with its shard id, so hand it the thirds.
+            # Reaching the fused parameter by name means the checkpoint gave
+            # us the whole convolution; the q/k/v_conv1d spelling never lands
+            # here because no parameter carries those names (the stacked
+            # mapping below routes it). Under TP the parameter holds only this
+            # rank's rows while the checkpoint tensor is whole, so compare
+            # nothing: just split and let the loader take its slice.
+            param = params_dict.get(name)
+            shards = getattr(param, "fused_conv1d_shards", 0) if param is not None else 0
+            if shards:
+                if weight.shape[0] % shards:
+                    raise ValueError(
+                        f"glm5_next: {name} has {weight.shape[0]} rows, not a "
+                        f"multiple of {shards}"
+                    )
+                for shard_id, piece in enumerate(weight.chunk(shards, dim=0)):
+                    param.weight_loader(param, piece, shard_id)
+                loaded.add(name)
                 continue
 
             is_expert = ".mlp.experts." in name
