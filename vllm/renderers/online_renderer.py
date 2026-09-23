@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Sequence
+from copy import deepcopy
+from dataclasses import replace
 from http import HTTPStatus
 from typing import Any
 
@@ -47,6 +49,50 @@ from vllm.utils.mistral import is_mistral_tokenizer, is_mistral_tool_parser
 from vllm.utils.mistral import mt as _mt
 
 logger = init_logger(__name__)
+
+# Prefix rendering is quadratic in conversation length. The host tier retains
+# eight KDA states by default, so sixteen recent candidates provide headroom
+# without turning long agent trajectories into a tokenizer CPU bottleneck.
+_SEMANTIC_BOUNDARY_MAX_CANDIDATES = 16
+_TEXT_ONLY_CONTENT_PARTS = frozenset(
+    {"text", "input_text", "output_text", "thinking", "refusal"}
+)
+
+
+def _semantic_message_prefixes(messages: list[Any]) -> list[list[Any]]:
+    """Build safe chat prefixes ending at message/content-part boundaries.
+
+    Whole-message boundaries are always eligible. Content-part boundaries
+    are emitted only when every part of that message is textual; replaying a
+    truncated image/audio message merely to discover an offset would repeat
+    media I/O and can change multimodal placeholder expansion.
+    """
+    prefixes: list[list[Any]] = []
+    for message_idx, message in enumerate(messages):
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if isinstance(content, list) and len(content) > 1 and all(
+            isinstance(part, dict)
+            and part.get("type") in _TEXT_ONLY_CONTENT_PARTS
+            for part in content
+        ):
+            for part_end in range(1, len(content)):
+                partial = deepcopy(message)
+                partial["content"] = deepcopy(content[:part_end])
+                prefixes.append(deepcopy(messages[:message_idx]) + [partial])
+        prefixes.append(deepcopy(messages[: message_idx + 1]))
+
+    # Very long content arrays must not turn rendering into unbounded
+    # quadratic CPU work. Deepest boundaries have the highest restore value.
+    return prefixes[-_SEMANTIC_BOUNDARY_MAX_CANDIDATES:]
+
+
+def _common_token_prefix_len(left: Sequence[int], right: Sequence[int]) -> int:
+    for i, (a, b) in enumerate(zip(left, right)):
+        if a != b:
+            return i
+    return min(len(left), len(right))
 
 
 def _adapt_responses_custom_tool_rendering(
@@ -411,6 +457,60 @@ class OnlineRenderer:
             },
             skip_mm_cache=skip_mm_cache,
         )
+
+        # Discover exact token offsets after messages and textual content
+        # parts. Render cumulative prefixes with generation controls off,
+        # then retain only their exact common token prefix with the final,
+        # fully processed prompt. This makes the hint robust to templates
+        # whose end-of-conversation suffix differs from an in-conversation
+        # separator, and automatically rejects offsets invalidated by left
+        # truncation or multimodal expansion.
+        # Only hybrid/recurrent models consume these checkpoints. Avoid up to
+        # sixteen extra template renders for ordinary attention-only models,
+        # whose existing block-prefix cache already resumes at any block.
+        if self.model_config.is_hybrid and engine_input["type"] != "embeds":
+            prefix_messages = _semantic_message_prefixes(messages)
+            if prefix_messages:
+                boundary_kwargs = dict(chat_params.chat_template_kwargs)
+                boundary_kwargs["add_generation_prompt"] = False
+                boundary_kwargs["continue_final_message"] = False
+                boundary_params = replace(
+                    chat_params,
+                    chat_template_kwargs=boundary_kwargs,
+                    return_assistant_tokens_mask=False,
+                )
+                try:
+                    _, prefix_inputs = await renderer.render_chat_async(
+                        prefix_messages,
+                        boundary_params,
+                        tok_params,
+                        skip_mm_cache=True,
+                    )
+                except (TypeError, ValueError):
+                    # A model-specific template may reject a partial
+                    # conversation (for example strict role alternation).
+                    # Boundaries are an optimization hint, never a reason to
+                    # reject an otherwise valid inference request.
+                    logger.debug(
+                        "semantic cache boundary rendering failed",
+                        exc_info=True,
+                    )
+                else:
+                    final_ids = engine_input["prompt_token_ids"]
+                    boundaries = {
+                        _common_token_prefix_len(
+                            candidate["prompt_token_ids"], final_ids
+                        )
+                        for candidate in prefix_inputs
+                        if candidate["type"] != "embeds"
+                    }
+                    valid_boundaries = sorted(
+                        boundary
+                        for boundary in boundaries
+                        if 0 < boundary <= len(final_ids)
+                    )
+                    if valid_boundaries:
+                        engine_input["semantic_cache_boundaries"] = valid_boundaries
 
         # tool parsing is done only if a tool_parser has been set and if
         # tool_choice is not "none" (if tool_choice is "none" but a tool_parser

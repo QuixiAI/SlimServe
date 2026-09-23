@@ -25,6 +25,9 @@ class _InputOptions(TypedDict):
     cache_salt: NotRequired[str]
     """Optional cache salt to be used for prefix caching."""
 
+    semantic_cache_boundaries: NotRequired[list[int]]
+    """Token offsets at exact rendered chat-message/content-part boundaries."""
+
 
 class TokensInput(_InputOptions):
     """Represents token-based input to the engine."""
@@ -53,6 +56,7 @@ def tokens_input(
     *,
     prompt: str | None = None,
     cache_salt: str | None = None,
+    semantic_cache_boundaries: list[int] | None = None,
 ) -> TokensInput:
     """
     Construct [`TokensInput`][vllm.inputs.engine.TokensInput]
@@ -64,6 +68,8 @@ def tokens_input(
         inputs["prompt"] = prompt
     if cache_salt is not None:
         inputs["cache_salt"] = cache_salt
+    if semantic_cache_boundaries is not None:
+        inputs["semantic_cache_boundaries"] = semantic_cache_boundaries
 
     return inputs
 

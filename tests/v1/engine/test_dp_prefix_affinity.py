@@ -59,6 +59,24 @@ def test_severe_imbalance_overrides_affinity():
     assert eng == 1
 
 
+def test_semantic_checkpoint_routes_to_owner_until_peer_copy_exists():
+    r = PrefixAffinityRouter(2, BLOCK, load_tokens=4)
+    turn1 = _prompt(40)
+    r.choose(turn1, None, [0, 0])
+    # The ordinary load heuristic would migrate this request, but block 8 is
+    # a renderer-proven message boundary with a pinned-host KDA checkpoint on
+    # engine 0. Keep it there instead of selecting an unhydratable replica.
+    turn2 = turn1 + _prompt(4, seed=9)
+    eng, matched = r.choose(
+        turn2,
+        None,
+        [20, 0],
+        semantic_cache_boundaries=(8 * BLOCK + 1,),
+    )
+    assert (eng, matched) == (0, 10)
+    assert r.semantic_affinity == 1 and r.migrated == 0
+
+
 def test_unrelated_prompts_spread_by_load():
     r = PrefixAffinityRouter(2, BLOCK)
     assert r.choose(_prompt(8, seed=1), None, [0, 0])[0] == 0
@@ -111,6 +129,7 @@ def test_dp_lb_client_routes_through_the_prefix_router():
             pooling_params=None,
             prompt_token_ids=tokens,
             cache_salt=None,
+            semantic_cache_boundaries=None,
         )
 
     turn1 = _prompt(40)
