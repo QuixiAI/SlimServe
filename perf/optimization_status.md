@@ -26225,3 +26225,22 @@ Phases, by value over risk:
   Both times only config.json/generation_config.json were overwritten and
   were restored from the hub cache; weights untouched. Rule: a fix to the
   override path must move the prod worktree in the same step.
+- PROD ON Lazarus-Ai/GLM-5.3-Flash-UnCut-NVFP4 (2026-09-23, operator).
+  Another ModelOpt NVFP4 export, so the 2026-09-22 fixes (exclusion-name
+  mapping, hybrid KV-dtype rule) carried over untouched. One NEW loader gap:
+  this export uses the upstream tensor spelling - KDA forget gate in a
+  forget_gate submodule, mHC as attn_hc/ffn_hc instead of hc_attn_*/hc_ffn_*,
+  and ONE pre-fused conv1d of 3 x 8192 rows where the RedHat/nvidia exports
+  ship q/k/v_conv1d separately - and it has no MTP layer (45 layers, not 46).
+  load_weights hit the fused parameter by name and called its shard-taking
+  loader with no shard id: TypeError before the first layer (2edd11a1d adds
+  the three renames and splits a pre-fused convolution into its thirds;
+  shapes are identical across all three exports, verified on disk).
+  Validation (localhost, prod down, spec off): canaries PASS, pool 4,165,129
+  tokens, exact c1 97.8 / c8 562.2 - within noise of nvidia's 97.8 / 563.8.
+  Live prod: canaries PASS, c1 97.6, cron canary clean, 0 restarts, fp8 e4m3
+  attention KV, MarlinNvFp4LinearKernel for the dense NVFP4 layers.
+  The deploy now moves the pinned prod worktree to the dev commit and refuses
+  to switch if the prod tree would resolve the override to a directory with
+  no checkpoint - the guard Monday's 30-minute stall needed.
+  Raw: perf/results/2026-09-23/glm53f-lazarus/.
