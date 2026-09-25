@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from fnmatch import fnmatch
 from typing import TYPE_CHECKING, Any, cast
 
@@ -1059,6 +1060,32 @@ class ModelOptNvFp4Config(ModelOptQuantConfigBase):
 
     def get_supported_act_dtypes(self) -> list[torch.dtype]:
         return [torch.bfloat16, torch.half, torch.float8_e4m3fn]
+
+    def get_quant_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> "QuantizeMethodBase | None":
+        # Diagnostic for mixed NVFP4 exports that leave the Qwen dense
+        # projections in BF16.  The on-load method reads the original BF16
+        # tensors and quantizes them once; the checkpoint is not modified.
+        if (
+            os.getenv("VLLM_MODELOPT_NVFP4_ONLINE_FP8_DENSE") == "1"
+            and isinstance(layer, LinearBase)
+            and self.is_layer_excluded(prefix)
+            and any(
+                part in prefix
+                for part in (
+                    ".linear_attn.",
+                    ".self_attn.",
+                    ".mlp.shared_expert.",
+                )
+            )
+        ):
+            from vllm.model_executor.layers.quantization.online.fp8 import (
+                Fp8PerTensorOnlineLinearMethod,
+            )
+
+            return Fp8PerTensorOnlineLinearMethod()
+        return super().get_quant_method(layer, prefix)
 
     @classmethod
     def get_min_capability(cls) -> int:

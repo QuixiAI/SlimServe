@@ -370,6 +370,74 @@ The concurrent gate (`concurrent_gate_pin.py`) asserts `exact` and a
 throughput floor; pins are written only when the batching bar (>= 2x at
 c=4, >= 3x at c=16) is met.
 
+## Affine King R21 GRPO5 S75 Vision NVFP4 / RTX 5090 TP1 V2 online FP8 dense - 2026-09-25
+
+- Registered `affine-king-nvfp4-1` on the enabled port-8000 systemd service. The target's previously excluded dense language projections are quantized from their shipped BF16 weights to per-tensor FP8 once during load; NVFP4 routed experts, 4 GiB CPU weight offload, FP8 KV, 262144-token configured context, 64 sequence slots, vision/tools, 48 GiB host and 96 GiB NVMe completed-prefix tiers remain. GPU KV pool: 649402 tokens (2.48 full contexts) versus 536203 previously. RTX 5090 32 GB, driver 595.91.07, CUDA toolkit 13.3, home venv. One timed sample per shape.
+- Exact completions use source SHA256 `1262c000f00dd7ebb97e085c417cd22b7963eba8615faee281c069dfd3e0d9ea`, temperature 1, top_p .95, top_k 20, seed 42, and an 8-token warmup. All 73 timed requests returned the requested count; zero preemptions, prefix hits, or draft tokens.
+
+| Concurrency | Input / output per request | Aggregate output tok/s | Prior no-draft tok/s | Speedup |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 1000 / 2000 | 122.352 | 29.070 | 4.21x |
+| 8 | 1000 / 2000 | 271.346 | 170.852 | 1.59x |
+| 64 | 1000 / 256 | 493.102 | 281.329 | 1.75x |
+
+- A separate cold 261000-input/128-output exact-token request finished in 65.22 s with zero preemptions and zero cache hits, versus the prior 150.69 s cold no-draft service result (2.31x faster; source offset differs by one token). Eight live behavior canaries passed: text, blue-square image, `get_weather` tool call, tool-result continuation, three arithmetic questions and a factual question. A 254872-token chat prompt with a passcode at the beginning correctly returned `QUARTZ-7319` at the end in 63.00 s. This single recall canary does not establish broad long-range accuracy. The FP8 weight conversion can alter model outputs; a full quality evaluation remains separate from these serving acceptance checks.
+- Raw: `perf/results/2026-09-25/affine-online-fp8-dense/`, particularly `production/c{1,8,64}.json`, `production/fullctx.json`, `production/canaries/`, and `production/long-recall.json`. Reproduce the throughput through the registered profile and `benchmarks/benchmark_dsv4_exact.py` with the shapes and sampling above; `tools/check_affine_online_fp8_dense.py` and `tools/check_affine_long_recall.py` reproduce behavior gates. The production systemd unit remains enabled and healthy.
+
+## Affine King R21 GRPO5 S75 Vision NVFP4 / RTX 5090 TP1 V2 - 2026-09-24
+
+- Registered `affine-king-nvfp4-1`, pinned QuixiAI revision `a9f9ae46f201e51bc042ae22ba5ef6d88e83ba13`, no MTP, 262144-token configured context, FP8 KV, 4 GiB CPU weight offload, 48 GiB pinned host and 96 GiB NVMe completed-prefix KV tiers. Systemd service on port 8000 uses 64 sequence slots and 64-row decode graphs. RTX 5090 32 GB, driver 595.91.07, CUDA toolkit 13.3, `/home/eric/.venv`; working tree based on `11e644b6c`.
+- Exact completions with prompt source SHA256 `1262c000f00dd7ebb97e085c417cd22b7963eba8615faee281c069dfd3e0d9ea`, temperature 1, top_p .95, top_k 20, seed 42, eight-token warmup; one timed sample at each load on the final systemd 64-slot service. The c1/c8/c32 prompt offsets are 1000/2000/3000 to avoid reusing the long-context cached prefix; c64 used offset 0 before that request. All had zero cache hits.
+
+| Concurrency | Input / output tokens per request | Aggregate output tok/s | Wall seconds | Configuration |
+| --- | ---: | ---: | ---: | --- |
+| 1 | 1000 / 2000 | 29.243 | 68.39 | final service |
+| 8 | 1000 / 2000 | 168.832 | 94.77 | final service |
+| 32 | 1000 / 256 | 219.430 | 37.33 | final service |
+| 64 | 1000 / 256 | 281.635 | 58.17 | final service |
+
+- All 105 requests returned the exact output count, with zero KV preemptions and zero draft tokens. A 261000-input/128-output cold request completed in 150.47 s on the initial 32-slot config and 150.69 s on the final 64-slot service; both returned the same answer SHA256 with no preemptions or drafts. After two distinct 200000-token fillers, replay of the original request restored 259904 tokens from the host tier, computed only 1096, matched the cold response SHA256, and completed in 8.31 s. The trace reported zero disk reads. The final service reports 536203 GPU KV tokens (2.05x one full context), 48 GiB host arena and 96 GiB NVMe tier. Text, image, parsed tool call, tool-result continuation and streamed chat passed on the live service. These are one-sample baselines; no variance range, long-range semantic recall or actual NVMe spill/restore is claimed.
+- Raw: `perf/results/2026-09-24/qwen36-5090-profile/affine-{c1,c8,c32-short,fullctx}.json`, `affine-prod-{c1,c8,c32-short,c64-short,fullctx,fullctx-restore,filler1,filler2,text,image,tool,tool-followup}.json`, `affine-serve-marlin.log`, and `journalctl -u slimserve-affine-king.service`. Exact harness: `/home/eric/.venv/bin/python benchmarks/benchmark_dsv4_exact.py --model /home/eric/models/affine-king-r21-grpo5-s75-vision-NVFP4 --served-model-name QuixiAI/affine-king-r21-grpo5-s75-vision-NVFP4 --source perf/results/2026-09-24/qwen36-5090-profile/source.md --concurrency N --input-tokens 1000 --output-tokens 256 --temperature 1 --top-p 0.95 --top-k 20 --seed 42 --allow-no-spec`.
+
+## Qwen3.6-35B-A3B NVFP4 / RTX 5090 TP1 V2 - 2026-09-24
+
+- Registered `qwen36-nvfp4-1`, V2 GPU runner, full 262144-token configured context, checkpoint MTP k=2, FP8 KV, 4 GiB CPU weight offload, 48 GiB pinned host and 128 GiB NVMe completed-prefix KV tiers. RTX 5090 32 GB, driver 595.91.07, CUDA toolkit 13.3, `/home/eric/.venv`; working tree based on `11e644b6c`.
+- Exact completions: 1000 input / 2000 output tokens, prompt source SHA256 `1262c000f00dd7ebb97e085c417cd22b7963eba8615faee281c069dfd3e0d9ea`, temperature 1, top_p .95, top_k 20, seed 42, eight-token warmup; one timed sample each.
+
+| Concurrency | Aggregate output tok/s | Wall seconds |
+| --- | ---: | ---: |
+| 1 | 100.165 | 19.97 |
+| 8 | 269.990 | 59.26 |
+
+- All nine responses returned exactly 2000 output tokens and passed harness checks; no preemptions. V2 GPU KV pool reported 489592 tokens (1.87x full context). The near-limit serving and host-tier restore canaries below were run on V1; V2 still needs those gates repeated. One timed sample gives no variance range.
+- Raw: `perf/results/2026-09-24/qwen36-5090-profile/nvfp4-v2-{c1,c8}.json`, `nvfp4-v2-serve.log`.
+
+## Qwen3.6-35B-A3B FP8 / RTX 5090 TP1 V2 - 2026-09-24
+
+- Registered `qwen36-fp8-1`, V2 GPU runner, full 262144-token configured context, checkpoint MTP k=2, FP8 KV, 16 GiB CPU weight offload, 48 GiB pinned host and 128 GiB NVMe completed-prefix KV tiers. RTX 5090 32 GB, driver 595.91.07, CUDA toolkit 13.3, `/home/eric/.venv`; working tree based on `11e644b6c`.
+- Exact completions: 1000 input / 2000 output tokens, prompt source SHA256 `1262c000f00dd7ebb97e085c417cd22b7963eba8615faee281c069dfd3e0d9ea`, temperature 1, top_p .95, top_k 20, seed 42, eight-token warmup; one timed sample each.
+
+| Concurrency | Aggregate output tok/s | Wall seconds | MTP drafted / accepted |
+| --- | ---: | ---: | ---: |
+| 1 | 35.058 | 57.05 | 1,680 / 1,159 |
+| 8 | 68.103 | 234.94 | 14,084 / 8,958 |
+
+- All nine responses returned exactly 2000 output tokens and passed harness checks; no preemptions. The image request returned a complete diagram description. A cold 261000-input/128-output request also completed in 400.67 s with three KV preemptions. Host/NVMe restore and long-range semantic recall remain to be validated. One sample does not establish a variance range or quantization speed comparison.
+- Raw: `perf/results/2026-09-24/qwen36-5090-profile/fp8-v2-{c1,c8,image,fullctx}.json`, `fp8-v2-batch8192-serve.log`.
+
+## Qwen3.6-35B-A3B NVFP4 / RTX 5090 TP1 V1 diagnostic - 2026-09-24
+
+- Registered `qwen36-nvfp4-1`, full 262144-token configured context, checkpoint MTP k=2, FP8 KV, 4 GiB CPU weight offload, 48 GiB pinned host and 128 GiB NVMe completed-prefix KV tiers. GeForce RTX 5090 32 GB, driver 595.91.07, CUDA toolkit 13.3, `/home/eric/.venv`; working tree based on `11e644b6c`. This run fell through to the deprecated V1 GPU runner. It is a diagnostic reference pending a V2 rerun, not the production baseline required by repository policy.
+- Exact completions: 1000 input / 2000 output tokens, SHA256-pinned prompt source `1262c000f00dd7ebb97e085c417cd22b7963eba8615faee281c069dfd3e0d9ea`, temperature 1, top_p .95, top_k 20, seed 42, eight-token warmup; one timed sample per concurrency.
+
+| Concurrency | Aggregate output tok/s | Wall seconds | MTP drafted / accepted |
+| --- | ---: | ---: | ---: |
+| 1 | 93.407 | 21.41 | 1,844 / 1,078 |
+| 8 | 254.965 | 62.75 | 14,594 / 8,702 |
+
+- All nine requests returned exactly 2000 output tokens and passed the harness checks; no preemptions. The profile reached health and an image request reached the vision path. A cold 261000-input/128-output request completed in 178.16 s with one preemption. After a disjoint 261000-token filler evicted its GPU prefix, repeating the first prompt restored 257488 tokens from the external host tier, zero GPU prefix hits, and the same 32-token answer hash as the GPU-cache replay. The trace reported zero disk reads, so NVMe restoration and long-range semantic recall remain unqualified. One sample does not establish a variance range or an optimization gain.
+- Raw: `perf/results/2026-09-24/qwen36-5090-profile/nvfp4-c1.json`, `nvfp4-c8.json`, `nvfp4-fullctx*.json`, `serve-full-tier48-offload4-retry.log`.
+
 ## DSV4 Metal FP8 draft KV - 2026-09-10
 
 - Apple M5 Max / 128 GiB, registered `dsv4-xxs-1`, TP1, target

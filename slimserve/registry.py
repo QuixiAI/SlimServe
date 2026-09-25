@@ -12,7 +12,7 @@ from __future__ import annotations
 import copy
 import json
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -20,6 +20,7 @@ from typing import Any
 from slimserve.term import human_bytes
 
 REGISTRY_PATH = Path(__file__).with_name("profiles.json")
+CHAT_TEMPLATE_DIR = Path(__file__).with_name("chat_templates")
 
 
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -156,6 +157,8 @@ class Plan:
     # Variant-level drafter when platforms diverge; falls back to the
     # source-level speculator.
     variant_speculator: dict[str, Any] | None = None
+    # Operator-supplied checkpoint served in place of the registered one.
+    model_override: "ModelOverride | None" = None
 
     @property
     def speculator(self) -> dict[str, Any] | None:
@@ -163,6 +166,13 @@ class Plan:
 
     @property
     def model_dir(self) -> Path:
+        if self.model_override is not None:
+            return self.model_override.directory
+        return cache_root() / self.source["local_dir"]
+
+    @property
+    def registered_model_dir(self) -> Path:
+        """Where the profile's own checkpoint lives, override or not."""
         return cache_root() / self.source["local_dir"]
 
     @property
@@ -175,6 +185,142 @@ class Plan:
         if self.quant.assembly:
             return self.model_dir / self.quant.assembly["output"]
         return self.model_dir / self.quant.files[0]["path"]
+
+    @property
+    def chat_template_file(self) -> Path | None:
+        """Checked-in chat template selected by the model source."""
+        asset = self.source.get("chat_template_asset")
+        return CHAT_TEMPLATE_DIR / asset if asset else None
+
+
+@dataclass(frozen=True)
+class ModelOverride:
+    """A drop-in checkpoint served in place of a profile's registered model.
+
+    For a fine-tune of the profile's model: same architecture, same
+    quantization, same tokenizer geometry, different weights. Everything else
+    in the plan - engine arguments, drafter, kernel flags, KV layout - stays
+    exactly as the profile validated it, so the override is only legal when
+    `conflicts()` finds nothing. It is an operator-supplied value (a path or a
+    Hugging Face repo id), never a registry field: the registry records
+    configurations we have qualified, and an override by definition has not
+    been.
+    """
+
+    spec: str
+    repo: str | None
+    directory: Path
+
+    @property
+    def base_url(self) -> str | None:
+        if self.repo is None:
+            return None
+        return f"https://huggingface.co/{self.repo}/resolve/main"
+
+
+def replace_override(plan: Plan, override: ModelOverride | None) -> Plan:
+    """The same plan, serving `override` instead of its registered model."""
+    return replace(plan, model_override=override)
+
+
+def parse_model_override(spec: str) -> ModelOverride:
+    """Read an operator's --model value as a local directory or a repo id."""
+    text = spec.strip()
+    if not text:
+        raise ProfileError("--model needs a directory or a Hugging Face repo id")
+    candidate = Path(text).expanduser()
+    if candidate.is_dir() or text.startswith((".", "/", "~")):
+        if not candidate.is_dir():
+            raise ProfileError(f"--model {spec}: no such directory")
+        return ModelOverride(spec=text, repo=None, directory=candidate.resolve())
+    parts = text.split("/")
+    if len(parts) != 2 or not all(parts):
+        raise ProfileError(
+            f"--model {spec}: expected a local directory or a Hugging Face "
+            "repo id of the form owner/name"
+        )
+    # The directory carries the owner too. Repos from different owners share
+    # repo names all the time (nvidia/GLM-5.3-Flash-NVFP4 beside
+    # RedHatAI/GLM-5.3-Flash-NVFP4), and keying on the name alone wrote one
+    # checkpoint's files over another's (2026-09-21).
+    return ModelOverride(
+        spec=text, repo=text, directory=cache_root() / f"{parts[0]}--{parts[1]}"
+    )
+
+
+def _config_of(directory: Path) -> dict[str, Any]:
+    path = directory / "config.json"
+    if not path.is_file():
+        raise ProfileError(f"{directory} has no config.json")
+    with path.open() as handle:
+        config = json.load(handle)
+    # glm5_next and friends nest the language model under text_config; compare
+    # the union so a nested-only key still participates.
+    merged = {**config.get("text_config", {}), **config}
+    return merged
+
+
+# Model properties an override must match for the profile's engine arguments,
+# kernels and drafter to remain the ones we qualified.
+_OVERRIDE_KEYS = (
+    "architectures",
+    "vocab_size",
+    "hidden_size",
+    "num_hidden_layers",
+    "num_attention_heads",
+    "max_position_embeddings",
+    "num_experts",
+    "n_routed_experts",
+    "num_experts_per_tok",
+)
+
+
+def override_conflicts(registered: Path, override: Path) -> list[str]:
+    """Differences that make an override illegal for a profile, in words.
+
+    Empty means the checkpoint is interchangeable with the registered one as
+    far as the serving configuration can tell.
+    """
+    ours, theirs = _config_of(registered), _config_of(override)
+    problems = []
+    for key in _OVERRIDE_KEYS:
+        mine, other = ours.get(key), theirs.get(key)
+        if mine != other:
+            problems.append(f"{key}: profile has {mine!r}, override has {other!r}")
+    mine = _quant_scheme(ours)
+    other = _quant_scheme(theirs)
+    if mine != other:
+        problems.append(f"quantization: profile has {mine!r}, override has {other!r}")
+    return problems
+
+
+def _quant_scheme(config: dict[str, Any]) -> str | None:
+    """The numeric scheme a checkpoint's experts use, container aside.
+
+    compressed-tensors (RedHatAI) and ModelOpt (nvidia) are two serializations
+    of the same NVFP4 arithmetic - e2m1 weights, e4m3 group-16 scales, an fp32
+    global scale - and the fork converts both into the same Marlin kernel
+    format at load, so they are interchangeable under a profile qualified on
+    either. The scheme is what must match; the container is not.
+    """
+    q = config.get("quantization_config")
+    if not q:
+        return None  # an unquantized checkpoint
+    method = q.get("quant_method")
+    algo = q.get("quant_algo")
+    if method == "modelopt":
+        return str(algo or "").upper() or None
+    if method == "compressed-tensors":
+        groups = q.get("config_groups") or {}
+        for group in groups.values():
+            weights = group.get("weights") or {}
+            fmt = group.get("format") or q.get("format")
+            if weights.get("num_bits") == 4 and weights.get("type") == "float":
+                return "NVFP4"
+            if fmt == "float-quantized" and weights.get("num_bits") == 8:
+                return "FP8"
+        return q.get("format")
+    return algo or method
 
 
 class ProfileError(Exception):
@@ -257,9 +403,12 @@ def _merge_platform(profile: dict[str, Any], platform: str) -> dict[str, Any]:
     left to merge now that each platform has its own record.
     """
     record = profile["variants"][platform]
+    env = dict(record.get("env") or {})
+    if tool_calling_profile := record.get("tool_calling_profile"):
+        env["VLLM_TOOL_CALLING_PROFILE"] = str(tool_calling_profile)
     return {
         "engine": dict(record["engine"]),
-        "env": dict(record.get("env") or {}),
+        "env": env,
         "notes": list(record.get("notes") or []),
         "default_quant": record["default_quant"],
         "speculative_overrides": dict(record.get("speculative_overrides") or {}),
@@ -422,6 +571,11 @@ def resolve(
     for key, value in _SERVING_DEFAULTS.items():
         merged["engine"].setdefault(key, copy.deepcopy(value))
 
+    if template_asset := source.get("chat_template_asset"):
+        merged["engine"].setdefault(
+            "chat_template", str(CHAT_TEMPLATE_DIR / template_asset)
+        )
+
     plan = Plan(
         profile_id=profile_id,
         title=profile["title"],
@@ -483,6 +637,14 @@ def files_for(plan: Plan) -> list[dict[str, Any]]:
                 "url": f"{base}/{entry['path']}",
                 "local_dir": plan.source["local_dir"],
                 "role": "model",
+                **(
+                    {
+                        "hf_repo": plan.source["repo"],
+                        "hf_revision": plan.source["revision"],
+                    }
+                    if plan.source.get("download_strategy") == "hf_hub"
+                    else {}
+                ),
             }
         )
     for entry in plan.source.get("shared") or []:
@@ -496,13 +658,26 @@ def files_for(plan: Plan) -> list[dict[str, Any]]:
             }
         )
     spec = plan.speculator if plan.speculative else None
-    if spec and (entry := spec.get("file")):
-        wanted.append(
-            {
-                **entry,
-                "url": f"{spec['base_url']}/{entry['path']}",
-                "local_dir": spec["local_dir"],
-                "role": "speculator",
-            }
-        )
+    if spec:
+        entries = [spec["file"]] if spec.get("file") else spec.get("files", [])
+        spec_base = spec.get("base_url")
+        if not spec_base:
+            spec_base = (
+                f"https://huggingface.co/{spec['repo']}/resolve/"
+                f"{spec.get('revision', 'main')}"
+            )
+        for entry in entries:
+            wanted.append(
+                {
+                    **entry,
+                    "url": f"{spec_base}/{entry['path']}",
+                    "local_dir": spec["local_dir"],
+                    "role": "speculator",
+                    **(
+                        {"hf_repo": spec["repo"], "hf_revision": spec["revision"]}
+                        if spec.get("download_strategy") == "hf_hub"
+                        else {}
+                    ),
+                }
+            )
     return wanted

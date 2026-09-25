@@ -351,6 +351,339 @@
         }
       }
     },
+    "affine-king-r21-grpo5-s75-vision-nvfp4": {
+      "title": "Affine King R21 GRPO5 S75 Vision NVFP4",
+      "modalities": ["text", "image"],
+      "format": "safetensors",
+      "repo": "QuixiAI/affine-king-r21-grpo5-s75-vision-NVFP4",
+      "revision": "a9f9ae46f201e51bc042ae22ba5ef6d88e83ba13",
+      "download_strategy": "hf_hub",
+      "base_url": "https://huggingface.co/QuixiAI/affine-king-r21-grpo5-s75-vision-NVFP4/resolve/a9f9ae46f201e51bc042ae22ba5ef6d88e83ba13",
+      "local_dir": "affine-king-r21-grpo5-s75-vision-NVFP4",
+      "speculator": {
+        "repo": "RedHatAI/Qwen3.6-35B-A3B-speculator.dspark",
+        "revision": "53814b238c3a6ce5f332066a6bedb9d179777ede",
+        "local_dir": "Qwen3.6-35B-A3B-speculator.dspark",
+        "download_strategy": "hf_hub",
+        "files": [
+          {"path": "config.json", "bytes": 2003},
+          {"path": "config.py", "bytes": 2342},
+          {"path": "model.safetensors", "bytes": 1900458850}
+        ],
+        "engine": {
+          "method": "dspark",
+          "num_speculative_tokens": 4,
+          "kv_cache_dtype": "fp8"
+        },
+        "note": "Optional diagnostic only: the base Qwen3.6 DSpark head is a warm start for Affine-specific training. Its acceptance, native-context capacity, and high-concurrency throughput must be measured before production use."
+      },
+      "quants": {
+        "NVFP4": {
+          "title": "NVFP4 (ModelOpt mixed precision)",
+          "bytes": 23959862426,
+          "summary": "Qwen3.6-35B-A3B vision tune, 40 hybrid attention layers and 262144-token native context. No MTP is used by the serving profile.",
+          "min_gpus": {"rtx5090": 1},
+          "files": [
+            {"path": "chat_template.jinja", "bytes": 7764},
+            {"path": "config.json", "bytes": 14758},
+            {"path": "configuration.json", "bytes": 58},
+            {"path": "generation_config.json", "bytes": 213},
+            {"path": "hf_quant_config.json", "bytes": 10234},
+            {"path": "model-00001-of-00003.safetensors", "bytes": 10005929080},
+            {"path": "model-00002-of-00003.safetensors", "bytes": 10007729472},
+            {"path": "model-00003-of-00003.safetensors", "bytes": 3912522824},
+            {"path": "model.safetensors.index.json", "bytes": 13655538},
+            {"path": "preprocessor_config.json", "bytes": 390},
+            {"path": "processor_config.json", "bytes": 1220},
+            {"path": "tokenizer.json", "bytes": 19989325},
+            {"path": "tokenizer_config.json", "bytes": 1165},
+            {"path": "video_preprocessor_config.json", "bytes": 385}
+          ]
+        }
+      }
+    },
+    "qwen36-35b-a3b-nvfp4": {
+      "title": "Qwen3.6-35B-A3B",
+      "modalities": ["text", "image"],
+      "format": "safetensors",
+      "repo": "nvidia/Qwen3.6-35B-A3B-NVFP4",
+      "base_url": "https://huggingface.co/nvidia/Qwen3.6-35B-A3B-NVFP4/resolve/1355db6a052410cfd62085d94b58866fd0f2c3c5",
+      "local_dir": "Qwen3.6-35B-A3B-NVFP4",
+      "speculator": {
+        "repo": "nvidia/Qwen3.6-35B-A3B-NVFP4",
+        "local_dir": "Qwen3.6-35B-A3B-NVFP4",
+        "engine": {"method": "qwen3_5_mtp", "num_speculative_tokens": 2},
+        "note": "The checkpoint includes its one-layer MTP head in model-00003-of-00003.safetensors; it shares the target directory and embeddings."
+      },
+      "quants": {
+        "NVFP4": {
+          "title": "NVFP4 (ModelOpt mixed FP8/NVFP4)",
+          "bytes": 23457713942,
+          "summary": "40-layer vision-language MoE with 256 experts, 8 active per token, 3:1 linear-to-full attention, and 262144-token context. The ModelOpt checkpoint uses W4A16 NVFP4 for experts, shared experts and lm_head, FP8 for attention projections, and BF16 elsewhere.",
+          "min_gpus": {"rtx5090": 1},
+          "files": [
+            {"path": "chat_template.jinja", "bytes": 7764},
+            {"path": "config.json", "bytes": 58110},
+            {"path": "generation_config.json", "bytes": 202},
+            {"path": "hf_quant_config.json", "bytes": 35085},
+            {"path": "model-00001-of-00003.safetensors", "bytes": 10006877608},
+            {"path": "model-00002-of-00003.safetensors", "bytes": 10003595752},
+            {"path": "model-00003-of-00003.safetensors", "bytes": 3413864960},
+            {"path": "model.safetensors.index.json", "bytes": 13726227},
+            {"path": "preprocessor_config.json", "bytes": 390},
+            {"path": "tokenizer.json", "bytes": 12807982},
+            {"path": "tokenizer_config.json", "bytes": 16718},
+            {"path": "video_preprocessor_config.json", "bytes": 385},
+            {"path": "vocab.json", "bytes": 6722759}
+          ]
+        }
+      }
+    },
+    "qwen36-35b-a3b-fp8": {
+      "title": "Qwen3.6-35B-A3B",
+      "modalities": [
+        "text",
+        "image"
+      ],
+      "format": "safetensors",
+      "repo": "Qwen/Qwen3.6-35B-A3B-FP8",
+      "base_url": "https://huggingface.co/Qwen/Qwen3.6-35B-A3B-FP8/resolve/95a723d08a9490559dae23d0cff1d9466213d989",
+      "local_dir": "Qwen3.6-35B-A3B-FP8",
+      "speculator": {
+        "repo": "Qwen/Qwen3.6-35B-A3B-FP8",
+        "revision": "95a723d08a9490559dae23d0cff1d9466213d989",
+        "local_dir": "Qwen3.6-35B-A3B-FP8",
+        "engine": {
+          "method": "qwen3_5_mtp",
+          "num_speculative_tokens": 2
+        },
+        "note": "The checkpoint includes its native one-layer MTP head in mtp.safetensors; it shares target embeddings and tokenizer."
+      },
+      "quants": {
+        "FP8": {
+          "title": "FP8 (dynamic E4M3, block 128x128)",
+          "bytes": 37492937900,
+          "summary": "Official Qwen dynamic FP8 release of the 40-layer vision-language MoE; 42 layer shards, a separate MTP shard, BF16 vision tower and unquantized small tensors. One RTX 5090 requires CPU weight offload because the 34.9 GiB checkpoint exceeds 32 GB VRAM.",
+          "min_gpus": {
+            "rtx5090": 1
+          },
+          "files": [
+            {
+              "path": "chat_template.jinja",
+              "bytes": 7764
+            },
+            {
+              "path": "config.json",
+              "bytes": 37000
+            },
+            {
+              "path": "configuration.json",
+              "bytes": 58
+            },
+            {
+              "path": "generation_config.json",
+              "bytes": 202
+            },
+            {
+              "path": "layers-0.safetensors",
+              "bytes": 843713608
+            },
+            {
+              "path": "layers-1.safetensors",
+              "bytes": 843713608
+            },
+            {
+              "path": "layers-10.safetensors",
+              "bytes": 843715168
+            },
+            {
+              "path": "layers-11.safetensors",
+              "bytes": 837094000
+            },
+            {
+              "path": "layers-12.safetensors",
+              "bytes": 843715168
+            },
+            {
+              "path": "layers-13.safetensors",
+              "bytes": 843715168
+            },
+            {
+              "path": "layers-14.safetensors",
+              "bytes": 843715168
+            },
+            {
+              "path": "layers-15.safetensors",
+              "bytes": 837094000
+            },
+            {
+              "path": "layers-16.safetensors",
+              "bytes": 843715168
+            },
+            {
+              "path": "layers-17.safetensors",
+              "bytes": 843715168
+            },
+            {
+              "path": "layers-18.safetensors",
+              "bytes": 843715168
+            },
+            {
+              "path": "layers-19.safetensors",
+              "bytes": 837094000
+            },
+            {
+              "path": "layers-2.safetensors",
+              "bytes": 843713608
+            },
+            {
+              "path": "layers-20.safetensors",
+              "bytes": 843715168
+            },
+            {
+              "path": "layers-21.safetensors",
+              "bytes": 843715168
+            },
+            {
+              "path": "layers-22.safetensors",
+              "bytes": 843715168
+            },
+            {
+              "path": "layers-23.safetensors",
+              "bytes": 837094000
+            },
+            {
+              "path": "layers-24.safetensors",
+              "bytes": 843715168
+            },
+            {
+              "path": "layers-25.safetensors",
+              "bytes": 843715168
+            },
+            {
+              "path": "layers-26.safetensors",
+              "bytes": 843715168
+            },
+            {
+              "path": "layers-27.safetensors",
+              "bytes": 837094000
+            },
+            {
+              "path": "layers-28.safetensors",
+              "bytes": 843715168
+            },
+            {
+              "path": "layers-29.safetensors",
+              "bytes": 843715168
+            },
+            {
+              "path": "layers-3.safetensors",
+              "bytes": 837092440
+            },
+            {
+              "path": "layers-30.safetensors",
+              "bytes": 843715168
+            },
+            {
+              "path": "layers-31.safetensors",
+              "bytes": 837094000
+            },
+            {
+              "path": "layers-32.safetensors",
+              "bytes": 843715168
+            },
+            {
+              "path": "layers-33.safetensors",
+              "bytes": 843715168
+            },
+            {
+              "path": "layers-34.safetensors",
+              "bytes": 843715168
+            },
+            {
+              "path": "layers-35.safetensors",
+              "bytes": 837094000
+            },
+            {
+              "path": "layers-36.safetensors",
+              "bytes": 843715168
+            },
+            {
+              "path": "layers-37.safetensors",
+              "bytes": 843715168
+            },
+            {
+              "path": "layers-38.safetensors",
+              "bytes": 843715168
+            },
+            {
+              "path": "layers-39.safetensors",
+              "bytes": 837094000
+            },
+            {
+              "path": "layers-4.safetensors",
+              "bytes": 843713608
+            },
+            {
+              "path": "layers-5.safetensors",
+              "bytes": 843713608
+            },
+            {
+              "path": "layers-6.safetensors",
+              "bytes": 843713608
+            },
+            {
+              "path": "layers-7.safetensors",
+              "bytes": 837092440
+            },
+            {
+              "path": "layers-8.safetensors",
+              "bytes": 843713608
+            },
+            {
+              "path": "layers-9.safetensors",
+              "bytes": 843713608
+            },
+            {
+              "path": "merges.txt",
+              "bytes": 3353259
+            },
+            {
+              "path": "model.safetensors.index.json",
+              "bytes": 6329223
+            },
+            {
+              "path": "mtp.safetensors",
+              "bytes": 853860608
+            },
+            {
+              "path": "outside.safetensors",
+              "bytes": 2927422112
+            },
+            {
+              "path": "preprocessor_config.json",
+              "bytes": 390
+            },
+            {
+              "path": "tokenizer.json",
+              "bytes": 12807982
+            },
+            {
+              "path": "tokenizer_config.json",
+              "bytes": 16718
+            },
+            {
+              "path": "video_preprocessor_config.json",
+              "bytes": 385
+            },
+            {
+              "path": "vocab.json",
+              "bytes": 6722759
+            }
+          ]
+        }
+      }
+    },
     "qwen38-27b-nvfp4": {
       "title": "Qwen3.8-27B",
       "modalities": [
@@ -1174,6 +1507,7 @@
       "repo": "RedHatAI/GLM-5.3-Flash-NVFP4",
       "base_url": "https://huggingface.co/RedHatAI/GLM-5.3-Flash-NVFP4/resolve/main",
       "local_dir": "GLM-5.3-Flash-NVFP4",
+      "chat_template_asset": "glm53_tool_calling.jinja",
       "shared_note": "Safetensors checkpoint served from its directory; the vision tower, MTP head (model_mtp.safetensors), tokenizer and processor configs ship in the same repo. Requires transformers >= 5.16.1 for the native glm5_next config and processor.",
       "speculator": {
         "repo": "incoai/GLM-5.3-Flash-DFlash2",
@@ -1444,6 +1778,16 @@
           "sha256": "ae23e14c6979e889051b2e4a39351abcdafb161e18e606fae4d8c40095a4bf3a"
         }
       ],
+      "speculator": {
+        "repo": "incoai/GLM-5.3-Flash-DFlash2",
+        "revision": "bf582e4eacc1810f76656d1811693ff6c6737d2a",
+        "local_dir": "GLM-5.3-Flash-DFlash2",
+        "engine": {
+          "method": "dflash",
+          "num_speculative_tokens": 7
+        },
+        "note": "Same registered drafter as the NVFP4 source of this model: DFlash 2 for GLM-5.3-Flash (Inco AI, cc-by-nc-nd-4.0; 2.34 GB bf16, block size 8 = up to 7 draft tokens per verify, target taps [5, 14, 24, 33, 42] through the aux-hidden-state interface), pinned at the same revision. Registering it records which drafter this artifact would run; glm53f-q2-1 keeps speculative decoding OFF until the Metal target-model qualification completes, and no draft weights are downloaded while it is off."
+      },
       "quants": {
         "Q2": {
           "title": "Q2 (IQ2_XXS gate/up, Q2_K down)",
@@ -1496,6 +1840,13 @@
         "recommendedMaxWorkingSetSize is roughly 90% of physical (115.4 of 128 GiB measured on an M5 Max). The min_memory_bytes figures are physical RAM, chosen to leave that margin plus a KV pool.",
         "No multi-device story: Apple exposes one GPU per machine, so every Metal profile is tensor_parallel_size 1 and scaling past one box means separate machines."
       ]
+    },
+    "rtx5090": {
+      "title": "NVIDIA GeForce RTX 5090",
+      "compute_capability": [12, 0],
+      "vram_bytes": 34190917632,
+      "gate": "gpus",
+      "status": "supported"
     },
     "rtx3090": {
       "title": "NVIDIA GeForce RTX 3090",
@@ -2427,6 +2778,190 @@
         }
       }
     },
+    "affine-king-nvfp4-1": {
+      "title": "Affine King Vision NVFP4 on 1 RTX 5090",
+      "source": "affine-king-r21-grpo5-s75-vision-nvfp4",
+      "gpus": 1,
+      "summary": "Full-context Qwen3.6 vision tune with tool calling, FP8 KV, CPU weights, host/NVMe KV tiers and no MTP.",
+      "speculative": false,
+      "variants": {
+        "rtx5090": {
+          "platform": "rtx5090",
+          "default_quant": "NVFP4",
+          "engine": {
+            "tensor_parallel_size": 1,
+            "max_model_len": 262144,
+            "max_num_seqs": 64,
+            "max_num_batched_tokens": 8192,
+            "gpu_memory_utilization": 0.82,
+            "cpu_offload_gb": 4,
+            "kv_cache_dtype": "fp8",
+            "moe_backend": "marlin",
+            "linear_backend": "auto",
+            "kernel_config": {"moe_backend": "marlin", "linear_backend": "auto"},
+            "compilation_config": {
+              "cudagraph_mode": "FULL_DECODE_ONLY",
+              "max_cudagraph_capture_size": 64
+            },
+            "kv_transfer_config": {
+              "kv_connector": "HostTierConnector",
+              "kv_role": "kv_both",
+              "kv_connector_extra_config": {
+                "host_tier_gb_per_rank": 48,
+                "nvme_tier_gb_per_rank": 96,
+                "enable_cross_layers_blocks": "True"
+              }
+            },
+            "reasoning_parser": "qwen3",
+            "tool_call_parser": "qwen3_xml",
+            "served_model_name": "QuixiAI/affine-king-r21-grpo5-s75-vision-NVFP4",
+            "enable_prefix_caching": true,
+            "enable_chunked_prefill": true,
+            "default_chat_template_kwargs": {
+              "reasoning_effort": "low",
+              "preserve_thinking": true,
+              "thinking": true,
+              "enable_thinking": true
+            },
+            "override_generation_config": {"thinking_token_budget": 2000}
+          },
+          "env": {
+            "LD_LIBRARY_PATH": "/usr/local/cuda-13.3/compat",
+            "VLLM_MODELOPT_NVFP4_ONLINE_FP8_DENSE": "1"
+          },
+          "notes": [
+            "Speculative decoding is disabled by default, so production loads no draft model or draft KV. The explicit --spec diagnostic uses the base Qwen3.6 DSpark head pending Affine-specific training and qualification. Marlin is the selected target MoE backend after the auto-selected VLLM CUTLASS route faulted during live profiling on this checkpoint. Excluded dense projections are quantized to FP8 during loading, reducing BF16 decode cost without changing the checkpoint on disk.",
+            "The model's native 262144-token context is retained. FP8 KV has 48 GiB pinned host and 96 GiB NVMe completed-prefix tiers; active-request KV remains GPU-resident.",
+            "64 concurrent sequences are registered for short-context traffic; full-context concurrency is bounded by the live GPU KV pool and must be measured on this checkpoint.",
+            "The profile enables vision, Qwen reasoning and XML tool parsing. Text, image and tool requests require live acceptance before production qualification.",
+            "CUDA 13.3 native PTX JIT on the tested R595 driver requires cuda-compat-13-3 via LD_LIBRARY_PATH."
+          ]
+        }
+      }
+    },
+    "qwen36-nvfp4-1": {
+      "title": "Qwen3.6-35B-A3B NVFP4 on 1 GPU",
+      "source": "qwen36-35b-a3b-nvfp4",
+      "gpus": 1,
+      "summary": "NVIDIA ModelOpt mixed FP8/NVFP4 vision-language MoE on one RTX 5090, with its checkpoint MTP drafter.",
+      "speculative": true,
+      "variants": {
+        "rtx5090": {
+          "platform": "rtx5090",
+          "default_quant": "NVFP4",
+          "engine": {
+            "tensor_parallel_size": 1,
+            "max_model_len": 262144,
+            "max_num_seqs": 8,
+            "max_num_batched_tokens": 8192,
+            "gpu_memory_utilization": 0.82,
+            "cpu_offload_gb": 4,
+            "kv_cache_dtype": "fp8",
+            "moe_backend": "auto",
+            "linear_backend": "auto",
+            "kernel_config": {"moe_backend": "auto", "linear_backend": "auto"},
+            "compilation_config": {
+              "cudagraph_mode": "FULL_DECODE_ONLY",
+              "max_cudagraph_capture_size": 24
+            },
+            "kv_transfer_config": {
+              "kv_connector": "HostTierConnector",
+              "kv_role": "kv_both",
+              "kv_connector_extra_config": {
+                "host_tier_gb_per_rank": 48,
+                "nvme_tier_gb_per_rank": 128,
+                "enable_cross_layers_blocks": "True"
+              }
+            },
+            "reasoning_parser": "qwen3",
+            "tool_call_parser": "qwen3_xml",
+            "served_model_name": "Qwen3.6-35B-A3B",
+            "enable_prefix_caching": true,
+            "enable_chunked_prefill": true,
+            "default_chat_template_kwargs": {
+              "reasoning_effort": "low",
+              "preserve_thinking": true,
+              "thinking": true,
+              "enable_thinking": true
+            },
+            "override_generation_config": {"thinking_token_budget": 2000}
+          },
+          "env": {"LD_LIBRARY_PATH": "/usr/local/cuda-13.3/compat"},
+          "notes": [
+            "On the tested R595 driver with a CUDA 13.3 native build, cuda-compat-13-3 is required for PTX JIT; this profile adds its library directory to child processes via LD_LIBRARY_PATH. A matching R610+ driver can use its own CUDA libraries.",
+            "HostTierConnector keeps completed hybrid KV trajectories in 48 GiB pinned RAM and spills to a 128 GiB NVMe tier. The tier preserves prefixes across eviction; its exact restore behavior requires on-box validation. Active-request KV residency remains GPU-side until a separate host-resident attention path is implemented.",
+            "FP8 target KV and the native 262144-token context are retained. At an 8192-token profiling batch, the 5090 left only 1.35 GiB for KV against a 3.04 GiB single-request requirement; reducing the prefill batch to 2048 did not increase available KV; 4 GiB of CPU weight offload frees room for the live GPU KV. Full-context validation remains required.",
+            "gpu_memory_utilization 0.82 leaves room for the display and CUDA context on the tested desktop 5090: at 0.90, engine initialization saw 26.54 GiB free against a 28.22 GiB reservation and stopped before weight loading.",
+            "The checkpoint's one-layer MTP head is in the third safetensors shard and is served through qwen3_5_mtp at k=2. The 24-row graph ceiling covers 8 concurrent requests times 3 verify rows; draft KV follows the registered MTP path.",
+            "ModelOpt mixed precision uses CUDA automatic backend selection for quantized target experts and the unquantized checkpoint MTP experts. A global Marlin override fails on the MTP head because unquantized MoE has no Marlin backend.",
+            "The checkpoint includes a native vision tower and processor; text and image requests are both required for live validation."
+          ]
+        }
+      }
+    },
+    "qwen36-fp8-1": {
+      "title": "Qwen3.6-35B-A3B FP8 on 1 GPU",
+      "source": "qwen36-35b-a3b-fp8",
+      "gpus": 1,
+      "summary": "Official dynamic FP8 vision-language MoE on one RTX 5090 with CPU weight offload and checkpoint MTP.",
+      "speculative": true,
+      "variants": {
+        "rtx5090": {
+          "platform": "rtx5090",
+          "default_quant": "FP8",
+          "engine": {
+            "tensor_parallel_size": 1,
+            "max_model_len": 262144,
+            "max_num_seqs": 8,
+            "max_num_batched_tokens": 8192,
+            "gpu_memory_utilization": 0.78,
+            "kv_cache_dtype": "fp8",
+            "moe_backend": "auto",
+            "linear_backend": "auto",
+            "kernel_config": {
+              "moe_backend": "auto",
+              "linear_backend": "auto"
+            },
+            "compilation_config": {
+              "cudagraph_mode": "FULL_DECODE_ONLY",
+              "max_cudagraph_capture_size": 24
+            },
+            "kv_transfer_config": {
+              "kv_connector": "HostTierConnector",
+              "kv_role": "kv_both",
+              "kv_connector_extra_config": {
+                "host_tier_gb_per_rank": 48,
+                "nvme_tier_gb_per_rank": 128,
+                "enable_cross_layers_blocks": "True"
+              }
+            },
+            "reasoning_parser": "qwen3",
+            "tool_call_parser": "qwen3_xml",
+            "served_model_name": "Qwen3.6-35B-A3B-FP8",
+            "enable_prefix_caching": true,
+            "enable_chunked_prefill": true,
+            "default_chat_template_kwargs": {
+              "reasoning_effort": "low",
+              "preserve_thinking": true,
+              "thinking": true,
+              "enable_thinking": true
+            },
+            "override_generation_config": {
+              "thinking_token_budget": 2000
+            },
+            "cpu_offload_gb": 16
+          },
+          "env": {"LD_LIBRARY_PATH": "/usr/local/cuda-13.3/compat"},
+          "notes": [
+            "On the tested R595 driver with a CUDA 13.3 native build, cuda-compat-13-3 is required for PTX JIT; this profile adds its library directory to child processes via LD_LIBRARY_PATH. A matching R610+ driver can use its own CUDA libraries.",
+            "HostTierConnector keeps completed hybrid KV trajectories in 48 GiB pinned RAM and spills to a 128 GiB NVMe tier. The tier preserves prefixes across eviction; its exact restore behavior requires on-box validation. Active-request KV residency remains GPU-side until a separate host-resident attention path is implemented.",
+            "The official dynamic FP8 checkpoint is 37.49 GB on disk, larger than this 32 GB GPU. 16 GiB CPU weight offload is a capacity setting and needs live TPS and correctness validation.",
+            "Target and MTP draft KV use FP8; the separate mtp.safetensors is included in the same pinned source revision.",
+            "Vision tower and processor are included; text and image requests are required for validation."
+          ]
+        }
+      }
+    },
     "qwen38-nvfp4-1": {
       "title": "Qwen3.8-27B NVFP4 on 1 GPU",
       "source": "qwen38-27b-nvfp4",
@@ -2893,6 +3428,7 @@
       "variants": {
         "a100": {
           "platform": "a100",
+          "tool_calling_profile": "glm53",
           "default_quant": "NVFP4",
           "engine": {
             "tensor_parallel_size": 4,
@@ -2945,7 +3481,7 @@
             "moe_backend marlin (top-level and kernel_config, since a non-auto top-level flag overwrites kernel_config): this fork defaults to aiter, which is ROCm-only; Marlin W4A16 is the NVFP4 MoE path on sm80.",
             "reasoning_parser and tool_call_parser glm47: GLM-5.3 uses the GLM-4.7-family thinking and tool-call markup; enable_auto_tool_choice and thinking are the registry serving defaults.",
             "Host KV tier ENABLED (2026-09-03): 72 GiB pinned host RAM per rank (cudaHostRegister-ed at exact size) plus a 256 GiB per-rank NVMe/disk third tier under it (per-rank O_TMPFILE in SLIMSERVE_KV_TIER_DIR - operator environment, never a profile field; on this box the tier directory sits on the 4.9 TB /dev/sda2 filesystem). The layout is the packed cross-layer slab (enable_cross_layers_blocks) over 56 layers: 4 KDA state groups + the MLA and indexer groups. Hybrid page-size unification gives the indexer group (512 B/token) 2176-token blocks beside the MLA group's 1088 (TP4; 576/1152 at TP8), so the connector runs per-group block ratios: the wider group is offloaded/restored only where its block completes and resume boundaries align to the ratios' lcm. Every kernel on this path addresses pages by block stride (no flattening of the packed view). Validation: host tier at TP4 (48 GiB/rank): 6/6 probes hit and restored at block 36 (39,168 tokens), 58 restore ops each, VLLM_KV_TIER_VERIFY 0/58 mismatched; disk tier at TP4 (8 GiB host + 64 GiB disk, restores forced from disk): promotions from NVMe, verify 0/58 mismatched, 0 disk round-trip mismatches, 6/6 recalled after a 1.9M-token churn of a 1.24M-token pool (perf/results/2026-09-03/kvtier-acceptance/glm53-tp4-{host48,disk9}/); the TP8 record validated through slimserve on 2026-09-04 (perf/results/2026-09-04/glm53f-nvfp4-8-tier/).",
-            "Reasoning effort: the GLM-5.3-Flash chat template implements the GLM-5.3 Low / High / Max levels (default Max) from the reasoning_effort chat_template_kwargs; thinking itself stays always-on (serving policy). No server flag is involved.",
+            "Reasoning effort: the GLM-5.3-Flash chat template implements the GLM-5.3 Low / High / Max levels (default Max) from reasoning_effort. Ordinary chat keeps thinking on; the glm53 tool-calling profile defaults native tools to non-thinking and always disables thinking for custom/free-form tools, whose structural prefix is otherwise corrupted.",
             "Thinking budget (2026-09-11): override_generation_config.thinking_token_budget 2000 per request, the fleet convention (qwen38 records); the V2 runner nudges the model to wrap up at 85% of the budget and force-closes the think block at 100%, capped inside the request's max_tokens. Added after the 1M-context legs showed probes at 900K+ spending their whole 1,024-token reply budget thinking with an empty answer: this record had no budget, so nothing ever closed the block."
           ]
         }
@@ -2960,6 +3496,7 @@
       "variants": {
         "a100": {
           "platform": "a100",
+          "tool_calling_profile": "glm53",
           "default_quant": "NVFP4",
           "engine": {
             "tensor_parallel_size": 4,
@@ -3029,7 +3566,7 @@
             "reasoning_parser and tool_call_parser glm47: GLM-5.3 uses the GLM-4.7-family thinking and tool-call markup; enable_auto_tool_choice and thinking are the registry serving defaults.",
             "Host KV tier ENABLED (2026-09-03): 72 GiB pinned host RAM per rank (cudaHostRegister-ed at exact size) plus a 256 GiB per-rank NVMe/disk third tier under it (per-rank O_TMPFILE in SLIMSERVE_KV_TIER_DIR - operator environment, never a profile field; on this box the tier directory sits on the 4.9 TB /dev/sda2 filesystem). The layout is the packed cross-layer slab (enable_cross_layers_blocks) over 56 layers: 4 KDA state groups + the MLA and indexer groups. Hybrid page-size unification gives the indexer group (512 B/token) 2176-token blocks beside the MLA group's 1088 (TP4; 576/1152 at TP8), so the connector runs per-group block ratios: the wider group is offloaded/restored only where its block completes and resume boundaries align to the ratios' lcm. Every kernel on this path addresses pages by block stride (no flattening of the packed view). Validation: host tier at TP4 (48 GiB/rank): 6/6 probes hit and restored at block 36 (39,168 tokens), 58 restore ops each, VLLM_KV_TIER_VERIFY 0/58 mismatched; disk tier at TP4 (8 GiB host + 64 GiB disk, restores forced from disk): promotions from NVMe, verify 0/58 mismatched, 0 disk round-trip mismatches, 6/6 recalled after a 1.9M-token churn of a 1.24M-token pool (perf/results/2026-09-03/kvtier-acceptance/glm53-tp4-{host48,disk9}/); the TP8 record validated through slimserve on 2026-09-04 (perf/results/2026-09-04/glm53f-nvfp4-8-tier/).",
             "Sized to the 8x A100 / 787 GB host box (2026-09-06): gpu_memory_utilization 0.95 (weights 23.6 GiB/rank, the rest of the budget is the VRAM KV pool), max_num_seqs 64 with a matching FULL_DECODE_ONLY capture size, 72 GiB pinned host tier per rank (576 GiB, leaving ~200 GB for prefill staging and page cache) and 256 GiB disk tier per rank (2 TiB on the 4.9 TB /dev/sda2). Three tiers: VRAM pool -> pinned host -> per-rank O_TMPFILE disk, all at the model-default 1,048,576 context.",
-            "Reasoning effort: the GLM-5.3-Flash chat template implements the GLM-5.3 Low / High / Max levels (default Max) from the reasoning_effort chat_template_kwargs; thinking itself stays always-on (serving policy). No server flag is involved.",
+            "Reasoning effort: the GLM-5.3-Flash chat template implements the GLM-5.3 Low / High / Max levels (default Max) from reasoning_effort. Ordinary chat keeps thinking on; the glm53 tool-calling profile defaults native tools to non-thinking and always disables thinking for custom/free-form tools, whose structural prefix is otherwise corrupted.",
             "Parallelism: TP4 x DP2 with replicated MoE (operator 2026-09-10: production is always c8+). vLLM's default DP flattens the MoE tensor-parallel group across DP (each rank holds 1/8 of every expert and every MoE layer all-gathers tokens across replicas in lockstep), which is what made the 2026-09-03 TP4xDP2 arm lose 10% at c1 to standalone TP4; data_parallel_replicate_moe keeps the full expert set on each replica sharded over its own TP4 group (44.9 GiB weights per rank), so the replicas share nothing per step. The DP load balancer routes by prefix affinity (VLLM_DP_PREFIX_AFFINITY, default on) because each replica's prefix cache and KV tiers are private. Measured 2026-09-11 through `slimserve --serve` (exact-token, DFlash2 on, three warmed repeats, medians): c1 117.8 / c8 506.8 / c16 786.5 / c32 985.8 / c64 1158.0 tok/s, text/image/tool canaries pass, forced-eviction tier acceptance 6/6 with VLLM_KV_TIER_VERIFY 96 batches / 0 mismatched (raw: perf/results/2026-09-11/glm53f-final-dp2/); the qualifying arm measured 128.8 / 559.4 / 771.2 / 1012.2 / 1174.6 (perf/results/2026-09-10/glm53f-dflash2/mx-tp4dp2-k2/); TP8 record before the flip: 153.6 / 495.0 / 687.3 / 879.5 / 1074.5. EP loses at every point and stays off.",
             "Thinking budget (2026-09-11): override_generation_config.thinking_token_budget 2000 per request, the fleet convention (qwen38 records); the V2 runner nudges the model to wrap up at 85% of the budget and force-closes the think block at 100%, capped inside the request's max_tokens. Added after the 1M-context legs showed probes at 900K+ spending their whole 1,024-token reply budget thinking with an empty answer: this record had no budget, so nothing ever closed the block.",
             "Main KV fp8 (e4m3) ON (2026-09-12, glm5_next_main_kv_fp8; FP8 is the official KV quantization): the 512-wide NoPE latent is stored fp8 with a per-tensor scale and decoded natively by the fp8 lane-parallel sparse decode and the fp8 sparse tensor-core path (bf16-parity kernels, 613 vs 602 us). The MLA blocks widen to 2304 tokens (packed slab, equal page bytes) beside the 1152-token KDA/drafter blocks, so the host tier hashes at the scheduler's 1152-token gcd. VRAM pool 2,969,768 tokens (bf16: 1,669,244; 2.83x the 1M context). Gates: canaries pass; exact medians c1 118.4 / c8 559.1 / c16 730.0 / c32 971.6 / c64 1139.3 tok/s (bf16 record 117.8 / 506.8 / 786.5 / 985.8 / 1158.0, within run-to-run noise); eviction-restore acceptance 6/6 markers after a 3.74M-token churn with VLLM_KV_TIER_VERIFY=1 (88 verify batches, 0 mismatched); WildChat deep-context leg c8 737 turns, 0 errors, 119/119 recall probes, 549 tier restores, 93.4% prefix hit rate, sessions to 624K tokens. Raw: perf/results/2026-09-12/glm53f-fp8-gates2/ and glm53f-leg-fp8-2/.",
@@ -3058,6 +3595,7 @@
       "variants": {
         "metal": {
           "platform": "metal",
+          "tool_calling_profile": "glm53",
           "default_quant": "Q2",
           "engine": {
             "tensor_parallel_size": 1,

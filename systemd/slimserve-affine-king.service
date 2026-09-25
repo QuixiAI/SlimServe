@@ -1,0 +1,22 @@
+[Unit]
+Description=SlimServe Affine King Qwen3.6 vision NVFP4
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=eric
+Group=eric
+WorkingDirectory=/home/eric/SlimServe
+Environment=PYTHONUNBUFFERED=1
+Environment=VLLM_KV_TIER_VERIFY=1
+ExecStart=/home/eric/.venv/bin/python -m slimserve.cli affine-king-nvfp4-1 --serve --host 0.0.0.0 --port 8000 -y
+Restart=always
+RestartSec=10
+KillMode=control-group
+TimeoutStopSec=90
+LimitMEMLOCK=infinity
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

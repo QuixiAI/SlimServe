@@ -83,6 +83,12 @@ class UVAOffloader(BaseOffloader):
                 # one module might have some parameters offloaded and some not
                 break
 
+            # Online quantizers construct meta weights and materialize the
+            # quantized parameter while loading. There is no storage to
+            # offload at model construction time.
+            if p.device.type == "meta":
+                continue
+
             if self.cpu_offload_params:
                 # Check if parameter belongs to the offloading set
                 # Add dots here to ensure we match full segments only

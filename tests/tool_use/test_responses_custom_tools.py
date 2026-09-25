@@ -116,6 +116,73 @@ def test_protocol_rejects_missing_named_custom_tool():
         custom_request(tool_choice={"type": "custom", "name": "missing"})
 
 
+def test_protocol_rejects_missing_allowed_tool():
+    with pytest.raises(Exception, match="Allowed tool choice references"):
+        custom_request(
+            tool_choice={
+                "type": "allowed_tools",
+                "mode": "required",
+                "tools": [{"type": "custom", "name": "missing"}],
+            }
+        )
+
+
+@pytest.mark.parametrize("mode", ["required", "auto"])
+def test_glm_allowed_custom_tool_uses_internal_function_reference(mode):
+    request = custom_request(
+        tool_choice={
+            "type": "allowed_tools",
+            "mode": mode,
+            "tools": [{"type": "custom", "name": "apply_patch"}],
+        },
+        parallel_tool_calls=False,
+        max_tool_calls=1,
+    )
+
+    structural_tag = get_model_structural_tag(
+        "glm_4_7",
+        request.tools,
+        request.tool_choice,
+        reasoning=False,
+        stop_after_first=True,
+    )
+
+    assert structural_tag is not None
+    assert "<tool_call>apply_patch" in structural_tag.model_dump_json()
+    Grammar.from_structural_tag(structural_tag)
+
+
+def test_allowed_tools_only_render_the_selected_subset():
+    request = ResponsesRequest.model_validate(
+        {
+            "model": "GLM-5.3-Flash-FP8",
+            "input": "Call get_time.",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "get_weather",
+                    "parameters": {"type": "object"},
+                },
+                {
+                    "type": "function",
+                    "name": "get_time",
+                    "parameters": {"type": "object"},
+                },
+            ],
+            "tool_choice": {
+                "type": "allowed_tools",
+                "mode": "required",
+                "tools": [{"type": "function", "name": "get_time"}],
+            },
+        }
+    )
+
+    tool_dicts = construct_tool_dicts(request.tools, request.tool_choice)
+
+    assert tool_dicts is not None
+    assert [tool["function"]["name"] for tool in tool_dicts] == ["get_time"]
+
+
 def test_generic_tool_construction_preserves_custom_declaration():
     request = custom_request()
     tool_dicts = construct_tool_dicts(request.tools, request.tool_choice)
@@ -220,6 +287,11 @@ def test_deepseek_regex_grammar_only_replaces_dsml_input_region():
     ("model", "parser_module", "expected_constants"),
     [
         (
+            "glm_4_7",
+            "vllm.tool_parsers.glm47_moe_tool_parser",
+            ("<arg_key>input</arg_key><arg_value>", "</arg_value>"),
+        ),
+        (
             "qwen_3_coder",
             "vllm.tool_parsers.qwen3_engine_tool_parser",
             ("<parameter=input>", "</parameter>"),
@@ -244,6 +316,69 @@ def test_other_model_formats_constrain_only_custom_payload(
     for expected in expected_constants:
         assert expected in constants
     assert len(grammars) == 1
+    Grammar.from_structural_tag(structural_tag)
+
+
+@pytest.mark.parametrize("tool_choice", ["required", "auto"])
+def test_glm_custom_tool_can_stop_after_one_call(tool_choice):
+    request = custom_request(
+        tool_choice=tool_choice,
+        parallel_tool_calls=False,
+        max_tool_calls=1,
+    )
+    structural_tag = get_model_structural_tag(
+        "glm_4_7",
+        request.tools,
+        request.tool_choice,
+        reasoning=False,
+        stop_after_first=True,
+    )
+    assert structural_tag is not None
+    dumped = structural_tag.model_dump()["format"]
+    expected_format = (
+        "tags_with_separator" if tool_choice == "required" else "triggered_tags"
+    )
+    assert dumped["type"] == expected_format
+    assert dumped["stop_after_first"] is True
+    Grammar.from_structural_tag(structural_tag)
+
+
+def test_glm_required_parallel_tools_allow_native_turn_stop():
+    request = custom_request(parallel_tool_calls=True)
+    structural_tag = get_model_structural_tag(
+        "glm_4_7",
+        request.tools,
+        request.tool_choice,
+        reasoning=False,
+    )
+    assert structural_tag is not None
+    dumped = structural_tag.model_dump()["format"]
+    assert dumped["type"] == "sequence"
+    assert dumped["elements"][-1] == {
+        "type": "const_string",
+        "value": "<|observation|>",
+    }
+    Grammar.from_structural_tag(structural_tag)
+
+
+def test_glm_required_parallel_custom_ignores_builtin_max_tool_calls():
+    request = custom_request(parallel_tool_calls=True, max_tool_calls=2)
+    structural_tag = get_model_structural_tag(
+        "glm_4_7",
+        request.tools,
+        request.tool_choice,
+        reasoning=False,
+    )
+    assert structural_tag is not None
+    dumped = structural_tag.model_dump()["format"]
+    assert dumped["type"] == "sequence"
+    assert len(dumped["elements"]) == 2
+    assert dumped["elements"][0]["type"] == "tags_with_separator"
+    assert dumped["elements"][0]["stop_after_first"] is False
+    assert dumped["elements"][1] == {
+        "type": "const_string",
+        "value": "<|observation|>",
+    }
     Grammar.from_structural_tag(structural_tag)
 
 

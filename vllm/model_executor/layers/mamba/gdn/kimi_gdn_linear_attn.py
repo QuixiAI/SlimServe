@@ -477,7 +477,12 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                     [self.projection_size] * 3,
                     self.tp_size,
                     self.tp_rank,
-                )
+                ),
+                # Checkpoints ship this convolution either as three tensors
+                # (q/k/v_conv1d, stacked here by shard id) or pre-fused as one
+                # tensor of 3 x projection_size rows. A loader needs the count
+                # to split the pre-fused form back into its shards.
+                "fused_conv1d_shards": 3,
             },
         )
 

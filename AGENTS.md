@@ -34,7 +34,7 @@ behavior:
 
 - SlimServe is profile-driven. `slimserve/profiles.json` is the source of truth for supported models, quants, engine args, environment, and platform overrides.
 - Missing model files are not a blocker. Run `slimserve <profile> ... -y`; `slimserve.fetch` downloads or resumes required files into `$SLIMSERVE_CACHE` or `~/models`.
-- Do not hand-build unsupported serving commands when a profile exists. Use `slimserve <profile> --dry-run` to inspect and `slimserve <profile> --serve` to run.
+- Do not hand-build unsupported serving commands when a profile exists. Use `slimserve <profile> --dry-run` to inspect and `slimserve <profile>` to run (serving is the default; `--serve` is still accepted).
 
 ## Agent Operating Discipline
 
