@@ -1,0 +1,14 @@
+ds4: Metal device Apple M1 Ultra, 128.00 GiB RAM
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal model views created in 2.057 ms, residency requested in 27722.293 ms, warmup 7.003 ms (mapped 92026.06 MiB from offset 9.07 MiB)
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: metal backend initialized for graph diagnostics
+ds4: memory: KV 0.05 GiB (raw 0.00 + compressed 0.05) + buffers 2.92 GiB + resident model 89.87 GiB = 92.84 GiB planned
+ds4: memory detail: ctx=4096 prefill_cap=2048 raw_kv_rows=0 compressed_kv_rows=4096 backend=metal
+ds4: memory: KV 0.05 GiB (raw 0.00 + compressed 0.05) + buffers 2.92 GiB = 2.97 GiB context
+ds4: memory detail: ctx=4096 prefill_cap=2048 raw_kv_rows=0 compressed_kv_rows=4096 backend=metal
+ds4: GLM graph using compact DSA KV only; expanded full-attention KV cache is skipped
+ds4: GLM graph allocating compact DSA cache: rows=4096 logical_ctx=4096 kv_layers=45 indexer_layers=11 f16 0.05 GiB
+ds4: GLM compact indexed prefill chunk=2048 score_rows=2048 score_scratch=8.00 MiB
+processing 3000 input tokens: 2048/3000 (68.3%)
+processing 3000 input tokens: 3000/3000 (100.0%)

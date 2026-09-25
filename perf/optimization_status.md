@@ -1,5 +1,32 @@
 # SlimServe Optimization Status
 
+## 2026-09-25 - glm53f-q2-1 release gates on the merged build; 2500x64 pin roll
+
+- Baseline: pins 7dd30ea193a6 / 393882a2ddaf / 1d7d58486dc7, c=1 400-out
+  c6b99cdf91ac; concurrent curve from the 2026-09-17/24 entries.
+- Change: merge of origin/main (15 commits). Fixes it needed: one source
+  speculator for glm53f-gguf (duplicate key), and `files_for` no longer
+  builds a hub URL for a speculator with no files (the in-target nextn
+  drafter; `test_in_target_drafter_adds_no_download`).
+- Result (`perf/results/2026-09-15/glm53f-q2-conc/release/`): concurrent
+  gate PASS and pinned - c=4 48.38, c=8 57.29, c=16 63.11 tok/s, exact at
+  every width; c=1 400-out c6b99cdf91ac; 8tok 7dd30ea193a6; off1-2000
+  393882a2ddaf at 34.30 tok/s.
+- 2500x64 now c097108f8fa5. Cause isolated by one switch per boot: with
+  VLLM_QC_MLA_SPARSE_MQA=0 it is 1d7d58486dc7 again. A 2500-token prompt
+  exceeds the 2051-token dense prefill limit, so its prefill runs the sparse
+  latent kernel, which since 2026-09-17 is the head-grouped MMA variant at
+  >= 3 rows (half-precision P and S tiles vs the per-head fp32 walk). No
+  earlier gate covered it (the concurrent gates are 1000-token prompts; the
+  existing ds4 oracle prompts are <= 1000 tokens, dense path).
+- Correctness: new ds4 teacher-forced dump on a 3000-token prompt
+  (`perf/results/2026-09-25/glm53f-q2-oracle-long/`, 64 greedy tokens,
+  top-8): MMA 62/64 argmax, mean |dlp| 0.0731, max 0.408; per-head 59/64,
+  0.0630, max 0.320. Disagreements are at ds4 margins <= 0.14 nats for
+  both. Equivalent quality; the pin rolls.
+- Decision: pin rolled; record `supported` (bar = ds4 on the same box,
+  perf/baseline_status.md 2026-09-24).
+
 ## 2026-09-17 (later) - c=16 lever board: plan, sizing, and results as they land
 
 Real step at c=16 / 1000-out is ~510 ms (2.08x; 27 tok/step); 3x needs

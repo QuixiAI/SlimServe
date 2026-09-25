@@ -1587,10 +1587,13 @@ design rather than a local bug.
   teacher-forced vs ds4 29/32 and 62/64. ds4 on the same box: 22.52 tok/s
   decode with MTP, 143 t/s prefill.
 - Gate pins (must hold): 8tok `7dd30ea193a6`, off1-2000 `393882a2ddaf`,
-  2500x64 `1d7d58486dc7`. `perf/results/2026-09-11/glm53f-q2-baseline/gate.sh <outdir>`.
-- Concurrency WORKS but does not SCALE. It was dead until 2026-09-15 (the
-  drafter's torch prefill prep crashed every multi-request step); that fix
-  is in e975d30aa with the ledger in `perf/optimization_status.md`.
+  2500x64 `c097108f8fa5` (rolled 2026-09-25 from `1d7d58486dc7` by the
+  sparse-MLA MMA kernel; teacher-forced vs ds4 at 3000 tokens 62/64, per-head
+  kernel 59/64). `perf/results/2026-09-11/glm53f-q2-baseline/gate.sh <outdir>`.
+- Concurrency SCALES and beats ds4 (2026-09-25): 27.5 / 48.4 / 58.2 / 63.1
+  / 60.2 tok/s at c=1/4/8/16/32 vs ds4 16.2 / 22.1 / 23.8 at c=1/4/8 (ds4
+  cannot fit 16). Concurrent gate pinned:
+  `perf/results/2026-09-15/glm53f-q2-conc/concurrent_gate_pin.py <outdir>`.
 
 ## The measurement you inherit, and its caveat
 
@@ -1811,6 +1814,26 @@ then re-enable. The trace harness is
   trailers. Commit only when the user asks.
 
 ## Status log (batching campaign)
+
+- 2026-09-25: **DONE - `glm53f-q2-1` is `supported`.** The bar is ds4 on
+  this box, not a self-set multiple of c=1: ds4 6289c516 `--batched-session
+  8` aggregates 16.2 / 22.1 / 23.8 tok/s at c=1/4/8 (1000-in/1000-out, same
+  harness) against our 27.5 / 48.4 / 58.2 (1.70x / 2.19x / 2.44x); ds4
+  cannot plan 16 sessions, we serve 63.1 at c=16. Merged main (15 commits;
+  two merge breaks fixed: a duplicate source speculator key, and the new
+  download planner building a hub URL for the in-target nextn drafter -
+  test added). Release gates on the merged build (`release/`): concurrent
+  gate PASS and pinned (`pins.json`: c=4 48.38, c=8 57.29, c=16 63.11,
+  exact at every width), c=1 400-out `c6b99cdf91ac` held, 8tok and
+  off1-2000 held (34.30 tok/s). 2500x64 ROLLED `1d7d58486dc7` ->
+  `c097108f8fa5`: the 2500-token prefill is above the 2051 dense limit and
+  runs the sparse-MLA kernel, which is now the MMA variant (MQA=0 restores
+  the old sha exactly). Teacher-forced vs ds4 on a new 3000-token dump:
+  MMA 62/64 argmax, mean |dlp| 0.073; per-head 59/64, 0.063 - every miss
+  at a ds4 near-tie (`perf/results/2026-09-25/glm53f-q2-oracle-long/`).
+  Remaining levers are a few percent each (sampling/drafter glue, mHC, KDA
+  in_proj); the routed MoE (~45% of the c=16 step) is at the IQ2_XXS
+  per-slot floor.
 
 - 2026-09-17: **ROOT CAUSE of "spec is a net loss at concurrency" FOUND
   AND FIXED.** (a) The record's dynamic draft schedule `[(1,2,1),(3,8,0)]`
