@@ -40,6 +40,36 @@ def test_every_profile_resolves_on_a_platform_it_claims():
             assert plan.engine, "a profile with no engine settings would serve nothing"
 
 
+def test_qwen36_5090_profile_fetches_vision_and_mtp_checkpoint():
+    plan = resolve("qwen36-nvfp4-1", "rtx5090", 1, None)
+    files = {entry["path"] for entry in files_for(plan)}
+    assert "preprocessor_config.json" in files
+    assert "model-00003-of-00003.safetensors" in files
+    assert plan.source["modalities"] == ["text", "image"]
+    assert plan.engine["kv_cache_dtype"] == "fp8"
+    assert plan.engine["moe_backend"] == "auto"
+    tier = plan.engine["kv_transfer_config"]["kv_connector_extra_config"]
+    assert tier["host_tier_gb_per_rank"] == 48
+    assert tier["nvme_tier_gb_per_rank"] == 128
+    assert plan.engine["max_model_len"] == 262144
+    assert plan.engine["cpu_offload_gb"] == 4
+    assert engine_kwargs(plan)["speculative_config"]["method"] == "qwen3_5_mtp"
+
+
+def test_qwen36_fp8_5090_profile_offloads_and_fetches_mtp():
+    plan = resolve("qwen36-fp8-1", "rtx5090", 1, None)
+    files = {entry["path"] for entry in files_for(plan)}
+    assert "mtp.safetensors" in files
+    assert "outside.safetensors" in files
+    assert "preprocessor_config.json" in files
+    assert plan.engine["cpu_offload_gb"] == 16
+    assert plan.engine["kv_cache_dtype"] == "fp8"
+    assert plan.source["modalities"] == ["text", "image"]
+    assert plan.engine["max_model_len"] == 262144
+    assert plan.engine["kv_transfer_config"]["kv_connector"] == "HostTierConnector"
+    assert engine_kwargs(plan)["speculative_config"]["method"] == "qwen3_5_mtp"
+
+
 def test_every_profile_uses_registered_drafter_with_fp8_dspark():
     for profile_id in registry.profile_ids():
         entry = registry.describe(profile_id)
@@ -90,13 +120,49 @@ def test_no_spec_cli_flag_disables_the_resolved_speculator(monkeypatch):
     assert "speculative_config" not in engine_kwargs(seen[0])
 
 
-def test_every_profile_source_names_a_blessed_dspark_download():
+def test_every_speculative_profile_source_names_a_blessed_download():
     sources = registry._registry()["sources"]
     for profile_id in registry.profile_ids():
+        if not registry.describe(profile_id)["speculative"]:
+            continue
         speculator = sources[registry.describe(profile_id)["source"]]["speculator"]
         assert speculator.get("base_url", "https://huggingface.co/").startswith(
             "https://huggingface.co/"
         )
+
+
+def test_affine_king_production_profile_has_full_context_and_no_draft():
+    plan = resolve("affine-king-nvfp4-1", "rtx5090", 1, "NVFP4")
+    engine = engine_kwargs(plan)
+    assert not plan.speculative
+    assert "speculative_config" not in engine
+    assert engine["max_model_len"] == 262144
+    assert engine["max_num_seqs"] == 64
+    assert engine["kv_cache_dtype"] == "fp8"
+    assert engine["kv_transfer_config"]["kv_connector"] == "HostTierConnector"
+    assert plan.engine["tool_call_parser"] == "qwen3_xml"
+    source_id = registry.describe("affine-king-nvfp4-1")["source"]
+    assert registry._registry()["sources"][source_id]["modalities"] == [
+        "text",
+        "image",
+    ]
+
+
+def test_affine_king_optional_dspark_fetches_complete_pinned_checkpoint():
+    plan = replace(
+        resolve("affine-king-nvfp4-1", "rtx5090", 1, "NVFP4"),
+        speculative=True,
+    )
+    draft_files = [entry for entry in files_for(plan) if entry["role"] == "speculator"]
+    assert {entry["path"] for entry in draft_files} == {
+        "config.json",
+        "config.py",
+        "model.safetensors",
+    }
+    assert {entry["hf_revision"] for entry in draft_files} == {
+        "53814b238c3a6ce5f332066a6bedb9d179777ede"
+    }
+    assert engine_kwargs(plan)["speculative_config"]["method"] == "dspark"
 
 
 def test_spec_cli_opt_in_keeps_registered_glm_defaults(monkeypatch):
@@ -402,6 +468,9 @@ def test_registry_contains_only_the_supported_model_artifacts():
         "kimi-k3",
         "dsv4-flash",
         "muse-glimmer",
+        "affine-king-r21-grpo5-s75-vision-nvfp4",
+        "qwen36-35b-a3b-nvfp4",
+        "qwen36-35b-a3b-fp8",
         "qwen38-27b",
         "qwen38-27b-nvfp4",
         "qwen38-flash-next-fp8",

@@ -637,6 +637,14 @@ def files_for(plan: Plan) -> list[dict[str, Any]]:
                 "url": f"{base}/{entry['path']}",
                 "local_dir": plan.source["local_dir"],
                 "role": "model",
+                **(
+                    {
+                        "hf_repo": plan.source["repo"],
+                        "hf_revision": plan.source["revision"],
+                    }
+                    if plan.source.get("download_strategy") == "hf_hub"
+                    else {}
+                ),
             }
         )
     for entry in plan.source.get("shared") or []:
@@ -650,13 +658,26 @@ def files_for(plan: Plan) -> list[dict[str, Any]]:
             }
         )
     spec = plan.speculator if plan.speculative else None
-    if spec and (entry := spec.get("file")):
-        wanted.append(
-            {
-                **entry,
-                "url": f"{spec['base_url']}/{entry['path']}",
-                "local_dir": spec["local_dir"],
-                "role": "speculator",
-            }
-        )
+    if spec:
+        entries = [spec["file"]] if spec.get("file") else spec.get("files", [])
+        spec_base = spec.get("base_url")
+        if not spec_base:
+            spec_base = (
+                f"https://huggingface.co/{spec['repo']}/resolve/"
+                f"{spec.get('revision', 'main')}"
+            )
+        for entry in entries:
+            wanted.append(
+                {
+                    **entry,
+                    "url": f"{spec_base}/{entry['path']}",
+                    "local_dir": spec["local_dir"],
+                    "role": "speculator",
+                    **(
+                        {"hf_repo": spec["repo"], "hf_revision": spec["revision"]}
+                        if spec.get("download_strategy") == "hf_hub"
+                        else {}
+                    ),
+                }
+            )
     return wanted

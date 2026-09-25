@@ -44,6 +44,7 @@ from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
 )
 from vllm.model_executor.model_loader import get_model_loader
+from vllm.model_executor.offloader import create_offloader, set_offloader
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.encoder_budget import (
     MultiModalBudget,
@@ -335,6 +336,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         time_before_load = time.perf_counter()
         if load_dummy_weights:
             self.load_config.load_format = "dummy"
+        # Construct layers with the configured CPU weight offloader active.
+        # V1 does this in its runner initializer; without it, V2 allocates
+        # every FP8 expert on GPU before loading and OOMs on a single 5090.
+        set_offloader(create_offloader(self.vllm_config.offload_config))
         self.eplb.prepare_load()
         eplb_models_added = False
         with DeviceMemoryProfiler() as m:
