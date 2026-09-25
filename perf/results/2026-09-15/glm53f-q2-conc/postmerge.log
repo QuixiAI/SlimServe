@@ -1,0 +1,34 @@
+launched pid 82230 sid-detached; log /Users/seangherardi/Code/slimserve/SlimServe-glm53f/perf/results/2026-09-15/glm53f-q2-conc/postmerge/boot.log
+READY ~605s
+== 400-out
+[14:03:54] c1
+Traceback (most recent call last):
+ConnectionRefusedError: [Errno 61] Connection refused
+[14:03:57] c8
+Traceback (most recent call last):
+ConnectionRefusedError: [Errno 61] Connection refused
+[14:04:01] c16
+Traceback (most recent call last):
+ConnectionRefusedError: [Errno 61] Connection refused
+  c  rows  exact  agg tok/s  per-req  x c=1  wall s  sha
+  1  (no json - see c1.err)
+  8  (no json - see c8.err)
+ 16  (no json - see c16.err)
+[14:04:05] CONCURRENT GATES DONE
+== 1000-out
+[14:04:05] c1
+Traceback (most recent call last):
+ConnectionRefusedError: [Errno 61] Connection refused
+[14:04:09] c8
+Traceback (most recent call last):
+ConnectionRefusedError: [Errno 61] Connection refused
+[14:04:13] c16
+Traceback (most recent call last):
+ConnectionRefusedError: [Errno 61] Connection refused
+  c  rows  exact  agg tok/s  per-req  x c=1  wall s  sha
+  1  (no json - see c1.err)
+  8  (no json - see c8.err)
+ 16  (no json - see c16.err)
+[14:04:17] CONCURRENT GATES DONE
+port 8000 free after ~1s
+[14:04:17] ALL DONE

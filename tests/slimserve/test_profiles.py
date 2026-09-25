@@ -219,6 +219,15 @@ def test_glm53_profiles_select_glm53_tool_calling_compatibility():
         assert plan.env["VLLM_TOOL_CALLING_PROFILE"] == "glm53"
 
 
+def test_in_target_drafter_adds_no_download():
+    # glm53f-q2-1's drafter is the GGUF's own nextn block (model: target): no
+    # repo, no files. The download planner must not build a hub URL for it.
+    plan = resolve("glm53f-q2-1", "metal", 1, None, memory_bytes=128 * (1 << 30))
+    plan = replace(plan, speculative=True)
+    assert plan.speculator["model"] == "target"
+    assert not [f for f in files_for(plan) if f["role"] == "speculator"]
+
+
 def test_spec_cli_flags_are_mutually_exclusive():
     with pytest.raises(SystemExit):
         cli._parser().parse_args(["--spec", "--no-spec"])

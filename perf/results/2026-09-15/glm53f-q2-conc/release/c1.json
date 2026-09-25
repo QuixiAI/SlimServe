@@ -1,0 +1,43 @@
+{
+  "aggregate_output_tps": 25.634852599543102,
+  "cache_metrics": {
+    "cached_prompt_tokens": null,
+    "external_prefix_hit_tokens": null,
+    "preemptions": null,
+    "prefill_computed_tokens": null,
+    "prefill_requests": null,
+    "prefix_hit_tokens": null,
+    "prefix_query_tokens": null,
+    "prompt_tokens": null
+  },
+  "chars_per_token": [
+    3.4925
+  ],
+  "completion_tokens": [
+    400
+  ],
+  "concurrency": 1,
+  "exact": true,
+  "model": "/Users/seangherardi/models/antirez-glm-5.3-flash-gguf/GLM-5.3-Flash-Q2.gguf",
+  "prompt_offset": 1,
+  "prompt_tokens": [
+    1000
+  ],
+  "request_latency_mean_seconds": 15.603334667161107,
+  "request_latency_median_seconds": 15.603334667161107,
+  "requested_input_tokens": 1000,
+  "requested_output_tokens": 400,
+  "response_sha256": [
+    "c6b99cdf91ac30a35592371ee693d38bbce51e99dd7b1eafd0e6f25a9d5a0486"
+  ],
+  "seed": 42,
+  "served_model_name": "GLM-5.3-Flash",
+  "spec_decode_accepted_tokens": 0.0,
+  "spec_decode_draft_tokens": 0.0,
+  "spec_decode_drafts": 0.0,
+  "temperature": 0.0,
+  "top_k": null,
+  "top_p": null,
+  "wall_seconds": 15.603756582830101,
+  "warmup_output_tokens": 1
+}

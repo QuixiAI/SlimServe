@@ -659,9 +659,11 @@ def files_for(plan: Plan) -> list[dict[str, Any]]:
         )
     spec = plan.speculator if plan.speculative else None
     if spec:
+        # A drafter inside the target checkpoint (model: target) has no files
+        # and no repo of its own.
         entries = [spec["file"]] if spec.get("file") else spec.get("files", [])
         spec_base = spec.get("base_url")
-        if not spec_base:
+        if entries and not spec_base:
             spec_base = (
                 f"https://huggingface.co/{spec['repo']}/resolve/"
                 f"{spec.get('revision', 'main')}"

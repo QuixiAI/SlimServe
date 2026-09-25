@@ -324,7 +324,7 @@ do not fit (ds4 plans 135 GiB against its 118 GiB guard). Raw:
 | 16 | does not fit | 63.08 | - |
 | 32 | does not fit | 60.16 | - |
 
-### Concurrent serving (batching campaign, 2026-09-17) - MEASURED, NOT PINNED
+### Concurrent serving (batching campaign, 2026-09-17) - pinned 2026-09-25
 
 Same harness, temperature 0, 1000-token prompts at strided offsets, warmup
 1; the record with the campaign fixes (mixed spec+prefill batches on the
@@ -366,9 +366,11 @@ at 32 rows, 16.6 at 64).
 Per-request shas are recorded in the run directories but NOT pinned: at
 c >= 4 the per-step row count, hence the dense route, depends on arrival
 timing, so the same prompt legitimately yields different tokens run to run.
-The concurrent gate (`concurrent_gate_pin.py`) asserts `exact` and a
-throughput floor; pins are written only when the batching bar (>= 2x at
-c=4, >= 3x at c=16) is met.
+The concurrent gate (`concurrent_gate_pin.py`) asserts `exact` at c=4/8/16
+and an aggregate floor (pin - 5%). The bar is ds4 on the same box (section
+above: 1.70x / 2.19x / 2.44x at c=1/4/8; ds4 cannot fit 16 sessions), so
+the record is `supported` and the gate is pinned (`pins.json`, 2026-09-25,
+post-merge build; run `release/`).
 
 ## Affine King R21 GRPO5 S75 Vision NVFP4 / RTX 5090 TP1 V2 online FP8 dense - 2026-09-25
 

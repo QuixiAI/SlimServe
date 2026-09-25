@@ -1,0 +1,22 @@
+READY ~159s
+== single-stream pins
+[14:09:42] 8tok
+8tok sha 7dd30ea193a6 prompt [1000] out [8] tps 1.81 wall 4.4s
+[14:09:56] off1-2000
+off1-2000 sha 393882a2ddaf prompt [1000] out [2000] tps 34.30 wall 58.3s
+[14:11:03] 2500x64
+2500x64 sha c097108f8fa5 prompt [2500] out [64] tps 5.17 wall 12.4s
+[14:11:31] GATES DONE
+== 400-out c=1
+[14:11:31] c1
+  c  rows  exact  agg tok/s  per-req  x c=1  wall s  sha
+  1     2   True      25.63    25.64  1.00x    15.6  c6b99cdf91ac
+[14:11:57] CONCURRENT GATES DONE
+== concurrent pin gate
+c= 4: exact=True agg 48.38 per-req 12.28
+c= 8: exact=True agg 57.29 per-req 7.22
+c=16: exact=True agg 63.11 per-req 4.00
+pins written to /Users/seangherardi/Code/slimserve/SlimServe-glm53f/perf/results/2026-09-15/glm53f-q2-conc/pins.json
+CONCURRENT GATE PASS
+port 8000 free after ~1s
+[14:22:10] ALL DONE
