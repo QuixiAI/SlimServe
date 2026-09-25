@@ -1,0 +1,2 @@
+prompt 64 tokens: ttft 0.89s, decode 39.89 tok/s over 599 tokens (301 chunks), total 15.9s, drafts 300 accept 1.000 tok/cycle 2.000
+prompt 64 tokens: ttft 0.89s, decode 39.85 tok/s over 599 tokens (301 chunks), total 15.9s, drafts 300 accept 1.000 tok/cycle 2.000

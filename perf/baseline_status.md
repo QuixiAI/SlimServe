@@ -306,6 +306,70 @@ regression point.**
   (after 1000 tokens) argmax agreement, ds4 token always in our top-8;
   needle recall PASS at 1.5k/4k/6.5k/12k. See HANDOFF 2026-09-11.
 
+### Concurrent serving vs ds4 on this box (2026-09-24)
+
+ds4 `6289c516` `ds4-server --batched-session 8 --mixed-prefill-quantum
+1024 --ctx 3008 --power 100`, same harness, 1000-token prompts, 1000
+output tokens (ds4 stops some requests at EOS despite ignore_eos, so its
+counts are inexact; tok/s is over the tokens it did produce). 16 sessions
+do not fit (ds4 plans 135 GiB against its 118 GiB guard). Raw:
+`perf/results/2026-09-24/ds4-batched/`, ours `fix4_long/`, `c4_1k_0924_long/`,
+`fix6_all_long/`, `c32_gemv_long/`.
+
+| concurrency | ds4 tok/s | glm53f-q2-1 tok/s | ratio |
+|---|---|---|---|
+| 1 | 16.15 | 27.45 | 1.70x |
+| 4 | 22.12 | 48.38 | 2.19x |
+| 8 | 23.80 | 58.16 | 2.44x |
+| 16 | does not fit | 63.08 | - |
+| 32 | does not fit | 60.16 | - |
+
+### Concurrent serving (batching campaign, 2026-09-17) - MEASURED, NOT PINNED
+
+Same harness, temperature 0, 1000-token prompts at strided offsets, warmup
+1; the record with the campaign fixes (mixed spec+prefill batches on the
+fused KDA kernels, q8_0 NR passes at 5..8 rows, the small-M MMA GEMM at
+9..32 rows behind `VLLM_QC_Q8_MMA=1` with 16 rows per simdgroup at 16..32
+rows, `VLLM_QC_MOE_MM_MIN_TOKENS=48`, the simdgroup-MMA sparse-MLA decode
+at >= 3 rows behind `VLLM_QC_MLA_SPARSE_MQA=6`, `VLLM_QC_KDA_SPEC_ROWS=2`,
+`max_num_seqs` 16, drafting on at every batch size). Raw:
+`perf/results/2026-09-15/glm53f-q2-conc/fix6_all/` (400 output tokens),
+`fix6_all_long/` (1000 output tokens); c=2/4 and the 1000-out c=1 from
+`fix4_moe_thresh/` and `fix4_long/` (the second-round levers only apply
+at >= 3 rows / >= 16 rows). Single-stream pins unchanged on the same
+build (`fix6_all/c1` sha c6b99cdf91ac = the fix-4 build; `gates_build5b/`:
+8tok 7dd30ea193a6, off1-2000 393882a2ddaf 34.28 tok/s, 2500x64
+1d7d58486dc7; probe 39.89 tok/s at 2.000 tok/cycle).
+
+| concurrency | 400-out aggregate tok/s | x c=1 | 1000-out aggregate tok/s | x c=1 | 3000-out aggregate tok/s | x c=1 |
+|---|---|---|---|---|---|---|
+| 1 | 25.1-25.8 | 1.00 | 27.45 | 1.00 | 34.95 | 1.00 |
+| 2 | 32.6-33.2 | 1.29 | - | - | - | - |
+| 4 | 35.6-35.8 | 1.39 | - | - | - | - |
+| 8 | 41.7 (was 40.0) | 1.62 | 58.16 (was 51.66) | 2.12 | - | - |
+| 16 | 44.2 (was 42.9) | 1.71 | 61.98 (was 57.23); 63.08 at max_num_seqs 32 | 2.26-2.30 | 77.39 | 2.21 |
+| 32 | 43.9 | 1.71 | 60.16 (MoE GEMV at 64 rows), 60.59 (tile) | 2.19-2.21 | 72.91 | 2.09 |
+
+The harness submits every prompt at t=0 and prefills serialize at ~250
+tok/s, so the short-output windows carry a prefill ramp (24% of the c=32
+1000-out window); the 3000-out column is the closest to steady-state
+decode. The single stream also speeds up over a long generation (36.7
+tok/s decode-only at 3000 tokens), so the ratio at c=16 is 2.2-2.3x on
+every protocol and c=32 is below c=16 on every protocol (per-request
+latency 1030 s vs 617 s at 3000 output tokens).
+
+`max_num_seqs` is 32 (`c32_gemv/`, `c32_tile/`, 2026-09-17): the KV pool
+is unchanged (381,513 tokens), c=32 adds capacity but no aggregate over
+c=16 - past 32 rows the step cost is per-row (16.1 ms per generated token
+at 32 rows, 16.6 at 64).
+
+Per-request shas are recorded in the run directories but NOT pinned: at
+c >= 4 the per-step row count, hence the dense route, depends on arrival
+timing, so the same prompt legitimately yields different tokens run to run.
+The concurrent gate (`concurrent_gate_pin.py`) asserts `exact` and a
+throughput floor; pins are written only when the batching bar (>= 2x at
+c=4, >= 3x at c=16) is met.
+
 ## DSV4 Metal FP8 draft KV - 2026-09-10
 
 - Apple M5 Max / 128 GiB, registered `dsv4-xxs-1`, TP1, target

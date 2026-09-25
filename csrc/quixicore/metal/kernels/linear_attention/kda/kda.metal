@@ -501,7 +501,7 @@ instantiate_kda_recur(128, 8, "kda_recur_d128_r8")
 // draft position verification accepts. A null initial slot skips the request
 // (zero y rows). Per-timestep math is kda_recur's verbatim.
 // ---------------------------------------------------------------------------
-template <int DK>
+template <int DK, int R>
 kernel void kda_recur_spec(device const float *q            [[buffer(0)]],
                            device const float *k            [[buffer(1)]],
                            device const float *v            [[buffer(2)]],
@@ -519,13 +519,17 @@ kernel void kda_recur_spec(device const float *q            [[buffer(0)]],
                            device const int   *num_accepted [[buffer(14)]],
                            uint3 gid [[threadgroup_position_in_grid]],
                            uint  lane [[thread_index_in_simdgroup]]) {
+  // R value rows per simdgroup (2026-09-17: the batching campaign; q/k/decay
+  // loads and the per-token chain are shared across the rows, the state
+  // and checkpoint traffic per row is unchanged, every R is bit-identical).
   static_assert(DK == 64 || DK == 128, "kda_recur_spec supports Dk in {64, 128}");
+  static_assert(R == 1 || R == 2 || R == 4 || R == 8, "kda_recur_spec rows per simdgroup");
   constexpr int N_PER_T = DK / 32;
   const int req_idx = (int)gid.z / H;
   const int h = (int)gid.z % H;
-  const int dv_idx = (int)gid.x;
+  const int dv0 = (int)gid.x * R;
   const int dk0 = (int)lane * N_PER_T;
-  if (req_idx >= num_requests || dv_idx >= DV) { return; }
+  if (req_idx >= num_requests || dv0 >= DV) { return; }
 
   const int seq_start = cu_seqlens[req_idx];
   const int seq_len = cu_seqlens[req_idx + 1] - seq_start;
@@ -541,23 +545,29 @@ kernel void kda_recur_spec(device const float *q            [[buffer(0)]],
   if (init_slot <= 0) {
     if (lane == 0) {
       for (int t = 0; t < seq_len; ++t) {
-        y_[(long)t * H * DV + dv_idx] = 0.0f;
+        #pragma clang loop unroll(full)
+        for (int r = 0; r < R; ++r) {
+          y_[(long)t * H * DV + dv0 + r] = 0.0f;
+        }
       }
     }
     return;
   }
   device const float *init_ptr = state_pool + init_slot * (long)state_stride +
-      ((long)h * DV + dv_idx) * DK;
+      ((long)h * DV + dv0) * DK;
 
-  float state[N_PER_T];
+  float state[R][N_PER_T];
   #pragma clang loop unroll(full)
-  for (int i = 0; i < N_PER_T; ++i) {
-    state[i] = init_ptr[dk0 + i];
+  for (int r = 0; r < R; ++r) {
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < N_PER_T; ++i) {
+      state[r][i] = init_ptr[r * DK + dk0 + i];
+    }
   }
 
   device const float *q_ = q + (long)seq_start * H * DK + h * DK;
   device const float *k_ = k + (long)seq_start * H * DK + h * DK;
-  device const float *v_ = v + (long)seq_start * H * DV + h * DV;
+  device const float *v_ = v + (long)seq_start * H * DV + h * DV + dv0;
   device const float *d_ = decay + (long)seq_start * H * DK + h * DK;
   device const float *beta_ = beta + (long)seq_start * H;
 
@@ -566,35 +576,54 @@ kernel void kda_recur_spec(device const float *q            [[buffer(0)]],
     const FN kvec = ((device const FN*)(k_ + dk0))[0];
     const FN qvec = ((device const FN*)(q_ + dk0))[0];
     const FN dvec = ((device const FN*)(d_ + dk0))[0];
-    float kv_mem = 0.0f;
+    float kv_mem[R];
     #pragma clang loop unroll(full)
-    for (int i = 0; i < N_PER_T; ++i) {
-      state[i] *= dvec[i];
-      kv_mem += state[i] * kvec[i];
+    for (int r = 0; r < R; ++r) {
+      kv_mem[r] = 0.0f;
+      #pragma clang loop unroll(full)
+      for (int i = 0; i < N_PER_T; ++i) {
+        state[r][i] *= dvec[i];
+        kv_mem[r] += state[r][i] * kvec[i];
+      }
     }
-    kv_mem = metal::simd_sum(kv_mem);
-
-    const float delta = (v_[dv_idx] - kv_mem) * beta_[h];
-
-    float out = 0.0f;
     #pragma clang loop unroll(full)
-    for (int i = 0; i < N_PER_T; ++i) {
-      state[i] += kvec[i] * delta;
-      out += state[i] * qvec[i];
+    for (int r = 0; r < R; ++r) {
+      kv_mem[r] = metal::simd_sum(kv_mem[r]);
     }
-    out = metal::simd_sum(out);
+    const float b = beta_[h];
+    float out[R];
+    #pragma clang loop unroll(full)
+    for (int r = 0; r < R; ++r) {
+      const float delta = (v_[r] - kv_mem[r]) * b;
+      out[r] = 0.0f;
+      #pragma clang loop unroll(full)
+      for (int i = 0; i < N_PER_T; ++i) {
+        state[r][i] += kvec[i] * delta;
+        out[r] += state[r][i] * qvec[i];
+      }
+    }
+    #pragma clang loop unroll(full)
+    for (int r = 0; r < R; ++r) {
+      out[r] = metal::simd_sum(out[r]);
+    }
     if (lane == 0) {
-      y_[dv_idx] = out;
+      #pragma clang loop unroll(full)
+      for (int r = 0; r < R; ++r) {
+        y_[dv0 + r] = out[r];
+      }
     }
 
     if (t < table_stride) {
       const long ckpt_slot = slots[t];
       if (ckpt_slot > 0) {
         device float *ckpt = state_pool + ckpt_slot * (long)state_stride +
-            ((long)h * DV + dv_idx) * DK;
+            ((long)h * DV + dv0) * DK;
         #pragma clang loop unroll(full)
-        for (int i = 0; i < N_PER_T; ++i) {
-          ckpt[dk0 + i] = state[i];
+        for (int r = 0; r < R; ++r) {
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < N_PER_T; ++i) {
+            ckpt[r * DK + dk0 + i] = state[r][i];
+          }
         }
       }
     }
@@ -608,9 +637,9 @@ kernel void kda_recur_spec(device const float *q            [[buffer(0)]],
   }
 }
 
-#define instantiate_kda_recur_spec(DKVAL)                                        \
-  template [[host_name("kda_recur_spec_d" #DKVAL)]] [[kernel]] void              \
-  kda_recur_spec<DKVAL>(device const float *q [[buffer(0)]],                      \
+#define instantiate_kda_recur_spec(DKVAL, RVAL, NAME)                            \
+  template [[host_name(NAME)]] [[kernel]] void                                   \
+  kda_recur_spec<DKVAL, RVAL>(device const float *q [[buffer(0)]],                \
                    device const float *k [[buffer(1)]],                           \
                    device const float *v [[buffer(2)]],                           \
                    device const float *decay [[buffer(3)]],                       \
@@ -628,8 +657,11 @@ kernel void kda_recur_spec(device const float *q            [[buffer(0)]],
                    uint3 gid [[threadgroup_position_in_grid]],                    \
                    uint lane [[thread_index_in_simdgroup]]);
 
-instantiate_kda_recur_spec(64)
-instantiate_kda_recur_spec(128)
+instantiate_kda_recur_spec(64, 1, "kda_recur_spec_d64")
+instantiate_kda_recur_spec(128, 1, "kda_recur_spec_d128")
+instantiate_kda_recur_spec(128, 2, "kda_recur_spec_d128_r2")
+instantiate_kda_recur_spec(128, 4, "kda_recur_spec_d128_r4")
+instantiate_kda_recur_spec(128, 8, "kda_recur_spec_d128_r8")
 
 // ---------------------------------------------------------------------------
 // rmsnorm(y) * weight * sigmoid(z): FusedRMSNormGated(activation="sigmoid").

@@ -1,0 +1,2 @@
+256 distinct             w13   3.82 ms  grp   4.70 ms  half2   3.47 ms (rel-err 8.4e-03)  tgh   4.00 ms  w2sum   1.64 ms
+random (180 distinct)    w13   3.81 ms  grp   4.03 ms  half2   3.46 ms (rel-err 3.7e-03)  tgh   3.99 ms  w2sum   1.64 ms

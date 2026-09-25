@@ -1,0 +1,71 @@
+{
+  "aggregate_output_tps": 22.458207753702684,
+  "cache_metrics": {
+    "cached_prompt_tokens": null,
+    "external_prefix_hit_tokens": null,
+    "preemptions": null,
+    "prefill_computed_tokens": null,
+    "prefill_requests": null,
+    "prefix_hit_tokens": null,
+    "prefix_query_tokens": null,
+    "prompt_tokens": null
+  },
+  "chars_per_token": [
+    3.8275,
+    2.22,
+    1.995,
+    3.08,
+    2.5625,
+    1.0,
+    2.3675,
+    1.8
+  ],
+  "completion_tokens": [
+    400,
+    400,
+    400,
+    400,
+    400,
+    400,
+    400,
+    400
+  ],
+  "concurrency": 8,
+  "exact": true,
+  "model": "/Users/seangherardi/models/antirez-glm-5.3-flash-gguf/GLM-5.3-Flash-Q2.gguf",
+  "prompt_offset": 1,
+  "prompt_tokens": [
+    1000,
+    1000,
+    1000,
+    1000,
+    1000,
+    1000,
+    1000,
+    1000
+  ],
+  "request_latency_mean_seconds": 135.1623092655791,
+  "request_latency_median_seconds": 133.99078231211752,
+  "requested_input_tokens": 1000,
+  "requested_output_tokens": 400,
+  "response_sha256": [
+    "462ddf5ec08da4d33d376f3c19d3a3c5b346b8cd01b38a02d18366c429b55539",
+    "bfac981cb2cf89347ccbb13b6cf9d119a329fcd40a17dd7f9ef5d98d9d068e0a",
+    "bf23b926913ca910193abb39945b3f2b4ac8bd326d2aba8283798ba4a9105ed7",
+    "91bfdf35c5cda7242186fe097c3c531f878dcda35675645a9e68fc4180450894",
+    "e88a576a227412b1cc829efeef9cea1db1410efa32f7ef45490669bb32168de0",
+    "fa430191ab86b0d4e9146c3d0b08facd096cf5ce52622f1ef481ed7699e1802e",
+    "25d2db61a9ce8e894f81af1ca7fbce1c3e374688cde58d46c6be793fe721bc90",
+    "3cbbb65eb38b941898367c2e620b5c5a7ccb9e117d0dab6125f7e6f737f15a7e"
+  ],
+  "seed": 42,
+  "served_model_name": "GLM-5.3-Flash",
+  "spec_decode_accepted_tokens": 0.0,
+  "spec_decode_draft_tokens": 0.0,
+  "spec_decode_drafts": 0.0,
+  "temperature": 0.0,
+  "top_k": null,
+  "top_p": null,
+  "wall_seconds": 142.48688208311796,
+  "warmup_output_tokens": 1
+}

@@ -1,0 +1,21 @@
+== kda_v Q8_0 N=8192 K=4096 M=16 (35.7 MB x30)
+  variant  2:   368.3 us    97 GB/s     91 Gw/s
+  variant  8:   346.9 us   103 GB/s     97 Gw/s
+  variant  9:   310.0 us   115 GB/s    108 Gw/s
+  variant 10:   416.9 us    86 GB/s     80 Gw/s
+  f16probe   :   252.0 us    133 Gw/s  (no dequant; 2 B/weight, SLC-resident)
+== attn_output Q8_0 N=4096 K=16384 M=16 (71.3 MB x15)
+  variant  2:  1245.6 us    57 GB/s     54 Gw/s
+  variant  8:   791.8 us    90 GB/s     85 Gw/s
+  variant  9:   588.4 us   121 GB/s    114 Gw/s
+  variant 10:   853.2 us    84 GB/s     79 Gw/s
+  f16probe   :   776.2 us     86 Gw/s  (no dequant; 2 B/weight, SLC-resident)
+== kda q|k Q4_K N=16384 K=4096 M=16 (37.7 MB x28)
+  variant  2:   802.5 us    47 GB/s     84 Gw/s
+  variant  8:   652.4 us    58 GB/s    103 Gw/s
+  variant  9:   603.5 us    63 GB/s    111 Gw/s
+  variant 10:   805.1 us    47 GB/s     83 Gw/s
+  variant 11:   702.1 us    54 GB/s     96 Gw/s
+  variant 12:   546.1 us    69 GB/s    123 Gw/s
+  variant 13:   554.7 us    68 GB/s    121 Gw/s
+  f16probe   :   485.2 us    138 Gw/s  (no dequant; 2 B/weight, SLC-resident)

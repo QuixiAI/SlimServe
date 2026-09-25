@@ -1,0 +1,4 @@
+256 distinct             w13   3.81 ms  w13-grp   4.69 ms (bit-identical=False)  w2sum   1.64 ms
+random (180 distinct)    w13   3.81 ms  w13-grp   4.03 ms (bit-identical=False)  w2sum   1.64 ms
+32 distinct              w13   3.81 ms  w13-grp   3.05 ms (bit-identical=False)  w2sum   1.62 ms
+8 distinct               w13   3.76 ms  w13-grp   3.04 ms (bit-identical=False)  w2sum   1.61 ms

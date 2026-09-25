@@ -48,6 +48,27 @@ def _moe_vec_row_limit(default: int, env: str, cuda_default: int = 64) -> int:
     return default
 
 
+_MOE_GROUP: tuple[int, int] | None = None
+
+
+def _moe_group_nb(slots: int) -> int:
+    """Expert-grouped slot pairing for the Metal iq2_xxs w13 GEMV
+    (2026-09-17): VLLM_QC_MOE_GROUP_NB=2 pairs co-routed slots per expert
+    (bit-identical per slot) from VLLM_QC_MOE_GROUP_MIN_SLOTS slots up
+    (default 64: below that there is nothing to share and the pairing
+    dispatch is pure cost)."""
+    global _MOE_GROUP
+    if _MOE_GROUP is None:
+        try:
+            nb = int(os.environ.get("VLLM_QC_MOE_GROUP_NB", "0") or 0)
+            min_slots = int(os.environ.get("VLLM_QC_MOE_GROUP_MIN_SLOTS", "64") or 64)
+        except ValueError:
+            nb, min_slots = 0, 64
+        _MOE_GROUP = (nb, min_slots)
+    nb, min_slots = _MOE_GROUP
+    return nb if slots >= min_slots else 0
+
+
 def _qc_mm_min_tokens() -> int:
     """Token threshold where the Metal tiled MoE GEMM replaces the GEMV for
     w13 (llama.cpp's exact GEMV/GEMM crossover: n_tokens >= 32). The decode
@@ -891,6 +912,7 @@ def _fused_moe_gguf(
                     N,
                     num_tokens,
                     clamp_limit=swiglu_limit,
+                    group_nb=_moe_group_nb(num_tokens * top_k),
                 )
         elif w1_vec:
             out = ops.ggml_moe_a8_vec(

@@ -1,0 +1,12 @@
+launched pid 22171 sid-detached; log perf/results/2026-09-15/glm53f-q2-conc/fix5_mla_mma/boot.log
+READY ~192s
+[18:28:32] c1
+[18:28:57] c8
+[18:30:53] c16
+  c  rows  exact  agg tok/s  per-req  x c=1  wall s  sha
+  1     2   True      25.77    25.77  1.00x    15.5  c6b99cdf91ac
+  8    16   True      40.88     5.25  1.59x    78.3  ecf630354937
+ 16    32   True      43.94     2.80  1.70x   145.7  ef2bd2e0a34d
+[18:34:31] CONCURRENT GATES DONE
+port 8000 free after ~1s
+[18:34:32] ALL DONE

@@ -781,8 +781,44 @@ def _conv_rows(layer):
     return c if is_conv_state_dim_first() else c.transpose(1, 2)
 
 
-@pytest.mark.parametrize("device", DEVICES)
-def test_layer_forward_native_mixed_spec_prefill(device):
+
+def _bind_fused(layer, P):
+    """Give the SimpleNamespace fake layer the class's real Metal fused-step
+    method, so the layer oracle exercises the fused kernels instead of the
+    torch reference. Returns the call log: True per spec-verify call
+    (slot_table passed), False per plain conv+recurrence call."""
+    from types import MethodType, SimpleNamespace
+
+    from vllm.model_executor.layers.mamba.gdn.kimi_gdn_linear_attn import (
+        KimiGatedDeltaNetAttention,
+    )
+
+    layer.o_norm = SimpleNamespace(
+        forward_native=layer.o_norm.forward_native,
+        weight=P["norm_w"].to(layer.A_log.device),
+        eps=P["eps"],
+    )
+    real = MethodType(KimiGatedDeltaNetAttention._kda_metal_fused_step, layer)
+    calls: list[bool] = []
+
+    def counted(_self, *args, **kwargs):
+        calls.append(kwargs.get("slot_table") is not None)
+        return real(*args, **kwargs)
+
+    layer._kda_metal_fused_step = MethodType(counted, layer)
+    return calls
+
+
+def _fused_kernels_available() -> bool:
+    if "mps" not in DEVICES:
+        return False
+    from vllm.quixicore.ops import quixicore_ops
+
+    return quixicore_ops.has("kda_step") and quixicore_ops.has_kernel(
+        "kda_recur_spec_d128"
+    )
+
+def _mixed_spec_prefill_case(device, fused):
     """Spec rows (verify with rollback) + prefill rows (incl. a length-1
     decode reclassified as prefill) in one batch, tokens interleaved, two
     padded rows, through the layer's native body."""
@@ -791,8 +827,17 @@ def test_layer_forward_native_mixed_spec_prefill(device):
     )
     from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
-    H, D, width, num_spec = 2, 8, WIDTH, 2
+    H, D, width, num_spec = 2, (128 if fused else 8), WIDTH, 2
+    act = torch.bfloat16 if fused else torch.float32
+    tol = 3e-2 if fused else 1e-4
     layer, P, conv_before, ssm_before = _fake_layer(device, H, D, width, num_spec, 12)
+    calls = None
+    if fused:
+        # Production shape: bf16 activations and conv ring, fp32 SSM state.
+        calls = _bind_fused(layer, P)
+        layer.kv_cache = (layer.kv_cache[0].to(act), layer.kv_cache[1])
+        conv_before = conv_before.to(act)
+    cbf = conv_before.float()
     dim = 3 * H * D
     # Batch token order: spec0 (3) | prefill A (5) | spec1 (2) | prefill B (1)
     spec_tok = [0, 1, 2, 8, 9]
@@ -800,11 +845,11 @@ def test_layer_forward_native_mixed_spec_prefill(device):
     T = 11
     pad = 2
     torch.manual_seed(201)
-    mixed = torch.randn(T + pad, dim).to(device)
-    g1 = torch.randn(1, T + pad, H, D).to(device)
-    beta = torch.randn(1, T + pad, H).to(device)
-    g2 = torch.randn(T + pad, H, D).to(device)
-    core = torch.full((1, T + pad, H, D), float("nan"), device=device)
+    mixed = torch.randn(T + pad, dim).to(device=device, dtype=act)
+    g1 = torch.randn(1, T + pad, H, D).to(device=device, dtype=act)
+    beta = torch.randn(1, T + pad, H).to(device=device, dtype=act)
+    g2 = torch.randn(T + pad, H, D).to(device=device, dtype=act)
+    core = torch.full((1, T + pad, H, D), float("nan"), device=device, dtype=act)
 
     spec_rows = [[1, 2, 3], [4, 5, 6]]
     spec_acc = [2, 1]
@@ -838,9 +883,14 @@ def test_layer_forward_native_mixed_spec_prefill(device):
         layer, mixed, g1, g2, beta, core, {layer.prefix: m}
     )
     assert torch.isfinite(core).all()
-    assert torch.equal(core[0, T:].cpu(), torch.zeros(pad, H, D))
+    assert torch.equal(core[0, T:].cpu(), torch.zeros(pad, H, D, dtype=act))
+    if fused:
+        # Both fused kernels ran, once each, on their own row subsets.
+        assert sorted(calls) == [False, True], calls
 
-    mixed_c, g1_c, beta_c, g2_c = (t.cpu() for t in (mixed, g1[0], beta[0], g2))
+    mixed_c, g1_c, beta_c, g2_c = (
+        t.cpu().float() for t in (mixed, g1[0], beta[0], g2)
+    )
     conv_after = _conv_rows(layer).cpu()
     ssm_after = layer.kv_cache[1].cpu()
     # Spec rows: window at offset acc-1, resume from rows[acc-1].
@@ -848,20 +898,25 @@ def test_layer_forward_native_mixed_spec_prefill(device):
     for i, toks in spec_segments:
         off = spec_acc[i] - 1
         slot0 = spec_rows[i][0]
-        prev = conv_before[slot0][:, off : off + width - 1]
+        prev = cbf[slot0][:, off : off + width - 1]
         S0 = ssm_before[spec_rows[i][off]].double()
         ref = _ref_row(mixed_c[toks], prev, S0, g1_c[toks], beta_c[toks], g2_c[toks], P)
         torch.testing.assert_close(
-            core[0, toks].cpu().double(), ref, rtol=1e-4, atol=1e-4
+            core[0, toks].cpu().double(), ref, rtol=tol, atol=tol
         )
         # conv row rewritten from col 0: [window[1:], x...]
         new_cols = torch.cat([prev[:, 1:], mixed_c[toks].T], 1)
-        assert torch.allclose(conv_after[slot0][:, : new_cols.shape[1]], new_cols)
+        assert torch.allclose(
+            conv_after[slot0][:, : new_cols.shape[1]].float(),
+            new_cols,
+            atol=tol,
+            rtol=tol,
+        )
     # Non-spec rows: prefill A (5 tokens, has init), B (1 token, no init).
     for i, toks in ((0, [3, 4, 5, 6, 7]), (1, [10])):
         slot = ns_slots[i]
         prev = (
-            conv_before[slot][:, : width - 1]
+            cbf[slot][:, : width - 1]
             if ns_has_init[i]
             else torch.zeros(dim, width - 1)
         )
@@ -872,11 +927,13 @@ def test_layer_forward_native_mixed_spec_prefill(device):
         )
         ref = _ref_row(mixed_c[toks], prev, S0, g1_c[toks], beta_c[toks], g2_c[toks], P)
         torch.testing.assert_close(
-            core[0, toks].cpu().double(), ref, rtol=1e-4, atol=1e-4
+            core[0, toks].cpu().double(), ref, rtol=tol, atol=tol
         )
         assert torch.allclose(
-            conv_after[slot][:, : width - 1],
+            conv_after[slot][:, : width - 1].float(),
             torch.cat([prev, mixed_c[toks].T], 1)[:, -(width - 1) :],
+            atol=tol,
+            rtol=tol,
         )
     # Untouched slots (null block, 9..11) are byte-identical.
     for s in (0, 9, 10, 11):
@@ -885,22 +942,44 @@ def test_layer_forward_native_mixed_spec_prefill(device):
 
 
 @pytest.mark.parametrize("device", DEVICES)
-def test_layer_forward_native_pure_decode(device):
+def test_layer_forward_native_mixed_spec_prefill(device):
+    _mixed_spec_prefill_case(device, fused=False)
+
+
+@pytest.mark.skipif(
+    not _fused_kernels_available(), reason="requires the Metal KDA kernels"
+)
+def test_layer_forward_native_mixed_spec_prefill_fused():
+    """The mixed batch through BOTH fused kernels (spec verify over the spec
+    rows, conv+recurrence over the prefill rows), scattered by token index -
+    the route that replaced the all-torch fallback for mixed batches."""
+    _mixed_spec_prefill_case("mps", fused=True)
+
+
+
+def _pure_decode_case(device, fused):
     from vllm.model_executor.layers.mamba.gdn.kimi_gdn_linear_attn import (
         KimiGatedDeltaNetAttention,
     )
     from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
-    H, D, width = 3, 8, WIDTH
+    H, D, width = 3, (128 if fused else 8), WIDTH
+    act = torch.bfloat16 if fused else torch.float32
+    tol = 3e-2 if fused else 1e-4
     layer, P, conv_before, ssm_before = _fake_layer(device, H, D, width, 0, 6)
+    calls = None
+    if fused:
+        calls = _bind_fused(layer, P)
+        layer.kv_cache = (layer.kv_cache[0].to(act), layer.kv_cache[1])
+        conv_before = conv_before.to(act)
     dim = 3 * H * D
     B = 3
     torch.manual_seed(202)
-    mixed = torch.randn(B, dim).to(device)
-    g1 = torch.randn(1, B, H, D).to(device)
-    beta = torch.randn(1, B, H).to(device)
-    g2 = torch.randn(B, H, D).to(device)
-    core = torch.full((1, B, H, D), float("nan"), device=device)
+    mixed = torch.randn(B, dim).to(device=device, dtype=act)
+    g1 = torch.randn(1, B, H, D).to(device=device, dtype=act)
+    beta = torch.randn(1, B, H).to(device=device, dtype=act)
+    g2 = torch.randn(B, H, D).to(device=device, dtype=act)
+    core = torch.full((1, B, H, D), float("nan"), device=device, dtype=act)
     slots = [2, 0, 5]  # middle row is a NULL/padded row
     m = GDNAttentionMetadata(
         num_prefills=0,
@@ -919,16 +998,20 @@ def test_layer_forward_native_pure_decode(device):
         layer, mixed, g1, g2, beta, core, {layer.prefix: m}
     )
     assert torch.isfinite(core).all()
-    mixed_c, g1_c, beta_c, g2_c = (t.cpu() for t in (mixed, g1[0], beta[0], g2))
+    if fused:
+        assert calls == [False], calls
+    mixed_c, g1_c, beta_c, g2_c = (
+        t.cpu().float() for t in (mixed, g1[0], beta[0], g2)
+    )
     for b, slot in enumerate(slots):
         if slot <= 0:
             # Null row: the recurrence output is zero, so only the norm's
             # rmsnorm(0) * sigmoid(g2) == 0 remains.
-            assert torch.equal(core[0, b].cpu(), torch.zeros(H, D))
+            assert torch.equal(core[0, b].cpu(), torch.zeros(H, D, dtype=act))
             continue
         ref = _ref_row(
             mixed_c[b : b + 1],
-            conv_before[slot][:, : width - 1],
+            conv_before[slot][:, : width - 1].float(),
             ssm_before[slot].double(),
             g1_c[b : b + 1],
             beta_c[b : b + 1],
@@ -936,7 +1019,20 @@ def test_layer_forward_native_pure_decode(device):
             P,
         )
         torch.testing.assert_close(
-            core[0, b : b + 1].cpu().double(), ref, rtol=1e-4, atol=1e-4
+            core[0, b : b + 1].cpu().double(), ref, rtol=tol, atol=tol
         )
     assert torch.equal(layer.kv_cache[1][0].cpu(), ssm_before[0])
     assert torch.equal(_conv_rows(layer)[0].cpu(), conv_before[0])
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_layer_forward_native_pure_decode(device):
+    _pure_decode_case(device, fused=False)
+
+
+@pytest.mark.skipif(
+    not _fused_kernels_available(), reason="requires the Metal KDA kernels"
+)
+def test_layer_forward_native_pure_decode_fused():
+    _pure_decode_case("mps", fused=True)
+

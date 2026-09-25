@@ -3598,6 +3598,51 @@ std::vector<at::Tensor> ggml_mul_mat_vec_a8_dual(
   return {d0, d1};
 }
 
+// Small-M MMA GEMM for the 9..32-row dense band (q8_0 / q4_K x bf16, row-major
+// in and out; see qgemm_mma.metal). `out` may be a unit-column-stride
+// [M, total] column slice (the KDA in_proj shards), written in place.
+at::Tensor ggml_mul_mat_mma(const at::Tensor& w, const at::Tensor& x,
+                            int64_t quant_type, int64_t row,
+                            const std::optional<at::Tensor>& out_opt,
+                            int64_t variant) {
+  check_mps(w, "w");
+  check_mps(x, "x");
+  const int N = static_cast<int>(row);
+  const int K = static_cast<int>(x.size(-1));
+  const int M = static_cast<int>(x.size(0));
+  const std::string fmt = ggml_type_to_format(quant_type);
+  TORCH_CHECK(fmt == "q8_0" || fmt == "q4_K", "ggml_mul_mat_mma: q8_0 or q4_K only, got ", fmt);
+  TORCH_CHECK(x.dim() == 2 && x.scalar_type() == at::kBFloat16 && x.is_contiguous(),
+              "ggml_mul_mat_mma: x must be a contiguous (M, K) bf16 tensor");
+  TORCH_CHECK(M >= 1 && M <= tk::kQgemmMmaMaxM, "ggml_mul_mat_mma: M must be 1..32, got ", M);
+  const int kblk = fmt == "q4_K" ? 256 : 32;
+  TORCH_CHECK(K % kblk == 0 && N % 32 == 0, "ggml_mul_mat_mma: needs K % ", kblk,
+              " == 0 and N % 32 == 0, got K=", K, " N=", N);
+  at::Tensor out;
+  int ldd = -1;
+  if (out_opt.has_value()) {
+    out = out_opt.value();
+    check_mps_strided(out, "out");
+    TORCH_CHECK(out.dim() == 2 && out.size(0) == M && out.size(1) == N &&
+                    out.stride(1) == 1 && out.scalar_type() == x.scalar_type(),
+                "ggml_mul_mat_mma: out must be [M, N] bf16 with unit column stride");
+    ldd = static_cast<int>(out.stride(0));
+  } else {
+    out = ring_out("gemm_mma_out", {M, N}, x.options());
+  }
+  int v = static_cast<int>(variant);
+  if (v <= 0) v = tk::qgemm_mma_auto_variant(fmt, M, N, K);
+  if (!tk::qgemm_mma_variant_ok(v, N, K)) v = 1;   // (8, 32) needs only N%32, K%32
+  const int ks = tk::qgemm_mma_k_slices(N, K, v);
+  auto partials = ring_out("gemm_mma_partials", {ks, M, N},
+                           x.options().dtype(at::kFloat));
+  encode("qc_gemm_mma", [&](TorchEncoder& e) {
+    tk::launch_qgemm_mma(e, partials, w, x, N, K, M, ks, fmt, v);
+    tk::launch_qgemm_mma_reduce(e, out, partials, N, M, ks, ldd);
+  });
+  return out;
+}
+
 at::Tensor ggml_mul_mat_vec_a8(const at::Tensor& w, const at::Tensor& x,
                                int64_t quant_type, int64_t row,
                                const std::optional<at::Tensor>& out_opt) {
@@ -3647,6 +3692,27 @@ at::Tensor ggml_mul_mat_vec_a8(const at::Tensor& w, const at::Tensor& x,
               "torch copy on this route (", fmt, ", batch ", batch,
               "), which is not allowed inside a concurrent region");
 
+  // q8_0 at 2..kQ8NrMbMaxM rows (VLLM_QC_Q8_NR=1): the NR mb walk, direct
+  // for an instantiated width, else decomposed into instantiated parts in
+  // one encoder (tk::launch_qgemv_q8_0_nr_mb_parts). Per-row numerics are
+  // the batch-1 NR kernel's for every width, so the route is bit-identical
+  // across splits. Row views bind by storage offset; a strided final_out
+  // keeps its row stride through narrow().
+  if (tk::q8_0_nr_mb_eligible(fmt, N, K, batch, type_name)) {
+    auto input = x.contiguous();
+    encode("qc_mmvq_q8_nr_mb", [&](TorchEncoder& e) {
+      if (tk::q8_0_nr_mb_direct(batch)) {
+        tk::launch_qgemv_q8_0_nr_mb(e, out, w, input, N, K, batch, type_name,
+                                    ldd);
+      } else {
+        tk::launch_qgemv_q8_0_nr_mb_parts(e, out, w, input, N, K, batch,
+                                          type_name, ldd);
+      }
+    });
+    if (final_out.defined() && !final_out.is_same(out)) final_out.copy_(out);
+    return final_out.defined() ? final_out : out;
+  }
+
   // Verify/decode widths 2..8: one weight-stationary launch that reads each
   // weight block once for all rows. Formats limited to the instantiated mb
   // set; per-row results are bit-identical to the looped batch-1 kernels.
@@ -3659,20 +3725,9 @@ at::Tensor ggml_mul_mat_vec_a8(const at::Tensor& w, const at::Tensor& x,
       !(K <= 512 && fmt == "q8_0" && type_name == "float16");
   if (mb_ok) {
     auto input = x.contiguous();
-    // q8_0 verify widths first: the llama.cpp-geometry multi-activation
-    // kernel (batch-1 NR numerics per row, ~2x the generic mb walk's
-    // bandwidth at the GLM-5.3-Flash shapes); falls through when the
-    // batch-1 NR route is off for this shape.
-    if (tk::q8_0_nr_mb_eligible(fmt, N, K, batch, type_name)) {
-      encode("qc_mmvq_q8_nr_mb", [&](TorchEncoder& e) {
-        tk::launch_qgemv_q8_0_nr_mb(e, out, w, input, N, K, batch, type_name,
-                                    ldd);
-      });
-    } else {
-      encode("qc_mmvq_mb", [&](TorchEncoder& e) {
-        tk::launch_qgemv_mb(e, out, w, input, N, K, batch, fmt, type_name);
-      });
-    }
+    encode("qc_mmvq_mb", [&](TorchEncoder& e) {
+      tk::launch_qgemv_mb(e, out, w, input, N, K, batch, fmt, type_name);
+    });
     if (final_out.defined() && !final_out.is_same(out)) final_out.copy_(out);
     return final_out.defined() ? final_out : out;
   }
@@ -3937,7 +3992,8 @@ at::Tensor ggml_moe_a8_vec_swiglu(const at::Tensor& x, const at::Tensor& w,
                                   const at::Tensor& topk_ids_in, int64_t top_k,
                                   int64_t quant_type, int64_t row,
                                   int64_t tokens,
-                                  std::optional<double> clamp_limit, bool soa) {
+                                  std::optional<double> clamp_limit, bool soa,
+                                  int64_t group_nb) {
   check_mps(w, "w");
   check_mps(x, "x");
   check_mps(topk_ids_in, "topk_ids");
@@ -3965,8 +4021,25 @@ at::Tensor ggml_moe_a8_vec_swiglu(const at::Tensor& x, const at::Tensor& w,
   const float limit =
       clamp_limit.has_value() ? static_cast<float>(*clamp_limit) : 0.0f;
   TORCH_CHECK(!soa, "iq2_xxs gate|up weights are AoS-only (no SoA repack)");
-  // No expert-grouped twin: measured negative, 123 -> 230 ms/step (see
-  // optimization_status 2026-08-13, expert-grouped w13 entry).
+  // Expert-grouped two-slot path (2026-09-17; group_nb == 2, texm kernels
+  // only): pair co-routed slots per expert on device and decode each weight
+  // once per pair. Distinct from the 2026-08-13 owner-threadgroup design
+  // (123 -> 230 ms/step): parallelism stays at the item count and every
+  // slot's arithmetic is the per-slot kernel's, bit for bit.
+  const int S = num_tokens * topk;
+  const int num_experts = static_cast<int>(w.size(0));
+  if (group_nb == 2 && tk::moe_iq2_tex_prod() && S <= 1024 &&
+      num_experts <= 512) {
+    auto items = ring_out("moe_grp_items", {S, 3}, x.options().dtype(at::kInt));
+    auto nitems = ring_out("moe_grp_n", {1}, x.options().dtype(at::kInt));
+    encode("qc_moe_vec_mr_swiglu_grp", [&](TorchEncoder& e) {
+      tk::launch_moe_group_slots(e, topk_ids, items, nitems, S, num_experts);
+      tk::launch_qgemv_moe_mr_swiglu_grp(e, out, w, input, items, nitems, N, K,
+                                         S, topk, has_clamp, limit,
+                                         activation_type_name(input));
+    });
+    return out;
+  }
   encode("qc_moe_vec_mr_swiglu", [&](TorchEncoder& e) {
     tk::launch_qgemv_moe_mr_swiglu(e, out, w, input, topk_ids, N, K, num_tokens,
                                    topk, has_clamp, limit,
@@ -5282,7 +5355,7 @@ at::Tensor qc_tape_layer_forward(int64_t idx, const at::Tensor& x,
   // vec kernel, down vec kernel, weighted sum into empty_like(x).
   at::Tensor mo =
       ggml_moe_a8_vec_swiglu(h, L.w13_qw, topk_ids, L.top_k, L.w13_qt,
-                             L.w13_row, T, L.swiglu_limit, L.w13_soa);
+                             L.w13_row, T, L.swiglu_limit, L.w13_soa, 0);
   // Sum-folded down projection (mirrors the Python route in
   // gguf/fused_moe.py _metal_q2k_sum_rows_supported; the sum-folded op's
   // TORCH_CHECK above is the safety authority — change all three
@@ -6412,7 +6485,8 @@ at::Tensor mla_sparse_latent_decode(const at::Tensor& q,
                                     const at::Tensor& block_table,
                                     const at::Tensor& indices,
                                     double sm_scale, int64_t partitions,
-                                    const std::optional<at::Tensor>& tlen) {
+                                    const std::optional<at::Tensor>& tlen,
+                                    int64_t mqa_cfg) {
   check_mps(q, "q");
   check_mps_strided(kv_cache, "kv_cache");
   check_mps_strided(block_table, "block_table");
@@ -6441,12 +6515,20 @@ at::Tensor mla_sparse_latent_decode(const at::Tensor& q,
   const int width = static_cast<int>(indices.size(1));
   TORCH_CHECK(indices.stride(0) == width,
               "indices rows must be contiguous, got stride ", indices.stride(0));
+  // Head-grouped (MQA) partition kernel: cfg 1..4, requires H % (G*NSG)
+  // == 0; otherwise the per-head kernel. Both feed the same reduce.
+  int mqa_G = 0, mqa_NSG = 0;
+  const bool use_mqa = tk::mla_sparse_latent_mqa_cfg(static_cast<int>(mqa_cfg),
+                                                     mqa_G, mqa_NSG) &&
+                       H % (mqa_G * mqa_NSG) == 0;
   int P = static_cast<int>(partitions);
   if (P <= 0) {
     // ~1024 simdgroups keeps the M1 Ultra's 64 cores fed at batch 1
     // (R=1, H=64, W=2051: 0.55 ms torch, 0.22 ms at P=8, 0.17 ms at P=16,
     // flat from 16 to 64 partitions).
-    P = std::max(1, std::min(32, (1024 + R * H - 1) / (R * H)));
+    const int sg_per_part = use_mqa ? (H / (mqa_G * mqa_NSG)) * mqa_NSG * R
+                                    : R * H;
+    P = std::max(1, std::min(32, (1024 + sg_per_part - 1) / sg_per_part));
   }
   P = std::max(1, std::min(P, width));
   auto fopts = q.options().dtype(at::kFloat);
@@ -6465,12 +6547,24 @@ at::Tensor mla_sparse_latent_decode(const at::Tensor& q,
   }
   const at::Tensor& tlen_buf = has_tlen ? *tlen : indices;
   encode("qc_mla_sparse_latent_decode", [&](TorchEncoder& e) {
-    tk::launch_mla_sparse_latent_partition(
-        e, q, kv_cache, block_table, indices, part_acc, part_ml, R, H, latent,
-        block_size, static_cast<int>(block_stride64),
-        static_cast<int>(block_table.stride(0)), static_cast<float>(sm_scale),
-        width, P, static_cast<int>(block_table.size(1)) - 1, tname, tlen_buf,
-        has_tlen ? 1 : 0);
+    if (use_mqa) {
+      tk::launch_mla_sparse_latent_mqa(
+          e, q, kv_cache, block_table, indices, part_acc, part_ml, R, H,
+          latent, block_size, static_cast<int>(block_stride64),
+          static_cast<int>(block_table.stride(0)),
+          static_cast<float>(sm_scale), width, P,
+          static_cast<int>(block_table.size(1)) - 1, tname, tlen_buf,
+          has_tlen ? 1 : 0, mqa_G, mqa_NSG,
+          tk::mla_sparse_latent_cfg_is_mma(static_cast<int>(mqa_cfg)));
+    } else {
+      tk::launch_mla_sparse_latent_partition(
+          e, q, kv_cache, block_table, indices, part_acc, part_ml, R, H,
+          latent, block_size, static_cast<int>(block_stride64),
+          static_cast<int>(block_table.stride(0)),
+          static_cast<float>(sm_scale), width, P,
+          static_cast<int>(block_table.size(1)) - 1, tname, tlen_buf,
+          has_tlen ? 1 : 0);
+    }
     tk::launch_mla_sparse_latent_reduce(e, part_acc, part_ml, out, R, H, latent,
                                         P, tname);
   });
@@ -7446,7 +7540,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("q"), pybind11::arg("kv_cache"),
         pybind11::arg("block_table"), pybind11::arg("indices"),
         pybind11::arg("sm_scale"), pybind11::arg("partitions") = 0,
-        pybind11::arg("tlen") = pybind11::none());
+        pybind11::arg("tlen") = pybind11::none(),
+        pybind11::arg("mqa_cfg") = 0);
   m.def("kda_recur_prefill", &kda_recur_prefill,
         "KDA prefill recurrence over prepared fp32 rows (q/k/decay [T, H*Dk], "
         "v [T, H*Dv], beta [T, H]) against the fp32 [slots, H, Dv, Dk] state "
@@ -7607,6 +7702,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "GGUF weight-only GEMV over raw quantized blocks", pybind11::arg("w"),
         pybind11::arg("x"), pybind11::arg("quant_type"), pybind11::arg("row"),
         pybind11::arg("out") = pybind11::none());
+  m.def("ggml_mul_mat_mma", &ggml_mul_mat_mma,
+        "Small-M MMA GEMM, q8_0 / q4_K x bf16 row-major (M <= 32)", pybind11::arg("w"),
+        pybind11::arg("x"), pybind11::arg("quant_type"), pybind11::arg("row"),
+        pybind11::arg("out") = pybind11::none(),
+        pybind11::arg("variant") = 0);
   m.def("qc_concurrent_begin", &qc_concurrent_begin,
         "open a concurrent-dispatch encoder for the following quixicore ops");
   m.def("qc_concurrent_barrier", &qc_concurrent_barrier,
@@ -7651,7 +7751,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("top_k"), pybind11::arg("quant_type"),
         pybind11::arg("row"), pybind11::arg("tokens"),
         pybind11::arg("clamp_limit") = pybind11::none(),
-        pybind11::arg("soa") = false);
+        pybind11::arg("soa") = false, pybind11::arg("group_nb") = 0);
 
   m.def("ggml_moe_a8_vec_sum", &ggml_moe_a8_vec_sum,
         "q2_K MoE down GEMV with the weighted expert-slot sum folded into "

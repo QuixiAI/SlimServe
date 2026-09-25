@@ -236,6 +236,41 @@ _SM_QUANT_TYPES = (
 )
 
 
+_METAL_Q8_MMA: bool | None = None
+
+
+def _mma_route_ok(x: torch.Tensor, qweight: torch.Tensor, qweight_type: int) -> bool:
+    """Metal 9..32-row band for q8_0 / q4_K x bf16: the small-M MMA GEMM
+    (`qgemm_mma_q8_0`, opt-in per profile through VLLM_QC_Q8_MMA=1). Measured
+    DRAM-resident on the GLM-5.3-Flash Q2 shapes (2026-09-17,
+    perf/results/2026-09-15/glm53f-q2-conc/mma_check_v2.log): 1.6-2.3x the
+    SM GEMM at M=16, 1.1-2.3x at M=32. Below 9 rows the NR walk stays (it is
+    bit-identical to batch-1 decode; this kernel is not)."""
+    global _METAL_Q8_MMA
+    if _METAL_Q8_MMA is None:
+        _METAL_Q8_MMA = False
+        if current_platform.is_metal() and os.environ.get("VLLM_QC_Q8_MMA") == "1":
+            try:
+                from vllm.quixicore import quixicore_ops
+
+                _METAL_Q8_MMA = quixicore_ops.is_available() and quixicore_ops.has(
+                    "ggml_mul_mat_mma"
+                )
+            except Exception:
+                _METAL_Q8_MMA = False
+    if not _METAL_Q8_MMA:
+        return False
+    if x.dtype != torch.bfloat16 or not (9 <= x.shape[0] <= 32):
+        return False
+    if qweight_type == WeightType.Q8_0:
+        kblk = 32
+    elif qweight_type == WeightType.Q4_K:
+        kblk = 256
+    else:
+        return False
+    return x.shape[1] % kblk == 0 and qweight.shape[0] % 32 == 0
+
+
 def _sm_route_ok(x: torch.Tensor, qweight: torch.Tensor, qweight_type: int) -> bool:
     """Metal speculative-verify band: the weight-streaming MMA GEMM beats the
     multi-row GEMV from ~8 rows up (measured on muse shapes at M=17: 1.5x on
@@ -276,12 +311,18 @@ def _metal_shard_overlap() -> bool:
     return not quixicore_ops.concurrent_active()
 
 
+# Mirrors tk::kQ8NrMbMaxM (tk_launch.h): widest M the q8_0 NR walk serves.
+_Q8_NR_MB_MAX_M = 8
+
+
 def _metal_shard_region_ok(x: torch.Tensor, shards) -> bool:
     """Whether every shard GEMV writes its column slice in place, so the
     concurrent region (which admits no torch copy) can hold them. Mirrors
     ggml_mul_mat_vec_a8's strided-output rule: batch 1 binds rows by offset
     for any format; the q8_0 NR batch kernel (VLLM_QC_Q8_NR=1) takes an
-    output stride at M 2..4 (K > 512, K % 32 == 0, N even); the q4_K NR batch
+    output stride at M 2..8 (K > 512, K % 32 == 0, N even;
+    `q8_0_nr_mb_eligible`; 5..8 decomposed into {4, 3, 2}-row launches in
+    one encoder); the q4_K NR batch
     twin does at 2/4/8-row chunks of any M <= 8 (N % 4 == 0, K % 256 == 0,
     kill switches off); every other route computes into the ring and
     copies."""
@@ -299,7 +340,11 @@ def _metal_shard_region_ok(x: torch.Tensor, shards) -> bool:
         n = w.shape[0]
         if t == WeightType.Q8_0:
             if not (
-                q8_nr and 2 <= batch <= 4 and k > 512 and k % 32 == 0 and n % 2 == 0
+                q8_nr
+                and 2 <= batch <= _Q8_NR_MB_MAX_M
+                and k > 512
+                and k % 32 == 0
+                and n % 2 == 0
             ):
                 return False
         elif t == WeightType.Q4_K:
@@ -333,6 +378,18 @@ def _metal_hetero_direct_ok(x: torch.Tensor, shards) -> bool:
     return True
 
 
+def _metal_hetero_mma_ok(x: torch.Tensor, shards) -> bool:
+    """9..32 rows: every hetero shard (KDA in_proj q|k q4_K + v|f|g|beta q8_0)
+    can take the small-M MMA GEMM writing its column slice in place, so the
+    per-layer torch.cat of the per-shard fallback goes away. Same gate as
+    `_mma_route_ok`, applied to each shard."""
+    if not current_platform.is_metal() or x.dim() != 2:
+        return False
+    if not (9 <= x.shape[0] <= 32) or x.dtype != torch.bfloat16:
+        return False
+    return all(_mma_route_ok(x, w, t) for w, t in shards)
+
+
 def _fused_mul_mat_gguf(
     x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
 ) -> torch.Tensor:
@@ -349,7 +406,9 @@ def _fused_mul_mat_gguf(
         # Split views reach here (GLM-5.3-Flash KDA: f_a/g_a are slices of the
         # fused qkvgfab projection feeding f_b/g_b); one small copy per call.
         x = x.contiguous()
-    if _sm_route_ok(x, qweight, qweight_type):
+    if _mma_route_ok(x, qweight, qweight_type):
+        y = ops.ggml_mul_mat_mma(qweight, x, qweight_type, qweight.shape[0])
+    elif _sm_route_ok(x, qweight, qweight_type):
         y = ops.ggml_mul_mat_sm(qweight, x, qweight_type, qweight.shape[0])
     elif x.shape[0] <= mmvq_safe and qweight_type in MMVQ_QUANT_TYPES:
         y = ops.ggml_mul_mat_vec_a8(qweight, x, qweight_type, qweight.shape[0])
@@ -720,6 +779,32 @@ class GGUFLinearMethod(LinearMethodBase):
             # `_create_hetero_shard_weights` (doing it here would mutate a
             # parameter inside the traced graph -- see that method).
             shards = layer._gguf_hetero_shards
+            if getattr(layer, "qc_metal_fused_shards", False) and (
+                _metal_hetero_mma_ok(x, shards)
+            ):
+                # 9..32 rows (2026-09-17 batching campaign): both shards on
+                # the small-M MMA GEMM, each writing its column slice of one
+                # [T, N] output in place; no concurrent region (its split-K
+                # partials come from a ring, one call at a time).
+                logger.info_once(
+                    "quixicore(metal): hetero-quant shard MMA GEMMs write one "
+                    "output (no cat)"
+                )
+                total = sum(w.shape[0] for w, _ in shards)
+                out = torch.empty(
+                    (x.shape[0], total), dtype=x.dtype, device=x.device
+                )
+                xc = x if x.is_contiguous() else x.contiguous()
+                col = 0
+                for shard_weight, shard_type in shards:
+                    rows = shard_weight.shape[0]
+                    ops.ggml_mul_mat_mma(
+                        shard_weight, xc, shard_type, rows, out=out[:, col : col + rows]
+                    )
+                    col += rows
+                if bias is not None:
+                    out.add_(bias)
+                return out
             if getattr(layer, "qc_metal_fused_shards", False) and (
                 _metal_hetero_direct_ok(x, shards)
             ):

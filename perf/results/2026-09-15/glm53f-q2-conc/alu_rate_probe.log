@@ -1,0 +1,2 @@
+fp32 fma      1.04 ms    2.06 T scalar-FMA/s
+half2 fma     0.88 ms    4.89 T scalar-FMA/s

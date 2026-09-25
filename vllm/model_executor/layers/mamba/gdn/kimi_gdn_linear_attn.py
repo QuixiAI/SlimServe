@@ -17,6 +17,7 @@ from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig
 from vllm.distributed import divide, get_tensor_model_parallel_rank
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 from vllm.model_executor.model_loader.weight_utils import (
@@ -95,6 +96,27 @@ def _use_recurrent_kda_prefill() -> bool:
 
 
 _KDA_FUSED: bool | None = None
+
+
+logger = init_logger(__name__)
+_KDA_DEBUG = os.environ.get("VLLM_QC_KDA_DEBUG") == "1"
+_kda_branch_counts: dict[str, int] = {}
+
+
+def _kda_branch_log(tag: str, num_tokens: int, m) -> None:
+    """Campaign diagnostic (VLLM_QC_KDA_DEBUG=1): which KDA core branch each
+    layer call takes, with the batch composition. Logs the first 3 hits per
+    branch and every 1000th after."""
+    n = _kda_branch_counts.get(tag, 0) + 1
+    _kda_branch_counts[tag] = n
+    if n <= 3 or n % 1000 == 0:
+        logger.info(
+            "[kda-branch] %s n=%d T=%d spec=%s prefills=%s decodes=%s spec_dec=%s",
+            tag, n, num_tokens,
+            m.spec_sequence_masks is not None,
+            getattr(m, "num_prefills", None), getattr(m, "num_decodes", None),
+            getattr(m, "num_spec_decodes", None),
+        )
 
 
 _KDA_SPEC: bool | None = None
@@ -1061,20 +1083,15 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             mixed_qkv_spec = g1_spec = beta_spec = None
             mixed_qkv_ns, g1_ns, beta_ns = mixed_qkv, g1, beta
 
-        # ---------- spec-decode multi-query path ----------
-        if (
-            spec_sequence_masks is not None
-            and m.num_prefills == 0
-            and m.num_decodes == 0
-            and mixed_qkv.device.type == "mps"
+        fused_ok = (
+            mixed_qkv.device.type == "mps"
             and head_dim == 128
             and getattr(self, "_kda_metal_fused_step", None) is not None
-            and _kda_metal_spec_available()
-        ):
-            # Metal fused verify step (conv rewind + checkpointing delta rule
-            # + gated norm): every row is a spec row, so the kernel writes
-            # the o_norm'd result straight into the attention slab. Mixed
-            # spec/prefill batches stay on the torch path below.
+        )
+
+        def _spec_fused_cache():
+            """Spec-verify kernel inputs over the spec rows (cached on the
+            shared metadata object: every KDA layer reuses it)."""
             num_spec = m.num_spec_decodes
             cache = getattr(m, "_kda_spec_cache", None)
             if cache is None:
@@ -1097,81 +1114,12 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                     cu=cu.contiguous(),
                 )
                 m._kda_spec_cache = cache  # type: ignore[attr-defined]
-            g2_rows = g2.reshape(-1, num_heads * head_dim)[:num_actual_tokens]
-            out_rows = core_attn_out[0, :num_actual_tokens].view(
-                num_actual_tokens, num_heads * head_dim
-            )
-            if out_rows.is_contiguous():
-                self._kda_metal_fused_step(
-                    mixed_qkv, g1, beta, conv_state, recurrent_state, cache.cu,
-                    cache.conv_slots, g2_rows, out_rows,
-                    slot_table=cache.table, num_accepted=cache.num_accepted,
-                )
-            else:
-                fused = self._kda_metal_fused_step(
-                    mixed_qkv, g1, beta, conv_state, recurrent_state, cache.cu,
-                    cache.conv_slots, g2_rows,
-                    slot_table=cache.table, num_accepted=cache.num_accepted,
-                )
-                core_attn_out[0, :num_actual_tokens] = fused.view(
-                    num_actual_tokens, num_heads, head_dim
-                )
-            return
-        core_attn_out_spec = None
-        if spec_sequence_masks is not None:
-            spec_state_indices_tensor = m.spec_state_indices_tensor
-            spec_query_start_loc = m.spec_query_start_loc
-            num_accepted_tokens = m.num_accepted_tokens
-            assert spec_state_indices_tensor is not None
-            assert spec_query_start_loc is not None
-            assert num_accepted_tokens is not None
-            num_spec = m.num_spec_decodes
-            spec_rows = spec_state_indices_tensor[:num_spec]
-            spec_max_query_len = spec_state_indices_tensor.size(-1)
-            spec_cu_seqlens = spec_query_start_loc[: num_spec + 1]
-            conv_out_spec = kda_conv_spec_update_native(
-                mixed_qkv_spec,
-                conv_state,
-                conv_weights,
-                conv_bias,
-                "silu",
-                spec_rows[:, 0],
-                num_accepted_tokens,
-                spec_cu_seqlens,
-                spec_max_query_len,
-            )
-            q_spec, k_spec, v_spec = split_heads(conv_out_spec)
-            core_attn_out_spec = kda_recurrent_spec_native(
-                q_spec,
-                k_spec,
-                v_spec,
-                g1_spec,
-                beta_spec,
-                self.A_log,
-                self.dt_bias,
-                self.gate_lower_bound,
-                recurrent_state,
-                spec_rows,
-                num_accepted_tokens,
-                spec_cu_seqlens,
-                spec_max_query_len,
-            )
+            return cache
 
-        # ---------- non-spec path (prefill or plain decode) ----------
-        core_attn_out_non_spec = None
-        if (
-            mixed_qkv_ns is not None
-            and spec_sequence_masks is None
-            and mixed_qkv_ns.device.type == "mps"
-            and head_dim == 128
-            and getattr(self, "_kda_metal_fused_step", None) is not None
-            and _kda_metal_fused_available()
-        ):
-            # Metal fused step (conv + gate + per-channel delta rule + gated
-            # norm in one command buffer). Covers plain decode and varlen
-            # prefill; the pool is written in place. Output is already
-            # o_norm'd, so the trailing forward_native is skipped.
-            assert g1_ns is not None and beta_ns is not None
+        def _ns_fused_args() -> tuple[torch.Tensor, torch.Tensor]:
+            """(cu_seqlens, slot_mapping) for the fused step over the
+            non-spec rows; zeroes the pool rows of fresh prefills first."""
+            assert mixed_qkv_ns is not None
             non_spec_state_indices_tensor = m.non_spec_state_indices_tensor
             assert non_spec_state_indices_tensor is not None
             T_ns = mixed_qkv_ns.size(0)
@@ -1213,6 +1161,148 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 cu = cu.to(torch.int32)
             if slots.dtype != torch.int32:
                 slots = slots.to(torch.int32)
+            return cu, slots
+
+        # ---------- spec-decode multi-query path ----------
+        if (
+            spec_sequence_masks is not None
+            and m.num_prefills == 0
+            and m.num_decodes == 0
+            and fused_ok
+            and _kda_metal_spec_available()
+        ):
+            if _KDA_DEBUG:
+                _kda_branch_log("spec_fused", mixed_qkv.shape[0], m)
+            # Metal fused verify step (conv rewind + checkpointing delta rule
+            # + gated norm): every row is a spec row, so the kernel writes
+            # the o_norm'd result straight into the attention slab. Mixed
+            # spec/prefill batches stay on the torch path below.
+            cache = _spec_fused_cache()
+            g2_rows = g2.reshape(-1, num_heads * head_dim)[:num_actual_tokens]
+            out_rows = core_attn_out[0, :num_actual_tokens].view(
+                num_actual_tokens, num_heads * head_dim
+            )
+            if out_rows.is_contiguous():
+                self._kda_metal_fused_step(
+                    mixed_qkv, g1, beta, conv_state, recurrent_state, cache.cu,
+                    cache.conv_slots, g2_rows, out_rows,
+                    slot_table=cache.table, num_accepted=cache.num_accepted,
+                )
+            else:
+                fused = self._kda_metal_fused_step(
+                    mixed_qkv, g1, beta, conv_state, recurrent_state, cache.cu,
+                    cache.conv_slots, g2_rows,
+                    slot_table=cache.table, num_accepted=cache.num_accepted,
+                )
+                core_attn_out[0, :num_actual_tokens] = fused.view(
+                    num_actual_tokens, num_heads, head_dim
+                )
+            return
+        # ---------- mixed spec + non-spec batch: both subsets fused ----------
+        if (
+            spec_sequence_masks is not None
+            and mixed_qkv_ns is not None
+            and fused_ok
+            and _kda_metal_spec_available()
+            and _kda_metal_fused_available()
+        ):
+            if _KDA_DEBUG:
+                _kda_branch_log("mixed_fused", mixed_qkv.shape[0], m)
+            # A request arriving while others decode makes every step of its
+            # prefill a mixed batch. Each subset takes its own fused kernel
+            # over its own rows (the verify step over the spec rows, the
+            # conv+recurrence step over the prefill/decode rows); both write
+            # o_norm'd rows, scattered back by token index, and their pool
+            # slots are disjoint sequences. Before this, a mixed batch sent
+            # BOTH subsets to the torch reference, whose prefill is a
+            # per-token loop: 34 layers x a 4288-token chunk per step, the
+            # whole concurrent-prefill collapse (2026-09-17).
+            assert g1_spec is not None and beta_spec is not None
+            assert g1_ns is not None and beta_ns is not None
+            cache = _spec_fused_cache()
+            cu, slots = _ns_fused_args()
+            g2_flat = g2.reshape(-1, num_heads * head_dim)[:num_actual_tokens]
+            out_spec = self._kda_metal_fused_step(
+                mixed_qkv_spec, g1_spec, beta_spec, conv_state, recurrent_state,
+                cache.cu, cache.conv_slots,
+                g2_flat.index_select(0, spec_token_indx),
+                slot_table=cache.table, num_accepted=cache.num_accepted,
+            )
+            out_ns = self._kda_metal_fused_step(
+                mixed_qkv_ns, g1_ns, beta_ns, conv_state, recurrent_state,
+                cu.contiguous(), slots.contiguous(),
+                g2_flat.index_select(0, non_spec_token_indx),
+            )
+            merged = torch.empty(
+                (num_actual_tokens, num_heads * head_dim),
+                dtype=core_attn_out.dtype,
+                device=core_attn_out.device,
+            )
+            merged.index_copy_(0, spec_token_indx, out_spec.to(merged.dtype))
+            merged.index_copy_(0, non_spec_token_indx, out_ns.to(merged.dtype))
+            core_attn_out[0, :num_actual_tokens] = merged.view(
+                num_actual_tokens, num_heads, head_dim
+            )
+            return
+        core_attn_out_spec = None
+        if spec_sequence_masks is not None:
+            spec_state_indices_tensor = m.spec_state_indices_tensor
+            spec_query_start_loc = m.spec_query_start_loc
+            num_accepted_tokens = m.num_accepted_tokens
+            assert spec_state_indices_tensor is not None
+            assert spec_query_start_loc is not None
+            assert num_accepted_tokens is not None
+            num_spec = m.num_spec_decodes
+            spec_rows = spec_state_indices_tensor[:num_spec]
+            spec_max_query_len = spec_state_indices_tensor.size(-1)
+            spec_cu_seqlens = spec_query_start_loc[: num_spec + 1]
+            conv_out_spec = kda_conv_spec_update_native(
+                mixed_qkv_spec,
+                conv_state,
+                conv_weights,
+                conv_bias,
+                "silu",
+                spec_rows[:, 0],
+                num_accepted_tokens,
+                spec_cu_seqlens,
+                spec_max_query_len,
+            )
+            q_spec, k_spec, v_spec = split_heads(conv_out_spec)
+            if _KDA_DEBUG:
+                _kda_branch_log("spec_torch", mixed_qkv.shape[0], m)
+            core_attn_out_spec = kda_recurrent_spec_native(
+                q_spec,
+                k_spec,
+                v_spec,
+                g1_spec,
+                beta_spec,
+                self.A_log,
+                self.dt_bias,
+                self.gate_lower_bound,
+                recurrent_state,
+                spec_rows,
+                num_accepted_tokens,
+                spec_cu_seqlens,
+                spec_max_query_len,
+            )
+
+        # ---------- non-spec path (prefill or plain decode) ----------
+        core_attn_out_non_spec = None
+        if (
+            mixed_qkv_ns is not None
+            and spec_sequence_masks is None
+            and fused_ok
+            and _kda_metal_fused_available()
+        ):
+            if _KDA_DEBUG:
+                _kda_branch_log("nonspec_fused", mixed_qkv.shape[0], m)
+            # Metal fused step (conv + gate + per-channel delta rule + gated
+            # norm in one command buffer). Covers plain decode and varlen
+            # prefill; the pool is written in place. Output is already
+            # o_norm'd, so the trailing forward_native is skipped.
+            assert g1_ns is not None and beta_ns is not None
+            T_ns = mixed_qkv_ns.size(0)
+            cu, slots = _ns_fused_args()
             g2_ns = g2.reshape(-1, num_heads * head_dim)[:num_actual_tokens]
             # The kernel writes the o_norm'd rows straight into the
             # attention output slab (no per-layer copy).
@@ -1256,6 +1346,8 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                     mixed_qkv_ns, conv_state, conv_weights, conv_bias, "silu", plan
                 )
                 q_ns, k_ns, v_ns = split_heads(conv_out_ns)
+                if _KDA_DEBUG:
+                    _kda_branch_log("nonspec_torch_prefill", mixed_qkv.shape[0], m)
                 core_attn_out_non_spec = kda_recurrent_prefill_native(
                     q_ns,
                     k_ns,
@@ -1280,6 +1372,8 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                     "silu",
                     decode_conv_indices,
                 )
+                if _KDA_DEBUG:
+                    _kda_branch_log("nonspec_torch_decode", mixed_qkv.shape[0], m)
                 core_attn_out_non_spec = kda_recurrent_decode_native(
                     conv_out_ns,
                     g1_ns,

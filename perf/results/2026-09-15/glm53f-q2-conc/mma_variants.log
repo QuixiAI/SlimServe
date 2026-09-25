@@ -1,0 +1,36 @@
+M= 8 kda_v q8       N=  8192 K= 4096 | v1   304.9us  117GB/s e0e+00 | v2   188.7us  189GB/s e3e-03 | v3   185.1us  193GB/s e0e+00 | v4   210.0us  170GB/s e3e-03
+M= 8 kda_out q8     N=  4096 K= 8192 | v1   237.3us  150GB/s e0e+00 | v2   215.1us  166GB/s e1e-03 | v3   227.2us  157GB/s e0e+00 | v4   186.7us  191GB/s e1e-03
+M= 8 attn_out q8    N=  4096 K=16384 | v1   490.7us  145GB/s e0e+00 | v2   308.0us  232GB/s e4e-04 | v3   302.8us  236GB/s e0e+00 | v4   339.8us  210GB/s e4e-04
+M= 8 attn_q_b q8    N= 16384 K= 1536 | v1   239.6us  112GB/s e0e+00 | v2   163.8us  163GB/s e1e-03 | v3   183.5us  146GB/s e0e+00 | v4   143.5us  186GB/s e1e-03
+M= 8 q_a|kv_a q8    N=  2112 K= 4096 | v1  1163.8us    8GB/s e0e+00 | v2   106.2us   87GB/s e0e+00 | v3    92.0us  100GB/s e0e+00 | v4   111.3us   83GB/s e0e+00
+M= 8 shexp g|u q8   N=  4096 K= 4096 | v1   161.3us  111GB/s e0e+00 | v2   147.2us  121GB/s e2e-03 | v3   129.0us  138GB/s e0e+00 | v4   167.8us  106GB/s e2e-03
+M= 8 shexp down q8  N=  4096 K= 2048 | v1    95.8us   93GB/s e0e+00 | v2    90.8us   98GB/s e1e-03 | v3    90.1us   99GB/s e0e+00 | v4   101.8us   88GB/s e1e-03
+M= 8 kda q|k q4K    N= 16384 K= 4096 | v1   603.3us   63GB/s e0e+00 | v2   390.9us   97GB/s e1e-03 | v3   350.1us  108GB/s e0e+00 | v4   454.3us   83GB/s e1e-03
+M= 8 lm_head q8     N=154880 K= 4096 | v1  1825.2us  369GB/s e0e+00 | v2  1900.6us  355GB/s e0e+00 | v3  1959.0us  344GB/s e0e+00 | v4  2442.1us  276GB/s e0e+00
+M=16 kda_v q8       N=  8192 K= 4096 | v1   323.5us  110GB/s e0e+00 | v2   266.8us  134GB/s e2e-03 | v3   339.7us  105GB/s e0e+00 | v4   270.1us  132GB/s e2e-03
+M=16 kda_out q8     N=  4096 K= 8192 | v1   311.6us  114GB/s e0e+00 | v2   246.3us  145GB/s e3e-04 | v3   249.8us  143GB/s e0e+00 | v4   276.8us  129GB/s e3e-04
+M=16 attn_out q8    N=  4096 K=16384 | v1   519.6us  137GB/s e0e+00 | v2   367.8us  194GB/s e2e-03 | v3   454.6us  157GB/s e0e+00 | v4   511.1us  140GB/s e2e-03
+M=16 attn_q_b q8    N= 16384 K= 1536 | v1   253.8us  105GB/s e0e+00 | v2   191.7us  139GB/s e6e-04 | v3   213.7us  125GB/s e0e+00 | v4   219.8us  122GB/s e6e-04
+M=16 q_a|kv_a q8    N=  2112 K= 4096 | v1   118.6us   77GB/s e0e+00 | v2   130.9us   70GB/s e0e+00 | v3   124.9us   74GB/s e0e+00 | v4   170.9us   54GB/s e0e+00
+M=16 shexp g|u q8   N=  4096 K= 4096 | v1   200.5us   89GB/s e0e+00 | v2   187.8us   95GB/s e4e-04 | v3   184.2us   97GB/s e0e+00 | v4   161.7us  110GB/s e4e-04
+M=16 shexp down q8  N=  4096 K= 2048 | v1   116.7us   76GB/s e0e+00 | v2   115.0us   78GB/s e6e-04 | v3   127.9us   70GB/s e0e+00 | v4   125.2us   71GB/s e6e-04
+M=16 kda q|k q4K    N= 16384 K= 4096 | v1   523.8us   72GB/s e0e+00 | v2   486.9us   78GB/s e3e-03 | v3   544.8us   69GB/s e0e+00 | v4   634.9us   59GB/s e3e-03
+M=16 lm_head q8     N=154880 K= 4096 | v1  2645.1us  255GB/s e0e+00 | v2  2519.9us  267GB/s e0e+00 | v3  2857.7us  236GB/s e0e+00 | v4  3527.9us  191GB/s e0e+00
+M=24 kda_v q8       N=  8192 K= 4096 | v1   316.5us  113GB/s e0e+00 | v2   247.9us  144GB/s e1e-03 | v3   390.7us   91GB/s e0e+00 | v4   329.7us  108GB/s e1e-03
+M=24 kda_out q8     N=  4096 K= 8192 | v1   438.7us   81GB/s e0e+00 | v2   255.6us  139GB/s e2e-03 | v3   396.4us   90GB/s e0e+00 | v4   327.0us  109GB/s e2e-03
+M=24 attn_out q8    N=  4096 K=16384 | v1   670.0us  106GB/s e0e+00 | v2   475.3us  150GB/s e8e-04 | v3   765.2us   93GB/s e0e+00 | v4   623.9us  114GB/s e8e-04
+M=24 attn_q_b q8    N= 16384 K= 1536 | v1   327.6us   82GB/s e0e+00 | v2   248.6us  108GB/s e2e-03 | v3   323.8us   83GB/s e0e+00 | v4   270.4us   99GB/s e2e-03
+M=24 q_a|kv_a q8    N=  2112 K= 4096 | v1   153.4us   60GB/s e0e+00 | v2   167.1us   55GB/s e0e+00 | v3   159.5us   58GB/s e0e+00 | v4   161.8us   57GB/s e0e+00
+M=24 shexp g|u q8   N=  4096 K= 4096 | v1   273.4us   65GB/s e0e+00 | v2   175.5us  102GB/s e1e-04 | v3   207.3us   86GB/s e0e+00 | v4   176.1us  101GB/s e1e-04
+M=24 shexp down q8  N=  4096 K= 2048 | v1   148.8us   60GB/s e0e+00 | v2   148.0us   60GB/s e3e-05 | v3   169.9us   52GB/s e0e+00 | v4   162.2us   55GB/s e3e-05
+M=24 kda q|k q4K    N= 16384 K= 4096 | v1   714.6us   53GB/s e0e+00 | v2   579.9us   65GB/s e3e-03 | v3   884.3us   43GB/s e0e+00 | v4   739.6us   51GB/s e3e-03
+M=24 lm_head q8     N=154880 K= 4096 | v1  3586.7us  188GB/s e0e+00 | v2  3236.2us  208GB/s e0e+00 | v3  5370.8us  125GB/s e0e+00 | v4  4368.1us  154GB/s e0e+00
+M=32 kda_v q8       N=  8192 K= 4096 | v1   540.4us   66GB/s e0e+00 | v2   352.3us  101GB/s e1e-03 | v3   475.8us   75GB/s e0e+00 | v4   393.9us   91GB/s e1e-03
+M=32 kda_out q8     N=  4096 K= 8192 | v1   475.3us   75GB/s e0e+00 | v2   300.8us  119GB/s e9e-04 | v3   477.8us   75GB/s e0e+00 | v4   389.1us   92GB/s e9e-04
+M=32 attn_out q8    N=  4096 K=16384 | v1   760.9us   94GB/s e0e+00 | v2   552.4us  129GB/s e3e-03 | v3   963.6us   74GB/s e0e+00 | v4   760.6us   94GB/s e3e-03
+M=32 attn_q_b q8    N= 16384 K= 1536 | v1   432.7us   62GB/s e0e+00 | v2   291.9us   92GB/s e2e-03 | v3   370.4us   72GB/s e0e+00 | v4   328.5us   81GB/s e2e-03
+M=32 q_a|kv_a q8    N=  2112 K= 4096 | v1   177.6us   52GB/s e0e+00 | v2   164.2us   56GB/s e0e+00 | v3   171.1us   54GB/s e0e+00 | v4   187.2us   49GB/s e0e+00
+M=32 shexp g|u q8   N=  4096 K= 4096 | v1   307.0us   58GB/s e0e+00 | v2   201.6us   88GB/s e7e-04 | v3   256.6us   69GB/s e0e+00 | v4   211.3us   84GB/s e7e-04
+M=32 shexp down q8  N=  4096 K= 2048 | v1   175.6us   51GB/s e0e+00 | v2   168.9us   53GB/s e2e-03 | v3   133.2us   67GB/s e0e+00 | v4   119.3us   75GB/s e2e-03
+M=32 kda q|k q4K    N= 16384 K= 4096 | v1   729.4us   52GB/s e0e+00 | v2   655.2us   58GB/s e3e-03 | v3  1066.4us   35GB/s e0e+00 | v4   882.0us   43GB/s e3e-03
+M=32 lm_head q8     N=154880 K= 4096 | v1  4557.8us  148GB/s e0e+00 | v2  3917.0us  172GB/s e0e+00 | v3  6525.9us  103GB/s e0e+00 | v4  5921.4us  114GB/s e0e+00

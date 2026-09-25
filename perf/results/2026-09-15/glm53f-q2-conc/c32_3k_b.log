@@ -1,0 +1,15 @@
+env VLLM_QC_MOE_MM_MIN_TOKENS = 96
+launched pid 32306 sid-detached; log /Users/seangherardi/Code/slimserve/SlimServe-glm53f/perf/results/2026-09-15/glm53f-q2-conc/c32_3k_b/boot.log
+READY ~189s
+== 400-out
+[22:36:38] c1
+  c  rows  exact  agg tok/s  per-req  x c=1  wall s  sha
+  1     2   True      25.71    25.71  1.00x    15.6  c6b99cdf91ac
+[22:37:03] CONCURRENT GATES DONE
+== 3000-out
+[22:37:03] c32
+  c  rows  exact  agg tok/s  per-req  x c=1  wall s  sha
+ 32    64   True      72.91     2.91  1.00x  1316.7  3f7ff2238a4f
+[23:01:17] CONCURRENT GATES DONE
+port 8000 free after ~1s
+[23:01:17] ALL DONE

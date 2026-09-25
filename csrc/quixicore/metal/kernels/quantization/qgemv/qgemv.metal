@@ -249,6 +249,12 @@ instantiate_qgemv_q8_0_nr_mb("qgemv_q8_0_nr_4x4_mb4", half, 4, 4, 4)
 instantiate_qgemv_q8_0_nr_mb("qgemv_q8_0_nr_2x4_mb2", half, 2, 4, 2)
 instantiate_qgemv_q8_0_nr_mb("qgemv_q8_0_nr_2x4_mb3", half, 2, 4, 3)
 instantiate_qgemv_q8_0_nr_mb("qgemv_q8_0_nr_2x4_mb4", half, 2, 4, 4)
+// Widths 8 and 16 were instantiated and measured 2026-09-17
+// (perf/results/2026-09-15/glm53f-q2-conc/dbench_m_wide.log): NB=8 runs
+// SLOWER than two NB=4 launches (kda_v 218 vs 160 us) and NB=16 spills
+// (831 us vs the SM GEMM's 308) - yl[NB][8] + sumf[NR][NB] outgrow the
+// register file. The walk stays at NB <= 4; wider M is decomposed into
+// {4, 3, 2}-row launches (tk::launch_qgemv_q8_0_nr_mb_parts).
 
 // Gate|up pair GEMV with the SwiGLU epilogue fused, q8_0 NR geometry: the
 // merged gate_up weight (rows [0, N/2) gate, [N/2, N) up) is walked by
@@ -2947,4 +2953,249 @@ instantiate_qgemv_format("qgemv_mxfp6_e3m2", mxfp6_e3m2);
 instantiate_qgemv_format("qgemv_mxfp6_e2m3", mxfp6_e2m3);
 instantiate_qgemv_format("qgemv_hqq", hqq);
 
+}
+
+// ---------------------------------------------------------------------------
+// Expert-grouped slot pairing for the routed-MoE decode GEMVs (2026-09-17,
+// batching campaign). At 32 rows x top-8 the 256 (token, expert) slots hit
+// ~180 distinct experts, and the per-slot GEMV's time tracks the SLOT count,
+// not the distinct-expert count (moe_sharing_bench.py: 4.73 ms for 256, 180,
+// 32 or 8 distinct experts) - it is bound by per-slot dequant/issue work,
+// not DRAM. This kernel counting-sorts the slots by expert (one
+// threadgroup, threadgroup-memory histogram) and emits items of up to two
+// slots of the SAME expert: items[i] = {expert, slot0, slot1 | -1}. Invalid
+// slots (expert < 0 or >= E) become single items with expert -1. The GEMV
+// twin below decodes every weight once per item and applies it to both
+// slots' activations from registers, so parallelism is the item count
+// (never a serialized owner threadgroup - the 2026-08-13 regression).
+// Pairing order within an expert follows atomic arrival and is not
+// deterministic; per-slot results do not depend on it.
+// ---------------------------------------------------------------------------
+kernel void moe_group_slots(
+    device const int *topk_ids [[buffer(0)]],   // (S)
+    device int *items          [[buffer(1)]],   // (S, 3)
+    device int *num_items      [[buffer(2)]],   // (1)
+    constant int &S            [[buffer(3)]],
+    constant int &E            [[buffer(4)]],   // <= 512
+    uint tid [[thread_index_in_threadgroup]],
+    uint nt  [[threads_per_threadgroup]]) {
+  threadgroup metal::atomic_int cnt[513];
+  threadgroup metal::atomic_int cur[513];
+  threadgroup int off[513];
+  threadgroup int ioff[513];
+  threadgroup int sorted[1024];
+  for (int b = int(tid); b <= E; b += int(nt)) {
+    metal::atomic_store_explicit(&cnt[b], 0, metal::memory_order_relaxed);
+    metal::atomic_store_explicit(&cur[b], 0, metal::memory_order_relaxed);
+  }
+  metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+  for (int s = int(tid); s < S; s += int(nt)) {
+    const int e = topk_ids[s];
+    const int b = (e < 0 || e >= E) ? E : e;
+    metal::atomic_fetch_add_explicit(&cnt[b], 1, metal::memory_order_relaxed);
+  }
+  metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+  if (tid == 0) {
+    int o = 0, io = 0;
+    for (int b = 0; b <= E; ++b) {
+      off[b] = o;
+      ioff[b] = io;
+      const int c = metal::atomic_load_explicit(&cnt[b], metal::memory_order_relaxed);
+      o += c;
+      io += (b < E) ? (c + 1) / 2 : c;
+    }
+    num_items[0] = io;
+  }
+  metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+  for (int s = int(tid); s < S; s += int(nt)) {
+    const int e = topk_ids[s];
+    const int b = (e < 0 || e >= E) ? E : e;
+    const int p = metal::atomic_fetch_add_explicit(&cur[b], 1, metal::memory_order_relaxed);
+    sorted[off[b] + p] = s;
+  }
+  metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+  for (int b = int(tid); b <= E; b += int(nt)) {
+    const int c = metal::atomic_load_explicit(&cnt[b], metal::memory_order_relaxed);
+    const int base = off[b];
+    const int ib = ioff[b];
+    if (b < E) {
+      for (int k = 0; k < c; k += 2) {
+        device int *it = items + (long)(ib + (k >> 1)) * 3;
+        it[0] = b;
+        it[1] = sorted[base + k];
+        it[2] = (k + 1 < c) ? sorted[base + k + 1] : -1;
+      }
+    } else {
+      for (int k = 0; k < c; ++k) {
+        device int *it = items + (long)(ib + k) * 3;
+        it[0] = -1;
+        it[1] = sorted[base + k];
+        it[2] = -1;
+      }
+    }
+  }
+}
+
+// Two-slot twin of qgemv_moe_mr_iq2_xxs_swiglu_texm over the items above:
+// the codebook texel, the sign pattern and the block scale are decoded once
+// per (row, block) and applied to both slots' activation registers. Each
+// lane walks half a block (see the walk note), so the per-slot result is
+// within fp32 rounding of the per-slot kernel (oracle: one bf16 ulp,
+// tests/kernels/test_moe_group_metal.py).
+template<typename T, int NSG, int NPAIR>
+kernel void qgemv_moe_mr_iq2_xxs_swiglu_texm_grp(
+    device T *D [[buffer(0)]],              // (tokens*topk, N/2) act output
+    device const uchar *Wq [[buffer(1)]],   // (E, N, K/256 * 66)
+    device const T *X [[buffer(2)]],        // (tokens, K)
+    device const int *items [[buffer(3)]],  // (max_items, 3)
+    device const int *num_items [[buffer(4)]],
+    constant int &N [[buffer(5)]],
+    constant int &K [[buffer(6)]],
+    constant int &topk [[buffer(7)]],
+    constant int &has_clamp [[buffer(8)]],
+    constant float &limit [[buffer(9)]],
+    metal::texture_buffer<uint, metal::access::read> lut [[texture(0)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]]) {
+    constexpr int NROWS = 2 * NPAIR;
+    const int it = int(tgid.y);
+    if (it >= num_items[0]) return;
+    const int expert = items[it * 3];
+    const int slot0 = items[it * 3 + 1];
+    const int slot1 = items[it * 3 + 2];
+    const int Nh = N / 2;
+    const int first = (int(tgid.x) * NSG + int(sgitg)) * NPAIR;
+    if (first >= Nh) return;
+    if (expert < 0) {
+        if (lane == 0) {
+            device T *out = D + (long)slot0 * Nh;
+            for (int j = 0; j < NPAIR && first + j < Nh; ++j) out[first + j] = T(0);
+        }
+        return;
+    }
+    const int bpr = K / 256;
+    const int nb32 = bpr * 8;
+    const long row_bytes = (long)bpr * 66;
+    const bool two = slot1 >= 0;
+    device const T *xs[2];
+    xs[0] = X + (long)(slot0 / topk) * K;
+    xs[1] = two ? X + (long)(slot1 / topk) * K : xs[0];
+    device const uchar *rbase[NROWS];
+    #pragma clang loop unroll(full)
+    for (short r = 0; r < NPAIR; ++r) {
+        rbase[r] = Wq + ((long)expert * N + first + r) * row_bytes;
+        rbase[NPAIR + r] = Wq + ((long)expert * N + Nh + first + r) * row_bytes;
+    }
+    float yl[2][16];
+    float sumf[2][NROWS];
+    #pragma clang loop unroll(full)
+    for (short r = 0; r < NROWS; ++r) { sumf[0][r] = 0.0f; sumf[1][r] = 0.0f; }
+
+#define IQ2_TEXM_GRP_WALK(NBV)                                                    \
+    for (int ib32 = lb; ib32 < nb32; ib32 += 16) {                                \
+        const int ibl = ib32 >> 3;                                                \
+        const int ib = ib32 & 7;                                                  \
+        _Pragma("clang loop unroll(full)")                                        \
+        for (short s = 0; s < NBV; ++s) {                                         \
+            device const metal::vec<T, 4> *y4 =                                   \
+                (device const metal::vec<T, 4> *)(xs[s] + 32 * ib32 + 16 * hb);   \
+            _Pragma("clang loop unroll(full)")                                    \
+            for (short i = 0; i < 4; ++i) {                                       \
+                const metal::vec<T, 4> v = y4[i];                                 \
+                yl[s][4 * i + 0] = float(v.x);                                    \
+                yl[s][4 * i + 1] = float(v.y);                                    \
+                yl[s][4 * i + 2] = float(v.z);                                    \
+                yl[s][4 * i + 3] = float(v.w);                                    \
+            }                                                                     \
+        }                                                                         \
+        _Pragma("clang loop unroll(full)")                                        \
+        for (short row = 0; row < NROWS; ++row) {                                 \
+            device const uchar *b = rbase[row] + (long)ibl * 66;                  \
+            const float db = float(((device const half *)b)[0]);                  \
+            device const ushort *q2 = (device const ushort *)(b + 2) + 4 * ib;    \
+            device const uchar *aux8 = (device const uchar *)q2;                  \
+            const uint aux32 = (uint)q2[2] | ((uint)q2[3] << 16);                 \
+            const float d = db * (0.5f + float(aux32 >> 28));                     \
+            float sum[2] = {0.0f, 0.0f};                                          \
+            _Pragma("clang loop unroll(full)")                                    \
+            for (short l = 0; l < 2; ++l) {                                       \
+                const short lg = short(2 * hb) + l;                               \
+                const uint code = uint(aux8[lg]);                                 \
+                const uint sg0 = (aux32 >> (7 * lg)) & 127u;                      \
+                const uint sg = sg0 | ((metal::popcount(sg0) & 1u) << 7);         \
+                const metal::uint4 v = lut.read(code);                            \
+                const metal::half2 h01 = as_type<metal::half2>(v.x);              \
+                const metal::half2 h23 = as_type<metal::half2>(v.y);              \
+                const metal::half2 h45 = as_type<metal::half2>(v.z);              \
+                const metal::half2 h67 = as_type<metal::half2>(v.w);              \
+                float m[8] = {float(h01.x), float(h01.y), float(h23.x), float(h23.y), \
+                              float(h45.x), float(h45.y), float(h67.x), float(h67.y)}; \
+                _Pragma("clang loop unroll(full)")                                \
+                for (short j = 0; j < 8; ++j) {                                   \
+                    const float w = as_type<float>(                               \
+                        as_type<uint>(m[j]) ^ (((sg >> j) & 1u) << 31));          \
+                    _Pragma("clang loop unroll(full)")                            \
+                    for (short s = 0; s < NBV; ++s) sum[s] += yl[s][8 * l + j] * w; \
+                }                                                                 \
+            }                                                                     \
+            _Pragma("clang loop unroll(full)")                                    \
+            for (short s = 0; s < NBV; ++s) sumf[s][row] += d * sum[s];           \
+        }                                                                         \
+    }
+    // Half-block per lane: lanes (2b, 2b+1) share block b of each 16-block
+    // iteration and each own two of its four 8-weight codes, so the live
+    // activation registers stay at 32 floats for BOTH slots (a whole block
+    // for two slots spilled: pair items ran 6x a single slot). The fp32
+    // chain per (slot, row, block) is therefore split in two before the
+    // d*sum fold - within fp32 rounding of the per-slot kernel, not
+    // bit-identical (oracle: one bf16 ulp).
+    const int hb = int(lane) & 1;
+    const int lb = int(lane) >> 1;
+    if (two) { IQ2_TEXM_GRP_WALK(2) } else { IQ2_TEXM_GRP_WALK(1) }
+#undef IQ2_TEXM_GRP_WALK
+
+    const int nvalid = two ? 2 : 1;
+    for (short s = 0; s < nvalid; ++s) {
+        float sums[NROWS];
+        #pragma clang loop unroll(full)
+        for (short r = 0; r < NROWS; ++r) sums[r] = metal::simd_sum(sumf[s][r]);
+        if (lane == 0) {
+            #pragma clang fp reassociate(off) contract(off)
+            device T *out = D + (long)(s == 0 ? slot0 : slot1) * Nh;
+            for (short j = 0; j < NPAIR; ++j) {
+                if (first + j >= Nh) break;
+                T g = T(sums[j] * 0.25f);
+                T u = T(sums[NPAIR + j] * 0.25f);
+                if (has_clamp) {
+                    const T lim = T(limit);
+                    const T nlim = T(-limit);
+                    g = (g > lim) ? lim : g;
+                    u = (u > lim) ? lim : ((u < nlim) ? nlim : u);
+                }
+                const T sv = T(metal::precise::divide(
+                    float(g), 1.0f + metal::precise::exp(-float(g))));
+                out[first + j] = sv * u;
+            }
+        }
+    }
+}
+
+#define instantiate_qgemv_moe_mr_swiglu_texm_grp(name, T, NSG, NPAIR)          \
+   template [[host_name(name)]] [[kernel]]                                   \
+   void qgemv_moe_mr_iq2_xxs_swiglu_texm_grp<T, NSG, NPAIR>(                 \
+     device T *D [[buffer(0)]], device const uchar *Wq [[buffer(1)]],       \
+     device const T *X [[buffer(2)]], device const int *items [[buffer(3)]], \
+     device const int *num_items [[buffer(4)]],                              \
+     constant int &N [[buffer(5)]], constant int &K [[buffer(6)]],           \
+     constant int &topk [[buffer(7)]], constant int &has_clamp [[buffer(8)]], \
+     constant float &limit [[buffer(9)]],                                    \
+     metal::texture_buffer<uint, metal::access::read> lut [[texture(0)]],   \
+     uint3 tgid [[threadgroup_position_in_grid]],                            \
+     ushort sgitg [[simdgroup_index_in_threadgroup]],                        \
+     ushort lane [[thread_index_in_simdgroup]]);
+
+instantiate_qgemv_moe_mr_swiglu_texm_grp("qgemv_iq2_xxs_moe_mr_swiglu_texm_grp", half, 2, 2)
+instantiate_qgemv_moe_mr_swiglu_texm_grp("qgemv_iq2_xxs_moe_mr_swiglu_texm_grp_bfloat16", mittens::bf16, 2, 2)
+  }
 }

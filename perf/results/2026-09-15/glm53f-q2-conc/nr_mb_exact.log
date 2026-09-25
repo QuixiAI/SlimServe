@@ -1,0 +1,22 @@
+N= 8192 K= 4096 M= 2: rows BIT-EXACT  strided BIT-EXACT
+N= 8192 K= 4096 M= 3: rows BIT-EXACT  strided BIT-EXACT
+N= 8192 K= 4096 M= 4: rows BIT-EXACT  strided BIT-EXACT
+N= 8192 K= 4096 M= 5: rows BIT-EXACT  strided BIT-EXACT
+N= 8192 K= 4096 M= 6: rows BIT-EXACT  strided BIT-EXACT
+N= 8192 K= 4096 M= 7: rows BIT-EXACT  strided BIT-EXACT
+N= 8192 K= 4096 M= 8: rows BIT-EXACT  strided BIT-EXACT
+N= 4096 K=16384 M= 2: rows BIT-EXACT  strided BIT-EXACT
+N= 4096 K=16384 M= 3: rows BIT-EXACT  strided BIT-EXACT
+N= 4096 K=16384 M= 4: rows BIT-EXACT  strided BIT-EXACT
+N= 4096 K=16384 M= 5: rows BIT-EXACT  strided BIT-EXACT
+N= 4096 K=16384 M= 6: rows BIT-EXACT  strided BIT-EXACT
+N= 4096 K=16384 M= 7: rows BIT-EXACT  strided BIT-EXACT
+N= 4096 K=16384 M= 8: rows BIT-EXACT  strided BIT-EXACT
+N= 2112 K= 4096 M= 2: rows BIT-EXACT  strided BIT-EXACT
+N= 2112 K= 4096 M= 3: rows BIT-EXACT  strided BIT-EXACT
+N= 2112 K= 4096 M= 4: rows BIT-EXACT  strided BIT-EXACT
+N= 2112 K= 4096 M= 5: rows BIT-EXACT  strided BIT-EXACT
+N= 2112 K= 4096 M= 6: rows BIT-EXACT  strided BIT-EXACT
+N= 2112 K= 4096 M= 7: rows BIT-EXACT  strided BIT-EXACT
+N= 2112 K= 4096 M= 8: rows BIT-EXACT  strided BIT-EXACT
+ALL BIT-EXACT

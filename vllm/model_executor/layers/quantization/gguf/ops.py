@@ -156,6 +156,20 @@ def ggml_mul_mat_sm(
     return quixicore_ops.ggml_mul_mat_sm(W, X, quant_type, row)
 
 
+def ggml_mul_mat_mma(
+    W: torch.Tensor,
+    X: torch.Tensor,
+    quant_type: int,
+    row: int,
+    out: torch.Tensor | None = None,
+    variant: int = 0,
+) -> torch.Tensor:
+    """Metal-only small-M MMA GEMM, q8_0 x bf16 row-major (the 9..32 band)."""
+    from vllm.quixicore import quixicore_ops
+
+    return quixicore_ops.ggml_mul_mat_mma(W, X, quant_type, row, out, variant)
+
+
 def muse_u4_repack(
     qweight: torch.Tensor, n_rows: int, k: int
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -261,6 +275,7 @@ def ggml_moe_a8_vec_swiglu(
     row: int,
     tokens: int,
     clamp_limit: float | None = None,
+    group_nb: int = 0,
 ) -> torch.Tensor:
     """Metal-only: iq2_xxs MoE GEMV with the SwiGLU epilogue fused in
     (bit-exact vs ggml_moe_a8_vec + the qc_swiglu SILU form)."""
@@ -269,7 +284,7 @@ def ggml_moe_a8_vec_swiglu(
     from vllm.quixicore import quixicore_ops
 
     return quixicore_ops.ggml_moe_a8_vec_swiglu(
-        X, W, topk_ids, top_k, quant_type, row, tokens, clamp_limit
+        X, W, topk_ids, top_k, quant_type, row, tokens, clamp_limit, group_nb=group_nb
     )
 
 

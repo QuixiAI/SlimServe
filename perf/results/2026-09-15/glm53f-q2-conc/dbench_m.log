@@ -1,0 +1,32 @@
+kda q|k Q4_K         M= 2 N= 16384 K= 4096   37.7 MB | vec   135.4 us  279 GB/s | sm   530.5 us   71 GB/s
+kda_v Q8_0           M= 2 N=  8192 K= 4096   35.7 MB | vec    64.7 us  551 GB/s | sm   304.9 us  117 GB/s
+kda_output Q8_0      M= 2 N=  4096 K= 8192   35.7 MB | vec    78.0 us  457 GB/s | sm   321.0 us  111 GB/s
+attn_output Q8_0     M= 2 N=  4096 K=16384   71.3 MB | vec   134.9 us  529 GB/s | sm   578.9 us  123 GB/s
+attn_q_b Q8_0        M= 2 N= 16384 K= 1536   26.7 MB | vec    58.5 us  457 GB/s | sm   237.9 us  112 GB/s
+attn_q_a|kv_a Q8_0   M= 2 N=  2112 K= 4096    9.2 MB | vec    25.0 us  367 GB/s | sm   134.3 us   68 GB/s
+shexp gate|up Q8_0   M= 2 N=  4096 K= 4096   17.8 MB | vec    44.6 us  399 GB/s | sm   203.9 us   87 GB/s
+shexp down Q8_0      M= 2 N=  4096 K= 2048    8.9 MB | vec    25.1 us  355 GB/s | sm   134.5 us   66 GB/s
+kda q|k Q4_K         M= 4 N= 16384 K= 4096   37.7 MB | vec   189.1 us  200 GB/s | sm   525.2 us   72 GB/s
+kda_v Q8_0           M= 4 N=  8192 K= 4096   35.7 MB | vec   100.0 us  356 GB/s | sm   300.6 us  119 GB/s
+kda_output Q8_0      M= 4 N=  4096 K= 8192   35.7 MB | vec   103.1 us  346 GB/s | sm   318.5 us  112 GB/s
+attn_output Q8_0     M= 4 N=  4096 K=16384   71.3 MB | vec   156.1 us  457 GB/s | sm   563.4 us  127 GB/s
+attn_q_b Q8_0        M= 4 N= 16384 K= 1536   26.7 MB | vec    90.5 us  295 GB/s | sm   243.3 us  110 GB/s
+attn_q_a|kv_a Q8_0   M= 4 N=  2112 K= 4096    9.2 MB | vec    44.9 us  205 GB/s | sm   138.6 us   66 GB/s
+shexp gate|up Q8_0   M= 4 N=  4096 K= 4096   17.8 MB | vec    55.6 us  320 GB/s | sm   203.1 us   88 GB/s
+shexp down Q8_0      M= 4 N=  4096 K= 2048    8.9 MB | vec    34.9 us  256 GB/s | sm   135.2 us   66 GB/s
+kda q|k Q4_K         M= 8 N= 16384 K= 4096   37.7 MB | vec   354.0 us  107 GB/s | sm   535.9 us   70 GB/s
+kda_v Q8_0           M= 8 N=  8192 K= 4096   35.7 MB | vec   362.5 us   98 GB/s | sm   300.8 us  119 GB/s
+kda_output Q8_0      M= 8 N=  4096 K= 8192   35.7 MB | vec   499.9 us   71 GB/s | sm   325.2 us  110 GB/s
+attn_output Q8_0     M= 8 N=  4096 K=16384   71.3 MB | vec  1044.7 us   68 GB/s | sm   580.3 us  123 GB/s
+attn_q_b Q8_0        M= 8 N= 16384 K= 1536   26.7 MB | vec   195.1 us  137 GB/s | sm   248.5 us  108 GB/s
+attn_q_a|kv_a Q8_0   M= 8 N=  2112 K= 4096    9.2 MB | vec   158.2 us   58 GB/s | sm   140.9 us   65 GB/s
+shexp gate|up Q8_0   M= 8 N=  4096 K= 4096   17.8 MB | vec   238.0 us   75 GB/s | sm   203.0 us   88 GB/s
+shexp down Q8_0      M= 8 N=  4096 K= 2048    8.9 MB | vec   108.3 us   82 GB/s | sm   133.9 us   67 GB/s
+kda q|k Q4_K         M=16 N= 16384 K= 4096   37.7 MB | vec   812.8 us   46 GB/s | sm   544.7 us   69 GB/s
+kda_v Q8_0           M=16 N=  8192 K= 4096   35.7 MB | vec   416.9 us   86 GB/s | sm   309.4 us  115 GB/s
+kda_output Q8_0      M=16 N=  4096 K= 8192   35.7 MB | vec   420.9 us   85 GB/s | sm   333.2 us  107 GB/s
+attn_output Q8_0     M=16 N=  4096 K=16384   71.3 MB | vec   845.9 us   84 GB/s | sm   584.4 us  122 GB/s
+attn_q_b Q8_0        M=16 N= 16384 K= 1536   26.7 MB | vec   301.3 us   89 GB/s | sm   259.5 us  103 GB/s
+attn_q_a|kv_a Q8_0   M=16 N=  2112 K= 4096    9.2 MB | vec   113.3 us   81 GB/s | sm   139.7 us   66 GB/s
+shexp gate|up Q8_0   M=16 N=  4096 K= 4096   17.8 MB | vec   211.0 us   84 GB/s | sm   203.0 us   88 GB/s
+shexp down Q8_0      M=16 N=  4096 K= 2048    8.9 MB | vec   105.9 us   84 GB/s | sm   134.2 us   66 GB/s

@@ -113,3 +113,55 @@ def test_kda_spec_step_matches_torch(lens, accepted, dtype):
             assert d <= stol, (r, t, d)
     # untouched slots (null block and unused checkpoints) unchanged
     assert torch.equal(ssm_pool[0], ssm_ref[0])
+
+
+@pytest.mark.parametrize("rows", [2, 4, 8])
+def test_kda_spec_rows_variants_bit_identical(monkeypatch, rows):
+    """kda_recur_spec_d128_r{2,4,8} (VLLM_QC_KDA_SPEC_ROWS, 2026-09-17) must be
+    bit-identical to the one-row grid: outputs and every checkpoint slot."""
+    qc = _qc()
+    if not qc.has_kernel(f"kda_recur_spec_d128_r{rows}"):
+        pytest.skip("rows variants not built")
+    torch.manual_seed(3)
+    dtype = torch.bfloat16
+    H, D, KS = 8, 128, 4
+    lens, accepted = [2, 2, 1, 2], [1, 2, 1, 2]
+    R, T = len(lens), sum(lens)
+    num_spec, C = 2, 3 * H * D
+    L = KS - 1 + num_spec
+    slots = 1 + R * num_spec
+    conv_pool = (torch.randn(slots, C, L) * 0.5).to(dtype).to(DEV)
+    ssm_pool = (torch.randn(slots, H, D, D) * 0.1).float().to(DEV)
+    table = torch.zeros(R, num_spec, dtype=torch.int32)
+    for r in range(R):
+        table[r] = torch.arange(1 + r * num_spec, 1 + (r + 1) * num_spec)
+    table = table.to(DEV)
+    num_accepted = torch.tensor(accepted, dtype=torch.int32, device=DEV)
+    cu = torch.tensor(
+        [0] + [int(v) for v in torch.tensor(lens).cumsum(0)], dtype=torch.int32
+    ).to(DEV)
+    mixed_qkv = (torch.randn(T, C) * 0.7).to(dtype).to(DEV)
+    g1 = (torch.randn(T, H * D) * 0.5).to(dtype).to(DEV)
+    beta = torch.randn(T, H).to(dtype).to(DEV)
+    g2 = torch.randn(T, H * D).to(dtype).to(DEV)
+    conv_w = (torch.randn(C, KS) * 0.3).float().to(DEV)
+    A_log = torch.randn(H).float().to(DEV)
+    dt_bias = (torch.randn(H * D) * 0.2).float().to(DEV)
+    norm_w = (torch.rand(D) + 0.5).to(dtype).to(DEV)
+    lb, eps, l2_eps, scale = -5.0, 1e-5, 1e-6, D**-0.5
+
+    def run(rows_env):
+        monkeypatch.setenv("VLLM_QC_KDA_SPEC_ROWS", str(rows_env))
+        cp, sp = conv_pool.clone(), ssm_pool.clone()
+        out = qc.kda_step(
+            mixed_qkv, g1, beta, conv_w, cp, sp, cu,
+            table[:, 0].contiguous(), A_log, dt_bias, lb, True, norm_w, g2, eps,
+            scale, l2_eps, slot_table=table, num_accepted=num_accepted,
+        ).clone()
+        torch.mps.synchronize()
+        return out, sp
+
+    o1, s1 = run(1)
+    o2, s2 = run(rows)
+    assert torch.equal(o1.cpu(), o2.cpu())
+    assert torch.equal(s1.cpu(), s2.cpu())

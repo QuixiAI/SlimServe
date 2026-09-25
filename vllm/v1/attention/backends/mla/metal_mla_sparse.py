@@ -193,6 +193,27 @@ def _row_insert_kernel_ok(kv_cache: torch.Tensor) -> bool:
 
 
 _SPARSE_KERNEL: bool | None = None
+# Head-grouped / simdgroup-MMA partition kernel for batched decode
+# (2026-09-17): VLLM_QC_MLA_SPARSE_MQA selects the kernel config (0 = the
+# per-head kernel; 6 = the MMA kernel with 8 simdgroups, 3.5x at 32 rows)
+# and VLLM_QC_MLA_SPARSE_MQA_MIN_R the row count from which it applies
+# (default 3: the single-stream pins run at 1-2 rows on the per-head kernel).
+_SPARSE_MQA: tuple[int, int] | None = None
+
+
+def _sparse_mqa_cfg(rows: int) -> int:
+    global _SPARSE_MQA
+    if _SPARSE_MQA is None:
+        import os
+
+        try:
+            cfg = int(os.environ.get("VLLM_QC_MLA_SPARSE_MQA", "0"))
+            min_r = int(os.environ.get("VLLM_QC_MLA_SPARSE_MQA_MIN_R", "3"))
+        except ValueError:
+            cfg, min_r = 0, 3
+        _SPARSE_MQA = (cfg, min_r)
+    cfg, min_r = _SPARSE_MQA
+    return cfg if rows >= min_r else 0
 
 
 def _sparse_kernel_ok(q: torch.Tensor, kv_cache: torch.Tensor, d_v: int) -> bool:
@@ -246,7 +267,7 @@ def sparse_attend_rows(
         idx = indices if indices.dtype == torch.int32 else indices.to(torch.int32)
         return quixicore_ops.mla_sparse_latent_decode(
             q.contiguous(), kv_cache, bt.contiguous(), idx.contiguous(), sm_scale,
-            0, tlen,
+            0, tlen, _sparse_mqa_cfg(R),
         )
     out = torch.empty((R, H, d_v), dtype=q.dtype, device=q.device)
     num_blocks = kv_cache.shape[0]

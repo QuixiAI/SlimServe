@@ -1,0 +1,5 @@
+INFO 09-17 18:16:52 [importing.py:96] Triton not installed or not compatible; certain GPU-related functions will not be available.
+R= 2 cfg0  0.486 ms err 2.4e-04 | cfg1  0.942 ms err 2.4e-04 | cfg2  0.853 ms err 2.4e-04 | cfg3  0.271 ms err 6.1e-05 | cfg4  0.295 ms err 6.1e-05
+R= 8 cfg0  1.058 ms err 1.2e-04 | cfg1  2.997 ms err 1.2e-04 | cfg2  2.728 ms err 1.2e-04 | cfg3  0.817 ms err 1.2e-04 | cfg4  0.908 ms err 1.2e-04
+R=16 cfg0  2.050 ms err 2.4e-04 | cfg1  5.893 ms err 2.4e-04 | cfg2  5.279 ms err 2.4e-04 | cfg3  1.556 ms err 2.4e-04 | cfg4  1.743 ms err 2.4e-04
+R=32 cfg0  3.953 ms err 2.4e-04 | cfg1 11.688 ms err 2.4e-04 | cfg2 10.496 ms err 2.4e-04 | cfg3  3.073 ms err 2.4e-04 | cfg4  3.451 ms err 2.4e-04

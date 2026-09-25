@@ -1,0 +1,8 @@
+M=1: strided in-place BIT-EXACT; in region BIT-EXACT (x20 ok; barriers 0); separate  130.0 us  strided  107.5 us  region  104.9 us
+M=2: strided in-place BIT-EXACT; in region BIT-EXACT (x20 ok; barriers 0); separate  147.9 us  strided  147.5 us  region  138.9 us
+M=3: strided in-place BIT-EXACT; in region BIT-EXACT (x20 ok; barriers 1); separate  217.6 us  strided  227.0 us  region  223.2 us
+M=4: strided in-place BIT-EXACT; in region BIT-EXACT (x20 ok; barriers 0); separate  253.8 us  strided  258.6 us  region  251.9 us
+M=5: strided in-place BIT-EXACT; in region BIT-EXACT (x20 ok; barriers 1); separate  341.8 us  strided  356.3 us  region  340.5 us
+M=6: strided in-place BIT-EXACT; in region BIT-EXACT (x20 ok; barriers 0); separate  391.3 us  strided  398.7 us  region  372.6 us
+M=7: strided in-place BIT-EXACT; in region BIT-EXACT (x20 ok; barriers 1); separate  468.9 us  strided  479.4 us  region  458.8 us
+M=8: strided in-place BIT-EXACT; in region BIT-EXACT (x20 ok; barriers 0); separate  489.0 us  strided  494.7 us  region  480.0 us

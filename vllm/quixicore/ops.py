@@ -1240,11 +1240,13 @@ class quixicore_ops:
         row: int,
         tokens: int,
         clamp_limit: float | None = None,
+        group_nb: int = 0,
     ) -> torch.Tensor:
         """iq2_xxs MoE GEMV with the SwiGLU epilogue fused (bit-exact vs
         ggml_moe_a8_vec followed by qc_swiglu form 0)."""
         return _qc().ggml_moe_a8_vec_swiglu(
-            x, w, topk_ids, top_k, quant_type, row, tokens, clamp_limit
+            x, w, topk_ids, top_k, quant_type, row, tokens, clamp_limit,
+            group_nb=int(group_nb),
         )
 
     @staticmethod
@@ -1299,6 +1301,24 @@ class quixicore_ops:
         instead of returning an uninitialized tail.
         """
         return _qc().ggml_mul_mat_a8(w, x, quant_type, row)
+
+    @staticmethod
+    def ggml_mul_mat_mma(
+        w: torch.Tensor,
+        x: torch.Tensor,
+        quant_type: int,
+        row: int,
+        out: torch.Tensor | None = None,
+        variant: int = 0,
+    ) -> torch.Tensor:
+        """Small-M weight-stationary MMA GEMM, q8_0 x bf16 row-major, M <= 32.
+
+        The 9..32-row dense band (2026-09-17): float-fragment accumulators,
+        a shared X K-tile per threadgroup step, transposed weight operand so
+        the product lands row-major. `out` may be a unit-column-stride
+        column slice written in place. Not bit-identical to the NR walk.
+        """
+        return _qc().ggml_mul_mat_mma(w, x, quant_type, row, out, int(variant))
 
     @staticmethod
     def ggml_mul_mat_sm(
@@ -2906,6 +2926,7 @@ class quixicore_ops:
         sm_scale: float,
         partitions: int = 0,
         tlen: torch.Tensor | None = None,
+        mqa_cfg: int = 0,
     ) -> torch.Tensor:
         """Sparse NoPE-MLA decode over bf16/f16 latent pages (GLM-5.3-Flash).
 
@@ -2913,10 +2934,12 @@ class quixicore_ops:
         stride), ``block_table [R, cols]`` i32 (one row per query row),
         ``indices [R, W]`` i32 request-local positions with ``< 0`` pad.
         Returns ``[R, H, 512]`` in q's dtype; a row with no valid position
-        is zero. Metal only.
+        is zero. Metal only. ``mqa_cfg`` 1..4 selects the head-grouped
+        partition kernel ((G, NSG) = (4,4) (4,8) (2,8) (2,4)); 0 = per-head.
         """
         return _qc().mla_sparse_latent_decode(
-            q, kv_cache, block_table, indices, float(sm_scale), int(partitions), tlen
+            q, kv_cache, block_table, indices, float(sm_scale), int(partitions), tlen,
+            int(mqa_cfg),
         )
 
     @staticmethod
