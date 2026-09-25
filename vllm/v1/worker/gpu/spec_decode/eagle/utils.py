@@ -116,5 +116,35 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
             for _, module in draft_inner.named_modules():
                 if hasattr(module, "topk_indices_buffer"):
                     module.topk_indices_buffer = target_buffer
+            # The GLM pooled indexer's valid-prefix buffer goes with it.
+            target_len = None
+            for _, module in target_inner.named_modules():
+                if getattr(module, "topk_len_buffer", None) is not None:
+                    target_len = module.topk_len_buffer
+                    break
+            if target_len is not None:
+                for _, module in draft_inner.named_modules():
+                    if hasattr(module, "topk_len_buffer"):
+                        module.topk_len_buffer = target_len
+            # Attention impls are not modules. A sparse-MLA impl captures
+            # `indexer.topk_indices_buffer` / `topk_len_buffer` in its
+            # __init__ (Metal, QuixiCore, AITER), so after the loops above
+            # the draft's indexer writes the target's buffers while its
+            # attention still reads the draft's original private ones
+            # (never written). GLM-5.3-Flash nextn drafter on Metal: every
+            # extend/decode row attended over that stale buffer (attention
+            # output zero; pos-0 acceptance 0.69 vs 0.78 for a dense fp32
+            # reference, pos-1 0.32 vs 0.65). Re-point the impls too.
+            for _, module in draft_inner.named_modules():
+                impl = getattr(module, "impl", None)
+                if impl is None:
+                    continue
+                if getattr(impl, "topk_indices_buffer", None) is not None:
+                    impl.topk_indices_buffer = target_buffer
+                if (
+                    target_len is not None
+                    and getattr(impl, "topk_len_buffer", None) is not None
+                ):
+                    impl.topk_len_buffer = target_len
 
     return eagle_model

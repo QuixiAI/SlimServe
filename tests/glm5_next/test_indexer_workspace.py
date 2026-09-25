@@ -117,6 +117,10 @@ def test_indexer_constructors_share_only_logits(speculative_tokens):
             StubModule,
         ),
         patch("torch.cuda.current_device", return_value=0),
+        patch(
+            "vllm.model_executor.layers.glm5_next_indexer.current_platform",
+            SimpleNamespace(device_type="cuda"),
+        ),
     ):
         layers = [
             Glm5NextPooledIndexer(

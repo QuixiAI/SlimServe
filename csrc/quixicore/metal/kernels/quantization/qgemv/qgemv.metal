@@ -41,6 +41,359 @@ kernel void qgemv(
     if (lane == 0) D[row] = T(acc);
 }
 
+// q8_0 decode GEMV in the llama.cpp mul_mv geometry (kernel_mul_mv_q8_0_f32
+// port): NR output rows per THREADGROUP, NSG simdgroups splitting the K axis
+// (simdgroup s owns blocks s*8 + ix, stride NSG*8), 4 lanes per 32-wide
+// block (8 codes each), activations loaded once per lane per block phase
+// and reused across the NR rows. The one-row-per-simdgroup walk above keeps
+// a single 34-byte block per lane-quad in flight per row and measured
+// 250-350 GB/s at the GLM-5.3-Flash KDA/MLA shapes (N=4096..8192, K=4096..
+// 16384); this geometry puts NSG*8 blocks in flight per row pair. Partial
+// sums cross simdgroups through threadgroup memory (llama.cpp's
+// helper_mv_reduce_and_write). NUMERICS: fp32 int8*y accumulation per lane
+// with the block scale applied per block, so outputs are NOT bit-identical
+// to qgemv<q8_0> (per-element half-rounded products). Host routes only
+// N % NR == 0 && K % 32 == 0: tail rows would read past the weight buffer.
+template<typename T, short NR, short NSG>
+kernel void qgemv_q8_0_nr(
+    device   T*     D  [[buffer(0)]],   // (N, 1) output
+    device   uchar* Wq [[buffer(1)]],   // (N, K/32 * 34B) q8_0 blocks
+    device   T*     X  [[buffer(2)]],   // (K, 1) activation vector
+    const constant int &N [[buffer(3)]],
+    const constant int &K [[buffer(4)]],
+    uint3  tgid  [[threadgroup_position_in_grid]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]],
+    ushort lane  [[thread_index_in_simdgroup]]) {
+    constexpr short NQ = 8;             // codes per lane per block
+    constexpr short LPB = 32 / NQ;      // 4 lanes per block
+    constexpr short BPS = 32 / LPB;     // 8 blocks per simdgroup phase
+    threadgroup float part[NR * 8];     // NSG <= 8
+
+    const short il = lane % LPB;
+    const short ix = lane / LPB;
+    const int nb = K / 32;
+    const int first_row = int(tgid.x) * NR;
+    const ulong row_bytes = (ulong)nb * 34;
+    device const uchar* rows_base = Wq + (ulong)first_row * row_bytes;
+
+    float sumf[NR];
+    #pragma clang loop unroll(full)
+    for (short r = 0; r < NR; ++r) sumf[r] = 0.f;
+
+    const int ib0 = int(sgitg) * BPS + ix;
+    device const T* yb = X + ib0 * 32 + il * NQ;
+    for (int ib = ib0; ib < nb; ib += NSG * BPS) {
+        float yl[NQ];
+        #pragma clang loop unroll(full)
+        for (short i = 0; i < NQ; ++i) yl[i] = float(yb[i]);
+        device const uchar* blk = rows_base + (ulong)ib * 34;
+        #pragma clang loop unroll(full)
+        for (short row = 0; row < NR; ++row) {
+            device const uchar* b = blk + (ulong)row * row_bytes;
+            const float d = float(((device const half*)b)[0]);
+            device const char* qs = (device const char*)(b + 2) + il * NQ;
+            float sumq = 0.f;
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < NQ; ++i) sumq += float(qs[i]) * yl[i];
+            sumf[row] += sumq * d;
+        }
+        yb += NSG * BPS * 32;
+    }
+
+    #pragma clang loop unroll(full)
+    for (short row = 0; row < NR; ++row) {
+        const float s = metal::simd_sum(sumf[row]);
+        if (lane == 0) part[row * NSG + sgitg] = s;
+    }
+    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    if (sgitg == 0 && lane == 0) {
+        #pragma clang loop unroll(full)
+        for (short row = 0; row < NR; ++row) {
+            float tot = 0.f;
+            #pragma clang loop unroll(full)
+            for (short sg = 0; sg < NSG; ++sg) tot += part[row * NSG + sg];
+            D[first_row + row] = T(tot);
+        }
+    }
+}
+
+#define instantiate_qgemv_q8_0_nr(name, T, NR, NSG)                           \
+   template [[host_name(name)]] [[kernel]]                                    \
+   void qgemv_q8_0_nr<T, NR, NSG>(                                            \
+     device T* D [[buffer(0)]], device uchar* Wq [[buffer(1)]],               \
+     device T* X [[buffer(2)]],                                               \
+     const constant int &N [[buffer(3)]], const constant int &K [[buffer(4)]], \
+     uint3 tgid [[threadgroup_position_in_grid]],                             \
+     ushort sgitg [[simdgroup_index_in_threadgroup]],                         \
+     ushort lane [[thread_index_in_simdgroup]]);
+
+instantiate_qgemv_q8_0_nr("qgemv_q8_0_nr_2x4_bfloat16", bf16, 2, 4)
+instantiate_qgemv_q8_0_nr("qgemv_q8_0_nr_4x2_bfloat16", bf16, 4, 2)
+instantiate_qgemv_q8_0_nr("qgemv_q8_0_nr_4x4_bfloat16", bf16, 4, 4)
+instantiate_qgemv_q8_0_nr("qgemv_q8_0_nr_2x2_bfloat16", bf16, 2, 2)
+instantiate_qgemv_q8_0_nr("qgemv_q8_0_nr_1x4_bfloat16", bf16, 1, 4)
+instantiate_qgemv_q8_0_nr("qgemv_q8_0_nr_2x8_bfloat16", bf16, 2, 8)
+instantiate_qgemv_q8_0_nr("qgemv_q8_0_nr_2x4", half, 2, 4)
+instantiate_qgemv_q8_0_nr("qgemv_q8_0_nr_4x2", half, 4, 2)
+
+// Multi-activation twin of qgemv_q8_0_nr for the speculative-verify widths
+// (2 <= NB <= 4 rows of X): the same NR x NSG weight walk, each lane holding
+// NB activation slices in registers so every q8_0 block is read once for all
+// NB rows. Per-row arithmetic (block order, per-block d, simdgroup then
+// cross-simdgroup reduction) is exactly the NB=1 kernel's, so row r of the
+// output is bit-identical to qgemv_q8_0_nr on X[r] alone: a K=1 verify
+// pass reproduces batch-1 decode numerics (the K split per simdgroup, NSG,
+// fixes the reduction order; NR only batches rows per threadgroup, so 4x4
+// and 2x4 agree bit for bit). 4x4 measured best at M=2..4 on the GLM-5.3-
+// Flash shapes (2026-09-11: kda_v 488 vs 383 GB/s, attn_q_b 503 vs 301,
+// lm_head 741 vs 750 at M=2). X is (NB, K) row-major, D is (NB, N)
+// row-major. Host guards: N % NR == 0, K % 32 == 0, K > 512.
+template<typename T, short NR, short NSG, short NB>
+kernel void qgemv_q8_0_nr_mb(
+    device   T*     D  [[buffer(0)]],   // (NB, N) output, rows LDD apart
+    device   uchar* Wq [[buffer(1)]],   // (N, K/32 * 34B) q8_0 blocks
+    device   T*     X  [[buffer(2)]],   // (NB, K) activations
+    const constant int &N [[buffer(3)]],
+    const constant int &K [[buffer(4)]],
+    const constant int &LDD [[buffer(5)]], // output row stride (N when dense)
+    uint3  tgid  [[threadgroup_position_in_grid]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]],
+    ushort lane  [[thread_index_in_simdgroup]]) {
+    constexpr short NQ = 8;
+    constexpr short LPB = 32 / NQ;
+    constexpr short BPS = 32 / LPB;
+    threadgroup float part[NR * NB * 8];
+
+    const short il = lane % LPB;
+    const short ix = lane / LPB;
+    const int nb = K / 32;
+    const int first_row = int(tgid.x) * NR;
+    const ulong row_bytes = (ulong)nb * 34;
+    device const uchar* rows_base = Wq + (ulong)first_row * row_bytes;
+
+    float sumf[NR][NB];
+    #pragma clang loop unroll(full)
+    for (short r = 0; r < NR; ++r) {
+        #pragma clang loop unroll(full)
+        for (short b = 0; b < NB; ++b) sumf[r][b] = 0.f;
+    }
+
+    const int ib0 = int(sgitg) * BPS + ix;
+    device const T* yb = X + ib0 * 32 + il * NQ;
+    for (int ib = ib0; ib < nb; ib += NSG * BPS) {
+        float yl[NB][NQ];
+        #pragma clang loop unroll(full)
+        for (short b = 0; b < NB; ++b) {
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < NQ; ++i) yl[b][i] = float(yb[(ulong)b * K + i]);
+        }
+        device const uchar* blk = rows_base + (ulong)ib * 34;
+        #pragma clang loop unroll(full)
+        for (short row = 0; row < NR; ++row) {
+            device const uchar* bp = blk + (ulong)row * row_bytes;
+            const float d = float(((device const half*)bp)[0]);
+            device const char* qs = (device const char*)(bp + 2) + il * NQ;
+            float q[NQ];
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < NQ; ++i) q[i] = float(qs[i]);
+            #pragma clang loop unroll(full)
+            for (short b = 0; b < NB; ++b) {
+                float sumq = 0.f;
+                #pragma clang loop unroll(full)
+                for (short i = 0; i < NQ; ++i) sumq += q[i] * yl[b][i];
+                sumf[row][b] += sumq * d;
+            }
+        }
+        yb += NSG * BPS * 32;
+    }
+
+    #pragma clang loop unroll(full)
+    for (short row = 0; row < NR; ++row) {
+        #pragma clang loop unroll(full)
+        for (short b = 0; b < NB; ++b) {
+            const float s = metal::simd_sum(sumf[row][b]);
+            if (lane == 0) part[(row * NB + b) * NSG + sgitg] = s;
+        }
+    }
+    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    if (sgitg == 0 && lane < NR * NB) {
+        const short row = lane / NB;
+        const short b = lane % NB;
+        float tot = 0.f;
+        #pragma clang loop unroll(full)
+        for (short sg = 0; sg < NSG; ++sg) tot += part[(row * NB + b) * NSG + sg];
+        D[(ulong)b * LDD + first_row + row] = T(tot);
+    }
+}
+
+#define instantiate_qgemv_q8_0_nr_mb(name, T, NR, NSG, NB)                    \
+   template [[host_name(name)]] [[kernel]]                                    \
+   void qgemv_q8_0_nr_mb<T, NR, NSG, NB>(                                     \
+     device T* D [[buffer(0)]], device uchar* Wq [[buffer(1)]],               \
+     device T* X [[buffer(2)]],                                               \
+     const constant int &N [[buffer(3)]], const constant int &K [[buffer(4)]], \
+     const constant int &LDD [[buffer(5)]],                                   \
+     uint3 tgid [[threadgroup_position_in_grid]],                             \
+     ushort sgitg [[simdgroup_index_in_threadgroup]],                         \
+     ushort lane [[thread_index_in_simdgroup]]);
+
+instantiate_qgemv_q8_0_nr_mb("qgemv_q8_0_nr_2x4_mb2_bfloat16", bf16, 2, 4, 2)
+instantiate_qgemv_q8_0_nr_mb("qgemv_q8_0_nr_2x4_mb3_bfloat16", bf16, 2, 4, 3)
+instantiate_qgemv_q8_0_nr_mb("qgemv_q8_0_nr_2x4_mb4_bfloat16", bf16, 2, 4, 4)
+instantiate_qgemv_q8_0_nr_mb("qgemv_q8_0_nr_4x4_mb2_bfloat16", bf16, 4, 4, 2)
+instantiate_qgemv_q8_0_nr_mb("qgemv_q8_0_nr_4x4_mb3_bfloat16", bf16, 4, 4, 3)
+instantiate_qgemv_q8_0_nr_mb("qgemv_q8_0_nr_4x4_mb4_bfloat16", bf16, 4, 4, 4)
+instantiate_qgemv_q8_0_nr_mb("qgemv_q8_0_nr_4x4_mb2", half, 4, 4, 2)
+instantiate_qgemv_q8_0_nr_mb("qgemv_q8_0_nr_4x4_mb3", half, 4, 4, 3)
+instantiate_qgemv_q8_0_nr_mb("qgemv_q8_0_nr_4x4_mb4", half, 4, 4, 4)
+instantiate_qgemv_q8_0_nr_mb("qgemv_q8_0_nr_2x4_mb2", half, 2, 4, 2)
+instantiate_qgemv_q8_0_nr_mb("qgemv_q8_0_nr_2x4_mb3", half, 2, 4, 3)
+instantiate_qgemv_q8_0_nr_mb("qgemv_q8_0_nr_2x4_mb4", half, 2, 4, 4)
+// Widths 8 and 16 were instantiated and measured 2026-09-17
+// (perf/results/2026-09-15/glm53f-q2-conc/dbench_m_wide.log): NB=8 runs
+// SLOWER than two NB=4 launches (kda_v 218 vs 160 us) and NB=16 spills
+// (831 us vs the SM GEMM's 308) - yl[NB][8] + sumf[NR][NB] outgrow the
+// register file. The walk stays at NB <= 4; wider M is decomposed into
+// {4, 3, 2}-row launches (tk::launch_qgemv_q8_0_nr_mb_parts).
+
+// Gate|up pair GEMV with the SwiGLU epilogue fused, q8_0 NR geometry: the
+// merged gate_up weight (rows [0, N/2) gate, [N/2, N) up) is walked by
+// threadgroups that own two gate rows AND their two matching up rows (4 rows,
+// NSG simdgroups splitting K exactly as qgemv_q8_0_nr / _mb do), so every
+// per-row sum is bit-identical to the plain NR launch on that row; the
+// epilogue then applies qc_swiglu's oai_form-0 chain (optional clamp, T
+// rounding at the same points) and stores act[b, g] = silu(g) * u as
+// (NB, N/2). Replaces the gate_up GEMV + the separate qc_swiglu dispatch
+// (and the (NB, N) intermediate) for the GLM-5.3-Flash shared expert and
+// dense FFNs. Host guards: N % 4 == 0, K % 32 == 0, K > 512, NSG == 4.
+template<typename T, short NSG, short NB>
+static inline void qc_pair_swiglu_body(
+    device T* D, device uchar* Wq, device T* X, int N, int K, int has_clamp,
+    float limit, threadgroup float* part, uint tgx, ushort sgitg,
+    ushort lane) {
+    constexpr short NR = 4;             // 2 gate rows + 2 up rows
+    constexpr short NQ = 8;
+    constexpr short LPB = 32 / NQ;
+    constexpr short BPS = 32 / LPB;
+
+    const short il = lane % LPB;
+    const short ix = lane / LPB;
+    const int nb = K / 32;
+    const int Nh = N / 2;
+    const int first_gate = int(tgx) * 2;
+    const ulong row_bytes = (ulong)nb * 34;
+    device const uchar* rbase[NR];
+    rbase[0] = Wq + (ulong)(first_gate) * row_bytes;
+    rbase[1] = Wq + (ulong)(first_gate + 1) * row_bytes;
+    rbase[2] = Wq + (ulong)(Nh + first_gate) * row_bytes;
+    rbase[3] = Wq + (ulong)(Nh + first_gate + 1) * row_bytes;
+
+    float sumf[NR][NB];
+    #pragma clang loop unroll(full)
+    for (short r = 0; r < NR; ++r) {
+        #pragma clang loop unroll(full)
+        for (short b = 0; b < NB; ++b) sumf[r][b] = 0.f;
+    }
+
+    const int ib0 = int(sgitg) * BPS + ix;
+    device const T* yb = X + ib0 * 32 + il * NQ;
+    for (int ib = ib0; ib < nb; ib += NSG * BPS) {
+        float yl[NB][NQ];
+        #pragma clang loop unroll(full)
+        for (short b = 0; b < NB; ++b) {
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < NQ; ++i) yl[b][i] = float(yb[(ulong)b * K + i]);
+        }
+        #pragma clang loop unroll(full)
+        for (short row = 0; row < NR; ++row) {
+            device const uchar* bp = rbase[row] + (ulong)ib * 34;
+            const float d = float(((device const half*)bp)[0]);
+            device const char* qs = (device const char*)(bp + 2) + il * NQ;
+            float q[NQ];
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < NQ; ++i) q[i] = float(qs[i]);
+            #pragma clang loop unroll(full)
+            for (short b = 0; b < NB; ++b) {
+                float sumq = 0.f;
+                #pragma clang loop unroll(full)
+                for (short i = 0; i < NQ; ++i) sumq += q[i] * yl[b][i];
+                sumf[row][b] += sumq * d;
+            }
+        }
+        yb += NSG * BPS * 32;
+    }
+
+    #pragma clang loop unroll(full)
+    for (short row = 0; row < NR; ++row) {
+        #pragma clang loop unroll(full)
+        for (short b = 0; b < NB; ++b) {
+            const float s = metal::simd_sum(sumf[row][b]);
+            if (lane == 0) part[(row * NB + b) * NSG + sgitg] = s;
+        }
+    }
+    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    if (sgitg == 0 && lane < 2 * NB) {
+        const short j = lane / NB;       // gate row within the pair
+        const short b = lane % NB;
+        float tg = 0.f, tu = 0.f;
+        #pragma clang loop unroll(full)
+        for (short sg = 0; sg < NSG; ++sg) {
+            tg += part[(j * NB + b) * NSG + sg];
+            tu += part[((2 + j) * NB + b) * NSG + sg];
+        }
+        // qc_swiglu oai_form-0 chain on the T-rounded GEMV outputs.
+        T g = T(tg);
+        T u = T(tu);
+        if (has_clamp) {
+            const T lim = T(limit);
+            const T nlim = T(-limit);
+            g = (g > lim) ? lim : g;
+            u = (u > lim) ? lim : ((u < nlim) ? nlim : u);
+        }
+        const T sg_ = T(metal::precise::divide(
+            float(g), 1.0f + metal::precise::exp(-float(g))));
+        D[(ulong)b * Nh + first_gate + j] = sg_ * u;
+    }
+}
+
+template<typename T, short NSG, short NB>
+kernel void qgemv_q8_0_nr_pair_swiglu(
+    device   T*     D  [[buffer(0)]],   // (NB, N/2) activation output
+    device   uchar* Wq [[buffer(1)]],   // (N, K/32 * 34B) q8_0 blocks, gate|up
+    device   T*     X  [[buffer(2)]],   // (NB, K) activations
+    const constant int &N [[buffer(3)]],
+    const constant int &K [[buffer(4)]],
+    const constant int &has_clamp [[buffer(5)]],
+    const constant float &limit [[buffer(6)]],
+    uint3  tgid  [[threadgroup_position_in_grid]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]],
+    ushort lane  [[thread_index_in_simdgroup]]) {
+    threadgroup float part[4 * NB * 8];
+    qc_pair_swiglu_body<T, NSG, NB>(D, Wq, X, N, K, has_clamp, limit, part,
+                                    tgid.x, sgitg, lane);
+}
+
+#define instantiate_qgemv_q8_0_nr_pair_swiglu(name, T, NSG, NB)              \
+   template [[host_name(name)]] [[kernel]]                                    \
+   void qgemv_q8_0_nr_pair_swiglu<T, NSG, NB>(                                \
+     device T* D [[buffer(0)]], device uchar* Wq [[buffer(1)]],               \
+     device T* X [[buffer(2)]],                                               \
+     const constant int &N [[buffer(3)]], const constant int &K [[buffer(4)]], \
+     const constant int &has_clamp [[buffer(5)]],                             \
+     const constant float &limit [[buffer(6)]],                               \
+     uint3 tgid [[threadgroup_position_in_grid]],                             \
+     ushort sgitg [[simdgroup_index_in_threadgroup]],                         \
+     ushort lane [[thread_index_in_simdgroup]]);
+
+instantiate_qgemv_q8_0_nr_pair_swiglu("qgemv_q8_0_nr_pair_swiglu_mb1_bfloat16", bf16, 4, 1)
+instantiate_qgemv_q8_0_nr_pair_swiglu("qgemv_q8_0_nr_pair_swiglu_mb2_bfloat16", bf16, 4, 2)
+instantiate_qgemv_q8_0_nr_pair_swiglu("qgemv_q8_0_nr_pair_swiglu_mb3_bfloat16", bf16, 4, 3)
+instantiate_qgemv_q8_0_nr_pair_swiglu("qgemv_q8_0_nr_pair_swiglu_mb4_bfloat16", bf16, 4, 4)
+instantiate_qgemv_q8_0_nr_pair_swiglu("qgemv_q8_0_nr_pair_swiglu_mb1", half, 4, 1)
+instantiate_qgemv_q8_0_nr_pair_swiglu("qgemv_q8_0_nr_pair_swiglu_mb2", half, 4, 2)
+instantiate_qgemv_q8_0_nr_pair_swiglu("qgemv_q8_0_nr_pair_swiglu_mb3", half, 4, 3)
+instantiate_qgemv_q8_0_nr_pair_swiglu("qgemv_q8_0_nr_pair_swiglu_mb4", half, 4, 4)
+
 // q4_K decode GEMV in the llama.cpp mul_mv layout (kernel_mul_mv_q4_K_f32
 // port: 2 rows per simdgroup, 2 simdgroups per threadgroup, 4 blocks in
 // flight on the K axis). The one-simdgroup-per-row walk above has BPI=1 for
@@ -194,11 +547,12 @@ kernel void qgemv_q4k_nr(
 // not fault on out-of-bounds reads.
 template<typename T>
 kernel void qgemv_q4k_nr_mb(
-    device   T*     D  [[buffer(0)]],   // (M, N) output, row-major
+    device   T*     D  [[buffer(0)]],   // (M, N) output, rows LDD apart
     device   uchar* Wq [[buffer(1)]],   // (N, K/256 * 144B) q4_K blocks
     device   T*     X  [[buffer(2)]],   // (M, K) activations, row-major
     const constant int &N [[buffer(3)]],
     const constant int &K [[buffer(4)]],
+    const constant int &LDD [[buffer(5)]], // output row stride (N when dense)
     uint3  tgid  [[threadgroup_position_in_grid]],
     ushort sgitg [[simdgroup_index_in_threadgroup]],
     ushort lane  [[thread_index_in_simdgroup]]) {
@@ -323,7 +677,7 @@ kernel void qgemv_q4k_nr_mb(
         for (short row = 0; row < NR; ++row) {
             const float tot = metal::simd_sum(sumf[row][mi]);
             if (lane == 0)
-                D[(long)(first_col + mi) * N + first_row + row] = T(tot);
+                D[(long)(first_col + mi) * LDD + first_row + row] = T(tot);
         }
 }
 
@@ -690,6 +1044,147 @@ kernel void qgemv_moe_mr_iq2_xxs_swiglu(
     }
 }
 
+// ---------------------------------------------------------------------------
+// W25: texture-unit iq2_xxs expert GEMV + SwiGLU (production behind
+// VLLM_METAL_MOE_IQ2_TEX=1). One RGBA32Uint texel per grid code holds the eight
+// unsigned magnitudes as packed halfs; the sign is applied by flipping the
+// fp32 sign bit from the ksigns pattern (s | parity << 7). One texel read
+// per 8 weights, ~5 ALU ops per weight - the control that separates the
+// texture fetch cost from the sign/convert savings.
+template<typename T, int NSG, int NPAIR>
+kernel void qgemv_moe_mr_iq2_xxs_swiglu_texm(
+    device T *D [[buffer(0)]],
+    device const uchar *Wq [[buffer(1)]],
+    device const T *X [[buffer(2)]],
+    device const int *topk_ids [[buffer(3)]],
+    constant int &N [[buffer(4)]],
+    constant int &K [[buffer(5)]],
+    constant int &topk [[buffer(6)]],
+    constant int &has_clamp [[buffer(7)]],
+    constant float &limit [[buffer(8)]],
+    metal::texture_buffer<uint, metal::access::read> lut [[texture(0)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]]) {
+    constexpr int NROWS = 2 * NPAIR;
+    const int slot = int(tgid.y);
+    const int token = slot / topk;
+    const int expert = topk_ids[slot];
+    const int Nh = N / 2;
+    const int first = (int(tgid.x) * NSG + int(sgitg)) * NPAIR;
+    if (first >= Nh) return;
+    device T *out = D + (long)slot * Nh;
+    if (expert < 0) {
+        if (lane == 0) {
+            for (int j = 0; j < NPAIR && first + j < Nh; ++j) {
+                out[first + j] = T(0);
+            }
+        }
+        return;
+    }
+
+    const int bpr = K / 256;
+    const int nb32 = bpr * 8;
+    const long row_bytes = (long)bpr * 66;
+    device const T *x = X + (long)token * K;
+    device const uchar *rbase[NROWS];
+    #pragma clang loop unroll(full)
+    for (short r = 0; r < NPAIR; ++r) {
+        rbase[r] = Wq + ((long)expert * N + first + r) * row_bytes;
+        rbase[NPAIR + r] =
+            Wq + ((long)expert * N + Nh + first + r) * row_bytes;
+    }
+
+    float yl[32];
+    float sumf[NROWS];
+    #pragma clang loop unroll(full)
+    for (short r = 0; r < NROWS; ++r) sumf[r] = 0.0f;
+
+    for (int ib32 = int(lane); ib32 < nb32; ib32 += 32) {
+        const int ibl = ib32 >> 3;
+        const int ib = ib32 & 7;
+        device const metal::vec<T, 4> *y4 =
+            (device const metal::vec<T, 4> *)(x + 32 * ib32);
+        #pragma clang loop unroll(full)
+        for (short i = 0; i < 8; ++i) {
+            const metal::vec<T, 4> v = y4[i];
+            yl[4 * i + 0] = float(v.x);
+            yl[4 * i + 1] = float(v.y);
+            yl[4 * i + 2] = float(v.z);
+            yl[4 * i + 3] = float(v.w);
+        }
+        #pragma clang loop unroll(full)
+        for (short row = 0; row < NROWS; ++row) {
+            device const uchar *b = rbase[row] + (long)ibl * 66;
+            const float db = float(((device const half *)b)[0]);
+            device const ushort *q2 =
+                (device const ushort *)(b + 2) + 4 * ib;
+            device const uchar *aux8 = (device const uchar *)q2;
+            const uint aux32 = (uint)q2[2] | ((uint)q2[3] << 16);
+            const float d = db * (0.5f + float(aux32 >> 28));
+            float sum = 0.0f;
+            #pragma clang loop unroll(full)
+            for (short l = 0; l < 4; ++l) {
+                const uint code = uint(aux8[l]);
+                const uint s = (aux32 >> (7 * l)) & 127u;
+                const uint sg = s | ((metal::popcount(s) & 1u) << 7);
+                const metal::uint4 v = lut.read(code);
+                const metal::half2 h01 = as_type<metal::half2>(v.x);
+                const metal::half2 h23 = as_type<metal::half2>(v.y);
+                const metal::half2 h45 = as_type<metal::half2>(v.z);
+                const metal::half2 h67 = as_type<metal::half2>(v.w);
+                float m[8] = {float(h01.x), float(h01.y), float(h23.x), float(h23.y),
+                              float(h45.x), float(h45.y), float(h67.x), float(h67.y)};
+                #pragma clang loop unroll(full)
+                for (short j = 0; j < 8; ++j) {
+                    const float w = as_type<float>(
+                        as_type<uint>(m[j]) ^ (((sg >> j) & 1u) << 31));
+                    sum += yl[8 * l + j] * w;
+                }
+            }
+            sumf[row] += d * sum;
+        }
+    }
+
+    float sums[NROWS];
+    #pragma clang loop unroll(full)
+    for (short r = 0; r < NROWS; ++r) sums[r] = metal::simd_sum(sumf[r]);
+    if (lane == 0) {
+        #pragma clang fp reassociate(off) contract(off)
+        for (short j = 0; j < NPAIR; ++j) {
+            if (first + j >= Nh) break;
+            T g = T(sums[j] * 0.25f);
+            T u = T(sums[NPAIR + j] * 0.25f);
+            if (has_clamp) {
+                const T lim = T(limit);
+                const T nlim = T(-limit);
+                g = (g > lim) ? lim : g;
+                u = (u > lim) ? lim : ((u < nlim) ? nlim : u);
+            }
+            const T s = T(metal::precise::divide(
+                float(g), 1.0f + metal::precise::exp(-float(g))));
+            out[first + j] = s * u;
+        }
+    }
+}
+
+#define instantiate_qgemv_moe_mr_swiglu_texm(name, T, NSG, NPAIR)              \
+   template [[host_name(name)]] [[kernel]]                                     \
+   void qgemv_moe_mr_iq2_xxs_swiglu_texm<T, NSG, NPAIR>(                        \
+     device T* D [[buffer(0)]], device const uchar* Wq [[buffer(1)]],           \
+     device const T* X [[buffer(2)]], device const int* topk_ids [[buffer(3)]], \
+     const constant int &N [[buffer(4)]], const constant int &K [[buffer(5)]],  \
+     const constant int &topk [[buffer(6)]],                                    \
+     const constant int &has_clamp [[buffer(7)]],                               \
+     const constant float &limit [[buffer(8)]],                                 \
+     metal::texture_buffer<uint, metal::access::read> lut [[texture(0)]],       \
+     uint3 tgid [[threadgroup_position_in_grid]],                               \
+     ushort sgitg [[simdgroup_index_in_threadgroup]],                           \
+     ushort lane [[thread_index_in_simdgroup]]);
+
+instantiate_qgemv_moe_mr_swiglu_texm("qgemv_iq2_xxs_moe_mr_swiglu_texm", half, 2, 2)
+instantiate_qgemv_moe_mr_swiglu_texm("qgemv_iq2_xxs_moe_mr_swiglu_texm_bfloat16", bf16, 2, 2)
+
 #define instantiate_qgemv_moe_mr_swiglu(name, T, NSG, NPAIR)                 \
    template [[host_name(name)]] [[kernel]]                                   \
    void qgemv_moe_mr_iq2_xxs_swiglu<T, NSG, NPAIR>(                          \
@@ -931,6 +1426,7 @@ kernel void qgemv_moe_mr_q2_K_sum(
     constant int &N [[buffer(5)]],
     constant int &K [[buffer(6)]],
     constant int &topk [[buffer(7)]],
+    constant int &accumulate [[buffer(8)]],
     uint3 tgid [[threadgroup_position_in_grid]],
     ushort sgitg [[simdgroup_index_in_threadgroup]],
     ushort lane [[thread_index_in_simdgroup]]) {
@@ -1098,7 +1594,15 @@ kernel void qgemv_moe_mr_q2_K_sum(
     #pragma clang loop unroll(full)
     for (short row = 0; row < NR0; ++row) {
         const int r = first_row + row;
-        if (r < N && lane == 0) out[r] = T(acc[row]);
+        if (r < N && lane == 0) {
+            // accumulate: fold the shared-expert add, identical to the
+            // unfused chain T(sum) then `shared + routed` (one fp32 add, one
+            // rounding). A runtime flag rather than a template parameter so
+            // both modes run the same compiled dot walk (same contraction
+            // choices, bit-identical sums).
+            const T rounded = T(acc[row]);
+            out[r] = accumulate ? T(float(out[r]) + float(rounded)) : rounded;
+        }
     }
 }
 
@@ -1110,6 +1614,7 @@ kernel void qgemv_moe_mr_q2_K_sum(
      device const float* topk_w [[buffer(4)]],                                \
      const constant int &N [[buffer(5)]], const constant int &K [[buffer(6)]], \
      const constant int &topk [[buffer(7)]],                                  \
+     const constant int &accumulate [[buffer(8)]],                            \
      uint3 tgid [[threadgroup_position_in_grid]],                             \
      ushort sgitg [[simdgroup_index_in_threadgroup]],                         \
      ushort lane [[thread_index_in_simdgroup]]);
@@ -1125,6 +1630,7 @@ instantiate_qgemv_moe_mr_q2k_sum("qgemv_q2_K_moe_mr_sum_g48", half, 4, 8)
      device const float* topk_w [[buffer(4)]],                                \
      const constant int &N [[buffer(5)]], const constant int &K [[buffer(6)]], \
      const constant int &topk [[buffer(7)]],                                  \
+     const constant int &accumulate [[buffer(8)]],                            \
      uint3 tgid [[threadgroup_position_in_grid]],                             \
      ushort sgitg [[simdgroup_index_in_threadgroup]],                         \
      ushort lane [[thread_index_in_simdgroup]]);
@@ -1185,6 +1691,84 @@ kernel void qgemv_mb(
         if (lane == 0) D[(long)m * N + row] = T(s);
     }
 }
+
+// Dual generic GEMV: two independent problems (D0 = W0 x X0, D1 = W1 x X1;
+// same K, same format, 1 <= M <= 8 rows) in ONE dispatch, grid.y selecting
+// the problem. The per-row walk is qgemv_mb's text (block order, dequant,
+// fp32 FMA chain, simd_sum), so each output is bit-identical to the two
+// separate qgemv_mb launches. Used for GLM-5.3-Flash KDA's f_b / g_b
+// (K=128, N=8192 q8_0) which cost one launch each for ~12 us of work.
+template<typename FMT, typename T, int M>
+kernel void qgemv_dual(
+    device   T*     D0 [[buffer(0)]],
+    device   uchar* W0 [[buffer(1)]],
+    device   T*     X0 [[buffer(2)]],
+    device   T*     D1 [[buffer(3)]],
+    device   uchar* W1 [[buffer(4)]],
+    device   T*     X1 [[buffer(5)]],
+    const constant int &N0 [[buffer(6)]],
+    const constant int &N1 [[buffer(7)]],
+    const constant int &K  [[buffer(8)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint  lane [[thread_index_in_simdgroup]]) {
+    const bool second = tgid.y != 0;
+    const int N = second ? N1 : N0;
+    const int row = tgid.x;
+    if (row >= N) return;
+    device T* D = second ? D1 : D0;
+    device const uchar* Wq = second ? W1 : W0;
+    device const T* X = second ? X1 : X0;
+    const int bpr = K / FMT::block_k;
+    device const uchar* row_base = Wq + (uint)(row * bpr) * FMT::block_bytes;
+
+    constexpr int CPL = 8;
+    constexpr int LPB = FMT::block_k / CPL;
+    constexpr int BPI = 32 / LPB;
+    const int b_off = (int)lane / LPB;
+    const int col0  = ((int)lane % LPB) * CPL;
+
+    float acc[M];
+    #pragma clang loop unroll(full)
+    for (int m = 0; m < M; ++m) acc[m] = 0.0f;
+    for (int kb = b_off; kb < bpr; kb += BPI) {
+        device const uchar* base = row_base + (uint)kb * FMT::block_bytes;
+        const int x_base = kb * FMT::block_k + col0;
+        half w[8];
+        tk_dequant8<FMT>(base, col0, w);
+        #pragma clang loop unroll(full)
+        for (int m = 0; m < M; ++m) {
+            #pragma clang fp reassociate(off)
+            device const T* xm = X + (long)m * K + x_base;
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < 8; ++i) acc[m] += float(w[i]) * float(xm[i]);
+        }
+    }
+    #pragma clang loop unroll(full)
+    for (int m = 0; m < M; ++m) {
+        const float sres = metal::simd_sum(acc[m]);
+        if (lane == 0) D[(long)m * N + row] = T(sres);
+    }
+}
+
+#define instantiate_qgemv_dual_one(name, FMT, T, M)                           \
+   template [[host_name(name #M)]] [[kernel]]                                 \
+   void qgemv_dual<FMT, T, M>(                                                \
+     device T* D0 [[buffer(0)]], device uchar* W0 [[buffer(1)]],              \
+     device T* X0 [[buffer(2)]], device T* D1 [[buffer(3)]],                  \
+     device uchar* W1 [[buffer(4)]], device T* X1 [[buffer(5)]],              \
+     const constant int &N0 [[buffer(6)]], const constant int &N1 [[buffer(7)]], \
+     const constant int &K [[buffer(8)]],                                     \
+     uint3 tgid [[threadgroup_position_in_grid]],                             \
+     uint lane [[thread_index_in_simdgroup]]);
+
+#define instantiate_qgemv_dual(name, FMT, T)                                  \
+   instantiate_qgemv_dual_one(name, FMT, T, 1)                                \
+   instantiate_qgemv_dual_one(name, FMT, T, 2)                                \
+   instantiate_qgemv_dual_one(name, FMT, T, 3)                                \
+   instantiate_qgemv_dual_one(name, FMT, T, 4)
+
+instantiate_qgemv_dual("qgemv_q8_0_dual_bfloat16_m", q8_0, bf16)
+instantiate_qgemv_dual("qgemv_q8_0_dual_m", q8_0, half)
 
 [[host_name("qgemv_q8_0")]]
 kernel void qgemv_q8_0_fast(
@@ -2201,6 +2785,7 @@ instantiate_qgemv_mm_format("qgemv_mm_iq4_xs", iq4_xs);
      device T* D [[buffer(0)]], device uchar* Wq [[buffer(1)]],              \
      device T* X [[buffer(2)]],                                              \
      const constant int &N [[buffer(3)]], const constant int &K [[buffer(4)]], \
+     const constant int &LDD [[buffer(5)]],                                  \
      uint3 tgid [[threadgroup_position_in_grid]],                            \
      ushort sgitg [[simdgroup_index_in_threadgroup]],                        \
      ushort lane [[thread_index_in_simdgroup]]);
@@ -2368,4 +2953,249 @@ instantiate_qgemv_format("qgemv_mxfp6_e3m2", mxfp6_e3m2);
 instantiate_qgemv_format("qgemv_mxfp6_e2m3", mxfp6_e2m3);
 instantiate_qgemv_format("qgemv_hqq", hqq);
 
+}
+
+// ---------------------------------------------------------------------------
+// Expert-grouped slot pairing for the routed-MoE decode GEMVs (2026-09-17,
+// batching campaign). At 32 rows x top-8 the 256 (token, expert) slots hit
+// ~180 distinct experts, and the per-slot GEMV's time tracks the SLOT count,
+// not the distinct-expert count (moe_sharing_bench.py: 4.73 ms for 256, 180,
+// 32 or 8 distinct experts) - it is bound by per-slot dequant/issue work,
+// not DRAM. This kernel counting-sorts the slots by expert (one
+// threadgroup, threadgroup-memory histogram) and emits items of up to two
+// slots of the SAME expert: items[i] = {expert, slot0, slot1 | -1}. Invalid
+// slots (expert < 0 or >= E) become single items with expert -1. The GEMV
+// twin below decodes every weight once per item and applies it to both
+// slots' activations from registers, so parallelism is the item count
+// (never a serialized owner threadgroup - the 2026-08-13 regression).
+// Pairing order within an expert follows atomic arrival and is not
+// deterministic; per-slot results do not depend on it.
+// ---------------------------------------------------------------------------
+kernel void moe_group_slots(
+    device const int *topk_ids [[buffer(0)]],   // (S)
+    device int *items          [[buffer(1)]],   // (S, 3)
+    device int *num_items      [[buffer(2)]],   // (1)
+    constant int &S            [[buffer(3)]],
+    constant int &E            [[buffer(4)]],   // <= 512
+    uint tid [[thread_index_in_threadgroup]],
+    uint nt  [[threads_per_threadgroup]]) {
+  threadgroup metal::atomic_int cnt[513];
+  threadgroup metal::atomic_int cur[513];
+  threadgroup int off[513];
+  threadgroup int ioff[513];
+  threadgroup int sorted[1024];
+  for (int b = int(tid); b <= E; b += int(nt)) {
+    metal::atomic_store_explicit(&cnt[b], 0, metal::memory_order_relaxed);
+    metal::atomic_store_explicit(&cur[b], 0, metal::memory_order_relaxed);
+  }
+  metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+  for (int s = int(tid); s < S; s += int(nt)) {
+    const int e = topk_ids[s];
+    const int b = (e < 0 || e >= E) ? E : e;
+    metal::atomic_fetch_add_explicit(&cnt[b], 1, metal::memory_order_relaxed);
+  }
+  metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+  if (tid == 0) {
+    int o = 0, io = 0;
+    for (int b = 0; b <= E; ++b) {
+      off[b] = o;
+      ioff[b] = io;
+      const int c = metal::atomic_load_explicit(&cnt[b], metal::memory_order_relaxed);
+      o += c;
+      io += (b < E) ? (c + 1) / 2 : c;
+    }
+    num_items[0] = io;
+  }
+  metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+  for (int s = int(tid); s < S; s += int(nt)) {
+    const int e = topk_ids[s];
+    const int b = (e < 0 || e >= E) ? E : e;
+    const int p = metal::atomic_fetch_add_explicit(&cur[b], 1, metal::memory_order_relaxed);
+    sorted[off[b] + p] = s;
+  }
+  metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+  for (int b = int(tid); b <= E; b += int(nt)) {
+    const int c = metal::atomic_load_explicit(&cnt[b], metal::memory_order_relaxed);
+    const int base = off[b];
+    const int ib = ioff[b];
+    if (b < E) {
+      for (int k = 0; k < c; k += 2) {
+        device int *it = items + (long)(ib + (k >> 1)) * 3;
+        it[0] = b;
+        it[1] = sorted[base + k];
+        it[2] = (k + 1 < c) ? sorted[base + k + 1] : -1;
+      }
+    } else {
+      for (int k = 0; k < c; ++k) {
+        device int *it = items + (long)(ib + k) * 3;
+        it[0] = -1;
+        it[1] = sorted[base + k];
+        it[2] = -1;
+      }
+    }
+  }
+}
+
+// Two-slot twin of qgemv_moe_mr_iq2_xxs_swiglu_texm over the items above:
+// the codebook texel, the sign pattern and the block scale are decoded once
+// per (row, block) and applied to both slots' activation registers. Each
+// lane walks half a block (see the walk note), so the per-slot result is
+// within fp32 rounding of the per-slot kernel (oracle: one bf16 ulp,
+// tests/kernels/test_moe_group_metal.py).
+template<typename T, int NSG, int NPAIR>
+kernel void qgemv_moe_mr_iq2_xxs_swiglu_texm_grp(
+    device T *D [[buffer(0)]],              // (tokens*topk, N/2) act output
+    device const uchar *Wq [[buffer(1)]],   // (E, N, K/256 * 66)
+    device const T *X [[buffer(2)]],        // (tokens, K)
+    device const int *items [[buffer(3)]],  // (max_items, 3)
+    device const int *num_items [[buffer(4)]],
+    constant int &N [[buffer(5)]],
+    constant int &K [[buffer(6)]],
+    constant int &topk [[buffer(7)]],
+    constant int &has_clamp [[buffer(8)]],
+    constant float &limit [[buffer(9)]],
+    metal::texture_buffer<uint, metal::access::read> lut [[texture(0)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]]) {
+    constexpr int NROWS = 2 * NPAIR;
+    const int it = int(tgid.y);
+    if (it >= num_items[0]) return;
+    const int expert = items[it * 3];
+    const int slot0 = items[it * 3 + 1];
+    const int slot1 = items[it * 3 + 2];
+    const int Nh = N / 2;
+    const int first = (int(tgid.x) * NSG + int(sgitg)) * NPAIR;
+    if (first >= Nh) return;
+    if (expert < 0) {
+        if (lane == 0) {
+            device T *out = D + (long)slot0 * Nh;
+            for (int j = 0; j < NPAIR && first + j < Nh; ++j) out[first + j] = T(0);
+        }
+        return;
+    }
+    const int bpr = K / 256;
+    const int nb32 = bpr * 8;
+    const long row_bytes = (long)bpr * 66;
+    const bool two = slot1 >= 0;
+    device const T *xs[2];
+    xs[0] = X + (long)(slot0 / topk) * K;
+    xs[1] = two ? X + (long)(slot1 / topk) * K : xs[0];
+    device const uchar *rbase[NROWS];
+    #pragma clang loop unroll(full)
+    for (short r = 0; r < NPAIR; ++r) {
+        rbase[r] = Wq + ((long)expert * N + first + r) * row_bytes;
+        rbase[NPAIR + r] = Wq + ((long)expert * N + Nh + first + r) * row_bytes;
+    }
+    float yl[2][16];
+    float sumf[2][NROWS];
+    #pragma clang loop unroll(full)
+    for (short r = 0; r < NROWS; ++r) { sumf[0][r] = 0.0f; sumf[1][r] = 0.0f; }
+
+#define IQ2_TEXM_GRP_WALK(NBV)                                                    \
+    for (int ib32 = lb; ib32 < nb32; ib32 += 16) {                                \
+        const int ibl = ib32 >> 3;                                                \
+        const int ib = ib32 & 7;                                                  \
+        _Pragma("clang loop unroll(full)")                                        \
+        for (short s = 0; s < NBV; ++s) {                                         \
+            device const metal::vec<T, 4> *y4 =                                   \
+                (device const metal::vec<T, 4> *)(xs[s] + 32 * ib32 + 16 * hb);   \
+            _Pragma("clang loop unroll(full)")                                    \
+            for (short i = 0; i < 4; ++i) {                                       \
+                const metal::vec<T, 4> v = y4[i];                                 \
+                yl[s][4 * i + 0] = float(v.x);                                    \
+                yl[s][4 * i + 1] = float(v.y);                                    \
+                yl[s][4 * i + 2] = float(v.z);                                    \
+                yl[s][4 * i + 3] = float(v.w);                                    \
+            }                                                                     \
+        }                                                                         \
+        _Pragma("clang loop unroll(full)")                                        \
+        for (short row = 0; row < NROWS; ++row) {                                 \
+            device const uchar *b = rbase[row] + (long)ibl * 66;                  \
+            const float db = float(((device const half *)b)[0]);                  \
+            device const ushort *q2 = (device const ushort *)(b + 2) + 4 * ib;    \
+            device const uchar *aux8 = (device const uchar *)q2;                  \
+            const uint aux32 = (uint)q2[2] | ((uint)q2[3] << 16);                 \
+            const float d = db * (0.5f + float(aux32 >> 28));                     \
+            float sum[2] = {0.0f, 0.0f};                                          \
+            _Pragma("clang loop unroll(full)")                                    \
+            for (short l = 0; l < 2; ++l) {                                       \
+                const short lg = short(2 * hb) + l;                               \
+                const uint code = uint(aux8[lg]);                                 \
+                const uint sg0 = (aux32 >> (7 * lg)) & 127u;                      \
+                const uint sg = sg0 | ((metal::popcount(sg0) & 1u) << 7);         \
+                const metal::uint4 v = lut.read(code);                            \
+                const metal::half2 h01 = as_type<metal::half2>(v.x);              \
+                const metal::half2 h23 = as_type<metal::half2>(v.y);              \
+                const metal::half2 h45 = as_type<metal::half2>(v.z);              \
+                const metal::half2 h67 = as_type<metal::half2>(v.w);              \
+                float m[8] = {float(h01.x), float(h01.y), float(h23.x), float(h23.y), \
+                              float(h45.x), float(h45.y), float(h67.x), float(h67.y)}; \
+                _Pragma("clang loop unroll(full)")                                \
+                for (short j = 0; j < 8; ++j) {                                   \
+                    const float w = as_type<float>(                               \
+                        as_type<uint>(m[j]) ^ (((sg >> j) & 1u) << 31));          \
+                    _Pragma("clang loop unroll(full)")                            \
+                    for (short s = 0; s < NBV; ++s) sum[s] += yl[s][8 * l + j] * w; \
+                }                                                                 \
+            }                                                                     \
+            _Pragma("clang loop unroll(full)")                                    \
+            for (short s = 0; s < NBV; ++s) sumf[s][row] += d * sum[s];           \
+        }                                                                         \
+    }
+    // Half-block per lane: lanes (2b, 2b+1) share block b of each 16-block
+    // iteration and each own two of its four 8-weight codes, so the live
+    // activation registers stay at 32 floats for BOTH slots (a whole block
+    // for two slots spilled: pair items ran 6x a single slot). The fp32
+    // chain per (slot, row, block) is therefore split in two before the
+    // d*sum fold - within fp32 rounding of the per-slot kernel, not
+    // bit-identical (oracle: one bf16 ulp).
+    const int hb = int(lane) & 1;
+    const int lb = int(lane) >> 1;
+    if (two) { IQ2_TEXM_GRP_WALK(2) } else { IQ2_TEXM_GRP_WALK(1) }
+#undef IQ2_TEXM_GRP_WALK
+
+    const int nvalid = two ? 2 : 1;
+    for (short s = 0; s < nvalid; ++s) {
+        float sums[NROWS];
+        #pragma clang loop unroll(full)
+        for (short r = 0; r < NROWS; ++r) sums[r] = metal::simd_sum(sumf[s][r]);
+        if (lane == 0) {
+            #pragma clang fp reassociate(off) contract(off)
+            device T *out = D + (long)(s == 0 ? slot0 : slot1) * Nh;
+            for (short j = 0; j < NPAIR; ++j) {
+                if (first + j >= Nh) break;
+                T g = T(sums[j] * 0.25f);
+                T u = T(sums[NPAIR + j] * 0.25f);
+                if (has_clamp) {
+                    const T lim = T(limit);
+                    const T nlim = T(-limit);
+                    g = (g > lim) ? lim : g;
+                    u = (u > lim) ? lim : ((u < nlim) ? nlim : u);
+                }
+                const T sv = T(metal::precise::divide(
+                    float(g), 1.0f + metal::precise::exp(-float(g))));
+                out[first + j] = sv * u;
+            }
+        }
+    }
+}
+
+#define instantiate_qgemv_moe_mr_swiglu_texm_grp(name, T, NSG, NPAIR)          \
+   template [[host_name(name)]] [[kernel]]                                   \
+   void qgemv_moe_mr_iq2_xxs_swiglu_texm_grp<T, NSG, NPAIR>(                 \
+     device T *D [[buffer(0)]], device const uchar *Wq [[buffer(1)]],       \
+     device const T *X [[buffer(2)]], device const int *items [[buffer(3)]], \
+     device const int *num_items [[buffer(4)]],                              \
+     constant int &N [[buffer(5)]], constant int &K [[buffer(6)]],           \
+     constant int &topk [[buffer(7)]], constant int &has_clamp [[buffer(8)]], \
+     constant float &limit [[buffer(9)]],                                    \
+     metal::texture_buffer<uint, metal::access::read> lut [[texture(0)]],   \
+     uint3 tgid [[threadgroup_position_in_grid]],                            \
+     ushort sgitg [[simdgroup_index_in_threadgroup]],                        \
+     ushort lane [[thread_index_in_simdgroup]]);
+
+instantiate_qgemv_moe_mr_swiglu_texm_grp("qgemv_iq2_xxs_moe_mr_swiglu_texm_grp", half, 2, 2)
+instantiate_qgemv_moe_mr_swiglu_texm_grp("qgemv_iq2_xxs_moe_mr_swiglu_texm_grp_bfloat16", mittens::bf16, 2, 2)
+  }
 }

@@ -1,0 +1,4 @@
+M= 8 kda q|k q4K    N= 16384 K= 4096 | v1   351.1us  108GB/s e0e+00 | v2   306.3us  123GB/s e7e-04 | v3   319.3us  118GB/s e0e+00 | v4   334.7us  113GB/s e7e-04 | v1   341.3us  111GB/s e0e+00
+M=16 kda q|k q4K    N= 16384 K= 4096 | v1   426.2us   89GB/s e0e+00 | v2   395.4us   95GB/s e3e-03 | v3   466.5us   81GB/s e0e+00 | v4   515.7us   73GB/s e3e-03 | v1   404.9us   93GB/s e0e+00
+M=24 kda q|k q4K    N= 16384 K= 4096 | v1   545.3us   69GB/s e0e+00 | v2   501.3us   75GB/s e3e-03 | v3   816.9us   46GB/s e0e+00 | v4   636.2us   59GB/s e3e-03 | v1   540.8us   70GB/s e0e+00
+M=32 kda q|k q4K    N= 16384 K= 4096 | v1   637.3us   59GB/s e0e+00 | v2   576.4us   65GB/s e3e-03 | v3   863.6us   44GB/s e0e+00 | v4   766.9us   49GB/s e3e-03 | v1   637.5us   59GB/s e0e+00

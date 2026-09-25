@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <string>
+#include <utility>
 
 #include "base_q_descriptor.h"
 
@@ -134,6 +135,40 @@ inline std::string selective_scan_kernel_name(const std::string& variant,
 }
 inline std::string gdn_recur_kernel_name(const std::string& t, int Dk) {
   return "gdn_recur_" + t + "_d" + std::to_string(Dk);
+}
+inline std::string mla_sparse_latent_partition_kernel_name(const std::string& t,
+                                                           int latent) {
+  return "mla_sparse_latent_partition_" + t + "_" + std::to_string(latent);
+}
+inline std::string mla_sparse_latent_reduce_kernel_name(const std::string& t,
+                                                        int latent) {
+  return "mla_sparse_latent_reduce_" + t + "_" + std::to_string(latent);
+}
+inline std::string kda_fused_prepare_kernel_name(const std::string& t, int Dk,
+                                                 int Dv) {
+  return "kda_fused_prepare_" + t + "_dk" + std::to_string(Dk) + "_dv" +
+         std::to_string(Dv);
+}
+inline std::string kda_recur_kernel_name(int Dk, int rows = 1) {
+  std::string n = "kda_recur_d" + std::to_string(Dk);
+  if (rows > 1) n += "_r" + std::to_string(rows);
+  return n;
+}
+// Value rows per simdgroup for kda_recur (Dk 128 only; instantiated for
+// 1, 2, 4, 8; every choice is bit-identical, see kda.metal). Measured per
+// layer at 2500 tokens, H=64 (w11-prefill/bench_kda_rows.log): R=1 89 ms,
+// R=2 44, R=4 5.7, R=8 4.8. VLLM_QC_KDA_RECUR_ROWS overrides.
+inline int kda_recur_rows_default() {
+  static const int rows = [] {
+    const char* e = std::getenv("VLLM_QC_KDA_RECUR_ROWS");
+    int r = e ? std::atoi(e) : 8;
+    return (r == 1 || r == 2 || r == 4 || r == 8) ? r : 8;
+  }();
+  return rows;
+}
+inline std::string kda_gated_rmsnorm_f32_kernel_name(const std::string& t,
+                                                     int D) {
+  return "kda_gated_rmsnorm_f32_" + t + "_d" + std::to_string(D);
 }
 inline std::string gdn_short_conv_kernel_name(const std::string& t) {
   return "gdn_short_conv_" + t;
@@ -1601,6 +1636,284 @@ void launch_gdn_gated_rmsnorm_f32(E& e, typename E::in_t y, typename E::in_t z,
   e.out(out, 3);
   e.bytes(rows, 4);
   e.bytes(Hv, 5);
+  e.bytes(z_stride, 6);
+  e.bytes(eps, 7);
+  e.dispatch(rows, 1, 1, 32, 1, 1);
+}
+
+// ----- Sparse NoPE-MLA decode over bf16/f16 latent pages (GLM-5.3-Flash):
+//        partition grid (H, R, P) over the top-k list, fp32 partials,
+//        reduce grid (H, R, 1). -----
+template <class E>
+void launch_mla_sparse_latent_partition(
+    E& e, typename E::in_t q, typename E::in_t cache,
+    typename E::in_t block_table, typename E::in_t indices,
+    typename E::out_t part_acc, typename E::out_t part_ml, int R, int H,
+    int latent, int block_size, int block_stride, int bt_stride, float scale,
+    int width, int partitions, int max_block_col,
+    const std::string& type_name, typename E::in_t tlen, int has_tlen) {
+  std::string name = mla_sparse_latent_partition_kernel_name(type_name, latent);
+  e.pipeline(name);
+  e.in(q, 0);
+  e.in(cache, 1);
+  e.in(block_table, 2);
+  e.in(indices, 3);
+  e.out(part_acc, 4);
+  e.out(part_ml, 5);
+  e.bytes(block_size, 6);
+  e.bytes(block_stride, 7);
+  e.bytes(bt_stride, 8);
+  e.bytes(scale, 9);
+  e.bytes(H, 10);
+  e.bytes(width, 11);
+  e.bytes(partitions, 12);
+  e.bytes(max_block_col, 13);
+  e.in(tlen, 14);
+  e.bytes(has_tlen, 15);
+  e.dispatch(H, R, partitions, 32, 1, 1);
+}
+
+// Head-grouped (MQA) partition: grid (H / (G*NSG), R, P), threadgroup
+// 32*NSG; cfg 1..4 = (G,NSG) (4,4) (4,8) (2,8) (2,4). Same partials layout.
+// cfg 5/6 = the simdgroup-MMA kernel (16 heads per threadgroup, NSG 4/8
+// simdgroups each owning a LATENT/NSG slice); G is reported as 16/NSG so
+// G*NSG is the heads-per-threadgroup in both families.
+inline bool mla_sparse_latent_mqa_cfg(int cfg, int& G, int& NSG) {
+  switch (cfg) {
+    case 1: G = 4; NSG = 4; return true;
+    case 2: G = 4; NSG = 8; return true;
+    case 3: G = 2; NSG = 8; return true;
+    case 4: G = 2; NSG = 4; return true;
+    case 5: G = 4; NSG = 4; return true;
+    case 6: G = 2; NSG = 8; return true;
+    default: return false;
+  }
+}
+inline bool mla_sparse_latent_cfg_is_mma(int cfg) { return cfg == 5 || cfg == 6; }
+inline std::string mla_sparse_latent_mma_kernel_name(const std::string& t,
+                                                     int latent, int NSG) {
+  return "mla_sparse_latent_mma_" + t + "_" + std::to_string(latent) + "_s" +
+         std::to_string(NSG);
+}
+inline std::string mla_sparse_latent_mqa_kernel_name(const std::string& t,
+                                                     int latent, int G, int NSG) {
+  return "mla_sparse_latent_mqa_" + t + "_" + std::to_string(latent) + "_g" +
+         std::to_string(G) + "s" + std::to_string(NSG);
+}
+template <class E>
+void launch_mla_sparse_latent_mqa(
+    E& e, typename E::in_t q, typename E::in_t cache,
+    typename E::in_t block_table, typename E::in_t indices,
+    typename E::out_t part_acc, typename E::out_t part_ml, int R, int H,
+    int latent, int block_size, int block_stride, int bt_stride, float scale,
+    int width, int partitions, int max_block_col,
+    const std::string& type_name, typename E::in_t tlen, int has_tlen,
+    int G, int NSG, bool mma) {
+  e.pipeline(mma ? mla_sparse_latent_mma_kernel_name(type_name, latent, NSG)
+                 : mla_sparse_latent_mqa_kernel_name(type_name, latent, G, NSG));
+  e.in(q, 0);
+  e.in(cache, 1);
+  e.in(block_table, 2);
+  e.in(indices, 3);
+  e.out(part_acc, 4);
+  e.out(part_ml, 5);
+  e.bytes(block_size, 6);
+  e.bytes(block_stride, 7);
+  e.bytes(bt_stride, 8);
+  e.bytes(scale, 9);
+  e.bytes(H, 10);
+  e.bytes(width, 11);
+  e.bytes(partitions, 12);
+  e.bytes(max_block_col, 13);
+  e.in(tlen, 14);
+  e.bytes(has_tlen, 15);
+  e.dispatch(H / (G * NSG), R, partitions, 32 * NSG, 1, 1);
+}
+
+template <class E>
+void launch_mla_sparse_latent_reduce(E& e, typename E::in_t part_acc,
+                                     typename E::in_t part_ml,
+                                     typename E::out_t out, int R, int H,
+                                     int latent, int partitions,
+                                     const std::string& type_name) {
+  e.pipeline(mla_sparse_latent_reduce_kernel_name(type_name, latent));
+  e.in(part_acc, 0);
+  e.in(part_ml, 1);
+  e.out(out, 2);
+  e.bytes(H, 3);
+  e.bytes(partitions, 4);
+  e.dispatch(H, R, 1, 32, 1, 1);
+}
+
+// ----- KDA (per-channel-decay delta rule, GLM-5.3-Flash / Kimi-Linear).
+//        kda_fused_prepare: one simdgroup per (request, row, token chunk)
+//        with 4*H rows per request ([q_h][k_h][v_h][gate_h]); conv ring +
+//        L2 norm + gate. Grid y = token chunks (prefill parallelism; spec
+//        mode is one chunk).
+//        kda_recur: gdn_recur's grid (Dv, 1, R*H) with decay@3 as
+//        [tokens, H, Dk] fp32. kda_gated_rmsnorm_f32: sigmoid gate. -----
+template <class E>
+void launch_kda_fused_prepare(
+    E& e, typename E::in_t qkv, typename E::in_t g_logits,
+    typename E::in_t beta_logits, typename E::in_t conv_w,
+    typename E::out_t conv_state_pool, typename E::in_t cu_seqlens,
+    typename E::in_t slot_mapping, typename E::in_t A_log,
+    typename E::in_t dt_bias, typename E::out_t q, typename E::out_t k,
+    typename E::out_t v, typename E::out_t decay, typename E::out_t beta, int R,
+    int H, int Dk, int Dv, int kernel_size, int load_initial, int qkv_stride,
+    int g_stride, int beta_stride, int conv_state_stride, int chan_stride,
+    int col_stride, float l2_eps, float q_scale, float lower_bound,
+    int has_dt_bias, const std::string& type_name,
+    typename E::in_t num_accepted, int spec_mode, int chunk_tokens,
+    int chunks) {
+  e.pipeline(kda_fused_prepare_kernel_name(type_name, Dk, Dv));
+  e.in(qkv, 0);
+  e.in(g_logits, 1);
+  e.in(beta_logits, 2);
+  e.in(conv_w, 3);
+  e.out(conv_state_pool, 4);
+  e.in(cu_seqlens, 5);
+  e.in(slot_mapping, 6);
+  e.in(A_log, 7);
+  e.in(dt_bias, 8);
+  e.out(q, 9);
+  e.out(k, 10);
+  e.out(v, 11);
+  e.out(decay, 12);
+  e.out(beta, 13);
+  e.bytes(R, 14);
+  e.bytes(H, 15);
+  e.bytes(kernel_size, 16);
+  e.bytes(load_initial, 17);
+  e.bytes(qkv_stride, 18);
+  e.bytes(g_stride, 19);
+  e.bytes(beta_stride, 20);
+  e.bytes(conv_state_stride, 21);
+  e.bytes(chan_stride, 22);
+  e.bytes(l2_eps, 23);
+  e.bytes(q_scale, 24);
+  e.bytes(lower_bound, 25);
+  e.bytes(has_dt_bias, 26);
+  e.bytes(col_stride, 27);
+  e.in(num_accepted, 28);
+  e.bytes(spec_mode, 29);
+  e.bytes(chunk_tokens, 30);
+  e.dispatch(R * 4 * H, chunks, 1, 32, 1, 1);
+}
+
+// Conv history writeback for the requests kda_fused_prepare walked in more
+// than one chunk (their pool rows are read by chunk 0 and must not be
+// written inside that dispatch). channels = 3 * H * Dk conv channels.
+template <class E>
+void launch_kda_conv_history_write(E& e, typename E::in_t qkv,
+                                   typename E::out_t conv_state_pool,
+                                   typename E::in_t cu_seqlens,
+                                   typename E::in_t slot_mapping, int R,
+                                   int channels, int kernel_size,
+                                   int qkv_stride, int conv_state_stride,
+                                   int chan_stride, int col_stride,
+                                   int chunk_tokens,
+                                   const std::string& type_name) {
+  e.pipeline("kda_conv_history_write_" + type_name);
+  e.in(qkv, 0);
+  e.out(conv_state_pool, 1);
+  e.in(cu_seqlens, 2);
+  e.in(slot_mapping, 3);
+  e.bytes(R, 4);
+  e.bytes(channels, 5);
+  e.bytes(kernel_size, 6);
+  e.bytes(qkv_stride, 7);
+  e.bytes(conv_state_stride, 8);
+  e.bytes(chan_stride, 9);
+  e.bytes(col_stride, 10);
+  e.bytes(chunk_tokens, 11);
+  e.dispatch((channels + 255) / 256, R, 1, 256, 1, 1);
+}
+
+// Speculative-verify recurrence: state_pool rows at slot_table[r, *];
+// initial from slot_table[r, num_accepted[r]-1], checkpoint after every
+// timestep to slot_table[r, t].
+// Value rows per simdgroup for kda_recur_spec (Dk 128; 1, 2, 4, 8; every
+// choice bit-identical). VLLM_QC_KDA_SPEC_ROWS, read per call so tests can
+// switch it; default 1 = the original grid (Dv, 1, R*H).
+inline int kda_recur_spec_rows_default() {
+  const char* e = std::getenv("VLLM_QC_KDA_SPEC_ROWS");
+  const int r = e ? std::atoi(e) : 1;
+  return (r == 1 || r == 2 || r == 4 || r == 8) ? r : 1;
+}
+template <class E>
+void launch_kda_recur_spec(E& e, typename E::in_t q, typename E::in_t k,
+                           typename E::in_t v, typename E::in_t decay,
+                           typename E::in_t beta, typename E::out_t state_pool,
+                           typename E::in_t cu_seqlens,
+                           typename E::in_t slot_table,
+                           typename E::in_t num_accepted, typename E::out_t y,
+                           int R, int H, int Dv, int Dk, int table_stride,
+                           int state_stride, int rows = 0) {
+  if (rows <= 0) rows = kda_recur_spec_rows_default();
+  if (Dk != 128 || Dv % rows != 0) rows = 1;
+  std::string name = "kda_recur_spec_d" + std::to_string(Dk);
+  if (rows > 1) name += "_r" + std::to_string(rows);
+  e.pipeline(name);
+  e.in(q, 0);
+  e.in(k, 1);
+  e.in(v, 2);
+  e.in(decay, 3);
+  e.in(beta, 4);
+  e.out(state_pool, 5);
+  e.in(cu_seqlens, 6);
+  e.in(slot_table, 7);
+  e.out(y, 8);
+  e.bytes(R, 9);
+  e.bytes(H, 10);
+  e.bytes(Dv, 11);
+  e.bytes(table_stride, 12);
+  e.bytes(state_stride, 13);
+  e.in(num_accepted, 14);
+  e.dispatch(Dv / rows, 1, R * H, 32, 1, 1);
+}
+
+template <class E>
+void launch_kda_recur(E& e, typename E::in_t q, typename E::in_t k,
+                      typename E::in_t v, typename E::in_t decay,
+                      typename E::in_t beta, typename E::out_t state_pool,
+                      typename E::in_t cu_seqlens,
+                      typename E::in_t slot_mapping, typename E::out_t y, int R,
+                      int H, int Dv, int Dk, int load_initial,
+                      int state_stride, int rows = 0) {
+  if (rows <= 0) rows = kda_recur_rows_default();
+  if (Dk != 128 || Dv % rows != 0) rows = 1;
+  e.pipeline(kda_recur_kernel_name(Dk, rows));
+  e.in(q, 0);
+  e.in(k, 1);
+  e.in(v, 2);
+  e.in(decay, 3);
+  e.in(beta, 4);
+  e.out(state_pool, 5);
+  e.in(cu_seqlens, 6);
+  e.in(slot_mapping, 7);
+  e.out(y, 8);
+  e.bytes(R, 9);
+  e.bytes(H, 10);
+  e.bytes(Dv, 11);
+  e.bytes(load_initial, 12);
+  e.bytes(state_stride, 13);
+  e.dispatch(Dv / rows, 1, R * H, 32, 1, 1);
+}
+
+template <class E>
+void launch_kda_gated_rmsnorm_f32(E& e, typename E::in_t y, typename E::in_t z,
+                                  typename E::in_t weight,
+                                  typename E::out_t out, int rows, int H,
+                                  int dim, int z_stride, float eps,
+                                  const std::string& type_name) {
+  e.pipeline(kda_gated_rmsnorm_f32_kernel_name(type_name, dim));
+  e.in(y, 0);
+  e.in(z, 1);
+  e.in(weight, 2);
+  e.out(out, 3);
+  e.bytes(rows, 4);
+  e.bytes(H, 5);
   e.bytes(z_stride, 6);
   e.bytes(eps, 7);
   e.dispatch(rows, 1, 1, 32, 1, 1);
@@ -6467,8 +6780,54 @@ void launch_qgemv(E& e, typename E::out_t d, typename E::in_t wq,
     e.in(x, 2);
     e.bytes(N, 3);
     e.bytes(K, 4);
-    // 2 simdgroups x 2 rows per threadgroup.
+    // 2 simdgroups x 2 rows per threadgroup. (Split-K variants - 2/4
+    // simdgroups per row pair - measured 239/222 GB/s vs 259 at M=1 on
+    // 2026-09-11 and were removed.)
     e.dispatch(N / 4, 1, 1, 64, 1, 1);
+    return;
+  }
+
+  // q8_0 rides the llama.cpp-geometry split-K kernel (qgemv_q8_0_nr): the
+  // one-row walk measured 250-350 GB/s at the GLM-5.3-Flash projection
+  // shapes. Geometry (rows x simdgroups) is VLLM_QC_Q8_NR_GEOM (default
+  // 2x4, llama.cpp's N_R0/N_SG). The route is opt-in per profile
+  // (VLLM_QC_Q8_NR=1, set in the glm53f-q2-1 env block): it is not
+  // bit-identical to the generic walk, and profiles the GLM campaign never
+  // gated (any GGUF with q8_0 tensors) keep the generic kernel. K <= 512
+  // keeps the generic route either way (the "_small" kernel carve-out above).
+  static const bool q8_nr_on = [] {
+    const char* v = std::getenv("VLLM_QC_Q8_NR");
+    return v != nullptr && v[0] == '1' && v[1] == '\0';
+  }();
+  static const std::pair<int, std::string> q8_geom = [] {
+    const char* v = std::getenv("VLLM_QC_Q8_NR_GEOM");
+    std::string g = v ? v : "2x4";
+    static const char* const known[] = {"2x4", "4x2", "4x4", "2x2", "1x4", "2x8"};
+    bool ok = false;
+    for (const char* k : known) ok = ok || g == k;
+    if (!ok) g = "2x4";
+    return std::make_pair(g[0] - '0', g);
+  }();
+  // fp16 has only the 2x4 / 4x2 instantiations: the geometry actually
+  // launched decides both the row divisibility and the dispatch.
+  const bool q8_bf16 = type_name == "bfloat16";
+  const std::string q8_g =
+      (!q8_bf16 && q8_geom.second != "2x4" && q8_geom.second != "4x2")
+          ? std::string("2x4")
+          : q8_geom.second;
+  if (fmt == "q8_0" && q8_nr_on && K > 512 && K % 32 == 0 &&
+      N % (q8_g[0] - '0') == 0 && type_name != "float32") {
+    const std::string name =
+        "qgemv_q8_0_nr_" + q8_g + (q8_bf16 ? "_bfloat16" : "");
+    const int nr = q8_g[0] - '0';
+    const int nsg = q8_g[2] - '0';
+    e.pipeline(name);
+    e.out(d, 0);
+    e.in(wq, 1);
+    e.in(x, 2);
+    e.bytes(N, 3);
+    e.bytes(K, 4);
+    e.dispatch(N / nr, 1, 1, 32 * nsg, 1, 1);
     return;
   }
 
@@ -6492,6 +6851,220 @@ void launch_qgemv(E& e, typename E::out_t d, typename E::in_t wq,
   // two-simdgroup split-K (3-4x better at the small BitNet shapes but 2-3x
   // worse at the K=4096 LLM shapes, both half-split and interleaved).
   e.dispatch(N, 1, 1, 32, 1, 1);
+}
+
+// q8_0 speculative-verify widths (2 <= M <= 4) in the llama.cpp geometry:
+// qgemv_q8_0_nr_mb reads every block once for all M rows and reproduces the
+// batch-1 qgemv_q8_0_nr numerics row for row. Eligibility mirrors the
+// batch-1 NR route (opt-in VLLM_QC_Q8_NR=1, K > 512, K % 32, N % 2,
+// non-fp32) so a shape never mixes the two summation orders across batch
+// widths. X (M, K) and D (M, N) contiguous row-major.
+constexpr int kQ8NrMbMaxM = 8;  // widest M the parts launcher serves
+
+inline bool q8_0_nr_mb_eligible(const std::string& fmt, int N, int K, int M,
+                                const std::string& type_name) {
+  static const bool q8_nr_on = [] {
+    const char* v = std::getenv("VLLM_QC_Q8_NR");
+    return v != nullptr && v[0] == '1' && v[1] == '\0';
+  }();
+  // Instantiated widths: 2..4. Any other M in 2..kQ8NrMbMaxM is decomposed
+  // by launch_qgemv_q8_0_nr_mb_parts.
+  return fmt == "q8_0" && q8_nr_on && M >= 2 && M <= kQ8NrMbMaxM && K > 512 &&
+         K % 32 == 0 && N % 2 == 0 && type_name != "float32";
+}
+
+// The direct instantiation for a row count, or 0 when M must be split.
+inline int q8_0_nr_mb_direct(int M) { return (M >= 2 && M <= 4) ? M : 0; }
+
+// Greedy split of M rows into instantiated widths {4, 3, 2}, never leaving
+// a 1-row tail (5 -> 3+2, 6 -> 4+2, 7 -> 4+3, 8 -> 4+4). Each part is one
+// launch over a row window of X and D; per-row results are the NR kernel's
+// whatever the split (its contract), so the route is bit-identical to the
+// direct launch at 2..4. Measured 2026-09-17
+// (perf/results/2026-09-15/glm53f-q2-conc/dbench_m_chunked.log): at M=8 the
+// generic mb walk runs at 58-137 GB/s and the SM GEMM at 65-123, while two
+// NR passes hold 123-257 (kda_v 363 -> 160 us, attn_output 1045 -> 277).
+// Wider NB instantiations lost (see qgemv.metal), so 9+ rows stay on the
+// SM GEMM until a weight-stationary GEMM for that band exists.
+inline int q8_0_nr_mb_next_part(int M) {
+  static const int parts[] = {4, 3, 2};
+  for (int i = 0; i < 3; ++i) {
+    if (parts[i] <= M && M - parts[i] != 1) return parts[i];
+  }
+  return 0;
+}
+
+template <class E>
+void launch_qgemv_q8_0_nr_mb(E& e, typename E::out_t d, typename E::in_t wq,
+                             typename E::in_t x, int N, int K, int M,
+                             const std::string& type_name, int ldd = -1) {
+  // Geometry: VLLM_QC_Q8_NR_MB_GEOM in {4x4, 2x4}; both NSG=4, so both
+  // keep the batch-1 numerics. 4x4 is the measured default (2026-09-11
+  // sweep at M=2..4; 1x4 and 2x8 lost everywhere and were dropped).
+  static const std::string geom = [] {
+    const char* v = std::getenv("VLLM_QC_Q8_NR_MB_GEOM");
+    std::string g = v ? v : "4x4";
+    return (g == "2x4" || g == "4x4") ? g : std::string("4x4");
+  }();
+  const bool bf16 = type_name == "bfloat16";
+  // N % 4 != 0 (N even by eligibility) takes the 2-row pair; same numerics.
+  const std::string g = (N % 4 == 0) ? geom : std::string("2x4");
+  const int nr = g[0] - '0';
+  const int nsg = g[2] - '0';
+  std::string name = "qgemv_q8_0_nr_" + g + "_mb" + std::to_string(M);
+  if (bf16) name += "_bfloat16";
+  e.pipeline(name);
+  e.out(d, 0);
+  e.in(wq, 1);
+  e.in(x, 2);
+  e.bytes(N, 3);
+  e.bytes(K, 4);
+  // Output row stride: the KDA in_proj shards write column slices of one
+  // [M, total] tensor in place (ldd = its row stride); N when dense.
+  const int ld = ldd < 0 ? N : ldd;
+  e.bytes(ld, 5);
+  e.dispatch(N / nr, 1, 1, 32 * nsg, 1, 1);
+}
+
+// M rows as a sequence of instantiated-width launches in one encoder (see
+// q8_0_nr_mb_next_part). d and x are row-major with M rows; the parts are
+// row windows (views bind by storage offset), ldd is d's row stride.
+template <class E, class TensorLike>
+void launch_qgemv_q8_0_nr_mb_parts(E& e, const TensorLike& d,
+                                   typename E::in_t wq, const TensorLike& x,
+                                   int N, int K, int M,
+                                   const std::string& type_name, int ldd) {
+  int r0 = 0;
+  while (r0 < M) {
+    const int m = q8_0_nr_mb_next_part(M - r0);
+    launch_qgemv_q8_0_nr_mb(e, d.narrow(0, r0, m), wq, x.narrow(0, r0, m), N,
+                            K, m, type_name, ldd);
+    r0 += m;
+  }
+}
+
+// Small-M MMA GEMM (qgemm_mma<FMT, MT>): fp32 partials P (KS, M, N), Wq
+// q8_0 or q4_K, X (M, K) bf16 row-major, M <= 32 padded to MT in {8,16,24,32}, K
+// split across grid.z into KS slices. Grid (N/32, 1, KS), 128 threads
+// (4 simdgroups x 8 rows). qgemm_mma_reduce folds the slices into D (M, N)
+// bf16 rows ldd apart. Host guards: q8_0 (K % 32) or q4_K (K % 256), bf16,
+// N % 32 == 0, 1 <= M <= 32.
+constexpr int kQgemmMmaMaxM = 32;
+// Variants: 1 = (RPS 8, BK 32) the original; 2 = (16, 32); 3 = (8, 64);
+// 4 = (16, 64). RPS rows per simdgroup (x4 simdgroups = rows per
+// threadgroup), BK = K per stage. 0 = the per-(fmt, M) table below.
+inline void qgemm_mma_variant_params(int v, int& rps, int& bk) {
+  switch (v) {
+    case 2: rps = 16; bk = 32; return;
+    case 3: rps = 8; bk = 64; return;
+    case 4: rps = 16; bk = 64; return;
+    default: rps = 8; bk = 32; return;
+  }
+}
+inline int qgemm_mma_auto_variant(const std::string& fmt, int M, int N, int K) {
+  // perf/results/2026-09-15/glm53f-q2-conc/mma_variants.log (M1 Ultra,
+  // DRAM-resident): r16k32 wins at 16..32 rows wherever N >= 4096 (kda_v
+  // M=32 352 vs 540 us, attn_out 552 vs 761, lm_head 3.9 vs 4.6 ms, q4_K
+  // q|k 655 vs 729); r16k64 wins the short-K shexp down (K 2048, M=32 119
+  // vs 176); N=2112 (33 threadgroups at 64 rows) stays on r8k32.
+  (void)fmt; (void)M;
+  if (N < 4096) return 1;
+  if (K <= 2048) return 4;
+  return 2;
+}
+inline bool qgemm_mma_variant_ok(int v, int N, int K) {
+  int rps, bk;
+  qgemm_mma_variant_params(v, rps, bk);
+  return N % (4 * rps) == 0 && K % bk == 0;
+}
+inline int qgemm_mma_k_slices(int N, int K, int v = 1) {
+  // Enough threadgroups to fill the GPU (>= ~512 at 128 threads), capped
+  // by the stage count so every slice has work.
+  int rps, bk;
+  qgemm_mma_variant_params(v, rps, bk);
+  const int tgs = N / (4 * rps);
+  int ks = 1;
+  while (ks < 8 && tgs * ks < 512 && (K / bk) / (ks * 2) >= 4) ks *= 2;
+  return ks;
+}
+template <class E>
+void launch_qgemm_mma(E& e, typename E::out_t p, typename E::in_t wq,
+                      typename E::in_t x, int N, int K, int M, int ks,
+                      const std::string& fmt, int v = 1) {
+  const int mt = ((M + 7) / 8) * 8;
+  int rps, bk;
+  qgemm_mma_variant_params(v, rps, bk);
+  e.pipeline("qgemm_mma_" + fmt + "_m" + std::to_string(mt) + "_r" +
+             std::to_string(rps) + "k" + std::to_string(bk) + "_bfloat16");
+  e.out(p, 0);
+  e.in(wq, 1);
+  e.in(x, 2);
+  e.bytes(N, 3);
+  e.bytes(K, 4);
+  e.bytes(M, 5);
+  e.bytes(ks, 6);
+  e.dispatch(N / (4 * rps), 1, ks, 128, 1, 1);
+}
+template <class E>
+void launch_qgemm_mma_reduce(E& e, typename E::out_t d, typename E::in_t p,
+                             int N, int M, int ks, int ldd) {
+  e.pipeline("qgemm_mma_reduce");
+  e.out(d, 0);
+  e.in(p, 1);
+  e.bytes(N, 2);
+  e.bytes(M, 3);
+  e.bytes(ks, 4);
+  const int ld = ldd < 0 ? N : ldd;
+  e.bytes(ld, 5);
+  const int threads = M * (N / 4);
+  e.dispatch((threads + 255) / 256, 1, 1, 256, 1, 1);
+}
+
+// Gate|up pair GEMV + SwiGLU epilogue (qgemv_q8_0_nr_pair_swiglu): D is
+// (M, N/2), Wq the merged gate|up q8_0 weight (N rows). NSG fixed at 4 so
+// every row's K-split reduction matches the 4x4 / 2x4 NR launches bit for
+// bit. Host guards: q8_0, 1 <= M <= 4, N % 4 == 0, K % 32 == 0, K > 512.
+template <class E>
+void launch_qgemv_q8_0_nr_pair_swiglu(E& e, typename E::out_t d,
+                                      typename E::in_t wq, typename E::in_t x,
+                                      int N, int K, int M, int has_clamp,
+                                      float limit,
+                                      const std::string& type_name) {
+  std::string name = "qgemv_q8_0_nr_pair_swiglu_mb" + std::to_string(M);
+  if (type_name == "bfloat16") name += "_bfloat16";
+  e.pipeline(name);
+  e.out(d, 0);
+  e.in(wq, 1);
+  e.in(x, 2);
+  e.bytes(N, 3);
+  e.bytes(K, 4);
+  e.bytes(has_clamp, 5);
+  e.bytes(limit, 6);
+  e.dispatch(N / 4, 1, 1, 32 * 4, 1, 1);
+}
+
+// Dual generic GEMV (qgemv_dual): D0 = W0 X0 and D1 = W1 X1 in one dispatch,
+// same K / format / M (1..4); grid (max(N0, N1), 2), one simdgroup per row.
+template <class E>
+void launch_qgemv_dual(E& e, typename E::out_t d0, typename E::in_t w0,
+                       typename E::in_t x0, typename E::out_t d1,
+                       typename E::in_t w1, typename E::in_t x1, int N0,
+                       int N1, int K, int M, const std::string& fmt,
+                       const std::string& type_name) {
+  std::string name = qgemv_kernel_name(fmt) + "_dual";
+  if (type_name == "bfloat16") name += "_bfloat16";
+  name += "_m" + std::to_string(M);
+  e.pipeline(name);
+  e.out(d0, 0);
+  e.in(w0, 1);
+  e.in(x0, 2);
+  e.out(d1, 3);
+  e.in(w1, 4);
+  e.in(x1, 5);
+  e.bytes(N0, 6);
+  e.bytes(N1, 7);
+  e.bytes(K, 8);
+  e.dispatch(std::max(N0, N1), 2, 1, 32, 1, 1);
 }
 
 // Multi-batch weight-stationary GEMV (2 <= M <= 8): one simdgroup per output
@@ -6677,17 +7250,11 @@ void launch_qgemm_fp8ch(E& e, typename E::out_t d, typename E::in_t wq,
 // Weight-stationary multi-row GEMV over M activation rows. M must be one of
 // the instantiated row counts (2/4/8/16/17/32); hosts decompose other
 // batches. Reads the quantized weights once for the whole row block.
-template <class E>
-void launch_qgemv_mm(E& e, typename E::out_t d, typename E::in_t wq,
-                     typename E::in_t x, int N, int K, int m_rows,
-                     const std::string& fmt,
-                     const std::string& type_name = "float16") {
-  // q4_K 2/4/8-row chunks ride the NR-layout batch twin (qgemv_q4k_nr_mb):
-  // the generic walk below has BPI=1 for 256-wide blocks and measured 91/81
-  // GB/s at the M=8 MLP shapes. Per-row outputs are bit-identical to the
-  // looped batch-1 qgemv_q4k_nr, NOT to qgemv_mm<q4_K>. Same tail-read
-  // guards as the batch-1 route. VLLM_QC_Q4K_NR=0 kills every NR route;
-  // VLLM_QC_Q4K_NR_MM=0 kills only this batch route (bisection).
+// Whether launch_qgemv_mm routes (fmt, N, K, m_rows) to the NR-layout q4_K
+// batch twin (qgemv_q4k_nr_mb). VLLM_QC_Q4K_NR=0 kills every NR route;
+// VLLM_QC_Q4K_NR_MM=0 kills only this batch route (bisection).
+inline bool q4k_nr_mm_route(const std::string& fmt, int N, int K, int m_rows,
+                            const std::string& type_name) {
   static const bool q4k_nr_off = [] {
     const char* v = std::getenv("VLLM_QC_Q4K_NR");
     return v != nullptr && v[0] == '0' && v[1] == '\0';
@@ -6696,9 +7263,22 @@ void launch_qgemv_mm(E& e, typename E::out_t d, typename E::in_t wq,
     const char* v = std::getenv("VLLM_QC_Q4K_NR_MM");
     return v != nullptr && v[0] == '0' && v[1] == '\0';
   }();
-  if (fmt == "q4_K" && !q4k_nr_off && !q4k_nr_mm_off &&
-      (m_rows == 2 || m_rows == 4 || m_rows == 8) && N % 4 == 0 &&
-      K % 256 == 0 && type_name != "float32") {
+  return fmt == "q4_K" && !q4k_nr_off && !q4k_nr_mm_off &&
+         (m_rows == 2 || m_rows == 4 || m_rows == 8) && N % 4 == 0 &&
+         K % 256 == 0 && type_name != "float32";
+}
+
+template <class E>
+void launch_qgemv_mm(E& e, typename E::out_t d, typename E::in_t wq,
+                     typename E::in_t x, int N, int K, int m_rows,
+                     const std::string& fmt,
+                     const std::string& type_name = "float16", int ldd = -1) {
+  // q4_K 2/4/8-row chunks ride the NR-layout batch twin (qgemv_q4k_nr_mb):
+  // the generic walk below has BPI=1 for 256-wide blocks and measured 91/81
+  // GB/s at the M=8 MLP shapes. Per-row outputs are bit-identical to the
+  // looped batch-1 qgemv_q4k_nr, NOT to qgemv_mm<q4_K>. Same tail-read
+  // guards as the batch-1 route (q4k_nr_mm_route).
+  if (q4k_nr_mm_route(fmt, N, K, m_rows, type_name)) {
     e.pipeline(type_name == "bfloat16" ? "qgemv_mm_q4_K_nr_bfloat16"
                                        : "qgemv_mm_q4_K_nr");
     e.out(d, 0);
@@ -6706,6 +7286,9 @@ void launch_qgemv_mm(E& e, typename E::out_t d, typename E::in_t wq,
     e.in(x, 2);
     e.bytes(N, 3);
     e.bytes(K, 4);
+    // Output row stride (column slice of a wider tensor in place); N dense.
+    const int ld = ldd < 0 ? N : ldd;
+    e.bytes(ld, 5);
     // 2 simdgroups x 2 rows per threadgroup; grid.y indexes column pairs.
     e.dispatch(N / 4, m_rows / 2, 1, 64, 1, 1);
     return;
@@ -6864,14 +7447,75 @@ void launch_qc_dflash_conv(E& e, typename E::in_t x, typename E::in_t delta,
 // 2 up rows per simdgroup).
 // Contract: N/2 must be a multiple of kNsg*kNpair (4) — host-checked; tail
 // simdgroups would otherwise walk gate/up rows past N.
+// W25 texture-LUT kernel (VLLM_METAL_MOE_IQ2_TEX=1, the glm53f-q2-1 env
+// block): the codebook magnitudes through the texture unit (texm: one
+// 4 KB RGBA32Uint table, one texel per 8 weights, signs by fp32 xor;
+// W25 measured -23..26% vs the threadgroup-table walk, bit-exact).
+inline bool moe_iq2_tex_prod() {
+  static const bool tex_prod = [] {
+    const char* v = std::getenv("VLLM_METAL_MOE_IQ2_TEX");
+    return v && std::string(v) == "1";
+  }();
+  return tex_prod;
+}
+
+
+// Expert-grouped slot pairing (moe_group_slots): items (S, 3) int32 and
+// num_items (1); one threadgroup of 512. Host guards S <= 1024, E <= 512.
+template <class E>
+void launch_moe_group_slots(E& e, typename E::in_t topk_ids,
+                            typename E::out_t items, typename E::out_t num_items,
+                            int S, int num_experts) {
+  e.pipeline("moe_group_slots");
+  e.in(topk_ids, 0);
+  e.out(items, 1);
+  e.out(num_items, 2);
+  e.bytes(S, 3);
+  e.bytes(num_experts, 4);
+  e.dispatch(1, 1, 1, 512, 1, 1);
+}
+
+// Two-slot grouped twin of the texm swiglu GEMV over the items above
+// (grid.y = S, items past num_items exit). Bit-identical per slot.
+template <class E>
+void launch_qgemv_moe_mr_swiglu_grp(E& e, typename E::out_t d, typename E::in_t wq,
+                                    typename E::in_t x, typename E::in_t items,
+                                    typename E::in_t num_items, int N, int K,
+                                    int S, int topk, int has_clamp, float limit,
+                                    const std::string& type_name) {
+  constexpr int nsg = 2, npair = 2;
+  std::string name = "qgemv_iq2_xxs_moe_mr_swiglu_texm_grp";
+  if (type_name == "bfloat16") name += "_bfloat16";
+  e.pipeline(name);
+  e.out(d, 0);
+  e.in(wq, 1);
+  e.in(x, 2);
+  e.in(items, 3);
+  e.in(num_items, 4);
+  e.bytes(N, 5);
+  e.bytes(K, 6);
+  e.bytes(topk, 7);
+  e.bytes(has_clamp, 8);
+  e.bytes(limit, 9);
+  e.texture("iq2xxs_mag", 0);
+  const int nh = N / 2;
+  e.dispatch((nh + nsg * npair - 1) / (nsg * npair), S, 1, 32 * nsg, 1, 1);
+}
+
 template <class E>
 void launch_qgemv_moe_mr_swiglu(E& e, typename E::out_t d, typename E::in_t wq,
                                 typename E::in_t x, typename E::in_t topk_ids,
                                 int N, int K, int tokens, int topk,
                                 int has_clamp, float limit,
                                 const std::string& type_name) {
-  constexpr int kNsg = 2, kNpair = 2;
+  constexpr int nsg = 2, npair = 2;
   std::string name = "qgemv_iq2_xxs_moe_mr_swiglu";
+  const bool tex_prod = moe_iq2_tex_prod();
+  std::string lut_key;
+  if (tex_prod) {
+    name += "_texm";
+    lut_key = "iq2xxs_mag";
+  }
   if (type_name == "bfloat16") name += "_bfloat16";
   e.pipeline(name);
   e.out(d, 0);
@@ -6883,9 +7527,10 @@ void launch_qgemv_moe_mr_swiglu(E& e, typename E::out_t d, typename E::in_t wq,
   e.bytes(topk, 6);
   e.bytes(has_clamp, 7);
   e.bytes(limit, 8);
+  if (!lut_key.empty()) e.texture(lut_key, 0);
   const int nh = N / 2;
-  e.dispatch((nh + kNsg * kNpair - 1) / (kNsg * kNpair), tokens * topk, 1,
-             32 * kNsg, 1, 1);
+  e.dispatch((nh + nsg * npair - 1) / (nsg * npair), tokens * topk, 1,
+             32 * nsg, 1, 1);
 }
 
 template <class E>
@@ -6941,7 +7586,7 @@ void launch_qgemv_moe_mr_q2k_sum(E& e, typename E::out_t d, typename E::in_t wq,
                                  typename E::in_t topk_w, int N, int K,
                                  int tokens, int topk,
                                  const std::string& type_name,
-                                 bool soa = false) {
+                                 bool soa = false, bool accumulate = false) {
   int nsg = 2, nr0 = 4;
   std::string name = "qgemv_q2_K_moe_mr_sum";
   if (type_name != "bfloat16") {
@@ -6951,6 +7596,8 @@ void launch_qgemv_moe_mr_q2k_sum(E& e, typename E::out_t d, typename E::in_t wq,
   }
   if (soa) name += "_soa";
   if (type_name == "bfloat16") name += "_bfloat16";
+  // (Split-K geometries - 2/4/8 simdgroups per row group - measured
+  // 148/125/82 GB/s vs 173 at T=1 on 2026-09-11 and were removed.)
   e.pipeline(name);
   e.out(d, 0);
   e.in(wq, 1);
@@ -6960,6 +7607,8 @@ void launch_qgemv_moe_mr_q2k_sum(E& e, typename E::out_t d, typename E::in_t wq,
   e.bytes(N, 5);
   e.bytes(K, 6);
   e.bytes(topk, 7);
+  const int acc_flag = accumulate ? 1 : 0;
+  e.bytes(acc_flag, 8);
   e.dispatch((N + nsg * nr0 - 1) / (nsg * nr0), tokens, 1, 32 * nsg, 1, 1);
 }
 

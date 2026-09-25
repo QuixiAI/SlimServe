@@ -1,0 +1,19 @@
+env VLLM_QC_PHASE_PROF = 1
+env VLLM_METAL_MOE_OVERLAP = 0
+env VLLM_METAL_SHARD_OVERLAP = 0
+env VLLM_METAL_MOE_ROUTER_OVERLAP = 0
+env VLLM_QC_MOE_MM_MIN_TOKENS = 96
+launched pid 29870 sid-detached; log /Users/seangherardi/Code/slimserve/SlimServe-glm53f/perf/results/2026-09-15/glm53f-q2-conc/phase_c32/boot.log
+READY ~214s
+dumps: 
+[21:30:02] c1
+  c  rows  exact  agg tok/s  per-req  x c=1  wall s  sha
+  1     2   True       6.84     6.84  1.00x    58.5  c6b99cdf91ac
+[21:31:11] CONCURRENT GATES DONE
+cp: /phaseprof_*.txt: No such file or directory
+[21:31:14] c32
+  c  rows  exact  agg tok/s  per-req  x c=1  wall s  sha
+ 32    64   True      41.29     1.68  1.00x   775.1  8af433cbd862
+[21:46:40] CONCURRENT GATES DONE
+perf/results/2026-09-15/glm53f-q2-conc/run_phase.sh: line 27: unexpected EOF while looking for matching `"'
+perf/results/2026-09-15/glm53f-q2-conc/run_phase.sh: line 28: syntax error: unexpected end of file

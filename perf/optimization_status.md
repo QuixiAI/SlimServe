@@ -1,5 +1,2217 @@
 # SlimServe Optimization Status
 
+## 2026-09-25 - glm53f-q2-1 release gates on the merged build; 2500x64 pin roll
+
+- Baseline: pins 7dd30ea193a6 / 393882a2ddaf / 1d7d58486dc7, c=1 400-out
+  c6b99cdf91ac; concurrent curve from the 2026-09-17/24 entries.
+- Change: merge of origin/main (15 commits). Fixes it needed: one source
+  speculator for glm53f-gguf (duplicate key), and `files_for` no longer
+  builds a hub URL for a speculator with no files (the in-target nextn
+  drafter; `test_in_target_drafter_adds_no_download`).
+- Result (`perf/results/2026-09-15/glm53f-q2-conc/release/`): concurrent
+  gate PASS and pinned - c=4 48.38, c=8 57.29, c=16 63.11 tok/s, exact at
+  every width; c=1 400-out c6b99cdf91ac; 8tok 7dd30ea193a6; off1-2000
+  393882a2ddaf at 34.30 tok/s.
+- 2500x64 now c097108f8fa5. Cause isolated by one switch per boot: with
+  VLLM_QC_MLA_SPARSE_MQA=0 it is 1d7d58486dc7 again. A 2500-token prompt
+  exceeds the 2051-token dense prefill limit, so its prefill runs the sparse
+  latent kernel, which since 2026-09-17 is the head-grouped MMA variant at
+  >= 3 rows (half-precision P and S tiles vs the per-head fp32 walk). No
+  earlier gate covered it (the concurrent gates are 1000-token prompts; the
+  existing ds4 oracle prompts are <= 1000 tokens, dense path).
+- Correctness: new ds4 teacher-forced dump on a 3000-token prompt
+  (`perf/results/2026-09-25/glm53f-q2-oracle-long/`, 64 greedy tokens,
+  top-8): MMA 62/64 argmax, mean |dlp| 0.0731, max 0.408; per-head 59/64,
+  0.0630, max 0.320. Disagreements are at ds4 margins <= 0.14 nats for
+  both. Equivalent quality; the pin rolls.
+- Decision: pin rolled; record `supported` (bar = ds4 on the same box,
+  perf/baseline_status.md 2026-09-24).
+
+## 2026-09-17 (later) - c=16 lever board: plan, sizing, and results as they land
+
+Real step at c=16 / 1000-out is ~510 ms (2.08x; 27 tok/step); 3x needs
+~353 ms. The MoE routed GEMVs are ~200 ms of that and sit within 1.5-2x of
+their DRAM floor (32 rows touch 173 of 288 experts = ~1.3 GB per layer of
+the 96.5 GB file; the IQ2_XXS dequant per (row, expert) pair is the W20 ALU
+floor) - not a lever. The board below is everything else, sized from the
+`phase_c16_b5/` split (profile numbers are sync-inflated 1.5-2.5x for
+sub-ms phases; the big kernels are close to real).
+
+1. Sparse MLA decode at 32 rows (`mla_mqa` 4.5 ms/call x 12 calls/step =
+   ~50 ms real). ROOT CAUSE: `mla_sparse_latent_partition` runs one
+   simdgroup per (head, row, partition), so all 64 heads re-read every
+   selected latent row: 32 rows x 64 heads x ~2048 positions x 1 KiB =
+   4.3 GB of L2 traffic per call for 67 MB of distinct data; 4.7 ms is
+   ~900 GB/s, i.e. the fabric rate. P is 1 at R=32 (the auto formula
+   targets 1024 simdgroups). FIX: a head-grouped (MQA) variant - one
+   threadgroup per (row, partition, group of HG heads), the latent rows
+   staged once through threadgroup memory in chunks of 8 positions
+   (register-prefetched, double-buffered), G heads per simdgroup with the
+   q and accumulators in registers; same fp32 partials layout so the
+   existing reduce kernel is reused. Traffic drops HG-fold. Legacy kernel
+   kept for R < 3 so the c=1 pins stay bit-identical. Expected: 50 -> ~10
+   ms per step.
+2. Dense MMA at 32 rows (~78 ms/step across kda in_proj/o_proj, MLA
+   o_proj/q_b, shared expert, lm_head x2 at 154880x4096): `qgemm_mma` drops
+   from 182 GB/s (M=16) to 116 (M=32) on q8_0 and is a wash on q4_K at 32.
+   Per simdgroup per 8-wide k step it does 1 B load + MF A loads + MF
+   MMAs; at MT=32 that is 9 threadgroup-memory ops per 4 MMAs. FIX: RPS=16
+   rows per simdgroup (2 n-fragments: A loads amortised over 2x the MMAs,
+   64 rows per threadgroup) and, for q4_K, BK=64 so one 8-byte nibble load
+   feeds two sub-blocks and the 12-byte scale header is decoded once per
+   pair. Bench with `dbench_m.py`/`mma_check.py` at M=8/16/32; pick per
+   (fmt, M). Expected: 1.3-1.5x on the band, ~20-25 ms per step.
+3. KDA recurrent-state traffic (kda_core 49 ms profile; 16 states x 4.3
+   MiB x read+write per layer = 138 MB -> 0.28 ms at DRAM rate vs ~1 ms
+   measured). Check the fused step's achieved bandwidth at R=16 with a
+   microbench before touching it.
+4. Sampling/drafter glue: sample_tokens 43 ms is 27 drafter + 7 sampler +
+   9 glue; the drafter is one layer + lm_head at 32 rows and inherits 1-2.
+   No separate work.
+LEVER 1 RESULT (sparse MLA decode, `mla_mqa_bench.log`, `mla_p_sweep.log`,
+`mla_mma_bench.log`; R=32, H=64, W=2048, 4 GiB of bf16 pages): the L2
+story was WRONG. A partition sweep floors every scalar kernel at 2.8-3.0 ms
+at R=32 (legacy P=1 3.95 -> P=16 2.94; a head-grouped scalar variant
+sharing the latent loads across 2 heads 3.07; 4 heads per simdgroup spills
+and runs 11.7). The per-head kernel is instruction-issue bound (~120
+instructions per head-position: 16 strided 2-byte loads, converts, a
+16-deep FMA chain, simd_sum, two exps, 32 FMAs), so sharing loads buys
+little. The fix that works is simdgroup MMA over the head dimension:
+`mla_sparse_latent_mma` (cfg 5/6) owns (row, partition, 16 heads) per
+threadgroup, NSG simdgroups each own a LATENT/NSG slice, S^T[16x8] =
+Q.Lat^T as half MMAs with the K split summed through threadgroup memory,
+P in half, O[16 x slice] += P.Lat, O rescaled by diag(alpha) with a float
+MMA only when a head's max moved; latent rows staged 8 at a time as half
+(register-prefetched, double-buffered); same partials layout so the
+reduce is shared. cfg6 (8 simdgroups): R=2 0.277 ms (legacy 0.291), R=8
+0.353 (1.075), R=16 0.606 (2.052), R=32 1.114 (3.945) = 3.5x at 32 rows,
+max abs err 2.4e-4 (the same as legacy vs the torch fp32 reference). cfg5
+(4 simdgroups: 64 O registers) 2.58 at R=32. First cut had a real bug
+(only the owner lane advanced the running max; 6e-2 error) caught by the
+bench's parity column. Gate: `VLLM_QC_MLA_SPARSE_MQA=6` in the profile
+env, `VLLM_QC_MLA_SPARSE_MQA_MIN_R` (default 3) keeps rows 1-2 on the
+per-head kernel so the c=1 pins stay bit-identical. Oracle:
+`tests/kernels/test_mla_sparse_latent_metal.py` (cfg 3/5/6 x dtypes x
+shapes incl. pads, all-pad rows, tlen, P=1/7; H=8 falls back).
+
+LEVER 2 RESULT (dense MMA band, `mma_variants.log`, `mma_variants_q4k.log`;
+DRAM-resident, warm 16, the r8k32 original re-measured last as a control):
+`qgemm_mma<FMT, MT, RPS, BK>` now has RPS 8/16 rows per simdgroup and BK
+32/64 (variants 1 r8k32, 2 r16k32, 3 r8k64, 4 r16k64; `ggml_mul_mat_mma(...,
+variant)`, 0 = the table in `qgemm_mma_auto_variant`). r16k32 wins at 16-32
+rows wherever N >= 4096 (M=32: kda_v 352 vs 540 us, kda_out 301 vs 475,
+attn_out 552 vs 761, attn_q_b 292 vs 433, shexp gate|up 202 vs 307, lm_head
+154880x4096 3.92 vs 4.56 ms; M=16: attn_out 368 vs 520); r16k64 wins the
+short-K shexp down (M=32 119 vs 176); N=2112 (33 threadgroups at 64 rows)
+stays on r8k32. Table: N < 4096 -> 1, K <= 2048 -> 4, else 2. q4_K dequant
+vectorised (one 16-byte header load, nibbles -> uchar4 -> float4 converts):
+kda q|k q4_K M=8 351 us (was 603), M=16 426 (524), M=32 r16k32 576 (729) -
+per weight row now at q8_0's rate; the 32-row ceiling (~100-130 GB/s) is
+the staging/barrier structure (15 KiB of threadgroup memory per
+threadgroup = 2 per core), not the dequant. Variants differ from r8k32
+by one bf16 ulp at most (different K-slice count); oracle
+`tests/kernels/test_qgemm_mma_metal.py` covers 2/3/4 x fmt x M x shapes,
+strided in-place and the N%64 fallback.
+LEVER 3 RESULT (KDA state traffic, `kda_spec_rows_bench.log`): the spec
+recurrence at 16 requests x 2 tokens (H 64, D 128) moves 201 MB per
+layer-call (init read + 2 checkpoint writes) at 411 GB/s with one value
+row per simdgroup; `kda_recur_spec_d128_r{2,4,8}` (VLLM_QC_KDA_SPEC_ROWS,
+bit-identical per `test_kda_spec_rows_variants_bit_identical`) reach
+498 GB/s at rows=2 (405 vs 490 us) - the DRAM floor, so this lever is
+worth ~3 ms/step at c=16 and is done. Both checkpoint writes are needed
+(rewind on reject, continue on accept). Profile env: `VLLM_QC_KDA_SPEC_ROWS=2`.
+
+GATES WITH LEVERS 1-3 (`fix6_all/`, `fix6_all_long/`; profile env now
+carries VLLM_QC_MLA_SPARSE_MQA=6 and VLLM_QC_KDA_SPEC_ROWS=2, the MMA
+variant table is in the launcher): 400-out c=1 25.78 (sha c6b99cdf91ac,
+identical to the fix-4 build), c=8 41.68 (1.62x, was 1.56), c=16 44.17
+(1.71x, was 1.67); 1000-out c=8 58.16 (2.12x, was 1.88), c=16 61.98
+(2.26x, was 2.08) against the fix-4 c=1 of 27.45. The c=16 decode step
+shed 8%, c=8 13% - less than the kernel-level wins sum to (sparse MLA
+-40 ms, dense band -20, KDA -3 of ~510 ms), so the next split
+(`phase_c16_b6/`) re-ranks before anything else is built.
+
+MoE DECODE GEMV AT 32 ROWS - INVESTIGATED, AT ITS FLOOR (every number
+`moe_sharing_bench*.log`, synthetic weights at the production shapes, 32
+rows x top-8 = 256 slots, two 1.25 GB weight copies alternating):
+- Sharing test: w13 (texm) 3.81 ms and w2sum 1.64 ms whether the 256
+  slots hit 256, 180 (random), 32 or 8 distinct experts. Time tracks the
+  SLOT count, never the distinct-expert count: no DRAM component at all,
+  per-slot work only (this is W20's counter result seen from the other
+  side: ALU limiter 75%, F32 utilization 16%, ~14 lane-cycles per weight
+  from the divergent codebook lookups).
+- Expert-grouped two-slot kernel (`moe_group_slots` + `qgemv_iq2_xxs_moe_
+  mr_swiglu_texm_grp`, VLLM_QC_MOE_GROUP_NB=2, kept opt-in, default off):
+  a whole block per lane for two slots spills (pairs 6x a single); the
+  half-block-per-lane layout keeps registers but a pair costs 1.6 singles
+  and singles cost 1.23x (twice the block headers), so at the realistic
+  180-distinct point it is 4.03 vs 3.81 ms (-6%), 3.05 when every item is
+  a pair. Within one bf16 ulp of the per-slot kernel (oracle
+  `test_moe_group_metal.py`). Candidate only for 64-row batches (2 slots
+  per expert on average); NOT the 2026-08-13 owner-threadgroup design.
+- Sign by `select` instead of the fp32 xor: bit-identical, 4.14 ms (+9%).
+- Signed-magnitude texels (code x 128 sign patterns, 512 KiB): bit-
+  identical, 14.2 ms - the table falls out of the texture cache. Removed.
+- Packed-half2 walk (products exact for bf16 activations, two-deep half2
+  partials widened per texel, 256-entry sign-mask table; the ALU probe
+  put half2 FMA issue at 2.4x fp32): 3.46 ms (-9%) at 1e-3 typical /
+  1.5% worst relative error; the same walk with the codebook as an 8-byte
+  threadgroup load instead of the texel: 4.00 ms. Both removed - a
+  numerics change is not worth 2% of the step.
+CONSEQUENCE: the routed MoE costs ~7 ms per generated token at any batch
+size >= 8 rows, so its aggregate throughput is flat with concurrency while
+every other block amortises. At c=16 (27 tok/step, ~436 ms real) the
+non-MoE part is ~236 ms; 3x needs the whole step at ~328 ms, i.e. the
+non-MoE part under ~130 ms - not reachable at 32 rows with 5% items. The
+route that can still reach 3x is MORE ROWS per step: max_num_seqs 32
+(64 rows; KDA state 146 MiB x 32 = 4.7 GB fits), where the MoE keeps its
+per-token cost and the rest halves per token. Dense band above 32 rows
+falls to the prefill tile route; MoE at 64 rows needs the tile-vs-GEMV
+crossover measured (VLLM_QC_MOE_MM_MIN_TOKENS 48 = tile, 96 = GEMV).
+
+c=32 (max_num_seqs 32, 64 rows per decode step; `c32_gemv/`, `c32_tile/`
+and their `_long` twins): the KV pool is unchanged at 381,513 tokens (the
+KDA state pages share the aligned pool), c=1 pin held (c6b99cdf91ac),
+c=16 63.08 tok/s 1000-out (2.30x; 61.98 at max_num_seqs 16, noise).
+c=32: 400-out 43.9 tok/s (1.71x, = c=16), 1000-out 60.16 with the MoE
+GEMV at 64 rows (VLLM_QC_MOE_MM_MIN_TOKENS=96) and 60.59 with the prefill
+tile serving the 64-row steps (48), 60.40 with the expert-grouped GEMV
+(`c32_grp/`, VLLM_QC_MOE_GROUP_NB=2 at ~2 slots per expert): 2.19-2.21x,
+BELOW c=16, and the three MoE routes are equal at 64 rows. Per generated
+token the step costs 16.1 ms at 32 rows and 16.6 ms at 64: nothing
+amortises past 32 rows - the MoE is per-slot (expected) and the rest
+doubled too (the dense band leaves the small-M MMA GEMM for the prefill
+tile above 32 rows, KDA state and MLA latent traffic are per sequence,
+sampling/drafter per row). The tile-vs-GEMV crossover for the routed MoE
+is at ~64 rows (equal). `phase_c32/` profiles the 64-row step to see
+whether the dense band (an MMA GEMM to M=64 is a small extension) is the
+part that failed to amortise. max_num_seqs stays 32 in the record (more
+capacity at the same pool, same aggregate, 2.4 s per-token latency at 32).
+
+WHAT THE WINDOW AGGREGATE HIDES (from the harness JSON's mean request
+latency; the harness submits every prompt at t=0 and the 1000-token
+prefills serialize at ~250 tok/s, so request k waits ~4k s for its first
+token): decode time per request = latency - estimated mean TTFT gives a
+steady-state DECODE aggregate of ~30.8 tok/s at c=1 (27.45 window; the
+pinned off1-2000 decode is 34.3), ~67 at c=8 (2.2x), ~74 at c=16 (2.4x)
+and ~89 at c=32 (2.9x). The 64-row step therefore amortises after all
+(~605 ms per 54 tokens vs ~366 per 27 at c=16 = 11.2 vs 13.6 ms per
+token); the c=32 window aggregate (60.2) is the 128 s prefill ramp (24%
+of the window) plus the drain. The `phase_c32/` dump agrees: 32,000
+tokens over ~1050 steps = 30 tokens per step on average, and the per-call
+w13 cost (4.0 ms vs 3.63 at c=16) says the average decode step carried
+~40 rows, not 64. MEASURED with 3000-output runs (`c1_3k/`, `c32_3k/`,
+`c32_3k_b/`; ramp < 10% of the window): c=1 34.95 tok/s (3000 tokens in
+85.8 s - the single stream ALSO speeds up over a long generation, 36.7
+tok/s decode-only, so the 30.8 estimate above was the 1000-token phase),
+c=16 77.39 = 2.21x, c=32 72.91 = 2.09x (`c32_3k_b/`, 96,000 tokens in
+1317 s, mean request latency 1030 s). The like-for-like ratio at c=16
+is 2.2-2.3x on every protocol and c=32 is below c=16 on every protocol;
+the latency-based 2.4x/2.9x estimates used too small a c=1 denominator
+and are withdrawn. FINAL: the record's concurrency scaling is 1.3 / 1.4
+/ 1.6 / 1.7x (400-out) and 2.1 / 2.2-2.3x (long outputs) at c=2/4/8/16,
+c=16 is the throughput optimum, max_num_seqs 32 is capacity only. The
+bar (>= 3x at c=16) is not reachable with the Q2 expert format on this
+GPU: the routed MoE alone is ~7 ms per generated token at any width.
+
+Gates after each lever: kernel oracle test, `concurrent_gate.sh` at c=1/8/16
+(pins must hold), notebook line. Sized total: ~510 -> ~430 ms (2.08 ->
+~2.5x); 3x needs the MoE floor to move, which W20 closed.
+
+## 2026-09-17 - GLM-5.3-Flash Q2 on Metal: ROOT CAUSE of "speculation is a net loss at concurrency" - mixed spec+prefill batches ran the KDA torch reference (a per-token loop over a 4288-token chunk, 34 layers); fixed by routing each subset through its own fused kernel; c=8 goes from 0.88x to 1.48x of c=1 with the c=1 pin unchanged
+
+- Baseline: branch at 5871b765a (the 2026-09-15 concurrency baseline below,
+  which added the dynamic draft schedule `[(1,2,1),(3,8,0)]` to the record).
+  Re-measured with the same harness at 1000-token prompts, 400 output
+  tokens, temperature 0, warmup 1, `exact=True`
+  (`perf/results/2026-09-15/glm53f-q2-conc/concurrent_gate.sh`, table by
+  `summarize.py`): c=1 25.83, c=2 24.14 (0.93x), c=4 21.43 (0.83x), c=8
+  22.75 (0.88x) aggregate tok/s. Per-request at c=8 was 2.88 tok/s against
+  25.83/8 = 3.23 for perfect serialization: batching was a net LOSS.
+  `Running: 8 reqs` in the engine log, so the scheduler co-batched; the
+  step time simply grew ~8x for 8x rows.
+- Hypothesis: the distinct-expert arithmetic (HANDOFF, batching campaign
+  definition of done) says even an ungrouped MoE should give ~2x at c=8
+  with the dense path flat, so a ~2.4x gap is a pathology, not physics.
+- Instrument 1, `VLLM_QC_PHASE_PROF=1` split at c=1 vs c=8 (`phase/`,
+  `phase_diff.py`; the profiler's `mps.synchronize` inside a concurrent-
+  dispatch region kills the encoder - "commit command buffer with
+  uncommitted encoder" - so profile with `VLLM_METAL_{MOE,SHARD,MOE_ROUTER}_OVERLAP=0`):
+  `drafter_propose` 0.99 -> 0.01 calls/step, `kda_core` 6.3x, dense
+  projections 2.7-3.5x, routed MoE only 2.4-2.7x (c=1 is occupancy-
+  starved, so the expert kernels batch better than the byte model assumes).
+- Finding 1 (why no drafts): the record's own schedule resolves to
+  `dynamic_sd_lookup = [0, 1, 1, 0, 0, 0, 0, 0, 0]` (`draftdbg2/boot.log`,
+  `VLLM_QC_DRAFT_DEBUG=1`): K=0 at 3..8 requests. Engine metrics agree
+  (drafted 0.01 tok/s, accepted 0 at c=8). Neither `AcceptanceThrottle`
+  (env-gated, off) nor any code path builds a schedule; it is the profile.
+- Finding 2 (why spec lost, the root cause): `VLLM_QC_KDA_DEBUG=1` branch
+  log at c=8 with drafting on (`kdadbg/boot.log`): steady decode takes
+  `spec_fused` (T=16, all 8 rows spec), but every ramp step is MIXED
+  (`prefills=5 spec_dec=1`: five prompts prefilling while one request
+  already decodes with a draft) and BOTH fused paths in
+  `KimiGatedDeltaNetAttention._forward_native` refused mixed batches (the
+  non-spec fused block required `spec_sequence_masks is None`, the spec
+  fused block required `num_prefills == 0 and num_decodes == 0`). Both
+  subsets then ran the torch reference; `kda_recurrent_prefill_native` is
+  a per-token loop, so a mixed step paid 34 layers x a 4288-token chunk of
+  sequential torch launches. That is the "concurrent prefill at a third of
+  its single-stream rate AND blocks decode" of the baseline entry, and it
+  only bites when spec rows coexist with prefills - i.e. exactly the
+  drafting-on arm at 1000-token prompts, which is why spec looked like a
+  net loss there and not on 64-token prompts (49.9 vs 45.1 no-spec).
+- FIX (kept): a mixed-batch block in `_forward_native` runs the spec rows
+  through the fused verify kernel and the prefill/decode rows through the
+  fused conv+recurrence kernel, each over its own index-selected subset
+  (the metadata already builds `spec_token_indx` / `non_spec_token_indx`),
+  and scatters both o_norm'd results back by token index; pool slots of
+  the two subsets are disjoint sequences. The two pure-batch blocks are
+  unchanged (their input prep is hoisted into closures shared with the
+  mixed block), so single-stream never changes route. Any unavailability
+  falls back to the previous all-torch path.
+- Oracle: `tests/model_executor/test_kda_native.py` - the mixed and
+  pure-decode layer oracles gained `_fused` variants that bind the class's
+  real `_kda_metal_fused_step` onto the fake layer (D=128, bf16
+  activations, fp32 state, kernel tolerances 3e-2) and assert from a call
+  log that both fused kernels ran on the mixed batch; 6 layer oracles and
+  23 kernel tests (`tests/kernels/test_kda_{metal_fused,spec_metal,prefill_metal}.py`)
+  pass. The pre-existing mixed oracle had been passing on the TORCH path
+  (its fake layer had no fused hook), which is why the gap was invisible.
+- RESULT, same protocol, drafting on at every batch size (schedule removed
+  from the record for the measurement), `fix1_mixed_fused/`:
+
+  | c | before | after | per-request after |
+  | ---: | ---: | ---: | ---: |
+  | 1 | 25.83 | 25.77 (sha `c6b99cdf91ac`, identical) | 25.77 |
+  | 2 | 24.14 (0.93x) | 33.22 (1.29x) | 16.89 |
+  | 4 | 21.43 (0.83x) | 29.90 (1.16x) | 7.56 |
+  | 8 | 22.75 (0.88x) | 38.13 (1.48x) | 4.85 |
+
+  c=8 wall 140.7 -> 83.9 s.
+- A/B, drafting vs `--no-spec`, same build and protocol (`fix1_nospec/`):
+
+  | c | spec K=1 | no-spec |
+  | ---: | ---: | ---: |
+  | 1 | 25.77 | 20.79 |
+  | 2 | 33.22 | 29.39 |
+  | 4 | 29.90 | 35.84 |
+  | 8 | 38.13 | 32.35 |
+
+  Drafting wins at c=1/2/8 and stays on at every batch size. BOTH arms dip
+  at exactly 8 rows in flight (spec c=4 = 8 rows, no-spec c=8 = 8 rows),
+  which points at a dense-path cliff at M=8: the q8_0 NR batch kernel
+  covers M 2..4, the SM GEMM band starts at 9, and the hetero KDA in_proj
+  direct path admits batch <= 8 - so M=8 is served by the narrowest route.
+- Dense route bench, DRAM-resident, real shapes (`dbench_m.py`,
+  `dbench_m.log`; us per call, vec = `ggml_mul_mat_vec_a8` as routed, sm =
+  `ggml_mul_mat_sm`):
+
+  | shape | M=2 vec | M=4 vec | M=8 vec | M=8 sm | M=16 vec | M=16 sm |
+  | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+  | kda q\|k Q4_K 16384x4096 | 135 | 189 | 354 | 536 | 813 | 545 |
+  | kda_v Q8_0 8192x4096 | 65 | 100 | 363 | 301 | 417 | 309 |
+  | kda_output Q8_0 4096x8192 | 78 | 103 | 500 | 325 | 421 | 333 |
+  | attn_output Q8_0 4096x16384 | 135 | 156 | 1045 | 580 | 846 | 584 |
+  | shexp gate\|up Q8_0 4096x4096 | 45 | 56 | 238 | 203 | 211 | 203 |
+
+  Two facts. (1) The vec route COLLAPSES between M=4 and M=8: q8_0 at
+  5..8 rows is the generic `qgemv_mb` walk (58-137 GB/s) because the NR mb
+  kernel is instantiated for 2..4 only. (2) The SM GEMM that serves 9..32
+  rows is flat in M but at 110-125 GB/s on q8_0 (70 on q4_K): 2-5x the
+  M=2 NR kernel's time. The dense path is not weight-stationary at any
+  batch width above 4; summing the shapes, it costs ~15 ms/step at 2 rows
+  and ~66 ms/step at 16.
+- FIX 2 (kept): q8_0 at 5..8 rows runs as two NR mb passes over row halves
+  (3+2, 3+3, 4+3, 4+4) in one encoder, in place for strided outputs
+  (`q8_0_nr_mb_chunked_eligible` in tk_launch.h, the vec entry in
+  `qc_metal_serving.mm`, and `_metal_shard_region_ok` widened to 2..8 so
+  the KDA in_proj region keeps its in-place write). Bench after
+  (`dbench_m_chunked.log`, M=8): kda_v 363 -> 160 us, kda_output 500 ->
+  164, attn_output 1045 -> 277, attn_q_b 195 -> 181, q_a|kv_a 158 -> 69,
+  shexp gate|up 238 -> 98, down 108 -> 62; the route now beats the SM GEMM
+  at every q8_0 shape. Numerics per row are the NR kernel's (as at M <= 4).
+  Sweep (`fix2_q8chunk/`): c=1 25.77 (sha identical), c=2 33.11 (sha
+  identical), c=4 29.90 -> 35.64 (1.38x; sha changes, 8 rows now on NR
+  numerics), c=8 38.27 (sha identical: 16 rows take the SM band, not this
+  route). The c=4 dip is gone and the curve is monotonic.
+- The 9..32-row band, measured (`dbench_tile.log`, `sm_variants.log`):
+  the prefill tile GEMM `ggml_mul_mat_a8` at M=16/32 is no better than the
+  SM route (52-111 GB/s). Sweeping every in-tree `qgemm_sm` variant at
+  M=16 (2/8/9/10 for q8_0; 11/12/13 paired for q4_K): the route's default
+  variant 9 is within 10% of the best everywhere (kda_v 310 us, attn_output
+  588, q|k 604 vs paired-4-warp 546). The in-tree `f16probe` - the SAME
+  pipeline with raw half weights and NO dequant - runs at 86-138
+  Gweights/s against the dequant variants' 108-123: the SM GEMM is
+  STRUCTURE-bound (per-warp 32x32 X register tiles, a barrier per 32-wide
+  K step, split-K partials + reduce, plus a to-half/transpose/pad in torch
+  per call), not dequant-bound. Vectorizing its staging is worth <= 20%.
+  The M=4 NR kernel does 444 Gw/s with dequant, so the NR structure was
+  tried first.
+- NR walk widened to NB=8/16 (bf16 instantiations of `qgemv_q8_0_nr_mb`,
+  the kernel is generic in NB): REJECTED (`dbench_m_wide.log`). NB=8 runs
+  SLOWER than two NB=4 launches (kda_v 218 vs 160 us, attn_output 382 vs
+  277) and NB=16 spills (kda_v 831 us, attn_q_b 924 - against the SM GEMM's
+  308 / 259): `yl[NB][8]` + `sumf[NR][NB]` outgrow the register file. The
+  NR structure does not widen past 4 rows per lane. KEPT from that pass:
+  the general decomposition launcher (`launch_qgemv_q8_0_nr_mb_parts`,
+  parts {4, 3, 2}, one encoder) replacing the two-half special case, with
+  `kQ8NrMbMaxM = 8` mirrored by `_Q8_NR_MB_MAX_M` in linear.py; 9..32 rows
+  stay on the SM GEMM until a weight-stationary GEMM exists for that band.
+  Oracle `nr_mb_exact.py` (`nr_mb_exact.log`): for M in 2..8 on three
+  shapes, every output row equals the batch-1 NR launch on that row, and
+  the strided column-slice output equals the contiguous one - ALL
+  BIT-EXACT. (Its first version reported phantom row-0 mismatches: the vec
+  entry returns a ring-buffer slot, so a list of more results than the
+  ring holds aliases the earliest; every result is now cloned. The 2026-09-14
+  `strided_test.py` had cloned for the same reason, and it now runs M 1..8:
+  strided in-place and in-region BIT-EXACT at every width.)
+- c=16 measured for the first time (`max_num_seqs` 8 -> 16 in the record;
+  `fix2b_seq16/`, same protocol): c=1 25.77, c=2 33.22, c=4 34.95, c=8
+  37.98, **c=16 26.15 (1.01x c=1, per-request 1.66 tok/s)**. Sixteen
+  requests at K=1 are 32 rows: every q8_0 projection takes the SM GEMM at
+  385-675 us, the KDA q|k q4_K at 647, and the MoE walks 256 (token, route)
+  pairs per layer. The 9..32 band is now the whole story for the c=16 bar.
+  (Concurrent shas move between runs at c >= 4 because the per-step row
+  count, hence the route, depends on arrival timing; concurrent gates will
+  need a fixed-composition protocol - noted for the gate design.)
+- NEW KERNEL for the 9..32 band: `qgemm_mma_q8_0<MT>`
+  (`csrc/quixicore/metal/kernels/quantization/qgemm_mma/qgemm_mma.metal`,
+  entry `ggml_mul_mat_mma`, route `_mma_route_ok` in linear.py behind
+  `VLLM_QC_Q8_MMA=1` in this profile's env block). q8_0 x bf16 row-major in
+  and out, M <= 32 padded to 8; per threadgroup 4 simdgroups x 8 weight
+  rows, K walked in 32-wide steps; accumulators in float fragments (2
+  registers per lane per 8 columns of M); a shared X K-tile staged once per
+  threadgroup per step with 8-byte loads (bf16 -> half is a 16-bit shift);
+  each lane dequantizes 8 weights into 8 threadgroup halves; the weight
+  tile is loaded transposed as the B operand so the product lands
+  row-major and simdgroup_store needs no host transpose; double-buffered
+  tiles (one barrier per step); K split across grid.z into fp32 partials
+  (`qgemm_mma_k_slices`: enough threadgroups to reach ~512) folded by
+  `qgemm_mma_reduce` with the output row stride, so column-slice outputs
+  work in place. Numerics: half operands (the X cast is what the SM route
+  already did in torch), fp32 accumulation; not bit-identical to the NR
+  walk; worst relative max error vs the half-operand reference 3.7e-3 over
+  four shapes x eight M (`mma_check_v2.log`).
+  v1 (no split-K, no double buffering, scalar X staging) LOST on every
+  long-K / small-N shape (attn_output M=16 1327 us vs SM 593; grid N/32 =
+  2 threadgroups per core) and won only where threadgroups were plentiful
+  (attn_q_b 2.4x) - an occupancy signature (`mma_check.log`). v2, DRAM-
+  resident, us (mma / sm):
+
+  | shape | M=8 | M=16 | M=32 |
+  | --- | ---: | ---: | ---: |
+  | kda_v 8192x4096 | 178 / 300 | 199 / 311 | 308 / 404 |
+  | kda_output 4096x8192 | 175 / 319 | 198 / 333 | 320 / 402 |
+  | attn_output 4096x16384 | 320 / 579 | 374 / 586 | 614 / 668 |
+  | attn_q_b 16384x1536 | 144 / 248 | 160 / 261 | 264 / 364 |
+  | q_a\|kv_a 2112x4096 | 56 / 140 | 62 / 139 | 91 / 209 |
+  | shexp gate\|up 4096x4096 | 96 / 201 | 106 / 201 | 168 / 277 |
+  | shexp down 4096x2048 | 53 / 136 | 61 / 135 | 92 / 199 |
+
+  1.6-2.3x at M=16, 1.1-2.3x at M=32. At M=8 the NR chunks are a wash
+  (kda_v 160 vs 178, attn_output 277 vs 320, shexp 98 vs 96) and are
+  bit-identical to batch-1, so the route stays NR through 8 and takes this
+  kernel at 9..32. Still 150-200 GB/s at M=16 against the ~400 the box
+  sustains: the next iteration is 64 rows per threadgroup at M >= 16
+  (halves the per-threadgroup X re-read, which at M=32 already equals the
+  weight bytes) and prefetching the next block's 34 bytes into registers
+  ahead of the MMA.
+- MMA route end to end (`fix3_mma/`, q8_0 only at 9..32 rows, production
+  config, same protocol): c=1 25.69 (sha `c6b99cdf91ac`, identical - the
+  route is never reached), c=8 37.98 -> 40.03 (+5%, 1.56x c=1), c=16 26.15
+  -> 26.75 (+2%, 1.04x). Far below the kernel-level 1.6-2.3x, so at 16-32
+  rows the q8_0 dense band is not what dominates in situ. Candidates: the
+  KDA q|k q4_K projection (37.7 MB x 34 layers, still on the SM GEMM at
+  545-647 us - the q4_K variant of the MMA kernel is built for the next
+  run), the routed MoE at 128-256 (token, route) pairs per layer, and the
+  prompts' prefill inside the window (16 x 1000 tokens is ~27% of the c=16
+  wall). The c=16 step split is the next measurement.
+- c=16 STEP SPLIT (`phase_c16/`, profiler + regions off, MMA build): 1470
+  ms/step sync-inflated; `moe_mm_w13` 491 + `moe_mm_w2` 345 = 836 ms (57%)
+  at 36.6 calls/step. Sixteen requests at K=1 are 32 rows, which is exactly
+  `VLLM_QC_MOE_MM_MIN_TOKENS` (32): the PREFILL tile GEMM `ggml_moe_mm_id`
+  was taking every decode step at c=16, at ~1.5 rows per expert. The same
+  build at c=8 (16 rows, per-slot GEMV): routed MoE 263 ms/step - so the
+  tile costs ~3.2x the GEMV for 2x the rows at decode occupancy. This is
+  the crossover the campaign plan said to measure, measured: the tile's
+  expert dedup (18-33% at 16-32 rows) is worth far less than its
+  low-occupancy cost. FIX: `VLLM_QC_MOE_MM_MIN_TOKENS=128` in the record
+  env (prefill chunks are >= 4288 tokens and keep the tile; 64 rows = a
+  future c=32 stays on the GEMV until its own crossover is measured).
+  Also in the split at c=16: `kda_in_proj` 142 ms (per-shard + cat path;
+  the in-place hetero MMA path landed after this boot), `mla_mqa` 62 ms
+  (10.9x c=1: sparse MLA decode at 32 rows, the never-measured item),
+  `kda_core` 66 ms (16 sequences x 2 sub-steps of 146 MiB state).
+- FIX 4 (kept): `VLLM_QC_MOE_MM_MIN_TOKENS=128` in the record, plus the
+  q4_K MMA variant and the in-place hetero MMA shard path
+  (`fix4_moe_thresh/`, same protocol): c=2 32.60 (sha identical), c=4
+  35.75, c=8 39.91, **c=16 26.75 -> 42.88 (+60%)**, c=16 wall 239 -> 149 s.
+  Against c=1 25.7: 1.27 / 1.39 / 1.55 / 1.67x at c=2/4/8/16. At c=16 the
+  16 x 1000-token prompts are ~40% of the 400-output window, so decode
+  scaling is measured separately at 1000 output tokens (`fix4_long/`):
+  c=1 27.45, c=8 51.66 (1.88x), c=16 57.23 (2.08x), per-request 3.68 at
+  c=16. The q4_K MMA variant at M=8 measures 378 us vs the SM route's 530
+  (1.40x) on the KDA q|k shape; the q4_K NR chunks (354) still edge it at
+  8 rows, so the route keeps NR through 8 for q4_K too.
+- GATES on the fix-4 build (`gates_build5/`): 8tok `7dd30ea193a6`,
+  off1-2000 `393882a2ddaf` at 34.31 tok/s, 2500x64 `1d7d58486dc7` - ALL
+  THREE PINS BIT-IDENTICAL. Decode probe 37.4 tok/s at 1.869 tok/cycle
+  against the pinned 39.96 at 2.000: not a kernel regression - the probe's
+  64-token prompt used to prefill through the MoE tile (>= 32) and under
+  the 128 threshold takes the per-slot GEMV, and the loop text's draft
+  acceptance moved with the prefill numerics (0.869 vs 1.000; the 2.000
+  figure was itself a loop artifact per the 2026-09-14 correction). The
+  threshold is set to 48 instead: c=16 decode (32 rows) stays on the GEMV,
+  every prefill the gates and probe run (64, 1000, 2500 tokens) keeps the
+  tile as before. A future c=24/32 (48/64 decode rows) needs its own tile
+  crossover measured before `max_num_seqs` goes above 16. q4_K MMA on the
+  KDA q|k shape: M=16 444 vs SM 544 us (1.23x), M=32 653 vs 633 (a wash) -
+  kept for the in-place hetero write, not for speed at 32.
+  Threshold 48 verified (`gates_build5b/`): probe 39.89 tok/s at 2.000
+  tok/cycle (pin 39.96 held), 8tok / off1-2000 (34.28) / 2500x64 shas
+  identical, c=16 42.45 with the same sha as at 128 (identical route).
+- STATE OF THE CURVE after fixes 1-4 (production config, 1000-in /
+  400-out): c=1 25.1-25.8, c=2 32.6-33.2 (1.29x), c=4 35.6-35.8 (1.39x),
+  c=8 39.9-40.0 (1.56x), c=16 42.5-42.9 (1.67x); decode-dominated
+  (1000-out): c=8 1.88x, c=16 2.08x. The bar (>= 2x at c=4, >= 3x at
+  c=16) is not met; per the distinct-expert arithmetic the routed MoE is
+  now the largest block at every c, followed by the 32-row dense band
+  (150-200 GB/s on the MMA kernel), KDA state traffic and sparse MLA
+  decode at 32 rows.
+- GROUPED w13 GEMV: NOT NEXT AFTER ALL. The 2026-08-13 Wave 10 entry
+  (expert-grouped w13 verify kernel, 123 -> 230 ms, DO-NOT-REDO) already
+  measured the mechanism this campaign's byte model assumes away: at
+  decode widths every slot is co-resident, so same-expert weight re-reads
+  are served by L2/SLC - the census counts LOGICAL duplicate bytes the
+  hardware has already dedup'ed - and the owner threadgroups' serialized
+  slot work set the wave's critical path (2x). The distinct-expert
+  arithmetic in the handoff's definition of done therefore overstates
+  what grouping can buy on this GPU; the per-slot GEMV at 128-256 pairs
+  is already near its ALU floor (W20). The MoE lever that remains is the
+  per-weight dequant cost itself, which W20 closed with hardware
+  counters. Next dense/step levers instead: a 64-rows-per-threadgroup
+  MMA iteration for 16-32 rows (150-200 -> ~300 GB/s), the KDA state
+  traffic (3 x 146 MiB per sequence per step at K=1), sparse MLA decode
+  at 32 rows, and the tile crossover at 48/64 rows for max_num_seqs 32.
+- c=16 SPLIT ON THE FIX-4 BUILD, decode-dominated (1000 output tokens,
+  `phase_c16_b5/`; 790 ms/step sync-inflated, 589 steps for 16,000 tokens
+  = 27 tokens/step): routed MoE decode GEMVs 233 ms (w13 157 + w2sum 76;
+  29%; 7x / 4.3x their c=1 per-call cost for 16x the rows, i.e. near the
+  W20 ALU floor once occupied), the prompts' prefill tile 115 (15%, 0.73
+  calls/step), KDA attention 193 (24%: in_proj 85 on the in-place MMA
+  route, core 49, o_proj 30, gates 12), MLA 121 (15%: `mla_mqa` 55 - the
+  sparse latent decode at 32 rows costs 4.7 ms per layer-call for ~67 MB
+  of latent reads, ~20x off DRAM rate; core 73 total; o_proj 19), sampling
+  43 (5%), shared expert 35, mHC 39, drafter 28, router 14, indexer 21.
+  No block dominates any more. Ranked remaining levers: (1) sparse MLA
+  decode at 32 rows (`launch_mla_sparse_latent_partition`, grid (H, R,
+  partitions) - tuned at R=1-2); (2) KDA q|k q4_K at 32 rows (the q4_K MMA
+  is a wash there; a 64-rows-per-threadgroup MMA iteration or a q4_K NR
+  16-row variant); (3) KDA state traffic (3 x 146 MiB per sequence per
+  step); (4) sampling / drafter glue at 32 rows. Reaching 3x at c=16 from
+  2.08x needs ~30% off the step across these; each is a 5-10% item.
+- Sized from the two benches, what this band was worth: a
+  weight-stationary q8_0/q4_K x bf16 GEMM at M=16..32 near DRAM rate (kda_v
+  ~90-130 us against 308-385 today) would take the dense block at 16 rows
+  from ~66 ms/step to ~25. Design notes for it: M=16 is still bandwidth-
+  bound if FMA utilisation is >= 60% (537 MFMA per kda_v call = 51 us of ALU
+  against 89 us of DRAM); the SM kernel's costs are the 32-wide padded X,
+  a per-warp 32x32 X register tile reloaded from threadgroup memory each
+  32-wide K step, a barrier per step in 2-warp threadgroups, split-K
+  partials, and the to-half/transpose/pad glue in torch per call. A lean
+  form: per simdgroup 8 weight rows x 32 k per step, each lane dequantizing
+  8 weights into one uint4 threadgroup store, A fragments via
+  simdgroup_load, B fragments (M/8 x 4 per step, the same for every
+  simdgroup) loaded straight from a device-resident row-major bf16 X, no
+  threadgroup barrier in the K loop.
+- Decision: KEEP the routing fix. The dynamic draft schedule is REMOVED
+  from `glm53f-q2-1` (it was a workaround for this bug) and drafting stays
+  on at every batch size per the A/B above. The record stays gated: the
+  bar is >= 2x at c=4 and >= 3x at c=16.
+- Not a bug, noted so nobody chases it: `moe_mm_w13/w2` at ~1 call/step in
+  the c=8 profiles is the prompts' prefill chunks (~6 chunk-steps x 42
+  layers) divided by decode steps; no preemptions (0 in the log, KV pool
+  at 39.5%). Prefix cache hit rate is 0.0% on this hybrid layout even with
+  a warmup pass, so the warmup does not remove prefill from the window.
+- Ops: `pkill -f slimserve.cli` does NOT stop the server (the CLI spawns
+  `vllm.entrypoints.openai.api_server` + `VLLM::EngineCore`); use
+  `stop_server.sh`, which waits for port 8000, or the next boot dies ten
+  minutes later with `Errno 48`.
+- Raw artifacts: `perf/results/2026-09-15/glm53f-q2-conc/` (`baseline/`,
+  `phase/`, `phase_specon/`, `draftdbg/`, `draftdbg2/`, `kdadbg/`,
+  `fix1_mixed_fused/`; scripts `concurrent_gate.sh`, `summarize.py`,
+  `boot_env.py`, `stop_server.sh`, `phase_diff.py`).
+
+## 2026-09-15 - GLM-5.3-Flash Q2 on Metal: concurrent-serving baseline - speculation is a NET LOSS above 2 requests, and long-prompt concurrency scales NEGATIVELY
+
+- Baseline: PR #30 branch at d8981f2bd, profile `glm53f-q2-1`, exact-token
+  harness `benchmarks/benchmark_dsv4_exact.py` at `--concurrency 1/4/8`,
+  200 output tokens, temperature 0, warmup 1, `exact=True` on every run.
+  This replaces the c=2/3/6 smoke numbers from 2026-09-14, which counted
+  each request's prefill inside a 96-token wall clock and are not a
+  scaling curve.
+- Hypothesis: single-stream is the only thing this profile has ever been
+  measured on, so the question is simply what concurrency does, separated
+  into decode-dominated (64-token prompts) and prefill-heavy (1000-token
+  prompts) workloads.
+- RESULT, aggregate output tok/s (`perf/results/2026-09-15/concurrency-baseline/`):
+
+  | arm | c=1 | c=4 | c=8 | c=8 @ 1000-tok prompt |
+  | --- | --- | --- | --- | --- |
+  | record as shipped (MTP K=1) | 28.66 | 32.51 | 49.92 | 14.53 |
+  | booted `--no-spec`          | 23.95 | 49.03 | 45.07 | 24.80 |
+  | dynamic schedule [(1,2,1),(3,8,0)] | 28.88 | 44.04 | 41.65 | 16.69 |
+
+  Also measured on the shipped record at 1000-token prompts: c=1 19.27,
+  c=4 14.13, c=8 14.53 - aggregate throughput FALLS as concurrency rises.
+- Two separate problems, and the review-era assumption that there is one
+  ("batching buys nothing") was wrong:
+  1. SPECULATION IS A NET LOSS AT CONCURRENCY. It wins at c=1 (28.66 vs
+     23.95, +20%) and costs 34% at c=4 (32.51 vs 49.03) and 41% on the
+     long-prompt c=8 case (14.53 vs 24.80). Expected in kind - the drafter
+     trades compute for latency and the GPU is already saturated at batch -
+     but not in size.
+  2. LONG-PROMPT CONCURRENCY SCALES NEGATIVELY, in both arms. Backing
+     prefill out of the c=8 no-spec run: 8000 prefill tokens cost ~64.5 -
+     35.5 = 29 s against 237-258 t/s single-stream, so concurrent prefill
+     runs at roughly a third of its single-stream rate AND blocks decode.
+  3. Even decode-only scaling is weak: no-spec 23.95 -> 49.03 at c=4 is
+     2.0x, and it goes DOWN at c=8 (45.07). max_num_seqs 8 and
+     max_num_batched_tokens 4288 were sized for the single-stream bring-up.
+- Dynamic speculative decoding EXISTS in this fork and works:
+  `speculative_config.num_speculative_tokens_per_batch_size`, a list of
+  inclusive `(range_start, range_end, num_speculative_tokens)` ranges
+  resolved by the scheduler against `max_num_seqs`
+  (`vllm/v1/spec_decode/dynamic/utils.py`); 0 is a legal draft length, and
+  the first range must start at 1. Added `[(1,2,1),(3,8,0)]` to the profile
+  and confirmed from the engine's SpecDecoding metrics that drafted
+  throughput drops from 9.20 tok/s at c=1 to 0.03-0.10 at c>=3, i.e. the
+  schedule fires.
+- BUT IT DOES NOT RECOVER THE NO-SPEC THROUGHPUT: c=4 44.04 vs 49.03,
+  long-prompt c=8 16.69 vs 24.80. So the cost is not the drafting work
+  itself. Suspects, in order, for the next session: a speculator-configured
+  engine reserves lookahead token budget (`max_num_scheduled_tokens is set
+  to 4288 based on the speculative decoding settings`) and sizes its KV /
+  state pools for the draft model, leaving less of the 8 GiB pool for eight
+  1000-token requests - preemption and recompute would explain a gap this
+  large, and the scheduler's preemption counters are the cheapest next
+  measurement. The `AcceptanceThrottle` path (`VLLM_SD_ADAPT_THROTTLE=1`)
+  is a second existing mechanism, untested here.
+- Decision: NOTHING KEPT YET. The dynamic schedule stays in the profile as
+  a measured partial (it is strictly better than the shipped record at c=4:
+  44.04 vs 32.51) but the profile is still gated and the campaign is open.
+  Single-stream is untouched by it: the c=1 arm measures 28.88 against the
+  shipped record's 28.66, and drafting is active there.
+- Raw artifacts: `perf/results/2026-09-15/concurrency-baseline/`
+  (`sweep.sh`, `c{1,4,8}.json`, `shortprompt/`, `nospec/`, `dynsd/`).
+- Method note: `aggregate_output_tps` from this harness INCLUDES each
+  request's prefill, so it is only comparable across arms at the same
+  prompt length, never against the decode probe.
+
+## 2026-09-15 - GLM-5.3-Flash Q2 on Metal: Astra (codex GPT-6) review round on PR #30 - a concurrent-serving crash, a conv-history race, unbounded prefill scratch
+
+- Baseline: PR #30 at 277922f31 (CodeRabbit round 1 applied; probe 40.01
+  tok/s, pins 7dd30ea193a6 / 393882a2ddaf / 1d7d58486dc7).
+- Hypothesis: the campaign's gates are all SINGLE-REQUEST and single-shape,
+  so any defect on a multi-request or multi-chunk path is invisible to them.
+  A reviewer reasoning over the code (not the gates) should therefore find
+  real bugs there, and fixing them must leave the gate shas untouched.
+- Findings (5, all accepted):
+  1. [P1] The shard concurrent region admits no torch copy, but its gate
+     (`_metal_hetero_direct_ok`) accepts batches 5..8, where the q8_0 NR
+     batch kernel has no strided-output route and `ggml_mul_mat_vec_a8`
+     falls back to the ring + copy -> TORCH_CHECK, engine dead. Three
+     concurrent K=1 requests reach that width (6 verify rows). Fix: a new
+     `_metal_shard_region_ok` mirrors the native strided-output rule
+     (batch 1 any format; q8_0 NR at M 2..4 with K > 512, K % 32 == 0,
+     N even; q4_K NR chunks at M <= 8 with N % 4 == 0, K % 256 == 0; kill
+     switches respected) and gates the region, not the fusion.
+  2. [P1] `kda_fused_prepare` chunk 0 reads the conv-history cells that the
+     request's LAST chunk writes, in the same dispatch: threadgroups are
+     unordered, so a long prefill could read post-write history (future
+     tokens leaking into early outputs, corrupted recurrent state). Fix:
+     the prepare kernel writes the pool only when one chunk covered the
+     request (`cstart == start`); multi-chunk requests get their history
+     from a new `kda_conv_history_write` dispatched after it, writing the
+     same last kernel_size-1 raw rows (bit-identical by construction, and
+     the 2500-token gate + the 12k needle confirm it).
+  3. [P2] `kda_step`'s six fp32 scratch tensors went through the 4-deep
+     `ring_out` rings, which are keyed by shape: every distinct prefill
+     length pinned its own set (~20 GiB after lengths 9..256 at H=64 D=128).
+     Fix: rings for decode/verify widths (T <= 32), transient allocations
+     above, like the other prefill-width tensors.
+  4. [P2] The indexer's windowed scatter parked out-of-window rows on
+     (b0, 0), a live cache row for every window but the first, with the
+     OLD value - an unordered duplicate write could drop a live update.
+     Same fix as the MLA one from CodeRabbit round 1 (park with the live
+     writer's value when this call has one); new test.
+  5. [P2] The q8_0 NR geometry knob computed `nr` from the REQUESTED
+     geometry while fp16 falls back to the 2x4 kernel: `VLLM_QC_Q8_NR_GEOM=1x4`
+     on fp16 dispatched 2N rows (out-of-bounds), 4x4 left half the output
+     unwritten. Fix: both the row-divisibility guard and the dispatch come
+     from the geometry actually launched.
+- FOUND WHILE VERIFYING (1), the most serious defect of the round: with the
+  region gate fixed, 3 concurrent requests still killed the engine, now in
+  `_prepare_prefill_inputs_native` - "shape mismatch: value tensor of shape
+  [3, 3] cannot be broadcast to indexing result of shape [3]". The runner
+  keeps `last_sampled_tokens` / `next_prefill_tokens` as [max_num_reqs, 1]
+  and the Triton kernel reads them through a flat pointer; the torch
+  replacement gathered them 2-D, so `torch.where` broadcast to [R, R] at
+  R > 1. Every multi-request step with the drafter died. Fix: gather flat.
+  The unit test built its fixtures 1-D, which is why it passed - it now
+  uses the runner's shapes (and fails 3/6 cases with the bug restored).
+  LESSON: a torch replacement for a kernel must be tested with the
+  PRODUCTION buffer shapes, not shapes convenient for the reference.
+- Correctness: 371 tests; kernels bit-exact; tf long 0.0830 (unchanged);
+  needles 4/4; concurrency 2/3/6 requests all served (2/2, 3/3, 6/6, health
+  200 after each; 41.2 tok/s aggregate at c=6), where c=3 was a hard engine
+  death before. Gates BIT-IDENTICAL: 8tok 7dd30ea193a6, off1-2000
+  393882a2ddaf 34.28 tok/s, 2500x64 1d7d58486dc7. Probe 39.96 tok/s at
+  2.000 tok/cycle; accept set 32.49-39.97 - no step-time cost.
+- Decision: ALL KEPT. The concurrency check is now a standing gate for this
+  profile (`concurrency_check.py`), since every exact-token gate is c=1.
+- Raw artifacts: `perf/results/2026-09-14/astra_review.log` (the review),
+  `perf/results/2026-09-14/glm53f-q2-w26-shard/astra1_k1/` (first pass, with
+  the crash in boot.log) and `astra1b_k1/` (concurrency.log, accept.log,
+  needle.log, gates/, tf_long.json).
+
+## 2026-09-14 - GLM-5.3-Flash Q2 on Metal: pre-PR cleanup, merge of main, merged-build verify, PR #30
+
+- Baseline: the Session 4 final build (`w26-shard/final_k1/`: loop probe
+  39.96 tok/s at 2.000 tok/cycle, off1-2000 34.23 tok/s, pins 7dd30ea193a6 /
+  393882a2ddaf / 1d7d58486dc7).
+- Cleanup (marker-matched strip, every block asserted gone): the unused
+  `qgemv_q8_0_nr_pair_swiglu_router` kernel + host op + ops.py wrapper; the
+  W17 `qgemv_q4k_nr_x` and W16d `qgemv_q4k_nr_mb_x` twins with their
+  VLLM_QC_Q4K_VARIANT / VLLM_QC_Q4K_MB_VARIANT hooks (launchers back to the
+  upstream form plus the W22 output row stride); the W20 pair-LUT /
+  register-LUT / lean kernels and the `qc_tgload_bench` probe; the W15
+  iq2_xxs `_x` / `_ilp2` / `_ref` and q2_K `_sum_x` / `_sum_sp` / `_ref` twins
+  with VLLM_QC_MOE_IQ2_VARIANT / VLLM_QC_MOE_Q2K_VARIANT; the sparse-MLA
+  heads-per-group twin (`mla_sparse_latent_partition_h`, VLLM_QC_MLA_HPG:
+  2 neutral, 4/8 spill 4-20x slower); the never-called `concurrent_enabled`
+  / VLLM_METAL_CONCURRENT wrapper; the DIAGNOSTIC `_glm_trace.py` and its
+  speculator hooks. qgemv.metal 4884 -> 2950 lines (upstream 2371). Kept:
+  the documented, bounded q8_0 NR geometry knob, `kda_recur_prefill` (the
+  kda_recur test harness, so documented), every kill switch.
+- Correctness on the cleaned build: kernels_test ALL EXACT; texbench
+  production vs texture kernel bit-exact at T=1/2/4 and the pre-strip vs
+  post-strip production kernel bit-exact (`w26-shard/cleanup_exact.log`);
+  the campaign suites 362 passed after two stale tests were fixed
+  (`test_glm5_next_indexer_native` called the op without `topk_len_buffer`,
+  stale since W16c; the routing smoke asserted no mHC norm fusion on Metal,
+  stale since the fused epilogue landed) (`cleanup_pytest2.log`). ruff:
+  no new findings (the 16 remaining are upstream's, same rules at shifted
+  lines).
+- Commits (author Eric Hartford, no trailers): e798309fa kernels +
+  binding, d7e97180e serving path, 5e2d9df65 profile + CLI + tests,
+  544cdc52d notebook / handoff. The tracked metallib is NOT committed: this
+  box's macOS 15 toolchain produces a metal3.1 library, which would drop the
+  M5 tensor-ops kernels the Qwen profiles use; upstream's metal4.0 binary
+  stays and the PR asks for a cmake/metal.cmake rebuild on merge.
+- Merge of origin/main 02fb15fc1 (76 commits since the 55fdb54bd base) as
+  328035d39. Conflicts, resolved semantically: profiles.json - main had
+  registered the `glm53f-gguf` source (pinned revision, shared vision
+  encoder) and a placeholder `glm53f-q2-1`; the measured record now sits on
+  that source and the campaign's `glm53f-q2` source is dropped; the source
+  declares text modality until the Metal vision path is qualified (the
+  registry rejects language_model_only on a vision source) and carries the
+  DFlash2 drafter entry the registry test requires; parsers glm47/glm47 like
+  the A100 glm53f records (the profile test and the GGUF parser-defaults
+  test follow). moe_runner - main records the MoE expert-stats histogram
+  right after the router; a torch op, so the W26b router region stays
+  closed when it is on. glm5_next_indexer - main's `row_group` (grouped
+  pool scoring for CUDA verify rows) beside our `tlen_out` / `pool_bound`;
+  the Metal path returns before it. The notebook keeps both sides.
+  `~/models/GLM-5.3-Flash-GGUF -> antirez-glm-5.3-flash-gguf` symlink for
+  the new local_dir.
+- Merged build (`build_merged.log`, rebuilt from the merged sources):
+  kernels_test exact, texbench bit-exact, 365 passed (`merged_tests.log`).
+  Verify chain `merged_k1/` (the server booted detached from the harness,
+  which kills background task trees once the model pins memory; steps run
+  in the foreground): loop probe 39.20 (64 tokens) / 40.03 / 40.02 (600)
+  tok/s at 2.000 tok/cycle; accept set off1 full 33.67 / first64 34.44 /
+  last64 37.13 / last256 32.50, m2 64/1000/2000 40.00 / 37.62 / 35.62 -
+  chunk counts identical to final_k1; tf short 29/32, tf long 62/64 mean
+  0.0830; needles 4/4 (6.3 / 18.9 / 31.0 / 60.4 s); gates 8tok
+  7dd30ea193a6, off1-2000 393882a2ddaf 34.27 tok/s (58.4 s), 2500x64
+  1d7d58486dc7 (13.9 s). ALL PINS HELD on the merged build.
+- Other-profile scope on the merged tree, by code path: every campaign
+  feature reads an env opt-in whose default is off (VLLM_METAL_ASYNC_SCHED,
+  VLLM_QC_Q8_NR, KV_META, MAMBA_LB, MOE_ROUTER, MOE_FOLD, SHEXP_PAIR,
+  KDA_GATE_DUAL, MOE_OVERLAP, INDEXER_IDENTITY, MLA_DUAL_NORM, MOE_IQ2_TEX,
+  SHARD_OVERLAP, MOE_ROUTER_OVERLAP - all `"0"` defaults, only the
+  glm53f-q2-1 env block sets them); the stripped launchers are back to the
+  upstream text on the paths DSV4 takes (q4_K NR, iq2_xxs swiglu without
+  the texture route, q2_K sum). The DSV4 / Qwen anchor re-gates stand from
+  the Session 3 build (`2026-09-12/dsv4-regate-r4`, `qwen-regate`).
+- Decision: PR #30 opened against QuixiAI/SlimServe main from
+  `glm53f-metal-campaign` (`perf/results/2026-09-14/PR_DESCRIPTION.md`).
+  Open items carried in the record's notes: text only, 131072 of the
+  native context, f16 latent pages, metallib rebuild. The codex (GPT-6
+  Astra) review was not run: the CLI's ChatGPT token is revoked on this box.
+- Raw artifacts: `perf/results/2026-09-14/glm53f-q2-w26-shard/
+  {cleanup_exact.log, cleanup_pytest2.log, build_merged.log,
+  merged_tests.log, merged_k1/}`.
+- CodeRabbit round 1 on PR #30 (2026-09-15): nine findings fixed - the
+  router kernel is total over NaN (NaN biased scores -> -inf; no mask write
+  at best_i == -1; a row with no finite candidate emits id -1 / weight 0,
+  the sentinel the expert kernels zero; renormalize guards s == 0), the
+  windowed latent scatter parks out-of-window rows with the value the live
+  writer of (b0, 0) carries (duplicate index writes are unordered; new
+  test `test_insert_latent_rows_windowed`), absent GGUF bos/pad ids stay
+  None, the native KDA prefill asserts has_initial_state like the Triton
+  path, and four test hygiene items (dispatch assertion, extension probes,
+  the torch reference forced off the Metal router route, the GGUF fixture
+  path from the registry / SLIMSERVE_GLM53F_GGUF). Skipped: moving the
+  per-wave pins out of baseline_status.md (they are the gate pins
+  perf/perf.md places there).
+- Hypothesis for the round: each fix is a correctness guard on a path the
+  campaign's single-request gates never exercise (NaN warm-up rows, caches
+  past the 32-bit element range, absent GGUF keys, unbuilt extensions), so
+  none of them may move the gate shas or the step time.
+- Correctness / throughput: confirmed - 367 tests, all three pins held, probe
+  40.01 tok/s at 2.000 tok/cycle, off1-2000 34.38 tok/s.
+- Decision: KEPT (all nine).
+- Raw artifacts: `perf/results/2026-09-14/glm53f-q2-w26-shard/cr1_k1/`
+  (boot.log, gates/, gates.log).
+
+## 2026-09-14 - GLM-5.3-Flash Q2 on Metal M1 Ultra: W23 K=2 is economically dead (3rd verify row = ~14 ms of expert bytes); W24 ROOT CAUSE of the weak nextn drafter - its sparse attention read a never-written top-k buffer (attention output ZERO on every extend/decode row); one-line re-pointing fix; W24a/b/c, W25 (iq2_xxs codebook through the TEXTURE UNIT, -23% on the expert kernel, bit-exact) and W26/W26b concurrency: loop probe 34.5 -> 39.9 tok/s (+15.8%), off1-2000 gate 34.23 tok/s, all pins held
+
+- Baseline: W22 final build, K=1 MTP (probe ~34.5 tok/s, off1-2000 gate
+  27.57, pins 7dd30ea193a6 / 8a9753e18551 / 1d7d58486dc7); per-position
+  acceptance (`accept_by_pos.py`, server metrics) on prose_64 / prose_1000
+  pos0 0.51-0.53, and at K=2 pos1 0.10-0.16.
+- W23 K=2 on the current tree (`w23-k2/chain_kp.sh 2 4352`, boot via
+  `w14-budget/boot_glm_prof.py` with GLM_K=2 GLM_MNBT=4352 - the Mamba
+  align block grows with K, so K=2 needs max_num_batched_tokens 4352):
+  probe 1.98 tok/cycle at ~77 ms/step (K=1: 1.948 at 53.8), off1-2000
+  25.51 tok/s (sha fbe4d6ae2909: the M=3 verify changes fp32 partition
+  numerics; tf long delta unchanged at 0.083), accept set 20-25 tok/s vs
+  K=1 27-34. xctrace decomposition of one K=2 cycle (`k2/budget.txt`,
+  `timeline_dump.py` on `k2/metal-gpu-intervals.xml`, 78.9 ms):
+
+  | segment | ms | note |
+  | --- | --- | --- |
+  | target verify, M=3 rows | 64.7 | M=2 is ~48.6: +14-16 ms for the 3rd row (up to 24 unique experts/layer instead of 16; ~2.2 GB of expert bytes per row) incl. a 1.3 ms GPU gap after layer 0 |
+  | sampling glue | 0.25 | |
+  | drafter prefill (up to 3 rows) | 5.0 | mamba_align, norms+eh_proj, indexer, MLA+MoE+lm_head |
+  | GPU IDLE before draft step 2 | 4.1 | host: `compute_slot_mappings` .cpu() sync + `_multi_step_decode` prep |
+  | draft step 2 (1 row) | 4.3 | embed/eh_proj 0.45, pool 0.14, MLA+MoE+lm_head 3.2 |
+  | glue to next target | ~0.5 | |
+
+  Arithmetic: K=2 must reach >= 2.66 tok/cycle to match K=1's 36 tok/s
+  probe rate even with the 4.1 ms gap removed; a PERFECT 2nd position on
+  prose (pos0 0.55 -> 1 + 0.55 + 0.55*0.55 = 1.85) gives ~25 tok/s. K>1
+  with a 288-expert top-8 target is dead on this box regardless of drafter
+  quality; the same per-row expert-byte tax bounds DFlash2 (8 rows/cycle).
+  DECISION: K=1 stays; K=2 kept only as a measurement mode.
+- W24 drafter root cause. Instrument: env-gated per-cycle trace of the
+  nextn drafter (`autoregressive/_glm_trace.py` + `# DIAGNOSTIC` hooks in
+  `autoregressive/speculator.py`, VLLM_GLM_SPEC_TRACE=<path>: target
+  hidden rows, drafter ids/positions, draft tokens, recycled hidden, per
+  step topk/tlen, and forward hooks on eh_proj / self_attn / mlp) and an
+  OFFLINE fp32 DENSE reference of blk.45 dequantized from the GGUF
+  (`w23-k2/ref_k2b.py`: dense causal attention with a per-position K/V
+  cache, top-8 sigmoid routing + bias, x2.5, shared expert; scored by
+  `score_log.py` against the truth from the next cycle's
+  num_rejected/last_sampled). 251 K=2 cycles over the 5 accept_by_pos
+  prompts (`k2_trace/`):
+
+  | | server | fp32 dense reference |
+  | --- | --- | --- |
+  | pos0 draft == target token | 0.693 | 0.781 |
+  | pos1 given pos0 accepted, reference fed the SERVER's recycled hidden | 0.316 | 0.649 |
+  | recycled-hidden cos vs reference post-norm, 3-row batches | 0.58 | (whole-prompt prefills: 0.84-1.00) |
+
+  So the recursion semantics are fine (the reference recycles the same
+  hidden and hits 65%); the server's forward is wrong for short batches.
+  Per-module probe (`ref_probe.py`, cos of the server's captured module
+  outputs vs the reference, `k2_trace2/`): whole-prompt prefill rows
+  eh_proj 1.000 / attention 1.000 / mlp 1.000; EVERY extend row and every
+  decode-step row eh_proj 1.000 / attention 0.000 (also 0.000 against a
+  no-context twin: the output is the zero vector) / mlp 0.3-0.5. Cause:
+  `eagle/utils.load_eagle_model` shares the target's `topk_indices_buffer`
+  and `topk_len_buffer` by re-pointing every draft nn.Module that has the
+  attribute, but the sparse-MLA attention impl (`layer.impl`, not a
+  module) captured `indexer.topk_indices_buffer` / `topk_len_buffer` in
+  its __init__ - so the draft's indexer wrote the target's buffers while
+  its attention read the draft's original private buffers (never
+  written). Whole-prompt prefills were exact only because fresh-prefill
+  rows take the dense SDPA path that never reads those buffers. Every
+  K=1 draft since W9 was made WITHOUT attention over the context.
+  Fix: re-point `module.impl.topk_indices_buffer` / `.topk_len_buffer`
+  too (generic: the QuixiCore CUDA and AITER sparse impls cache the same
+  way, so CUDA/ROCm MTP drafts on sparse-MLA models get the same fix -
+  flag for their owners; not re-gated here).
+- VERIFICATION (K=1 profile boot `slimserve.cli glm53f-q2-1 --serve --spec`,
+  `w24-fix/chain_k1.sh`, raw in `w24-fix/k1/`): the three exact-token
+  gates are BIT-IDENTICAL to the pins (8tok 7dd30ea193a6, off1-2000
+  8a9753e18551, 2500x64 1d7d58486dc7 - spec decoding is lossless, only
+  the proposals changed), tf short/long unchanged (long delta 0.083),
+  needles 4/4. Throughput: off1-2000 gate **27.57 -> 29.46 tok/s**
+  (+6.9%; ds4's recorded MTP bar 22.52 -> +30.8%); probe 64/600 34.63 /
+  35.25 tok/s at 2.000 / 1.997 tok/cycle (was 34.5 at 1.945). Accept set
+  (`accept_probe.py 300`): off1 full 0.648 tok/draft (was ~0.56), first
+  64 0.604, last 64 0.571, last 256 0.661; m2 64 / 1000 / 2000 = 0.993 /
+  0.892 / 0.980 (was 0.92 / 0.75 / -: the "acceptance falls with
+  context" observation was this bug - the drafter saw no context at
+  all). Per-position (`accept_by_pos.py 128`): m2src 0.98, m2src_64b
+  0.59, prose_64 0.49, prose_1000 0.62. DECISION: KEPT (fix in
+  `eagle/utils.py`); pins unchanged. The drafter now matches its own
+  dense reference's behaviour; remaining acceptance headroom is the
+  checkpoint's (ds4's drafter on real text: 0.47-0.61).
+- W24a KEPT: shared-expert pair-SwiGLU || routed w13 in one
+  MTLDispatchTypeConcurrent region (`GGUFMoEMethod._apply` +
+  `mk_can_overlap_shared_experts`; encode order pair, w13, [auto
+  barrier] shexp down, [auto barrier] w2 q2_K sum accumulated into the
+  shexp output = the existing fold; opt-in VLLM_METAL_MOE_OVERLAP=1,
+  now in the glm53f-q2-1 env block). Rationale: the iq2_xxs w13 kernel
+  is ALU-bound with ~70% of the memory pipe idle (W20 counters) and the
+  two q8_0 shexp GEMVs are bandwidth-bound (43 + 24 us DRAM-resident at
+  M=2, x44 layers). A/B at K=1 (`w24-fix/ovl_k1/`, boot_glm_prof.py +
+  the env): gates BIT-IDENTICAL (7dd30ea193a6 / 8a9753e18551 /
+  1d7d58486dc7 - same kernels, same rounding), tf long 0.083; off1-2000
+  29.46 -> 29.88 tok/s (+1.4%), probe 35.25 -> 35.41/35.61, accept set
+  +1.0-1.3% on every prompt (off1 full 28.29 -> 28.62, m2 2000 32.78 ->
+  33.17); fitted step 53.8 -> 53.6 ms. Smaller than the ~2 ms the
+  standalone overlap suggested: with the routed kernel occupying every
+  core, the pair GEMV mostly runs in its tail. Kept: free and exact.
+- W24b KEPT: indexer identity bypass below the selection limit
+  (`glm5_next_indexer._pooled_select_native`, opt-in
+  VLLM_METAL_INDEXER_IDENTITY=1, now in the glm53f-q2-1 env block). When
+  the batch's longest context has at most `ksel` (512) pools (context
+  <= 2048 tokens) the pooled top-k selects every pool of every row, so
+  the pool-logits kernel (114 us x 12 layers in situ) and the torch
+  top-k / eq / masked_fill / cast chain are skipped and each row's pools
+  are emitted in position order (valid prefix, -1 tail) straight into
+  the expand kernel. Same selected SET (the pre-fix K=2 trace shows the
+  scored path at topk_n = seq for these rows); only the list ORDER
+  differs, which the sparse decode kernel's fp32 partition merge sees as
+  rounding. Verify at K=1 (`w24-fix/idn_k1/`, CLI profile boot BEFORE
+  the overlap flag entered the profile, so this is identity alone vs the
+  fix baseline): loop probe 35.25 -> 36.50 tok/s at an identical 2.000
+  tok/cycle (**+3.5% step time**, ~1.9 ms), 8tok 7dd30ea193a6 and
+  2500x64 1d7d58486dc7 UNCHANGED (the 2500-token context runs the scored
+  path), tf short/long unchanged (0.083), needles 4/4 (1.5k on the
+  identity path, 4k-12k on the scored path); off1-2000 ROLLED to
+  393882a2ddaf (31.70 tok/s) - see the caveat below. Contexts above
+  2048 keep the scored path unchanged.
+- FINAL K=1 BUILD OF THIS WAVE (profile env now carries VLLM_METAL_MOE_OVERLAP
+  and VLLM_METAL_INDEXER_IDENTITY beside the earlier opt-ins; CLI profile
+  boot, `w24-fix/final_k1/`): loop probe 64/600 36.26 / 36.97 tok/s at
+  2.000 tok/cycle (session start: 34.5 at 1.945 = +7.2%); accept set off1
+  full / first64 / last64 / last256 31.18 / 31.82 / 34.25 / 30.06, m2 64 /
+  1000 / 2000 36.98 / 34.89 / 33.18 tok/s; per-position pos0 m2src 1.00,
+  m2src_64b 0.69, prose_64 0.56, prose_1000 0.61; tf short/long unchanged
+  (0.083), needles 4/4 (6.5 / 18.9 / 31.0 / 60.2 s). Gates: 8tok
+  7dd30ea193a6 and 2500x64 1d7d58486dc7 unchanged, off1-2000 393882a2ddaf
+  (identical to the identity-only run, so the overlap is bit-exact in
+  situ too) 32.13 tok/s / 62.3 s incl. prefill. **NEW PINS: 7dd30ea193a6 /
+  393882a2ddaf / 1d7d58486dc7.** vs ds4's recorded MTP bar (22.52):
+  +43% on the gate number (both outputs partly degenerate - see the
+  caveat), +38-52% on the non-degenerate accept set.
+- W24c KEPT (`w24-fix/dual_k1/`, rebuilt extension + metallib, profile env
+  now also VLLM_METAL_MLA_DUAL_NORM=1): (a) the indexer identity bypass
+  moved in-kernel (`glm5_indexer_expand_identity`: the expand_topk kernel
+  gained an `identity` flag, so the <= 2048-context selection is one
+  dispatch with no torch ops - the W24b python path with its 3 torch ops
+  stays as the fallback for an older metallib); (b) `rms_norm_dual`: the
+  MLA wrapper's q_a_layernorm and kv_a_layernorm run as one dispatch over
+  the two column slices of the fused qkv_a output (`qc_rms_norm_w32_dual`,
+  tgid.y selects the slice; same body, same rounding). Exactness test
+  `w24-fix/kernels_test.py`: ALL EXACT vs the single dispatches (rms dual
+  over 4 shapes incl. odd visible lengths; identity expand vs the python
+  path at vis 3/130/1000/2047/2048). In situ: loop probe 36.90/36.92 ->
+  37.31/37.29 tok/s (+1.1%), accept set off1 full 31.15 -> 31.44, m2 64
+  36.97 -> 37.30, m2 1000 34.89 -> 35.16, m2 2000 33.11 -> 33.53; tf 0.083
+  unchanged; needles 4/4; gates 7dd30ea193a6 / 393882a2ddaf /
+  1d7d58486dc7 ALL IDENTICAL to the pins (bit-exact, as the kernels
+  promised).
+- NEXT (W25, staged `perf/results/2026-09-14/glm53f-q2-w25-tex/`): the
+  routed iq2_xxs w13 kernel is bounded by the divergent threadgroup-memory
+  lookup rate + ~12 ALU ops per weight (W15/W20 closed every LDS/register
+  formulation). Untried: the TEXTURE unit, whose whole job is divergent
+  per-lane fetches through its own pipeline and cache. Kernel
+  `qgemv_moe_mr_iq2_xxs_swiglu_tex`: a texture_buffer LUT (8192 texels x
+  half4, 64 KB) indexed by (grid code, 4 sign bits) returns four SIGNED
+  magnitudes, so an 8-weight group is two texel reads + eight FMAs
+  (no byte lookup, no int->float, no sign select, no extra multiply).
+  Host builds the LUT on the CPU from the codebook and binds it at
+  texture(0) (`lut_texture`, `TorchEncoder::texture`); env
+  VLLM_METAL_MOE_IQ2_TEX=1 routes production to it; twins texnc (no
+  mul+add contraction), texf (fp32 LUT), texm (magnitude-only 256-texel
+  LUT + sign-bit xor: the control for texture-fetch cost), tex4x1/tex4x2
+  geometries through the W15 variant hook. Bench `texbench.py`
+  (DRAM-resident, 64 rotating id sets) + bit-compare vs production.
+- W25 RESULT (`w25-tex/run_w25.log`, `run_w25b.log`; texbench.py,
+  DRAM-resident 64 rotating id sets, bf16, T = 1 / 2 / 4, production
+  0.179-0.192 / 0.315-0.324 / 0.606 ms): the TEXTURE UNIT IS A REAL
+  LOOKUP ENGINE ON THIS GPU, BUT ONLY FOR TABLES THAT FIT ITS L1.
+  - joint signed LUT (8192 texels x half4 = 64 KB, 2 reads per 8 weights,
+    per weight only a convert + FMA): 0.575 / 1.133 / 2.248 ms = 3x SLOWER
+    (fp32 LUT 128 KB: 0.743 / 1.472 / 2.927; geometries 4x1 / 4x2 the
+    same; contraction on/off the same). The table misses the texture L1
+    and every read is an L2 round trip on a kernel with 18% occupancy.
+  - **texm** (256 texels x RGBA32Uint = 4 KB: the 8 unsigned magnitudes
+    of one grid code as packed halfs; ONE texel read per 8 weights; sign
+    applied by xor-ing the fp32 sign bit from the ksigns pattern; convert
+    + xor + FMA per weight): **0.132-0.152 / 0.249-0.251 / 0.486 ms =
+    -21..26% at every T, BIT-EXACT vs production** (all six W25 variants
+    and all eight W25b variants compare BIT-EXACT: the per-weight
+    arithmetic text is production's, only the magnitude source changed).
+  - W25b refinements all lose to texm: packed 16-bit sign masks from a
+    2 KB second table (texms, 2 reads / 8 w) 0.166 / 0.286 / 0.543 at 2x2
+    and 0.141 / 0.256 / 0.469 at 4x1; fp32 magnitudes (texmf, 8 KB, 2
+    reads / 8 w, no convert) 0.176 / 0.317 / 0.614 = production; fp32
+    magnitudes + fp32 sign masks (texmfs, 4 reads / 8 w) worse; the
+    2-op shift-and sign twin (texm2) 0.153 / 0.254 / 0.511 (the compiler
+    already had it). So a texel read from an L1-resident table costs
+    about what the convert it replaces costs; the win is the codebook
+    lookup itself leaving the threadgroup-memory path (W20 measured a
+    divergent threadgroup lookup at ~10 ALU-op equivalents). One read per
+    8 weights is the sweet spot; every second table costs its win back.
+  - Promoted: env VLLM_METAL_MOE_IQ2_TEX=1 routes ggml_moe_a8_vec_swiglu
+    to `qgemv_iq2_xxs_moe_mr_swiglu_texm` (half + bf16, 2x2). Expected in
+    situ: w13 14.7 -> ~11.3 ms/step (K=1, M=2) = ~ -3.4 ms of a 52 ms
+    step. Verify chain pending (`w25-tex/tex_k1/`).
+- W25c q2_K down-sum texture twin (`run_w25c.log`; two 4 KB RGBA32Uint
+  tables returning the four in-place masked 2-bit fields of a byte as
+  fp32, two texel reads per 8 weights, bit-exact at every geometry):
+  LOSES - production 0.094 / 0.152 / 0.224 ms (T=1/2/4) vs 0.248 / 0.308
+  / 0.459 at 2x4, 0.147 / 0.243 / 0.464 at 4x4, 0.116 / 0.179 / 0.335 at
+  1x2. The q2_K walk is already only an `and` + convert + FMA per weight
+  (llama.cpp's fraction-scaled masked multiply), so the texel reads cost
+  more than they save; the rule from W25b holds (a read ~ a convert; the
+  texture path pays only where it replaces the threadgroup-memory
+  codebook lookup). Not promoted; VLLM_METAL_MOE_Q2K_TEX stays off and
+  the twin is stripped before the PR. Production iq2_xxs texm path through
+  the env flag: 0.153 / 0.268 / 0.502 vs 0.174 / 0.320 / 0.618, BIT-EXACT.
+- W25 IN SITU - KEPT (`w25-tex/tex_k1/`, profile CLI boot with
+  VLLM_METAL_MOE_IQ2_TEX=1 on top of the W24c env): loop probe 37.31/37.29
+  -> 38.35/39.14/39.14 tok/s (+5.0%); accept set off1 full 31.44 -> 32.90,
+  first64 32.09 -> 33.63, last64 34.59 -> 36.27, last256 30.31 -> 31.70,
+  m2 64 37.30 -> 39.07, m2 1000 35.16 -> 36.77, m2 2000 33.53 -> 34.66;
+  per-position acceptance unchanged (prose_64 0.56, prose_1000 0.61, m2src
+  1.00); tf 0.083 unchanged; needles 4/4; gates 8tok 7dd30ea193a6 /
+  off1-2000 393882a2ddaf (33.59 tok/s, 59.5 s) / 2500x64 1d7d58486dc7 -
+  ALL IDENTICAL to the pins. Step ~52.2 -> ~49.6 ms at 2.000 tok/cycle.
+  **VLLM_METAL_MOE_IQ2_TEX=1 added to the glm53f-q2-1 env block.** vs ds4's
+  MTP bar 22.52: loop probe +74%, off1-2000 gate +49%, non-degenerate
+  accept set +41..74%.
+- W26 KDA in_proj shard GEMVs in one concurrent region
+  (`gguf/linear.py`, env VLLM_METAL_SHARD_OVERLAP=1; the q4_K q|k walk
+  and the q8_0 v|f|g|beta GEMV read the same input and write disjoint
+  column slices of the LDD output, so they overlap): single-variable
+  verify vs dual_k1 (`w26-shard/shard_k1/`): loop probe 37.31/37.29 ->
+  36.77/37.49/37.48, accept set off1 full 31.44 -> 31.57, first64 32.09
+  -> 32.22, last64 34.59 -> 34.74, last256 30.31 -> 30.45, m2 64 37.30 ->
+  37.45, m2 1000 35.16 -> 35.31, m2 2000 33.53 -> 33.64: +0.3..0.5% on
+  every probe, i.e. ~0.2 ms/step - the q4_K kernel leaves little
+  bandwidth headroom (its "198 us in situ" in the W16 fit was a
+  collinearity artifact; the shard pair is ~150 us together). Gates
+  identical, needles 4/4, tf unchanged. KEPT as a marginal, bit-identical
+  opt-in (VLLM_METAL_SHARD_OVERLAP=1 goes into the profile env with the
+  final combined verify).
+- W26b router kernel inside the MoE concurrent region (`moe_runner.py`
+  `_metal_router_region_ok` opens the region before `select_experts` when
+  the Metal single-group router kernel and the W24a shared||routed region
+  both apply to the call; `gguf/fused_moe.py` `_metal_overlap_prep` /
+  `metal_region_ok` factor the eligibility, `_metal_overlap_moe` joins an
+  open region and closes it, or closes it before any serial fallback so
+  no torch op ever runs inside; env VLLM_METAL_MOE_ROUTER_OVERLAP=1):
+  single-variable verify on top of W25 (`w26-shard/router_k1/` vs
+  `tex_k1/`): loop probe 39.14 -> 39.71/39.70 (+1.4%), accept set off1
+  full 32.90 -> 33.35, first64 33.63 -> 34.16, last64 36.27 -> 36.72,
+  last256 31.70 -> 32.27, m2 64 39.07 -> 39.68, m2 1000 36.77 -> 37.36,
+  m2 2000 34.66 -> 35.46 (+2.3%); off1-2000 gate 33.59 -> 34.12 tok/s;
+  gates identical, needles 4/4, tf unchanged. KEPT
+  (VLLM_METAL_MOE_ROUTER_OVERLAP=1 in the profile env). The router's
+  ~25 us launch now hides under the shared-expert pair GEMV in all 43
+  MoE layers + the drafter's.
+- **FINAL OF THIS SESSION (stripped build, every kept flag in the profile
+  env, CLI profile boot, `w26-shard/final_k1/`, 18:14):** loop probe
+  39.15 / 39.96 / 39.94 tok/s at 2.000 tok/cycle (session start 34.5 at
+  1.945 = **+15.8%**; W24 fix 36.3, W24b 36.5, W24c 37.3, W25 39.1, W26b
+  39.7); accept set off1 full / first64 / last64 / last256 33.60 / 34.36 /
+  37.04 / 32.45, m2 64 / 1000 / 2000 39.92 / 37.57 / 35.60 tok/s;
+  per-position acceptance unchanged (prose_64 0.56, prose_1000 0.61,
+  m2src 1.00); tf short/long 0.083 unchanged; needles 4/4 (6.4 / 18.6 /
+  31.7 / 59.3 s); gates 8tok 7dd30ea193a6, off1-2000 393882a2ddaf 34.23
+  tok/s (58.4 s incl. 4.3 s prefill), 2500x64 1d7d58486dc7 - **PINS
+  HELD** (every kept change since W24b is bit-identical). Standalone on
+  the stripped build: texm 0.152 / 0.260 / 0.488 ms vs 0.187 / 0.320 /
+  0.603 (T=1/2/4), BIT-EXACT; kernels_test ALL EXACT. vs ds4's recorded
+  MTP bar (22.52 tok/s): loop probe +77%, off1-2000 gate +52%, the
+  non-degenerate accept set +44..77%. Step at 2.000 tok/cycle ~50.1 ms
+  (2 tokens) = ~25 ms per token.
+- Final traced budget (`w26-shard/final_trace/budget.txt`, boot_glm_prof
+  sweep on the same build; its gates matched the pins again, off1-2000
+  34.35 tok/s): **48.3 ms/step fitted, encoder busy 48.8 ms, GPU 95.8%
+  busy** (W16 baseline 56.0, W24c 52.2). With 77 concurrent regions per
+  step (43 MoE + 34 KDA shard pairs) the encoder-level fit can no longer
+  rank kernels inside regions (residual 38.8 us, the region group absorbs
+  77 x 1.0 ms); a per-kernel ranking now needs a trace with the overlap
+  flags off. Outside the regions: q8_0 NR GEMVs 74/step, rms_norm 30,
+  paged_row_insert 24 (31 us each), sparse-MLA decode 12 (105 us),
+  indexer identity expand 12 (56 us = launch floor), dense-layer pair
+  SwiGLU 3 (434 us each for 107 MB = 246 GB/s - a candidate), lm_head +
+  final norm 1.6 ms.
+- Pair-SwiGLU GEMV re-measured DRAM-resident (`w26-shard/pairbench.py`,
+  `.log`, 28 / 8 rotating weight copies): shexp shape 4096x4096 (17.8 MB)
+  38.7 / 35.7 us at M=1/2 (460 / 500 GB/s) vs the plain NR GEMV 44.7 /
+  58.6 (+ qc_swiglu 65-67); dense-MLP shape 24576x4096 (107 MB) 168.8 /
+  157.5 us (634 / 679 GB/s) vs 170 / 223. The fit's "434 us" for the
+  dense pair was a region-collinearity artifact; the pair kernel is at or
+  above the NR rate at both shapes. No lever there. (Standalone the pair
+  output matches gemv + qc_swiglu bit-for-bit only at 4096x4096 M=1; the
+  M=2 / wide-N plain routes take other NR batch kernels with a different
+  accumulation order - a comparison of two kernels, not a defect: the
+  serving path uses the pair kernel throughout and every gate held.)
+- NEXT (small, ~1% each, in order): fuse the two paged_row_insert
+  dispatches per MLA layer (24/step at 31 us) with the identity expand;
+  the drafter/sampling torch glue (~1.3 ms); rms_norm into the following
+  GEMV's staging (30/step, exactness-fiddly); then the pre-PR cleanup and
+  anchor re-gates listed in HANDOFF.md.
+- CAVEAT on the off1-2000 gate as a SPEED number (applies to every sha
+  roll on this prompt): its greedy continuation sits on a 0.004-nat
+  near-tie at token 6 (tf long k=5), so ANY decode-numerics change
+  diverges at character 41 and the new continuation may or may not
+  degenerate. K=1 baseline 8a9753e18551: 8105 chars, most repeated line
+  x10 (structural, coherent to the end). K=2 fbe4d6ae2909: one bullet
+  x28 (runaway). Identity 393882a2ddaf: 6364 chars, one block x20
+  (runaway). A degenerate tail drafts at ~1.0 and inflates the gate
+  (`check`: `Counter(txt[i:i+80])` over the completion in
+  `gates/off1_completions/`). Step-time claims therefore come from the
+  fixed-text loop probe (2.000 tok/cycle in every variant) and the
+  xctrace budget; the gate stays the exact-token pin, not the headline.
+- W23 K=2 re-measured with the fixed drafter (`w24-fix/k2/`,
+  `chain_kp2.sh 2 4352`): per-position pos1 (unconditional) prose_64
+  0.27 / prose_1000 0.47 / m2src_64b 0.73 / m2src 0.93 (was 0.13 / 0.15
+  / 0.18 / 0.91); step 71.0 ms GPU + ~6 ms gaps = ~80 ms wall (the 4.1
+  ms host gap before draft step 2 remains). Equal-prefix accept set
+  (300 tokens): K=2 26.18 / 24.48 / 30.02 / 30.35 / 38.03 / 31.92 /
+  29.99 tok/s vs K=1 28.29 / 28.43 / 27.82 / 29.29 / 35.25 / 32.45 /
+  32.78 (off1 full / first64 / last64 / last256 / m2 64 / 1000 / 2000):
+  mean 30.1 vs 30.6 - a wash on prose, a win only on loop-like text.
+  Its off1-2000 gate read 32.05 tok/s (sha fbe4d6ae2909) but that output
+  DEGENERATES (the M=3 verify numerics diverge from K=1's text at
+  character 41 and the continuation repeats one bullet 28 times; K=1's
+  8a9753e18551 output repeats its most common line 10 times, no
+  runaway) - the same loop inflation as ds4's bar. DECISION: K=1 stays
+  the profile default; K=2 is a measurement mode. A dynamic K (2 only
+  when both positions' running acceptance exceeds ~0.9) would need
+  p0*p1 > (1+p0)*(T2/T1-1) ~ 0.7-0.8, i.e. loop-like text only - not
+  worth a scheduler change.
+
+## 2026-09-14 - GLM-5.3-Flash Q2 on Metal M1 Ultra: CORRECTION - ds4's 90% off1 acceptance is a LOOP ARTIFACT; on non-degenerate text ds4's drafter accepts 0.47-0.61 like ours (0.48-0.56); the "acceptance gap" below is NOT a drafter defect
+
+- Read the ds4 `--mtp --mtp-timing` bar run (`glm53f-q2-bar/C_cli.err`,
+  1051 cycles) per cycle instead of by its summary line. ds4's greedy
+  2000-token off1 output DEGENERATES into one repeated paragraph ("The kernel
+  is enabled by default in serving profiles. It is disabled in benchmark
+  profiles...", 66 copies, first at char 969 of 10324) after ~300 tokens,
+  and its acceptance tracks that exactly:
+
+  | ds4 cycles | accept | tokens so far |
+  | --- | --- | --- |
+  | 0-100 | 0.47 | 147 |
+  | 100-200 | 0.61 | 308 |
+  | 200-300 | 0.96 | 504 (loop) |
+  | 300-1051 | 0.98-1.00 | 1998 (loop) |
+
+  ds4's no-MTP arm (`B_cli.out`) is byte-identical, so the loop is ds4's
+  greedy path, not an MTP effect. OUR off1-2000 gate output
+  (`verify_final/gates/off1_completions/completion_0.txt`) never loops
+  (most-repeated 80-char chunk: 3 copies in 8105 chars); it diverges from
+  ds4 at token ~6 on a 0.004-nat coin flip (' and' vs ',' - tf long k=5).
+  So ds4's headline 90.1% / 1.90 tok/cycle is ~75% loop; on the non-loop
+  stretch its drafter accepts 0.47-0.61 - the same as ours on the same
+  prompt (off1 full 0.56, first-64 0.48, last-256 0.42).
+- The indexer is exonerated for these lengths independently: index_topk
+  2048 pools x kpool covers every token below ~2048 context, so the
+  "off1 first 64" probe (64 + 300 tokens, accept 0.48) ran with NO sparse
+  pruning at all. Acceptance variation across prompts is content, not the
+  draft-time attention.
+- Apples-to-apples on NON-looping text: ds4 cycles 0-200 = 308 tokens in
+  200 x 86 ms (76.1 verify + 9.8 draft) = ~17.9 tok/s; ours over the first
+  300 tokens of off1 full = 27.0 tok/s -> +51%. Against ds4's own bar as
+  recorded (loop included) we are +23% (27.57 vs 22.52); that bar is what
+  ds4 does on that workload and stays the campaign's reference number, but
+  the +50% "if we matched ds4's acceptance" projection in the entry below
+  is withdrawn - there is no 90% to match on real text.
+- What this changes: the remaining levers are (1) MORE TOKENS PER CYCLE by
+  drafting deeper - K=2 with the single nextn block applied recursively
+  (`DeepSeekMultiTokenPredictor` steps `spec_step_idx % num_mtp_layers`, so
+  the proposer already supports it): at ~0.5 first-draft acceptance,
+  tok/cycle 1.5 -> ~1.7-1.75 if the verify M=3 step and the extra draft
+  pass cost less than +15%; (2) the step itself (every ms of the 54 ms is
+  ~1.9% at 1.5 tok/cycle), including the shared||routed overlap the
+  concurrent mechanism was built for; (3) the drafter's inherent quality
+  on prose is bounded by the checkpoint's nextn block, the same block ds4
+  runs (ds4 runs it DENSE over the generated window only, no prompt KV
+  and no indexer - `ds4.c` "nextn attention (full causal over the MTP
+  window, no indexer)"; ours runs it over prompt + generated with the
+  sparse path, and gets the same acceptance). NEXT: measure K=2 (and K=3)
+  on the accept probe set and the off1-2000 gate.
+
+## 2026-09-14 - GLM-5.3-Flash Q2 on Metal M1 Ultra: DECODE IS ACCEPTANCE-LIMITED ON THE off1 GATE, NOT STEP-LIMITED - our MTP accepts ~50% on off1 vs ds4's 90% on the SAME prompt; closing that, not shaving kernel us, is the path to the +50% goal
+
+- The off1-2000 gate is 27.7 tok/s; the 64-token m2 probe is 34.5 tok/s at the
+  SAME ~54 ms step. tok/s = tok-per-cycle / step, and MTP acceptance sets
+  tok-per-cycle. Accept probe (`w22-concurrent/accept_probe.py`, K=1 MTP,
+  ignore_eos greedy, 300 tokens; `verify_ldd/accept.log`):
+
+  | prompt | accept | tok/cycle | tok/s |
+  | --- | --- | --- | --- |
+  | m2 64 tok | 0.923 | 1.923 | 34.0 |
+  | m2 1000 tok | 0.754 | 1.754 | 30.2 |
+  | off1 full (the gate prompt) | 0.557 | 1.557 | 27.0 |
+  | off1 first 64 | 0.478 | 1.478 | 26.3 |
+  | off1 last 256 | 0.417 | 1.417 | 25.2 |
+
+- ds4 `--mtp` on the SAME off1 prompt (`baseline_status`): 90.1% acceptance,
+  1.90 tok/cycle, 22.52 gen tok/s at an ~84 ms step. We already beat ds4 by
+  +23% (27.7 vs 22.52) because our step is 54 ms vs 84, DESPITE accepting
+  ~50% vs ds4's 90%. If our MTP accepted like ds4 (1.90 tok/cycle) at our
+  54 ms step, off1 would be ~35 tok/s = +56% over ds4 - THE GOAL, with no
+  kernel change. Conversely the step floor (expert kernels ~20.8 ms, W15/W20)
+  caps the step-time path at ~28-30 tok/s on off1 at 1.5 tok/cycle.
+- Acceptance falls with context length (m2 0.92 at 64 tok -> 0.75 at 1000),
+  which points at the MTP block's draft-time attention (sparse-MLA + the
+  pooled indexer's top-2048 selection over the growing KV), not a uniform
+  numerics bug (the MTP is excellent at short context). ds4 holds ~90% at
+  1000+ tokens on off1, so a faithful draft-time sparse attention should
+  too. NEXT (highest leverage by far): teacher-force off1 and compare our
+  MTP draft argmax to the target argmax position-by-position (our own
+  self-accept) against ds4's, isolate whether the draft-time indexer /
+  sparse-MLA selects the wrong context or the MoE/head numerics degrade the
+  draft, and fix. This is where the remaining ~8 tok/s to the goal lives;
+  launch fusion cannot get there.
+
+## 2026-09-14 - GLM-5.3-Flash Q2 on Metal M1 Ultra: W21 (router-into-pair) DEAD-END + W22 concurrent regions - only the LDD strided in-place KDA in_proj shard writes landed (68 torch copies/step gone, step 55.6 -> 53.8 ms); router-into-pair and the MoE concurrent region never ran (wrong branch) and are reverted
+
+- ROOT CAUSE both fusions missed: GLM's `MoERunner.is_internal_router` is
+  `self.gate is not None` and the runner owns the gate, so
+  `DeepseekV2MoE.forward` takes the `if is_internal_router` branch
+  (`self.experts(router_logits=hidden_states)`, gate computed inside the
+  runner). The router-into-pair call and the MoE concurrent-region wrapper
+  were both in the `else` branch, which GLM never executes - confirmed by a
+  one-shot log that never fired. The earlier "W21 token-identical +0.3%" was
+  the unchanged torch-gate fallback (noise), NOT the fusion. Both reverted;
+  the `qgemv_q8_0_nr_pair_swiglu_router` kernel + host op are left in the
+  tree for the pre-PR cleanup (a runner-side hook would be needed and the
+  gate GEMV is a tiny 288x4096 fp32 - negligible expected gain).
+- LDD strided in-place shard writes (KEPT, the real win): the KDA in_proj
+  hetero shards (q|k q4_K + v|f_a|g_a|beta q8_0) wrote column slices of one
+  [M, total] output through the ring + a torch `copy_` at M > 1 (68 copies
+  per K=1 step, hidden in the W16 fit's `qc_mmvq_loop` / `qc_mmvq_q8_nr_mb`
+  in-situ costs). `qgemv_q8_0_nr_mb` and `qgemv_q4k_nr_mb` now take the
+  output row stride (`LDD`, buffer 5; addressing only, values untouched -
+  DSV4/Qwen anchors re-gate before the PR since the q4_K twin is shared)
+  and `ggml_mul_mat_vec_a8` binds the slice in place on those routes.
+  Standalone (`w22-concurrent/strided_test.py`, `.log`, 16384x4096 q4_K +
+  8448x4096 q8_0): BIT-EXACT in place for M=1..4. In situ: K=1 GPU budget
+  (`k1_ldd/budget.txt`) 53.8 ms/step vs the W16 55.6 (`k1_dual`); off1-2000
+  gate 27.7 tok/s, probe 34.5, shas 7dd30ea193a6 / 8a9753e18551 /
+  1d7d58486dc7 unchanged, needles 4/4.
+- Concurrent-dispatch mechanism (`qc_concurrent_begin/barrier/end`,
+  MTLDispatchTypeConcurrent encoder + automatic buffer-conflict barriers,
+  2-D range tracker; the llama.cpp `ggml-metal-ops` / ds4
+  `g_batch_encoder_concurrent` scheme) is BUILT and standalone-verified
+  (`concurrent_test.py`: a memory-bound GEMV hides ~50% behind the ALU-bound
+  expert walk; dependent chains get their barrier and stay bit-exact over
+  100 repeats) but gives NO measured in-situ gain here: the KDA shards are
+  both bandwidth-bound (no overlap) and the MoE region was dead code. The
+  mechanism is left in `qc_metal_serving.mm` / `ops.py` for a future
+  runner-side shared||routed overlap (ds4's parallel_ffn_mode 2) and listed
+  for the pre-PR cleanup if not used. Profile `VLLM_METAL_ROUTER_PAIR` /
+  `VLLM_METAL_CONCURRENT` removed (dead); `VLLM_METAL_SHEXP_PAIR` (W16a),
+  `VLLM_METAL_KDA_GATE_DUAL` (W16b) stay.
+
+## 2026-09-14 - GLM-5.3-Flash Q2 on Metal M1 Ultra: W16a+b+c verify chain (pair-SwiGLU, f_b|g_b dual GEMV, sparse-MLA valid-range partitions) - tf 29/32 and 62/64 hold, needles pass, off1-2000 gate 26.50 -> 27.46 tok/s (+3.6%), pins re-pinned for the tlen merge order
+
+- Build: the three W16 fusions on together through the profile env
+  (`VLLM_METAL_SHEXP_PAIR=1`, `VLLM_METAL_KDA_GATE_DUAL=1`, tlen default
+  on with `VLLM_METAL_MLA_TLEN=0` as the bisect switch). Chain
+  `w16-fusions/verify/chain.sh` (boot `glm53f-q2-1 --spec`, probes,
+  teacher-forced short/long, needles, the 3 exact-token gates); raw in
+  `w16-fusions/verify/` (`chain.log`, `tf_short.json`, `tf_long.json`,
+  `needle.log`, `gates.log`, `gates/`).
+- Correctness: teacher-forced short 29/32 argmax matches (k=1/15/30 differ,
+  the same three positions as the W9 baseline, all ds4 margins <= 0.175),
+  long 62/64 (k=5/28, margins 0.004 / 0.419), |logprob| delta mean 0.083
+  max 0.49, ds4 token never missing from our top-8; needles 1500 / 6500 /
+  12000 tokens all PASS (ZEBRA-7741, ORCHID-5518, GRANITE-3306).
+- Gates: 8tok sha 7dd30ea193a6 UNCHANGED (1000-token prefill + 8 tokens);
+  off1-2000 sha 8a9753e18551 (was a88022b375ea) at **27.46 tok/s** (W9/W13
+  pin 26.50 -> +3.6%); 2500x64 sha 1d7d58486dc7 (was f80d14780458) at
+  4.73 tok/s (prefill-dominated, unchanged rate). The two long-output
+  shas move because the sparse-MLA partition kernel now splits the
+  valid range [0, tlen) across the 8 partitions instead of the padded
+  2048-slot width: the fp32 partial merges (m/l/acc) combine in a
+  different order, so fp32 sums differ at the ulp level and a 2000-token
+  greedy stream diverges after the first near-tie. The teacher-forced and
+  needle results above are the correctness evidence; the new shas are
+  the pins from here on.
+- Probe (64-token prompt, 600 tokens, K=1 MTP): 34.15 tok/s over 599
+  tokens, accept 0.948 tok/cycle 1.948 (pre-W16 33.21-33.35).
+- Decision: keep all three; pins updated (`gate.sh` prior pins ->
+  7dd30ea193a6 / 8a9753e18551 / 1d7d58486dc7).
+
+## 2026-09-14 - GLM-5.3-Flash Q2 on Metal M1 Ultra: W20 pair-LUT expert kernels (threadgroup and register tables) - the iq2_xxs expert GEMV is bounded by the GPU's divergent-lookup rate, not by FMA; closed with hardware numbers. W16d q4_K M=2 geometry twins: no gain
+
+- Hypothesis: replace the per-weight byte lookup + convert + sign-select +
+  multiply + add of the production iq2_xxs walk with one table read per
+  weight PAIR: a 6-bit pair symbol (2-bit magnitudes, 2 sign bits) indexes
+  L[slot][sym] = (+-)kmag[m0] x[2p] + (+-)kmag[m1] x[2p+1], built per
+  128-weight slice of K in threadgroup memory (16 KB fp32); the grid code
+  and 7-bit sign index map to the four pair symbols through two 384-entry
+  tables (`iq2xxs_pair_code/sign`, generated from the codebook). Lanes own
+  rows and walk K in lockstep. Correct: 3-13 values of 16k-65k differ from
+  production by one bf16 ulp (fp32 association, pairs first).
+- Results (`w20-lut/lut_sweep.log`, expbench T=1/2/4, DRAM-resident,
+  production 189 / 319 / 607 us): threadgroup LUT at 16 simdgroups 192 /
+  305 / 549 (`lut16`); 2/4/8 simdgroups 1380 / 467 / 216 at T=1 (one
+  threadgroup per core with the 18.5 KB table, so occupancy = NSG);
+  two-slice weight prefetch no gain (192); half-precision table 182 but 2-3
+  bf16 ulps off; barriers removed (wrong results) 164 - the barrier cost
+  is 15%; bank-disjoint index twin 179 - conflicts are 7%; constant-memory
+  tables 229-247 (divergent constant loads are slower than threadgroup);
+  register LUT via simd_shuffle 2790 (see below).
+- Metal GPU Counters (`counters_run.sh`, `parse_counters.py`): production
+  T=1 ALU limiter 75% / F32 utilization 16% / occupancy 18%; `lut16` ALU
+  29%, buffer-read 36%, threadgroup-load 26%, LLC 28%, occupancy 15% - no
+  unit saturated, i.e. latency-bound at 16 simdgroups per core, and the
+  register-limited maxTotalThreadsPerThreadgroup (`scratchpad/mtl_info`)
+  is 512 for `lut16` vs 640 for production.
+- The hard numbers (`tgload_bench.py` / `.log`, 1024 x 256 threads, 16 KB
+  table): threadgroup-memory loads sustain 30 lane-loads per core-cycle
+  when the address is uniform, 19 lane-linear, 13.9 random, 12.6 random
+  within one 64-word slot (the LUT pattern); general `simd_shuffle` with
+  per-lane indices 3.2 per core-cycle (`simd_shuffle_xor/down` 10.2). So
+  a divergent lookup costs ~10 ALU-op equivalents on this GPU (ALU issue
+  is 128 lane-ops per core-cycle). The pair LUT needs 0.75 lookups per
+  weight (floor 96 us at T=1 from lookups alone) versus the production
+  walk's ~0.25 lookups + ~12 ALU ops; both land at ~14 lane-cycles per
+  weight, which is why every W15 variant and every W20 variant sits at
+  the same time. The expert budget (20.8 ms/step at K=1, linear in T) is
+  the format's decode cost on this GPU; a cheaper-to-decode repack would
+  cost >= 1.45x the bytes (+24 GB) and does not fit beside the KV pool.
+- W16d q4_K M=2 (`w16d-q4k/q4k_dram.py`, 28 copies): production column-
+  pair kernel 101 us (373 GB/s); the batch-1 geometry twins at M=1 are
+  76-86 us against 79 production and a 63 us streaming floor; a two-column
+  twin with the nibble->float decode hoisted out of the column loop and
+  NSG x NR = 2x2 / 4x2 / 2x4 / 4x1 / 8x1 measured 104 / 111 / 329 / 135 /
+  137 us. The compiler already shares the decode; the M=2 kernel is ALU-
+  limited at ~20 us over M=1. Closed; hooks and twins to be stripped.
+- Decision: expert kernels and q4_K stay as they are. The decode program
+  is launch fusion (~17 us per launch in situ, ~300 dense launches +
+  ~230 others per step), the sparse-MLA effective-length fix, and merged
+  KV inserts; MTP K=2 is bounded by the same per-token expert cost
+  (verify at M=3 adds ~10 ms/step for ~0.75 more tokens per cycle).
+
+## 2026-09-14 - GLM-5.3-Flash Q2 on Metal M1 Ultra: W16a shexp pair-SwiGLU in situ (+0.5%), W16b f_b|g_b dual GEMV (bit-exact), W19 DRAM-resident GEMV bench - the W14/W17 per-kernel numbers were system-level-cache inflated 1.3-1.5x; Metal GPU Counters now readable per kernel
+
+- W16a `qgemv_q8_0_nr_pair_swiglu` in situ (`w16-timeline/k1_pair/`,
+  `VLLM_METAL_SHEXP_PAIR=1`, K=1 trace + 600-token probe): the 46
+  `qc_swiglu` dispatches per step are gone and `qc_mmvq_q8_nr_mb` drops
+  197 -> 151/step; the fused op fits at 98 us vs the 52 + 49 us it
+  replaced, so the step is 56.0 -> 55.8 ms and the probe 33.21/33.35 ->
+  33.39/33.55 tok/s. Kept (bit-exact, one launch fewer per shexp), but the
+  pair kernel itself runs 339 GB/s DRAM-resident against 378 for the plain
+  NR GEMV at the same shape (below) - a small geometry loss that the
+  removed launch barely covers.
+- W16b `qgemv_dual<q8_0>` (`w16-fusions/dual_test.py`, 34 distinct
+  weight pairs rotated): two [8192, 128] q8_0 GEMVs in one dispatch,
+  BIT-EXACT vs two `ggml_mul_mat_vec_a8` calls for M=1..4 (same generic
+  walk); M=1 35.3 -> 19.8 us, M=2 23.4 -> 20.4, M=4 36.1 -> 27.2. Wired
+  behind `VLLM_METAL_KDA_GATE_DUAL=1` in `kimi_gdn_linear_attn.py`
+  (non-paired branch, both projections q8_0, <= 4 rows); not yet in the
+  profile env - goes in with the next in-situ A/B.
+- W19 `w19-dram/dbench.py` (`dbench2.log`; the first run, `dbench.log`,
+  warmed fewer calls than copies and paid first-touch page mapping inside
+  the timed loop - 25% pessimistic, superseded): every dense shape timed
+  DRAM-resident (copies rotated past 1 GiB, every copy touched twice before
+  timing) beside the one-copy number the earlier benches used. The M1
+  Ultra system-level cache inflates every 9-71 MB shape by 1.3-1.6x:
+
+  | shape (q8_0 unless noted) | M | DRAM us / GB/s | one-copy (SLC) us / GB/s |
+  | --- | --- | --- | --- |
+  | kda q\|k Q4_K 16384x4096 | 1 / 2 | 79 / 475, 101 / 373 | 68 / 555, 96 / 395 |
+  | kda_v 8192x4096 | 1 / 2 | 65 / 546, 68 / 522 | 46 / 774, 47 / 752 |
+  | kda_output 4096x8192 | 1 / 2 | 64 / 559, 82 / 438 | 41 / 881, 56 / 642 |
+  | attn_output 4096x16384 | 1 / 2 | 113 / 630, 120 / 596 | 73 / 977, 87 / 823 |
+  | attn_q_b 16384x1536 | 1 / 2 | 48 / 557, 51 / 528 | 35 / 776, 42 / 639 |
+  | attn_q_a\|kv_a 2112x4096 | 1 / 2 | 24 / 382, 24 / 383 | 19 / 474, 19 / 484 |
+  | shexp gate\|up 4096x4096 | 1 / 2 | 37 / 488, 37 / 478 | 28 / 639, 27 / 651 |
+  | shexp pair-swiglu | 1 / 2 | 41 / 432, 43 / 418 | 31 / 576, 37 / 485 |
+  | shexp down 4096x2048 | 1 / 2 | 23 / 394, 24 / 372 | 15 / 593, 19 / 464 |
+  | f_b 8192x128 | 1 / 2 | 12.0 / 93, 12.1 / 92 | 11.5 / 97 |
+  | lm_head 154880x4096 (674 MB) | 1 / 3 | 893 / 755, 962 / 701 | same |
+
+  So the achievable DRAM rate is ~750 GB/s (lm_head), the mid-size q8_0
+  NR GEMVs reach 490-630 at M=1 and 440-600 at M=2 (per-launch fixed cost
+  ~10 us standalone), the pair-SwiGLU kernel costs ~6 us over the plain
+  gate|up GEMV (which the removed qc_swiglu launch repays), and q4_K sits
+  at 475 / 373 GB/s - W17's "at its floor" verdict was measured SLC-
+  resident. Summing the step's dense launches at these DRAM rates gives
+  ~16.4 ms against the 21.5 ms the in-situ fit attributes to them: ~5 ms
+  (~17 us per launch over ~300 launches) is in-situ launch/dependency
+  overhead, which is what launch fusion recovers.
+- Metal GPU Counters: `w20-lut/counters_run.sh` attaches
+  `xctrace record --template 'Metal System Trace' --instrument 'Metal GPU
+  Counters'` to a kernel loop (`loop_prod.py`) and `parse_counters.py`
+  averages the `gpu-counter-value` table (export only the first ~300 MB;
+  the full table is GBs). Production iq2_xxs w13 kernel, T=1, DRAM-
+  resident: ALU limiter 75%, ALU utilization 63%, F32 utilization 16%,
+  compute occupancy 18%, buffer-read limiter 30%, threadgroup-load limiter
+  7%. It is ALU-bound on the NON-fp32 work (byte extract, convert, sign
+  select) - the W15 conclusion, now with the reason.
+- Decision: keep W16a (profile env carries `VLLM_METAL_SHEXP_PAIR`),
+  W16b staged (env off until the in-situ A/B), q4_K M=2 kernel reopened
+  (W16d) with the DRAM-resident bench as the yardstick; the expert kernel
+  work moves to a pair-LUT formulation (W20, next entry).
+
+## 2026-09-14 - GLM-5.3-Flash Q2 on Metal M1 Ultra: W16 GPU timeline (xctrace) - the K=1 step is 56 ms of GPU time at 95% busy; per-op budget from a least-squares fit over 11,568 encoder intervals; encoder-per-op coalescing measured NULL
+
+- Instrument: `perf/results/2026-09-14/glm53f-q2-w16-timeline/trace_run.sh`
+  boots the profile (K=1, GLM env), runs a 600-token greedy decode and
+  attaches `xctrace record --template 'Metal System Trace'` to the
+  EngineCore for 6 s; `parse_intervals.py` reads the exported
+  `metal-gpu-intervals` table (one interval per command-buffer kick, whose
+  label lists the encoder labels it ran) and fits each op label's mean GPU
+  cost by least squares (residual 16 us on 540 us intervals). The phase
+  profiler cannot do this (sync-inflated 5x); the Instruments shader
+  profiler table is empty under --attach.
+- K=1 budget (`k1/budget.txt`; 110 steps; probe 33.2-33.4 tok/s at 1.945
+  tok/cycle over 600 tokens, 30.2 over 64): 56.0 ms/step, GPU busy 95.2%.
+  routed MoE (router+w13 swiglu 14.7 + w2 sum 6.1) 20.8 ms = 37%; q8_0 NR
+  GEMVs 197/step 10.3 ms (52 us each); KDA q|k q4_K at M=2 35/step 6.9 ms
+  (198 us each in situ; 95 us standalone at N=16384 M=2); sparse MLA decode
+  12/step 2.9 ms (241 us each at a ~100-token context); `qc_swiglu`
+  46/step 2.25 ms (49 us each for a 2 x 4096 elementwise); f_b|g_b K=128
+  GEMVs 68/step 2.2 ms (33 us each vs 12.5 standalone); drafter step
+  singleton 2.1; lm_head + final norm + sampling 1.9; rms_norm 30/step
+  1.8 (60 us each); paged_row_insert 24/step 1.7 (69 us each); indexer
+  pack+pool 12/step 0.9; kda_step 34/step 0.56 (16 us each); mHC pre 0.55;
+  mamba_align 2/step 0.4; torch ops ~1.0. Small kernels cost 20-40 us
+  more in situ than standalone: that is the per-dispatch cost in this
+  pipeline, so removing dispatches is worth ~25 us each.
+- Null result: `encode()` opens a fresh compute encoder per quixicore op;
+  routing every op through torch's kernel-coalescing stream encoder
+  instead (MPSStream::commandEncoder, debug-group labels) changed nothing
+  (probe 33.23/33.39 vs 33.21/33.35 tok/s, 11,241 vs 11,568 kicks in 6 s;
+  `k1_coalesce/`). Encoder boundaries are not the cost; the change was
+  reverted.
+- Next (in order): shexp gate|up pair-swiglu (one dispatch, -86/step),
+  f_b|g_b dual GEMV (-34), sparse MLA decode fixed cost, q4_K M=2 route,
+  MLA q_a|kv_a + dual norm + merged insert (-46), router GEMV into topk
+  (-43).
+
+## 2026-09-14 - GLM-5.3-Flash Q2 on Metal M1 Ultra: W14 decode budget + W15 expert-kernel study - the routed expert kernels are at the ALU floor of the iq2_xxs / q2_K dequant (every exact rewrite within +-10%); nothing promoted
+
+- Baseline: Session 3 final build (probe 31.95 tok/s K=1, off1-2000 26.50,
+  no-spec step 43 ms, K=1 step ~54 ms).
+- W14 budget (`perf/results/2026-09-13/glm53f-q2-w14-budget/`): the phase
+  profiler is sync-inflated 5x (258 ms/step under it), so the budget is the
+  per-kernel microbench at every GLM decode shape with the profile's env
+  (`kbench.py`, `kbench_q8nr.log`; `kbench.log` is the same run WITHOUT
+  `VLLM_QC_Q8_NR=1` and shows why that switch matters: 23.5 -> 15.9 ms of
+  dense GEMV per token). Per token, M=1 / M=2: dense GEMVs 15.9 / 15.3 ms
+  (q8_0 NR 740-950 GB/s on every >= 8 MB shape; q4_K kda q|k 2.6+1.75 ms at
+  ~300 GB/s; f_b|g_b 1.1 ms at 70 GB/s = launch floor; shexp 2.3 ms at
+  ~480), routed experts 11.5 / 19.4 ms (iq2_xxs pair-swiglu 202-220 GB/s,
+  q2_K sum 232-325, both LINEAR in tokens), router+indexer 1.5. GEMV
+  ~29 of the 43 ms no-spec step; non-GEMV 14-16 ms. K=1 phase profile:
+  `sample_tokens` 17 ms/call sync-inflated (drafter_propose 12 of it), K=2
+  25 ms/call; K=2 tok/cycle 1.95 at 0.477 accept (pos-1 acceptance still
+  broken as in W9).
+- W15 (`perf/results/2026-09-14/glm53f-q2-w15-experts/`, `expbench.py` one
+  process per env-selected variant, bit-compare of saved outputs, finite
+  synthetic weights): 25 variants of the two expert kernels, all env-gated
+  behind `VLLM_QC_MOE_IQ2_VARIANT` / `VLLM_QC_MOE_Q2K_VARIANT` (unset = the
+  production kernels; measurement only). Findings, iq2_xxs gate|up at T=1 /
+  T=2 / T=4 (ms per layer, production 0.201 / 0.344 / 0.613):
+  - streaming twin (same weight loads, no codebook math, y unused): 0.063 /
+    0.109 / 0.180 = 550-770 GB/s -> the memory pattern is fine;
+  - ALU-only twin (all threadgroups read the same 4 cached rows, full
+    math): 0.213 / 0.353 / 0.682 = identical to production -> the kernel is
+    100% ALU/latency, memory fully hidden;
+  - fma-only (y loads + 1 fma/weight, no codebook): 0.095 / 0.143 / 0.223;
+    + codebook ulong load and byte->float: 0.162 / 0.249 / 0.481; + signs:
+    0.202 / 0.369 / 0.701. Each op/weight costs ~0.025 ms at T=1 (~5 T
+    ops/s); the reference spends ~5-6 ops/weight.
+  - exact rewrites, all BIT-EXACT vs production: 8-byte codebook loads +
+    shift extraction (f1/f2) 0.227 / 0.397 / 0.724; reinterpret-cast bytes
+    + 4 KB sign-mask table (f3/f4) 0.202-0.214 / 0.331-0.379 / 0.621-0.672;
+    register-built sign masks (f5) 0.202 / 0.369 / 0.701; constant-memory
+    codebook (f6) 0.222 / 0.401 / 0.719; magic-number byte->float (f9)
+    0.189 / 0.358 / 0.671; 8 KB float codebook (f10) 0.222 / 0.412 /
+    0.718; 4 KB half codebook (f13) 0.203 / 0.312 / 0.601; two chunks per
+    lane (ilp2) 0.276 / 0.492 / 0.964 (register pressure); geometries
+    4x2 / 2x4 / 4x4 / 1x2 / 1x4 all >= production. Half-precision math
+    (f14, NOT exact, 1613/16384 outputs differ) 0.185 / 0.307 / 0.549: even
+    giving up exactness buys 10%.
+  - q2_K down sum (production 0.119 / 0.146 / 0.247): streaming twin 0.042
+    / 0.085 / 0.134; vector weight loads (f1) 0.102 / 0.172 / 0.251; +
+    vector y loads (f2) 0.133 / 0.170 / 0.294; slot-parallel (one slot per
+    simdgroup, 8 simdgroups, exact sequential weighted sum; sp_8x4) 0.110 /
+    0.152 / 0.272; geometries 4x4 / 4x8 / 2x8 / 1x4 / 1x8 all >= production.
+- Conclusion: on the M1 Ultra the iq2_xxs and q2_K dequant is an ALU floor
+  of ~5 ops/weight that no exact load/table/geometry/ILP restructuring
+  moves; the production kernels stay. The routed-expert time (11.5 ms at
+  T=1, linear in T) is a property of the quant format on this GPU, not of
+  the kernel. Levers that remain for that time are structural: overlap
+  the memory-bound shared-expert GEMVs with the ALU-bound routed kernels
+  (needs concurrent dispatch inside the MoE op; ~2.4 ms/token), or fewer
+  tokens per step. Decode work moves to the non-GEMV 14-16 ms, q4_K
+  (2.6 ms), the small-GEMV launch diet and MTP K=2.
+- Cleanup owed before the PR: strip the `_x` / `_ilp2` / `_sp` experiment
+  kernels and the two env hooks from qgemv.metal / tk_launch.h (they are
+  measurement scaffolding, not features).
+
+## 2026-09-11 - GLM-5.3-Flash Q2 on Metal M1 Ultra: W9 GGUF nextn MTP drafter (K=1) - decode 23.26 -> 31.95 tok/s, off1-2000 20.38 -> 26.50; ds4's MTP bar (22.52) beaten by 18% on its own workload
+
+- Baseline: W8b (decode 23.26, off1-2000 20.38, no speculation). Bar: ds4
+  `--mtp` 22.52 gen tok/s at 90.1% acceptance (1.90 tok/cycle, K=1).
+- Change: the GGUF's own nextn block (blk.45: sparse MLA + 288-expert MoE,
+  BF16 eh_proj, own indexer) serves as the MTP drafter through the V2
+  `AutoRegressiveSpeculator` (`method: glm5_next_mtp` -> mtp, `model:
+  "target"`, `slimserve/engine.py` resolves the draft path to the target
+  GGUF; profile `glm53f-q2-1` metal `speculator`, K=1). Four pieces made it
+  run on Metal:
+  1. `spec_decode/speculator.py`: the hc_mult buffer widening (DSV4 drafts
+     from the pre-hc_head 4x residual) now applies to `deepseek_v4` only;
+     GLM's head consumes the 4096-wide combined state (was: 16384 vs 4096
+     copy_ crash).
+  2. `glm5_next.py` `get_mtp_target_hidden_states`: the drafter is fed the
+     POST-final-norm hidden state (`VLLM_GLM_MTP_HIDDEN=pre` keeps the
+     pre-norm stream mean as a diagnostic). Measured on strictly periodic
+     prompts (K=1 greedy; `w9-mtp/loop_accept.py`, `loop_len.py`,
+     `accept_by_pos.py`): pre-norm 77-92% (the draft emitted
+     `<|code_suffix|>` at fixed content positions, `spec_trace.jsonl`),
+     post-norm digits 98.8 / sentence 100 / abc 95.1%; ds4 `--mtp` on the
+     same prompt files accepts 69/69 and 80/80 (`w9-mtp/ds4_loops/`).
+     off1-2000 acceptance 72.0% -> 84.6%.
+  3. `spec_decode/autoregressive/speculator.py`: torch-native (mps)
+     replacements for the three Triton input-prep kernels
+     (`_prepare_prefill_inputs_native`, `_prepare_decode_inputs_native`,
+     `_update_draft_inputs_native`; no host sync), tested against a literal
+     transcription of the kernels (`tests/kernels/test_spec_native_inputs_metal.py`).
+  4. `qgemv_q8_0_nr_mb<T, NR, NSG, NB>` (qgemv.metal): multi-activation twin
+     of the W8b q8_0 kernel for the verify widths M=2..4; every block read
+     once for all rows and the per-row arithmetic is the batch-1 kernel's,
+     so rows are BIT-IDENTICAL to batch-1 decode
+     (`test_q8_0_nr_mb_rows_bit_identical_to_batch_1`, 18 cases). Routed
+     ahead of the generic `qgemv_*_mb` walk in `ggml_mul_mat_vec_a8`
+     (`q8_0_nr_mb_eligible`; `VLLM_QC_Q8_NR=0` kill switch,
+     `VLLM_QC_Q8_NR_MB_GEOM` 4x4|2x4). Sweep (`w8-gemv/bench_q8_mb.log`,
+     `bench_q8_mb_geom.log`, M=2, GB/s generic mb -> 4x4): kda_v 304 -> 488,
+     kda_output 260 -> 428, attn_output 323 -> 507, attn_q_b 427 -> 503,
+     lm_head 496 -> 741. 1x4 and 2x8 lost everywhere and were dropped.
+     Decode probe 26.3 -> 30.2 tok/s from this kernel alone.
+- Also: `glm5_next_mtp.py` prefix `.mtp_block.` (the GGUF adapter's
+  unquantized-module list keys on it; without it kv_b_proj/indexer were
+  GGUF-quantized and the draft load KeyError'd), a draft parameter-coverage
+  log (all 35 loaded), `Glm5NextMTPLayer` diag hooks `VLLM_SPEC_TRACE=<file>`
+  (per-step target inputs / sampled / draft ids, hidden rows, draft logit
+  top-2; synchronizes, never on a measured run). `w9-mtp/ref_draft.py`: an
+  offline fp32 reference of the nextn block (dequantized GGUF, dense causal
+  MLA) that replays the traced rows - written, not needed once the feed fix
+  landed.
+- Correctness: gates 8tok 5f870096e207 (== W7's), off1-2000 bf329ffc964c
+  (rolled; identical between the pre-norm and post-norm drafter runs -
+  greedy rejection sampling is lossless, the draft only changes speed),
+  2500x64 105b4a274b22 (rolled). Teacher-forced 30/32 (0.0817) / 60/64
+  (0.0875) byte-identical to W7/W8. Needles PASS (18/50/81/150 s).
+  Spec tests: q8 NR 27 passed, native inputs 4, KDA spec 8, glue 19.
+- Throughput (K=1): decode probe 31.95 tok/s (23.26; 1.84 tok/cycle, 84.1%
+  accept on m2_source); off1-2000 26.50 tok/s 75.5 s (20.38 / 98.1 s;
+  1.85 tok/cycle, 84.6%); 2500x64 33.0 s. **ds4's MTP bar 22.52 is beaten
+  by 18% on the identical exact-token workload and by 42% on the probe.**
+  Step cost: 43 ms (no-spec) -> ~54 ms (K=1 verify at M=2 + draft); GPU
+  busy 96% (`w9-mtp/gputrace/`), so the remainder is real GPU work: q4_K
+  in_proj shards at M=2 still ride `qgemv_mm`, the q2_K MoE sum reads the
+  second token's experts, the draft's own MoE + lm_head ~2-3 ms.
+- K=2: boots only with `max_num_batched_tokens` raised to the K=2 Mamba
+  align block (4352; the assert names it). With the post-norm feed: probe
+  23.2-24.2 tok/s at 1.87 tok/cycle, off1-2000 22.88 tok/s 87.4 s at 2.16
+  tok/cycle (58.1% over both positions; sha 1d3271ab8ebf - the M=3 verify
+  is its own numeric lineage). Loses to K=1 (26.50): the step is ~94 ms vs
+  ~54 ms, i.e. the draft decode step + M=3 verify cost ~40 ms, far above
+  the ~3 ms the 1 GB draft should take; and pos1 acceptance is erratic
+  (count 0.85, prose_64 0.42, m2src_64 0.03 with pos0 0.84 -
+  `accept_by_pos_k2_post.log`), which points at the multi-step draft
+  path (its own attn metadata / slot mappings / recycled hidden) rather
+  than the head. Not pinned; both are follow-ups if K>1 is ever wanted.
+- DFlash2 arm (`incoai/GLM-5.3-Flash-DFlash2` bf582e4e, downloaded to
+  `~/models/GLM-5.3-Flash-DFlash2`; `w10-dflash2/boot.sh` strips the
+  variant's MTP registration so the source-level `dflash` record boots):
+  two boots, two blockers. (1) `attn_utils._align_mixed_attention_kv_cache_views`
+  asserted `(blocks, 2, ...)` on the sparse-MLA latent cache when the
+  drafter's dense qwen3-class layers share an allocation with it - FIXED:
+  the pass is skipped on hybrid attention/mamba models, whose views were
+  already restrided page-local by `_update_hybrid_attention_mamba_layout`.
+  (2) `kv_cache_coordinator`: "Each KV cache group's real block_size must
+  be divisible by hash_block_size. block_sizes=[4416 x7, 8832 x3, 4416 x3,
+  1104], hash_block_size=8832" - the drafter's five sliding-window(2048)
+  layers plus its caches land in the mamba-aligned hybrid grouping with
+  block sizes the hash block does not divide. Not pursued: it is KV-config
+  work of unknown size, and the verify pass at M=k+1 pays (k+1) x 2.4 GB of
+  expert bytes per step on this box, so the arm's ceiling is uncertain.
+  PARKED with these notes; K=1 MTP stays pinned.
+- Launch-diet probe (W10, not kept): hoisting the indexer's per-row
+  visible/row_req arange ops from the 12 per-layer paths to once per step
+  measured 32.02 vs 31.95 tok/s - noise. With GPU busy 95%
+  (`w9-mtp/gputrace_post/`), the step is kernel execution time, not
+  launches: indexer CBs ~11 ms/step and sparse-latent decode CBs ~9 ms/step
+  of the ~72 ms traced step are the next targets (per-kernel timing of
+  `glm5_indexer_pool_logits` / torch.topk / `expand_topk` /
+  `paged_row_insert` and the `mla_sparse_latent` partition+reduce at R=2,
+  plus the two MPSGraph bmm's per layer in the MLA core).
+- Decision: K=1 MTP pinned in the profile (`num_speculative_tokens: 1`).
+
+## 2026-09-12 - GLM-5.3-Flash Q2 on Metal M1 Ultra: W11 prefill - the MoE tile GEMM was silently off for bf16 models; routed, prefill 84 -> 182 t/s at 2500 tokens (ds4 143)
+
+- Baseline: W9 (prefill 85.6/88.1 t/s at 1000 tokens = 11.7/11.4 s ttft,
+  83.7/83.2 at 2500 = 29.9/30.1 s; `w11-prefill/prefill_probe.log`). Bar:
+  ds4 6289c516 prefill 143 t/s.
+- Finding: the phase profile of a 2500-token prefill (`phaseprof_prefill2500.txt`:
+  moe 21.2 s of 33, `moe_w13` 363 ms/layer) carried the `moe_w13` label,
+  which only the DECODE GEMV branch emits. `_fused_moe_gguf`'s tile route
+  (`use_mm_w1` / `use_mm_w2`, `ggml_moe_mm_id`) required fp16 activations;
+  GLM-5.3-Flash runs bf16 (`dtype=torch.bfloat16` in the boot config), so
+  every GLM prefill so far ran the per-slot `ggml_moe_a8_vec_swiglu` +
+  `sum6` decode GEMVs: 2500 x 8 slot-GEMVs per layer. The boot log never
+  showed "tiled MoE prefill GEMM active". `bench_moe_mm.py` (random bytes,
+  uniform top-8, `bench_moe_mm.log`) puts the tiles at 2500 tokens at
+  w13 iq2_xxs 60.8 ms / 11.0 TFLOPS, down q2_K 67.4 ms / 5.0 TFLOPS (vs
+  9.25 TFLOPS at 1024 tokens: the 32-slot q2_K tile pays a 5/32-live tail
+  tile per expert at 69 slots/expert), dense fp16 torch mm 18 TFLOPS.
+- Change (`fused_moe.py`): bf16 activations take the tile route with one
+  fp16 cast in (`x.to(float16)`, the same fp16 staging llama.cpp's mul_mm
+  applies at prefill widths) and the weighted reduce runs in the tile dtype
+  into a temp, then one cast into the bf16 output (`reduce_out`). Phases
+  `moe_mm_w13` / `moe_mm_w2` added for the profiler. Test
+  `tests/kernels/test_metal_moe_mm_bf16.py` (64 / 300 tokens: tile route vs
+  GEMV route on the same bf16 input <= 5e-2 rel, deterministic, bf16 out,
+  fp16-input route within 2e-2). Note: random weight bytes overflow fp16
+  in the intermediates (act absmax 3e4 -> inf/NaN in the down tile) - the
+  test scales its input; real post-norm activations are far smaller and
+  the teacher-forced pass below is the production check for it.
+- Result (`prefill_probe_moe.log`): 1000 tokens 5.41/5.07 s = 185/197 t/s;
+  2500 tokens 13.75/13.76 s = **182 t/s (was 84; ds4 143)**. Boot log:
+  "tiled MoE prefill GEMM active (w13 + w2)". 2500x64 gate wall 33.0 ->
+  16.5 s, off1-2000 wall 75.5 -> 68.7 s (the prefill share; decode
+  unchanged), 8tok 11.9 -> 5.5 s.
+- Correctness: teacher-forced vs ds4 28/32 (mean |dlp| 0.0605) / 58/64
+  (0.0843) vs W9 30/32 (0.0817) / 60/64 (0.0875): the mean logprob distance
+  to ds4 IMPROVED (fp16 activations + fp32 MMA accumulate vs the GEMV's
+  q8-block activation quantization); the argmax flips sit at ds4 margins
+  0.004 (short k=30), 0.053, 0.203, 0.260, 0.172, one position regained
+  (long k=5, margin 0.004); long k=63 (margin 0.43) disagreed in both waves.
+  Exact-token gates rolled with the prefill numerics: 8tok 7dd30ea193a6,
+  off1-2000 cf3a15f8c2ef (29.10 tok/s incl. prefill), 2500x64 15be63c98eae;
+  completions coherent (`gates/off1_completions`).
+- KDA prefill (this wave's first arm, `kda_recur_prefill` C++/py wrapper +
+  `kda_recurrent_prefill_metal` + `test_kda_prefill_metal.py` 8 passed
+  after fixing the test's null-slot expectation: the kernel zeroes slot-0
+  rows like `kda_step`): NO GAIN (`prefill_probe_kda.log` == W9) because the
+  server's Metal block already runs prefill through the fused `kda_step`
+  (prepare + `kda_recur` + gated rmsnorm) and returns before the torch
+  branch; the profile's "torch per-token loop" reading was wrong. The new
+  branch is dead code for GLM (reachable only without the fused kernels);
+  revert it at the next extension rebuild. Microbench kept: `kda_recur`
+  39.3 ms/layer at T=2500 H=32 (10.8 ms at T=1000; torch loop 141.8 ms) ->
+  ~78 ms/layer at the real H=64, i.e. ~2.7 s of the 2500-token prefill is
+  the sequential scan (34 layers); the rest of the KDA layer is the
+  projections (in_proj q/k Q4_K 4096->8192 each, v Q8_0, out Q8_0
+  8192->4096; sub-phases `kda_in_proj` / `kda_gate_proj` / `kda_core` /
+  `kda_o_proj` added for the next profile).
+- MLA prefill microbench (`bench_mla_prefill.py`, `.log`, per layer): the
+  current torch-fp32 paths cost 1000 tokens 16.6 ms (dense_causal_attend),
+  2048 123 ms, 2500 131 ms (sparse_attend_rows); MPS SDPA in the
+  kv_b-decompressed MHA form (bf16 GEMM decompress + `is_causal`) 14.4 /
+  47.4 / 66.4 ms; SDPA in the latent MQA form 17.8 / 64.6 / 99.7 ms. The
+  absorb bmm is 2.2-5.3 ms here vs 94 ms/call in the sync-inflated profile.
+- Next (Session 2): profiled boot with the sub-phases (`prof_chain.sh`);
+  q2_K dual-half (w64) down tile; KDA in_proj GEMM route per the profile;
+  MLA MHA-form SDPA for rows under the 2,051 dense limit (exact) with the
+  sparse gather for the rest; then the chunked KDA scan. Exit clock: 2048
+  tokens on ds4's own prefill definition.
+
+## 2026-09-12 - GLM-5.3-Flash Q2 on Metal M1 Ultra: W12 prefill - KDA prepare kernel was serial over tokens; token-chunked grid, bit-exact, prefill 182 -> 230 t/s at 2500 tokens
+
+- Baseline: W11 (2500 tokens 13.75 s = 182 t/s; 1000 tokens 5.1-5.4 s).
+  Profile with the new sub-phases (`phaseprof_moe.txt`, 2 x 2500-token
+  forwards, sync-inflated): kda_attn 6.0 s per forward = kda_core 3.66 s
+  (107.6 ms/layer) + kda_in_proj 1.79 s + kda_o_proj 0.47 s; moe 5.4 s
+  (moe_mm_w13 59.9 ms/layer, moe_mm_w2 51.5 ms/layer SoA, shared 0.45 s);
+  mla_attn 3.2 s (mla_mqa 166 ms/layer, indexer 50 ms/layer).
+- Finding: `kda_core` is the fused `kda_step` (prepare + `kda_recur` +
+  gated rmsnorm). Two costs, both decode-shaped grids:
+  (1) `kda_recur` at one simdgroup per (request, head, value row): 8192
+  single-row simdgroups per 64-head request, each re-reading the same
+  1.5 KB q/k/decay row per step - 89 ms/layer at 2500 tokens. R value
+  rows per simdgroup (template `kda_recur<DK, R>`, rows loaded once and
+  reused; grid shrinks R-fold) measures R=1 89.1 / R=2 43.6 / R=4 5.7 /
+  R=8 4.8 ms per layer (1000 tokens: 29.5 / 12.8 / 2.3 / 2.0), every R
+  bit-identical to R=1 and to an independent torch fp32 loop
+  (`bench_kda_rows.log`, T=300: max |y - ref| 1.2e-7). CORRECTION to the
+  first version of this entry: the initial rows bench reported all R at
+  5.6 ms and "neutral" because the Python wrapper dropped the `rows`
+  argument, so every variant silently ran the env default (R=4) and the
+  exactness check compared a variant against itself; the wrapper is fixed
+  and the bench now checks against the torch loop on cloned outputs.
+  Default R=8 (`VLLM_QC_KDA_RECUR_ROWS` overrides).
+  (2) `kda_fused_prepare`: one simdgroup per (request, q|k|v|gate row) =
+  R*4*H = 256 simdgroups for one request, each walking EVERY token of the
+  request serially (conv + silu + L2 norm per token) - a decode design
+  (many requests x 1 token) running a 2500-token prefill on 4 simdgroups
+  per core.
+- Change (`kda.metal`, `tk_launch.h`, `kda_step` in qc_metal_serving.mm):
+  grid y = 32-token chunks of the request (`chunk_tokens`, buffer 30):
+  chunk 0 seeds its conv history from the pool as before, later chunks
+  from the raw rows just before them (kernel_size-1 <= 32), and the chunk
+  holding the request's last token writes the pool. Per-token arithmetic
+  and order unchanged, so outputs and the written state are bit-identical
+  for any chunk size. Spec mode (per-token window writes) launches as one
+  chunk. Chunk count from T (host-known) - no device pull. The
+  `kda_recur_prefill` binding (test / bench entry for the kernel) takes an
+  explicit `rows`.
+- Measured (`bench_kda_step.log`, default R=4 at the time): kda_step 2500
+  tokens 107 -> 13.4 ms/layer (`kda_recur` 5.7 of it; R=8: 12.6 / 4.7);
+  1000 tokens 5.6 ms. With the serial prepare and R=1 the same call was
+  ~97 ms (recur 88). Serving
+  (`prefill_probe_kdaprep.log`): 1000 tokens 4.11/4.41 s = 227-243 t/s,
+  2048 tokens 8.86/8.87 s = **231 t/s**, 2500 tokens 10.83/10.92 s =
+  **229-231 t/s** (W11 182; ds4 143). 2500x64 gate wall 16.5 -> 13.5 s,
+  8tok 5.5 -> 4.5 s.
+- Correctness: BIT-EXACT - 8tok 7dd30ea193a6, off1-2000 cf3a15f8c2ef,
+  2500x64 15be63c98eae all identical to W11's; teacher-forced identical
+  (28/32 0.0605, 58/64 0.0843). Tests: `test_kda_metal_fused.py` (+
+  `test_varlen_prefill_multi_chunk_rows`: 70/1/79/33-token rows with a
+  null slot, chunk seams at 32/64), `test_kda_spec_metal.py`,
+  `test_kda_prefill_metal.py`: 23 passed.
+- Dense GEMM survey (`bench_dense_gemm.log`, serving route vs fp16 torch
+  matmul ceiling at 2500 rows): kda q/k Q4_K 9.3 TFLOPS (ceiling 17.9),
+  kda_v Q8_0 13.8, kda_output 12.4, attn_q_b 14.0, attn_output 11.3 (torch
+  7.6), shexp 10.2 - the tile routes sit at 55-80% of the dense ceiling;
+  a better Q4_K tile is worth ~0.6 s at 2500 tokens.
+- Next: MLA prefill in the hybrid SDPA form (fresh-prefill rows under the
+  2,051 dense limit: per-head keys, latent values; `bench_mla_prefill.log`,
+  hybrid bf16 54.7 ms vs 123 ms torch at 2048), then the MoE tiles (now
+  ~50% of the 2500-token prefill).
+
+## 2026-09-12 - GLM-5.3-Flash Q2 on Metal M1 Ultra: W13 prefill - sparse MLA fresh-prefill rows through MPS SDPA in the hybrid form; 2048 tokens 231 -> 245-251 t/s; MoE tile pipelining measured neutral (reverted)
+
+- Baseline: W12 (2048 tokens 8.86 s = 231 t/s; 2500 10.9 s = 230 t/s;
+  1000 4.1-4.4 s). `mla_mqa` was 166 ms/layer at 2500 tokens: both
+  `dense_causal_attend` (seq <= 2,051) and `sparse_attend_rows` are torch
+  fp32 einsum + softmax chains over the gathered latent rows
+  (`bench_mla_prefill.log`: 123 ms at 2048 dense, 131 ms at 2500 sparse).
+- Change: `dense_causal_attend_sdpa` (metal_mla_sparse.py): for a fresh
+  prefill (request starts at position 0), rows i < limit attend keys
+  0..i, all of which the indexer selects (top-k 2048 tokens as 512 pools
+  of 4 -> limit 2,051), so they are dense-exact. Those rows run through
+  `F.scaled_dot_product_attention(is_causal=True)` in the hybrid form:
+  scores in the per-head 256-wide space (K = latent @ W_UK_T^T, one bf16
+  GEMM per layer; mathematically the absorbed q_nope W_UK_T . latent),
+  values in the 512-wide latent space so the caller's v_up projection
+  stays; rows past the limit keep the gathered top-k path. The un-absorbed
+  query is stashed by mla_attention.py (`_metal_q_nope`, Metal only).
+  Continuations (cached prefix / later chunks) keep the fp32 paths (SDPA's
+  causal mask has no offset). `VLLM_METAL_MLA_PREFILL_SDPA=0` pins the old
+  paths. Bench (per layer): hybrid bf16 15.6 / 54.7 / 81.9 ms at 1000 /
+  2048 / 2500 vs torch 16.6 / 123 / 131 (fp16 would be 11.4 / 40.0 / 59.6;
+  the pure MHA form 14.4 / 47.4 / 66.4 needs the v_up moved - not taken).
+  Test `tests/kernels/test_mla_prefill_sdpa_metal.py` (6: Q 5/64/300 x
+  bf16/fp16 vs the absorbed fp32 reference, <= 4e-2 / 2e-2 rel).
+- Result (`prefill_probe_sdpa.log`): 1000 tokens 4.09/4.48 s (223-245
+  t/s), 2048 tokens 8.15/8.36 s = **245-251 t/s** (ds4 139 on its bench),
+  2500 tokens 10.39/10.41 s = **240 t/s** (ds4-server 132.9 at 2518).
+- Correctness: teacher-forced vs ds4 29/32 (mean |dlp| 0.0473) / 62/64
+  (0.0830) - the best of the campaign (W9 30/32 0.0817, 60/64 0.0875; W11/
+  W12 28/32, 58/64); bf16 SDPA vs the fp32 chain moves near-tie argmaxes
+  both ways. Gates: 8tok 7dd30ea193a6 UNCHANGED, off1-2000 a88022b375ea
+  (rolled, 28.71 tok/s incl. prefill), 2500x64 f80d14780458 (rolled,
+  13.2 s). RETAINED.
+- MoE w64 tile software pipelining (dequant + B loads for step i+1 issued
+  before step i's MMAs; bit-identical): `bench_moe_mm_pipe.log` w13 62.4 ms
+  at 2500 tokens / 32.0 at 1024 vs 60.8 / 30.8 unpipelined - NEUTRAL (the
+  loop is not stalled on those loads; the August aliasing/occupancy result
+  stands). Reverted to the byte-identical prior kernel; the metallib was
+  rebuilt from it (oracle `test_metal_moe_mm.py` re-run).
+- Remaining 2500-token budget (~10.4 s): MoE tiles ~5.4 s (w13 iq2_xxs
+  11 TFLOPS of an 18 TFLOPS fp16 ceiling; w2 q2_K SoA ~6), KDA projections
+  ~2.3 s (Q4_K tile 9.3 TFLOPS), MLA ~1.3 s (rows past the dense limit +
+  indexer 50 ms/layer + o_proj), sampler/drafter ~0.7 s. Session 2 exit
+  (2048 >= ds4) met at 1.8x; the next lever is a deeper MoE tile
+  restructure (double-buffered staging / larger B tiles) - parked for
+  Session 3 cleanup, gates, anchors, PR.
+
+## 2026-09-12 - GLM-5.3-Flash Q2 on Metal M1 Ultra: Session 3 anchors - the DSV4 2000-token anchor ROLLED on the final build; bisected to the W8a async-scheduling default (not the q8_0 NR GEMV); default returned to opt-in, DSV4 bit-exact again
+
+- Setting: final build re-gate of the DSV4 anchors (`dsv4-xxs-1`, DSpark
+  drafter K=5, fp16, sync scheduler at its pins). r3
+  (`perf/results/2026-09-12/dsv4-regate-r3/`): 8tok 573db39598e7 BIT-EXACT,
+  2500x64 73f41acf8ca0 BIT-EXACT (same 24/120/40 drafts/draft-tokens/
+  accepted as the pin), **off1-2000 ROLLED: 394993781527 vs pin
+  bb83cc3054a3** (counters 1474/2640/528 vs 1582/2110/422). The texts
+  share the first ~100 tokens (char 397 of 6552: "...(one change at a
+  time) and keep a log." vs "...against that baseline.") - a greedy
+  tie-flip that propagates, both continuations coherent. Deterministic:
+  394993781527 on 3/3 default-env boots (`default_x2/`).
+- Suspects on DSV4's path from the W8b ledger ("DSV4 profiles share this
+  GEMV: their re-gate is owed before the PR"): the q8_0 NR/mb GEMV (fp16
+  q8_0 attention/shared-expert projections), async scheduling ON by default
+  (W8a, platform-wide), the fused block-table prepare (W7), the MoE
+  shared-expert fold. Bisect by env switch, one boot each
+  (`regate_env.sh <tag>`; every boot 8tok + off1-2000):
+
+| boot | env | off1-2000 |
+| --- | --- | --- |
+| r3 | campaign defaults | 394993781527 ROLLED |
+| null_env | ASYNC_SCHED=0 Q8_NR=0 KV_META=0 MHC_FUSE_NORM=0 ROW_INSERT=0 MOE_ROUTER=0 MLA_PREFILL_SDPA=0 MAMBA_LB=0 | bb83cc3054a3 = pin |
+| async0 | VLLM_METAL_ASYNC_SCHED=0 only | bb83cc3054a3 = pin (1582/2110/422, 57.6 s) |
+| q8nr0 | VLLM_QC_Q8_NR=0 only | 394993781527 ROLLED |
+| kvmeta0 | VLLM_METAL_KV_META=0 only | 394993781527 ROLLED |
+
+  Async scheduling alone flips the anchor; the q8_0 NR route and the fused
+  prepare are exonerated on DSV4 (both rolled boots carry the async default).
+  The 8tok/2500x64 counters match the pin under async, so drafting and
+  acceptance are identical for the first 24 verify steps; the flip lands
+  around step 25-30 (~token 100), i.e. a numerics-shape effect of the async
+  step pipeline on the DSpark verify path rather than a token-bookkeeping
+  error. Not chased further: DSV4 gains nothing from it (per verify step
+  135.7 ms async vs 136.7 ms sync from the wall/draft counters; 2500x64
+  5.10 vs 5.24 s).
+- q8_0 NR GEMV, checked anyway (`dsv4-regate-r3/ab_q8nr.py` + `ab_q8nr.log`, 9 DSV4 q8_0 shapes
+  x batch 1-6, same seeded Q8_0 blocks and fp16 activations, NR=1 vs the
+  kill switch): 36/54 cases differ (batch 1-4, the NR/mb routes; max 1 fp16
+  ulp), batch 5-6 (generic route) identical - the documented "not
+  bit-identical to the generic walk" (W8b). Against an fp64 dequant-dot
+  reference both routes sit at 0.181 output-ulp mean error (NR 0.1809,
+  generic 0.1811; max 62.4 ulp on both, near-zero outputs). It is on DSV4's
+  path only through `ggml_mul_mat_vec_a8`, and the async0 boot (NR on)
+  reproduced the pin, so the anchors do not see it.
+- FIX: `vllm/platforms/metal.py` async scheduling back to opt-in
+  (`VLLM_METAL_ASYNC_SCHED=1`, the pre-campaign contract; the config
+  layer's default-on resolution applies only after the opt-in); the
+  `glm53f-q2-1` Metal env block carries the opt-in (its gates were pinned
+  with async on, W8a: probe 18.9 -> 21.9 tok/s); `qwen38-nvfp4-1` already
+  did. `dsv4-xxs-1` (no opt-in) runs the synchronous scheduler again.
+  Test: `tests/attention/test_metal_config.py::test_async_scheduling_is_opt_in`.
+  Stale profile note (registered speculator = DFlash2 candidate) corrected
+  to the gated nextn MTP block.
+- Qwen anchor (`perf/results/2026-09-12/qwen-regate/`): the profile as
+  committed at HEAD (b47509dd1, vision enabled, `language_model_only`
+  removed) cannot boot in this venv - `Qwen3VLVideoProcessor` hard-requires
+  torchvision (absent; the 2026-08 notes record the same trap). Pre-existing
+  at HEAD, not a campaign regression; the anchor is re-gated with
+  `--language-model-only` appended to the profile's resolved argv
+  (`boot_qwen_lang.py`), the configuration its pins were made with
+  (benchmark_dsv4_exact.py + harness_assets/m2_source.txt, offset 0).
+- RESULT (r4, `perf/results/2026-09-12/dsv4-regate-r4/`, fixed tree, default
+  env): DSV4 anchors ALL BIT-EXACT - 8tok 573db39598e7, off1-2000
+  bb83cc3054a3 2/2 (1582/2110/422, 57.6/57.7 s), 2500x64 73f41acf8ca0
+  (40/120/24, 5.16 s); boot log "Asynchronous scheduling is disabled".
+  28th consecutive bit-exact DSV4 re-gate.
+- GLM on the fixed tree (`perf/results/2026-09-12/glm-regate-asyncfix/`,
+  profile opt-in active, boot log "Asynchronous scheduling is enabled"):
+  8tok 7dd30ea193a6 / off1-2000 a88022b375ea (28.77 tok/s incl. prefill) /
+  2500x64 f80d14780458 (13.2 s) - BIT-IDENTICAL to the final pins.
+- Qwen RESULT (`qwen-regate/`): campaign build c1 1000x256 **0f6fbb440708**
+  2/2 (16.33 tok/s, 147 accepted draft tokens) / 2500x64 **1b2541ff56ae**
+  2/2 (8.4-8.5 s) vs the 2026-08-25 pins 467b35c3 / d0e07ddd. Null boot
+  of upstream HEAD 55fdb54bd (`qwen-regate/head_null/`: HEAD python + a
+  binary built from HEAD's own sources in a scratch checkout, same
+  language-only override, async on via the profile env): IDENTICAL
+  0f6fbb440708 / 1b2541ff56ae, 2/2 each, 16.40/16.35 tok/s, 147. The
+  campaign is bit-identical to HEAD on the Qwen anchor; the divergence
+  from the 08-25 pins is HEAD-side (the 2026-09-07..10 merges: FP8 KV +
+  metal_attn.py rewrite b47509dd1, host-tier and V2-runner work landed
+  after the last Qwen gate) and the Qwen pins are stale at HEAD - flagged,
+  not re-pinned here (outside this campaign). Side note: HEAD's
+  git-tracked metallib does not load on this box (built elsewhere); the
+  null boot rebuilt it from HEAD's kernel sources.
+- Other Metal profiles: muse-kdyn-1 and qwen38-q2kxl-1 have no local
+  weights (18.3 / 9.2 GiB downloads) and no Metal pins; their
+  campaign-vs-HEAD gate (`other-profiles/regate.sh`) is written and
+  pending the weights. Every shared-code change they would execute is the
+  set proven bit-exact on DSV4 and identical-to-HEAD on Qwen NVFP4.
+
+## 2026-09-12 - GLM-5.3-Flash Q2 on Metal M1 Ultra: scope audit - every campaign feature a non-GLM profile could execute is now opt-in through the glm53f-q2-1 env block; the pre-campaign mHC monolith is back for DSV4
+
+- Trigger: the DSV4 anchor roll above showed a campaign change (the
+  async default) leaking into a profile the campaign never targeted. The
+  question "does a change reach profile X" is answered from the code, so
+  this is a static audit of every campaign edit against the four Metal
+  profiles on this box (dsv4-xxs-1, qwen38-nvfp4-1, muse-kdyn-1 dense
+  Q4_K_XL GGUF, qwen38-q2kxl-1 hybrid UD-Q2_K_XL GGUF), followed by the
+  scoping so that each of them runs exactly the code it was gated with.
+
+| campaign change | reaches | now |
+| --- | --- | --- |
+| async scheduling default (platforms/metal.py) | every Metal profile | opt-in `VLLM_METAL_ASYNC_SCHED=1` (GLM env; qwen38-nvfp4-1 had it) |
+| q8_0 NR / mb GEMV (qgemv.metal, tk_launch.h) | any GGUF q8_0 tensor: DSV4, both GGUF Qwen/Muse profiles | opt-in `VLLM_QC_Q8_NR=1` (GLM env); generic walk otherwise |
+| kv_meta_prepare single-launch metadata (block_table.py) | every profile | opt-in `VLLM_METAL_KV_META=1` |
+| mamba_last_blocks (backends/utils.py) | hybrid profiles (qwen38-*) | opt-in `VLLM_METAL_MAMBA_LB=1` |
+| moe_router_topk (grouped_topk_router.py) | MoE profiles routing fp32 logits without groups | opt-in `VLLM_METAL_MOE_ROUTER=1` |
+| shared-expert add folded into the q2_K sum kernel (fused_moe.py) | GGUF MoE with shared experts + q2_K down: DSV4 | opt-in `VLLM_METAL_MOE_FOLD=1` |
+| hetero-quant shard runs + column-slice GEMVs (gguf/linear.py) | any hetero-quant fused GGUF layer (UD quants) | per-layer flag `qc_metal_fused_shards`, set only by the KDA merged projection |
+| mHC fused_post_pre as post + split pre (dsv4_mhc.metal, .mm) | DSV4 (norm-free call) | pre-campaign monolith kernel restored and encoded whenever no norm is fused; the split only for the GLM norm-fused call |
+
+  Left as is, with the reason: `moe_mm_id` threadgroup arrays sized for
+  512 experts instead of 256 (same math on DSV4's 256; bit-exact r3/r4,
+  step time unchanged); host signatures with defaulted new args (`out`,
+  `accumulate`); the drafter `hc_mult` guard (non-DSV4 drafters resolve
+  to 1 as before); the hybrid KV-view alignment skip (a no-op for
+  single-backend hybrids; qwen38-nvfp4-1 identical to HEAD); the
+  torch-native drafter input prep (its Triton originals could not run on
+  Metal, so no prior profile reached them); everything under the
+  glm5_next / KDA / indexer / sparse-MLA modules (unreachable by other
+  architectures).
+- Test module `test_qgemv_q8_0_nr_metal.py` opts its process into the
+  route at import. The GLM profile note lists the opt-ins.
+- metallib + .so rebuilt (monolith kernel + opt-in launcher defaults); 214
+  unit tests pass (mHC parity + fused norm, q8_0 NR, W7 glue, router, KDA
+  fused, profiles, Metal config, GLM GGUF adapter). The staged
+  QuixiCore-Metal port carries the same kernel files and builds.
+- RESULT DSV4 r5 (`perf/results/2026-09-12/dsv4-regate-r5/`, default env:
+  generic q8_0 walk, torch step metadata, unfused shared-expert add,
+  monolith mHC, synchronous scheduler - the pre-campaign path throughout):
+  ALL BIT-EXACT, 8tok 573db39598e7 / off1-2000 bb83cc3054a3 2/2 (58.1 s) /
+  2500x64 73f41acf8ca0 (5.19 s); 29th consecutive. The boot log's only
+  quixicore route line is the pre-existing tiled MoE prefill GEMM.
+- RESULT GLM (`glm-regate-scoped/`, opt-ins via the profile env, async
+  enabled): 8tok 7dd30ea193a6 / off1-2000 a88022b375ea 28.78 tok/s /
+  2500x64 f80d14780458 - BIT-IDENTICAL to the final pins.
+
+## 2026-09-11 - GLM-5.3-Flash Q2 on Metal M1 Ultra: W8b q8_0 llama.cpp-geometry GEMV - decode 21.94 -> 23.26 tok/s, off1-2000 19.38 -> 20.38; ds4's MTP bar (22.52) beaten without speculation
+
+- Baseline: W8a (decode 21.94, off1-2000 19.38; GPU busy 95%). The q8_0
+  projections (KDA v/output 35.7 MB x 34 layers, MLA attn_output 71 MB x
+  11, shared experts, lm_head) ran the one-row-per-simdgroup walk at
+  250-375 GB/s (gemv_bench, W4) against the ~690-750 GB/s the lm_head
+  reaches.
+- Change: `qgemv_q8_0_nr<T, NR, NSG>` (qgemv.metal): llama.cpp
+  kernel_mul_mv_q8_0_f32 geometry - NR rows per threadgroup, NSG
+  simdgroups splitting K (8 blocks per simdgroup phase, 4 lanes x 8 codes
+  per 32-wide block), activations loaded once per lane per block and
+  reused across rows, cross-simdgroup reduce through threadgroup memory.
+  Routed in `launch_qgemv` for q8_0, K > 512, N % NR == 0, fp16/bf16
+  (`VLLM_QC_Q8_NR=0` kill switch, `VLLM_QC_Q8_NR_GEOM` in {2x4, 4x2, 4x4,
+  2x2, 1x4, 2x8}; default 2x4 = llama.cpp's N_R0/N_SG). NUMERICS: fp32
+  int8*y accumulation per lane, block scale applied per block - closer to
+  the exact dequant-dot than the generic walk's per-element half products;
+  not bit-identical to it.
+- Sweep (`glm53f-q2-w8-gemv/bench_q8.log`, M=1, GB/s generic -> 2x4):
+  kda_v 375 -> 619, kda_output 293 -> 513, attn_output 354 -> 787,
+  attn_q_b 416 -> 424, shexp up/down 190/222 -> 307/285, lm_head 715 ->
+  754. 2x4 best or tied on every shape; 4x2 wins only attn_q_b (530).
+  Split-K variants of the q4_K NR GEMV (2/4 simdgroups per row pair:
+  239/222 vs 259 GB/s at M=1) and of the q2_K MoE sum (2/4/8: 148/125/82
+  vs 173 GB/s at T=1) measured slower at every decode width
+  (`bench_ks.log`) and were removed.
+- Correctness: `tests/kernels/test_qgemv_q8_0_nr_metal.py` 9 passed
+  (within 4 output-ulp of the exact fp32 dequant-dot on 4 shapes x
+  bf16/fp16; mean error <= the generic kernel's, checked in a subprocess
+  with the route pinned off). Gates: 8tok 7dd30ea193a6 (rolled to W2's
+  8tok sha - the decode-path numerics changed), off1-2000 49335758cdab
+  (rolled), 2500x64 75c38d5ea816 (rolled). Teacher-forced 30/32
+  (0.0817) and 60/64 (0.0875) are BYTE-IDENTICAL to W7/W8a: the oracle is
+  a prompt_logprobs prefill and never runs the batch-1 GEMV, so it cannot
+  see decode-kernel changes; the kernel parity test is the decode-side
+  evidence. Needles PASS (18/48/79/147 s).
+- Throughput: decode probe 23.26 tok/s (21.94); off1-2000 20.38 tok/s
+  98.1 s (19.38 / 103.2 s); 2500x64 32.1 s. **ds4's MTP bar (22.52 gen
+  tok/s) is beaten on the probe with no speculation; ds4 no-MTP 18.19 is
+  beaten by 28%.**
+- Decision: retained (default route). DSV4 profiles share this GEMV
+  (fp16 q8_0 projections): their re-gate is owed before the PR. Next: W9
+  MTP speculation (the GGUF's nextn block, registered as the Metal record's
+  speculator, K=1) to widen the gap; then compaction handoff and Session 2
+  prefill (ds4 143 t/s vs our ~50-90).
+
+## 2026-09-11 - GLM-5.3-Flash Q2 on Metal M1 Ultra: W8a async scheduling ON - decode 18.89 -> 21.94 tok/s, off1-2000 16.63 -> 19.38
+
+- Baseline: W7 (decode 18.89, off1-2000 16.63). GPU trace: one 9.8 ms
+  idle gap per 57 ms step between the sampler's output blit and the next
+  step's first compute command - the scheduler + input prep run on the
+  CPU while the GPU waits, because `platforms/metal.py` force-disabled
+  `async_scheduling` during bring-up.
+- Change: `VLLM_METAL_ASYNC_SCHED` default flipped: the config layer's
+  default-on resolution applies (the AsyncScheduler overlaps step N+1's
+  scheduling with step N's GPU work); `=0` pins the synchronous scheduler.
+  No kernel change.
+- Correctness: gates 8tok 5f870096e207, off1-2000 1553b858e2ef, 2500x64
+  8cb1cbc48a44 - all three IDENTICAL to W7. Teacher-forced 30/32
+  (0.0817), 60/64 (0.0875) == W7; needles PASS x4.
+- Throughput: decode probe 21.94 tok/s (18.89); off1-2000 19.38 tok/s
+  103.2 s (16.63 / 120.3 s); 2500x64 32.3 s (33.2). GPU trace
+  (`glm53f-q2-w8a-async/gputrace`): GPU busy 95.0% of the window (was
+  77.0%), remaining gaps 323 ms over 121 steps (~2.7 ms/step).
+- Decision: retained (default on Metal). The step is now GPU-execution
+  bound at ~45 ms; the bar (ds4 MTP 22.52) is within 3%. Next: W8b GEMV
+  bandwidth (q8_0 llama.cpp-geometry kernel + split-K q4_K/q2_K-sum
+  variants, env-swept), then MTP speculation.
+
+## 2026-09-11 - GLM-5.3-Flash Q2 on Metal M1 Ultra: W7 remaining glue diet - decode 18.78 -> 18.89 tok/s; GPU trace says the step idles 23% between steps
+
+- Baseline: W6 (decode 18.78, off1-2000 16.65; census 2079 calls/step).
+  Widened census attribution: runner block-table gather + slot mappings
+  ~65 launches/step across the six KV groups (index_select/zero_/copy_,
+  floor_divide/remainder/index/to/mul/add/copy_ per group) plus the
+  "align" mamba tail-block gather (six ops x four groups); the indexer
+  forward ~10 launches/layer (wk, gate and weights_proj linears, float,
+  layer_norm, to, cat, mul); the MoE `shared + routed` add per layer; the
+  KDA in_proj two-shard `cat`; the int64->int32 slot cast per MLA layer.
+- Change: `kernels/serving/kv_meta/kv_meta.metal`: `kv_meta_prepare` (one
+  launch: every group's batch block table + slot mapping; CSR request
+  lookup by binary search over query_start_loc; PAD past num_tokens) routed
+  from `prepare_attn` via `BlockTables.prepare_metal`
+  (`VLLM_METAL_KV_META=0` pins torch); `mamba_last_blocks` for
+  `mamba_get_block_table_tensor` (`VLLM_METAL_MAMBA_LB=0`).
+  `glm5_indexer_pack` (`glm5_indexer.metal`): one fused
+  [wk | gate | weights_proj] bf16 linear then LayerNorm(k) | gate ->
+  packed and fp32 scaled weights (`VLLM_METAL_INDEXER_PACK=0`).
+  `ggml_moe_a8_vec_sum(accumulate=)`: the q2_K sum kernel adds
+  T(sum) into the shared-expert output (runtime flag, same compiled walk;
+  `SharedExperts.peek_output` + runner `accumulate_ok`; fold detected by
+  identity in `FusedMoE.forward`). `ggml_mul_mat_vec_a8(out=)`: the KDA
+  hetero shards write column slices of one output (batch-1 kernels bind by
+  byte offset; strided batch>1 targets copy from the ring).
+  `paged_row_insert` takes int64 slots (`_i64` instantiations).
+- Correctness: `tests/kernels/test_w7_glue_metal.py` 19 passed (kv meta
+  integer-exact vs the torch chain incl. disabled group, padded rows and
+  tokens, 2048-token request; mamba tail gather; pack within bf16 ulp;
+  i64 insert == i32; accumulate == `shared + T(sum)` bit-exact bf16/fp16;
+  GEMV slice outputs == plain). Live: routes logged (router, folded add,
+  hetero no-cat). Gates: 8tok 5f870096e207 (== W4b..W6); off1-2000
+  1553b858e2ef (rolled at token ~130/2000, a near-tie flip: the pack
+  kernel's fp32 LayerNorm statistic order) 16.63 tok/s 120.3 s; 2500x64
+  8cb1cbc48a44 33.2 s. Teacher-forced 30/32 mean 0.0817, 60/64 mean
+  0.0875 (== W6); needles PASS (18/49/79/148 s).
+- Throughput: decode 18.89 tok/s (18.78) - ~250 launches/step removed
+  with no measurable gain.
+- Why (Metal System Trace, `perf/results/2026-09-11/glm53f-q2-w7-glue/
+  gputrace3`, `w8-gemv/analyze_trace.py`): over 113 decode steps the GPU
+  is busy 77.0% - 44 ms of GPU work per 57 ms step; 77 command buffers
+  per step with 36 us median boundaries (negligible), and ONE 9.8 ms gap
+  per step between the sampler's output blit and the next step's first
+  compute command (scheduler + input prep + sampler postprocess on the
+  CPU with the GPU idle: async scheduling is force-disabled on Metal,
+  `VLLM_METAL_ASYNC_SCHED=1` opts in) plus a ~0.9 ms gap before the
+  mamba metadata (a host sync in the metadata build). The removed
+  launches were inside the busy 77%, where the GPU is the wall.
+- Decision: retained (bit-exact except the pack LayerNorm order; keeps
+  the GPU-side launch count down for the GPU-bound part). Next: W8a async
+  scheduling (the 9.8 ms/step gap), then W8b GEMV bandwidth (the busy 44
+  ms is ~2/3 GEMVs at 250-350 GB/s vs 690 peak: q8_0 llama.cpp-geometry
+  kernel written, `VLLM_QC_Q8_NR_GEOM`, not yet built/measured).
+
+## 2026-09-11 - GLM-5.3-Flash Q2 on Metal M1 Ultra: W6 Metal indexer + row insert + metadata - decode 15.85 -> 18.78 tok/s
+
+- Baseline: W5 (decode 15.85, off1-2000 13.93). Census: the MLA layer's
+  torch glue - the pooled indexer producer (~25 ops: gather pool rows,
+  softmax, einsum, relu, top-k, expansion), the latent insert (5 ops), the
+  decode output slab + copy - plus a 1.9 ms/step host stall in the MLA
+  metadata build (a CPU->MPS copy_ drains the whole GPU queue; measured
+  227 ms behind a queued matmul).
+- Change: `kernels/attention/glm5_indexer/glm5_indexer.metal`:
+  `glm5_indexer_pool_logits` (one simdgroup per (pool, row): member
+  softmax over gate+APE, pooled key rounded through bf16 as the Triton
+  kernel does, 32 head dots, relu, head weights), `glm5_indexer_expand_topk`
+  (valid pools first + tail + -1 pad, the Triton/torch expand contract),
+  `paged_row_insert` (slot -> block/offset copy, PAD -> null row). Route in
+  `_pooled_select_native` (Metal: kernel logits, torch sorted top-k,
+  expand kernel; `VLLM_METAL_INDEXER_KERNEL=0` pins torch), in
+  `_insert_rows_native` and `insert_latent_rows` (`VLLM_METAL_ROW_INSERT=0`);
+  `forward_mqa` returns the decode attention directly; the MLA metadata
+  builds request ids on the device from `query_start_loc` (no blocking copy).
+- Correctness: `tests/kernels/test_glm5_indexer_metal.py` 8 passed
+  (selected token sets identical to the torch producer for 1-3 rows incl.
+  9000-token and 3-token rows, logits within 1e-3 relative, insert
+  bit-exact). Live: 8tok and off1-2000 shas identical to W5; 2500x64 rolled
+  (fp32 reduction order of the pooled logits at 2500 tokens); teacher-forced
+  30/32, 60/64 unchanged; needles PASS.
+- Throughput: decode 18.78 tok/s (53 ms/step, was 63); off1-2000 16.65
+  (13.93); 2500x64 33.2 s (33.8).
+- Decision: retained. ds4 no-MTP 18.19 is now matched on the probe; the
+  MTP bar (22.52) needs speculation on top of the remaining glue diet.
+
+## 2026-09-11 - GLM-5.3-Flash Q2 on Metal M1 Ultra: W5 KDA layer launch diet - decode 14.9 -> 15.85 tok/s
+
+- Baseline: W4b (decode 14.91, off1-2000 13.15). Widened op census: per KDA
+  layer the in_proj ran six GEMVs + a cat (hetero shard types), the fused
+  KDA output was copied into the attention slab, o_proj was copied into a
+  caller buffer, and every layer built its own `arange` for the decode
+  cu_seqlens; the mHC sites are three launches each.
+- Change: `_create_hetero_shard_weights` coalesces adjacent same-type
+  shards (q|k Q4_K, v|f_a|g_a|beta Q8_0: two GEMVs + a two-way cat, same
+  per-row kernel so bit-identical); `kda_step` takes an optional `out`
+  (the attention slab rows); `KimiGatedDeltaNetAttention.forward` returns
+  the o_proj result when `output` is None (GLM decoder takes it directly);
+  the decode `cu` arange is cached on the shared metadata object. A fused
+  post-mix+dots mHC pass (25 simdgroups/token recomputing the mix) was
+  tried and measured slower (0.239 vs 0.112 ms at T=1) - reverted, not kept.
+- Correctness: 88 tests (KDA fused/native, mHC) passed; live gates
+  bit-identical to W4b (8tok 5f870096e207, off1-2000 29878bddab74, 2500x64
+  c4f607e5cc8a); teacher-forced 30/32 and 60/64 unchanged; needles PASS.
+- Throughput: decode 15.85 tok/s (63 ms/step, from 67); off1-2000 13.93
+  (13.15); 2500x64 33.8 s (34.2); ttft 0.75 s (0.79).
+- Decision: retained. Also measured: a CPU->MPS `copy_` blocks until every
+  queued command buffer drains (227 ms behind a queued matmul), which is
+  the 1.9 ms/step stall in the MLA metadata build - fixed in W6.
+
+## 2026-09-11 - GLM-5.3-Flash Q2 on Metal M1 Ultra: W4 fp32 routing + Metal router kernel - decode 12.3 -> 14.9 tok/s
+
+- Baseline: W3 (decode 12.28, off1-2000 11.25). GPU-busy census (cb census,
+  no brackets): 72 of 82 ms/step GPU, ~15 command buffers/step; ioreg GPU
+  utilization 85-98% during decode. Fine profile: `moe_router` 0.73 ms x 42
+  sync-inflated, the expert GEMVs near the bracket floor.
+- Hypothesis: the ~16-op torch `grouped_topk` chain (sigmoid, bias, topk,
+  gather, renorm, scale...) per MoE layer is launch-bound; one kernel
+  replaces it.
+- Change: `kernels/moe/moe_router/moe_router.metal` (`moe_router_topk`, one
+  simdgroup per token, K rounds of simd max with lowest-index tie-break),
+  host `moe_router_topk`, `quixicore_ops.moe_router_topk`, route at the top
+  of `grouped_topk()` for Metal + single group + fp32 logits
+  (`VLLM_METAL_MOE_ROUTER=0` pins torch). First boot showed no change: the
+  GLM gate ran in bf16 (`_get_moe_router_dtype` only forces fp32 for
+  glm_moe_dsa), so the fp32-only route never engaged. Fix: GLM GGUF config
+  sets `moe_router_dtype: float32` and `DeepseekV2MoE` passes
+  `force_fp32_compute` on Metal so the F32 `ffn_gate_inp` stays fp32 - ds4
+  routes in fp32 too. Also: KDA prefill `fresh.any()` host sync (23 ms
+  pipeline drain per layer per prefill step) replaced by a masked row scale.
+- Correctness: `tests/kernels/test_moe_router_metal.py` 32 passed (fp32
+  sets + weights to 2e-6; bf16 logits deliberately not routed - the torch
+  chain's per-op bf16 rounding flips near-tie experts). Live teacher-forced
+  vs ds4: short 30/32 (mean 0.082), long 60/64 (mean 0.088, max 0.50) - up
+  from 56/64 / 0.155 with bf16 routing. Needles PASS.
+- Throughput: router on/off A/B at bf16 routing: 12.31 vs 12.28 (route
+  inactive); with fp32 routing: decode 14.91 tok/s, off1-2000 13.15 (11.26),
+  2500x64 34.2 s (35.0). ttft 64-tok 0.88 -> 0.80 s (sync removal).
+  Calibration: ~670 torch ops removed per step bought ~14 ms => ~20 us per
+  small MPS op on this box. Op count is the lever.
+- GEMV bandwidth at M=1 (`gemv_bench.py`): lm_head (674 MB) 709 GB/s; the
+  35 MB KDA/MLA projections 270-400 GB/s (launch floor ~0.025 ms, 690 GB/s
+  only above ~140 MB); iq2_xxs w13 0.17 ms + q2_K w2 0.10 ms per MoE layer.
+  Measured GEMV sum ~37 ms/step vs a 10.6 GB/token stream (~18 ms floor).
+- Decision: retained. Next: widened op census (call-site attribution of
+  add/sub/mul/bmm/index/... ) to fuse the remaining ~1300 non-view ops per
+  step (KDA in_proj shard cat + rearranges, indexer torch producer, MLA
+  absorb/insert glue, MoE combine).
+
+## 2026-09-11 - GLM-5.3-Flash Q2 on Metal M1 Ultra: W3 mHC sites (post + split pre, fused norm) - decode 6.7 -> 12.3 tok/s
+
+- Baseline: W2 stack (decode 6.68 tok/s, off1-2000 6.25). Fine-grained
+  sync profile (`perf/results/2026-09-11/glm53f-q2-w3-prof/`) put the two
+  mHC sites at 1.10-1.12 ms/call x 90 = ~100 of 329 sync-inflated ms/step.
+- Hypothesis: the GLM path called the one-threadgroup-per-token monolith
+  `dsv4_mhc_fused_post_pre_<T>`; at decode widths that kernel is
+  latency-starved (one threadgroup reads the 1.5 MB fn projection). DSV4
+  Metal rejected the same monolith on 2026-08-12 and runs post + split pre.
+- Change: `dsv4_mhc_fused_post_pre` host now encodes `dsv4_mhc_post` +
+  `dsv4_mhc_pre_dots` (25 simdgroups/token) + `dsv4_mhc_pre_finalize` in
+  one encode; the monolith kernel is removed. New `*_finalize_norm_*`
+  variant carries the layer-input RMSNorm (statistic from the T-rounded mix,
+  one rounding of x*inv*w like `rms_norm_dyn`), `_fuse_mhc_norm` true on
+  Metal (`VLLM_METAL_MHC_FUSE_NORM=0` pins the separate norm).
+- Correctness: `tests/kernels/test_mhc_fused_norm_metal.py` 20 passed
+  (pair vs fused host bit-identical for T=1/5/64/130 with and without norm;
+  norm vs torch reference within bf16 ulp). Live: teacher-forced short 28/32
+  (mean |dlogprob| 0.069, was 0.113), long 56/64 (mean 0.155, was 0.124);
+  needles PASS to 12k. 8tok sha unchanged; 2500x64 sha equals W1's.
+- Throughput: microbench T=1: 0.755 -> 0.112 ms/call (norm included).
+  Live: decode probe 12.28 tok/s (was 6.68), off1-2000 11.25 tok/s (6.25),
+  2500x64 35.4 s (39.9). Prefill-bound needle walls barely move.
+- Decision: retained. ds4 bar: 18.19 (no MTP) / 22.52 (MTP) tok/s; we are
+  at 12.3 without speculation. Next: GPU-busy vs wall split (VLLM_SYNCPROF
+  cb census) to choose between torch-glue removal in the MLA/indexer layer
+  and the step-tape approach.
+
+## 2026-09-11 - GLM-5.3-Flash Q2 on Metal M1 Ultra: W2 sparse latent MLA decode kernel
+
+- Baseline: W1 stack (`glm53f-q2-1 --no-spec`, decode 6.6 tok/s, off1-2000
+  6.08 tok/s; W1 entry below). Sync-inflated split on W1: mla_attn 5.9 ms x
+  11 layers = the largest per-layer bucket.
+- Hypothesis: `sparse_attend_rows` (torch: gather 2051 latent rows, einsum,
+  masked softmax, einsum, per layer) is the MLA cost; one Metal kernel over
+  the paged bf16 latent with the indexer's top-k list removes it.
+- Change: `csrc/quixicore/metal/kernels/attention/mla_sparse_latent/`
+  (`mla_sparse_latent_partition` grid (H, R, P) online-softmax over the
+  index list, `mla_sparse_latent_reduce` merges partitions in fp32), host
+  `mla_sparse_latent_decode` (auto P = 1024/(R*H) capped at 32),
+  `quixicore_ops.mla_sparse_latent_decode`, fast path at the top of
+  `metal_mla_sparse.sparse_attend_rows` (`VLLM_METAL_MLA_SPARSE_KERNEL=0`
+  pins torch).
+- Correctness: `tests/kernels/test_mla_sparse_latent_metal.py` 6 passed
+  (bf16/f16, pads, all-pad rows, partition-count independence, max |d| vs
+  the torch path < 2e-2). Live: teacher-forced identical to W1 (short 30/32,
+  long 55/64 mean 0.124); needles PASS to 12k.
+- Throughput: microbench at the serving shape (R=1, H=64, W=2051): torch
+  0.55 ms -> kernel 0.17 ms per layer. Live: decode probe 6.68 tok/s (W1 6.6),
+  off1-2000 6.25 tok/s (6.08), 2500x64 39.9 s (42.5), needle 12k 151 s (159).
+  A ~2% step - the attention math was never the 5 ms; the bucket is the
+  torch glue around it (indexer producer, absorb bmm, projections).
+- Decision: retained (correct, strictly faster, and the kernel is the
+  building block for batch > 1 and speculation). Next: fine-grained
+  brackets inside the MLA layer and indexer (`perf/results/2026-09-11/
+  glm53f-q2-w3-prof/`) to pick the W3 target; norm-fused mHC kernels
+  (`dsv4_mhc_*_norm_*`, 90 fewer dispatches/step) built and parity-tested
+  alongside, measured in the same profiled boot.
+
+## 2026-09-11 - GLM-5.3-Flash Q2 on Metal M1 Ultra: bring-up (N0) and W1 fused KDA
+
+- Status: in progress (campaign `glm53f-metal-campaign`, profile `glm53f-q2-1`;
+  roadmap + running log in the first section of `HANDOFF.md`).
+- Baseline (N0, `perf/baseline_status.md` top section): antirez's
+  GLM-5.3-Flash-Q2.gguf served through the real profile with torch-native
+  KDA / indexer / sparse-MLA paths: decode 3.04 tok/s (329 ms/step), prefill
+  ~50 t/s. Bar on this box: ds4 6289c516 decode 22.52 (MTP) / 18.19, prefill 143.
+- Phase split at N0 (`VLLM_QC_PHASE_PROF=1`, sync-inflated 450 ms/step):
+  kda_attn 6.84 ms x 34 = 232 ms; moe 1.51 x 42 = 63; mhc sites 1.18 x 90 =
+  106; mla_attn 3.80 x 11 = 42; sample 6. Raw:
+  `perf/results/2026-09-11/glm53f-q2-phaseprof/dump_run1/`.
+- W1 hypothesis: the KDA layer is ~30 torch MPS ops per layer per token (conv
+  update, L2 norms, gate, four recurrence ops, gated norm); one command buffer
+  of three Metal kernels removes the launch/glue wall and the MPS fp32 path's
+  own rounding error.
+- W1 change: `csrc/quixicore/metal/kernels/linear_attention/kda/kda.metal`
+  (`kda_fused_prepare` conv+L2norm+per-channel gate, `kda_recur` per-channel
+  decay delta rule over varlen cu_seqlens against the fp32 page-packed pool,
+  `kda_gated_rmsnorm_f32` sigmoid gate), host `kda_step` in
+  `qc_metal_serving.mm` (three launches, one encode), `quixicore_ops.kda_step`,
+  and the hook in `kimi_gdn_linear_attn.py::_forward_native` for pure non-spec
+  batches (decode and varlen prefill; fresh prefill rows zero their pool rows
+  and every request loads state). `VLLM_METAL_KDA_FUSED=0` pins the torch path.
+- Correctness: `tests/kernels/test_kda_metal_fused.py` 6 passed - the kernel's
+  state matches a float64 recurrence to 4e-8 (the MPS torch reference is off
+  by 1.6e-3 against float64, so the test holds the kernel to float64 and the
+  torch path loosely); `tests/model_executor/test_kda_native.py` 58 passed.
+  Live: teacher-forced vs ds4 dumps short 30/32 (mean |dlogprob| 0.113, one
+  position moved 2.3 nats at a ds4 margin of 0.18), long 55/64 (was 52/64,
+  mean 0.124 was 0.175, max 0.56 was 0.97) - the 1000-token context agrees
+  better with ds4 than N0 did; needle PASS 1.5k/4k/6.5k/12k.
+- Throughput: streaming decode 6.6 tok/s (151 ms/step) vs 3.04 (329) at N0,
+  x2.2; needle walls 34/86/132/244 s -> 19/54/86/159 s (prefill via the
+  varlen kernel instead of the per-token torch loop). Exact-token gates in
+  `perf/results/2026-09-11/glm53f-q2-w1-kda/gates/` (shas roll vs N0 by
+  design: the state path is now float64-exact instead of MPS-rounded).
+- Decision: retained. Next: phase split on the W1 stack; expected wall order
+  mHC sites (90 launches/step) > MoE > MLA/indexer > sampler.
+- Bring-up notes retained for the PR: upstream's tracked metallib is
+  metal4.0 and unloadable on macOS 15 (rebuilt metal3.1 locally); the K-quant
+  small-M GEMM selection assumed the M5 tensor-ops kernels (`has_tensor_qgemm`
+  probe + simdgroup fallbacks); GLM `swiglu_limit` 10 now applied on dense,
+  shared and routed FFNs as ds4 does; tiled MoE map0 cap 256 -> 512; Mamba
+  align-mode block 4288 needs `max_num_batched_tokens` >= 4288 (profile
+  updated); GGUF linear inputs made contiguous on Metal; prompt_logprobs
+  token-id gather has a torch fallback on Metal.
+
 ## 2026-09-25 - Affine King online FP8 dense projections on RTX 5090
 
 - Status: retained in registered production profile. Scope: `affine-king-nvfp4-1`, TP1 V2, RTX 5090 32 GB, driver 595.91.07, CUDA 13.3, home venv, working tree based on `11e644b6c`.

@@ -773,7 +773,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             spec_hidden_states = hidden_states
             if hasattr(self.model, "get_mtp_target_hidden_states"):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
-                spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
+                if pre_hc_hidden_states is not None:
+                    spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]
             self.speculator.propose(
                 input_batch=input_batch,
                 attn_metadata=attn_metadata,
@@ -1246,6 +1247,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
         if self.pcp_manager is not None:
             return self.pcp_manager.prepare_attn(input_batch)
+
+        if self.block_tables.metal_fused_prepare_ok():
+            # Metal: one launch for every group's block-table gather and
+            # slot mapping (the torch chain issued ~10 launches per group).
+            return self.block_tables.prepare_metal(
+                input_batch.idx_mapping,
+                input_batch.query_start_loc,
+                input_batch.positions,
+                num_reqs_padded=input_batch.num_reqs_after_padding,
+                num_tokens_padded=input_batch.num_tokens_after_padding,
+                num_tokens=input_batch.num_tokens,
+            )
 
         # Block tables: num_kv_cache_groups x [num_reqs_padded, max_num_blocks].
         block_tables = self.block_tables.gather_block_tables(
@@ -1992,7 +2005,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             spec_hidden_states = hidden_states
             if hasattr(self.model, "get_mtp_target_hidden_states"):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
-                spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
+                if pre_hc_hidden_states is not None:
+                    spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]
             try:
                 with _qc_phase("drafter_propose"):
                     draft_tokens = self.speculator.propose(

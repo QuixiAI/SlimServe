@@ -1,0 +1,212 @@
+ phase timing for prefill, decode,
+  and quantize. Prints one line per phase with median and spread. Useful for
+  locating which phase absorbs a regression.
+- `VLLM_QC_PHASE_PROF=1 VLLM_QC_PHASE_PROF_DETAIL=1` — adds per-iteration
+  detail lines, including per-phase breakdown and per-iteration medians. Use
+  for short runs; detail output is verbose.
+
+Both profilers are diagnostics only. They are not retained performance wins
+and must not be recorded as such.
+
+## Metal Serving Path
+
+The Metal path is the current cross-platform reference for the fused MoE
+loop. The retained implementation is:
+
+```text
+IQ2_XXS gate/up -> SwiGLU -> Q2_K down -> weighted reduce
+```
+
+with the public entry point `slimserve_qc_metal_fused_moe` in
+`slimserve/qc/metal/fused_moe.py`. It must support vLLM's combined
+`[expert, gate|up, packed]` GGUF layout or split/aligned artifacts.
+
+The retained loop is:
+
+```text
+IQ2_XXS gate/up -> SwiGLU -> Q2_K down -> weighted reduce
+```
+
+with the public entry point `slimserve_qc_metal_fused_moe` in
+`slimserve/qc/metal/fused_moe.py`. It must support vLLM's combined
+`[expert, gate|up, packed]` GGUF layout or split/aligned artifacts.
+
+The retained loop is:
+
+```text
+IQ2_XXS gate/up -> SwiGLU -> Q2_K down -> weighted reduce
+```
+
+with the public entry point `slimserve_qc_metal_fused_moe` in
+`slimserve/qc/metal/fused_moe.py`. It must support vLLM's combined
+`[expert, gate|up, packed]` GGUF layout or split/aligned artifacts.
+
+The retained loop is:
+
+```text
+IQ2_XXS gate/up -> SwiGLU -> Q2_K down -> weighted reduce
+```
+
+with the public entry point `slimserve_qc_metal_fused_moe` in
+`slimserve/qc/metal/fused_moe.py`. It must support vLLM's combined
+`[expert, gate|up, packed]` GGUF layout or split/aligned artifacts.
+
+The retained loop is:
+
+```text
+IQ2_XXS gate/up -> SwiGLU -> Q2_K down -> weighted reduce
+```
+
+with the public entry point `slimserve_qc_metal_fused_moe` in
+`slimserve/qc/metal/fused_moe.py`. It must support vLLM's combined
+`[expert, gate|up, packed]` GGUF layout or split/aligned artifacts.
+
+The retained loop is:
+
+```text
+IQ2_XXS gate/up -> SwiGLU -> Q2_K down -> weighted reduce
+```
+
+with the public entry point `slimserve_qc_metal_fused_moe` in
+`slimserve/qc/metal/fused_moe.py`. It must support vLLM's combined
+`[expert, gate|up, packed]` GGUF layout or split/aligned artifacts.
+
+The retained loop is:
+
+```text
+IQ2_XXS gate/up -> SwiGLU -> Q2_K down -> weighted reduce
+```
+
+with the public entry point `slimserve_qc_metal_fused_moe` in
+`slimserve/qc/metal/fused_moe.py`. It must support vLLM's combined
+`[expert, gate|up, packed]` GGUF layout or split/aligned artifacts.
+
+The retained loop is:
+
+```text
+IQ2_XXS gate/up -> SwiGLU -> Q2_K down -> weighted reduce
+```
+
+with the public entry point `slimserve_qc_metal_fused_moe` in
+`slimserve/qc/metal/fused_moe.py`. It must support vLLM's combined
+`[expert, gate|up, packed]` GGUF layout or split/aligned artifacts.
+
+The retained loop is:
+
+```text
+IQ2_XXS gate/up -> SwiGLU -> Q2_K down -> weighted reduce
+```
+
+with the public entry point `slimserve_qc_metal_fused_moe` in
+`slimserve/qc/metal/fused_moe.py`. It must support vLLM's combined
+`[expert, gate|up, packed]` GGUF layout or split/aligned artifacts.
+
+The retained loop is:
+
+```text
+IQ2_XXS gate/up -> SwiGLU -> Q2_K down -> weighted reduce
+```
+
+with the public entry point `slimserve_qc_metal_fused_moe` in
+`slimserve/qc/metal/fused_moe.py`. It must support vLLM's combined
+`[expert, gate|up, packed]` GGUF layout or split/aligned artifacts.
+
+The retained loop is:
+
+```text
+IQ2_XXS gate/up -> SwiGLU -> Q2_K down -> weighted reduce
+```
+
+with the public entry point `slimserve_qc_metal_fused_moe` in
+`slimserve/qc/metal/fused_moe.py`. It must support vLLM's combined
+`[expert, gate|up, packed]` GGUF layout or split/aligned artifacts.
+
+The retained loop is:
+
+```text
+IQ2_XXS gate/up -> SwiGLU -> Q2_K down -> weighted reduce
+```
+
+with the public entry point `slimserve_qc_metal_fused_moe` in
+`slimserve/qc/metal/fused_moe.py`. It must support vLLM's combined
+`[expert, gate|up, packed]` GGUF layout or split/aligned artifacts.
+
+The retained loop is:
+
+```text
+IQ2_XXS gate/up -> SwiGLU -> Q2_K down -> weighted reduce
+```
+
+with the public entry point `slimserve_qc_metal_fused_moe` in
+`slimserve/qc/metal/fused_moe.py`. It must support vLLM's combined
+`[expert, gate|up, packed]` GGUF layout or split/aligned artifacts.
+
+The retained loop is:
+
+```text
+IQ2_XXS gate/up -> SwiGLU -> Q2_K down -> weighted reduce
+```
+
+with the public entry point `slimserve_qc_metal_fused_moe` in
+`slimserve/qc/metal/fused_moe.py`. It must support vLLM's combined
+`[expert, gate|up, packed]` GGUF layout or split/aligned artifacts.
+
+The retained loop is:
+
+```text
+IQ2_XXS gate/up -> SwiGLU -> Q2_K down -> weighted reduce
+```
+
+with the public entry point `slimserve_qc_metal_fused_moe` in
+`slimserve/qc/metal/fused_moe.py`. It must support vLLM's combined
+`[expert, gate|up, packed]` GGUF layout or split/aligned artifacts.
+
+The retained loop is:
+
+```text
+IQ2_XXS gate/up -> SwiGLU -> Q2_K down -> weighted reduce
+```
+
+with the public entry point `slimserve_qc_metal_fused_moe` in
+`slimserve/qc/metal/fused_moe.py`. It must support vLLM's combined
+`[expert, gate|up, packed]` GGUF layout or split/aligned artifacts.
+
+The retained loop is:
+
+```text
+IQ2_XXS gate/up -> SwiGLU -> Q2_K down -> weighted reduce
+```
+
+with the public entry point `slimserve_qc_metal_fused_moe` in
+`slimserve/qc/metal/fused_moe.py`. It must support vLLM's combined
+`[expert, gate|up, packed]` GGUF layout or split/aligned artifacts.
+
+The retained loop is:
+
+```text
+IQ2_XXS gate/up -> SwiGLU -> Q2_K down -> weighted reduce
+```
+
+with the public entry point `slimserve_qc_metal_fused_moe` in
+`slimserve/qc/metal/fused_moe.py`. It must support vLLM's combined
+`[expert, gate|up, packed]` GGUF layout or split/aligned artifacts.
+
+The retained loop is:
+
+```text
+IQ2_XXS gate/up -> SwiGLU -> Q2_K down -> weighted reduce
+```
+
+with the public entry point `slimserve_qc_metal_fused_moe` in
+`slimserve/qc/metal/fused_moe.py`. It must support vLLM's combined
+`[expert, gate|up, packed]` GGUF layout or split/aligned artifacts.
+
+The retained loop is:
+
+```text
+IQ2_XXS gate/up -> SwiGLU -> Q2_K down -> weighted reduce
+```
+
+with the public entry point `slimserve_qc_metal_fused_moe` in
+`slimserve/qc/metal/fused_moe.py`. It must support vLLM's combined
+`[expert, gate|up

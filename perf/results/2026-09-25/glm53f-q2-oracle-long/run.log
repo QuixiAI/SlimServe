@@ -1,0 +1,22 @@
+env VLLM_QC_MLA_SPARSE_MQA = 6
+launched pid 83878 sid-detached; log /Users/seangherardi/Code/slimserve/SlimServe-glm53f/perf/results/2026-09-25/glm53f-q2-oracle-long/mqa6/boot.log
+== MQA=6 ready
+teacher-forced positions: 64; argmax agreement 62/64 = 0.969
+|logprob(ds4 token)| delta: mean 0.0731 max 0.4077 (n=64, missing-from-our-top8: 0)
+  k= 0 ds4 '3' lp -1.833 (margin 0.072) | ours argmax '5' lp -1.867, our lp of ds4 tok -2.1165523529052734
+  k=12 ds4 ' pre' lp -3.430 (margin 0.074) | ours argmax '/' lp -3.364, our lp of ds4 tok -3.363636016845703
+8tok sha 7dd30ea193a6 prompt [1000] out [8] tps 1.73 wall 4.6s
+off1-2000 sha 393882a2ddaf prompt [1000] out [2000] tps 34.28 wall 58.3s
+2500x64 sha c097108f8fa5 prompt [2500] out [64] tps 5.21 wall 12.3s
+env VLLM_QC_MLA_SPARSE_MQA = 0
+launched pid 84130 sid-detached; log /Users/seangherardi/Code/slimserve/SlimServe-glm53f/perf/results/2026-09-25/glm53f-q2-oracle-long/mqa0/boot.log
+== MQA=0 ready
+  k= 1 ds4 ' ms' lp -1.373 (margin 0.078) | ours argmax ').' lp -1.194, our lp of ds4 tok -1.4444828033447266
+  k= 9 ds4 ' (' lp -2.266 (margin 0.139) | ours argmax ' GPU' lp -2.235, our lp of ds4 tok -2.297168731689453
+  k=12 ds4 ' pre' lp -3.430 (margin 0.074) | ours argmax '/' lp -3.481, our lp of ds4 tok -3.5434789657592773
+  k=36 ds4 '1' lp -0.780 (margin 0.056) | ours argmax '2' lp -0.740, our lp of ds4 tok -0.8646640777587891
+8tok sha 7dd30ea193a6 prompt [1000] out [8] tps 1.79 wall 4.5s
+off1-2000 sha 393882a2ddaf prompt [1000] out [2000] tps 34.26 wall 58.4s
+2500x64 sha 1d7d58486dc7 prompt [2500] out [64] tps 5.07 wall 12.6s
+port 8000 free after ~1s
+ALL DONE

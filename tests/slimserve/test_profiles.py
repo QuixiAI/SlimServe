@@ -219,6 +219,15 @@ def test_glm53_profiles_select_glm53_tool_calling_compatibility():
         assert plan.env["VLLM_TOOL_CALLING_PROFILE"] == "glm53"
 
 
+def test_in_target_drafter_adds_no_download():
+    # glm53f-q2-1's drafter is the GGUF's own nextn block (model: target): no
+    # repo, no files. The download planner must not build a hub URL for it.
+    plan = resolve("glm53f-q2-1", "metal", 1, None, memory_bytes=128 * (1 << 30))
+    plan = replace(plan, speculative=True)
+    assert plan.speculator["model"] == "target"
+    assert not [f for f in files_for(plan) if f["role"] == "speculator"]
+
+
 def test_spec_cli_flags_are_mutually_exclusive():
     with pytest.raises(SystemExit):
         cli._parser().parse_args(["--spec", "--no-spec"])
@@ -229,6 +238,7 @@ def test_every_source_declares_its_live_smoke_modalities():
     assert sources["glm52-vision"]["modalities"] == ["text", "image"]
     assert sources["kimi-k3"]["modalities"] == ["text", "image"]
     assert sources["glm53f-nvfp4"]["modalities"] == ["text", "image"]
+    assert sources["glm53f-gguf"]["modalities"] == ["text"]
     assert sources["dsv4-flash"]["modalities"] == ["text"]
     assert sources["muse-glimmer"]["modalities"] == ["text", "image"]
     assert sources["qwen38-27b"]["modalities"] == ["text", "image"]

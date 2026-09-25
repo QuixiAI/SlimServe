@@ -1,0 +1,51 @@
+{
+  "16": {
+    "aggregate_output_tps": 63.11055152603237,
+    "exact": true,
+    "per_request_tps": 3.999946846042231,
+    "shas": [
+      "797078326f4b",
+      "1e31f6623961",
+      "92aa2ea2c942",
+      "e3f9c5697795",
+      "fd55e1994bd2",
+      "2b9748aec689",
+      "5aca4e910ff9",
+      "e88119ba4942",
+      "551eaf32cc55",
+      "73461b08b0ce",
+      "44cee4ff4ab7",
+      "42cddee6f821",
+      "112ae045c9fe",
+      "05947f568a57",
+      "9d41c2f2de00",
+      "db0be856128e"
+    ]
+  },
+  "4": {
+    "aggregate_output_tps": 48.3792265175373,
+    "exact": true,
+    "per_request_tps": 12.281337082666052,
+    "shas": [
+      "eaac08ac6db8",
+      "ea4226a33e8f",
+      "7a81ccd723b4",
+      "48c3c9b6c41e"
+    ]
+  },
+  "8": {
+    "aggregate_output_tps": 57.2913407819947,
+    "exact": true,
+    "per_request_tps": 7.215780784222005,
+    "shas": [
+      "d81d32abd57a",
+      "ca43ba54e9c7",
+      "e80074ad4f2e",
+      "d7b1098d0c2f",
+      "b88a1c0ac2ae",
+      "745f40cc3c2c",
+      "fbc80951ced3",
+      "4404093d87c3"
+    ]
+  }
+}

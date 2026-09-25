@@ -1,0 +1,14 @@
+launched pid 73711 sid-detached; log /Users/seangherardi/Code/slimserve/SlimServe-glm53f/perf/results/2026-09-15/glm53f-q2-conc/c4_1k_0924/boot.log
+READY ~240s
+== 400-out
+[15:23:05] c1
+  c  rows  exact  agg tok/s  per-req  x c=1  wall s  sha
+  1     2   True      25.75    25.75  1.00x    15.5  c6b99cdf91ac
+[15:23:30] CONCURRENT GATES DONE
+== 1000-out
+[15:23:30] c4
+  c  rows  exact  agg tok/s  per-req  x c=1  wall s  sha
+  4     8   True      48.38    12.28  1.00x    82.7  eaac08ac6db8
+[15:25:14] CONCURRENT GATES DONE
+port 8000 free after ~1s
+[15:25:14] ALL DONE

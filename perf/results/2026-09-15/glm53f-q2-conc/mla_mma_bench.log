@@ -1,0 +1,4 @@
+R= 2 cfg0  0.291 ms err 2.4e-04 | cfg3  0.269 ms err 6.1e-05 | cfg5  0.457 ms err 2.4e-04 | cfg6  0.277 ms err 2.4e-04
+R= 8 cfg0  1.075 ms err 1.2e-04 | cfg3  0.819 ms err 1.2e-04 | cfg5  0.745 ms err 2.4e-04 | cfg6  0.353 ms err 2.4e-04
+R=16 cfg0  2.052 ms err 2.4e-04 | cfg3  1.555 ms err 2.4e-04 | cfg5  1.346 ms err 2.4e-04 | cfg6  0.606 ms err 2.4e-04
+R=32 cfg0  3.945 ms err 2.4e-04 | cfg3  3.068 ms err 2.4e-04 | cfg5  2.581 ms err 2.4e-04 | cfg6  1.114 ms err 2.4e-04

@@ -24,6 +24,7 @@ from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
+from vllm.v1.worker.metal_phaseprof import phase as _qc_phase
 
 from . import ops
 from .params import (
@@ -45,6 +46,27 @@ def _moe_vec_row_limit(default: int, env: str, cuda_default: int = 64) -> int:
     if not current_platform.is_rocm():
         return cuda_default
     return default
+
+
+_MOE_GROUP: tuple[int, int] | None = None
+
+
+def _moe_group_nb(slots: int) -> int:
+    """Expert-grouped slot pairing for the Metal iq2_xxs w13 GEMV
+    (2026-09-17): VLLM_QC_MOE_GROUP_NB=2 pairs co-routed slots per expert
+    (bit-identical per slot) from VLLM_QC_MOE_GROUP_MIN_SLOTS slots up
+    (default 64: below that there is nothing to share and the pairing
+    dispatch is pure cost)."""
+    global _MOE_GROUP
+    if _MOE_GROUP is None:
+        try:
+            nb = int(os.environ.get("VLLM_QC_MOE_GROUP_NB", "0") or 0)
+            min_slots = int(os.environ.get("VLLM_QC_MOE_GROUP_MIN_SLOTS", "64") or 64)
+        except ValueError:
+            nb, min_slots = 0, 64
+        _MOE_GROUP = (nb, min_slots)
+    nb, min_slots = _MOE_GROUP
+    return nb if slots >= min_slots else 0
 
 
 def _qc_mm_min_tokens() -> int:
@@ -245,6 +267,175 @@ def _use_quixi_weighted_sum(
     return quixicore_ops.is_available()
 
 
+
+# Metal shared||routed expert overlap (W24a, opt-in per profile through
+# VLLM_METAL_MOE_OVERLAP=1 in the glm53f-q2-1 env block). The routed iq2_xxs
+# w13 kernel is ALU-bound with its memory pipe ~30% used (W15/W20 counters)
+# while the shared expert's two q8_0 GEMVs are bandwidth-bound, so the pair
+# overlaps: one MTLDispatchTypeConcurrent region encodes
+#   shexp gate|up pair-SwiGLU  ||  routed w13 (+SwiGLU)
+#   -- barrier (down reads the pair output) --
+#   shexp down
+#   -- barrier (the sum reads w13's rows and the shexp output) --
+#   routed w2 q2_K sum, accumulated into the shexp output (the existing fold)
+# Every kernel and every rounding point is the serial path's; only the
+# encoder changes, so the result is bit-identical. Other GGUF MoE profiles
+# never see it: the flag is read once and the runner keeps its NO_OVERLAP
+# shared-expert call unless the flag is set.
+_METAL_MOE_OVERLAP: bool | None = None
+
+
+def _metal_moe_overlap() -> bool:
+    global _METAL_MOE_OVERLAP
+    if _METAL_MOE_OVERLAP is None:
+        _METAL_MOE_OVERLAP = False
+        if (
+            current_platform.is_metal()
+            and os.environ.get("VLLM_METAL_MOE_OVERLAP", "0") == "1"
+        ):
+            try:
+                from vllm.quixicore import quixicore_ops
+
+                _METAL_MOE_OVERLAP = quixicore_ops.is_available() and (
+                    not quixicore_ops.concurrent_active()
+                )
+            except Exception:
+                _METAL_MOE_OVERLAP = False
+    return _METAL_MOE_OVERLAP
+
+
+def _metal_overlap_prep(
+    layer,
+    x: torch.Tensor,
+    shared_experts,
+    shared_experts_input: torch.Tensor | None,
+    moe_config,
+    topk_weights: torch.Tensor | None = None,
+    topk_ids: torch.Tensor | None = None,
+):
+    """Eligibility of a decode-width GLM MoE layer (iq2_xxs w13, q2_K w2,
+    q8_0 shared expert) for the concurrent region; returns the prepared
+    operands or None. With topk_* None only the static checks run (the
+    runner asks before the router has produced them)."""
+    if shared_experts_input is None or shared_experts_input is not x:
+        return None
+    if not getattr(shared_experts, "accumulate_ok", False):
+        return None
+    if x.dim() != 2 or not (1 <= x.shape[0] <= 4) or not x.is_contiguous():
+        return None
+    if x.dtype not in (torch.float16, torch.bfloat16):
+        return None
+    w1, w2 = layer.w13_qweight, layer.w2_qweight
+    qt1 = layer.w13_qweight_type.weight_type
+    qt2 = layer.w2_qweight_type.weight_type
+    if qt1 != 16 or qt2 != 10:  # IQ2_XXS w13, Q2_K w2
+        return None
+    if layer.global_to_local_expert_map is not None:
+        return None
+    if getattr(layer, "_dsv4_w1_repacked", False):
+        return None
+    if MoEActivation.from_str(layer.activation.value) != MoEActivation.SILU:
+        return None
+    if (
+        moe_config.activation_situ_beta is not None
+        or moe_config.activation_situ_linear_beta is not None
+    ):
+        return None
+    top_k = layer.top_k if topk_ids is None else topk_ids.shape[1]
+    if top_k > 8 or not _metal_q2k_sum_rows_supported(w2.shape[1], x.dtype):
+        return None
+    if topk_ids is not None and (
+        topk_ids.dtype != torch.int32 or not topk_ids.is_contiguous()
+    ):
+        return None
+    if topk_weights is not None and (
+        topk_weights.dtype != torch.float32 or not topk_weights.is_contiguous()
+    ):
+        return None
+    mlp = shared_experts._layer
+    from vllm.model_executor.models.deepseek_v2 import _metal_pair_qweight
+
+    pair_q = _metal_pair_qweight(mlp, x)
+    if pair_q is None:
+        return None
+    down = mlp.down_proj
+    down_q = getattr(down, "qweight", None)
+    down_t = getattr(down, "qweight_type", None)
+    if (
+        down_q is None
+        or down_t is None
+        or getattr(down_t, "weight_type", None) != 8
+        or getattr(down_q, "shard_id", None)
+        or getattr(down, "bias", None) is not None
+        or down_q.shape[1] != (pair_q.shape[0] // 2 // 32) * 34
+        or down_q.shape[0] != x.shape[1]
+    ):
+        return None
+    return (w1, w2, qt1, qt2, top_k, pair_q, down_q, mlp)
+
+
+def _metal_overlap_moe(
+    layer,
+    x: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    shared_experts,
+    shared_experts_input: torch.Tensor | None,
+    moe_config,
+) -> torch.Tensor | None:
+    """Decode-width GLM MoE layer (iq2_xxs w13, q2_K w2, q8_0 shared expert)
+    as one concurrent region; returns the folded shared+routed output (the
+    shared-expert output tensor itself, stored on `shared_experts`), or
+    None when the shape/quant does not qualify (the caller then runs the
+    serial path). A region the runner opened around the router (W26b) is
+    joined and closed here; on an ineligible call it is closed first so
+    the serial torch path never runs inside it."""
+    from vllm.quixicore import quixicore_ops as qc
+
+    prep = _metal_overlap_prep(
+        layer, x, shared_experts, shared_experts_input, moe_config,
+        topk_weights, topk_ids,
+    )
+    if prep is None:
+        if qc.concurrent_active():
+            qc.concurrent_end()
+        return None
+    w1, w2, qt1, qt2, top_k, pair_q, down_q, mlp = prep
+    num_tokens = x.shape[0]
+    limit = getattr(mlp.act_fn, "swiglu_limit", None)
+    E, N, _ = w1.shape
+    metal_soa2 = bool(getattr(layer, "_dsv4_w2_repacked", False))
+    logger.info_once(
+        "quixicore(metal): MoE shared expert dispatched concurrently with "
+        "the routed w13 kernel (one region per layer)"
+    )
+    if not qc.concurrent_active():
+        qc.concurrent_begin()
+    try:
+        act = qc.ggml_mul_mat_vec_a8_pair_swiglu(pair_q, x, pair_q.shape[0], limit)
+        mid = ops.ggml_moe_a8_vec_swiglu(
+            x, w1, topk_ids, top_k, qt1, N, num_tokens, clamp_limit=layer.swiglu_limit
+        )
+        shared_out = ops.ggml_mul_mat_vec_a8(down_q, act, 8, down_q.shape[0])
+        ops.ggml_moe_a8_vec_sum(
+            mid,
+            w2,
+            topk_ids,
+            topk_weights,
+            top_k,
+            qt2,
+            w2.shape[1],
+            num_tokens,
+            shared_out,
+            soa=metal_soa2,
+            accumulate=True,
+        )
+    finally:
+        qc.concurrent_end()
+    shared_experts._output[shared_experts._output_idx] = shared_out
+    return shared_out
+
+
 def _fused_moe_gguf(
     x: torch.Tensor,
     w1: torch.Tensor,
@@ -262,6 +453,7 @@ def _fused_moe_gguf(
     w2_repacked: bool = False,
     quant_input: torch.Tensor | None = None,
     defer_down: bool = False,
+    accumulate_into: torch.Tensor | None = None,
 ) -> torch.Tensor:
     activation_enum = MoEActivation.from_str(activation)
 
@@ -678,12 +870,17 @@ def _fused_moe_gguf(
         # ggml_moe_mm_id contract: every routed id must be >= 0 (its output
         # rows for dropped ids would be stale pooled memory). Negative ids
         # only arise via expert_map, so both mm routes require it be None.
+        # The tile kernels stage fp16 operands (simdgroup half MMA); bf16
+        # activations (GLM-5.3-Flash runs bf16) are cast once per call, the
+        # same fp16 staging llama.cpp's mul_mm applies at prefill widths.
+        # Before this, GLM prefill silently fell through to the per-slot
+        # decode GEMVs (measured 6x the tile time at 2500 tokens).
         use_mm_w1 = (
             current_platform.is_metal()
             and qweight_type == 16  # IQ2_XXS
             and expert_map is None
-            and x.dtype == torch.float16
-            and w1.shape[0] <= 256
+            and x.dtype in (torch.float16, torch.bfloat16)
+            and w1.shape[0] <= 512  # QC_MOE_MAP0_MAX_E (DSV4 256, GLM-5.3-Flash 288)
             and top_k in (2, 4, 6, 8)
             and x.shape[1] % 256 == 0
             and N % 64 == 0
@@ -694,26 +891,29 @@ def _fused_moe_gguf(
             logger.info_once(
                 "quixicore(metal): tiled MoE prefill GEMM active (w13 + w2)"
             )
-            out = ops.ggml_moe_mm_id(
-                x,
-                w1,
-                local_topk_ids,
-                top_k,
-                qweight_type,
-                N,
-                num_tokens,
-            )
+            with _qc_phase("moe_mm_w13"):
+                out = ops.ggml_moe_mm_id(
+                    x if x.dtype == torch.float16 else x.to(torch.float16),
+                    w1,
+                    local_topk_ids,
+                    top_k,
+                    qweight_type,
+                    N,
+                    num_tokens,
+                )
         elif w1_vec and use_fused_act:
-            out = ops.ggml_moe_a8_vec_swiglu(
-                x,
-                w1,
-                local_topk_ids,
-                top_k,
-                qweight_type,
-                N,
-                num_tokens,
-                clamp_limit=swiglu_limit,
-            )
+            with _qc_phase("moe_w13"):
+                out = ops.ggml_moe_a8_vec_swiglu(
+                    x,
+                    w1,
+                    local_topk_ids,
+                    top_k,
+                    qweight_type,
+                    N,
+                    num_tokens,
+                    clamp_limit=swiglu_limit,
+                    group_nb=_moe_group_nb(num_tokens * top_k),
+                )
         elif w1_vec:
             out = ops.ggml_moe_a8_vec(
                 x,
@@ -753,32 +953,42 @@ def _fused_moe_gguf(
             and qweight_type2 == 10  # Q2_K
             and expert_map is None
             and out.dtype == torch.float16
-            and w2.shape[0] <= 256
+            and w2.shape[0] <= 512  # QC_MOE_MAP0_MAX_E (DSV4 256, GLM-5.3-Flash 288)
             and top_k in (2, 4, 6, 8)
             and out.shape[1] % 256 == 0
             and w2.shape[1] % 64 == 0
             and out_hidden_states.is_contiguous()
-            and out_hidden_states.dtype == out.dtype
+            and out_hidden_states.dtype in (out.dtype, torch.bfloat16)
             and out_hidden_states.shape == (num_tokens, w2.shape[1])
             and num_tokens >= _qc_mm_min_tokens()
         )
         if use_mm_w2:
-            slots = ops.ggml_moe_mm_id(
-                out,
-                w2,
-                local_topk_ids,
-                top_k,
-                qweight_type2,
-                w2.shape[1],
-                num_tokens,
-                soa=metal_soa2,
-            )
+            with _qc_phase("moe_mm_w2"):
+                slots = ops.ggml_moe_mm_id(
+                    out,
+                    w2,
+                    local_topk_ids,
+                    top_k,
+                    qweight_type2,
+                    w2.shape[1],
+                    num_tokens,
+                    soa=metal_soa2,
+                )
             slots = slots.reshape(num_tokens, top_k, w2.shape[1])
+            # bf16 model over the fp16 tiles: reduce in the tile dtype, then
+            # one cast into the bf16 output (tokens x hidden, negligible).
+            reduce_out = (
+                out_hidden_states
+                if out_hidden_states.dtype == slots.dtype
+                else torch.empty_like(out_hidden_states, dtype=slots.dtype)
+            )
             if not _metal_weighted_sum(
-                slots, topk_weights.contiguous(), out_hidden_states
+                slots, topk_weights.contiguous(), reduce_out
             ):
                 reduced = (slots.float() * topk_weights.unsqueeze(-1)).sum(dim=1)
-                out_hidden_states.copy_(reduced.to(out_hidden_states.dtype))
+                reduce_out.copy_(reduced.to(reduce_out.dtype))
+            if reduce_out is not out_hidden_states:
+                out_hidden_states.copy_(reduce_out)
             return out_hidden_states
         # Metal q2_K decode: fold the down GEMV, the (tokens, topk, N)
         # intermediate, and the weighted expert-slot sum into one kernel
@@ -796,19 +1006,33 @@ def _fused_moe_gguf(
             and _metal_q2k_sum_rows_supported(w2.shape[1], out.dtype)
         )
         if use_sum6:
-            ops.ggml_moe_a8_vec_sum(
-                out,
-                w2,
-                local_topk_ids,
-                topk_weights.contiguous(),
-                top_k,
-                qweight_type2,
-                w2.shape[1],
-                num_tokens,
-                out_hidden_states,
-                soa=metal_soa2,
+            # accumulate_into (the shared-expert output, same shape/dtype):
+            # the kernel adds T(sum) into it with the unfused bf16 add's
+            # rounding, so the runner's `shared + routed` launch is folded.
+            # The caller detects the fold by identity (result is the
+            # accumulate target).
+            accumulate = (
+                accumulate_into is not None
+                and accumulate_into.shape == out_hidden_states.shape
+                and accumulate_into.dtype == out_hidden_states.dtype
+                and accumulate_into.is_contiguous()
             )
-            return out_hidden_states
+            target = accumulate_into if accumulate else out_hidden_states
+            with _qc_phase("moe_w2sum"):
+                ops.ggml_moe_a8_vec_sum(
+                    out,
+                    w2,
+                    local_topk_ids,
+                    topk_weights.contiguous(),
+                    top_k,
+                    qweight_type2,
+                    w2.shape[1],
+                    num_tokens,
+                    target,
+                    soa=metal_soa2,
+                    accumulate=accumulate,
+                )
+            return target
         if w2_vec:
             out = ops.ggml_moe_a8_vec(
                 out,
@@ -906,8 +1130,10 @@ def _fused_moe_gguf_fake(
     w2_repacked: bool = False,
     quant_input: torch.Tensor | None = None,
     defer_down: bool = False,
+    accumulate_into: torch.Tensor | None = None,
 ) -> torch.Tensor:
     del (
+        accumulate_into,
         w1,
         w2,
         topk_weights,
@@ -948,6 +1174,14 @@ class GGUFMoEMethod(FusedMoEMethodBase):
     ):
         super().__init__(moe)
         self.quant_config = quant_config
+
+    @property
+    def mk_can_overlap_shared_experts(self) -> bool:
+        # Metal opt-in (W24a): `_apply` dispatches the shared experts inside
+        # its concurrent region, so the runner must not run them first.
+        if _metal_moe_overlap():
+            return True
+        return super().mk_can_overlap_shared_experts
 
     def create_weights(
         self,
@@ -1124,6 +1358,27 @@ class GGUFMoEMethod(FusedMoEMethodBase):
             replace_parameter(layer, "w2_qweight", repacked_w2, prefer_copy=True)
             layer._dsv4_w2_repacked = True
 
+    def metal_region_ok(
+        self,
+        layer: RoutedExperts,
+        x: torch.Tensor,
+        shared_experts,
+        shared_experts_input: torch.Tensor | None,
+    ) -> bool:
+        """Whether this call will take the concurrent shared||routed region
+        (W24a), so the runner may open that region already around the Metal
+        router kernel (W26b) - the ops in between are quixicore-only."""
+        return (
+            _metal_moe_overlap()
+            and shared_experts is not None
+            and shared_experts.peek_output() is None
+            and not layer.apply_router_weight_on_input
+            and _metal_overlap_prep(
+                layer, x, shared_experts, shared_experts_input, self.moe
+            )
+            is not None
+        )
+
     def apply(
         self,
         layer: RoutedExperts,
@@ -1173,15 +1428,58 @@ class GGUFMoEMethod(FusedMoEMethodBase):
         shared_experts,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
-        del shared_experts, shared_experts_input
         if layer.apply_router_weight_on_input:
             raise NotImplementedError(
                 "Apply router weight on input is not supported for"
                 "fused GGUF MoE method."
             )
+        if (
+            _metal_moe_overlap()
+            and shared_experts is not None
+            and shared_experts.peek_output() is None
+        ):
+            # The runner skipped its NO_OVERLAP shared-expert call (the
+            # method claims the overlap); dispatch them here, concurrently
+            # with the routed w13 kernel when the layer qualifies, else
+            # serially as before.
+            fused = _metal_overlap_moe(
+                layer, x, topk_weights, topk_ids, shared_experts,
+                shared_experts_input, self.moe,
+            )
+            if fused is not None:
+                return fused
+            assert shared_experts_input is not None
+            shared_experts._output[shared_experts._output_idx] = (
+                shared_experts._layer(shared_experts_input)
+            )
+        del shared_experts_input
 
         from . import fused_moe_gguf as fused_moe_gguf_op
 
+        # Metal: the runner computes the shared experts first (NO_OVERLAP
+        # order); hand their output to the q2_K sum kernel so the routed
+        # result accumulates into it. Fold detection is by identity in
+        # FusedMoE.forward (the returned tensor *is* shared_experts.output).
+        # Opt-in per profile (VLLM_METAL_MOE_FOLD=1, the glm53f-q2-1 env
+        # block): other GGUF MoE profiles keep the unfused add they were
+        # gated with.
+        accumulate_into = None
+        if (
+            current_platform.is_metal()
+            and os.environ.get("VLLM_METAL_MOE_FOLD", "0") == "1"
+            and shared_experts is not None
+            and getattr(shared_experts, "accumulate_ok", False)
+        ):
+            accumulate_into = shared_experts.peek_output()
+            if accumulate_into is not None and (
+                accumulate_into.shape != x.shape or accumulate_into.dtype != x.dtype
+            ):
+                accumulate_into = None
+            if accumulate_into is not None:
+                logger.info_once(
+                    "quixicore(metal): MoE shared-expert add folded into the "
+                    "q2_K sum kernel epilogue"
+                )
         return fused_moe_gguf_op(
             x,
             layer.w13_qweight,
@@ -1199,4 +1497,5 @@ class GGUFMoEMethod(FusedMoEMethodBase):
             getattr(layer, "_dsv4_w2_repacked", False),
             quant_input,
             getattr(layer, "_dsv4_defer_down", False),
+            accumulate_into,
         )

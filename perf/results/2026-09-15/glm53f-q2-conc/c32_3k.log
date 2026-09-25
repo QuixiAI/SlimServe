@@ -1,0 +1,16 @@
+env VLLM_QC_MOE_MM_MIN_TOKENS = 96
+launched pid 30647 sid-detached; log /Users/seangherardi/Code/slimserve/SlimServe-glm53f/perf/results/2026-09-15/glm53f-q2-conc/c32_3k/boot.log
+READY ~182s
+== 400-out
+[21:52:04] c1
+  c  rows  exact  agg tok/s  per-req  x c=1  wall s  sha
+  1     2   True      25.70    25.71  1.00x    15.6  c6b99cdf91ac
+[21:52:29] CONCURRENT GATES DONE
+== 3000-out
+[21:52:29] c16
+[22:04:00] c32
+/Users/seangherardi/Code/slimserve/SlimServe-glm53f/perf/results/2026-09-15/glm53f-q2-conc/concurrent_gate.sh: line 28: 31345 Terminated: 15          $H --concurrency "$c" --input-tokens 1000 --output-tokens "${OUT_TOKENS:-400}" --prompt-offset 1 > "$OUT/$name.json" 2> "$OUT/$name.err"
+  c  rows  exact  agg tok/s  per-req  x c=1  wall s  sha
+ 16    32   True      77.39     4.86  1.00x   620.2  a91d4e209e97
+ 32  (no json - see c32.err)
+[22:28:37] CONCURRENT GATES DONE

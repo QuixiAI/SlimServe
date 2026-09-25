@@ -15,6 +15,7 @@ from torch import nn
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -27,7 +28,7 @@ from .deepseek_mtp import (
     SharedHead,
 )
 from .deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV2MoE
-from .glm5_next import Glm5NextMLAAttention
+from .glm5_next import Glm5NextMLAAttention, glm5_next_device
 from .utils import get_spec_layer_idx_from_weight_name, maybe_prefix
 
 
@@ -35,6 +36,9 @@ def _draft_config(vllm_config):
     # The proposer passes the target VllmConfig to the draft constructor;
     # model_config= at the loader selects the class, not this config field.
     return vllm_config.speculative_config.draft_model_config.hf_config
+
+
+logger = init_logger(__name__)
 
 
 class Glm5NextMTPBlock(DeepseekV2DecoderLayer):
@@ -78,7 +82,13 @@ class Glm5NextMTPLayer(DeepSeekMultiTokenPredictorLayer):
         self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.eh_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
         self.shared_head = SharedHead(config, prefix, vllm_config.quant_config)
-        self.mtp_block = Glm5NextMTPBlock(vllm_config, prefix, topk_indices_buffer)
+        # The block's module prefix carries `.mtp_block` like its attribute
+        # path: the GGUF adapter spells its unquantized-module list
+        # (kv_b_proj, the BF16 indexer linears) as `.layers.L.mtp_block.…`,
+        # and the quant config matches those against this prefix.
+        self.mtp_block = Glm5NextMTPBlock(
+            vllm_config, f"{prefix}.mtp_block", topk_indices_buffer
+        )
 
 
 class Glm5NextMultiTokenPredictor(DeepSeekMultiTokenPredictor):
@@ -96,7 +106,7 @@ class Glm5NextMultiTokenPredictor(DeepSeekMultiTokenPredictor):
             vllm_config.scheduler_config.max_num_batched_tokens,
             width,
             dtype=torch.int32,
-            device=torch.cuda.current_device(),
+            device=glm5_next_device(),
         )
         idx = self.mtp_start_layer_idx
         self.layers = nn.ModuleDict(
@@ -148,5 +158,24 @@ class Glm5NextMTP(DeepSeekMTP):
                 else:
                     yield name, weight
 
-        loaded = super().load_weights(normalized_weights())
-        return loaded | loaded_indexer
+        try:
+            loaded = super().load_weights(normalized_weights())
+        except KeyError as err:
+            have = sorted(k for k in params if ".self_attn." in k)
+            raise KeyError(
+                f"{err.args[0]} not in the MTP draft; self_attn params: {have}"
+            ) from err
+        result = loaded | loaded_indexer
+        # A draft whose parameters silently keep their init values is a
+        # weaker drafter, not a crash: report the coverage every boot.
+        missing = sorted(set(params) - result)
+        if missing:
+            logger.warning(
+                "glm5-next MTP draft: %d of %d parameters NOT loaded: %s",
+                len(missing), len(params), missing[:48],
+            )
+        else:
+            logger.info(
+                "glm5-next MTP draft: all %d parameters loaded", len(params)
+            )
+        return result

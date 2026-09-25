@@ -1,0 +1,27 @@
+env VLLM_QC_PHASE_PROF = 1
+env VLLM_METAL_MOE_OVERLAP = 0
+env VLLM_METAL_SHARD_OVERLAP = 0
+env VLLM_METAL_MOE_ROUTER_OVERLAP = 0
+launched pid 23964 sid-detached; log /Users/seangherardi/Code/slimserve/SlimServe-glm53f/perf/results/2026-09-15/glm53f-q2-conc/phase_c16_b6/boot.log
+READY ~216s
+dumps: 
+[19:05:08] c1
+  c  rows  exact  agg tok/s  per-req  x c=1  wall s  sha
+  1     2   True       6.85     6.85  1.00x    58.4  c6b99cdf91ac
+[19:06:17] CONCURRENT GATES DONE
+cp: /phaseprof_*.txt: No such file or directory
+[19:06:20] c16
+  c  rows  exact  agg tok/s  per-req  x c=1  wall s  sha
+ 16    32   True      41.70     2.67  1.00x   383.7  797078326f4b
+[19:14:04] CONCURRENT GATES DONE
+cp: /phaseprof_*.txt: No such file or directory
+port 8000 free after ~1s
+Traceback (most recent call last):
+  File "/Users/seangherardi/Code/slimserve/SlimServe-glm53f/perf/results/2026-09-15/glm53f-q2-conc/phase_diff.py", line 18, in <module>
+    a = load(sys.argv[1])
+        ^^^^^^^^^^^^^^^^^
+  File "/Users/seangherardi/Code/slimserve/SlimServe-glm53f/perf/results/2026-09-15/glm53f-q2-conc/phase_diff.py", line 10, in load
+    for line in open(path):
+                ^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: '/Users/seangherardi/Code/slimserve/SlimServe-glm53f/perf/results/2026-09-15/glm53f-q2-conc/phase_c16_b6/phase_base.txt'
+[19:14:07] PHASE DONE

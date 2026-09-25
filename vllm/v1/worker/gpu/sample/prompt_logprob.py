@@ -198,6 +198,25 @@ def get_prompt_logprobs_token_ids(
         )
         return token_ids
 
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_cuda_alike():
+        # No Triton on Metal/CPU: gather the shifted target ids in torch.
+        # prompt_logprobs is a diagnostic path (oracle comparisons), so a
+        # per-request loop over the batch is acceptable here.
+        qsl = query_start_loc.tolist()
+        idx = idx_mapping.tolist()
+        for b in range(num_reqs):
+            r = idx[b]
+            qs, qe = qsl[b], qsl[b + 1]
+            if qe <= qs:
+                continue
+            start = int(num_computed_tokens[r].item()) + 1
+            token_ids[qs:qe] = all_token_ids[r, start : start + (qe - qs)].to(
+                token_ids.dtype
+            )
+        return token_ids
+
     _prompt_logprobs_token_ids_kernel[(num_reqs,)](
         token_ids,
         query_start_loc,

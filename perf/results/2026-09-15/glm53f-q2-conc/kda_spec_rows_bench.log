@@ -1,0 +1,5 @@
+rows=1   490.0 us    411 GB/s (state read + 2 ckpt writes)  bit-identical=True
+rows=2   404.6 us    498 GB/s (state read + 2 ckpt writes)  bit-identical=False
+rows=4   407.3 us    494 GB/s (state read + 2 ckpt writes)  bit-identical=False
+rows=8   414.4 us    486 GB/s (state read + 2 ckpt writes)  bit-identical=False
+rows=1   435.2 us    463 GB/s (state read + 2 ckpt writes)  bit-identical=False

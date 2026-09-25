@@ -28,6 +28,8 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+
+
 @cache
 def _qc():
     import vllm._quixicore_C as qc
@@ -49,6 +51,22 @@ def _qc():
 
     return qc
 
+
+
+_TENSOR_QGEMM: bool | None = None
+
+
+def _has_tensor_qgemm() -> bool:
+    """The M5 tensor-ops K-quant GEMM family (qgemm_sm_t*) exists in the
+    loaded metallib. False on a metal3.1 build (macOS 15 / pre-M5 GPUs),
+    where the selectors fall back to the paired-plane simdgroup kernels."""
+    global _TENSOR_QGEMM
+    if _TENSOR_QGEMM is None:
+        try:
+            _TENSOR_QGEMM = bool(_qc().has_tensor_qgemm())
+        except (ImportError, AttributeError):
+            _TENSOR_QGEMM = False
+    return _TENSOR_QGEMM
 
 class quixicore_ops:
     @staticmethod
@@ -161,6 +179,136 @@ class quixicore_ops:
         )
 
     @staticmethod
+    def moe_router_topk(
+        gating_output: torch.Tensor,
+        bias: torch.Tensor | None,
+        topk: int,
+        renormalize: bool,
+        softmax: bool,
+        scale: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Single-group MoE router: (weights fp32 [T, K], ids int32 [T, K])."""
+        return _qc().moe_router_topk(
+            gating_output, bias, int(topk), bool(renormalize), bool(softmax),
+            float(scale),
+        )
+
+    @staticmethod
+    def glm5_indexer_pool_logits(
+        q: torch.Tensor,
+        w: torch.Tensor,
+        ape: torch.Tensor,
+        cache: torch.Tensor,
+        block_table: torch.Tensor,
+        row_req: torch.Tensor,
+        visible: torch.Tensor,
+        max_pools: int,
+        block_size: int,
+        softmax_scale: float,
+    ) -> torch.Tensor:
+        """Pooled indexer logits [R, max_pools] fp32 over the paged
+        [k | gate] cache (-inf past each row's visible pools)."""
+        return _qc().glm5_indexer_pool_logits(
+            q, w, ape, cache, block_table, row_req, visible, int(max_pools),
+            int(block_size), float(softmax_scale),
+        )
+
+    @staticmethod
+    def glm5_indexer_expand_topk(
+        sel: torch.Tensor,
+        visible: torch.Tensor,
+        out: torch.Tensor,
+        kp: int,
+        tlen: torch.Tensor | None = None,
+    ) -> None:
+        """Expand selected pools to token indices (+ tail) into out; with
+        ``tlen`` [R] int32 also write each row's valid prefix length."""
+        _qc().glm5_indexer_expand_topk(sel, visible, out, int(kp), tlen)
+
+    @staticmethod
+    def glm5_indexer_expand_identity(
+        visible: torch.Tensor,
+        out: torch.Tensor,
+        kp: int,
+        ksel: int,
+        tlen: torch.Tensor | None = None,
+    ) -> None:
+        """Identity pooled selection (context below the selection limit):
+        expand every pool of every row to token indices (+ tail) into out
+        without computing logits or a top-k; `tlen` as for expand_topk."""
+        _qc().glm5_indexer_expand_identity(visible, out, int(kp), int(ksel), tlen)
+
+    @staticmethod
+    def paged_row_insert(
+        rows: torch.Tensor, cache: torch.Tensor, slot_mapping: torch.Tensor
+    ) -> None:
+        """cache[slot // BS, slot % BS] = rows[t]; PAD slots (< 0) hit the
+        null block 0 row 0. `slot_mapping` may be int32 or int64."""
+        _qc().paged_row_insert(rows, cache, slot_mapping)
+
+    @staticmethod
+    def glm5_indexer_pack(
+        fused: torch.Tensor,
+        norm_w: torch.Tensor,
+        norm_b: torch.Tensor,
+        packed: torch.Tensor,
+        weights: torch.Tensor,
+        head_dim: int,
+        eps: float,
+        scale: float,
+    ) -> None:
+        """Indexer decode glue after one fused [k | gate | weights] linear:
+        packed[:, :D] = LayerNorm(k) (fp32 stats, rounded once), packed[:,
+        D:] = gate, weights = float(w) * scale."""
+        _qc().glm5_indexer_pack(
+            fused, norm_w, norm_b, packed, weights, head_dim, eps, scale
+        )
+
+    @staticmethod
+    def kv_meta_prepare(
+        idx_mapping: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        positions: torch.Tensor,
+        params: torch.Tensor,
+        slot_mappings: torch.Tensor,
+        block_tables: list[torch.Tensor],
+        input_block_tables: list[torch.Tensor],
+        num_reqs: int,
+        num_reqs_padded: int,
+        num_tokens: int,
+        num_tokens_padded: int,
+    ) -> None:
+        """One launch: gather every KV group's batch block table
+        (input_block_tables[g][:num_reqs_padded], padded rows zeroed) and
+        compute every group's slot mapping (slot_mappings[:,
+        :num_tokens_padded], PAD past num_tokens). `params` is int32
+        [groups, 8]: src stride, dst stride, columns, kernel block size,
+        slot-mapping enabled."""
+        _qc().kv_meta_prepare(
+            idx_mapping,
+            query_start_loc,
+            positions,
+            params,
+            slot_mappings,
+            block_tables,
+            input_block_tables,
+            num_reqs,
+            num_reqs_padded,
+            num_tokens,
+            num_tokens_padded,
+        )
+
+    @staticmethod
+    def mamba_last_blocks(
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        out: torch.Tensor,
+        block_size: int,
+    ) -> None:
+        """out[r, j] = block_table[r, max((seq_lens[r] - 1) // bs, 0) + j]."""
+        _qc().mamba_last_blocks(block_table, seq_lens, out, block_size)
+
+    @staticmethod
     def dsv4_mhc_post(
         x: torch.Tensor,
         residual: torch.Tensor,
@@ -213,6 +361,20 @@ class quixicore_ops:
         (normed, summed_residual), matching ir.ops.fused_add_rms_norm with
         weight = float(w) + 1 to reduction-order ulps."""
         return _qc().gemma_add_rms_norm(x, residual, weight, epsilon)
+
+    @staticmethod
+    def rms_norm_dual(
+        x: torch.Tensor,
+        d0: int,
+        w0: torch.Tensor,
+        d1: int,
+        w1: torch.Tensor,
+        epsilon: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """RMS norm of two packed column segments [0, d0) and [d0, d0 + d1)
+        of one row-strided fp16/bf16 input with fp32 weights, one dispatch;
+        per segment bit-exact to rms_norm (Metal)."""
+        return _qc().rms_norm_dual(x, int(d0), w0, int(d1), w1, float(epsilon))
 
     @staticmethod
     def rms_norm(x: torch.Tensor, weight: torch.Tensor, epsilon: float) -> torch.Tensor:
@@ -824,6 +986,11 @@ class quixicore_ops:
         )
 
     @staticmethod
+    def has_kernel(name: str) -> bool:
+        """Whether the loaded metallib exposes the named kernel."""
+        return bool(_qc().has_kernel(name))
+
+    @staticmethod
     def has(name: str) -> bool:
         """Whether the compiled extension exposes `name`."""
         try:
@@ -952,10 +1119,73 @@ class quixicore_ops:
 
     @staticmethod
     def ggml_mul_mat_vec_a8(
-        w: torch.Tensor, x: torch.Tensor, quant_type: int, row: int
+        w: torch.Tensor,
+        x: torch.Tensor,
+        quant_type: int,
+        row: int,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Weight-only GEMV, one output row per simdgroup."""
-        return _qc().ggml_mul_mat_vec_a8(w, x, quant_type, row)
+        """Weight-only GEMV, one output row per simdgroup. `out` ([batch,
+        row], unit column stride, e.g. a column slice of a wider tensor)
+        receives the result in place; a strided target at batch > 1 is
+        filled by a copy from the ring output."""
+        return _qc().ggml_mul_mat_vec_a8(w, x, quant_type, row, out)
+
+    @staticmethod
+    def ggml_mul_mat_vec_a8_dual(
+        w0: torch.Tensor,
+        x0: torch.Tensor,
+        w1: torch.Tensor,
+        x1: torch.Tensor,
+        quant_type: int,
+        row0: int,
+        row1: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Two independent q8_0 GEMVs (same K, 1 <= M <= 4) in one dispatch;
+        each result is bit-identical to ggml_mul_mat_vec_a8 on its problem."""
+        d0, d1 = _qc().ggml_mul_mat_vec_a8_dual(w0, x0, w1, x1, quant_type, row0, row1)
+        return d0, d1
+
+    @staticmethod
+    def concurrent_begin() -> None:
+        """Open a concurrent-dispatch region: the quixicore ops encoded until
+        concurrent_end() share one MTLDispatchTypeConcurrent encoder and
+        overlap on the GPU unless their buffers conflict (a memory barrier
+        is inserted automatically on a read-after-write / write-after-
+        read-or-write conflict). NO torch op may run inside the region."""
+        _qc().qc_concurrent_begin()
+
+    @staticmethod
+    def concurrent_barrier() -> None:
+        """Explicit barrier inside the open region (closes a level)."""
+        _qc().qc_concurrent_barrier()
+
+    @staticmethod
+    def concurrent_end() -> None:
+        _qc().qc_concurrent_end()
+
+    @staticmethod
+    def concurrent_active() -> bool:
+        return bool(_qc().qc_concurrent_active())
+
+    @staticmethod
+    def concurrent_stats() -> tuple[int, int, int]:
+        """(regions opened, dispatches encoded inside regions, barriers)."""
+        r = _qc().qc_concurrent_stats()
+        return int(r[0]), int(r[1]), int(r[2])
+
+    @staticmethod
+    def ggml_mul_mat_vec_a8_pair_swiglu(
+        w: torch.Tensor,
+        x: torch.Tensor,
+        row: int,
+        clamp_limit: float | None = None,
+    ) -> torch.Tensor:
+        """q8_0 gate|up GEMV with the SwiGLU epilogue fused: `w` is the
+        merged gate|up weight (`row` rows: gate first, then up), `x` (M, K)
+        with 1 <= M <= 4. Returns (M, row // 2) = silu(clamp(gate)) *
+        clamp(up), bit-identical to qc_swiglu over the q8_0 NR GEMV."""
+        return _qc().ggml_mul_mat_vec_a8_pair_swiglu(w, x, row, clamp_limit)
 
     @staticmethod
     def fp8ch_mul_mat_vec(
@@ -1010,11 +1240,13 @@ class quixicore_ops:
         row: int,
         tokens: int,
         clamp_limit: float | None = None,
+        group_nb: int = 0,
     ) -> torch.Tensor:
         """iq2_xxs MoE GEMV with the SwiGLU epilogue fused (bit-exact vs
         ggml_moe_a8_vec followed by qc_swiglu form 0)."""
         return _qc().ggml_moe_a8_vec_swiglu(
-            x, w, topk_ids, top_k, quant_type, row, tokens, clamp_limit
+            x, w, topk_ids, top_k, quant_type, row, tokens, clamp_limit,
+            group_nb=int(group_nb),
         )
 
     @staticmethod
@@ -1029,12 +1261,16 @@ class quixicore_ops:
         tokens: int,
         out: torch.Tensor,
         soa: bool = False,
+        accumulate: bool = False,
     ) -> torch.Tensor:
         """q2_K MoE down GEMV with the weighted expert-slot sum folded into
         the epilogue; writes (tokens, row) into `out` (no per-slot
-        intermediate, no separate weighted-sum dispatch)."""
+        intermediate, no separate weighted-sum dispatch). `accumulate`
+        adds into `out` instead (out = out + T(sum), the unfused bf16 add's
+        rounding), folding the shared-expert add."""
         return _qc().ggml_moe_a8_vec_sum(
-            x, w, topk_ids, topk_w, top_k, quant_type, row, tokens, out, soa
+            x, w, topk_ids, topk_w, top_k, quant_type, row, tokens, out, soa,
+            accumulate,
         )
 
     @staticmethod
@@ -1067,6 +1303,24 @@ class quixicore_ops:
         return _qc().ggml_mul_mat_a8(w, x, quant_type, row)
 
     @staticmethod
+    def ggml_mul_mat_mma(
+        w: torch.Tensor,
+        x: torch.Tensor,
+        quant_type: int,
+        row: int,
+        out: torch.Tensor | None = None,
+        variant: int = 0,
+    ) -> torch.Tensor:
+        """Small-M weight-stationary MMA GEMM, q8_0 x bf16 row-major, M <= 32.
+
+        The 9..32-row dense band (2026-09-17): float-fragment accumulators,
+        a shared X K-tile per threadgroup step, transposed weight operand so
+        the product lands row-major. `out` may be a unit-column-stride
+        column slice written in place. Not bit-identical to the NR walk.
+        """
+        return _qc().ggml_mul_mat_mma(w, x, quant_type, row, out, int(variant))
+
+    @staticmethod
     def ggml_mul_mat_sm(
         w: torch.Tensor, x: torch.Tensor, quant_type: int, row: int
     ) -> torch.Tensor:
@@ -1081,7 +1335,7 @@ class quixicore_ops:
         """
         variant = 9
         if x.shape[-1] % 64 == 0:
-            if quant_type in (12, 13, 14) and row % 32 == 0:
+            if quant_type in (12, 13, 14) and row % 32 == 0 and _has_tensor_qgemm():
                 # Default: the per-shape 15/16/17 selection -- it won the
                 # same-protocol rested A/B (17.81/17.56/17.58 vs 16.05
                 # flat for the split-K=1 route, 2026-08-15). The split-K=1
@@ -2662,6 +2916,134 @@ class quixicore_ops:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """decay = exp(-exp(A_log)*softplus(a+dt_bias)), beta = sigmoid(b)."""
         return _qc().gdn_gate_beta(a, b, A_log, dt_bias)
+
+    @staticmethod
+    def mla_sparse_latent_decode(
+        q: torch.Tensor,
+        kv_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        indices: torch.Tensor,
+        sm_scale: float,
+        partitions: int = 0,
+        tlen: torch.Tensor | None = None,
+        mqa_cfg: int = 0,
+    ) -> torch.Tensor:
+        """Sparse NoPE-MLA decode over bf16/f16 latent pages (GLM-5.3-Flash).
+
+        ``q [R, H, 512]``, ``kv_cache [blocks, block_size, 512]`` (any block
+        stride), ``block_table [R, cols]`` i32 (one row per query row),
+        ``indices [R, W]`` i32 request-local positions with ``< 0`` pad.
+        Returns ``[R, H, 512]`` in q's dtype; a row with no valid position
+        is zero. Metal only. ``mqa_cfg`` 1..4 selects the head-grouped
+        partition kernel ((G, NSG) = (4,4) (4,8) (2,8) (2,4)); 0 = per-head.
+        """
+        return _qc().mla_sparse_latent_decode(
+            q, kv_cache, block_table, indices, float(sm_scale), int(partitions), tlen,
+            int(mqa_cfg),
+        )
+
+    @staticmethod
+    def kda_recur_prefill(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        decay: torch.Tensor,
+        beta: torch.Tensor,
+        ssm_state: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        Dk: int,
+        Dv: int,
+        load_initial: bool,
+        rows: int = 0,
+    ) -> torch.Tensor:
+        """KDA prefill recurrence (the ``kda_recur`` kernel, test / bench entry)
+        over already-prepared fp32 rows (``q``/``k``/``decay`` ``[T, H*Dk]``,
+        ``v`` ``[T, H*Dv]``, ``beta`` ``[T, H]``) against the fp32
+        ``[slots, H, Dv, Dk]`` state pool in place; the initial state loads
+        from ``ssm_state[slot]`` when ``load_initial``; final state written
+        back. Returns ``y`` ``[T, H*Dv]`` fp32; slot <= 0 is the null block.
+        ``rows`` = value rows per simdgroup (0 = the VLLM_QC_KDA_RECUR_ROWS
+        default; every choice is bit-identical)."""
+        return _qc().kda_recur_prefill(
+            q,
+            k,
+            v,
+            decay,
+            beta,
+            ssm_state,
+            cu_seqlens,
+            slot_mapping,
+            Dk,
+            Dv,
+            load_initial,
+            rows,
+        )
+
+    def kda_step(
+        mixed_qkv: torch.Tensor,
+        g_logits: torch.Tensor,
+        beta_logits: torch.Tensor,
+        conv_w: torch.Tensor,
+        conv_state: torch.Tensor,
+        ssm_state: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor | None,
+        lower_bound: float,
+        load_initial: bool,
+        norm_weight: torch.Tensor,
+        z: torch.Tensor,
+        norm_eps: float,
+        q_scale: float,
+        l2_eps: float = 1e-6,
+        out: torch.Tensor | None = None,
+        slot_table: torch.Tensor | None = None,
+        num_accepted: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """KDA fused serving step (GLM-5.3-Flash / Kimi-Linear), Metal.
+
+        ``slot_table`` [R, num_spec+1] int32 + ``num_accepted`` [R] int32
+        select the speculative-verify mode (conv rewind from
+        num_accepted-1, recurrence resumed from slot_table[r,
+        num_accepted-1] and checkpointed to slot_table[r, t] after every
+        token); ``slot_mapping`` must then be slot_table[:, 0].
+
+        Three launches in one command buffer: short conv (silu) over the
+        packed [q|k|v] channels against the persistent ring, L2-normalized
+        q (scaled) / k, per-channel decay ``exp(lb * sigmoid(exp(A_log) *
+        (g + dt_bias)))`` and ``beta = sigmoid(b)``; the per-channel delta
+        rule over varlen ``cu_seqlens`` against the fp32 ``[slots, H, Dv,
+        Dk]`` pool (in place at ``slot_mapping[req]``); ``rmsnorm(y) *
+        norm_weight * sigmoid(z)``. Slot <= 0 is the null block (zero
+        output, pool untouched). Returns ``[T, H*Dv]`` in the activation
+        dtype. Numerics contract: ``kda_mps_fallback.py``.
+        """
+        return _qc().kda_step(
+            mixed_qkv,
+            g_logits,
+            beta_logits,
+            conv_w,
+            conv_state,
+            ssm_state,
+            cu_seqlens,
+            slot_mapping,
+            A_log,
+            dt_bias
+            if dt_bias is not None
+            else torch.empty(0, dtype=torch.float32, device=mixed_qkv.device),
+            float(lower_bound),
+            bool(load_initial),
+            norm_weight,
+            z,
+            float(norm_eps),
+            float(q_scale),
+            float(l2_eps),
+            out,
+            slot_table,
+            num_accepted,
+        )
 
     @staticmethod
     def gdn_recur(

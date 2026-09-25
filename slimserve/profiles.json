@@ -1754,19 +1754,13 @@
     "glm53f-gguf": {
       "title": "GLM-5.3-Flash",
       "modalities": [
-        "text",
-        "image"
+        "text"
       ],
+      "format": "gguf",
       "repo": "antirez/glm-5.3-flash-gguf",
       "base_url": "https://huggingface.co/antirez/glm-5.3-flash-gguf/resolve/b2fa29d7a6b410db11221c904973967b80b760f5",
       "local_dir": "GLM-5.3-Flash-GGUF",
-      "shared": [
-        {
-          "path": "GLM-5.3-Flash-Vision-Encoder.gguf",
-          "bytes": 1127280960,
-          "sha256": "ae23e14c6979e889051b2e4a39351abcdafb161e18e606fae4d8c40095a4bf3a"
-        }
-      ],
+      "shared_note": "Text only until the Metal vision path for this model is qualified: the companion GLM-5.3-Flash-Vision-Encoder.gguf is fetched with the source but not served (the text record runs language_model_only). The GGUF is the ds4 layout (general.architecture glm5-next, ds4 tensor names): one 89.88 GiB file, 45 trunk layers (34 KDA + 11 pooled sparse MLA) and the nextn MTP block. Modalities flip to text+image when an image request is validated on Metal.",
       "speculator": {
         "repo": "incoai/GLM-5.3-Flash-DFlash2",
         "revision": "bf582e4eacc1810f76656d1811693ff6c6737d2a",
@@ -1775,8 +1769,15 @@
           "method": "dflash",
           "num_speculative_tokens": 7
         },
-        "note": "Same registered drafter as the NVFP4 source of this model: DFlash 2 for GLM-5.3-Flash (Inco AI, cc-by-nc-nd-4.0; 2.34 GB bf16, block size 8 = up to 7 draft tokens per verify, target taps [5, 14, 24, 33, 42] through the aux-hidden-state interface), pinned at the same revision. Registering it records which drafter this artifact would run; glm53f-q2-1 keeps speculative decoding OFF until the Metal target-model qualification completes, and no draft weights are downloaded while it is off."
+        "note": "The source-level drafter is the published DFlash2 head (the A100 glm53f records use it). The Metal record overrides it with the GGUF-resident nextn MTP block (speculator model \"target\"): DFlash2 is parked on Metal after a hybrid KV group block-size mismatch on this layout (2026-09-11)."
       },
+      "shared": [
+        {
+          "path": "GLM-5.3-Flash-Vision-Encoder.gguf",
+          "bytes": 1127280960,
+          "sha256": "ae23e14c6979e889051b2e4a39351abcdafb161e18e606fae4d8c40095a4bf3a"
+        }
+      ],
       "quants": {
         "Q2": {
           "title": "Q2 (IQ2_XXS gate/up, Q2_K down)",
@@ -3576,8 +3577,9 @@
       "title": "GLM-5.3-Flash Q2 on one Mac",
       "source": "glm53f-gguf",
       "gpus": 1,
-      "summary": "GLM-5.3-Flash Q2 with vision and the native 1048576-token context on 128 GiB Apple Silicon.",
-      "speculative": false,
+      "summary": "GLM-5.3-Flash Q2 (antirez's GGUF: IQ2_XXS gate/up + Q2_K down experts) resident on one 128 GiB Apple Silicon machine, text only, 131072-token context, the GGUF's own nextn block as the K=1 MTP drafter. M1 Ultra single-stream: decode 34-40 tok/s, prefill 237-258 t/s; ds4 on the same box 22.5 / 143. Concurrent (1000-token prompts, 1000 output): 27.5 / 48.4 / 58.2 / 63.1 / 60.2 tok/s at c=1/4/8/16/32; ds4 batched on the same box 16.2 / 22.1 / 23.8 at c=1/4/8 and cannot fit 16 sessions.",
+      "speculative": true,
+      "status": "supported",
       "variants": {
         "metal": {
           "platform": "metal",
@@ -3585,32 +3587,71 @@
           "default_quant": "Q2",
           "engine": {
             "tensor_parallel_size": 1,
-            "max_num_seqs": 4,
-            "max_num_batched_tokens": 512,
-            "block_size": 64,
-            "gpu_memory_utilization": 0.9,
-            "kv_cache_dtype": "fp8",
+            "max_model_len": 131072,
+            "max_num_seqs": 32,
+            "max_num_batched_tokens": 4288,
+            "kv_cache_memory_bytes": 8589934592,
+            "kv_cache_dtype": "auto",
+            "mamba_ssm_cache_dtype": "float32",
             "compilation_config": {
               "cudagraph_mode": "NONE"
             },
             "enable_prefix_caching": true,
             "enable_chunked_prefill": true,
-            "limit_mm_per_prompt": {
-              "image": 2
-            },
+            "trust_remote_code": true,
+            "served_model_name": "GLM-5.3-Flash",
             "reasoning_parser": "glm47",
             "tool_call_parser": "glm47",
-            "served_model_name": "GLM-5.3-Flash"
+            "language_model_only": true,
+            "default_chat_template_kwargs": {
+              "reasoning_effort": "low",
+              "preserve_thinking": true,
+              "thinking": true,
+              "enable_thinking": true
+            }
           },
           "env": {
-            "VLLM_USE_V2_MODEL_RUNNER": "1"
+            "VLLM_USE_V2_MODEL_RUNNER": "1",
+            "VLLM_METAL_ASYNC_SCHED": "1",
+            "VLLM_QC_Q8_NR": "1",
+            "VLLM_METAL_KV_META": "1",
+            "VLLM_METAL_MAMBA_LB": "1",
+            "VLLM_METAL_MOE_ROUTER": "1",
+            "VLLM_METAL_MOE_FOLD": "1",
+            "VLLM_METAL_SHEXP_PAIR": "1",
+            "VLLM_METAL_KDA_GATE_DUAL": "1",
+            "VLLM_METAL_MOE_OVERLAP": "1",
+            "VLLM_METAL_INDEXER_IDENTITY": "1",
+            "VLLM_METAL_MLA_DUAL_NORM": "1",
+            "VLLM_METAL_MOE_IQ2_TEX": "1",
+            "VLLM_METAL_SHARD_OVERLAP": "1",
+            "VLLM_METAL_MOE_ROUTER_OVERLAP": "1",
+            "VLLM_QC_Q8_MMA": "1",
+            "VLLM_QC_MOE_MM_MIN_TOKENS": "48",
+        "VLLM_QC_MLA_SPARSE_MQA": "6",
+        "VLLM_QC_KDA_SPEC_ROWS": "2"
+          },
+          "speculator": {
+            "model": "target",
+            "engine": {
+              "method": "glm5_next_mtp",
+              "num_speculative_tokens": 1,
+              "quantization": "gguf"
+            },
+            "note": "The GGUF's own nextn block (blk.45: one sparse-MLA + MoE layer, BF16 eh_proj) as the MTP drafter, loaded from the target file (ds4's MTP recipe) and fed the post-final-norm hidden state. K=1 measured against no drafter and K=2 (2026-09-11/14): 2.000 tok/cycle on the loop probe, 0.63-0.85 accepted drafts per cycle on prose; K=2 loses because the third verify row costs ~14 ms of expert bytes per step. The DFlash2 candidate is parked (hybrid KV group block-size mismatch). Drafting stays on at every batch size: the 2026-09-15 per-batch-size schedule that switched it off above two requests was a workaround for a KDA routing bug (mixed spec+prefill batches ran the torch reference; fixed 2026-09-17) and was removed after a same-protocol A/B (spec 25.8/33.2/29.9/38.1 vs no-spec 20.8/29.4/35.8/32.4 tok/s at c=1/2/4/8)."
           },
           "notes": [
-            "Bring-up in progress: end-to-end Metal qualification is not yet complete.",
-            "Context is read from the GGUF metadata (1048576); vision uses the exact companion GLM-5.3-Flash-Vision-Encoder.gguf.",
-            "Resident loading is the first qualification target. Expert offload is only needed if the complete runtime at native context exceeds the 128 GiB memory budget.",
-            "No speculative decoder is enabled during the initial target-model qualification.",
-            "Main KV is fp8 (e4m3) through kv_cache_dtype, per the standing directive that FP8 is the official KV cache quantization. NOT yet validated on box: it is part of the pending Metal qualification, together with resident loading and the vision encoder."
+            "max_num_batched_tokens 4288 = the Mamba align-mode block: the fp32 KDA state page is 4,341,760 B per layer-slot and the MLA latent is 1 KiB/token, so the hybrid aligner sets the attention block to 4288 tokens and align mode requires the batch cap >= one block (first boot 2026-09-11 failed the assert at 2048). One prefill chunk == one block.",
+            "MEASURED RECORD (2026-09-14, perf/baseline_status.md): weights 89.9 GiB resident + 8 GiB KV pool + fp32 KDA state + dequantized kv_b lands the footprint near 100 GiB against the ~115 GiB Metal working set. Exact-token gates sha-pinned on the final build (8tok 7dd30ea193a6, off1-2000 393882a2ddaf, 2500x64 c097108f8fa5 (2026-09-25; was 1d7d58486dc7: rolled by the sparse-MLA MMA kernel, VLLM_QC_MLA_SPARSE_MQA=6, which a 2500-token prefill reaches above the 2051-token dense limit - MQA=0 restores 1d7d58486dc7 exactly; teacher-forced vs ds4 at 3000 tokens 62/64 argmax for MMA vs 59/64 per-head, perf/results/2026-09-25/glm53f-q2-oracle-long/)): decode loop probe 39.96 tok/s at 2.000 tok/cycle, off1-2000 gate 34.23 tok/s incl. prefill, prose 32.5-39.9 tok/s, prefill 256-258 t/s at 2048 tokens / 237-241 at 2500; needles pass at 1.5k/4k/6.5k/12k; teacher-forced argmax agreement with ds4 29/32 and 62/64. ds4 6289c516 on the same box: decode 22.52 tok/s (--mtp), prefill 143 t/s.",
+            "Hybrid layout: 45 text layers, sparse-MLA (NoPE, kv_lora 512, 64 heads x 256) at layers 3,7,...,43, KDA (64 heads x 128, conv 4, per-channel decay, gate_lower_bound -5) everywhere else; only the 11 MLA layers hold paged KV (11 KiB/token f16 latents + 0.7 KiB/token indexer pools). The 8 GiB pool holds two full 131072-token requests with margin.",
+            "mamba_ssm_cache_dtype float32: the KDA recurrent state stays fp32 on Metal (bf16 state is a recorded quality hazard on the Qwen GDN path; the A100 records use bfloat16 with different kernels).",
+            "Registered speculator = the GGUF's own nextn MTP block (glm5_next_mtp, K=1). Gated 2026-09-11 against no drafter (23.3 tok/s) and K=2; the W24 drafter fix (2026-09-14: the draft's sparse attention read never-written top-k buffers) took prose acceptance to 0.63-0.85 drafts per cycle. K=2 re-measured after the fix and rejected.",
+            "Campaign features are opt-in per profile, and this is the only profile that opts in: VLLM_METAL_ASYNC_SCHED (W8a, decode 18.9 -> 21.9 tok/s; dsv4-xxs-1's DSpark anchor rolls under it), VLLM_QC_Q8_NR (W8b q8_0 NR/mb GEMV, 21.9 -> 23.3; not bit-identical to the generic walk), VLLM_METAL_KV_META and VLLM_METAL_MAMBA_LB (W7 single-launch step metadata), VLLM_METAL_MOE_ROUTER (single-dispatch top-k), VLLM_METAL_MOE_FOLD (shared-expert add folded into the q2_K sum kernel), VLLM_METAL_SHEXP_PAIR and VLLM_METAL_KDA_GATE_DUAL (W16 launch fusions), VLLM_METAL_MOE_OVERLAP / VLLM_METAL_SHARD_OVERLAP / VLLM_METAL_MOE_ROUTER_OVERLAP (W24a/W26 concurrent-dispatch regions), VLLM_METAL_INDEXER_IDENTITY (W24b: identity selection below the 2048 selection limit), VLLM_METAL_MLA_DUAL_NORM (W24c), VLLM_METAL_MOE_IQ2_TEX (W25: the iq2_xxs codebook through the texture unit, bit-exact), VLLM_QC_Q8_MMA (2026-09-17 batching campaign: the small-M MMA GEMM for q8_0 dense projections at 9..32 rows in flight; single-stream never reaches it). Every other Metal profile runs the code it was gated with (2026-09-12 scope audit, re-checked 2026-09-17).",
+            "Vision deferred (language_model_only): the companion GLM-5.3-Flash-Vision-Encoder.gguf is registered with the source but not loaded; the Metal vision path for this model is not qualified. Open item.",
+            "max_model_len 131072 of the GGUF's 1048576: the 8 GiB pool holds two full 131072-token requests; the native context needs a ~12 GiB latent pool for one request plus its indexer pools and is not yet qualified on this box. Open item.",
+            "kv_cache_dtype auto: the 11 sparse-MLA layers hold f16 latent pages (the exact-token pins were taken with them); an fp8 latent path for the Metal sparse-MLA kernels is not built. FP8 is the fleet policy. Open item.",
+            "CONCURRENCY (batching campaign, 2026-09-17): four fixes took the curve from a net loss (0.88x at c=8) to 1.56x at c=8 and 1.67x at c=16 on 400-output windows (1.88x / 2.08x decode-dominated): mixed spec+prefill batches now run both KDA subsets on the fused kernels (a mixed batch used to send everything to the torch per-token loop, the whole concurrent-prefill collapse), q8_0 dense at 5..8 rows runs as NR passes, q8_0/q4_K dense at 9..32 rows takes the small-M MMA GEMM (VLLM_QC_Q8_MMA), and the MoE prefill tile stays off the decode batch (VLLM_QC_MOE_MM_MIN_TOKENS=48; at 32 it served every c=16 decode step at 3x the GEMV cost). max_num_seqs is 32 (KDA state 146 MiB/seq fp32 in the aligned pool; the KV pool is the same 381,513 tokens as at 16): c=32 measured 60.2-60.6 tok/s decode-dominated (2.2x) against 63.1 at c=16 - past 32 rows the step is per-row (the routed MoE is per-slot at every width, the MoE tile/GEMV crossover is ~64 rows), so 32 buys capacity, not aggregate. Second round (same day): the sparse-MLA decode runs on a simdgroup-MMA kernel over the head dimension at >= 3 rows (VLLM_QC_MLA_SPARSE_MQA=6, 3.5x at 32 rows; rows 1-2 keep the per-head kernel so the pins hold), the small-M MMA GEMM walks 16 rows per simdgroup at 16..32 rows (auto-selected; q4_K dequant vectorised), and the KDA spec recurrence takes two value rows per simdgroup (VLLM_QC_KDA_SPEC_ROWS=2, bit-identical, DRAM rate). Decode-dominated: 2.12x at c=8, 2.26-2.30x at c=16. The routed MoE GEMVs (~45% of the c=16 step) cost the same for 8 or 256 distinct experts - per-slot decode work at the format's divergent-lookup floor (W20), not DRAM - so neither grouping (opt-in VLLM_QC_MOE_GROUP_NB=2, measured -6% at 32 rows), signed texels nor a half2 walk moved it. Bar (2026-09-24, perf/baseline_status.md): ds4 6289c516 --batched-session 8 on the same box, same harness, aggregates 16.2 / 22.1 / 23.8 tok/s at c=1/4/8 (1.70x / 2.19x / 2.44x to this record) and cannot plan 16 sessions (135 GiB vs its 118 GiB guard). Concurrent gates pinned in perf/results/2026-09-15/glm53f-q2-conc/pins.json (exact at every width, aggregate floor).",
+            "Chat-template defaults mirror the A100 glm53f records: reasoning_effort low, thinking on, glm47 reasoning and tool-call parsers, EOS set {154820, 154827, 154829}."
           ]
         }
       }

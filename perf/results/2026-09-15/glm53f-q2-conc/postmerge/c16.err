@@ -1,0 +1,59 @@
+INFO 09-25 14:04:04 [bootstamp.py:34] [boot +  -0.00s pid=82968] gguf_reader restored GLM-5.3-Flash-Q2.gguf metadata in 0.06s
+Traceback (most recent call last):
+  File "/Users/seangherardi/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/lib/python3.12/urllib/request.py", line 1344, in do_open
+    h.request(req.get_method(), req.selector, req.data, headers,
+  File "/Users/seangherardi/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/lib/python3.12/http/client.py", line 1358, in request
+    self._send_request(method, url, body, headers, encode_chunked)
+  File "/Users/seangherardi/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/lib/python3.12/http/client.py", line 1404, in _send_request
+    self.endheaders(body, encode_chunked=encode_chunked)
+  File "/Users/seangherardi/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/lib/python3.12/http/client.py", line 1353, in endheaders
+    self._send_output(message_body, encode_chunked=encode_chunked)
+  File "/Users/seangherardi/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/lib/python3.12/http/client.py", line 1113, in _send_output
+    self.send(msg)
+  File "/Users/seangherardi/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/lib/python3.12/http/client.py", line 1057, in send
+    self.connect()
+  File "/Users/seangherardi/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/lib/python3.12/http/client.py", line 1023, in connect
+    self.sock = self._create_connection(
+                ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/seangherardi/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/lib/python3.12/socket.py", line 865, in create_connection
+    raise exceptions[0]
+  File "/Users/seangherardi/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/lib/python3.12/socket.py", line 850, in create_connection
+    sock.connect(sa)
+ConnectionRefusedError: [Errno 61] Connection refused
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/Users/seangherardi/Code/slimserve/SlimServe-glm53f/benchmarks/benchmark_dsv4_exact.py", line 395, in <module>
+    main()
+  File "/Users/seangherardi/Code/slimserve/SlimServe-glm53f/benchmarks/benchmark_dsv4_exact.py", line 275, in main
+    warmup.result()
+  File "/Users/seangherardi/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/lib/python3.12/concurrent/futures/_base.py", line 456, in result
+    return self.__get_result()
+           ^^^^^^^^^^^^^^^^^^^
+  File "/Users/seangherardi/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/lib/python3.12/concurrent/futures/_base.py", line 401, in __get_result
+    raise self._exception
+  File "/Users/seangherardi/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/lib/python3.12/concurrent/futures/thread.py", line 59, in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/seangherardi/Code/slimserve/SlimServe-glm53f/benchmarks/benchmark_dsv4_exact.py", line 233, in request_completion
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/seangherardi/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/lib/python3.12/urllib/request.py", line 215, in urlopen
+    return opener.open(url, data, timeout)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/seangherardi/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/lib/python3.12/urllib/request.py", line 515, in open
+    response = self._open(req, data)
+               ^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/seangherardi/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/lib/python3.12/urllib/request.py", line 532, in _open
+    result = self._call_chain(self.handle_open, protocol, protocol +
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/seangherardi/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/lib/python3.12/urllib/request.py", line 492, in _call_chain
+    result = func(*args)
+             ^^^^^^^^^^^
+  File "/Users/seangherardi/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/lib/python3.12/urllib/request.py", line 1373, in http_open
+    return self.do_open(http.client.HTTPConnection, req)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/seangherardi/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/lib/python3.12/urllib/request.py", line 1347, in do_open
+    raise URLError(err)
+urllib.error.URLError: <urlopen error [Errno 61] Connection refused>

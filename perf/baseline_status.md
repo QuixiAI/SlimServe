@@ -3,6 +3,375 @@
 This file holds stable baseline snapshots for comparison. Raw outputs belong in
 `perf/results/`; summarize only the numbers needed to compare future work.
 
+## GLM-5.3-Flash Q2 (antirez GGUF) Metal M1 Ultra - ds4 base-recipe bar - 2026-09-11
+
+The bar the `glm53f-q2-1` campaign must beat, measured on this box with
+clean memory. Engine: antirez ds4 upstream 6289c516 (`~/.local/scratch/ds4-upstream`,
+`make`, run from its own directory because it resolves `metal/*.metal`
+relative to cwd), `--metal --power 100`, wired limit 122880 MiB, AC power.
+Artifact: `~/models/antirez-glm-5.3-flash-gguf/GLM-5.3-Flash-Q2.gguf`
+(96,505,816,384 B, sha256 e81fd624..., ds4 plans 92.82 GiB: 89.87 model +
+2.92 buffers + 0.03 compact KV at ctx 3008). Raw:
+`perf/results/2026-09-10/glm53f-q2-bar/` (`run_bar.sh`, `*_cli.err`,
+`A_server.log`, `A_*.json`, `D_bench_2048.csv`).
+
+- ds4 CLI, no MTP (arm B): `--ctx 3008 --prompt-file prompt_1000_off1.txt
+  --raw -n 2000 --temp 0`: **prefill 143.03 t/s, generation 18.19 t/s**
+  (2000 tokens generated; full-attention argmax path).
+- ds4 CLI, `--mtp --mtp-timing` (arm C, ds4's own speculative path,
+  the number to beat): **prefill 143.11 t/s, generation 22.52 t/s**.
+  1051 MTP cycles, 947 accepted (90.1%), 104 rejected; per cycle
+  verify2 ~76 ms + head+draft ~10 ms on accept (~62 + ~53 ms on reject);
+  1.90 tokens/cycle. Output byte-identical to arm B (lossless).
+- ds4-server + exact-token harness (arm A, timing only): ds4-server
+  re-tokenizes the prompt to 1018 tokens (harness flags "did not honor
+  the exact token counts"), so shas are not comparable to ours. Its own
+  log: 1018-token prefill 7.05 s (144.5 t/s), greedy decode 19.75 t/s
+  avg over 612 tokens (EOS), 2518-token prefill 18.94 s (132.9 t/s, two
+  chunks of 2048/470). Every request re-prefilled (no prefix reuse).
+- ds4-bench 2048 frontier, 128 greedy tokens (arm D, ds4's published
+  definition): prefill 139.16 t/s, gen 17.39 t/s (first token 56.6 ms,
+  steady 17.40 t/s over 127 tokens).
+- Method note: ds4 residency drains slowly after the process exits
+  (wired pages stay ~90 GiB for minutes); the free+inactive check in
+  `run_bar.sh` warned at 26-33 GiB before each arm, and every arm still
+  loaded and ran. Budget that drain before booting SlimServe after ds4.
+
+## GLM-5.3-Flash Q2 Metal M1 Ultra - `glm53f-q2-1` bring-up baseline (N0) - 2026-09-11
+
+First serving baseline of antirez's GLM-5.3-Flash-Q2.gguf through the real
+profile (`glm53f-q2-1 --no-spec`, worktree `glm53f-metal-campaign`, metal3.1
+metallib, fp32 KDA state, block 4288, 8 GiB KV pool, 95.87 GiB pinned).
+No GLM-specific Metal kernels yet: KDA core / pooled indexer / sparse MLA
+are the torch-native paths, MoE is the existing IQ2_XXS/Q2_K GEMV path,
+mHC the existing fused kernels. Exact-token harness, temperature 0,
+concurrency 1. Raw: `perf/results/2026-09-11/glm53f-q2-baseline/`.
+
+| gate | sha | tokens | aggregate tok/s | wall |
+|---|---|---|---|---|
+| 8tok (1000/8 off1) | 7dd30ea193a6 | 1000 -> 8 | 0.38 | 20.9 s |
+| off1-2000 (1000/2000 off1) | f9282de33fed | 1000 -> 2000 | 2.94 | 680.4 s |
+| 2500x64 (2500/64 off0) | b6949a578f73 | 2500 -> 64 | 0.91 | 70.3 s |
+
+W1 (fused KDA kernels, 2026-09-11, `perf/results/2026-09-11/glm53f-q2-w1-kda/gates/`):
+
+| gate | sha | aggregate tok/s | wall |
+|---|---|---|---|
+| 8tok | 7dd30ea193a6 (== N0) | 0.62 | 12.8 s |
+| off1-2000 | c1cf25bb8268 (rolled) | 6.08 | 328.9 s |
+| 2500x64 | 12d98b9d33ab (rolled) | 1.51 | 42.5 s |
+
+Streaming decode 6.6 tok/s (151 ms/step). The 2000-token trajectory rolls
+because the KDA state path is now float64-exact instead of MPS-rounded (kernel
+vs float64 4e-8; torch-MPS path 1.6e-3); teacher-forced agreement with ds4
+improved (long 55/64, mean |dlogprob| 0.124).
+
+W2 (Metal sparse latent MLA decode kernel, 2026-09-11,
+`perf/results/2026-09-11/glm53f-q2-w2-mla/gates/`):
+
+| gate | sha | aggregate tok/s | wall |
+|---|---|---|---|
+| 8tok | 7dd30ea193a6 (== N0/W1) | 0.62 | 12.8 s |
+| off1-2000 | 7656da8323ef (rolled) | 6.25 | 320.1 s |
+| 2500x64 | 29b6e8772495 (rolled) | 1.60 | 39.9 s |
+
+Streaming decode 6.68 tok/s. Teacher-forced agreement identical to W1
+(short 30/32 mean 0.113; long 55/64 mean 0.124 max 0.56); needles PASS
+1.5k/4k/6.5k/12k (walls 19/51/82/151 s). The long shas roll because the
+kernel's fp32 online softmax orders the reduction differently from the
+torch einsum path (kernel vs torch path max |d| < 2e-2 in bf16 at the
+serving shape).
+
+W3 (mHC sites: post kernel + split pre in one encode, RMSNorm fused into the
+finalize, 2026-09-11, `perf/results/2026-09-11/glm53f-q2-w3-mhc/gates/`):
+
+| gate | sha | aggregate tok/s | wall |
+|---|---|---|---|
+| 8tok | 7dd30ea193a6 (== N0/W1/W2) | 0.65 | 12.3 s |
+| off1-2000 | e1b8cf9219b7 (rolled) | 11.25 | 177.8 s |
+| 2500x64 | 12d98b9d33ab (== W1) | 1.81 | 35.4 s |
+
+Streaming decode 12.28 tok/s (81 ms/step). Teacher-forced short 28/32
+(mean 0.069), long 56/64 (mean 0.155, max 0.57); needles PASS
+1.5k/4k/6.5k/12k (walls 19/50/81/150 s). The post+pre sequence is
+bit-identical to the monolith it replaces; the shas roll only through the
+fused norm's reduction order (ulp-level).
+
+W4 (Metal MoE router kernel + KDA prefill host-sync removal, 2026-09-11,
+`perf/results/2026-09-11/glm53f-q2-w4-router/gates/`): 8tok 7dd30ea193a6,
+off1-2000 e1b8cf9219b7 11.26 tok/s 177.7 s, 2500x64 12d98b9d33ab 35.0 s -
+all three shas identical to W3 (the router kernel is exact), decode probe
+12.31 tok/s (no change), ttft 64-tok 0.88 -> 0.80 s (sync removal).
+Teacher-forced identical to W3; needles PASS.
+
+W4b (fp32 routing: `moe_router_dtype` float32 + fp32 gate weight on Metal,
+which lets the Metal router kernel engage; 2026-09-11,
+`perf/results/2026-09-11/glm53f-q2-w4-router/gates/`, earlier bf16-routing
+gate run kept in `gates_routeroff/`):
+
+| gate | sha | aggregate tok/s | wall |
+|---|---|---|---|
+| 8tok | 5f870096e207 (rolled) | 0.67 | 12.0 s |
+| off1-2000 | 29878bddab74 (rolled) | 13.15 | 152.1 s |
+| 2500x64 | c4f607e5cc8a (rolled) | 1.87 | 34.2 s |
+
+Streaming decode 14.91 tok/s (67 ms/step). Teacher-forced vs ds4: short
+30/32 (mean |dlogprob| 0.082), long **60/64** (mean 0.088, max 0.50) - the
+closest to ds4 so far (ds4 routes in fp32 with the F32 gate). Needles PASS
+(walls 18/49/79/148 s). Shas roll because routing precision changed.
+
+W5 (KDA launch diet, 2026-09-11, `perf/results/2026-09-11/glm53f-q2-w5-kda/gates/`):
+8tok 5f870096e207, off1-2000 29878bddab74 **13.93 tok/s** 143.6 s, 2500x64
+c4f607e5cc8a 33.8 s - all three shas identical to W4b (launch/copy-only
+changes). Streaming decode 15.85 tok/s (63 ms/step); ttft 64-tok 0.75 s.
+Teacher-forced identical to W4b (30/32, 60/64); needles PASS.
+
+W6 (Metal indexer + paged row insert + direct decode MQA return +
+device-built MLA metadata, 2026-09-11,
+`perf/results/2026-09-11/glm53f-q2-w6-indexer/gates/`): 8tok 5f870096e207
+(== W4b), off1-2000 29878bddab74 (== W4b) **16.65 tok/s** 120.1 s, 2500x64
+5b6e19532bf8 (rolled: pooled-logit fp32 reduction order on the 2500-token
+context) 33.2 s. Streaming decode **18.78 tok/s** (53 ms/step) - above
+ds4's no-MTP 18.19 on the 64-token probe; ds4's MTP bar 22.52 stands.
+Teacher-forced 30/32, 60/64 (unchanged); needles PASS (18/49/79/148 s).
+
+W7 (remaining glue diet: one-launch KV metadata, mamba tail gather,
+indexer pack, folded shared add, KDA shard slice GEMV, int64 row insert,
+2026-09-11, `perf/results/2026-09-11/glm53f-q2-w7-glue/gates/`): 8tok
+5f870096e207 (== W4b), off1-2000 1553b858e2ef (rolled: pack-kernel fp32
+LayerNorm statistic order; near-tie flip at token ~130) **16.63 tok/s**
+120.3 s, 2500x64 8cb1cbc48a44 33.2 s. Streaming decode **18.89 tok/s**.
+Teacher-forced 30/32 (0.0817), 60/64 (0.0875) == W6; needles PASS.
+GPU trace (gputrace3): GPU busy 77% of the step, one 9.8 ms idle gap per
+step at the step boundary (async scheduling off on Metal).
+
+W8a (async scheduling on, 2026-09-11,
+`perf/results/2026-09-11/glm53f-q2-w8a-async/gates/`): 8tok 5f870096e207,
+off1-2000 1553b858e2ef **19.38 tok/s** 103.2 s, 2500x64 8cb1cbc48a44
+32.3 s - all three shas identical to W7. Streaming decode **21.94 tok/s**
+(ds4 no-MTP 18.19; ds4 MTP 22.52). Teacher-forced == W7; needles PASS.
+GPU busy 95% of the step.
+
+W8b (q8_0 llama.cpp-geometry GEMV `qgemv_q8_0_nr` 2x4, 2026-09-11,
+`perf/results/2026-09-11/glm53f-q2-w8b-q8nr/gates/`): 8tok 7dd30ea193a6
+(rolled, == W2's), off1-2000 49335758cdab (rolled) **20.38 tok/s** 98.1 s,
+2500x64 75c38d5ea816 (rolled) 32.1 s. Streaming decode **23.26 tok/s** -
+**above ds4's MTP bar 22.52 with no speculation** (ds4 no-MTP 18.19).
+Teacher-forced byte-identical to W7 (prefill oracle; decode GEMV
+unexercised); kernel parity test within 4 ulp of the exact dot. Needles
+PASS (18/48/79/147 s).
+
+W9 (GGUF nextn MTP drafter K=1, post-final-norm feed, q8_0 verify-width
+GEMV `qgemv_q8_0_nr_mb` 4x4, 2026-09-11,
+`perf/results/2026-09-11/glm53f-q2-w9-mtp/gates/`): 8tok 5f870096e207
+(== W7's), off1-2000 bf329ffc964c (rolled) **26.50 tok/s** 75.5 s at 84.6%
+acceptance / 1.85 tok/cycle, 2500x64 105b4a274b22 (rolled) 33.0 s.
+Streaming decode **31.95 tok/s** (1.84 tok/cycle). **ds4's MTP bar 22.52
+beaten by 18% on the identical workload.** Teacher-forced byte-identical
+to W7. Needles PASS (18/50/81/150 s). Loop-prompt acceptance 95-100%
+(ds4 100%).
+
+W11 (MoE tile GEMM routed for bf16 activations, 2026-09-12,
+`perf/results/2026-09-11/glm53f-q2-w11-prefill/`): prefill **182 t/s at
+2500 tokens** (13.75 s; was 84 / 29.9 s), 185-197 t/s at 1000 (5.1-5.4 s;
+was 86-88 / 11.4 s). **ds4's prefill bar 143 t/s beaten at both lengths.**
+Gates rolled with the prefill numerics: 8tok 7dd30ea193a6 (5.5 s),
+off1-2000 cf3a15f8c2ef 29.10 tok/s incl. prefill (68.7 s; decode itself
+unchanged), 2500x64 15be63c98eae 16.5 s (was 33.0). Teacher-forced 28/32
+(0.0605) / 58/64 (0.0843): near-tie argmax flips, mean distance to ds4
+improved. Decode unchanged from W9.
+
+W12 (KDA prepare kernel token-chunked, 2026-09-12, bit-exact vs W11):
+prefill **231 t/s at 2048 tokens** (8.86 s), **230 t/s at 2500** (10.9 s),
+227-243 t/s at 1000 (4.1-4.4 s). Gate shas identical to W11 (8tok
+7dd30ea193a6, off1-2000 cf3a15f8c2ef 29.46 tok/s incl. prefill, 2500x64
+15be63c98eae 13.5 s). Teacher-forced identical to W11.
+
+W13 (sparse MLA fresh-prefill rows via MPS SDPA, hybrid form, 2026-09-12,
+`perf/results/2026-09-11/glm53f-q2-w11-prefill/gates_sdpa/`): prefill
+**245-251 t/s at 2048 tokens** (8.15-8.36 s), **240 t/s at 2500** (10.4 s),
+223-245 at 1000. Gates: 8tok 7dd30ea193a6 (unchanged), off1-2000
+a88022b375ea (rolled) 28.71 tok/s incl. prefill, 2500x64 f80d14780458
+(rolled) 13.2 s. Teacher-forced 29/32 (0.0473) / 62/64 (0.0830) - best of
+the campaign. **ds4 prefill (139-144 t/s) beaten 1.7-1.8x; ds4 MTP decode
+22.52 beaten 1.42x (W9 31.95).**
+
+FINAL BUILD (Session 3 cleanup: `kda_recur` R=8 default, dead diagnostics
+removed; 2026-09-12, `perf/results/2026-09-11/glm53f-q2-w11-prefill/gates_final/`):
+prefill **256-258 t/s at 2048 tokens** (7.94-8.01 s), **237-241 t/s at
+2500** (10.4-10.6 s), 228-245 at 1000. Gates BIT-IDENTICAL to W13 (8tok
+7dd30ea193a6, off1-2000 a88022b375ea 28.74 tok/s incl. prefill, 2500x64
+f80d14780458 13.2 s); teacher-forced identical (29/32 0.0473, 62/64
+0.0830); needles PASS 1.5k/4k/6.5k/12k (6.5 / 18.5 / 30.4 / 58.7 s).
+
+SESSION 3 ANCHORS (2026-09-12). DSV4 `dsv4-xxs-1` r3 on the final build
+(`perf/results/2026-09-12/dsv4-regate-r3/`): 8tok 573db39598e7 and 2500x64
+73f41acf8ca0 bit-exact, **off1-2000 ROLLED 394993781527** (pin
+bb83cc3054a3; tie-flip at ~token 100, deterministic 3/3). Bisected by env
+switch, one boot each: async scheduling alone flips it (async0 = pin;
+q8nr0 and kvmeta0 still rolled) - the W8a platform-wide async default, not
+the q8_0 NR GEMV (which is off DSV4's anchor path and, checked directly,
+sits at the same 0.181 output-ulp mean error as the generic kernel). Fix:
+Metal async scheduling back to opt-in (`VLLM_METAL_ASYNC_SCHED=1` in a
+profile's env block; glm53f-q2-1 and qwen38-nvfp4-1 carry it, dsv4-xxs-1
+does not). r4 (`dsv4-regate-r4/`, fixed tree): **ALL BIT-EXACT** - 8tok
+573db39598e7, off1-2000 bb83cc3054a3 2/2 (57.6/57.7 s), 2500x64
+73f41acf8ca0 (5.16 s); 28th consecutive. DSV4 per-verify-step time under
+async was 135.7 vs 136.7 ms sync, so nothing is given up.
+GLM re-gated on the fixed tree with its opt-in active
+(`glm-regate-asyncfix/`): 7dd30ea193a6 / a88022b375ea 28.77 tok/s /
+f80d14780458 13.2 s, bit-identical to the final pins.
+Qwen `qwen38-nvfp4-1` (language-only override; HEAD's vision-enabled
+profile needs torchvision, absent here): c1 1000x256 0f6fbb440708 2/2
+(16.33 tok/s) / 2500x64 1b2541ff56ae 2/2 - bit-identical to upstream HEAD
+55fdb54bd booted the same way (0f6fbb440708 / 1b2541ff56ae, 16.40 tok/s),
+so no campaign change reaches Qwen; both differ from the 2026-08-25 pins
+(467b35c3 / d0e07ddd), which are therefore stale at HEAD (HEAD-side
+2026-09-07..10 changes) - flagged, not re-pinned here.
+SCOPING (same day): every campaign feature another profile could execute
+is opt-in through the glm53f-q2-1 env block (async, q8_0 NR GEMV, kv_meta,
+mamba_last_blocks, router kernel, MoE shared-expert fold; hetero shard
+fusion is a per-layer flag from the KDA projection) and the pre-campaign
+mHC monolith is restored for the norm-free DSV4 call - audit table in
+optimization_status 2026-09-12 "scope audit". DSV4 r5 on that build (its
+pre-campaign path throughout): ALL BIT-EXACT 573db39598e7 / bb83cc3054a3
+2/2 / 73f41acf8ca0, 29th consecutive. GLM on the same build with its
+opt-ins (`glm-regate-scoped/`): 7dd30ea193a6 / a88022b375ea 28.78 tok/s /
+f80d14780458, bit-identical to the final pins.
+
+SESSION 4 DECODE (2026-09-14). W16a/b/c launch fusions + W22 LDD strided
+in-place KDA shard writes (`perf/results/2026-09-14/glm53f-q2-w22-concurrent/verify_final/`):
+K=1 step 56.0 -> 53.8 ms, probe ~34.5 tok/s, **off1-2000 27.57 tok/s**;
+pins ROLLED ONCE at W16 for the sparse-MLA partition merge order (tf
+29/32 + 62/64 and needles held): 8tok 7dd30ea193a6, off1-2000
+8a9753e18551, 2500x64 1d7d58486dc7. W24 drafter fix (the nextn drafter's
+sparse attention had read a never-written top-k buffer since W9 - zero
+attention output on every extend/decode row; `eagle/utils.py` re-points
+the attention impls' shared buffers; `perf/results/2026-09-14/glm53f-q2-w24-fix/k1/`):
+gates BIT-IDENTICAL (7dd30ea193a6 / 8a9753e18551 / 1d7d58486dc7), tf
+long 0.083, needles 4/4 (6.4 / 18.9 / 31.5 / 60.1 s); **off1-2000 29.46
+tok/s** (67.9 s incl. prefill; ds4 MTP bar 22.52 beaten 1.31x), probe
+34.63 / 35.25 tok/s at 2.00 / 1.997 tok/cycle, accept set off1 full
+0.648 tok/draft, m2 1000 0.892, m2 2000 0.980. K=2 measured and rejected
+(W23: 3rd verify row = +14-16 ms of expert bytes; off1-2000 25.51; with
+the fixed drafter it is a wash on the equal-prefix accept set and its
+32.05 gate is a degenerate-output artifact). W24a shared||routed
+concurrent region (+1.2%, bit-identical) and W24b indexer identity bypass
+below 2048 tokens (+3.5% on the fixed-text loop probe; tf + needles held;
+the off1-2000 sha rolls on this near-tie prompt) are in the profile env.
+**FINAL (2026-09-14, `perf/results/2026-09-14/glm53f-q2-w24-fix/final_k1/`):
+loop probe 36.97 tok/s at 2.000 tok/cycle; accept set 30.06-36.98 tok/s;
+gates 8tok 7dd30ea193a6, off1-2000 393882a2ddaf 32.13 tok/s (62.3 s incl.
+prefill; its continuation partly degenerates, like ds4's - the exact-token
+pin, not the speed headline), 2500x64 1d7d58486dc7; tf 0.083; needles
+4/4.** ds4 MTP bar 22.52 beaten 1.38-1.5x on non-degenerate text.
+W24c (in-kernel identity expand + dual q_a|kv_a RMSNorm, env
+VLLM_METAL_MLA_DUAL_NORM=1, `w24-fix/dual_k1/`): bit-exact (all pins held),
+loop probe 37.3 tok/s, accept set off1 full 31.44 / m2 64 37.30 / m2 2000
+33.53.
+W25 (iq2_xxs expert codebook through the texture unit, `texm`, env
+VLLM_METAL_MOE_IQ2_TEX=1, `w25-tex/tex_k1/`): bit-exact (all pins held),
+loop probe 39.1 tok/s, accept set off1 full 32.90 / m2 64 39.07 / m2 2000
+34.66, off1-2000 gate 33.59 tok/s (59.5 s incl. prefill).
+W26 (KDA shard GEMVs concurrent, +0.5%) and W26b (router kernel inside the
+MoE region, +1.4%) - both bit-identical, flags in the profile env.
+**SESSION 4 FINAL (2026-09-14 18:14, stripped build, every flag in the
+profile, `perf/results/2026-09-14/glm53f-q2-w26-shard/final_k1/`): loop
+probe 39.96 tok/s at 2.000 tok/cycle (session start 34.5 = +15.8%); accept
+set off1 full 33.60 / first64 34.36 / last64 37.04 / last256 32.45, m2 64
+39.92 / 1000 37.57 / 2000 35.60; tf 0.083; needles 4/4; gates 8tok
+7dd30ea193a6, off1-2000 393882a2ddaf 34.23 tok/s (58.4 s incl. prefill),
+2500x64 1d7d58486dc7.** ds4 MTP bar 22.52: +52% on its own gate workload,
++44..77% on non-degenerate text, +77% on the loop probe.
+**MERGED BUILD (2026-09-14 23:22, main 02fb15fc1 merged, measurement twins
+stripped, PR #30, `w26-shard/merged_k1/`): loop probe 40.02 tok/s at 2.000
+tok/cycle; accept set 32.50-40.00; tf 29/32, 62/64 (0.0830); needles 4/4;
+gates 7dd30ea193a6 / 393882a2ddaf 34.27 tok/s / 1d7d58486dc7 - bit-identical
+to the Session 4 final pins.**
+**REVIEW BUILD (2026-09-15, CodeRabbit + Astra rounds applied,
+`w26-shard/astra1b_k1/`): probe 39.96 tok/s at 2.000 tok/cycle; accept set
+32.49-39.97; tf 0.0830; needles 4/4; gates 7dd30ea193a6 / 393882a2ddaf
+34.28 tok/s / 1d7d58486dc7 - pins held. FIRST CONCURRENT NUMBERS on this
+profile: c=2 27.8, c=3 33.7, c=6 41.2 tok/s aggregate (96 tokens each,
+6/6 served, health 200) - multi-request serving with the drafter was dead
+before this round (engine crash), so these are the baseline, not a
+regression point.**
+
+- Decode ~3.0 tok/s (329 ms/step, streaming probe 3.04 x2). Prefill
+  ~50-55 t/s (1000 tok ~18 s; 2500 tok ~50 s) - the KDA prefill is the
+  sequential per-token torch loop.
+- Bar (same box, ds4 6289c516): decode 22.52 tok/s with MTP / 18.19
+  without, prefill 143 t/s. Gap to close: 7.5x decode, 2.7x prefill.
+- Correctness at N0: teacher-forced vs ds4 dumps 31/32 (short) and 52/64
+  (after 1000 tokens) argmax agreement, ds4 token always in our top-8;
+  needle recall PASS at 1.5k/4k/6.5k/12k. See HANDOFF 2026-09-11.
+
+### Concurrent serving vs ds4 on this box (2026-09-24)
+
+ds4 `6289c516` `ds4-server --batched-session 8 --mixed-prefill-quantum
+1024 --ctx 3008 --power 100`, same harness, 1000-token prompts, 1000
+output tokens (ds4 stops some requests at EOS despite ignore_eos, so its
+counts are inexact; tok/s is over the tokens it did produce). 16 sessions
+do not fit (ds4 plans 135 GiB against its 118 GiB guard). Raw:
+`perf/results/2026-09-24/ds4-batched/`, ours `fix4_long/`, `c4_1k_0924_long/`,
+`fix6_all_long/`, `c32_gemv_long/`.
+
+| concurrency | ds4 tok/s | glm53f-q2-1 tok/s | ratio |
+|---|---|---|---|
+| 1 | 16.15 | 27.45 | 1.70x |
+| 4 | 22.12 | 48.38 | 2.19x |
+| 8 | 23.80 | 58.16 | 2.44x |
+| 16 | does not fit | 63.08 | - |
+| 32 | does not fit | 60.16 | - |
+
+### Concurrent serving (batching campaign, 2026-09-17) - pinned 2026-09-25
+
+Same harness, temperature 0, 1000-token prompts at strided offsets, warmup
+1; the record with the campaign fixes (mixed spec+prefill batches on the
+fused KDA kernels, q8_0 NR passes at 5..8 rows, the small-M MMA GEMM at
+9..32 rows behind `VLLM_QC_Q8_MMA=1` with 16 rows per simdgroup at 16..32
+rows, `VLLM_QC_MOE_MM_MIN_TOKENS=48`, the simdgroup-MMA sparse-MLA decode
+at >= 3 rows behind `VLLM_QC_MLA_SPARSE_MQA=6`, `VLLM_QC_KDA_SPEC_ROWS=2`,
+`max_num_seqs` 16, drafting on at every batch size). Raw:
+`perf/results/2026-09-15/glm53f-q2-conc/fix6_all/` (400 output tokens),
+`fix6_all_long/` (1000 output tokens); c=2/4 and the 1000-out c=1 from
+`fix4_moe_thresh/` and `fix4_long/` (the second-round levers only apply
+at >= 3 rows / >= 16 rows). Single-stream pins unchanged on the same
+build (`fix6_all/c1` sha c6b99cdf91ac = the fix-4 build; `gates_build5b/`:
+8tok 7dd30ea193a6, off1-2000 393882a2ddaf 34.28 tok/s, 2500x64
+1d7d58486dc7; probe 39.89 tok/s at 2.000 tok/cycle).
+
+| concurrency | 400-out aggregate tok/s | x c=1 | 1000-out aggregate tok/s | x c=1 | 3000-out aggregate tok/s | x c=1 |
+|---|---|---|---|---|---|---|
+| 1 | 25.1-25.8 | 1.00 | 27.45 | 1.00 | 34.95 | 1.00 |
+| 2 | 32.6-33.2 | 1.29 | - | - | - | - |
+| 4 | 35.6-35.8 | 1.39 | - | - | - | - |
+| 8 | 41.7 (was 40.0) | 1.62 | 58.16 (was 51.66) | 2.12 | - | - |
+| 16 | 44.2 (was 42.9) | 1.71 | 61.98 (was 57.23); 63.08 at max_num_seqs 32 | 2.26-2.30 | 77.39 | 2.21 |
+| 32 | 43.9 | 1.71 | 60.16 (MoE GEMV at 64 rows), 60.59 (tile) | 2.19-2.21 | 72.91 | 2.09 |
+
+The harness submits every prompt at t=0 and prefills serialize at ~250
+tok/s, so the short-output windows carry a prefill ramp (24% of the c=32
+1000-out window); the 3000-out column is the closest to steady-state
+decode. The single stream also speeds up over a long generation (36.7
+tok/s decode-only at 3000 tokens), so the ratio at c=16 is 2.2-2.3x on
+every protocol and c=32 is below c=16 on every protocol (per-request
+latency 1030 s vs 617 s at 3000 output tokens).
+
+`max_num_seqs` is 32 (`c32_gemv/`, `c32_tile/`, 2026-09-17): the KV pool
+is unchanged (381,513 tokens), c=32 adds capacity but no aggregate over
+c=16 - past 32 rows the step cost is per-row (16.1 ms per generated token
+at 32 rows, 16.6 at 64).
+
+Per-request shas are recorded in the run directories but NOT pinned: at
+c >= 4 the per-step row count, hence the dense route, depends on arrival
+timing, so the same prompt legitimately yields different tokens run to run.
+The concurrent gate (`concurrent_gate_pin.py`) asserts `exact` at c=4/8/16
+and an aggregate floor (pin - 5%). The bar is ds4 on the same box (section
+above: 1.70x / 2.19x / 2.44x at c=1/4/8; ds4 cannot fit 16 sessions), so
+the record is `supported` and the gate is pinned (`pins.json`, 2026-09-25,
+post-merge build; run `release/`).
+
 ## Affine King R21 GRPO5 S75 Vision NVFP4 / RTX 5090 TP1 V2 online FP8 dense - 2026-09-25
 
 - Registered `affine-king-nvfp4-1` on the enabled port-8000 systemd service. The target's previously excluded dense language projections are quantized from their shipped BF16 weights to per-tensor FP8 once during load; NVFP4 routed experts, 4 GiB CPU weight offload, FP8 KV, 262144-token configured context, 64 sequence slots, vision/tools, 48 GiB host and 96 GiB NVMe completed-prefix tiers remain. GPU KV pool: 649402 tokens (2.48 full contexts) versus 536203 previously. RTX 5090 32 GB, driver 595.91.07, CUDA toolkit 13.3, home venv. One timed sample per shape.

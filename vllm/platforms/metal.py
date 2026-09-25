@@ -218,8 +218,15 @@ class MetalPlatform(Platform):
                 "vllm.v1.attention.backends.turboquant_attn.TurboQuantAttentionBackend"
             )
         if getattr(attn_selector_config, "use_mla", False):
-            # Resolves so the failure names the missing kernels rather than
-            # surfacing as an ImportError; see that module for what is left.
+            # Sparse (DSA) NoPE MLA, torch-native over bf16/f16 latent pages:
+            # GLM-5.3-Flash. Dense MLA (DeepSeek-V2/V3-style layers without
+            # an indexer) has no Metal backend yet.
+            if not getattr(attn_selector_config, "use_sparse", False):
+                raise NotImplementedError(
+                    "Dense (non-sparse) MLA has no Apple Metal attention "
+                    "backend; only indexer-driven sparse MLA "
+                    "(METAL_MLA_SPARSE) is implemented."
+                )
             return (
                 "vllm.v1.attention.backends.mla.metal_mla_sparse.MetalMLASparseBackend"
             )
@@ -250,10 +257,22 @@ class MetalPlatform(Platform):
                 f"{parallel_config.tensor_parallel_size}."
             )
 
-        # Async scheduling was force-disabled during Metal bring-up. The
-        # step is sync-free now and dspark speculation is on the config
-        # layer's async whitelist, but async scheduling is not yet
-        # gate-proven on Metal; VLLM_METAL_ASYNC_SCHED=1 opts in.
+        # Async scheduling is opt-in per profile on Metal
+        # (VLLM_METAL_ASYNC_SCHED=1, set in a profile's env block). It is a
+        # real win where the CPU-side step prep leaves the GPU idle: a Metal
+        # System Trace of GLM-5.3-Flash Q2 decode (2026-09-11) showed 9.8 ms
+        # of every 57 ms step between the sampler's output blit and the next
+        # step's first compute command; overlapping them took the probe from
+        # 18.9 to 21.9 tok/s (GPU busy 77% -> 95%) with that profile's gates
+        # bit-identical. It is not numerics-neutral for every profile: with
+        # the DSpark drafter, dsv4-xxs-1 under async scheduling rolls its
+        # 2000-token exact-token anchor at ~token 100 (deterministic 3/3,
+        # 2026-09-12 bisect, perf/results/2026-09-12/dsv4-regate-r3/) while
+        # the synchronous scheduler reproduces the pin, so the default stays
+        # synchronous and profiles gated under async (glm53f-q2-1,
+        # qwen38-nvfp4-1) carry the opt-in explicitly. The config layer's
+        # default-on resolution (and its compatibility whitelist) applies
+        # only after the opt-in.
         if os.environ.get("VLLM_METAL_ASYNC_SCHED", "0") != "1":
             vllm_config.scheduler_config.async_scheduling = False
 

@@ -1,0 +1,54 @@
+kda_v          M= 1: rel-max-err vs half-ref 2.31e-03  vs fp32-ref 2.32e-03  strided OK
+kda_v          M= 5: rel-max-err vs half-ref 2.21e-03  vs fp32-ref 2.32e-03  strided OK
+kda_v          M= 8: rel-max-err vs half-ref 1.95e-03  vs fp32-ref 2.01e-03  strided OK
+kda_v          M= 9: rel-max-err vs half-ref 3.69e-03  vs fp32-ref 3.65e-03  strided OK
+kda_v          M=16: rel-max-err vs half-ref 2.02e-03  vs fp32-ref 2.11e-03  strided OK
+kda_v          M=17: rel-max-err vs half-ref 2.74e-03  vs fp32-ref 2.74e-03  strided OK
+kda_v          M=24: rel-max-err vs half-ref 3.70e-03  vs fp32-ref 3.69e-03  strided OK
+kda_v          M=32: rel-max-err vs half-ref 3.62e-03  vs fp32-ref 3.67e-03  strided OK
+kda_output     M= 1: rel-max-err vs half-ref 3.65e-03  vs fp32-ref 3.59e-03  strided OK
+kda_output     M= 5: rel-max-err vs half-ref 3.37e-03  vs fp32-ref 3.31e-03  strided OK
+kda_output     M= 8: rel-max-err vs half-ref 2.83e-03  vs fp32-ref 2.83e-03  strided OK
+kda_output     M= 9: rel-max-err vs half-ref 2.96e-03  vs fp32-ref 2.93e-03  strided OK
+kda_output     M=16: rel-max-err vs half-ref 2.99e-03  vs fp32-ref 3.03e-03  strided OK
+kda_output     M=17: rel-max-err vs half-ref 2.81e-03  vs fp32-ref 2.84e-03  strided OK
+kda_output     M=24: rel-max-err vs half-ref 2.51e-03  vs fp32-ref 2.53e-03  strided OK
+kda_output     M=32: rel-max-err vs half-ref 2.96e-03  vs fp32-ref 3.00e-03  strided OK
+attn_output    M= 1: rel-max-err vs half-ref 2.16e-03  vs fp32-ref 2.18e-03  strided OK
+attn_output    M= 5: rel-max-err vs half-ref 2.20e-03  vs fp32-ref 2.25e-03  strided OK
+attn_output    M= 8: rel-max-err vs half-ref 2.09e-03  vs fp32-ref 2.14e-03  strided OK
+attn_output    M= 9: rel-max-err vs half-ref 3.24e-03  vs fp32-ref 3.28e-03  strided OK
+attn_output    M=16: rel-max-err vs half-ref 1.95e-03  vs fp32-ref 2.01e-03  strided OK
+attn_output    M=17: rel-max-err vs half-ref 2.06e-03  vs fp32-ref 2.11e-03  strided OK
+attn_output    M=24: rel-max-err vs half-ref 1.79e-03  vs fp32-ref 1.89e-03  strided OK
+attn_output    M=32: rel-max-err vs half-ref 2.03e-03  vs fp32-ref 2.16e-03  strided OK
+q_a|kv_a       M= 1: rel-max-err vs half-ref 2.73e-03  vs fp32-ref 2.76e-03  strided OK
+q_a|kv_a       M= 5: rel-max-err vs half-ref 2.04e-03  vs fp32-ref 2.05e-03  strided OK
+q_a|kv_a       M= 8: rel-max-err vs half-ref 2.13e-03  vs fp32-ref 2.18e-03  strided OK
+q_a|kv_a       M= 9: rel-max-err vs half-ref 2.11e-03  vs fp32-ref 2.16e-03  strided OK
+q_a|kv_a       M=16: rel-max-err vs half-ref 2.31e-03  vs fp32-ref 2.38e-03  strided OK
+q_a|kv_a       M=17: rel-max-err vs half-ref 2.16e-03  vs fp32-ref 2.29e-03  strided OK
+q_a|kv_a       M=24: rel-max-err vs half-ref 2.15e-03  vs fp32-ref 2.25e-03  strided OK
+q_a|kv_a       M=32: rel-max-err vs half-ref 2.13e-03  vs fp32-ref 2.28e-03  strided OK
+worst rel-max-err vs half-operand reference: 3.70e-03
+M= 8 kda_v          N=  8192 K= 4096 | mma   212.7 us  168 GB/s | sm   302.6 us  118 GB/s | 1.42x
+M= 8 kda_output     N=  4096 K= 8192 | mma   394.4 us   90 GB/s | sm   326.8 us  109 GB/s | 0.83x
+M= 8 attn_output    N=  4096 K=16384 | mma   796.9 us   89 GB/s | sm   574.6 us  124 GB/s | 0.72x
+M= 8 attn_q_b       N= 16384 K= 1536 | mma   102.4 us  261 GB/s | sm   248.1 us  108 GB/s | 2.42x
+M= 8 q_a|kv_a       N=  2112 K= 4096 | mma   192.1 us   48 GB/s | sm   137.2 us   67 GB/s | 0.71x
+M= 8 shexp gate|up  N=  4096 K= 4096 | mma   199.9 us   89 GB/s | sm   203.1 us   88 GB/s | 1.02x
+M= 8 shexp down     N=  4096 K= 2048 | mma    98.3 us   91 GB/s | sm   135.1 us   66 GB/s | 1.37x
+M=16 kda_v          N=  8192 K= 4096 | mma   352.7 us  101 GB/s | sm   309.1 us  115 GB/s | 0.88x
+M=16 kda_output     N=  4096 K= 8192 | mma   653.5 us   55 GB/s | sm   333.7 us  107 GB/s | 0.51x
+M=16 attn_output    N=  4096 K=16384 | mma  1327.3 us   54 GB/s | sm   593.2 us  120 GB/s | 0.45x
+M=16 attn_q_b       N= 16384 K= 1536 | mma   158.6 us  169 GB/s | sm   259.7 us  103 GB/s | 1.64x
+M=16 q_a|kv_a       N=  2112 K= 4096 | mma   316.2 us   29 GB/s | sm   134.1 us   69 GB/s | 0.42x
+M=16 shexp gate|up  N=  4096 K= 4096 | mma   319.9 us   56 GB/s | sm   193.7 us   92 GB/s | 0.61x
+M=16 shexp down     N=  4096 K= 2048 | mma   163.9 us   54 GB/s | sm   135.4 us   66 GB/s | 0.83x
+M=32 kda_v          N=  8192 K= 4096 | mma   599.0 us   60 GB/s | sm   404.0 us   88 GB/s | 0.67x
+M=32 kda_output     N=  4096 K= 8192 | mma  1155.5 us   31 GB/s | sm   409.7 us   87 GB/s | 0.35x
+M=32 attn_output    N=  4096 K=16384 | mma  2329.8 us   31 GB/s | sm   681.0 us  105 GB/s | 0.29x
+M=32 attn_q_b       N= 16384 K= 1536 | mma   276.7 us   97 GB/s | sm   362.3 us   74 GB/s | 1.31x
+M=32 q_a|kv_a       N=  2112 K= 4096 | mma   595.6 us   15 GB/s | sm   213.3 us   43 GB/s | 0.36x
+M=32 shexp gate|up  N=  4096 K= 4096 | mma   605.8 us   29 GB/s | sm   276.9 us   64 GB/s | 0.46x
+M=32 shexp down     N=  4096 K= 2048 | mma   293.2 us   30 GB/s | sm   198.6 us   45 GB/s | 0.68x

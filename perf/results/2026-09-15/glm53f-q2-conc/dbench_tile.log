@@ -1,0 +1,14 @@
+kda q|k Q4_K         M=16 N= 16384 K= 4096 | sm   544.9 us   69 GB/s | tile   615.4 us   61 GB/s
+kda_v Q8_0           M=16 N=  8192 K= 4096 | sm   312.3 us  114 GB/s | tile   322.3 us  111 GB/s
+kda_output Q8_0      M=16 N=  4096 K= 8192 | sm   335.2 us  106 GB/s | tile   554.0 us   64 GB/s
+attn_output Q8_0     M=16 N=  4096 K=16384 | sm   585.8 us  122 GB/s | tile  1055.1 us   68 GB/s
+attn_q_b Q8_0        M=16 N= 16384 K= 1536 | sm   263.8 us  101 GB/s | tile   263.1 us  102 GB/s
+shexp gate|up Q8_0   M=16 N=  4096 K= 4096 | sm   199.9 us   89 GB/s | tile   308.4 us   58 GB/s
+shexp down Q8_0      M=16 N=  4096 K= 2048 | sm   135.8 us   66 GB/s | tile   173.0 us   52 GB/s
+kda q|k Q4_K         M=32 N= 16384 K= 4096 | sm   646.7 us   58 GB/s | tile   611.2 us   62 GB/s
+kda_v Q8_0           M=32 N=  8192 K= 4096 | sm   390.8 us   91 GB/s | tile   322.1 us  111 GB/s
+kda_output Q8_0      M=32 N=  4096 K= 8192 | sm   408.8 us   87 GB/s | tile   551.3 us   65 GB/s
+attn_output Q8_0     M=32 N=  4096 K=16384 | sm   675.7 us  106 GB/s | tile  1054.3 us   68 GB/s
+attn_q_b Q8_0        M=32 N= 16384 K= 1536 | sm   365.5 us   73 GB/s | tile   262.2 us  102 GB/s
+shexp gate|up Q8_0   M=32 N=  4096 K= 4096 | sm   304.7 us   59 GB/s | tile   309.9 us   58 GB/s
+shexp down Q8_0      M=32 N=  4096 K= 2048 | sm   205.7 us   43 GB/s | tile   175.2 us   51 GB/s
