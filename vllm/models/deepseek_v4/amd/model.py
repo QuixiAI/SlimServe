@@ -69,6 +69,10 @@ if current_platform.is_metal():
     from vllm.models.deepseek_v4.metal import (
         DeepseekV4MetalAttention as DeepseekV4PlatformAttention,
     )
+elif current_platform.is_xpu():
+    from vllm.models.deepseek_v4.xpu import (
+        DeepseekV4XPUAttention as DeepseekV4PlatformAttention,
+    )
 elif current_platform.is_cuda():
     from vllm.models.deepseek_v4.ampere import (
         DeepseekV4AmpereMLAAttention as DeepseekV4PlatformAttention,
