@@ -118,7 +118,7 @@ def _parser() -> argparse.ArgumentParser:
 def _help() -> None:
     out = sys.stdout
     print(term.paint("slimserve", term.BOLD, out))
-    print("Run GLM-5.2-Vision, Kimi K3, DeepSeek-V4-Flash, or Qwen3.8-27B.\n")
+    print("Run a registered SlimServe model profile.\n")
     print(f"Usage: {USAGE}\n")
     machine = hardware.detect()
     _print_profiles(machine)

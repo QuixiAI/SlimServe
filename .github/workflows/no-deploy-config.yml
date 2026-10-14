@@ -27,6 +27,26 @@ jobs:
           fi
           echo "deploy/ is not tracked."
 
+      - name: Reject systemd units in the tree
+        run: |
+          hits=$(git ls-files | grep -E '(^|/)systemd/|\.(service|socket|timer)$' || true)
+          if [ -n "$hits" ]; then
+            echo "::error::systemd units are deployment configuration:"; echo "$hits"; exit 1
+          fi
+          echo "No tracked systemd units."
+
+      - name: Reject operator-private Affine King material
+        run: |
+          # Affine King is served from an operator-private profile in the
+          # git-ignored slimserve/profiles.local.json; nothing about it
+          # belongs in the repo.
+          if git ls-files | grep -iE 'affine[-_]?king|tools/.*affine' \
+             || git grep -nIiE 'affine[-_ ]?king' -- . ':!.github/workflows/*' ':!.gitignore'; then
+            echo "::error::Affine King material is tracked; keep it local."
+            exit 1
+          fi
+          echo "No Affine King material."
+
       - name: Reject committed environment files
         run: |
           hits=$(git ls-files | grep -E '(^|/)\.env$|(^|/)[^/]*\.env$|(^|/)env$' || true)
