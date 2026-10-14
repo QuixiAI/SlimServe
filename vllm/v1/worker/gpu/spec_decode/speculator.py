@@ -26,21 +26,27 @@ from vllm.v1.worker.utils import AttentionGroup
 logger = init_logger(__name__)
 
 
+# Drafts whose config carries hc_mult (it describes the target's mHC trunk)
+# but which consume the contracted, hidden_size-wide state. GLM-5.3-Flash's
+# checkpoint MTP head is trained on the mean over its four mHC streams.
+_CONTRACTED_HC_DRAFT_MODEL_TYPES = frozenset({"glm5_next_mtp"})
+
+
 def _get_draft_hidden_size(draft_model_config) -> int:
     """Return the target-state width consumed by a draft model.
 
-    ``hc_mult`` alone does not imply that the draft consumes the expanded
-    hyper-connection residual.  GLM-5.3-Flash has four mHC streams, but its
-    checkpoint MTP head is trained on their contracted 4096-wide mean.  The
-    uncontracted ``hc_mult * hidden_size`` contract is specific to DeepSeek V4
-    drafts, identified by the same ``compress_ratios`` marker used by the V1
-    proposer.
+    A draft whose config carries ``hc_mult`` consumes the target's
+    uncontracted ``(T, hc_mult * hidden_size)`` hyper-connection residual:
+    DeepSeek V4's MTP and DSpark drafts take the pre-hc_head stream, and
+    Qwen4-exp MTP takes its multi-stream feedback (``hc_mult`` comes from the
+    text config's ``hc_count``). Non-HC drafts default to ``hc_mult=1``. The
+    exceptions are the model types in ``_CONTRACTED_HC_DRAFT_MODEL_TYPES``.
     """
     hidden_size = draft_model_config.get_hidden_size()
     hf_config = draft_model_config.hf_config
-    if hasattr(hf_config, "compress_ratios") and hasattr(hf_config, "hc_mult"):
-        hidden_size *= hf_config.hc_mult
-    return hidden_size
+    if getattr(hf_config, "model_type", None) in _CONTRACTED_HC_DRAFT_MODEL_TYPES:
+        return hidden_size
+    return hidden_size * getattr(hf_config, "hc_mult", 1)
 
 
 class BaseSpeculator(ABC):
