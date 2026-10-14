@@ -13,7 +13,7 @@ kernels here first, then port the finished, measured pieces upstream.
 
 - **Upstream base:** commit `71a08cd4cbcdc622ce31b3fc91e1f505e144b516`
   (2026-07-27, branch `main`). Upstream `main` has had no `kernels/` or
-  `include/` commits since that point (last checked 2026-09-01), so every
+  `include/` commits since that point (last checked 2026-10-14), so every
   difference between this tree and upstream originated in SlimServe.
 - **Port-back vehicle:**
   [QuixiCore-Metal PR #3](https://github.com/QuixiAI/QuixiCore-Metal/pull/3),
@@ -61,14 +61,24 @@ Modified upstream files:
 | `include/metal/ops/warp/register/tile/dequant_tables.metal` | Qwen3.8 |
 | `kernels/attention/mla/mla.metal` | DSpark TurboQuant restore, DSV4 M1 Ultra, exact fp8 scale fixes |
 | `kernels/attention/paged_attn_v2/paged_attn_v2.metal` | DSV4 M1 Ultra, Muse-Glimmer verify, Qwen3.8 D=256 split-K, `kv_block_stride` |
-| `kernels/common/tk_launch.h` | every campaign (host ABI for everything below) |
+| `kernels/common/tk_launch.h` | every campaign (host ABI for everything below; most recently Metal NVMe KV tier, Metal CT native quantized prefill GEMM) |
 | `kernels/linear_attention/gdn/gdn.metal` | Qwen3.8 GDN fusion |
 | `kernels/norms/rms_norm/rms_norm.metal` | Qwen3.8 |
 | `kernels/quantization/qgemm/qgemm.metal` | DSV4 M1 Ultra, Qwen3.8 |
 | `kernels/quantization/qgemv/qgemv.metal` | DSpark TurboQuant restore through Qwen3.8 (multi-row MoE GEMVs, fp8ch/nvfp4, bf16 axis) |
 | `kernels/quantization/turboquant/turboquant.metal` | DSpark TurboQuant restore, Qwen3.8 |
 | `kernels/serving/indexer/indexer.metal` | DSV4 M1 Ultra, long-context guards |
-| `kernels/serving/kv_cache/kv_cache.metal` | Qwen3.8 stride-aware paged kernel |
+| `kernels/serving/kv_cache/kv_cache.metal` | Qwen3.8 stride-aware paged kernel; Metal NVMe KV tier (`kv_cache_scatter` takes a physical `cache_block_stride` instead of `block_mult`) |
+
+Added files inside upstream directories:
+
+| Path | What |
+| --- | --- |
+| `kernels/quantization/qgemm/qgemm_planar.metal` | Metal CT native quantized prefill GEMM: `qgemm_nvfp4_planar` / `qgemm_fp8ch` reading the checkpoint's planar buffers |
+| `kernels/sampling/sampling/flatten_sampled.metal` | Metal NVMe KV tier campaign: v2 sampler, packs per-request sampled tokens (variable counts) into one flat output |
+| `kernels/sampling/sampling/logit_bias.metal` | Metal NVMe KV tier campaign: v2 sampler allowed-token / logit-bias / min-tokens stop masking in one dispatch |
+| `kernels/serving/kv_cache/kv_cache_fp8_strided.metal` | FP8 KV directive: FP8 E4M3 paged-cache scatter with explicit 64-bit physical strides |
+| `kernels/serving/kv_cache/mamba_align.metal` | Metal NVMe KV tier campaign: GPU-resident mamba align-mode plan and state copies for hybrid models |
 
 Added directories (no upstream counterpart before PR #3):
 
@@ -83,7 +93,7 @@ Added directories (no upstream counterpart before PR #3):
 | `kernels/serving/qk_norm_rope_gate/` | fused Qwen3-Next attention prep (gated-q split, QK RMSNorm, partial RoPE) |
 | `kernels/serving/rms_norm/` | weighted RMS norm for the decode path (w32 / strided variants) |
 | `kernels/serving/swiglu/` | fused SwiGLU mirroring the eager torch chains bit for bit |
-| `kernels/serving_glue/` | Muse step glue, DFlash prepare, DFlash2 conv, GDN decode step, rejection sampling |
+| `kernels/serving_glue/` | Muse step glue, DFlash prepare, DFlash2 conv, GDN decode step, rejection sampling (the NVMe KV tier campaign added a reduction barrier to `rejection_sample.metal` and removed the superseded `muse_kv_store` from `muse_step.metal`) |
 
 ## What was and was not taken from upstream
 
@@ -91,7 +101,7 @@ Taken:
 
 | Path | What |
 | --- | --- |
-| `kernels/**/*.metal` | the MSL kernel sources (79 upstream at the base commit, 93 here) |
+| `kernels/**/*.metal` | the MSL kernel sources (79 upstream at the base commit, 98 here) |
 | `include/metal/**` | the tile substrate `tk.metal` pulls in |
 | `kernels/common/tk_launch.h` | host-side launch ABI, pure C++, no MLX, no Metal |
 | `kernels/common/base_q_descriptor.h` | BaseQN packed-quant descriptor |
@@ -119,6 +129,7 @@ Deliberately not taken:
 `include/metal/` changes. The equivalent command line:
 
 ```bash
+cd csrc/quixicore/metal
 xcrun metal -std=metal4.0 -O2 -I include/metal -I kernels/common \
   $(find kernels -name '*.metal') -o quixicore_metal.metallib
 ```
