@@ -306,6 +306,7 @@ if TYPE_CHECKING:
     VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: bool = True
     VLLM_NIXL_EP_MAX_NUM_RANKS: int = 32
     VLLM_XPU_ENABLE_XPU_GRAPH: bool = False
+    VLLM_XPU_PER_WORKER_AFFINITY: bool = True
     VLLM_XPU_USE_SAMPLER_KERNEL: bool = True
     VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
@@ -2057,6 +2058,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_NIXL_EP_MAX_NUM_RANKS", "32")
     ),
     # Whether enable XPU graph on Intel GPU
+    # Spawn each XPU TP worker with a single-device ZE_AFFINITY_MASK so its
+    # Level Zero context is single-device (VRAM is otherwise mirrored in host
+    # RAM through dma-buf sharing; see vllm/platforms/xpu_affinity.py).
+    "VLLM_XPU_PER_WORKER_AFFINITY": lambda: bool(
+        int(os.getenv("VLLM_XPU_PER_WORKER_AFFINITY", "1"))
+    ),
     "VLLM_XPU_ENABLE_XPU_GRAPH": lambda: bool(
         int(os.getenv("VLLM_XPU_ENABLE_XPU_GRAPH", "0"))
     ),
