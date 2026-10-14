@@ -1,5 +1,79 @@
 # SlimServe Optimization Status
 
+## 2026-10-01..08 - LTX-2.5 audio+video generation on Apple Silicon (`kind: "video"`)
+
+Summary of the campaign ledger `perf/ltx25_metal_campaign.md` (sections cited
+as "ledger N"); every number below is from it, and the handoff is
+`HANDOFF-LTX25.md`. Validated on **one machine only**: M1 Ultra (64-core GPU,
+128 GiB unified, macOS 15.7.2, MLX 0.31.2 and 0.32.2), seed 42, the fox
+prompt. M2-M5 are unmeasured; M3+ native bf16 and the M5 int8 path will be
+their own profile records.
+
+**Terminology.** "Exact" in these profiles and in the ledger means *no
+output-changing approximation* (same steps, guidance passes, decoder and
+attention as Lightricks' pipelines). It is **not bit-exact**: DiT matrix
+multiplies and attention take fp16 operands with fp32 accumulation, and the
+residual stream, norms, AdaLN and model boundary stay fp32. Per-forward
+rel-L2 against an fp32 run of the same weights on identical captured inputs:
+video 0.0069 (0.00692 with split-K), audio 0.0011; the baseline runner as
+shipped is 0.042 video / 0.025 audio (ledger 9, 13). Components: text
+encoder rel-L2 0.0003-0.0007 vs fp32; video VAE decode fp32, 89.7 dB vs the
+runner's fp32 path (ledger 13). The `-fast` profiles are output-changing by
+design and are judged by PSNR against exact, never by parity.
+
+- **Baseline**: dgrauet/ltx-2-mlx v0.15.12, q8 pack (its recommended config)
+  and bf16 pack, cold process, prompt to mp4 (ledger 6).
+- **Hypothesis**: fp16 MMA operands with fp32 glue on the official bf16
+  weights (bf16 -> fp16 is exact) beat the q8 baseline in speed and accuracy
+  with no quantization; MLX's kernels are close enough to the M1 MMA
+  ceiling (19.4 TF/s measured, ledger 17) that the remaining wins are
+  structural, not hand-written Metal.
+- **Retained** (each measured, ledger 13, 15-17, 22): fp16-operand precision
+  path; split-K for the K=16384 FFN GEMM (13.71 -> 11.92 s per 6k forward,
+  error unchanged); compiled glue (-> 11.52 s, bit-identical); temporal-slab
+  VAE convs (peak 60 -> 14.4 GiB, output unchanged); batched/forked dev
+  guidance; diffusion-decoder NA kernel QW=2 + core-only queries (decoder
+  121.8 -> 91.3 s at 1536x1024x121, parity gates unchanged) and a lent
+  buffer cache (HD distilled 480.2 -> 406.6 s, frames identical).
+- **Rejected** (ledger 15, 22, 23, 24): hand-written simdgroup GEMM (9.2 TF/s
+  vs MLX 18.7, 45x the error); query-chunked attention; fp16 VAE decode as a
+  default (55.1 dB from fp32; opt-in only); fused decoder RoPE (0.6%, 1 ulp);
+  step cache on the distilled/DFR ancestral schedules (never fires); tiled
+  stage-2 attention on distilled and dev (visible seam).
+- **Measured throughput** (cold process unless noted):
+
+| clip | pipeline | baseline q8 | SlimServe | vs q8 |
+| --- | --- | ---: | ---: | ---: |
+| 768x512x121 | distilled, conv decoder | 116.9 s | 86 s (CLI), 71 s resident | 1.36x |
+| 768x512x121 | dev, 30 steps | 606.9 s | 343 s | 1.77x |
+| 768x512x121 | DFR | 170.9 s | 125 s | 1.37x |
+| 1536x1024x121 | distilled | 504.9 s (tiled, lossy; untiled dies in decode) | 343 s conv decoder; 406.6 s diffusion decoder | 1.47x (conv) |
+
+  Fast tier at 1536x1024x121, resident engine (ledger 24): distilled-fast
+  277.9 s vs exact 413.5 s (1.49x, 29.6 dB); dev-fast 644.2 s vs 1513.4 s
+  (2.35x, 21.4 dB, same shot); dfr-fast 421.0 s vs 680.7 s (1.62x, 27.1 dB,
+  no seam). Serving (ledger 15, 768x512x49, weights resident, requests
+  strictly one at a time): distilled 40.7 s/clip at 68.6 GiB resident, DFR
+  51.9 s at 68.9 GiB, dev 194-203 s at 76.9 GiB; all PASS.
+- **Correctness**: per-component and end-to-end parity against the runner
+  and Lightricks' torch sources (ledger 13, 20, 21, 28-43); the audit of
+  ledger 20 found and fixed a missing BOS token and six further deviations.
+  No remaining output-preserving avenue is both above the 1% epsilon and
+  achievable (ledger 23).
+- **Decision**: ship the exact profiles as the reference and the `-fast`
+  profiles as the documented output-changing tier; no custom GEMM/attention
+  kernel on M1-M4; revisit kernels on M5 (int8 MMA).
+- **Raw artifacts** (on the validating machine; `perf/results/` is
+  git-ignored): `perf/results/2026-10-01-ltx25-baseline/`,
+  `perf/results/2026-10-02-ltx25-n2/`, baseline clips and logs under
+  `~/.local/scratch/ltx25/baseline/`, fast-tier A/B under
+  `~/.local/scratch/ltx25/n10/`. Scripts: `perf/ltx25_harness/`.
+- **Not run in review** (2026-10-14, PR #86 fixes on Linux): none of the
+  above was re-measured; the review changes (CLI option split, server input
+  root / body cap / upload cleanup, LoRA detach, optional enhancer download)
+  were checked by CPU tests only and need one Mac rerun of
+  `perf/ltx25_harness/n6_serve_check.py` before the numbers are restated.
+
 ## 2026-09-24 - Qwen3.6-35B-A3B on one RTX 5090
 
 - Status: in progress; NVFP4 V1 diagnostic passes short, full-length and host-tier restore checks. Qwen3.6 V2 runner work and FP8 qualification are active.
