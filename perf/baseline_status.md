@@ -3,6 +3,45 @@
 This file holds stable baseline snapshots for comparison. Raw outputs belong in
 `perf/results/`; summarize only the numbers needed to compare future work.
 
+## Qwen3.6-35B-A3B NVFP4 / RTX 5090 TP1 V2 - 2026-09-24
+
+- Registered `qwen36-nvfp4-1`, V2 GPU runner, full 262144-token configured context, checkpoint MTP k=2, FP8 KV, 4 GiB CPU weight offload, 48 GiB pinned host and 128 GiB NVMe completed-prefix KV tiers. RTX 5090 32 GB, driver 595.91.07, CUDA toolkit 13.3, `/home/eric/.venv`; working tree based on `11e644b6c`.
+- Exact completions: 1000 input / 2000 output tokens, prompt source SHA256 `1262c000f00dd7ebb97e085c417cd22b7963eba8615faee281c069dfd3e0d9ea`, temperature 1, top_p .95, top_k 20, seed 42, eight-token warmup; one timed sample each.
+
+| Concurrency | Aggregate output tok/s | Wall seconds |
+| --- | ---: | ---: |
+| 1 | 100.165 | 19.97 |
+| 8 | 269.990 | 59.26 |
+
+- All nine responses returned exactly 2000 output tokens and passed harness checks; no preemptions. V2 GPU KV pool reported 489592 tokens (1.87x full context). The near-limit serving and host-tier restore canaries below were run on V1; V2 still needs those gates repeated. One timed sample gives no variance range.
+- Raw: `perf/results/2026-09-24/qwen36-5090-profile/nvfp4-v2-{c1,c8}.json`, `nvfp4-v2-serve.log`.
+
+## Qwen3.6-35B-A3B FP8 / RTX 5090 TP1 V2 - 2026-09-24
+
+- Registered `qwen36-fp8-1`, V2 GPU runner, full 262144-token configured context, checkpoint MTP k=2, FP8 KV, 16 GiB CPU weight offload, 48 GiB pinned host and 128 GiB NVMe completed-prefix KV tiers. RTX 5090 32 GB, driver 595.91.07, CUDA toolkit 13.3, `/home/eric/.venv`; working tree based on `11e644b6c`.
+- Exact completions: 1000 input / 2000 output tokens, prompt source SHA256 `1262c000f00dd7ebb97e085c417cd22b7963eba8615faee281c069dfd3e0d9ea`, temperature 1, top_p .95, top_k 20, seed 42, eight-token warmup; one timed sample each.
+
+| Concurrency | Aggregate output tok/s | Wall seconds | MTP drafted / accepted |
+| --- | ---: | ---: | ---: |
+| 1 | 35.058 | 57.05 | 1,680 / 1,159 |
+| 8 | 68.103 | 234.94 | 14,084 / 8,958 |
+
+- All nine responses returned exactly 2000 output tokens and passed harness checks; no preemptions. The image request returned a complete diagram description. A cold 261000-input/128-output request also completed in 400.67 s with three KV preemptions. Host/NVMe restore and long-range semantic recall remain to be validated. One sample does not establish a variance range or quantization speed comparison.
+- Raw: `perf/results/2026-09-24/qwen36-5090-profile/fp8-v2-{c1,c8,image,fullctx}.json`, `fp8-v2-batch8192-serve.log`.
+
+## Qwen3.6-35B-A3B NVFP4 / RTX 5090 TP1 V1 diagnostic - 2026-09-24
+
+- Registered `qwen36-nvfp4-1`, full 262144-token configured context, checkpoint MTP k=2, FP8 KV, 4 GiB CPU weight offload, 48 GiB pinned host and 128 GiB NVMe completed-prefix KV tiers. GeForce RTX 5090 32 GB, driver 595.91.07, CUDA toolkit 13.3, `/home/eric/.venv`; working tree based on `11e644b6c`. This run fell through to the deprecated V1 GPU runner. It is a diagnostic reference pending a V2 rerun, not the production baseline required by repository policy.
+- Exact completions: 1000 input / 2000 output tokens, SHA256-pinned prompt source `1262c000f00dd7ebb97e085c417cd22b7963eba8615faee281c069dfd3e0d9ea`, temperature 1, top_p .95, top_k 20, seed 42, eight-token warmup; one timed sample per concurrency.
+
+| Concurrency | Aggregate output tok/s | Wall seconds | MTP drafted / accepted |
+| --- | ---: | ---: | ---: |
+| 1 | 93.407 | 21.41 | 1,844 / 1,078 |
+| 8 | 254.965 | 62.75 | 14,594 / 8,702 |
+
+- All nine requests returned exactly 2000 output tokens and passed the harness checks; no preemptions. The profile reached health and an image request reached the vision path. A cold 261000-input/128-output request completed in 178.16 s with one preemption. After a disjoint 261000-token filler evicted its GPU prefix, repeating the first prompt restored 257488 tokens from the external host tier, zero GPU prefix hits, and the same 32-token answer hash as the GPU-cache replay. The trace reported zero disk reads, so NVMe restoration and long-range semantic recall remain unqualified. One sample does not establish a variance range or an optimization gain.
+- Raw: `perf/results/2026-09-24/qwen36-5090-profile/nvfp4-c1.json`, `nvfp4-c8.json`, `nvfp4-fullctx*.json`, `serve-full-tier48-offload4-retry.log`.
+
 ## DSV4 Metal FP8 draft KV - 2026-09-10
 
 - Apple M5 Max / 128 GiB, registered `dsv4-xxs-1`, TP1, target
