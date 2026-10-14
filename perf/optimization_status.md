@@ -29109,7 +29109,7 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   `slimserve/profiles.json` (the chain refuses to run if it is dirty), the
   drafter resolved from the variant's own `speculator` entry.
 - Boot: `SpeculativeConfig(method='mtp',
-  model='/raid/weights/GLM-5.3-Flash-NVFP4', num_spec_tokens=3)` with
+  model='$SLIMSERVE_CACHE/GLM-5.3-Flash-NVFP4', num_spec_tokens=3)` with
   `'draft_top_k_top_p': True` and the batch-size schedule - the draft model
   is the target's own directory, resolved from `local_dir` under the
   operator's `SLIMSERVE_CACHE`, so the repo carries no host path. Healthy

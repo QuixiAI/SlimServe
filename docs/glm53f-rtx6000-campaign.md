@@ -94,11 +94,11 @@ rules in section 6 exist so it does not happen again.
 
 ### 1c. What survives on disk and is safe to reuse
 
-- Checkpoints: `/raid/weights/GLM-5.3-Flash-NVFP4` (RedHatAI, 191 GB, with
-  `model_mtp.safetensors`), `/raid/weights/GLM-5.3-Flash` (ZAI native FP8,
+- Checkpoints: `$SLIMSERVE_CACHE/GLM-5.3-Flash-NVFP4` (RedHatAI, 191 GB, with
+  `model_mtp.safetensors`), `$SLIMSERVE_CACHE/GLM-5.3-Flash` (ZAI native FP8,
   306 GB), and the sidecars next to the RedHatAI dir:
   `f32-overrides.safetensors` (1.2 MB) and `fp8-swapset.{safetensors,json}`
-  (7.2 GB, 157 native FP8 weights + scales). `/raid/weights/
+  (7.2 GB, 157 native FP8 weights + scales). `$SLIMSERVE_CACHE/
   GLM-5.3-Flash-NVFP4-FP8-KDA-TP4/` is the symlinked recipe dir for the FP8-KDA
   variant (recipe id `glm53-redhatai-nvfp4-fp8-kda-tp4-v1`). These are data
   artifacts, verified bit-exact at build time; reusing them costs nothing.
@@ -246,7 +246,7 @@ Secure boot off. Rollback: `~/.local/scratch/slimserve-glm53/driver-580-rollback
 Post-upgrade smoke: all four cards P2P-reachable, bf16 8192^3 matmul
 426-433 TFLOP/s per card, no throttle reasons, `vllm._C_stable_libtorch`
 imports. The box-wide `NCCL_P2P_DISABLE=1` was removed from
-`~/.config/fish/conf.d/tinybox-env.fish` the same day.
+the operator's shell environment the same day.
 
 GLM-5.3-Flash: 45 layers (3 dense FFN 12288, 42 MoE: 288 routed experts
 top-8 at intermediate 2048 = 25.2M params each, plus one shared expert), 34
@@ -499,14 +499,15 @@ Rules that come from the previous campaign's failure:
 Serve (the only recorded path):
 
 ```bash
-# operator env (kept in ~/.local/scratch/slimserve-glm53/serve.sh, not in the repo)
-export SLIMSERVE_CACHE=/raid/weights
+# operator env (kept in the operator's serve.sh, not in the repo); $SCRATCH is the
+# operator's durable scratch directory, $SLIMSERVE_CACHE the model cache
+export SLIMSERVE_CACHE=<model cache>
 export CUDA_HOME=/usr/local/cuda-13.0 PATH=/usr/local/cuda-13.0/bin:$PATH
-export VLLM_CACHE_ROOT=/home/tiny/.local/scratch/slimserve-glm53/vllm-cache
-export TMPDIR=/home/tiny/.local/scratch/slimserve-glm53/tmp
+export VLLM_CACHE_ROOT=$SCRATCH/vllm-cache
+export TMPDIR=$SCRATCH/tmp
 .venv/bin/python -m slimserve.cli glm53f-nvfp4-4 --dry-run          # inspect the rtx6000 record
 systemd-run --user --scope -p MemoryMax=150G --quiet -- \
-  .venv/bin/python -m slimserve.cli glm53f-nvfp4-4 --serve --host 127.0.0.1 --port 8000 -y [--no-spec] [--torch-profile-dir DIR]
+  .venv/bin/python -m slimserve.cli glm53f-nvfp4-4 --serve --host <host> --port <port> -y [--no-spec] [--torch-profile-dir DIR]
 ```
 
 Throughput (repo canonical shapes; c1, c8, c16 at 1000/300, plus 1000/2000
@@ -514,9 +515,9 @@ at c1 and c8 once per phase; upstream's harness flags, `--help` first):
 
 ```bash
 .venv/bin/python benchmarks/benchmark_dsv4_exact.py \
-  --model /raid/weights/GLM-5.3-Flash-NVFP4 \
-  --source /home/tiny/.local/scratch/slimserve-glm53/prompt-source.txt \
-  --url http://127.0.0.1:8000/v1/completions \
+  --model $SLIMSERVE_CACHE/GLM-5.3-Flash-NVFP4 \
+  --source $SCRATCH/prompt-source.txt \
+  --url http://<host>:<port>/v1/completions \
   --concurrency 8 --input-tokens 1000 --output-tokens 300 \
   --temperature 1.0 --top-p 0.95 --top-k 20 --seed 42
 ```
@@ -560,7 +561,7 @@ Build (Codex's working recipes; 73 min full, ~90 s incremental):
 ```bash
 # full editable rebuild (no serving or benches while it runs)
 CUDA_HOME=/usr/local/cuda-13.0 TORCH_CUDA_ARCH_LIST=12.0f MAX_JOBS=8 NVCC_THREADS=2 CMAKE_BUILD_TYPE=Release \
-VLLM_CUTLASS_SRC_DIR=/home/tiny/.local/scratch/slimserve-glm53/cutlass TMPDIR=/home/tiny/.local/scratch/slimserve-glm53/tmp \
+VLLM_CUTLASS_SRC_DIR=$SCRATCH/cutlass TMPDIR=$SCRATCH/tmp \
 systemd-run --user --scope -p MemoryMax=120G --quiet -- \
   ~/.local/bin/uv pip install --python .venv/bin/python -e . --no-build-isolation -v
 # incremental _quixicore_C in a persistent cmake dir: ~/.local/scratch/slimserve-glm53/native_incremental.sh [_quixicore_C]
@@ -621,7 +622,7 @@ and are re-derived from the Phase 0 trace before Phase 1 starts.
    no KV tier yet, every `glm5_next_*` additional-config switch off until
    qualified. Registry tests pass (`test_a_profile_is_one_config_per_platform`).
 3. Environment audit, recorded in the entry: `NCCL_P2P_DISABLE` (Codex found
-   `~/.config/fish/conf.d/*.fish` exporting it box-wide, which forces NCCL
+   the operator's shell profile exporting it box-wide, which forces NCCL
    through host SHM), CPU governor, GPU clocks and power limits, `nvidia-smi
    topo -p2p r`, free host RAM, earlyoom threshold.
 4. Baseline through the profile: three warmed repeats of c1/c8/c16 at
@@ -755,7 +756,7 @@ microbench GB/s and an e2e entry.
    rewritten to state each setting's evidence; kill switches removed for
    retained changes; failed paths deleted.
 2. Host + NVMe KV tier on this box (188 GB RAM: 32 GiB host per rank + a disk
-   tier under `/raid`), qualified with forced eviction and
+   tier under the data volume), qualified with forced eviction and
    `VLLM_KV_TIER_VERIFY=1` (operator decision on sizes, section 11).
 3. PR(s) against QuixiAI/SlimServe main, under 100 files each; port retained
    kernels to QuixiCore-CUDA (`bf16/fp8_decode_gemm.cuh`, routing/combine,
@@ -766,9 +767,9 @@ microbench GB/s and an e2e entry.
 - One GPU workload at a time; no native builds while a server or bench
   runs; attribute GPU processes by PID lineage. The four GPUs are idle today
   (Foundry stopped).
-- Venvs under `~/venvs` (never on /raid); scratch, logs, build trees and
+- Venvs under `~/venvs` (never on the data volume); scratch, logs, build trees and
   traces under `~/.local/scratch/slimserve-glm53/` (never /tmp); model weights
-  under `/raid/weights` (`SLIMSERVE_CACHE`); `/raid` has 459 GB free, root
+  under `$SLIMSERVE_CACHE`; the data volume has 459 GB free, root
   161 GB.
 - Prebuilt wheels only for torch (2.13.0+cu130) and FlashInfer (nightly
   `flashinfer-python` + `-cubin` + `-jit-cache` from flashinfer.ai/whl when a
@@ -783,7 +784,7 @@ microbench GB/s and an e2e entry.
 - Native builds capped: `MAX_JOBS=8 NVCC_THREADS=2` under
   `systemd-run --user --scope -p MemoryMax=120G`; serving under 150G;
   earlyoom is active.
-- Docker only for the image-only B12X control; containerd root is on /raid.
+- Docker only for the image-only B12X control; containerd root is on the data volume.
 - Never `pkill -f` a pattern the calling shell contains; kill by PID.
 - Never A/B a compiled path with a private env var; use `graph_factors` or
   distinct code.
@@ -814,13 +815,13 @@ microbench GB/s and an e2e entry.
    A100 records carry 72 GiB per rank of pinned host RAM plus 256 GiB per
    rank of disk, which does not transfer to a 188 GB host with four ranks.
    Default for the `rtx6000` record: 32 GiB pinned per rank (128 GiB total)
-   plus a disk tier under `/raid` sized to what is free at Phase 6. It is a
+   plus a disk tier under the data volume sized to what is free at Phase 6. It is a
    completeness item, not a throughput item.
 5. Cleanup: done for the local branch, the fetched PR refs and 32 GB of
    scratch build products, traces and stale compile cache. Two deletions on
-   `/raid` were blocked by the tool sandbox and are left to the operator:
-   `/raid/scratch/slimserve-glm53` (a 148 KB CMake cache) and
-   `/raid/weights/GLM-5.3-Flash-NVFP4-FP8-KDA-TP4` (a 7.2 GB duplicate of
+   the data volume were blocked by the tool sandbox and are left to the operator:
+   the data volume's old scratch directory (a 148 KB CMake cache) and
+   `$SLIMSERVE_CACHE/GLM-5.3-Flash-NVFP4-FP8-KDA-TP4` (a 7.2 GB duplicate of
    the sidecars that live next to the checkpoint, verified byte-identical,
    plus symlinks).
 6. Hosting of the FP8 hybrid artifacts (needs an HF org and a name by
