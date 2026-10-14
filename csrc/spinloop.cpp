@@ -7,7 +7,8 @@ extern "C" {
 
 #if defined(__i386__) || defined(__x86_64__)
   #include <cpuid.h>
-  #include <mwaitxintrin.h>
+  // clang (and icpx) refuse the direct include; x86intrin.h provides it too.
+  #include <x86intrin.h>
 #endif
 
 #if defined(CLOCK_MONOTONIC_RAW)

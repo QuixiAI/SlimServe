@@ -1,0 +1,22 @@
+# Common dependencies
+-r common.txt
+
+# Dependencies for Intel XPU (Arc Pro B70, SYCL / Level Zero).
+#
+# torch is NOT pinned here on purpose: the XPU wheels come from the PyTorch
+# nightly xpu index (2.15.0.dev+xpu at bring-up, 2026-08-18) and bundle their
+# own SYCL runtime (intel-sycl-rt, libsycl.so.9). Install torch first:
+#   uv pip install --pre torch torchvision --index-url https://download.pytorch.org/whl/nightly/xpu
+# then build with VLLM_TARGET_DEVICE=xpu. Do NOT `source setvars.sh` in the
+# serving environment - it puts a second SYCL/UR runtime on LD_LIBRARY_PATH and
+# torch.xpu itself segfaults on the first allocation; setvars is only for the
+# icpx build step.
+#
+# triton-xpu ships with the torch nightly index (batch-prep Triton helpers).
+# A transitive dependency drags in CUDA `triton`, which shadows the xpu build
+# (torch then reports "triton not found"). After `pip install -e .`, re-pin:
+#   pip uninstall -y triton triton-xpu && \
+#   pip install --pre triton-xpu --index-url https://download.pytorch.org/whl/nightly/xpu
+
+# GGUF metadata parsing for the loader and the config parsers.
+gguf >= 0.10.0
