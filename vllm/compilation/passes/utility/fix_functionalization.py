@@ -127,6 +127,14 @@ class FixFunctionalizationPass(VllmInductorPass):
             ]:
                 mutated_args = {1: "result"}
                 self.defunctionalize(graph, node, mutated_args)
+            elif at_target == torch.ops._C.cutlass_scaled_mm.default:
+                # CUTLASS writes its output tensor in place. Restore that
+                # mutation so later graph segments observe the same buffer.
+                self.defunctionalize(graph, node, {1: "out"})
+            elif at_target == torch.ops._C.static_scaled_fp8_quant.default:
+                # Dynamic FP8 model execution writes into its preallocated
+                # quantized activation buffer.
+                self.defunctionalize(graph, node, {1: "result"})
             elif (
                 hasattr(torch.ops.vllm, "flashinfer_trtllm_fused_allreduce_norm")
                 and at_target
