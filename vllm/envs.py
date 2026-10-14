@@ -307,6 +307,7 @@ if TYPE_CHECKING:
     VLLM_NIXL_EP_MAX_NUM_RANKS: int = 32
     VLLM_XPU_ENABLE_XPU_GRAPH: bool = False
     VLLM_XPU_PER_WORKER_AFFINITY: bool = True
+    VLLM_XPU_KEEP_UR_TRACING: bool = False
     VLLM_XPU_USE_SAMPLER_KERNEL: bool = True
     VLLM_NVFP4_LINEAR_PREFILL_DPAS: bool = False
     VLLM_NVFP4_DPAS_ROWS_CACHE: bool = False
@@ -2068,6 +2069,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # RAM through dma-buf sharing; see vllm/platforms/xpu_affinity.py).
     "VLLM_XPU_PER_WORKER_AFFINITY": lambda: bool(
         int(os.getenv("VLLM_XPU_PER_WORKER_AFFINITY", "1"))
+    ),
+    # Keep the Unified Runtime / XPTI tracing layer that XPU workers otherwise
+    # strip from their environment (vllm/platforms/xpu_env.py). Debug only.
+    "VLLM_XPU_KEEP_UR_TRACING": lambda: bool(
+        int(os.getenv("VLLM_XPU_KEEP_UR_TRACING", "0"))
     ),
     "VLLM_XPU_ENABLE_XPU_GRAPH": lambda: bool(
         int(os.getenv("VLLM_XPU_ENABLE_XPU_GRAPH", "0"))

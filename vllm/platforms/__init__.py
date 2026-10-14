@@ -103,6 +103,11 @@ def xpu_platform_plugin() -> str | None:
         # CUDA/ROCm/CPU torch builds never touch torch.xpu here.
         if not getattr(torch._C, "_has_xpu", False):
             return None
+        # Before the first torch.xpu call: the UR loader reads its layer
+        # configuration once, when torch.xpu initialises it.
+        from vllm.platforms.xpu_env import disable_ur_tracing
+
+        disable_ur_tracing()
         if torch.xpu.is_available() and torch.xpu.device_count() > 0:
             logger.debug("Confirmed XPU platform is available.")
             return "vllm.platforms.xpu.XPUPlatform"
