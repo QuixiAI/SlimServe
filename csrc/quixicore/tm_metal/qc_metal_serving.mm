@@ -4192,10 +4192,12 @@ at::Tensor ggml_moe_mm_id(const at::Tensor& x, const at::Tensor& w,
   // ids, so their slot rows would appear in no expert's ids list, neither
   // tile kernel would write them, and this pooled allocation would surface
   // them as stale memory (the vec kernels write T(0) for expert < 0).
-  // Negative ids only arise via expert_map indexing, and both Python
-  // callers gate this route on expert_map is None; a zeros fill here was
+  // Negative ids arise via expert_map indexing (both Python callers gate
+  // this route on expert_map is None) and from the Metal router's dropped
+  // slots (fused_moe remaps those onto unused experts with weight 0 before
+  // calling, _fill_dropped_router_ids); a zeros fill here was
   // measured at ~107 MB per call (~8.6 GB per 2176-token chunk step across
-  // layers) to defend that unreachable case, so the contract stays with
+  // layers) to defend that case, so the contract stays with
   // the caller.
   auto out = at::empty({tokens * top_k, (int64_t)N}, x.options());
   // Dual-half 64-slot tiles amortize one weight-dequant pass over two slot

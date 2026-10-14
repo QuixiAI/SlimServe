@@ -86,8 +86,10 @@ kernel void moe_router_topk(
     const float win_w = simd_broadcast(
         (best_i >= 0) ? score[best_i] : 0.0f, (ushort)(win_e & 31));
     if (best_i >= 0 && win_e == best_e) { sel[best_i] = -INFINITY; }
-    // No finite candidate left on any lane: the negative id the expert
-    // kernels treat as "write zeros", with weight 0.
+    // No finite candidate left on any lane: id -1 with weight 0. The vec
+    // expert kernels write zeros for it; the tiled mm routes need ids >= 0,
+    // so fused_moe remaps it onto an unused expert first
+    // (_fill_dropped_router_ids).
     const bool valid = win_e < E;
     if ((int)lane == k) { w_k = valid ? win_w : 0.0f; id_k = valid ? win_e : -1; }
   }

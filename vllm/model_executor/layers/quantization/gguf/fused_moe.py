@@ -69,6 +69,35 @@ def _moe_group_nb(slots: int) -> int:
     return nb if slots >= min_slots else 0
 
 
+def _fill_dropped_router_ids(topk_ids: torch.Tensor, num_experts: int) -> torch.Tensor:
+    """Remap dropped routes (id < 0) onto experts the token did not select.
+
+    The Metal router (moe_router_topk) emits id -1 with weight 0 for the
+    selection rounds left after a row ran out of finite scores, so the
+    dropped slots are a suffix of each row. ggml_moe_mm_id needs every id
+    >= 0 and unique per token; filling slot k of a row with j valid ids with
+    the (k - j)-th unselected expert keeps both, and the slot's weight is
+    already 0. Device-side only (no host sync); used on the prefill-width
+    mm routes, where its few [tokens, E] ops are negligible.
+    """
+    neg = topk_ids < 0
+    taken = torch.zeros(
+        (topk_ids.shape[0], num_experts), dtype=torch.float32, device=topk_ids.device
+    )
+    # scatter_add: dropped slots alias expert 0 with a 0 addend, which a
+    # plain scatter could let overwrite a real selection of expert 0.
+    taken.scatter_add_(1, topk_ids.clamp(min=0).long(), (~neg).to(taken.dtype))
+    k = topk_ids.shape[1]
+    # E >= k, so each row has at least k - j unselected experts and they
+    # rank first.
+    free = torch.topk(1.0 - taken, k, dim=1).indices
+    pos = (
+        torch.arange(k, device=topk_ids.device)[None, :]
+        - (~neg).sum(dim=1, keepdim=True)
+    ).clamp(min=0)
+    return torch.where(neg, free.gather(1, pos).to(topk_ids.dtype), topk_ids)
+
+
 def _qc_mm_min_tokens() -> int:
     """Token threshold where the Metal tiled MoE GEMM replaces the GEMV for
     w13 (llama.cpp's exact GEMV/GEMM crossover: n_tokens >= 32). The decode
@@ -867,9 +896,13 @@ def _fused_moe_gguf(
         # output is the same flat (token, slot) row order, so act() and the
         # down path are unchanged. No fused pair+SwiGLU tile: measured
         # negative twice (optimization_status 2026-08-13/14).
-        # ggml_moe_mm_id contract: every routed id must be >= 0 (its output
-        # rows for dropped ids would be stale pooled memory). Negative ids
-        # only arise via expert_map, so both mm routes require it be None.
+        # ggml_moe_mm_id contract: every routed id is >= 0 and unique within
+        # its token (its output rows for dropped ids would be stale pooled
+        # memory). Negative ids arise via expert_map, so both mm routes
+        # require it be None, and from the Metal router kernel, which emits
+        # id -1 with weight 0 for slots that had no finite score left; those
+        # are remapped onto unused experts (weight stays 0) before either mm
+        # call, the same zero contribution the vec kernels give id < 0.
         # The tile kernels stage fp16 operands (simdgroup half MMA); bf16
         # activations (GLM-5.3-Flash runs bf16) are cast once per call, the
         # same fp16 staging llama.cpp's mul_mm applies at prefill widths.
@@ -887,15 +920,17 @@ def _fused_moe_gguf(
             and num_tokens >= _qc_mm_min_tokens()
         )
         took_mm_w1 = w1_vec and use_mm_w1
+        mm_ids: torch.Tensor | None = None
         if took_mm_w1:
             logger.info_once(
                 "quixicore(metal): tiled MoE prefill GEMM active (w13 + w2)"
             )
+            mm_ids = _fill_dropped_router_ids(local_topk_ids, w1.shape[0])
             with _qc_phase("moe_mm_w13"):
                 out = ops.ggml_moe_mm_id(
                     x if x.dtype == torch.float16 else x.to(torch.float16),
                     w1,
-                    local_topk_ids,
+                    mm_ids,
                     top_k,
                     qweight_type,
                     N,
@@ -963,11 +998,13 @@ def _fused_moe_gguf(
             and num_tokens >= _qc_mm_min_tokens()
         )
         if use_mm_w2:
+            if mm_ids is None:
+                mm_ids = _fill_dropped_router_ids(local_topk_ids, w2.shape[0])
             with _qc_phase("moe_mm_w2"):
                 slots = ops.ggml_moe_mm_id(
                     out,
                     w2,
-                    local_topk_ids,
+                    mm_ids,
                     top_k,
                     qweight_type2,
                     w2.shape[1],
