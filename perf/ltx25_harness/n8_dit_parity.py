@@ -22,12 +22,9 @@ Usage: python n8_dit_parity.py <mode> ..."""
 import sys
 
 import numpy as np
+from paths import MODELS, UP
 
-UP = "/Users/seangherardi/.local/scratch/ltx25/upstream/packages"
-DIT = (
-    "/Users/seangherardi/models/ltx-2.5/official/diffusion_models/"
-    "ltx-2.5-22b-dev-transformer-bf16.safetensors"
-)
+DIT = f"{MODELS}/diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors"
 F, H, W, FPS = 3, 8, 12, 24.0
 FRAMES = (F - 1) * 8 + 1
 SIGMA = 0.7

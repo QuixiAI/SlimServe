@@ -15,11 +15,9 @@ gpu_run.py in venv-slimserve. Small on purpose: 3x8x8 latent (17 frames of
 import sys
 
 import numpy as np
+from paths import MODELS, UP
 
-UP = "/Users/seangherardi/.local/scratch/ltx25/upstream/packages"
-VAE = (
-    "/Users/seangherardi/models/ltx-2.5/official/vae/ltx-2.5-video-vae-bf16.safetensors"
-)
+VAE = f"{MODELS}/vae/ltx-2.5-video-vae-bf16.safetensors"
 F, H, W = 3, 8, 8
 FRAMES = [4, 12]
 

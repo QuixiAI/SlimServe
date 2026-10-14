@@ -17,10 +17,10 @@ plane at 48 with a pinned lead-in), two anchors, two new slots. Run `ref` in the
 import sys
 
 import numpy as np
+from paths import MODELS as ROOT
+from paths import SCRATCH, UP
 
-UP = "/Users/seangherardi/.local/scratch/ltx25/upstream/packages"
-STUB = "/Users/seangherardi/.local/scratch/ltx25/n11"
-ROOT = "/Users/seangherardi/models/ltx-2.5/official"
+STUB = f"{SCRATCH}/n11"
 DIT = f"{ROOT}/diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors"
 VAE = f"{ROOT}/vae/ltx-2.5-video-vae-bf16.safetensors"
 TUP = f"{ROOT}/latent_upscale_models/ltx-2.5-latent-temporal-upscaler-x2-bf16-1.0.safetensors"
@@ -30,7 +30,7 @@ PLANES = (24, 48)
 SEED = 7
 
 
-REAL = "/Users/seangherardi/.local/scratch/ltx25/n11/tr_real_inputs.npz"
+REAL = f"{SCRATCH}/n11/tr_real_inputs.npz"
 
 
 def inputs():

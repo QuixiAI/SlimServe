@@ -1791,7 +1791,7 @@
           }
         ]
       },
-      "shared_note": "Official Lightricks bf16 safetensors, loaded directly by slimserve/video/ltx25 (no converted pack). Gated: the Hugging Face token must have accepted Lightricks/LTX-2.5, and Lightricks/LTX-2.5-22b-IC-LoRA-Pixel-Spatial-Upscaler for the DFR quant. Nothing is quantized on M1-M4: bf16 converts to fp16 exactly and fp16 is the only matrix-multiply-accumulate those GPUs have.",
+      "shared_note": "Official Lightricks bf16 safetensors, loaded directly by slimserve/video/ltx25 (no converted pack). Licensed under Lightricks' LTX-2 Community License Agreement and gated: the Hugging Face token must have accepted Lightricks/LTX-2.5, and Lightricks/LTX-2.5-22b-IC-LoRA-Pixel-Spatial-Upscaler for the DFR quant (the IC-LoRA adapters a request names are gated the same way). Nothing is quantized on M1-M4: bf16 converts to fp16 exactly and fp16 is the only matrix-multiply-accumulate those GPUs have.",
       "quants": {
         "bf16-distilled": {
           "title": "bf16, distilled transformer",

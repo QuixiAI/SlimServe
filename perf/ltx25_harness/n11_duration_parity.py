@@ -13,12 +13,9 @@ Run `ref` in the torch env (conda vllm-mlx), `ours` in venv-slimserve."""
 import sys
 
 import numpy as np
+from paths import MODELS, UP
 
-UP = "/Users/seangherardi/.local/scratch/ltx25/upstream/packages"
-HEAD = (
-    "/Users/seangherardi/models/ltx-2.5/official/model_patches/"
-    "ltx-2.5-duration-head-bf16.safetensors"
-)
+HEAD = f"{MODELS}/model_patches/ltx-2.5-duration-head-bf16.safetensors"
 CASES = ("video", "audio", "both")
 
 

@@ -20,10 +20,10 @@ Usage: python n12_encoders_parity.py <mode> ...   (through gpu_run.py)"""
 import sys
 
 import numpy as np
+from paths import MODELS as ROOT
+from paths import SCRATCH, UP
 
-UP = "/Users/seangherardi/.local/scratch/ltx25/upstream/packages"
-STUB = "/Users/seangherardi/.local/scratch/ltx25/n11"  # oiio_stub
-ROOT = "/Users/seangherardi/models/ltx-2.5/official"
+STUB = f"{SCRATCH}/n11"  # oiio_stub
 AUDIO_VAE = f"{ROOT}/vae/ltx-2.5-audio-vae-bf16.safetensors"
 VIDEO_VAE = f"{ROOT}/vae/ltx-2.5-video-vae-conv-bf16.safetensors"
 TILES = ((24, 16), (256, 64))  # (frames tile, overlap), (pixels tile, overlap)

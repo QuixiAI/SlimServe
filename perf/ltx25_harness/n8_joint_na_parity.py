@@ -31,8 +31,9 @@ def inputs():
 
 def ref(out):
     import torch
+    from paths import SCRATCH
 
-    sys.path.insert(0, "/Users/seangherardi/.local/scratch/ltx25/n8")
+    sys.path.insert(0, f"{SCRATCH}/n8")
     from ltxkf.joint_eager import joint_na3d
 
     q, k, v, pq, pk, pv, times = (torch.from_numpy(a) for a in inputs())

@@ -15,9 +15,9 @@ HQ stage 1) and STAGE_2_DISTILLED_SIGMAS (the HQ stage 2)."""
 import sys
 
 import numpy as np
+from paths import REPO, SCRATCH, UP
 
-UP = "/Users/seangherardi/.local/scratch/ltx25/upstream/packages"
-STUB = "/Users/seangherardi/.local/scratch/ltx25/n11"
+STUB = f"{SCRATCH}/n11"
 NV, NA, C = 96, 12, 128
 SEED = 3
 
@@ -49,7 +49,7 @@ def ref(out):
     from ltx_core.types import LatentState
     from ltx_pipelines.utils.samplers import res2s_audio_video_denoising_loop
 
-    sys.path.append("/Users/seangherardi/Code/slimserve/SlimServe-ltx25")
+    sys.path.append(REPO)
     v, a, wv, wa = inputs()
     wv_t, wa_t = torch.from_numpy(wv).double(), torch.from_numpy(wa).double()
 

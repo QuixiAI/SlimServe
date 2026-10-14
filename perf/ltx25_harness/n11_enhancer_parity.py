@@ -29,14 +29,12 @@ import sys
 import time
 
 import numpy as np
+from paths import MODELS, REPO, SCRATCH
 
-ROOT = "/Users/seangherardi/models/ltx-2.5/official/prompt_enhancer/gemma-4-E2B-it"
-REPO = "/Users/seangherardi/Code/slimserve/SlimServe-ltx25"
+ROOT = f"{MODELS}/prompt_enhancer/gemma-4-E2B-it"
 # processor_config.json of google/gemma-4-E2B-it at the pinned revision (not
 # part of the registry manifest: our port reads what it needs from config.json)
-PROCESSOR_CONFIG = (
-    "/Users/seangherardi/.local/scratch/ltx25/gemma_aux/processor_config.json"
-)
+PROCESSOR_CONFIG = f"{SCRATCH}/gemma_aux/processor_config.json"
 
 
 def _processor(tk):
