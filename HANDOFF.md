@@ -711,7 +711,9 @@ upstream; drift check against the port branch).
   `mamba_ssm_cache_dtype` float32, `language_model_only`, glm45/glm47
   parsers). `tests/slimserve/test_profiles.py` 68 passed. The CLI gate on
   in-progress records now honours `SLIMSERVE_SERVE_IN_PROGRESS=1`
-  (warns instead of dying) so the campaign can boot the record.
+  (warns instead of dying) so the campaign can boot the record. (Removed
+  2026-10-14 in review: it was a generic bypass of the readiness gate for
+  every in-progress record; the gate dies again.)
 - 2026-09-10: header census from the first 64 MB of the download
   (`perf/results/2026-09-10/glm53f-q2-discovery/gguf_header_census.txt`,
   plus the embedded 8,617-char chat template as `chat_template.jinja`).
