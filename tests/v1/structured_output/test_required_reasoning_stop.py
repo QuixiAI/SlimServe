@@ -62,7 +62,8 @@ def test_required_reasoning_masks_stop_in_all_draft_and_bonus_rows(drafts):
     manager, request = build()
     mask, applied = manager.grammar_bitmask({"r": request}, ["r"], {"r": drafts})
     for row in range(len(drafts) + 1):
-        assert applied[row]
+        # Workers mask every row; the flag only feeds the draft mirror.
+        assert not applied[row]
         assert not allowed(mask, row, EOS)
         assert not allowed(mask, row, STOP)
         assert allowed(mask, row, TEXT)
@@ -75,6 +76,8 @@ def test_mid_window_reasoning_end_returns_eos_control_to_grammar():
         {"r": request}, ["r"], {"r": [TEXT, END_THINK, TEXT]}
     )
     assert [allowed(mask, row, EOS) for row in range(4)] == [False, False, True, True]
+    # Only rows the grammar itself constrained are flagged for the mirror.
+    assert applied.tolist() == [False, False, True, True]
 
 
 @pytest.mark.parametrize("required,ended", [(False, False), (True, True)])
@@ -91,7 +94,7 @@ def test_parallel_non_speculative_masking_and_reused_rows():
     with ThreadPoolExecutor(1) as executor:
         manager.executor_for_fillmask = executor
         mask, applied = manager.grammar_bitmask({"r": request}, ["r"], {})
-        assert applied[0]
+        assert not applied[0]
         assert not allowed(mask, 0, EOS)
         request.structured_output_request.params._required_tool_call = False
         mask, applied = manager.grammar_bitmask({"r": request}, ["r"], {})
@@ -142,3 +145,46 @@ def test_responses_tool_choice_reaches_required_metadata(choice, required):
     parser._tool_parser.get_structural_tag.return_value.model_dump.return_value = {}
     parser._apply_structural_tag(request)
     assert request.structured_outputs._required_tool_call is required
+
+
+def test_required_reasoning_rows_are_not_fed_to_draft_grammar_mirror():
+    # The scheduler's stop-masked reasoning rows reach the V2 spec-decode
+    # draft-grammar mirror through apply_rows. Flagging them would push
+    # reasoning tokens into the tool grammar, which rejects them and disables
+    # grammar-aware drafting for the rest of the request.
+    from vllm.v1.core.sched.output import GrammarOutput
+    from vllm.v1.worker.gpu.spec_decode.structured_output import (
+        DraftStructuredOutputState,
+    )
+
+    drafts = [TEXT, TEXT, TEXT]
+    manager, request = build()
+    mask, applied = manager.grammar_bitmask({"r": request}, ["r"], {"r": drafts})
+    assert not allowed(mask, 0, EOS)
+
+    verified = Mock()
+    verified.accept_tokens.return_value = False
+    draft = Mock()
+    state = object.__new__(DraftStructuredOutputState)
+    state.manager = SimpleNamespace()
+    state.worker = SimpleNamespace()
+    structured = SimpleNamespace(grammar=verified)
+    state.requests = {"r": SimpleNamespace(structured_output_request=structured)}
+    state.draft_grammars = {"r": draft}
+    state.verified_tokens = {"r": []}
+    state.draft_active = set()
+    state.draft_disabled = set()
+    num_rows = len(drafts) + 1
+    state.advance_verified(
+        SimpleNamespace(
+            req_ids=["r"], cu_num_logits_np=np.array([0, num_rows], dtype=np.int32)
+        ),
+        sampled_token_ids=torch.tensor([[TEXT] * num_rows]),
+        num_sampled=torch.tensor([num_rows]),
+        grammar_output=GrammarOutput(["r"], mask, apply_rows=applied),
+    )
+    verified.accept_tokens.assert_not_called()
+    draft.accept_tokens.assert_not_called()
+    assert state.verified_tokens["r"] == []
+    assert state.draft_active == set()
+    assert state.draft_disabled == set()

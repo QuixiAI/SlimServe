@@ -422,15 +422,17 @@ class StructuredOutputManager:
         apply_rows = self._apply_rows[:cumulative_index].copy()
         bitmask_array = bitmask_tensor.numpy()
         # Required calls may reason freely, but cannot stop before the tool
-        # grammar becomes active. Mark these rows for the worker to apply even
-        # though their masks were initially filled as unrestricted reasoning.
+        # grammar becomes active. The workers apply every row's mask (V1
+        # apply_grammar_bitmask, V2 apply_grammar_bitmask_rows), so clearing
+        # the stop bits is enough. apply_rows stays False: it tells the V2
+        # spec-decode draft-grammar mirror which sampled tokens the grammar
+        # constrained, and these reasoning tokens must not be fed to it.
         for row, stop_ids in reasoning_stop_rows:
             for token in stop_ids:
                 word, bit = divmod(token, 32)
                 if 0 <= word < bitmask_array.shape[1]:
                     clear_bit = 0x7FFFFFFF if bit == 31 else ~(1 << bit)
                     bitmask_array[row, word] &= clear_bit
-                    apply_rows[row] = True
         return bitmask_array, apply_rows
 
     def should_fill_bitmask(self, request: "Request") -> bool:
