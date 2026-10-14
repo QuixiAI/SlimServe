@@ -211,6 +211,9 @@ def qwen3_config(
         # grammar. Conversion keeps the last value, so an earlier JSON
         # prefix is not stable. Emit arguments once the call closes; tool
         # headers, reasoning, and normal content still stream incrementally.
+        # nemotron_v3_config (dataclasses.replace over this config) and
+        # SeedOssParser (subclasses Qwen3Parser) inherit this setting, so
+        # they also stop streaming argument deltas.
         stream_arg_deltas=False,
         strip_trailing_reasoning_whitespace=False,
         tool_args_json=False,
