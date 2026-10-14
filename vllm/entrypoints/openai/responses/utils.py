@@ -256,6 +256,29 @@ def _response_output_message_text(item: ResponseOutputMessage) -> str:
     )
 
 
+def _response_content_parts_text(parts: list) -> str | None:
+    """Untyped (dict) counterpart of `_response_output_message_text`.
+
+    Joins every text and refusal part in order, so a dict assistant message
+    replays exactly like a typed one. Returns None when a part carries
+    neither, leaving the item to the caller's generic handling.
+    """
+    texts: list[str] = []
+    for part in parts:
+        if isinstance(part, dict):
+            text = part.get("text")
+            if not isinstance(text, str):
+                text = part.get("refusal")
+        else:
+            text = getattr(part, "text", None)
+            if not isinstance(text, str):
+                text = getattr(part, "refusal", None)
+        if not isinstance(text, str):
+            return None
+        texts.append(text)
+    return "".join(texts)
+
+
 def _construct_message_from_response_item(
     item: ResponseInputOutputItem,
     prev_msg: ChatCompletionMessageParam | None = None,
@@ -386,17 +409,15 @@ def _construct_message_from_response_item(
         text: str | None = None
         if isinstance(content, str):
             text = content
-        elif content == []:
-            text = ""
-        elif isinstance(content, list) and content:
-            text = content[0].get("text")
+        elif isinstance(content, list):
+            text = _response_content_parts_text(content)
         if text is not None:
             if prev_assistant_msg:
                 previous_content = prev_assistant_msg.get("content")
                 if previous_content is None:
                     prev_assistant_msg["content"] = text
                     return None
-                if text == "" and (not isinstance(content, list) or len(content) <= 1):
+                if text == "":
                     return None
             return {"role": "assistant", "content": text}
     return item  # type: ignore[arg-type]
