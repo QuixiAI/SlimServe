@@ -175,11 +175,15 @@ def load_aware_call(func):
                 raw_request.app.state.server_load_metrics -= 1
             raise
 
+        keepalive_interval = envs.VLLM_SSE_KEEPALIVE_INTERVAL_S
         if (
-            isinstance(response, StreamingResponse)
+            keepalive_interval > 0
+            and isinstance(response, StreamingResponse)
             and response.media_type == "text/event-stream"
         ):
-            response.body_iterator = sse_with_keepalive(response.body_iterator)
+            response.body_iterator = sse_with_keepalive(
+                response.body_iterator, interval_seconds=keepalive_interval
+            )
 
         if not load_tracking:
             return response

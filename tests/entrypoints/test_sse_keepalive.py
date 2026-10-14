@@ -58,3 +58,32 @@ def test_sse_keepalive_rejects_nonpositive_interval() -> None:
             await anext(stream)
 
     asyncio.run(run())
+
+
+def _sse_endpoint():
+    from types import SimpleNamespace
+
+    from fastapi.responses import StreamingResponse
+
+    from vllm.entrypoints.serve.utils.api_utils import load_aware_call
+
+    async def body():
+        yield "data: event\n\n"
+
+    @load_aware_call
+    async def endpoint(request, raw_request):
+        return StreamingResponse(body(), media_type="text/event-stream")
+
+    raw_request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace()))
+    return endpoint, raw_request
+
+
+@pytest.mark.parametrize("interval, wrapped", [("30", True), ("0", False)])
+def test_sse_keepalive_interval_from_env(monkeypatch, interval, wrapped) -> None:
+    monkeypatch.setenv("VLLM_SSE_KEEPALIVE_INTERVAL_S", interval)
+    endpoint, raw_request = _sse_endpoint()
+    response = asyncio.run(endpoint(None, raw_request=raw_request))
+    is_wrapped = getattr(response.body_iterator, "__name__", "") == (
+        "sse_with_keepalive"
+    )
+    assert is_wrapped is wrapped
