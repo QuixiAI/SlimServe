@@ -10,9 +10,11 @@ import shutil
 import numpy as np
 import pytest
 
-from slimserve.video import server
-from slimserve.video.ltx25 import image as image_mod
-from slimserve.video.ltx25 import sampling
+mx = pytest.importorskip("mlx.core")  # the stills reach MLX latents
+
+from slimserve.video import server  # noqa: E402
+from slimserve.video.ltx25 import image as image_mod  # noqa: E402
+from slimserve.video.ltx25 import sampling  # noqa: E402
 
 CFG = {
     "pipeline": "distilled",
