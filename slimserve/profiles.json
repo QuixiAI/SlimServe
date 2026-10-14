@@ -1865,7 +1865,6 @@
           ]
         }
       },
-      "chat_template_asset": "qwen38_tool_calling.jinja",
       "format": "safetensors"
     }
   },
@@ -3701,16 +3700,18 @@
             "VLLM_XPU_TRITON_ATTN_NUM_PAR_SOFTMAX_SEGMENTS": "16"
           },
           "notes": [
-            "Disable Triton tensor descriptors on B70: the repaired attention path passed ragged-tail reference tests, and the 2026-09-19 local c8 tool workload measured 97.8 tok/s with descriptors versus 205.5 tok/s without. See perf/optimization_status.md for scope and raw evidence.",
+            "Disable Triton tensor descriptors on B70 (VLLM_TRITON_USE_TD=0): on the out-of-tree B70 integration branch the descriptor path was markedly slower on a c8 tool workload. Historical and unverified here: no raw artifacts are in this repository, so re-measure once the XPU backend lands.",
             "The checkpoint is serialized offline FP8; do not add --quantization fp8, which is reserved here for online conversion of BF16 weights.",
             "linear_backend=xpu selects XPUFp8BlockScaledMMKernel for the checkpoint 128x128 block scales; benchmark triton as the small-batch fallback.",
             "FULL_DECODE_ONLY breakable graphs with VLLM_XPU_ENABLE_XPU_GRAPH=0 were validated on TP4 and improved aggregate output throughput at concurrency 1, 8, and 32; keep this mode.",
-            "Native MTP k=3 uses token-width-aware graph sizes; its matched baseline peaked at 72.4, 219.2, and 321.4 aggregate output tok/s for concurrency 1, 8, and 32. The full coding evaluation is the current promotion gate; earlier synthetic measurements are not a correctness qualification.",
+            "Native MTP k=3 uses token-width-aware graph sizes (multiples of the 4-token verification width). Throughput for this recipe was only measured on the out-of-tree B70 integration branch, with no raw artifacts here; it is historical and unverified until re-measured through this profile. The full coding evaluation is the promotion gate.",
             "FP8 E4M3 KV uses weight savings for cache capacity; the checkpoint has no calibrated KV scales, so vLLM uses 1.0.",
             "The source repository is gated. Fully present local files skip fetching; automatic repair requires an authenticated Hugging Face fetch path.",
             "The profile supplies a 2000-token thinking default for all reasoning efforts except none; an explicit request budget, including -1 for unlimited, takes precedence.",
-            "The 2026-09-19 local c8 workload passed, but subsequent live traffic stalled with sample_tokens RPC timeout. Long-running stability remains unqualified; see docs/deployment/qwen38-b70.md.",
-            "This recipe is gated pending fresh qualification on current main; earlier measurements apply only to the saved B70 integration checkout."
+            "On the out-of-tree integration branch a local c8 workload passed, but later live traffic stalled with a sample_tokens RPC timeout. Long-running stability remains unqualified.",
+            "This recipe is gated pending fresh qualification on current main; earlier measurements apply only to the saved B70 integration checkout.",
+            "Chat template: the checked-in Qwen3.8 tool-calling template (qwen38_tool_calling.jinja) arrives with PR #61; until then this record serves the checkpoint's own chat_template.jinja. Wire chat_template_asset into the source once that template is on main.",
+            "CPU-offloaded KV (the HostTierConnector host tier), the standing goal for every non-Metal profile, is deferred until the XPU serving backend exists; the connector has not been generalized to or validated on XPU."
           ],
           "platform": "b70",
           "status": "in-progress",

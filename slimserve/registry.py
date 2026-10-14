@@ -600,9 +600,13 @@ def resolve(
         merged["engine"].setdefault(key, copy.deepcopy(value))
 
     if template_asset := source.get("chat_template_asset"):
-        merged["engine"].setdefault(
-            "chat_template", str(CHAT_TEMPLATE_DIR / template_asset)
-        )
+        template_path = CHAT_TEMPLATE_DIR / template_asset
+        if not template_path.is_file():
+            raise ProfileError(
+                f"{source['title']} names chat template {template_asset!r}, "
+                f"which is not checked in under {CHAT_TEMPLATE_DIR}"
+            )
+        merged["engine"].setdefault("chat_template", str(template_path))
 
     plan = Plan(
         profile_id=profile_id,
