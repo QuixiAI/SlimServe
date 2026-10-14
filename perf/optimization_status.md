@@ -1,5 +1,39 @@
 # SlimServe Optimization Status
 
+## 2026-10-14 - glm53f-q2-1 review round: record back to in-progress; benchmarks were greedy
+
+- Status: review fixes, no performance claim. No Metal rebuild and no
+  serving run on this box (Linux, no Metal toolchain); CPU tests only.
+- Benchmarks: every glm53f-q2-1 number in this notebook and in
+  baseline_status (N0 through the 2026-09-25 release gates, the concurrent
+  curve and the ds4 comparison) was measured at temperature 0. Policy is
+  temperature 1.0 / top_p 0.95 / top_k 20, seeded; all of them must be
+  rerun that way before they count as baselines. The greedy exact-token
+  pins remain useful as numerics regression checks.
+- Record: `glm53f-q2-1` is `in-progress` again (status_reason /
+  status_detail list the items): vision off (language_model_only), context
+  131072 against the GGUF's 1048576 with no stated impossibility, a
+  measured 0.0% prefix-cache hit rate on the hybrid layout (2026-09-15
+  entry), and the greedy-only benchmarks. Engine settings unchanged.
+- Correctness fixes: (1) the windowed KV scatter (sparse MLA latent rows
+  and the GLM-5 indexer cache) parked out-of-window rows with a 0/1-mask
+  sum, so an Inf in a non-hit row became NaN in a live KV row; it now
+  selects the hit row (CPU test with Inf rows, fails on the old form).
+  (2) The Metal router's id -1 (weight 0) slots are remapped onto unused
+  experts before the tiled ggml_moe_mm_id routes, whose contract needs
+  ids >= 0 and unique per token (CPU test). Neither is measured on Metal
+  yet: rerun the exact-token gates and teacher-forced checks on the next
+  Metal build to confirm the pins hold (the scatter fix is
+  value-identical for finite rows; the id remap only touches rows that
+  had no finite router score).
+- Removed: the `SLIMSERVE_SERVE_IN_PROGRESS=1` readiness-gate bypass in
+  the CLI. Untracked: 316 force-added files under perf/results/ (raw
+  artifacts stay local per perf.md). The W1-W26 gate log moved here from
+  baseline_status (entry "2026-09-15 - glm53f-q2-1 W1-W26 gate log").
+- Next: on the M1 Ultra, rebuild the metallib, rerun the release gates,
+  then the c=1..32 curve at 1.0/0.95/20 seeded, and close the vision,
+  context and prefix-cache items before returning the record to supported.
+
 ## 2026-09-25 - glm53f-q2-1 release gates on the merged build; 2500x64 pin roll
 
 - Baseline: pins 7dd30ea193a6 / 393882a2ddaf / 1d7d58486dc7, c=1 400-out
