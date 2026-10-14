@@ -46,6 +46,11 @@ class WorkerProfiler(ABC):
         """Start the profiler."""
         pass
 
+    @property
+    def is_running(self) -> bool:
+        """Whether profiling is recording, rather than merely configured/armed."""
+        return self._running
+
     @abstractmethod
     def _stop(self) -> None:
         """Stop the profiler."""

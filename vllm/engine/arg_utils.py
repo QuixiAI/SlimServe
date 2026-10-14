@@ -534,6 +534,7 @@ class EngineArgs:
     data_parallel_address: str | None = None
     data_parallel_rpc_port: int | None = None
     data_parallel_hybrid_lb: bool = False
+    data_parallel_replicate_moe: bool = ParallelConfig.data_parallel_replicate_moe
     data_parallel_external_lb: bool = False
     data_parallel_multi_port_external_lb: bool = False
     data_parallel_backend: DataParallelBackend = ParallelConfig.data_parallel_backend
@@ -1146,6 +1147,10 @@ class EngineArgs:
             "--data-parallel-hybrid-lb",
             "-dph",
             **parallel_kwargs["data_parallel_hybrid_lb"],
+        )
+        parallel_group.add_argument(
+            "--data-parallel-replicate-moe",
+            **parallel_kwargs["data_parallel_replicate_moe"],
         )
         parallel_group.add_argument(
             "--data-parallel-external-lb",
@@ -2246,6 +2251,7 @@ class EngineArgs:
             data_parallel_rpc_port=data_parallel_rpc_port,
             data_parallel_backend=self.data_parallel_backend,
             data_parallel_hybrid_lb=self.data_parallel_hybrid_lb,
+            data_parallel_replicate_moe=self.data_parallel_replicate_moe,
             is_moe_model=model_config.is_moe,
             enable_expert_parallel=self.enable_expert_parallel,
             enable_ep_weight_filter=self.enable_ep_weight_filter,

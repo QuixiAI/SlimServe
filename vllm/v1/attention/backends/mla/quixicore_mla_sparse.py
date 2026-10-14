@@ -27,7 +27,7 @@ from typing import ClassVar
 
 import torch
 
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mla_attention import get_mla_dims
@@ -47,6 +47,95 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 logger = init_logger(__name__)
 
 
+def _page_stride_bytes(kv_cache: torch.Tensor) -> int:
+    """Byte stride between consecutive blocks' pages, or 0 when the pages are
+    dense. The packed cross-layer slab (host KV tier) interleaves every
+    layer's page per block, so a layer's [num_blocks, block_size, ...] view
+    has stride(0) > page bytes; flattening it with reshape(-1) would COPY
+    the whole layer cache on every call (silently, per layer, per step)."""
+    if kv_cache.is_contiguous():
+        return 0
+    return kv_cache.stride(0) * kv_cache.element_size()
+
+
+_BF16_PARTITION = 128
+_BF16_PARTITION_SCRATCH_CAP = 512 << 20  # bytes of fp32 partials
+
+
+def _sparse_tc_option(config, heads):
+    """Compiler-hashed explicit opt-in; other profiles keep native dispatch."""
+    enabled = (config.additional_config or {}).get("glm5_next_sparse_tc_decode", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("glm5_next_sparse_tc_decode must be a boolean")
+    if enabled:
+        from vllm.platforms import current_platform
+
+        if not (current_platform.is_cuda()
+                and current_platform.is_device_capability((8, 0))):
+            raise ValueError("Sparse tensor-core decode is qualified only on SM80")
+        if heads not in (8, 16):
+            # The Triton kernel tiles 16 query rows per token: 8 heads (TP8)
+            # half-masked or 16 heads (TP4) full.
+            raise ValueError("Sparse tensor-core decode requires 8 or 16 heads per rank")
+        # Speculative batches are ordinary query rows to this path (each row
+        # carries its own selected-index list); _sparse_tc_split still bounds
+        # the rows per launch and falls back to the native kernel above it.
+    return enabled
+
+
+_SPARSE_PREFILL: bool | None = None
+
+
+def _sparse_prefill_enabled() -> bool:
+    """Profile flag additional_config.glm5_next_sparse_prefill (default on),
+    env VLLM_QC_SPARSE_PREFILL=0/1 overrides for A/B runs."""
+    global _SPARSE_PREFILL
+    if _SPARSE_PREFILL is None:
+        import os
+
+        env = os.getenv("VLLM_QC_SPARSE_PREFILL")
+        if env is not None:
+            _SPARSE_PREFILL = env == "1"
+        else:
+            try:
+                from vllm.config import get_current_vllm_config
+
+                extra = get_current_vllm_config().additional_config or {}
+                _SPARSE_PREFILL = bool(extra.get("glm5_next_sparse_prefill", True))
+            except Exception:
+                _SPARSE_PREFILL = True
+    return _SPARSE_PREFILL
+
+
+def _sparse_tc_split(enabled, q, cache, metadata):
+    # Shape/metadata decisions are CPU-only and stable under CUDA graph replay.
+    # Prefill and unqualified shapes retain the native bounded-scratch path.
+    if (enabled and metadata.num_prefills == 0 and 0 < q.shape[0] <= 32
+            and q.shape[1] in (8, 16) and q.shape[2] == 512
+            and q.dtype == torch.bfloat16
+            and cache.dtype in (torch.bfloat16, torch.uint8, torch.float8_e4m3fn)
+            and cache.shape[-1] == 512):
+        return 32 if q.shape[0] < 8 else 128
+    return 0
+
+
+def _bf16_partition(q: torch.Tensor, idx: torch.Tensor) -> int:
+    """Partition size for the bf16 sparse decode launches.
+
+    Partitioning exists to expose parallelism at small token counts (a
+    decode step is B x H warps, 8 at TP8/c1). Its scratch is
+    B x H x P x 512 fp32; this MQA path also serves prefill chunks, where
+    B is thousands of tokens and the scratch reached 3.4 GiB and OOMed
+    glm52-q2k-8 (2026-09-03). Above the cap the unpartitioned launch is
+    already B x H warps wide, so partition only while the scratch is small.
+    """
+    B, H = q.shape[0], q.shape[1]
+    P = (idx.shape[1] + _BF16_PARTITION - 1) // _BF16_PARTITION
+    if B * H * P * 512 * 4 > _BF16_PARTITION_SCRATCH_CAP:
+        return 0
+    return _BF16_PARTITION
+
+
 class QuixiCoreMLASparseBackend(AttentionBackend):
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
     # The sparse decode kernel reads the latent cache as packed e4m3 + scales
@@ -60,7 +149,15 @@ class QuixiCoreMLASparseBackend(AttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        return [64]
+        # Every kernel on this path takes the block size at runtime (the
+        # sparse decode resolves indices through the block table with a
+        # runtime block_size; the prefill gather and the indexer likewise),
+        # so the kernel block may equal the KV-manager block. That matters
+        # for hybrid GLM-5.3 (KDA + MLA): mamba alignment raises the KV
+        # block to 576/1088 tokens, and a 64-token kernel block would split
+        # each KV page into 9-17 kernel pages, which the packed cross-layer
+        # slab (host KV tier) cannot express as a single strided view.
+        return [MultipleOf(64)]
 
     @staticmethod
     def get_name() -> str:
@@ -275,6 +372,7 @@ class QuixiCoreMLASparseImpl(MLAAttentionImpl[QuixiCoreMLASparseMetadata]):
         self.kv_cache_dtype = kv_cache_dtype
         self.kv_lora_rank: int = mla_args["kv_lora_rank"]
         self.softmax_scale = float(scale)
+        self._sparse_tc_decode = _sparse_tc_option(get_current_vllm_config(), num_heads)
         # Host copy of layer._k_scale. Reading it per call would be a D2H sync,
         # which CUDA graph capture rejects; the scale is fixed once weights are
         # loaded, so it is cached on first use during eager warmup.
@@ -351,14 +449,33 @@ class QuixiCoreMLASparseImpl(MLAAttentionImpl[QuixiCoreMLASparseMetadata]):
 
         if kv_c_and_k_pe_cache.dtype == torch.bfloat16:
             if q.shape[-1] == 512:
+                tc_split = _sparse_tc_split(
+                    self._sparse_tc_decode, q, kv_c_and_k_pe_cache, attn_metadata
+                )
+                if tc_split:
+                    from vllm.quixicore.sparse_mla_tc import sparse_tc_nope
+
+                    return sparse_tc_nope(
+                        q, kv_c_and_k_pe_cache, bt, idx, tlen,
+                        self.softmax_scale, split=tc_split,
+                    ), None
                 # NoPE MLA (glm5_next): no rope segment, 512-wide latents.
+                # Partitioned (128 -> 17 partitions at the 2080-wide list):
+                # the one-warp-per-(head, token) walk was 155 ms/token at
+                # TP8 with the 2048 top-k (8 warps per rank). Microbench
+                # H=8 L=2048: unpartitioned 1138 us, P256 138 us, P128 74 us
+                # per call with the vectorized bf16 row path.
                 return quixicore_ops.mla_decode_bf16_sparse_nope(
-                    q, kv_c_and_k_pe_cache.reshape(-1), bt, idx, tlen,
+                    q, kv_c_and_k_pe_cache, bt, idx, tlen,
                     attn_metadata.block_size, self.softmax_scale,
+                    partition_size=_bf16_partition(q, idx),
+                    page_stride_bytes=_page_stride_bytes(kv_c_and_k_pe_cache),
                 ), None
             return quixicore_ops.mla_decode_bf16_sparse_glm(
-                q, kv_c_and_k_pe_cache.reshape(-1), bt, idx, tlen,
+                q, kv_c_and_k_pe_cache, bt, idx, tlen,
                 attn_metadata.block_size, self.softmax_scale,
+                partition_size=_bf16_partition(q, idx),
+                page_stride_bytes=_page_stride_bytes(kv_c_and_k_pe_cache),
             ), None
 
         if self._k_scale_host is None:
@@ -378,7 +495,7 @@ class QuixiCoreMLASparseImpl(MLAAttentionImpl[QuixiCoreMLASparseMetadata]):
             out = quixicore_ops.mla_decode_fp8_sparse_glm_splitq(
                 splitq[0],
                 splitq[1],
-                kv_c_and_k_pe_cache.view(torch.uint8).reshape(-1),
+                kv_c_and_k_pe_cache.view(torch.uint8),
                 bt,
                 idx,
                 tlen,
@@ -386,6 +503,7 @@ class QuixiCoreMLASparseImpl(MLAAttentionImpl[QuixiCoreMLASparseMetadata]):
                 self.softmax_scale,
                 k_scale,
                 partition_size=256,
+                page_stride_bytes=_page_stride_bytes(kv_c_and_k_pe_cache),
             )
             _sparse_nan_debug(
                 out, splitq[0].transpose(0, 1), kv_c_and_k_pe_cache, bt, idx,
@@ -393,9 +511,47 @@ class QuixiCoreMLASparseImpl(MLAAttentionImpl[QuixiCoreMLASparseMetadata]):
             )
             return out, None
 
+        if q.shape[-1] == 512:
+            # Prefill chunks: groups of 4 consecutive queries attend on tensor
+            # cores over the union of their selected pools (2026-09-12: the
+            # per-token decode kernel was 39% of prefill time). Env-gated
+            # VLLM_QC_SPARSE_PREFILL until the serving gates pass.
+            if (
+                _sparse_prefill_enabled()
+                and attn_metadata.num_prefills > 0
+                and q.shape[1] == 16
+            ):
+                return quixicore_ops.mla_sparse_prefill_fp8(
+                    q, kv_c_and_k_pe_cache.view(torch.uint8), bt, idx, tlen,
+                    attn_metadata.block_size, self.softmax_scale, k_scale,
+                    _page_stride_bytes(kv_c_and_k_pe_cache),
+                ), None
+            tc_split = _sparse_tc_split(
+                self._sparse_tc_decode, q, kv_c_and_k_pe_cache, attn_metadata
+            )
+            if tc_split:
+                from vllm.quixicore.sparse_mla_tc import sparse_tc_nope
+                return sparse_tc_nope(
+                    q, kv_c_and_k_pe_cache.view(torch.uint8), bt, idx, tlen,
+                    self.softmax_scale, split=tc_split, kv_scale=k_scale,
+                ), None
+            # NoPE MLA (glm5_next) over an fp8 latent: the NFP8=512
+            # instantiation of the bf16 NoPE kernel, same partition heuristic.
+            return quixicore_ops.mla_decode_fp8_sparse_nope(
+                q,
+                kv_c_and_k_pe_cache.view(torch.uint8),
+                bt,
+                idx,
+                tlen,
+                attn_metadata.block_size,
+                self.softmax_scale,
+                k_scale,
+                partition_size=_bf16_partition(q, idx),
+                page_stride_bytes=_page_stride_bytes(kv_c_and_k_pe_cache),
+            ), None
         out = quixicore_ops.mla_decode_fp8_sparse_glm(
             q,
-            kv_c_and_k_pe_cache.view(torch.uint8).reshape(-1),
+            kv_c_and_k_pe_cache.view(torch.uint8),
             bt,
             idx,
             tlen,
@@ -403,6 +559,7 @@ class QuixiCoreMLASparseImpl(MLAAttentionImpl[QuixiCoreMLASparseMetadata]):
             self.softmax_scale,
             k_scale,
             partition_size=256,
+            page_stride_bytes=_page_stride_bytes(kv_c_and_k_pe_cache),
         )
         _sparse_nan_debug(out, q, kv_c_and_k_pe_cache, bt, idx, tlen,
                           attn_metadata)

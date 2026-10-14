@@ -31,6 +31,7 @@ from vllm.entrypoints.openai.engine.protocol import (
     validate_structural_tag_response_format,
     validate_structured_outputs_structural_tag,
 )
+from vllm.entrypoints.openai.tool_thinking_compat import apply_tool_thinking_compat
 from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob
@@ -553,6 +554,11 @@ class ChatCompletionRequest(OpenAIBaseModel):
         user_kwargs = self.chat_template_kwargs or {}
         if self.reasoning_effort is not None and "enable_thinking" not in user_kwargs:
             extra_kwargs["enable_thinking"] = self.reasoning_effort != "none"
+        apply_tool_thinking_compat(
+            tools=self.tools,
+            user_kwargs=user_kwargs,
+            extra_kwargs=extra_kwargs,
+        )
 
         return ChatParams(
             chat_template=self.chat_template or default_template,

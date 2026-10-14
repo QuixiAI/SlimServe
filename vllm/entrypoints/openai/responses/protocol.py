@@ -64,6 +64,7 @@ from vllm.entrypoints.chat_utils import (
     ChatTemplateContentFormatOption,
 )
 from vllm.entrypoints.openai.engine.protocol import OpenAIBaseModel
+from vllm.entrypoints.openai.tool_thinking_compat import apply_tool_thinking_compat
 from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
 from vllm.renderers import ChatParams, TokenizeParams, merge_kwargs
@@ -339,6 +340,11 @@ class ResponsesRequest(OpenAIBaseModel):
                 extra_kwargs["thinking"] = reasoning_enabled
             if "reasoning_strength" not in user_kwargs:
                 extra_kwargs["reasoning_strength"] = reasoning_effort
+        apply_tool_thinking_compat(
+            tools=self.tools,
+            user_kwargs=user_kwargs,
+            extra_kwargs=extra_kwargs,
+        )
 
         return ChatParams(
             chat_template=default_template,
@@ -622,6 +628,10 @@ class ResponsesRequest(OpenAIBaseModel):
         is_named_tool_choice = isinstance(tool_choice, dict) and tool_choice.get(
             "type"
         ) in ("function", "custom")
+        is_allowed_tool_choice = (
+            isinstance(tool_choice, dict)
+            and tool_choice.get("type") == "allowed_tools"
+        )
 
         if not has_tools:
             if tool_choice in ("auto", "none"):
@@ -634,6 +644,11 @@ class ResponsesRequest(OpenAIBaseModel):
             elif is_named_tool_choice:
                 raise VLLMValidationError(
                     "Named tool choice not found in 'tools' parameter.",
+                    parameter="tool_choice",
+                )
+            elif is_allowed_tool_choice:
+                raise VLLMValidationError(
+                    "Allowed tool choice must be specified with 'tools' parameter.",
                     parameter="tool_choice",
                 )
         elif is_named_tool_choice and tools is not None:
@@ -656,6 +671,79 @@ class ResponsesRequest(OpenAIBaseModel):
                     "Named tool choice not found in 'tools' parameter.",
                     parameter="tool_choice",
                 )
+        elif is_allowed_tool_choice and tools is not None:
+            allowed_refs = tool_choice.get("tools")
+            if not isinstance(allowed_refs, list):
+                return data
+            if tool_choice.get("mode") == "required" and not allowed_refs:
+                raise VLLMValidationError(
+                    "Allowed tool choice with mode 'required' must contain at "
+                    "least one tool.",
+                    parameter="tool_choice",
+                )
+
+            declared_types: set[str] = set()
+            declared_named_tools: set[tuple[str, str]] = set()
+            for tool in tools:
+                if isinstance(tool, dict):
+                    tool_type = tool.get("type")
+                    tool_name = tool.get("name")
+                    if isinstance(tool_type, str):
+                        declared_types.add(tool_type)
+                    if tool_type in ("function", "custom") and isinstance(
+                        tool_name, str
+                    ):
+                        declared_named_tools.add((tool_type, tool_name))
+                    elif tool_type == "namespace":
+                        for namespaced_tool in tool.get("tools", []):
+                            if not isinstance(namespaced_tool, dict):
+                                continue
+                            nested_type = namespaced_tool.get("type")
+                            nested_name = namespaced_tool.get("name")
+                            if nested_type == "function" and isinstance(
+                                nested_name, str
+                            ):
+                                declared_named_tools.add(
+                                    ("function", nested_name)
+                                )
+                                if isinstance(tool_name, str):
+                                    declared_named_tools.add(
+                                        (
+                                            "function",
+                                            f"{tool_name}__{nested_name}",
+                                        )
+                                    )
+                else:
+                    tool_type = getattr(tool, "type", None)
+                    tool_name = getattr(tool, "name", None)
+                    if isinstance(tool_type, str):
+                        declared_types.add(tool_type)
+                    if tool_type in ("function", "custom") and isinstance(
+                        tool_name, str
+                    ):
+                        declared_named_tools.add((tool_type, tool_name))
+
+            for tool_ref in allowed_refs:
+                if not isinstance(tool_ref, dict):
+                    continue
+                ref_type = tool_ref.get("type")
+                ref_name = tool_ref.get("name")
+                if ref_type in ("function", "custom"):
+                    if (
+                        not isinstance(ref_name, str)
+                        or (ref_type, ref_name) not in declared_named_tools
+                    ):
+                        raise VLLMValidationError(
+                            "Allowed tool choice references a tool not found in "
+                            "the 'tools' parameter.",
+                            parameter="tool_choice",
+                        )
+                elif isinstance(ref_type, str) and ref_type not in declared_types:
+                    raise VLLMValidationError(
+                        "Allowed tool choice references a tool type not found in "
+                        "the 'tools' parameter.",
+                        parameter="tool_choice",
+                    )
 
         return data
 

@@ -153,6 +153,14 @@ class ParallelConfig:
     models should use independent vLLM instances without --data-parallel-*
     arguments. Set implicitly when --data-parallel-rank is provided explicitly
     to vllm serve."""
+    data_parallel_replicate_moe: bool = False
+    """True data parallelism for MoE models: every DP replica holds the full
+    expert set sharded over its own tensor-parallel group, so there is no
+    cross-replica MoE dispatch, no DP token-count sync per step and no
+    lockstep dummy stepping of idle replicas. Costs dp_size x the expert
+    weight memory of the default (which shards experts across all DP x TP
+    ranks and all-gathers tokens across replicas every MoE layer). Not
+    compatible with expert parallelism."""
     data_parallel_hybrid_lb: bool = False
     """Whether to use "hybrid" DP LB mode. Applies only to online serving
     and when data_parallel_size > 0. Enables running an AsyncLLM
@@ -481,6 +489,12 @@ class ParallelConfig:
         if self.data_parallel_size <= 1 and self.data_parallel_external_lb:
             raise ValueError(
                 "data_parallel_external_lb can only be set when data_parallel_size > 1"
+            )
+
+        if self.data_parallel_replicate_moe and self.enable_expert_parallel:
+            raise ValueError(
+                "data_parallel_replicate_moe keeps every expert on each DP "
+                "replica and cannot be combined with expert parallelism"
             )
 
         if not self.numa_bind and (

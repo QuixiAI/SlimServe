@@ -855,15 +855,63 @@ class Platform:
                 kv_quant_mode=kv_quant_mode,
             ).page_size_bytes
 
-        # Qwen4Exp can store its main QSA KV as TurboQuant k8v4 through a
-        # layer-scoped override (VLLM_QWEN4_EXP_TQ_MAIN_KV) that never
-        # touches cache_config.cache_dtype, so the computation above sized
-        # the page for the model dtype. Recompute with the override's
-        # layout: the aligner then scales block_size up, keeping the page's
-        # byte size (the slot every packed GDN state page must fit inside)
-        # roughly unchanged while multiplying its token capacity.
+        # Qwen4Exp stores its main QSA KV in FP8 when the profile sets
+        # kv_cache_dtype fp8 (or the layer-scoped VLLM_QWEN4_EXP_FP8_MAIN_KV
+        # diagnostic), or as TurboQuant k8v4 through VLLM_QWEN4_EXP_TQ_MAIN_KV;
+        # the env overrides never touch cache_config.cache_dtype, so the
+        # computation above sized the page for the model dtype (the fp8
+        # profile path is already right and the recompute is a no-op).
+        # Recompute with the override's layout: the
+        # aligner then scales block_size up, keeping the page's byte size
+        # (the slot every packed GDN state page must fit inside) roughly
+        # unchanged while multiplying its token capacity.
         if model_config.architecture.startswith("Qwen4Exp"):
-            if envs.VLLM_QWEN4_EXP_TQ_MAIN_KV:
+            kv_transfer = getattr(vllm_config, "kv_transfer_config", None)
+            extra = (kv_transfer.kv_connector_extra_config or {}) if kv_transfer else {}
+            # Sticky: config views built later (the MTP draft view shares this
+            # cache_config) may lack the transfer config, and an aligner pass
+            # with the main-KV bytes/token would re-pad the mamba page 8x.
+            if extra.get("main_kv_host_resident"):
+                cache_config.main_kv_host_resident = True
+                # Floor for the attention block (tokens). The natural block is
+                # the GDN state page over the indexer's 64 B/token, which
+                # halves with every TP doubling (12,688 at TP4, 6,352 at TP8);
+                # 6,352 = 16 x 397 splits into no sub-row near the requested
+                # count, so every hot-window row would be a whole 19.5 MB
+                # block. Holding the block at the validated 12,688 (13 rows
+                # of 976 tokens) pads the GDN page instead - cheap, since a
+                # request carries 16 GDN blocks against 21 indexer blocks.
+                cache_config.main_kv_block_tokens = int(
+                    extra.get("main_kv_block_tokens", 12688) or 12688
+                )
+            if getattr(cache_config, "main_kv_host_resident", False):
+                # Host-resident main KV (docs/host_resident_kv_design.md): the
+                # QSA main KV lives in pinned host rows, so the largest GPU
+                # page per attention layer is the indexer's compressed cache
+                # (one entry per compress_ratio tokens). Sizing the block from
+                # it lets one block cover ~10K+ tokens, so a max-length
+                # request charges the packed slab tens of rows, not hundreds.
+                from vllm.v1.kv_cache_interface import MLAAttentionSpec
+
+                text_cfg = model_config.hf_text_config
+                cr = int(getattr(text_cfg, "indexer_compress_ratio", 4))
+                indexer_dim = int(getattr(text_cfg, "indexer_head_dim", 128))
+                attn_page_size_1_token = (
+                    MLAAttentionSpec(
+                        block_size=cr,
+                        num_kv_heads=1,
+                        head_size=indexer_dim,
+                        dtype=model_config.dtype,
+                        compress_ratio=cr,
+                    ).page_size_bytes
+                    // cr
+                )
+                logger.info(
+                    "Host-resident main KV: attention block sized from the "
+                    "indexer page (%d bytes/token)",
+                    attn_page_size_1_token,
+                )
+            elif envs.VLLM_QWEN4_EXP_TQ_MAIN_KV:
                 from vllm.model_executor.layers.quantization.turboquant.config import (
                     TurboQuantConfig,
                 )
@@ -879,6 +927,17 @@ class Platform:
                     dtype=torch.uint8,
                     tq_slot_size=tq_cfg.slot_size_aligned,
                     tq_cache_dtype="turboquant_k8v4",
+                ).page_size_bytes
+            elif envs.VLLM_QWEN4_EXP_FP8_MAIN_KV or cache_config.cache_dtype in (
+                "fp8",
+                "fp8_e4m3",
+            ):
+                attn_page_size_1_token = FullAttentionSpec(
+                    block_size=1,
+                    num_kv_heads=model_config.get_num_kv_heads(parallel_config),
+                    head_size=model_config.get_head_size(),
+                    dtype=torch.float8_e4m3fn,
+                    kv_quant_mode=get_kv_quant_mode("fp8"),
                 ).page_size_bytes
 
         # Compute mamba page size
@@ -900,6 +959,14 @@ class Platform:
 
         if mamba_page_size == 0:
             return
+        logger.info(
+            "Hybrid block alignment: mamba page %d bytes (padded %s), attention "
+            "%d bytes/token, block_size %d",
+            mamba_page_size,
+            cache_config.mamba_page_size_padded,
+            attn_page_size_1_token,
+            cache_config.block_size,
+        )
 
         # mamba_block_size here should either be user specified value or None
         mamba_block_size = (
@@ -935,6 +1002,19 @@ class Platform:
             attn_block_size = kernel_block_alignment_size * cdiv(
                 mamba_page_size,
                 kernel_block_alignment_size * attn_page_size_1_token,
+            )
+
+        floor_tokens = int(getattr(cache_config, "main_kv_block_tokens", 0) or 0)
+        if floor_tokens and attn_block_size < floor_tokens:
+            natural_block_size = attn_block_size
+            attn_block_size = kernel_block_alignment_size * cdiv(
+                floor_tokens, kernel_block_alignment_size
+            )
+            logger.info(
+                "Host-resident main KV: attention block held at %d tokens "
+                "(natural %d); the GDN page is padded to match",
+                attn_block_size,
+                natural_block_size,
             )
 
         if cache_config.block_size < attn_block_size:

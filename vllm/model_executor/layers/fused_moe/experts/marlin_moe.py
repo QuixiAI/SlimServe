@@ -3,12 +3,14 @@
 """Fused MoE utilities for GPTQ."""
 
 import math
+import os
 from collections.abc import Callable
 
 import torch
 
 import vllm._custom_ops as ops
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.config import get_current_vllm_config_or_none
 from vllm.model_executor.layers.fused_moe.activation import (
     MoEActivation,
     apply_moe_activation,
@@ -24,6 +26,10 @@ from vllm.model_executor.layers.fused_moe.experts.lora_experts_mixin import (
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
     batched_moe_align_block_size,
     moe_align_block_size,
+)
+from vllm.model_executor.layers.fused_moe.singleton_alignment import (
+    SingletonAlignment,
+    make_singleton_alignment,
 )
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceDelegate,
@@ -52,6 +58,65 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.platforms import current_platform
 from vllm.scalar_type import ScalarType, scalar_types
+
+
+def _qc_nvfp4_prefill_rows_threshold() -> int:
+    """Average sorted rows per expert above which the NVFP4 MoE GEMMs run on
+    the QuixiCore prefill kernel (128-row tiles, one shared dequant per tile
+    stage) instead of Marlin. 0 disables it. Marlin stays the decode kernel:
+    at a few rows per expert it streams the weights at HBM bandwidth."""
+    return int(os.getenv("VLLM_QC_NVFP4_PREFILL_MOE_MIN_ROWS", "0"))
+
+
+def _qc_nvfp4_prefill_stages() -> int:
+    return int(os.getenv("VLLM_QC_NVFP4_PREFILL_MOE_STAGES", "2"))
+
+
+def _qc_nvfp4_prefill_applicable(
+    quant_type: ScalarType,
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    M: int,
+    topk: int,
+    E: int,
+    bias1: torch.Tensor | None,
+    bias2: torch.Tensor | None,
+    global_scale1: torch.Tensor | None,
+    global_scale2: torch.Tensor | None,
+    g_idx1: torch.Tensor | None,
+    w1_zeros: torch.Tensor | None,
+    w2_zeros: torch.Tensor | None,
+    expert_map: torch.Tensor | None,
+    input_dtype: torch.dtype | None,
+    activation: MoEActivation,
+) -> bool:
+    if not current_platform.is_cuda():
+        return False
+    thr = _qc_nvfp4_prefill_rows_threshold()
+    if thr <= 0 or M * topk < thr * E:
+        return False
+    try:
+        import vllm._quixicore_C as qc
+    except ImportError:
+        return False
+    if not hasattr(qc, "nvfp4_moe_gemm"):
+        return False
+    if quant_type != scalar_types.float4_e2m1f or global_scale1 is None or global_scale2 is None:
+        return False
+    if hidden_states.dtype != torch.bfloat16 or input_dtype is not None:
+        return False
+    if bias1 is not None or bias2 is not None or g_idx1 is not None:
+        return False
+    if w1_zeros is not None or w2_zeros is not None or expert_map is not None:
+        return False
+    if not activation.is_gated:
+        return False
+    K = w1.size(1) * 16          # w13: k = hidden
+    n13 = w1.size(2) // 2        # w13: n = 2 * padded intermediate
+    n2 = w2.size(2) // 2         # w2: n = hidden
+    k2 = w2.size(1) * 16         # w2: k = padded intermediate
+    return K % 64 == 0 and n13 % 128 == 0 and n2 % 128 == 0 and k2 % 64 == 0
 
 
 def _fused_marlin_moe(
@@ -93,6 +158,7 @@ def _fused_marlin_moe(
     clamp_limit: float | None = None,
     gemm1_alpha: float = 1.0,
     gemm1_beta: float = 0.0,
+    use_qc_prefill: bool = False,
 ) -> torch.Tensor:
     assert hidden_states.ndim == 2
     M, K = hidden_states.size()
@@ -132,34 +198,56 @@ def _fused_marlin_moe(
     elif input_dtype == torch.float8_e4m3fn:
         gate_up_input, a_scales1 = marlin_quant_input(hidden_states, input_dtype)
 
-    intermediate_cache1 = ops.moe_wna16_marlin_gemm(
-        gate_up_input,
-        intermediate_cache1,
-        w1,
-        bias1,
-        w1_scale,
-        a_scales1,
-        global_scale1,
-        w1_zeros,
-        g_idx1,
-        sort_indices1,
-        workspace,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        topk_weights,
-        moe_block_size=block_size_m,
-        top_k=num_topk,
-        mul_topk_weights=apply_router_weight_on_input,
-        b_q_type=quant_type,
-        size_m=M,
-        size_n=w13_num_shards * N,
-        size_k=K,
-        is_k_full=is_k_full,
-        use_atomic_add=False,
-        use_fp32_reduce=True,
-        is_zp_float=False,
-    )
+    if use_qc_prefill:
+        # QuixiCore NVFP4 prefill GEMM (alignment at block 128, see
+        # _qc_nvfp4_prefill_applicable); Marlin's numerics, 128-row tiles.
+        from vllm.quixicore.ops import quixicore_ops
+
+        assert global_scale1 is not None and global_scale2 is not None
+        stages = _qc_nvfp4_prefill_stages()
+        quixicore_ops.nvfp4_moe_gemm(
+            gate_up_input,
+            w1,
+            w1_scale.view(torch.uint8),
+            global_scale1,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            topk_weights,
+            intermediate_cache1,
+            num_topk,
+            apply_router_weight_on_input,
+            stages,
+        )
+    else:
+        intermediate_cache1 = ops.moe_wna16_marlin_gemm(
+            gate_up_input,
+            intermediate_cache1,
+            w1,
+            bias1,
+            w1_scale,
+            a_scales1,
+            global_scale1,
+            w1_zeros,
+            g_idx1,
+            sort_indices1,
+            workspace,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            topk_weights,
+            moe_block_size=block_size_m,
+            top_k=num_topk,
+            mul_topk_weights=apply_router_weight_on_input,
+            b_q_type=quant_type,
+            size_m=M,
+            size_n=w13_num_shards * N,
+            size_k=K,
+            is_k_full=is_k_full,
+            use_atomic_add=False,
+            use_fp32_reduce=True,
+            is_zp_float=False,
+        )
     # apply_moe_activation fuses the clamp/gate params: SILU + clamp_limit and
     # SWIGLUOAI_UNINTERLEAVE both map to the silu_and_mul_with_clamp kernel.
     activation_func(
@@ -187,6 +275,25 @@ def _fused_marlin_moe(
         intermediate_cache2, a_scales2 = marlin_quant_input(
             intermediate_cache2, input_dtype
         )
+
+    if use_qc_prefill:
+        from vllm.quixicore.ops import quixicore_ops
+
+        quixicore_ops.nvfp4_moe_gemm(
+            intermediate_cache2,
+            w2,
+            w2_scale.view(torch.uint8),
+            global_scale2,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            topk_weights,
+            output,
+            1,
+            not apply_router_weight_on_input,
+            _qc_nvfp4_prefill_stages(),
+        )
+        return output
 
     output = ops.moe_wna16_marlin_gemm(
         intermediate_cache2,
@@ -256,6 +363,7 @@ def fused_marlin_moe(
     clamp_limit: float | None = None,
     gemm1_alpha: float = 1.0,
     gemm1_beta: float = 0.0,
+    singleton_alignment: SingletonAlignment | None = None,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -328,13 +436,32 @@ def fused_marlin_moe(
     if input_dtype is not None and input_dtype.itemsize == 1:
         block_size_m = max(block_size_m, 16)
 
-    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-        topk_ids,
-        block_size_m,
-        global_num_experts,
-        expert_map,
-        ignore_invalid_experts=True,
+    use_qc_prefill = _qc_nvfp4_prefill_applicable(
+        quant_type, hidden_states, w1, w2, M, topk, E, bias1, bias2,
+        global_scale1, global_scale2, g_idx1, w1_zeros, w2_zeros, expert_map,
+        input_dtype, activation,
     )
+    if use_qc_prefill:
+        block_size_m = 128
+
+    if (
+        hidden_states.shape[0] == 1
+        and expert_map is None
+        and global_num_experts == E
+        and singleton_alignment is not None
+        and singleton_alignment.compatible(topk_ids, block_size_m)
+    ):
+        sorted_token_ids, expert_ids, num_tokens_post_padded = singleton_alignment.get(
+            topk_ids
+        )
+    else:
+        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+            topk_ids,
+            block_size_m,
+            global_num_experts,
+            expert_map,
+            ignore_invalid_experts=True,
+        )
 
     assert activation is not None
     moe_output = _fused_marlin_moe(
@@ -376,6 +503,7 @@ def fused_marlin_moe(
         clamp_limit=clamp_limit,
         gemm1_alpha=gemm1_alpha,
         gemm1_beta=gemm1_beta,
+        use_qc_prefill=use_qc_prefill,
     ).view(-1, topk, K)
 
     if output is None:
@@ -605,6 +733,16 @@ class MarlinExpertsBase(mk.FusedMoEExpertsModular):
             max_num_tokens=max_num_tokens,
             num_dispatchers=num_dispatchers,
         )
+        vllm_config = get_current_vllm_config_or_none()
+        extra = vllm_config.additional_config if vllm_config is not None else {}
+        self._singleton_alignment = make_singleton_alignment(
+            moe_config,
+            quant_config,
+            extra,
+            self.input_dtype,
+            current_platform.is_cuda()
+            and current_platform.is_device_capability((8, 0)),
+        )
 
     @staticmethod
     def _supports_current_device() -> bool:
@@ -809,6 +947,7 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
                 clamp_limit=self.gemm1_clamp_limit,
                 gemm1_alpha=self.gemm1_alpha,
                 gemm1_beta=self.gemm1_beta,
+                singleton_alignment=self._singleton_alignment,
             )
             return
 

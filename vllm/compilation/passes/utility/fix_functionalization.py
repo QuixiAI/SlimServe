@@ -127,6 +127,14 @@ class FixFunctionalizationPass(VllmInductorPass):
             ]:
                 mutated_args = {1: "result"}
                 self.defunctionalize(graph, node, mutated_args)
+            elif at_target == torch.ops._C.cutlass_scaled_mm.default:
+                # CUTLASS writes its output tensor in place. Restore that
+                # mutation so later graph segments observe the same buffer.
+                self.defunctionalize(graph, node, {1: "out"})
+            elif at_target == torch.ops._C.static_scaled_fp8_quant.default:
+                # Dynamic FP8 model execution writes into its preallocated
+                # quantized activation buffer.
+                self.defunctionalize(graph, node, {1: "result"})
             elif (
                 hasattr(torch.ops.vllm, "flashinfer_trtllm_fused_allreduce_norm")
                 and at_target
@@ -271,11 +279,19 @@ class FixFunctionalizationPass(VllmInductorPass):
             if is_func(node, auto_functionalized)
         ]
         if leftover:
-            logger.warning(
-                "fix_functionalization left %d auto_functionalized node(s) "
-                "unhandled; inductor will fail on them: %s",
-                len(leftover),
-                sorted({str(t) for t in leftover}),
+            # Hard failure, not a warning: inductor no longer asserts on a
+            # leftover node, it lowers it with copy-in/copy-out semantics,
+            # and for an op whose in-place buffer is read by a LATER
+            # subgraph through a side channel (glm5_next's pooled indexer
+            # writes topk_indices_buffer for the sparse attention op) that
+            # silently produced garbage tokens on 2026-09-03. Either handle
+            # the op above or list it in CompilationConfig._attention_ops.
+            raise RuntimeError(
+                "fix_functionalization left "
+                f"{len(leftover)} auto_functionalized node(s) unhandled: "
+                f"{sorted({str(t) for t in leftover})}. Add the op to the "
+                "if/elif chain in this pass or to "
+                "CompilationConfig._attention_ops (splitting ops)."
             )
 
     def _remove(self, node_or_nodes: torch.fx.Node | Iterable[torch.fx.Node]) -> None:

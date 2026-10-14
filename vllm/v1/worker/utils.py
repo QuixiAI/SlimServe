@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import math
+import os
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
@@ -157,7 +158,12 @@ class KVBlockZeroer:
             for layer_name in group.layer_names:
                 if layer_name in runner_only_attn_layers:
                     continue
-                kv = static_forward_context[layer_name].kv_cache
+                layer = static_forward_context[layer_name]
+                if getattr(layer, "kv_cache_host_resident", False):
+                    # Host-resident main KV: the GPU window is not indexed by
+                    # logical block id; the residency zeroes a row on bind.
+                    continue
+                kv = layer.kv_cache
                 if not isinstance(kv, torch.Tensor):
                     continue
                 dp = kv.data_ptr()
@@ -225,8 +231,12 @@ class KVBlockZeroer:
             len(seg_addrs),
         )
 
+    _zero_disabled = os.environ.get("VLLM_QC_KV_ZERO_DISABLE", "0") == "1"
+
     def zero_block_ids(self, block_ids: list[int]) -> None:
         """Zero the KV cache memory for the given block IDs."""
+        if self._zero_disabled:  # VLLM_QC_KV_ZERO_DISABLE=1, diagnostic only
+            return
         if current_platform.is_metal():
             for kv, block_dim, ratio in self._metal_segments:
                 for block_id in block_ids:
@@ -363,7 +373,12 @@ def select_common_block_size(
             continue
         if block_size_is_supported(backends, supported_size):
             return supported_size
-    raise ValueError(f"No common block size for {kv_manager_block_size}. ")
+    raise ValueError(
+        f"No common block size for {kv_manager_block_size}. Backends: "
+        + "; ".join(
+            f"{b.__name__}={b.get_supported_kernel_block_sizes()}" for b in backends
+        )
+    )
 
 
 def prepare_kernel_block_sizes(

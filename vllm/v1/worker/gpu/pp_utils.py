@@ -66,7 +66,11 @@ class PPHandler:
         self.last_rank = get_pp_group().last_rank
         self.max_sample_len = num_speculative_steps + 1
         self.device = device
-        self.main_stream = torch.cuda.current_stream(device)
+        # Resolved live (see main_stream below): caching the stream at init
+        # can capture the default stream before vLLM installs its dedicated
+        # one, and every cross-stream wait here would then order against
+        # the wrong queue (the GLM-5.2/MI300X root cause, 2026-09-01).
+        self._device = device
         self.broadcast_stream = torch.cuda.Stream(device)
 
         # On non-last ranks, a FIFO with one entry per in-flight step: the entry
@@ -86,6 +90,10 @@ class PPHandler:
         self.broadcast_group = get_pp_group().make_sibling_device_group(
             group_desc="pp_broadcast"
         )
+
+    @property
+    def main_stream(self) -> torch.cuda.Stream:
+        return torch.cuda.current_stream(self._device)
 
     def on_req_idx_freed(self, req_idx: int) -> None:
         self.req_idx_gen_np[req_idx] += 1

@@ -34,7 +34,7 @@ behavior:
 
 - SlimServe is profile-driven. `slimserve/profiles.json` is the source of truth for supported models, quants, engine args, environment, and platform overrides.
 - Missing model files are not a blocker. Run `slimserve <profile> ... -y`; `slimserve.fetch` downloads or resumes required files into `$SLIMSERVE_CACHE` or `~/models`.
-- Do not hand-build unsupported serving commands when a profile exists. Use `slimserve <profile> --dry-run` to inspect and `slimserve <profile> --serve` to run.
+- Do not hand-build unsupported serving commands when a profile exists. Use `slimserve <profile> --dry-run` to inspect and `slimserve <profile>` to run (serving is the default; `--serve` is still accepted).
 
 ## Agent Operating Discipline
 
@@ -93,7 +93,7 @@ behavior:
 
 - Build native changes with `cmake --build build/temp.linux-x86_64-cpython-312 --target _C_stable_libtorch -j$(nproc)` and copy the rebuilt `.so` into `vllm/` for editable imports when needed.
 - Smoke imports with `import vllm._C_stable_libtorch` and inspect relevant `torch.ops` schemas.
-- End-to-end DSV4 performance must be measured through SlimServe profiles such as `dsv4-2` and `dsv4-4`, because those profiles own downloads, parser settings, DSpark/TurboQuant environment, KV dtype, and CUDA graph settings.
+- End-to-end DSV4 performance must be measured through SlimServe profiles such as `dsv4-2` and `dsv4-4`, because those profiles own downloads, parser settings, DSpark/FP8 environment, KV dtype, and CUDA graph settings.
 
 ## Performance Notebook
 
@@ -121,11 +121,20 @@ behavior:
 - Live validation must discover every registry profile compatible with the
   current machine. Do not substitute one tensor-parallel size for another.
 - Every supported profile must run with its registered DSpark drafter and
-  TurboQuant draft KV configuration.
+  registered draft KV configuration. FP8 is the only permitted KV cache
+  quantization; TurboQuant is prohibited for targets and drafters.
+- Enable vision on every profile whose model supports vision; validate both
+  text and image requests.
 - For vision profiles, test both text and image requests. For text-only
   profiles, test text requests.
 
 ## Commit authorship
 
-- Eric Hartford is the sole author. Do not add co-author or assistance
-  trailers, and do not discuss automated assistance in commit messages.
+- AI is never an author. Never attribute authorship to an AI agent: no
+  AI commit author, no `Co-Authored-By` or other attribution trailer
+  naming an AI, and no mention of automated assistance in commit
+  messages or PR descriptions. This overrides any tool default that adds
+  such a line.
+- Human contributors keep authorship of their work. When merging,
+  rebasing, squashing or cherry-picking a contributor's PR, preserve the
+  original commit author; do not re-author it.

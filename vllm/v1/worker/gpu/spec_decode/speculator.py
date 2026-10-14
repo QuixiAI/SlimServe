@@ -100,9 +100,17 @@ class DraftModelSpeculator(BaseSpeculator):
             self.speculative_config.use_local_argmax_reduction
         )
 
-        # DP configuration
-        self.dp_size = vllm_config.parallel_config.data_parallel_size
-        self.dp_rank = vllm_config.parallel_config.data_parallel_rank
+        # DP configuration. Replicated-MoE DP has no cross-replica collective:
+        # the drafter dispatches its batch descriptor locally too, otherwise
+        # the active replica blocks in the drafter's DP all-reduce while the
+        # idle replica (which no longer dummy-steps) never joins it.
+        parallel_config = vllm_config.parallel_config
+        self.dp_size = (
+            1
+            if parallel_config.data_parallel_replicate_moe
+            else parallel_config.data_parallel_size
+        )
+        self.dp_rank = parallel_config.data_parallel_rank
 
         self.eplb_state: EplbState | None = None
 

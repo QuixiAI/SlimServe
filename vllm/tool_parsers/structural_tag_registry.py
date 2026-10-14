@@ -88,6 +88,7 @@ SUPPORTED_STRUCTURAL_TAG_MODELS = (
 
 _VLLM_STRUCTURAL_TAG_REGISTRY: dict[str, StructuralTagBuilder] = {}
 _CUSTOM_TOOL_FORMAT_ADAPTERS: dict[str, CustomToolFormatAdapter] = {}
+_MODEL_TOOL_STOP_SENTINELS = {"glm_4_7": "<|observation|>"}
 
 
 def register_vllm_structural_tag(model: str):
@@ -195,6 +196,8 @@ def get_model_structural_tag(
     tools: Sequence[ChatCompletionToolsParam | ResponsesTool] | None,
     tool_choice: ToolChoice,
     reasoning: bool,
+    *,
+    stop_after_first: bool = False,
 ) -> StructuralTag | None:
     """Build a structural tag with xgrammar's builtin model templates."""
 
@@ -218,11 +221,11 @@ def get_model_structural_tag(
     ]
     dumped_tool_choice = _dump_tool_choice_for_xgrammar(tool_choice)
 
+    function_tools, builtin_tools, simplified_tool_choice = normalize_tool_choice(
+        dumped_tools,
+        dumped_tool_choice,
+    )
     if model in _VLLM_STRUCTURAL_TAG_REGISTRY:
-        function_tools, builtin_tools, simplified_tool_choice = normalize_tool_choice(
-            dumped_tools,
-            dumped_tool_choice,
-        )
         structural_tag = _VLLM_STRUCTURAL_TAG_REGISTRY[model](
             function_tools,
             builtin_tools,
@@ -245,7 +248,47 @@ def get_model_structural_tag(
 
     if custom_tool_adapter is not None:
         custom_tool_adapter.apply_structural_tag(structural_tag, custom_tools)
+    if stop_after_first:
+        _set_stop_after_first(structural_tag.format)
+    elif (
+        simplified_tool_choice != "auto"
+        and (stop_sentinel := _MODEL_TOOL_STOP_SENTINELS.get(model)) is not None
+    ):
+        # GLM ends a native tool-call turn with <|observation|>. The token is
+        # also an engine stop token, but a required structural grammar that
+        # accepts only an unbounded sequence of <tool_call> tags masks it out.
+        # Permit the model's turn sentinel so parallel calls can terminate
+        # naturally instead of repeating the valid call sequence to max_tokens.
+        structural_tag.format = SequenceFormat(
+            elements=[
+                structural_tag.format,
+                ConstStringFormat(value=stop_sentinel),
+            ]
+        )
     return structural_tag
+
+
+def _set_stop_after_first(format_: object) -> None:
+    """Limit a structural tool grammar to one call for this response.
+
+    A named choice and ``parallel_tool_calls=false`` both mean the decoder must
+    return after its first complete tool envelope. Without this, XGrammar's
+    GLM ``required`` format accepts an unbounded sequence and GLM-5.3-Flash can
+    repeat the same valid call until the output-token limit.
+    """
+    if isinstance(format_, TagsWithSeparatorFormat):
+        format_.stop_after_first = True
+        for tag in format_.tags:
+            _set_stop_after_first(tag)
+    elif isinstance(format_, TagFormat):
+        _set_stop_after_first(format_.content)
+    elif isinstance(format_, SequenceFormat):
+        for element in format_.elements:
+            _set_stop_after_first(element)
+    elif isinstance(format_, TriggeredTagsFormat):
+        format_.stop_after_first = True
+        for tag in format_.tags:
+            _set_stop_after_first(tag)
 
 
 def _dump_tool_for_xgrammar(
@@ -337,10 +380,14 @@ def get_custom_tool_input_format(tool: CustomTool):
 
 def _dump_allowed_tool_ref_for_xgrammar(tool_ref: AllowedToolRef) -> AllowedToolRef:
     if (
-        tool_ref.get("type") == "function"
+        tool_ref.get("type") in ("function", "custom")
         and "function" not in tool_ref
         and "name" in tool_ref
     ):
+        # Responses custom tools are represented as one-string function tools
+        # while XGrammar builds the model-native envelope.  Their allowed-tool
+        # references must use that same internal representation; otherwise
+        # XGrammar treats ``custom`` as an undeclared builtin tool type.
         return {
             "type": "function",
             "function": {"name": tool_ref["name"]},

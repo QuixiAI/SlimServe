@@ -285,6 +285,7 @@ def set_forward_context(
             or vllm_config.parallel_config.use_sequence_parallel_moe
         )
         and vllm_config.parallel_config.is_moe_model is not False
+        and not vllm_config.parallel_config.data_parallel_replicate_moe
         and (attn_metadata is not None or num_tokens is not None)
     ):
         # If num_tokens_across_dp hasn't already been initialized, then

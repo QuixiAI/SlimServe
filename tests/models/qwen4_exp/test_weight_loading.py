@@ -191,3 +191,108 @@ def test_qwen4_exp_mtp_weight_name_mapping(
     model_name: str | None,
 ) -> None:
     assert _remap_mtp_weight_name(checkpoint_name) == model_name
+
+
+# --- ModelOpt MIXED_PRECISION release (nvidia/Qwen3.8-Flash-Next-NVFP4) -----
+
+
+def _mixed_config(quantized_layers):
+    from vllm.model_executor.layers.quantization.modelopt import (
+        ModelOptMixedPrecisionConfig,
+    )
+
+    return ModelOptMixedPrecisionConfig.from_config(
+        {
+            "quant_method": "modelopt",
+            "quant_algo": "MIXED_PRECISION",
+            "kv_cache_quant_algo": None,
+            "group_size": 16,
+            "exclude_modules": ["lm_head", "model.language_model.layers.3.self_attn*"],
+            "quantized_layers": quantized_layers,
+        }
+    )
+
+
+def test_modelopt_mixed_ple_tables_take_the_fp8_host_path() -> None:
+    from vllm.models.qwen4_exp.nvidia.ple_layer import (
+        Qwen4ExpPLEFp8EmbeddingMethod,
+        _get_ple_embedding_quant_method,
+    )
+
+    cfg = _mixed_config(
+        {
+            "model.language_model.layers.1.ple.ple_embedding.ngram_embedding": {
+                "quant_algo": "FP8"
+            },
+            "model.language_model.layers.3.mlp.experts": {
+                "quant_algo": "NVFP4",
+                "group_size": 16,
+            },
+        }
+    )
+    # The vLLM-side prefix roots the language model differently from the
+    # checkpoint; the lookup must bridge that.
+    method = _get_ple_embedding_quant_method(
+        cfg, "language_model.model.layers.1.ple.ple_embedding.ngram_embedding"
+    )
+    assert isinstance(method, Qwen4ExpPLEFp8EmbeddingMethod)
+    # An unlisted table (bf16 in the checkpoint) stays unquantized.
+    assert (
+        _get_ple_embedding_quant_method(
+            cfg, "language_model.model.layers.5.ple.ple_embedding.ngram_embedding"
+        )
+        is None
+    )
+
+
+def test_modelopt_mixed_qsa_sees_no_quant_config() -> None:
+    from vllm.models.qwen4_exp.nvidia.model import without_modelopt_fp4
+
+    cfg = _mixed_config(
+        {"model.language_model.layers.3.mlp.experts": {"quant_algo": "NVFP4"}}
+    )
+    assert without_modelopt_fp4(cfg) is None
+
+
+def test_modelopt_mixed_drafter_experts_become_block_fp8() -> None:
+    from vllm.models.qwen4_exp.nvidia.mtp import (
+        Qwen4ExpDraftBlockFp8Config,
+        _draft_quant_config_from_modelopt_mixed,
+    )
+
+    cfg = _mixed_config(
+        {
+            "model.language_model.layers.3.mlp.experts": {
+                "quant_algo": "NVFP4",
+                "group_size": 16,
+            },
+            "mtp.layers.0.mlp.experts": {"quant_algo": "FP8_PB_WO", "group_size": 128},
+        }
+    )
+    draft = _draft_quant_config_from_modelopt_mixed(cfg, mtp_start_layer_idx=48)
+    assert isinstance(draft, Qwen4ExpDraftBlockFp8Config)
+    assert draft.expert_prefixes == {"mtp.layers.48.mlp.experts"}
+    assert draft.weight_block_size == [128, 128]
+    assert draft.is_checkpoint_fp8_serialized and draft.activation_scheme == "dynamic"
+
+    from vllm.model_executor.layers.linear import (
+        ColumnParallelLinear,
+        UnquantizedLinearMethod,
+    )
+
+    # Every non-expert draft module is bf16 in the release.
+    linear = ColumnParallelLinear.__new__(ColumnParallelLinear)
+    assert isinstance(
+        draft.get_quant_method(linear, "mtp.layers.48.self_attn.qkv_proj"),
+        UnquantizedLinearMethod,
+    )
+    assert draft.get_quant_method(object(), "mtp.layers.48.self_attn.attn") is None
+
+    # A release with no drafter experts listed needs no draft quant config.
+    assert (
+        _draft_quant_config_from_modelopt_mixed(
+            _mixed_config({"model.language_model.layers.3.mlp.experts": {"quant_algo": "NVFP4"}}),
+            48,
+        )
+        is None
+    )

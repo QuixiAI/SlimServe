@@ -144,8 +144,12 @@ if TYPE_CHECKING:
     VLLM_NVFP4_EMULATION_CACHE_WEIGHTS: bool = True
     VLLM_NVFP4_TRITON_GEMM: bool = True
     VLLM_QWEN4_EXP_PLE_HOST: bool = False
+    VLLM_QWEN4_EXP_FP8_MAIN_KV: bool = False
     VLLM_QWEN4_EXP_TQ_MAIN_KV: bool = False
     VLLM_CUSTOM_AR_ALLOW_PCIE: bool = False
+    VLLM_CUSTOM_AR_PCIE_MAX_BYTES: int = 0
+    VLLM_QWEN4_EXP_SKINNY_GEMM: bool = False
+    VLLM_QWEN4_EXP_SKINNY_W8: bool = False
     VLLM_GDN_DECODE_KERNEL: Literal["cuda", "triton"] = "cuda"
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
     VLLM_ROCM_FP8_PADDING: bool = True
@@ -167,6 +171,11 @@ if TYPE_CHECKING:
     VLLM_DP_RANK: int = 0
     VLLM_DP_RANK_LOCAL: int = -1
     VLLM_DP_SIZE: int = 1
+    VLLM_DP_PREFIX_AFFINITY: bool = True
+    VLLM_DP_PREFIX_AFFINITY_LOAD_TOKENS: int = 2048
+    VLLM_DP_PREFIX_AFFINITY_BLOCKS: int = 262144
+    VLLM_DP_PREFIX_AFFINITY_RECENT_WINDOW: int = 64
+    VLLM_DP_PREFIX_AFFINITY_RECENT_PERMILLE: int = 100
     VLLM_USE_STANDALONE_COMPILE: bool = True
     VLLM_ENABLE_PREGRAD_PASSES: bool = True
     VLLM_USE_BREAKABLE_CUDAGRAPH: bool = False
@@ -225,6 +234,7 @@ if TYPE_CHECKING:
     VLLM_MAX_TOKENS_PER_EXPERT_FP4_MOE: int = 163840
     VLLM_TOOL_PARSE_REGEX_TIMEOUT_SECONDS: int = 1
     VLLM_ENFORCE_STRICT_TOOL_CALLING: bool = True
+    VLLM_TOOL_CALLING_PROFILE: str = ""
     VLLM_MQ_MAX_CHUNK_BYTES_MB: int = 16
     VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: int = 300
     VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS: int = 5
@@ -1259,12 +1269,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_QWEN4_EXP_PLE_HOST": lambda: (
         os.getenv("VLLM_QWEN4_EXP_PLE_HOST", "False").lower() in ("true", "1")
     ),
+    # Store the Qwen4Exp main QSA KV cache in FP8 (unit scale) and dequantize
+    # in the sparse-attention kernel; the indexer cache, raw-key ring and GDN
+    # state keep their own dtypes. Halves the dominant KV-slab term.
+    "VLLM_QWEN4_EXP_FP8_MAIN_KV": lambda: (
+        os.getenv("VLLM_QWEN4_EXP_FP8_MAIN_KV", "False").lower() in ("true", "1")
+    ),
     "VLLM_NVFP4_TRITON_GEMM": lambda: (
         os.getenv("VLLM_NVFP4_TRITON_GEMM", "True").lower() in ("true", "1")
     ),
     # Store the Qwen4Exp main QSA KV as TurboQuant k8v4 (e4b15 keys, 4-bit
     # uniform values with per-slot fp16 scale/zero): ~2.64x smaller than
-    # bf16, decoded in-register by the QSA gather kernel.
+    # bf16, decoded in-register by the QSA gather kernel. Mutually exclusive
+    # with VLLM_QWEN4_EXP_FP8_MAIN_KV.
     "VLLM_QWEN4_EXP_TQ_MAIN_KV": lambda: (
         os.getenv("VLLM_QWEN4_EXP_TQ_MAIN_KV", "False").lower() in ("true", "1")
     ),
@@ -1273,6 +1290,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # without that the P2P probe fails and the gate below still disables it.
     "VLLM_CUSTOM_AR_ALLOW_PCIE": lambda: (
         os.getenv("VLLM_CUSTOM_AR_ALLOW_PCIE", "False").lower() in ("true", "1")
+    ),
+    # PCIe-only custom allreduce: payloads above this many bytes fall back to
+    # NCCL (0 = no extra cap). The one-shot kernel reads every peer's slice,
+    # so it wins only at decode-size payloads: on 4x RTX 3090 (PCIe P2P)
+    # 24-25 us vs NCCL 40 us at <=16 KiB, 50+ us from 40 KiB up.
+    "VLLM_CUSTOM_AR_PCIE_MAX_BYTES": lambda: int(
+        os.getenv("VLLM_CUSTOM_AR_PCIE_MAX_BYTES", "0")
+    ),
+    # Qwen4Exp on SM 8.6: route the bf16 decode projections through the
+    # weight-stationary Triton skinny GEMMs (models/qwen4_exp/nvidia/
+    # skinny_gemm_sm86.py). Registered here so it is part of the
+    # torch.compile cache key: a cached decode graph otherwise keeps cuBLAS.
+    "VLLM_QWEN4_EXP_SKINNY_GEMM": lambda: (
+        os.getenv("VLLM_QWEN4_EXP_SKINNY_GEMM", "0").lower() in ("1", "true")
+    ),
+    # int8 weight-only storage for the skinny-routed linears (E8); a
+    # compile factor for the same reason.
+    "VLLM_QWEN4_EXP_SKINNY_W8": lambda: (
+        os.getenv("VLLM_QWEN4_EXP_SKINNY_W8", "0").lower() in ("1", "true")
     ),
     # use rocm skinny gemms
     "VLLM_ROCM_USE_SKINNY_GEMM": lambda: (
@@ -1371,6 +1407,28 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # In some system, find_loaded_library() may not work. So we allow users to
     # specify the path through environment variable VLLM_CUDART_SO_PATH.
     "VLLM_CUDART_SO_PATH": lambda: os.getenv("VLLM_CUDART_SO_PATH", None),
+    # DP load balancer: route a request to the replica that already holds
+    # its prompt prefix (approximate per-replica block memory), charging
+    # LOAD_TOKENS of prefill per unit of the replica's load score;
+    # BLOCKS bounds the per-replica memory.
+    "VLLM_DP_PREFIX_AFFINITY": lambda: bool(
+        int(os.getenv("VLLM_DP_PREFIX_AFFINITY", "1"))
+    ),
+    "VLLM_DP_PREFIX_AFFINITY_LOAD_TOKENS": lambda: int(
+        os.getenv("VLLM_DP_PREFIX_AFFINITY_LOAD_TOKENS", "2048")
+    ),
+    "VLLM_DP_PREFIX_AFFINITY_BLOCKS": lambda: int(
+        os.getenv("VLLM_DP_PREFIX_AFFINITY_BLOCKS", "262144")
+    ),
+    # Live-context footprint term of the prefix-affinity router: prompt
+    # tokens routed to each replica over the last WINDOW requests, charged
+    # at PERMILLE/1000 tokens per token (0 disables the term).
+    "VLLM_DP_PREFIX_AFFINITY_RECENT_WINDOW": lambda: int(
+        os.getenv("VLLM_DP_PREFIX_AFFINITY_RECENT_WINDOW", "64")
+    ),
+    "VLLM_DP_PREFIX_AFFINITY_RECENT_PERMILLE": lambda: int(
+        os.getenv("VLLM_DP_PREFIX_AFFINITY_RECENT_PERMILLE", "100")
+    ),
     # Rank of the process in the data parallel setting
     "VLLM_DP_RANK": lambda: int(os.getenv("VLLM_DP_RANK", "0")),
     # Rank of the process in the data parallel setting.
@@ -1667,6 +1725,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ENFORCE_STRICT_TOOL_CALLING": lambda: (
         os.getenv("VLLM_ENFORCE_STRICT_TOOL_CALLING", "True").lower() in ("true", "1")
     ),
+    # Select model-family compatibility for chat-template and tool parsing.
+    # SlimServe derives this from the active profile rather than model names.
+    "VLLM_TOOL_CALLING_PROFILE": lambda: os.getenv(
+        "VLLM_TOOL_CALLING_PROFILE", ""
+    ).lower(),
     # Control the max chunk bytes (in MB) for the rpc message queue.
     # Object larger than this threshold will be broadcast to worker
     # processes via zmq.

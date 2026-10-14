@@ -362,8 +362,6 @@ def get_kv_cache_quant_algo_string(quant_cfg: dict[str, Any]) -> str | None:
     return None
 
 
-
-
 def resolve_kv_cache_dtype_string(
     kv_cache_dtype: str, model_config: ModelConfig
 ) -> str:
@@ -372,6 +370,17 @@ def resolve_kv_cache_dtype_string(
     """
     if kv_cache_dtype != "auto":
         return kv_cache_dtype
+
+    # A hybrid model's cache holds more than attention KV: recurrent states,
+    # pooled indexer rows, a block drafter's own windows. The checkpoint's
+    # kv_cache_quant_algo describes only its attention KV, so applying it
+    # engine-wide would quantize state groups that have no quantized backend.
+    # A ModelOpt GLM-5.3-Flash export declaring FP8 KV booted with every
+    # group at fp8 and died selecting an attention backend for the drafter
+    # (2026-09-22). Such models quantize their main KV per layer through
+    # their own configuration (glm5_next_main_kv_fp8), so "auto" stays auto.
+    if getattr(model_config, "is_hybrid", False):
+        return "auto"
 
     hf_cfg = getattr(model_config, "hf_config", None)
     if hf_cfg is not None:
@@ -677,7 +686,16 @@ def current_stream() -> torch.cuda.Stream:
         # for more details. Therefore, we create a dedicated stream per process.
         if current_platform.is_rocm() or current_platform.is_cuda():
             # torch.cuda.set_stream here is the alias of _pathed_set_stream
-            torch.cuda.set_stream(torch.cuda.Stream())
+            import os as _os
+
+            if _os.environ.get("VLLM_QC_NULL_STREAM") == "1":
+                # Diagnostic (GLM-5.2/MI300X, 2026-09-01): run the worker
+                # on the null stream so kernels that a library launches on
+                # hipStream 0 (AITER's thread-local default) become ordered
+                # with ours. Costs RCCL performance; not for serving.
+                torch.cuda.set_stream(torch.cuda.default_stream())
+            else:
+                torch.cuda.set_stream(torch.cuda.Stream())
         elif current_platform.is_cpu():
             _current_stream_tls.value = _StreamPlaceholder()
         else:

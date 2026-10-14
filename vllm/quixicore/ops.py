@@ -738,6 +738,7 @@ class quixicore_ops:
         scale: float,
         kv_scale: float,
         partition_size: int = 0,
+        page_stride_bytes: int = 0,
     ) -> torch.Tensor:
         """GLM sparse MLA decode reading q from its two source buffers.
 
@@ -757,6 +758,7 @@ class quixicore_ops:
             scale,
             kv_scale,
             partition_size,
+            page_stride_bytes,
         )
 
     @staticmethod
@@ -798,6 +800,7 @@ class quixicore_ops:
         scale: float,
         kv_scale: float,
         partition_size: int = 0,
+        page_stride_bytes: int = 0,
     ) -> torch.Tensor:
         """GLM-5.2-Vision sparse MLA decode (576 fp8 slot, value = leading 512).
 
@@ -817,6 +820,7 @@ class quixicore_ops:
             scale,
             kv_scale,
             partition_size,
+            page_stride_bytes,
         )
 
     @staticmethod
@@ -887,6 +891,14 @@ class quixicore_ops:
             window,
             max_context_len,
         )
+
+    @staticmethod
+    def kv_cache_gather_range_fp8(*args):
+        return _qc().kv_cache_gather_range_fp8(*args)
+
+    @staticmethod
+    def qc_kv_cache_scatter_fp8(*args):
+        return _qc().qc_kv_cache_scatter_fp8(*args)
 
     @staticmethod
     def kv_cache_gather_range(
@@ -1347,6 +1359,35 @@ class quixicore_ops:
         )
 
     @staticmethod
+    def mqa_logits_paged_gfx942(
+        q: torch.Tensor,
+        kv_values: torch.Tensor,
+        kv_scales: torch.Tensor,
+        weights: torch.Tensor,
+        seq_lens: torch.Tensor,
+        block_table: torch.Tensor,
+        logits: torch.Tensor,
+        block_size: int,
+        block_tile: int = 16,
+        head_tile: int = 16,
+    ) -> None:
+        """Decode lightning-indexer logits straight from the paged indexer
+        cache with 64-bit addressing (fp8_paged_mqa_logits_kernel.cuh).
+        Writes logits[r, :seq_lens[r]] for every row."""
+        _qc().mqa_logits_paged_gfx942(
+            q,
+            kv_values,
+            kv_scales,
+            weights,
+            seq_lens,
+            block_table,
+            logits,
+            block_size,
+            block_tile,
+            head_tile,
+        )
+
+    @staticmethod
     def post_update(
         idx_mapping: torch.Tensor,
         num_computed_tokens: torch.Tensor,
@@ -1361,8 +1402,16 @@ class quixicore_ops:
         all_token_ids: torch.Tensor,
         all_token_ids_stride: int,
         total_len: torch.Tensor,
+        sampled_cols: int,
+        vocab_size: int,
+        diag: torch.Tensor | None,
     ) -> None:
-        """Native `_post_update_kernel`."""
+        """Native `_post_update_kernel` with the row bounds guard.
+
+        `sampled_cols` is the sampled_tokens row width, `vocab_size` bounds
+        the token ids (0 disables that check), `diag` is an int64[8] device
+        buffer that receives the first violating row (see the kernel).
+        """
         _qc().post_update(
             idx_mapping,
             num_computed_tokens,
@@ -1377,6 +1426,9 @@ class quixicore_ops:
             all_token_ids,
             all_token_ids_stride,
             total_len,
+            sampled_cols,
+            vocab_size,
+            diag,
         )
 
     @staticmethod
@@ -1526,6 +1578,8 @@ class quixicore_ops:
         topk_length: torch.Tensor,
         block_size: int,
         scale: float,
+        partition_size: int = 0,
+        page_stride_bytes: int = 0,
     ) -> torch.Tensor:
         """GLM sparse MLA decode over a bf16 latent cache (576 bf16 per slot).
 
@@ -1533,7 +1587,111 @@ class quixicore_ops:
         vLLM cannot store an fp8 KV cache there. Returns [tokens, heads, 512].
         """
         return _qc().mla_decode_bf16_sparse_glm(
-            q, kv, block_table, indices, topk_length, block_size, scale
+            q,
+            kv,
+            block_table,
+            indices,
+            topk_length,
+            block_size,
+            scale,
+            partition_size,
+            page_stride_bytes,
+        )
+
+    @staticmethod
+    def nvfp4_moe_gemm(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        s: torch.Tensor,
+        g: torch.Tensor,
+        sorted_ids: torch.Tensor,
+        expert_ids: torch.Tensor,
+        num_post_padded: torch.Tensor,
+        topk_weights: torch.Tensor | None,
+        c: torch.Tensor,
+        top_k: int,
+        mul_topk: bool,
+        stages: int = 3,
+    ) -> torch.Tensor:
+        """Grouped NVFP4 MoE GEMM over the Marlin-packed expert weights for
+        prefill-sized batches: 128 x 128 x 64 tiles, one shared dequant per
+        tile stage, Marlin's numerics. Alignment must come from
+        moe_align_block_size at block 128; c is [M * top_k, N] indexed by the
+        sorted id, with mul_topk folding topk_weights[sid] into the row scale
+        (the w2 contract)."""
+        return _qc().nvfp4_moe_gemm(
+            a, b, s, g, sorted_ids, expert_ids, num_post_padded, topk_weights, c, top_k, mul_topk, stages
+        )
+
+    @staticmethod
+    def mla_sparse_prefill_fp8(
+        q: torch.Tensor,
+        data: torch.Tensor,
+        bt: torch.Tensor,
+        indices: torch.Tensor,
+        topk_length: torch.Tensor,
+        block_size: int,
+        scale: float,
+        kv_scale: float,
+        page_stride_bytes: int = 0,
+    ) -> torch.Tensor:
+        """Sparse NoPE-MLA attention for prefill chunks over the fp8 latent:
+        groups of 4 consecutive queries attend on tensor cores over the union
+        of their selected 4-token pools with a per-query mask. Same inputs as
+        mla_decode_fp8_sparse_nope; q must be [T, 16, 512] (TP4 heads)."""
+        return _qc().mla_sparse_prefill_fp8(
+            q, data, bt, indices, topk_length, block_size, scale, kv_scale, page_stride_bytes
+        )
+
+    @staticmethod
+    def kda_decode(
+        mixed_qkv: torch.Tensor,
+        raw_g: torch.Tensor,
+        raw_beta: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        state: torch.Tensor,
+        state_indices: torch.Tensor,
+        scale: float,
+        lower_bound: float | None,
+    ) -> torch.Tensor:
+        """KDA single-token decode recurrence (packed q|k|v per head, K=V=128):
+        the CUDA port of fused_recurrent_kda_packed_decode. Updates `state`
+        in place for state_indices > 0; returns out [1, N, H, V] bf16."""
+        return _qc().kda_decode(
+            mixed_qkv, raw_g, raw_beta, A_log, dt_bias, state, state_indices,
+            scale, 0.0 if lower_bound is None else float(lower_bound),
+            lower_bound is not None,
+        )
+
+    @staticmethod
+    def mla_decode_fp8_sparse_nope(
+        q: torch.Tensor,
+        data: torch.Tensor,
+        block_table: torch.Tensor,
+        indices: torch.Tensor,
+        topk_length: torch.Tensor,
+        block_size: int,
+        scale: float,
+        kv_scale: float = 1.0,
+        partition_size: int = 0,
+        page_stride_bytes: int = 0,
+    ) -> torch.Tensor:
+        """NoPE sparse MLA decode over an fp8 (e4m3) latent cache: 512 fp8
+        per slot, one per-tensor kv_scale (vLLM's fp8 MLA layout). The
+        NFP8=512 instantiation of the bf16 NoPE kernel; sm80 decodes fp8 in
+        software. Returns [tokens, heads, 512]."""
+        return _qc().mla_decode_fp8_sparse_nope(
+            q,
+            data,
+            block_table,
+            indices,
+            topk_length,
+            block_size,
+            scale,
+            kv_scale,
+            partition_size,
+            page_stride_bytes,
         )
 
     @staticmethod
@@ -1545,12 +1703,23 @@ class quixicore_ops:
         topk_length: torch.Tensor,
         block_size: int,
         scale: float,
+        partition_size: int = 0,
+        page_stride_bytes: int = 0,
     ) -> torch.Tensor:
         """NoPE sparse MLA decode over a bf16 latent cache (512 bf16 per
         slot, no rope segment): GLM-5.3-Flash (glm5_next). Returns
-        [tokens, heads, 512]."""
+        [tokens, heads, 512]. partition_size > 0 splits each (head, token)
+        walk over ceil(max_topk / partition_size) blocks plus a reduce."""
         return _qc().mla_decode_bf16_sparse_nope(
-            q, kv, block_table, indices, topk_length, block_size, scale
+            q,
+            kv,
+            block_table,
+            indices,
+            topk_length,
+            block_size,
+            scale,
+            partition_size,
+            page_stride_bytes,
         )
 
     @staticmethod

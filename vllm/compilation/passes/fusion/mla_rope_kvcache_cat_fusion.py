@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+
 import torch
 from torch._higher_order_ops.auto_functionalize import auto_functionalized
 
@@ -49,7 +51,68 @@ def fused_rope_unified_mla_kv_cache_update_impl(
             kv_cache_dtype,
             kv_cache_scale,
         )
+        if _INSERT_VERIFY and not torch.cuda.is_current_stream_capturing():
+            _verify_mla_insert(layer_name, kv_c, layer_slot_mapping, kv_cache)
+    else:
+        # A skipped call writes NOTHING to the cache and leaves q_pe/k_pe
+        # UNROTATED (the fused kernel applies rope in place); downstream
+        # attends stale block bytes with an unrotated query. This must
+        # never be silent.
+        logger.warning_once(
+            "fused MLA kv-cache update SKIPPED for %s: no slot mapping in "
+            "the attention context (no cache write, rope not applied)",
+            layer_name,
+        )
     return torch.empty(0, device=kv_c.device, dtype=kv_c.dtype)
+
+
+_INSERT_VERIFY = os.environ.get("VLLM_QC_MLA_INSERT_VERIFY", "0") == "1"
+_verify_state = {"calls": 0, "bad": 0}
+
+
+def _verify_mla_insert(layer_name, kv_c, slot_mapping, kv_cache) -> None:
+    """Diagnostic (VLLM_QC_MLA_INSERT_VERIFY=1): read back rows just
+    written and compare the kv_c lanes (stored unrotated, so exact modulo
+    dtype cast). Bounded to the first tokens of sampled calls."""
+    _verify_state["calls"] += 1
+    n = _verify_state["calls"]
+    if n > 40 and n % 512 != 0:
+        return
+    torch.cuda.synchronize()
+    lora = kv_c.shape[1]
+    bs = kv_cache.shape[1]
+    slots = slot_mapping.flatten()
+    bad = 0
+    checked = 0
+    for i in range(min(4, slots.shape[0])):
+        s = int(slots[i])
+        if s < 0:
+            continue
+        row = kv_cache[s // bs, s % bs, :lora]
+        d = (row.float() - kv_c[i].float()).abs().max().item()
+        checked += 1
+        if d > 1e-2:
+            bad += 1
+            _verify_state["bad"] += 1
+            logger.warning(
+                "mla-insert-verify MISMATCH %s call=%d slot=%d block=%d "
+                "off=%d maxdiff=%.4f",
+                layer_name,
+                n,
+                s,
+                s // bs,
+                s % bs,
+                d,
+            )
+    if n <= 40 or bad:
+        logger.info(
+            "mla-insert-verify: %s call=%d checked=%d bad=%d (total bad %d)",
+            layer_name,
+            n,
+            checked,
+            bad,
+            _verify_state["bad"],
+        )
 
 
 def fused_rope_unified_mla_kv_cache_update_fake(

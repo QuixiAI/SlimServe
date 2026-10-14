@@ -173,15 +173,40 @@ def _allocate_kv_cache(
     kv_cache_config: KVCacheConfig, shared_layers: dict[str, str], device: torch.device
 ):
     kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
-    packed_backing: torch.Tensor | None = None
+    # One packed backing per block pool (multi-pool slab: each page-size
+    # class has its own stride and block count).
+    packed_backings: dict[int, torch.Tensor] = {}
+    residency = None
     for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-        if kv_cache_tensor.block_stride > 0:
-            # Allocate once; all packed tensors alias the same backing.
-            if packed_backing is None:
-                packed_backing = torch.zeros(
+        if getattr(kv_cache_tensor, "host_resident", False):
+            # Host-resident main KV (docs/host_resident_kv_design.md): the
+            # layers' raw backing is the GPU hot window; the logical blocks
+            # live in the residency's pinned host rows.
+            if residency is None:
+                from vllm.v1.worker.gpu.kv_residency import (
+                    MainKVResidency,
+                    set_main_kv_residency,
+                )
+
+                stride = kv_cache_tensor.block_stride
+                sub = max(1, int(getattr(kv_cache_tensor, "sub_blocks", 1)))
+                residency = MainKVResidency(
+                    num_blocks=(kv_cache_tensor.size // stride) * sub,
+                    gpu_rows=kv_cache_tensor.gpu_rows,
+                    row_bytes=stride // sub,
+                    device=device,
+                )
+                residency.sub_blocks = sub
+                set_main_kv_residency(residency)
+            tensor = residency.layer_raw()
+        elif kv_cache_tensor.block_stride > 0:
+            # Allocate once per pool; packed tensors of a pool alias its backing.
+            pool = int(getattr(kv_cache_tensor, "pool", 0))
+            if pool not in packed_backings:
+                packed_backings[pool] = torch.zeros(
                     kv_cache_tensor.size, dtype=torch.int8, device=device
                 )
-            tensor = packed_backing
+            tensor = packed_backings[pool]
         else:
             tensor = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=device)
         for layer_name in kv_cache_tensor.shared_by:
@@ -213,8 +238,10 @@ def _reshape_attention_kv_cache(
 
     if packing is not None:
         offset, block_stride = packing
-        assert inv_order[0] == 0
-        page_bytes = prod(kv_cache_shape[1:]) * get_dtype_size(dtype)
+        # The physical layout must put blocks first; the public view may
+        # put K/V first (Metal exposes [2, blocks, ...] with order 1,0,...).
+        assert permuted_kv_cache_shape[0] == num_blocks
+        page_bytes = prod(permuted_kv_cache_shape[1:]) * get_dtype_size(dtype)
         kv_cache = (
             kv_raw_tensor.view(-1, block_stride)[:, offset : offset + page_bytes]
             .view(dtype)
@@ -265,9 +292,13 @@ def _reshape_kv_cache(
     has_attn, has_mamba = False, False
 
     layer_packing: dict[str, tuple[int, int]] = {}
+    host_resident_tensors: dict[str, Any] = {}
     if kv_cache_config is not None:
         for kv_tensor in kv_cache_config.kv_cache_tensors:
-            if kv_tensor.block_stride > 0:
+            if getattr(kv_tensor, "host_resident", False):
+                for ln in kv_tensor.shared_by:
+                    host_resident_tensors[ln] = kv_tensor
+            elif kv_tensor.block_stride > 0:
                 for ln in kv_tensor.shared_by:
                     layer_packing[ln] = (kv_tensor.offset, kv_tensor.block_stride)
 
@@ -290,6 +321,41 @@ def _reshape_kv_cache(
 
             kv_raw_tensor = kv_cache_raw_tensors[layer_name]
             packing = layer_packing.get(layer_name)
+            host_tensor = host_resident_tensors.get(layer_name)
+            if host_tensor is not None:
+                assert isinstance(kv_cache_spec, AttentionSpec)
+                # Host-resident main KV: the layer's kernel view is the GPU
+                # hot window of sub-rows (block_size / sub_blocks tokens each);
+                # logical blocks resolve through the residency's tables.
+                sub = max(1, int(getattr(host_tensor, "sub_blocks", 1)))
+                sub_stride = host_tensor.block_stride // sub
+                sub_offset = host_tensor.offset // sub
+                sub_tokens = kv_cache_spec.block_size // sub
+                rows = kv_raw_tensor.numel() // sub_stride
+                kv_cache_shape = group.backend.get_kv_cache_shape(
+                    rows,
+                    sub_tokens,
+                    kv_cache_spec.num_kv_heads,
+                    kv_cache_spec.head_size,
+                    cache_dtype_str=(
+                        "auto"
+                        if kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
+                        else cache_dtype
+                    ),
+                )
+                page_bytes = prod(kv_cache_shape[1:]) * get_dtype_size(
+                    kv_cache_spec.dtype
+                )
+                assert sub_offset + page_bytes <= sub_stride
+                kv_caches[layer_name] = (
+                    kv_raw_tensor.view(rows, sub_stride)[
+                        :, sub_offset : sub_offset + page_bytes
+                    ]
+                    .view(kv_cache_spec.dtype)
+                    .view(kv_cache_shape)
+                )
+                has_attn = True
+                continue
             if packing is not None:
                 _, blk_stride = packing
                 num_blocks = kv_raw_tensor.numel() // blk_stride
@@ -444,6 +510,14 @@ def _update_hybrid_attention_mamba_layout(
                 continue
             kv_cache = kv_caches[layer_name]
             hidden_size = kv_cache.shape[2:].numel()
+            if (
+                kv_cache.stride(0) == hidden_size
+                and kv_cache.stride(1) >= 2 * hidden_size
+            ):
+                # Already page-local. Packed slabs may include other layers
+                # and padding between pages; collapsing their block stride
+                # makes attention overwrite the hybrid state allocations.
+                continue
             kv_cache.as_strided_(
                 size=kv_cache.shape,
                 stride=(hidden_size, 2 * hidden_size, *kv_cache.stride()[2:]),
@@ -560,6 +634,28 @@ def init_kv_cache(
         runner_kv_caches,  # type: ignore[arg-type]
         num_attn_module,
     )
+    from vllm.v1.worker.gpu.kv_residency import get_main_kv_residency
+
+    residency = get_main_kv_residency()
+    if residency is not None:
+        host_layers = [
+            ln
+            for t in kv_cache_config.kv_cache_tensors
+            if getattr(t, "host_resident", False)
+            for ln in t.shared_by
+        ]
+        for layer_name in host_layers:
+            layer = forward_context[layer_name]
+            layer.kv_cache_host_resident = True
+            layer.main_kv_residency = residency
+        for gid, group in enumerate(kv_cache_config.kv_cache_groups):
+            if host_layers[0] in group.layer_names:
+                residency.group_id = gid
+                residency.manager_block_size = group.kv_cache_spec.block_size
+                residency.block_size = (
+                    group.kv_cache_spec.block_size // residency.sub_blocks
+                )
+                break
     return kv_caches
 
 

@@ -239,35 +239,6 @@ kernel void muse_copy_rows(
     dst[tid] = ((device const bf16_4 *)(src + (long)r * src_stride))[c4];
 }
 
-// Scatter new K/V rows into the paged cache.
-// cache layout: (2, num_blocks, block_size, kv_heads, head_dim); k/v are
-// (tokens, kv_heads, head_dim); slot_mapping is (tokens).
-kernel void muse_kv_store(
-    device bf16         *cache [[buffer(0)]],
-    device const bf16   *k     [[buffer(1)]],
-    device const bf16   *v     [[buffer(2)]],
-    device const long   *slots [[buffer(3)]],
-    constant int &block_size [[buffer(4)]],
-    constant int &kv_heads   [[buffer(5)]],
-    constant int &head_dim   [[buffer(6)]],
-    constant long &half_elems [[buffer(7)]],  // num_blocks*block_size*kv_heads*head_dim
-    constant int &tokens     [[buffer(8)]],
-    uint tid [[thread_position_in_grid]]) {
-    const int per_tok = kv_heads * head_dim / 4;
-    const int total = per_tok * tokens;
-    if ((int)tid >= total) return;
-    const int t = (int)tid / per_tok;
-    const int e4 = (int)tid % per_tok;
-    const long slot = slots[t];
-    if (slot < 0) return;
-    device bf16_4 *kdst =
-        (device bf16_4 *)(cache + slot * kv_heads * head_dim) + e4;
-    device bf16_4 *vdst =
-        (device bf16_4 *)(cache + half_elems + slot * kv_heads * head_dim) + e4;
-    *kdst = ((device const bf16_4 *)(k + (long)t * kv_heads * head_dim))[e4];
-    *vdst = ((device const bf16_4 *)(v + (long)t * kv_heads * head_dim))[e4];
-}
-
 // Plain vec4 copy: the fused verify step snapshots the residual stream into
 // the aux-hidden buffer the DFlash drafter consumes.
 kernel void muse_copy(

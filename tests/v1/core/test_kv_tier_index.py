@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """HostKVTierIndex: trajectory staging, tail-boundary resume, eviction."""
 
 from vllm.v1.core.kv_tier_index import HostKVTierIndex
@@ -34,7 +35,12 @@ def test_resumable_only_with_confirmed_tail():
     hit = idx.lookup([h(0), h(1), h(2), h(3)])
     assert hit is not None
     owner, n, attn, states = hit
-    assert owner == "a" and n == 3 and attn == slots and set(states) == {0, 1}
+    assert (
+        owner == "a"
+        and n == 3
+        and [d[0] for d in attn] == slots
+        and set(states) == {0, 1}
+    )
 
 
 def test_no_hit_on_hash_mismatch_or_short_prompt():
@@ -158,3 +164,47 @@ def test_adopted_owner_extends_one_lineage():
     assert idx.stats()["trajectories"] == 1
     hit = idx.lookup([h(i) for i in range(6)])
     assert hit is not None and hit[0] == "turn-1" and hit[1] == 5
+
+
+def test_ratio_groups_due_positions_and_resume():
+    """A group whose KV block spans 2 hash blocks (GLM-5.3 indexer beside
+    MLA) is due only at odd positions; a position is complete without it
+    at even positions, and the resumable span still covers every position
+    up to a tail boundary that is a multiple of the ratio."""
+    from vllm.v1.core.kv_tier_index import HostKVTierIndex
+
+    idx = HostKVTierIndex(64, attn_gids=[4, 5], attn_ratio={4: 2, 5: 1})
+    assert idx.resume_align == 2
+    assert idx.due(0) == frozenset({5}) and idx.due(1) == frozenset({4, 5})
+    hashes = [bytes([i]) * 4 for i in range(4)]
+    for pos in range(4):
+        s5 = idx.stage_attention("o", pos, hashes[pos], gid=5)
+        assert s5 is not None
+        if (pos + 1) % 2 == 0:
+            s4 = idx.stage_attention("o", pos, hashes[pos], gid=4)
+            assert s4 is not None
+    idx.confirm_writes(list(range(64)))
+    tails = idx.stage_tail_states("o", 4, 1, boundary_hash=hashes[3])
+    assert tails is not None
+    idx.confirm_writes(list(tails.values()) if isinstance(tails, dict) else list(tails))
+    hit = idx.lookup(hashes)
+    assert hit is not None
+    owner, n, attn, tail = hit
+    assert owner == "o" and n == 4
+    assert set(attn[0]) == {5} and set(attn[1]) == {4, 5}
+    assert set(attn[2]) == {5} and set(attn[3]) == {4, 5}
+
+
+def test_partial_lookup_clamps_a_longer_trajectory_to_the_query():
+    """A conversation continued from its own earlier, longer trajectory
+    (GLM-5.2/MI300X acceptance, 2026-09-03: 141 staged positions vs 139
+    queried) must match the query's full length, not miss because the
+    stored trajectory is longer."""
+    idx = HostKVTierIndex(num_slots=16)
+    slots = build_traj(idx, "a", 5, tail=False)
+    assert idx.lookup([h(0), h(1), h(2)]) is None  # tail-exact: no match
+    hit = idx.lookup([h(0), h(1), h(2)], allow_partial=True)
+    assert hit is not None
+    owner, n, attn, states = hit
+    assert owner == "a" and n == 3 and [d[0] for d in attn] == slots[:3]
+    assert states == {}
