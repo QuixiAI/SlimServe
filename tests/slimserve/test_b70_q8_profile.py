@@ -19,3 +19,14 @@ def test_b70_q8_recipe_uses_embedded_mtp_and_stays_gated():
     target = next(f for f in artifacts if f["role"] == "model")
     spec = next(f for f in artifacts if f["role"] == "speculator")
     assert (target["path"], target["sha256"]) == (spec["path"], spec["sha256"])
+
+
+def test_b70_q8_recipe_serves_vision_through_the_published_mmproj():
+    plan = resolve("qwen38-hauhau-q8-4", "b70", 4, None)
+    assert plan.source["modalities"] == ["text", "image"]
+    assert plan.engine["tool_call_parser"] == "qwen3_xml"
+    shared = [f for f in files_for(plan) if f["role"] == "shared"]
+    assert [f["path"] for f in shared] == [
+        "mmproj-Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-BF16.gguf"
+    ]
+    assert plan.source["revision"] in shared[0]["url"]

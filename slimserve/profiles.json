@@ -1870,15 +1870,25 @@
     "qwen38-hauhau-aggressive-gguf": {
       "title": "Qwen3.8-27B Uncensored HauhauCS Aggressive GGUF",
       "modalities": [
-        "text"
+        "text",
+        "image"
       ],
       "repo": "HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF",
-      "base_url": "https://huggingface.co/HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF/resolve/main",
+      "revision": "993a5971fda8f30dd1b7eb2654792ba4415c7460",
+      "base_url": "https://huggingface.co/HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF/resolve/993a5971fda8f30dd1b7eb2654792ba4415c7460",
       "local_dir": "Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF",
-      "shared_note": "Aggressive uncensoring variant. The Q8 target preserves its embedded NextN head; the separate FastMTP sidecar needs its trimmed-vocabulary d2t loader before vLLM can use it.",
+      "shared": [
+        {
+          "path": "mmproj-Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-BF16.gguf",
+          "bytes": 931146624,
+          "sha256": "5681b690bcb8eb10cd28d62d078cb4e01521a3ea4880a3fc7d54de72de2dd142"
+        }
+      ],
+      "shared_note": "Aggressive uncensoring variant. The Q8 target preserves its embedded NextN head; the separate FastMTP sidecar needs its trimmed-vocabulary d2t loader before vLLM can use it. The repo publishes a BF16 mmproj of the shared Qwen3.5 vision tower; it is discovered by globbing mmproj* next to the text GGUF, as for qwen38-27b, so both live in the repo root of the local dir.",
       "speculator": {
         "repo": "HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF",
-        "base_url": "https://huggingface.co/HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF/resolve/main",
+        "revision": "993a5971fda8f30dd1b7eb2654792ba4415c7460",
+        "base_url": "https://huggingface.co/HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF/resolve/993a5971fda8f30dd1b7eb2654792ba4415c7460",
         "local_dir": "Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF",
         "file": {
           "path": "Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q8_K_P.gguf",
@@ -3806,7 +3816,7 @@
               "max_cudagraph_capture_size": 64
             },
             "enable_auto_tool_choice": true,
-            "tool_call_parser": "qwen3_coder",
+            "tool_call_parser": "qwen3_xml",
             "reasoning_parser": "qwen3",
             "served_model_name": "Qwen3.8-27B-HauhauCS-Aggressive-Q8_K_P",
             "override_generation_config": {
@@ -3824,12 +3834,15 @@
           },
           "notes": [
             "The Qwen3.5 GGUF adapter maps the appended block as a native Qwen3_5MTP draft while leaving it excluded from the target backbone.",
-            "Embedded MTP defaults to measured depth 1; it beat depth 2 at concurrency 8 and 32 while tying at concurrency 1.",
+            "Embedded MTP defaults to depth 1. On the out-of-tree B70 integration branch depth 1 was reported ahead of depth 2 at concurrency 8 and 32; that comparison is historical and unverified here (no raw artifacts in this repository), so re-measure depth once the XPU backend lands.",
             "The FastMTP-32K sidecar is not selected here: its full-vocabulary embedding plus trimmed 32K output head and d2t map need a dedicated vLLM draft model contract.",
-            "FULL_DECODE_ONLY breakable graphs with k=1 verification-width capture sizes improve single-stream throughput while preserving concurrent throughput and MTP acceptance.",
+            "FULL_DECODE_ONLY breakable graphs with k=1 verification-width capture sizes (multiples of 2) are the historical recipe; their throughput effect is unverified on current main.",
             "The profile supplies a 2000-token thinking default for all reasoning efforts except none; an explicit request budget, including -1 for unlimited, takes precedence.",
             "This recipe is gated pending fresh qualification on current main; earlier measurements apply only to the saved B70 integration checkout.",
-            "Target KV uses fp8_e4m3 and native MTP draft KV uses fp8. These preserve the historical recipe; fresh current-main accuracy and cache-reuse qualification is required."
+            "Target KV uses fp8_e4m3 and native MTP draft KV uses fp8. These preserve the historical recipe; fresh current-main accuracy and cache-reuse qualification is required.",
+            "Vision: the published BF16 mmproj loads through the same Qwen3.5 GGUF vision path as qwen38-27b; image requests on XPU are unvalidated and are part of this record's qualification.",
+            "Tool calls use qwen3_xml, matching every other Qwen3.8 record.",
+            "CPU-offloaded KV (the HostTierConnector host tier), the standing goal for every non-Metal profile, is deferred until the XPU serving backend exists; the connector has not been generalized to or validated on XPU."
           ],
           "platform": "b70",
           "status": "in-progress",
