@@ -29,6 +29,12 @@ operator-directed wrap-up nudge, 2026-08-30):
 - FORCING: the budget is a HARD cutoff - at exhaustion the end marker is
   forced token-by-token (all other logits -> -inf), then DONE.
 
+Grammar masks win over forcing: a row whose forced token the grammar
+prohibits is left unchanged, so the state follows the token actually
+sampled. The close cursor tracks the end matcher, restarting the marker
+after a blocked token and staying in FORCING until the whole marker lands;
+a blocked nudge token abandons the rest of the message and is charged.
+
 Under speculative decoding the machine is SIMULATED across each request's
 verify span, so the first violating draft position is forced while a draft
 that closes the block naturally within budget is left for rejection
@@ -292,14 +298,25 @@ class ThinkingBudgetState:
         where it is False keep all state unchanged.
         """
         st = s["st"]
+        tc = torch.clamp(t, 0, self.vocab_size - 1)
         watch = valid & ((st == _IDLE) | (st == _DONE))
-        counting = valid & (st == _COUNTING)
         waiting = valid & (st == _WAITING_UTF8)
         waitn = valid & (st == _WAITING_NUDGE)
-        nudging = valid & (st == _NUDGING)
         forcing = valid & (st == _FORCING)
+        # A forced token is only a request: apply_mask leaves a row alone
+        # when the grammar prohibits the forced token, and the model then
+        # samples something else. A nudge token that did not land abandons
+        # the rest of the (advisory) wrap-up message: the token is charged
+        # as ordinary reasoning and the nudge is spent for this block, so the
+        # hard budget keeps running instead of stalling uncharged.
+        nudging_all = valid & (st == _NUDGING)
+        nudge_missed = nudging_all & (tc != self._forced_nudge_token(s))
+        nudging = nudging_all & ~nudge_missed
+        counting = (valid & (st == _COUNTING)) | nudge_missed
+        s["nudged"] = torch.where(
+            nudge_missed, torch.ones_like(s["nudged"]), s["nudged"]
+        )
         complete = self._token_complete(t)
-        tc = torch.clamp(t, 0, self.vocab_size - 1)
 
         # --- IDLE/DONE: watch for a start marker; match re-arms fresh.
         sprog_raw = self.start_dfa[s["sprog"].to(torch.long), tc]
@@ -350,9 +367,18 @@ class ThinkingBudgetState:
         s["npos"] = s["npos"] + nudging.to(s["npos"].dtype)
         nudge_done = nudging & (s["npos"] >= self.ln)
 
-        # --- FORCING: advance the close cursor; sequence end -> DONE.
-        s["fpos"] = s["fpos"] + forcing.to(s["fpos"].dtype)
-        forced_done = forcing & (s["fpos"] >= self.le)
+        # --- FORCING: the close cursor is the end matcher's progress over
+        # what was actually emitted (both start at 0 on entering FORCING).
+        # A forced closer token the grammar blocked does not advance it; the
+        # KMP fallback restarts the closer, so a blocked first token is
+        # forced again rather than followed by the second half, and the
+        # budget stays enforced until the whole closer lands.
+        s["fpos"] = torch.where(
+            forcing,
+            torch.where(e_match, torch.full_like(s["fpos"], self.le), eprog_raw),
+            s["fpos"],
+        ).to(s["fpos"].dtype)
+        forced_done = forcing & e_match
 
         # --- Start-marker match activates counting with a fresh budget and
         # a fresh nudge; budget <= 0 promotes straight to FORCING.
@@ -367,6 +393,7 @@ class ThinkingBudgetState:
             ),
             st,
         )
+        st_new = torch.where(nudge_missed, torch.full_like(st, _COUNTING), st_new)
         st_new = torch.where(nat_done, torch.full_like(st, _DONE), st_new)
         st_new = torch.where(
             to_forcing_c | to_forcing_w, torch.full_like(st, _FORCING), st_new
@@ -387,7 +414,9 @@ class ThinkingBudgetState:
             enter_forcing | forced_done, torch.zeros_like(s["fpos"]), s["fpos"]
         )
         s["npos"] = torch.where(
-            enter_nudging | nudge_done, torch.zeros_like(s["npos"]), s["npos"]
+            enter_nudging | nudge_done | nudge_missed,
+            torch.zeros_like(s["npos"]),
+            s["npos"],
         )
         s["nudged"] = torch.where(
             nudge_done, torch.ones_like(s["nudged"]), s["nudged"]
@@ -406,14 +435,17 @@ class ThinkingBudgetState:
             nat_done | forced_done, torch.zeros_like(s["sprog"]), s["sprog"]
         )
 
+    def _forced_nudge_token(self, s: dict[str, torch.Tensor]) -> torch.Tensor:
+        return self.nudge_seq[
+            torch.clamp(s["npos"].to(torch.long), max=max(self.ln - 1, 0))
+        ]
+
     def _forced_token(self, s: dict[str, torch.Tensor]) -> torch.Tensor:
         """The token forced for the current state (0 where passthrough)."""
         close_tok = self.close_seq[
             torch.clamp(s["fpos"].to(torch.long), max=self.le - 1)
         ]
-        nudge_tok = self.nudge_seq[
-            torch.clamp(s["npos"].to(torch.long), max=max(self.ln - 1, 0))
-        ]
+        nudge_tok = self._forced_nudge_token(s)
         return torch.where(s["st"] == _NUDGING, nudge_tok, close_tok)
 
     # ------------------------------------------------------------ step hooks

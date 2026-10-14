@@ -181,3 +181,82 @@ def test_split_multitoken_end_marker_in_draft_prefix_does_not_force_again():
     logits = torch.zeros(3, VOCAB_SIZE + 1)
     holder.apply_to_logits(logits, False, [drafts])
     assert torch.equal(logits, torch.zeros_like(logits))
+
+
+SECOND_END = END + 1
+BLOCKED = 120  # what the model samples when the forced end token is prohibited
+
+
+class PlainHolder:
+    """A non-speculative V1 holder driven one committed token at a time."""
+
+    def __init__(self, budget, end_ids):
+        self.holder = ThinkingBudgetStateHolder(
+            SimpleNamespace(
+                reasoning_start_token_ids=[START], reasoning_end_token_ids=end_ids
+            ),
+            1,
+            0,
+            torch.device("cpu"),
+            False,
+        )
+        self.output: list[int] = []
+        self.holder.sync_batch(
+            BatchUpdate(
+                batch_size=1,
+                removed=[],
+                added=[(0, SamplingParams(thinking_token_budget=budget), [START], [])],
+                moved=[],
+            )
+        )
+
+    def emit(self, *tokens):
+        for token in tokens:
+            self.output.append(token)
+            self.holder.update_state([list(self.output)], [[]])
+
+    def forced(self):
+        logits = torch.zeros(1, VOCAB_SIZE + 1)
+        self.holder.apply_to_logits(logits, False, [[]])
+        if logits.max() < 1e9:
+            return None
+        return int(logits.argmax())
+
+
+def test_v1_blocked_second_end_token_does_not_release_the_budget():
+    run = PlainHolder(1, [END, SECOND_END])
+    run.emit(120)  # exhausted
+    assert run.forced() == END
+    run.emit(END)
+    assert run.forced() == SECOND_END
+    run.emit(BLOCKED)  # the grammar blocked SECOND_END
+    # Not counted as emitted: thinking is still open and the marker restarts,
+    # since "END BLOCKED" is no prefix of it.
+    assert run.holder._state[0]["in_end"]
+    assert run.forced() == END
+    run.emit(END)
+    assert run.forced() == SECOND_END
+    run.emit(SECOND_END)
+    assert not run.holder._state[0]["in_end"]
+    assert run.forced() is None
+
+
+def test_v1_blocked_first_end_token_is_forced_again_not_half_marker():
+    run = PlainHolder(1, [END, SECOND_END])
+    run.emit(120)
+    assert run.forced() == END
+    run.emit(BLOCKED)
+    assert run.forced() == END
+    run.emit(END, SECOND_END)
+    assert run.forced() is None
+
+
+def test_v1_blocked_single_end_token_is_forced_again_when_allowed():
+    run = PlainHolder(1, [END])
+    run.emit(120)
+    assert run.forced() == END
+    run.emit(BLOCKED)
+    run.emit(BLOCKED)
+    assert run.forced() == END
+    run.emit(END)
+    assert run.forced() is None

@@ -534,6 +534,17 @@ class ThinkingBudgetStateHolder:
 
         else:
             state["force_index"] = []
+            committed = self._committed_end_progress(output)
+            if committed < min(state["end_count"] + 1, len(self.think_end_token_ids)):
+                # The last forced end token did not land: forcing only boosts
+                # an allowed token, so a grammar that prohibited it let the
+                # model sample something else. Do not count it. Resume from
+                # what was actually emitted (restarting the marker when the
+                # partial one was broken) and keep forcing; the budget is
+                # not released until the whole end marker is in the output.
+                state["end_count"] = committed
+                state["force_index"] = [0]
+                return
             if len(state["spec_token_ids"]) > 0:
                 for i, token_id in enumerate(state["spec_token_ids"]):
                     if state["end_count"] + 1 < len(self.think_end_token_ids):
@@ -564,6 +575,14 @@ class ThinkingBudgetStateHolder:
                         "scan_offset": len(state.get("output_tok_ids", [])),
                     }
                 )
+
+    def _committed_end_progress(self, output: list[int]) -> int:
+        """Length of the longest end-marker prefix that ends ``output``."""
+        end_ids = self.think_end_token_ids
+        for length in range(min(len(end_ids), len(output)), 0, -1):
+            if output[-length:] == end_ids[:length]:
+                return length
+        return 0
 
     def _draft_prefix_ends_thinking(
         self, state: dict[str, Any], prefix_length: int

@@ -437,3 +437,89 @@ def test_grammar_mask_wins_over_close_and_nudge_forcing(speculative, nudge):
     assert torch.isneginf(logits[allowed_row]).sum().item() == VOCAB - 1
     # A request with no budget stays unchanged.
     assert torch.equal(logits[-1], before[-1])
+
+
+# ------------------------------------- forced tokens the grammar blocked
+#
+# apply_mask leaves a row unchanged when the grammar prohibits the forced
+# token, so the sampled token can differ from it. The state must follow what
+# was emitted, never what was requested.
+
+BLOCKED = 13  # what the model samples when the forced token is prohibited
+
+
+def test_blocked_first_closer_token_is_forced_again_not_half_closer():
+    st = make_state(starts=(80, 81), ends=(90, 91))
+    st.add_request(0, [80, 81], sp(1))
+    st.apply_staged_writes()
+    run_tokens(st, 0, [10])  # exhausted
+    assert forced_now(st, 0) == 90
+    step(st, 0, BLOCKED)  # the grammar blocked 90
+    # Forcing 91 now would emit half a closer; restart at the first token.
+    assert forced_now(st, 0) == 90
+    step(st, 0, 90)
+    assert forced_now(st, 0) == 91
+    step(st, 0, 91)
+    assert forced_now(st, 0) is None  # DONE
+
+
+def test_blocked_second_closer_token_restarts_the_closer():
+    st = make_state(starts=(80, 81), ends=(90, 91))
+    st.add_request(0, [80, 81], sp(1))
+    st.apply_staged_writes()
+    run_tokens(st, 0, [10, 90])  # exhausted, first closer token landed
+    assert forced_now(st, 0) == 91
+    step(st, 0, BLOCKED)  # "90 13" is no closer prefix
+    assert forced_now(st, 0) == 90
+    run_tokens(st, 0, [90, 91])
+    assert forced_now(st, 0) is None
+
+
+def test_blocked_single_token_closer_keeps_the_budget_enforced():
+    st = make_state()
+    st.add_request(0, [START], sp(1))
+    st.apply_staged_writes()
+    step(st, 0, 10)  # exhausted
+    assert forced_now(st, 0) == END
+    run_tokens(st, 0, [BLOCKED, BLOCKED])  # the grammar blocked END twice
+    # The budget is not dropped: END is forced again as soon as it is allowed.
+    assert forced_now(st, 0) == END
+    step(st, 0, END)
+    assert forced_now(st, 0) is None
+
+
+def test_blocked_closer_in_speculative_span_keeps_forcing_later_rows():
+    st = make_state()
+    st.add_request(0, [START], sp(1))
+    st.apply_staged_writes()
+    step(st, 0, 10)  # exhausted: every row of the span is forced
+    batch = make_batch([0], [3], [0, BLOCKED, BLOCKED])
+    assert forced_map(st, batch) == {0: END, 1: END, 2: END}
+
+
+def test_blocked_nudge_is_abandoned_and_budget_keeps_counting():
+    st = make_state(nudge=NUDGE, fraction=0.5)
+    st.add_request(0, [START], sp(10))  # nudge at remaining <= 5
+    st.apply_staged_writes()
+    run_tokens(st, 0, [10, 11, 12, 13, 14])  # remaining 5: trigger
+    assert forced_now(st, 0) == NUDGE[0]
+    step(st, 0, BLOCKED)  # the grammar blocked the nudge: charged, remaining 4
+    # The advisory message is abandoned (not resumed mid-text later) and is
+    # not re-triggered in this block.
+    assert forced_now(st, 0) is None
+    run_tokens(st, 0, [20, 21, 22])  # remaining 1
+    assert forced_now(st, 0) is None
+    step(st, 0, 23)  # remaining 0: hard cutoff still lands on budget
+    assert forced_now(st, 0) == END
+
+
+def test_nudge_blocked_mid_message_is_abandoned():
+    st = make_state(nudge=NUDGE, fraction=0.5)
+    st.add_request(0, [START], sp(4))  # nudge at remaining <= 2
+    st.apply_staged_writes()
+    run_tokens(st, 0, [10, 11, NUDGE[0]])
+    assert forced_now(st, 0) == NUDGE[1]
+    step(st, 0, BLOCKED)  # remaining 1
+    assert forced_now(st, 0) is None
+    step(st, 0, 20)  # remaining 0
+    assert forced_now(st, 0) == END
