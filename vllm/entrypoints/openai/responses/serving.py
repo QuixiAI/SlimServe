@@ -7,11 +7,13 @@ from collections import deque
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping, Sequence
 from contextlib import AsyncExitStack
 from copy import copy
+from dataclasses import dataclass, field
 from http import HTTPStatus
 from typing import Any, Final
 
 from fastapi import Request
 from openai.types.responses import (
+    ResponseErrorEvent,
     ResponseFunctionToolCall,
     ResponseOutputItem,
     ResponseOutputMessage,
@@ -109,6 +111,37 @@ from vllm.utils import random_uuid
 from vllm.utils.collection_utils import as_list
 
 logger = init_logger(__name__)
+
+
+# Events after which a Responses stream carries nothing more. Cancellation has
+# no response.* event in the Responses API; it is reported as a typed `error`
+# event with this code, and the response itself is available by retrieval.
+_TERMINAL_STREAM_EVENTS: Final = frozenset(
+    ("response.completed", "response.incomplete", "response.failed", "error")
+)
+RESPONSE_CANCELLED_CODE: Final = "response_cancelled"
+
+
+def _response_cancelled_event(response_id: str) -> ResponseErrorEvent:
+    return ResponseErrorEvent(
+        type="error",
+        code=RESPONSE_CANCELLED_CODE,
+        message=f"Response {response_id} was cancelled.",
+        param=None,
+        sequence_number=-1,
+    )
+
+
+@dataclass
+class _BackgroundEventLog:
+    """Events of one background streamed response, for (re)play by readers."""
+
+    events: deque[StreamingResponsesResponse] = field(default_factory=deque)
+    signal: asyncio.Event = field(default_factory=asyncio.Event)
+    # Set once the producer has stopped, however it stopped. Readers must not
+    # wait for events after this, or a producer that ended without a terminal
+    # event (task cancellation, an exception) would hang them forever.
+    done: bool = False
 
 
 def _extract_allowed_tools_from_mcp_requests(
@@ -237,9 +270,7 @@ class OpenAIServingResponses(GenerateBaseServing):
         # HACK(wuhang): This is a hack. We should use a better store.
         # FIXME: If enable_store=True, this may cause a memory leak since we
         # never remove events from the store.
-        self.event_store: dict[
-            str, tuple[deque[StreamingResponsesResponse], asyncio.Event]
-        ] = {}
+        self.event_store: dict[str, _BackgroundEventLog] = {}
 
         self.background_tasks: dict[str, asyncio.Task] = {}
 
@@ -862,6 +893,8 @@ class OpenAIServingResponses(GenerateBaseServing):
             # Check if generation was stopped due to max_tokens
             if final_output.finish_reason == "length":
                 status = "incomplete"
+            elif final_output.finish_reason == "abort":
+                status = "cancelled"
 
             output = self._make_response_output_items(
                 request,
@@ -1238,16 +1271,28 @@ class OpenAIServingResponses(GenerateBaseServing):
         *args,
         **kwargs,
     ):
-        event_deque: deque[StreamingResponsesResponse] = deque()
-        new_event_signal = asyncio.Event()
-        self.event_store[request.request_id] = (event_deque, new_event_signal)
+        log = _BackgroundEventLog()
+        self.event_store[request.request_id] = log
         generator = self.responses_stream_generator(request, *args, **kwargs)
         try:
             async for event in generator:
-                event_deque.append(event)
-                new_event_signal.set()  # Signal new event available
+                log.events.append(event)
+                log.signal.set()  # Signal new event available
+        except asyncio.CancelledError:
+            # cancel_responses cancels this task, so the generator never
+            # reaches its own terminal event. Close the replay with one.
+            last_type = getattr(log.events[-1], "type", None) if log.events else None
+            if last_type not in _TERMINAL_STREAM_EVENTS:
+                event = _response_cancelled_event(request.request_id)
+                last_sequence = (
+                    getattr(log.events[-1], "sequence_number", -1) if log.events else -1
+                )
+                event.sequence_number = last_sequence + 1
+                log.events.append(event)
+            raise
         finally:
-            new_event_signal.set()
+            log.done = True
+            log.signal.set()
 
     async def _run_background_request(
         self,
@@ -1278,26 +1323,26 @@ class OpenAIServingResponses(GenerateBaseServing):
                 value=response_id,
             )
 
-        event_deque, new_event_signal = self.event_store[response_id]
+        log = self.event_store[response_id]
         start_index = 0 if starting_after is None else starting_after + 1
         current_index = start_index
 
         while True:
-            new_event_signal.clear()
+            log.signal.clear()
 
             # Yield existing events from start_index
-            while current_index < len(event_deque):
-                event = event_deque[current_index]
+            while current_index < len(log.events):
+                event = log.events[current_index]
                 yield event
-                if getattr(event, "type", "unknown") in (
-                    "response.completed",
-                    "response.incomplete",
-                    "response.failed",
-                ):
+                if getattr(event, "type", "unknown") in _TERMINAL_STREAM_EVENTS:
                     return
                 current_index += 1
 
-            await new_event_signal.wait()
+            # No await separates the drain above from this check, so a
+            # finished producer has no events left for this reader.
+            if log.done:
+                return
+            await log.signal.wait()
 
     async def retrieve_responses(
         self,
@@ -1604,8 +1649,12 @@ class OpenAIServingResponses(GenerateBaseServing):
                 yield await failed_event(final_response.error.message)
                 return
             if final_response.status == "cancelled":
-                # Cancellation is exposed through retrieval; Responses defines
-                # no response.cancelled SSE event.
+                # Responses defines no response.cancelled event; end the stream
+                # with a typed error event so readers see that it is over. The
+                # cancelled response itself is available by retrieval.
+                yield _increment_sequence_number_and_return(
+                    _response_cancelled_event(final_response.id)
+                )
                 return
             terminal_event = {
                 "incomplete": ResponseIncompleteEvent,

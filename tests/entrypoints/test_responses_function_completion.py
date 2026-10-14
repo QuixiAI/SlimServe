@@ -20,7 +20,11 @@ from vllm.entrypoints.openai.engine.protocol import (
 )
 from vllm.entrypoints.openai.responses.context import SimpleContext
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
-from vllm.entrypoints.openai.responses.serving import OpenAIServingResponses
+from vllm.entrypoints.openai.responses.serving import (
+    RESPONSE_CANCELLED_CODE,
+    OpenAIServingResponses,
+    _BackgroundEventLog,
+)
 from vllm.entrypoints.openai.responses.streaming_events import (
     SimpleStreamingState,
     emit_simple_tool_call_delta,
@@ -32,7 +36,20 @@ from vllm.sampling_params import SamplingParams
 
 
 @pytest.mark.parametrize(
-    "arguments", ["", " ", '{"query":"unterminated', "{", "NaN", '{"x":Infinity}']
+    "arguments",
+    [
+        "",
+        " ",
+        '{"query":"unterminated',
+        "{",
+        "NaN",
+        '{"x":Infinity}',
+        # Valid JSON, but not an object of named arguments.
+        "[]",
+        "42",
+        "null",
+        '"text"',
+    ],
 )
 def test_invalid_arguments_are_never_completed(arguments):
     state = SimpleStreamingState()
@@ -45,7 +62,7 @@ def test_invalid_arguments_are_never_completed(arguments):
     assert events[0].item.arguments == arguments
 
 
-@pytest.mark.parametrize("arguments", ["{}", "[]", '{"query":"hello"}', '{"extra":42}'])
+@pytest.mark.parametrize("arguments", ["{}", '{"query":"hello"}', '{"extra":42}'])
 def test_valid_json_does_not_impose_schema_constraints(arguments):
     state = SimpleStreamingState()
     emit_simple_tool_call_open(state, "lookup", 0)
@@ -184,14 +201,15 @@ def test_custom_tool_freeform_input_is_not_validated_as_json():
 
 
 @pytest.mark.parametrize(
-    "terminal", ["response.incomplete", "response.failed", "response.completed"]
+    "terminal",
+    ["response.incomplete", "response.failed", "response.completed", "error"],
 )
 def test_background_stream_stops_on_each_terminal_event(terminal):
     async def run():
         serving = make_serving([])
-        serving.event_store = {
-            "test": ([SimpleNamespace(type=terminal)], asyncio.Event())
-        }
+        log = _BackgroundEventLog()
+        log.events.append(SimpleNamespace(type=terminal))
+        serving.event_store = {"test": log}
 
         async def collect():
             return [
@@ -248,5 +266,120 @@ def test_stream_processor_flush_respects_finish_reason(
         ]
         assert bool(done) == completed
         assert events[-1].item.status == ("completed" if completed else "incomplete")
+
+    asyncio.run(run())
+
+
+def make_background_serving():
+    serving = make_serving([])
+    serving.response_store = {}
+    serving.response_store_lock = asyncio.Lock()
+    serving.event_store = {}
+    return serving
+
+
+def background_args(context):
+    args = list(request_args(context))
+    args[0] = ResponsesRequest(
+        model="test",
+        input="test",
+        store=True,
+        background=True,
+        stream=True,
+        max_output_tokens=4,
+    )
+    args[6] = RequestResponseMetadata(request_id=args[0].request_id)
+    return args
+
+
+async def replay(serving, response_id):
+    async def collect():
+        return [
+            event
+            async for event in serving.responses_background_stream_generator(
+                response_id
+            )
+        ]
+
+    # A replay that never ends is the regression; bound it.
+    return await asyncio.wait_for(collect(), timeout=2)
+
+
+def assert_cancelled_terminal(events):
+    assert events[-1].type == "error"
+    assert events[-1].code == RESPONSE_CANCELLED_CODE
+    assert [e.sequence_number for e in events] == list(range(len(events)))
+
+
+def test_background_replay_ends_when_response_is_cancelled():
+    async def run():
+        serving = make_background_serving()
+        args = background_args(make_context("abort"))
+        response_id = args[0].request_id
+
+        async def no_events(*args):
+            if False:
+                yield
+
+        serving._process_simple_streaming_events = no_events
+        task = asyncio.create_task(serving._run_background_request_stream(*args))
+        await asyncio.sleep(0)
+        # One reader is attached while the producer runs, one replays after.
+        live = asyncio.create_task(replay(serving, response_id))
+        await task
+        assert serving.response_store[response_id].status == "cancelled"
+        assert_cancelled_terminal(await live)
+        assert_cancelled_terminal(await replay(serving, response_id))
+
+    asyncio.run(run())
+
+
+def test_background_replay_ends_when_task_is_cancelled():
+    async def run():
+        serving = make_background_serving()
+        args = background_args(make_context(None))
+        response_id = args[0].request_id
+        started = asyncio.Event()
+
+        async def stalled_events(*args):
+            started.set()
+            await asyncio.Event().wait()
+            if False:
+                yield
+
+        serving._process_simple_streaming_events = stalled_events
+        task = asyncio.create_task(serving._run_background_request_stream(*args))
+        await started.wait()
+        live = asyncio.create_task(replay(serving, response_id))
+        await asyncio.sleep(0)
+        # What cancel_responses does to the producer.
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert_cancelled_terminal(await live)
+        assert_cancelled_terminal(await replay(serving, response_id))
+
+    asyncio.run(run())
+
+
+def test_background_replay_ends_when_producer_fails_without_terminal_event():
+    async def run():
+        serving = make_background_serving()
+        args = background_args(make_context(None))
+        response_id = args[0].request_id
+
+        async def broken_events(*args):
+            raise RuntimeError("producer failed")
+            if False:
+                yield
+
+        serving._process_simple_streaming_events = broken_events
+        with pytest.raises(RuntimeError):
+            await serving._run_background_request_stream(*args)
+        events = await replay(serving, response_id)
+        assert [event.type for event in events] == [
+            "response.created",
+            "response.in_progress",
+        ]
 
     asyncio.run(run())
