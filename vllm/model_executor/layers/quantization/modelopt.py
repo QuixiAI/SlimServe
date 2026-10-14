@@ -13,8 +13,11 @@ import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear import (
+    EmulationNvFp4W4A16LinearKernel,
     MarlinNvFp4LinearKernel,
+    NvFp4LinearKernel,
     NvFp4LinearLayerConfig,
+    XPUNvFp4W4A16LinearKernel,
     init_fp8_linear_kernel,
     init_mxfp8_linear_kernel,
     init_nvfp4_linear_kernel,
@@ -97,6 +100,7 @@ from vllm.model_executor.parameter import (
     PerTensorScaleParameter,
 )
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
+from vllm.platforms import current_platform
 
 if TYPE_CHECKING:
     from vllm.model_executor.models.utils import WeightsMapper
@@ -1306,8 +1310,19 @@ class ModelOptNvFp4W4A16LinearMethod(LinearMethodBase):
         # init_nvfp4_linear_kernel(): the latter's priority list returns a
         # cutlass W4A4 kernel as first-pick on this hardware, which would
         # silently try to quantize activations (we have no input_scale). For
-        # W4A16 there is exactly one valid kernel, so we pin it.
-        self.kernel = MarlinNvFp4LinearKernel(NvFp4LinearLayerConfig())
+        # W4A16 there is exactly one valid kernel, so we pin it. Intel XPU has
+        # no Marlin: it takes the native XPU decode kernel when the kernel
+        # package provides it, else weight-only emulation.
+        self.kernel: NvFp4LinearKernel
+        if current_platform.is_xpu():
+            if XPUNvFp4W4A16LinearKernel.is_supported()[0]:
+                self.kernel = XPUNvFp4W4A16LinearKernel(NvFp4LinearLayerConfig())
+            else:
+                self.kernel = EmulationNvFp4W4A16LinearKernel(
+                    NvFp4LinearLayerConfig()
+                )
+        else:
+            self.kernel = MarlinNvFp4LinearKernel(NvFp4LinearLayerConfig())
 
     def create_weights(
         self,
@@ -1596,6 +1611,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             )
         w13_weight_scale_2 = layer.w13_weight_scale_2[:, 0].contiguous()
 
+        drop_act_scales = self.use_a16 and current_platform.is_xpu()
         (
             w13,
             w13_scale,
@@ -1611,11 +1627,14 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             w13=layer.w13_weight,
             w13_scale=layer.w13_weight_scale,
             w13_scale_2=w13_weight_scale_2,
-            a13_scale=layer.w13_input_scale,
+            # W4A16 checkpoints carry no activation scales; the registered
+            # input_scale params are uninitialized placeholders. Marlin drops
+            # them itself; the XPU backends must not see them at all.
+            a13_scale=None if drop_act_scales else layer.w13_input_scale,
             w2=layer.w2_weight,
             w2_scale=layer.w2_weight_scale,
             w2_scale_2=layer.w2_weight_scale_2,
-            a2_scale=layer.w2_input_scale,
+            a2_scale=None if drop_act_scales else layer.w2_input_scale,
             is_act_and_mul=self.moe.is_act_and_mul,
         )
 

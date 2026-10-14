@@ -308,6 +308,11 @@ if TYPE_CHECKING:
     VLLM_XPU_ENABLE_XPU_GRAPH: bool = False
     VLLM_XPU_PER_WORKER_AFFINITY: bool = True
     VLLM_XPU_USE_SAMPLER_KERNEL: bool = True
+    VLLM_NVFP4_LINEAR_PREFILL_DPAS: bool = False
+    VLLM_NVFP4_DPAS_ROWS_CACHE: bool = False
+    VLLM_NVFP4_DPAS_ROWS_FULL: bool = False
+    VLLM_NVFP4_LINEAR_DPAS_BF16_SCALE: bool = False
+    VLLM_XPU_GEMMA_NORM_FUSED: bool = False
     VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
     VLLM_NIC_SELECTION_VARS: str = ""
@@ -2070,6 +2075,32 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # whether use xpu specific sample kernel
     "VLLM_XPU_USE_SAMPLER_KERNEL": lambda: bool(
         int(os.getenv("VLLM_XPU_USE_SAMPLER_KERNEL", "1"))
+    ),
+    # XPU NVFP4 W4A16 linears (vllm/model_executor/kernels/linear/nvfp4/xpu.py):
+    # route prefill (M > VLLM_NVFP4_LINEAR_NATIVE_M_MAX) through the
+    # vllm-xpu-kernels DPAS grouped GEMM as a single-group GEMM instead of
+    # dequant -> oneDNN emulation. Off by default (emulation unchanged).
+    "VLLM_NVFP4_LINEAR_PREFILL_DPAS": lambda: bool(
+        int(os.getenv("VLLM_NVFP4_LINEAR_PREFILL_DPAS", "0"))
+    ),
+    # The DPAS prefill builds a 1-element int32 rows_per_expert tensor per
+    # call; on XPU torch.tensor([m], device=dev) is a blocking 4-byte H2D.
+    # ROWS_CACHE memoizes it per (m, device); ROWS_FULL builds it on device.
+    "VLLM_NVFP4_DPAS_ROWS_CACHE": lambda: bool(
+        int(os.getenv("VLLM_NVFP4_DPAS_ROWS_CACHE", "0"))
+    ),
+    "VLLM_NVFP4_DPAS_ROWS_FULL": lambda: bool(
+        int(os.getenv("VLLM_NVFP4_DPAS_ROWS_FULL", "0"))
+    ),
+    # Fold the per-tensor NVFP4 global scale onto the DPAS output in bf16
+    # instead of an fp32 round trip. Off by default.
+    "VLLM_NVFP4_LINEAR_DPAS_BF16_SCALE": lambda: bool(
+        int(os.getenv("VLLM_NVFP4_LINEAR_DPAS_BF16_SCALE", "0"))
+    ),
+    # GemmaRMSNorm.forward_xpu: cache (1 + w) in the activation dtype so the
+    # fused rms_norm / fused_add_rms_norm kernels are selected. Off by default.
+    "VLLM_XPU_GEMMA_NORM_FUSED": lambda: bool(
+        int(os.getenv("VLLM_XPU_GEMMA_NORM_FUSED", "0"))
     ),
     # Enable simple KV offload.
     "VLLM_USE_SIMPLE_KV_OFFLOAD": lambda: bool(
