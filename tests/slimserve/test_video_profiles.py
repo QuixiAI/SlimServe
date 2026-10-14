@@ -4,6 +4,7 @@ one-at-a-time serving queue. No weights and no GPU are needed here; the
 measured gates live in perf/ltx25_harness/."""
 
 import base64
+import os
 import threading
 import time
 
@@ -58,6 +59,7 @@ def test_video_profiles_resolve_on_metal_only():
 
 
 def test_fast_profiles_are_the_exact_profiles_plus_a_fast_block():
+    pytest.importorskip("mlx.core")  # the pipeline module needs MLX
     from slimserve.video.ltx25.pipeline import Fast
 
     for fast_id in FAST_IDS:
@@ -125,18 +127,28 @@ def test_the_detailing_adapter_downloads_from_its_own_repository():
     )
 
 
-def test_every_profile_fetches_the_prompt_enhancer_from_googles_repo():
-    """The enhancer is google/gemma-4-E2B-it, shared by every quant, pinned to a
-    revision, and kept under the LTX root where checkpoints.path_of finds it."""
-    from slimserve.video.ltx25 import checkpoints
+def test_the_prompt_enhancer_is_fetched_only_when_asked_for():
+    """The enhancer is google/gemma-4-E2B-it (10.2 GB): an optional file group,
+    pinned to a revision and kept under the LTX root where checkpoints.path_of
+    finds it, fetched only by a run that asks for enhancement."""
+    from dataclasses import replace
 
+    from slimserve.video import cli as video_cli
+
+    enhancer = "prompt_enhancer/gemma-4-E2B-it/model.safetensors"
     for pid in VIDEO_IDS + FAST_IDS:
-        shared = [e for e in files_for(_plan(pid)) if e["role"] == "shared"]
-        paths = {e["path"] for e in shared}
-        assert checkpoints.FILES["enhancer"] in paths
+        plan = _plan(pid)
+        assert not [e for e in files_for(plan) if e["role"] in ("shared", "optional")]
+        args = video_cli.parser().parse_args([])
+        assert video_cli.prepare(plan, args).optional == ()
+        args = video_cli.parser().parse_args(["--enhance-prompt"])
+        wanted = files_for(video_cli.prepare(plan, args))
+        optional = [e for e in wanted if e["role"] == "optional"]
+        paths = {e["path"] for e in optional}
+        assert enhancer in paths
         assert "prompt_enhancer/gemma-4-E2B-it/tokenizer.json" in paths
         assert "prompt_enhancer/gemma-4-E2B-it/config.json" in paths
-        for e in shared:
+        for e in optional:
             assert e["url"].startswith(
                 "https://huggingface.co/google/gemma-4-E2B-it/resolve/"
             )
@@ -144,6 +156,38 @@ def test_every_profile_fetches_the_prompt_enhancer_from_googles_repo():
             assert e["url"].endswith("/" + e["path"].rsplit("/", 1)[1])
             assert e["sha256"]
             assert e["local_dir"] == "ltx-2.5/official"
+        serve = video_cli.prepare(
+            plan, video_cli.parser().parse_args(["--prompt-enhancer"])
+        )
+        assert serve.optional == ("prompt_enhancer",)
+    with pytest.raises(registry.ProfileError):
+        files_for(replace(_plan("ltx25-distilled"), optional=("nope",)))
+
+
+def test_the_enhancer_path_matches_the_checkpoint_registry():
+    pytest.importorskip("mlx.core")  # checkpoints imports MLX
+    from slimserve.video.ltx25 import checkpoints
+
+    paths = {
+        e["path"]
+        for e in registry._registry()["sources"]["ltx25"]["optional"]["prompt_enhancer"]
+    }
+    assert checkpoints.FILES["enhancer"] in paths
+
+
+def test_a_server_without_the_enhancer_refuses_enhance_requests(tmp_path):
+    engine = _FakeEngine()
+    service = server.VideoService(
+        {**CFG, "prompt_enhancer": False},
+        "LTX-2.5",
+        tmp_path,
+        engine_factory=lambda: engine,
+    )
+    assert service.ready.wait(5)
+    with pytest.raises(server.BadRequest, match="prompt enhancer"):
+        service.submit({"prompt": "x", "enhance_prompt": True})
+    assert service.submit({"prompt": "x"}).done.wait(10)
+    service.stop()
 
 
 CFG = {
@@ -476,6 +520,7 @@ def test_adapter_and_chunk_arguments_reach_the_right_place(tmp_path):
         "LTX-2.5",
         tmp_path,
         engine_factory=lambda: engine,
+        input_root=tmp_path,
     )
     assert service.ready.wait(5)
     job = service.submit(
@@ -487,19 +532,24 @@ def test_adapter_and_chunk_arguments_reach_the_right_place(tmp_path):
         }
     )
     assert job.done.wait(10) and job.status == "completed", job.error
-    assert engine.kwargs[-1]["loras"] == [(str(lora), 0.5)]
+    assert engine.kwargs[-1]["loras"] == [(os.path.realpath(lora), 0.5)]
     assert engine.loras[-1] is None  # not through the request-wide context
     service.stop()
     engine = _Engine()
     service = server.VideoService(
-        {**CFG, "pipeline": "dev"}, "LTX-2.5", tmp_path, engine_factory=lambda: engine
+        {**CFG, "pipeline": "dev"},
+        "LTX-2.5",
+        tmp_path,
+        engine_factory=lambda: engine,
+        input_root=tmp_path,
     )
     assert service.ready.wait(5)
     job = service.submit(
         {"prompt": "x", "seconds": 10, "chunked": True, "loras": [{"path": str(lora)}]}
     )
     assert job.done.wait(10) and job.status == "completed", job.error
-    assert "loras" not in engine.kwargs[-1] and engine.loras[-1] == [(str(lora), 1.0)]
+    assert "loras" not in engine.kwargs[-1]
+    assert engine.loras[-1] == [(os.path.realpath(lora), 1.0)]
     assert engine.kwargs[-1]["decoder"] == "diffusion"
     assert engine.kwargs[-1]["chunk"].chunk_pixel_frames == 97
     service.stop()

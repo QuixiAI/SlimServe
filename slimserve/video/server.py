@@ -28,6 +28,15 @@ requests. The API is job-shaped because a clip takes minutes:
     DELETE /v1/videos/<id>
     GET    /v1/models, /health
 
+Fields that name files on the server (`video_path`, `audio_path`,
+`reference_video`, `video_conditioning[].path`, `attention_mask`,
+`loras[].path`, `images[].path`, `text_embeddings`) are refused unless the
+operator started the server with an input root (`--input-root DIR` or
+SLIMSERVE_VIDEO_INPUT_ROOT); with one, a path resolves inside that directory
+(relative paths against it, symlinks followed) and anything outside it is
+refused. Base64 uploads (`video`, `audio`, `image`, `images[].image`) work
+either way. Bodies above the configured cap are answered with 413.
+
 `"wait": true` in the POST body holds the request open and returns the
 finished job. `enhance_prompt` (default false, as upstream's --enhance-prompt)
 has Gemma-4 E2B-it rewrite the request into the model's caption style first
@@ -52,6 +61,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import contextvars
 import io
 import json
 import os
@@ -66,6 +76,9 @@ from typing import Any
 
 MAX_QUEUED = 16
 KEEP_FINISHED = 32
+# The largest POST body the server reads (base64 sources and stills travel in
+# it). SLIMSERVE_VIDEO_MAX_BODY_MB or --max-body-mb override it.
+DEFAULT_MAX_BODY_BYTES = 256 << 20
 # pipelines on the dev transformer (CFG/STG guidance, a negative prompt)
 GUIDED_PIPELINES = ("dev", "hq", "keyframes", "one_stage", "a2vid", "t2a", "alpha")
 # pipelines that edit a source clip: its size, length and rate are the output's
@@ -89,6 +102,8 @@ class Job:
     path: Path | None = None
     timings: dict[str, Any] = field(default_factory=dict)
     done: threading.Event = field(default_factory=threading.Event)
+    # base64 sources written for this job; removed once it has run
+    uploads: list[Path] = field(default_factory=list)
 
     def public(self, model: str) -> dict[str, Any]:
         out = {
@@ -128,6 +143,68 @@ class Job:
         if self.timings:
             out["timings"] = self.timings
         return out
+
+
+# Set while VideoService.submit normalises a request: the uploads written for
+# it, so they can be removed when the request is refused or the job ends.
+_UPLOADS: contextvars.ContextVar[list[Path] | None] = contextvars.ContextVar(
+    "slimserve_video_uploads", default=None
+)
+# cfg key holding the server's input root: absent = the local CLI (any path the
+# user can read), None = serving with path fields disabled, str = the root.
+INPUT_ROOT = "input_root"
+
+
+def server_path(value: Any, name: str, cfg: dict[str, Any], dirs: bool = False) -> str:
+    """A request field that names a file (or, with `dirs`, an EXR frame folder)
+    on the server.
+
+    From the local CLI (no input root key in cfg) it is the user's own path.
+    When serving, it must resolve inside the operator's input root; nothing
+    outside the root is checked for existence or echoed back."""
+    if not isinstance(value, str) or not value:
+        raise BadRequest(f"{name} must be a path string")
+    if INPUT_ROOT not in cfg:
+        path = Path(value).expanduser()
+        if not (path.is_file() or (dirs and path.is_dir())):
+            raise BadRequest(f"{name} {path} is not a file")
+        return str(path)
+    root = cfg[INPUT_ROOT]
+    if not root:
+        raise BadRequest(
+            f"{name}: this server does not accept server-side paths (the operator "
+            "has not set an input root); send the file as base64 where the "
+            "request allows it"
+        )
+    real = os.path.realpath(os.path.join(root, value))
+    if os.path.commonpath([real, root]) != root:
+        raise BadRequest(f"{name}: the path is outside the server's input root")
+    if not (os.path.isfile(real) or (dirs and os.path.isdir(real))):
+        raise BadRequest(f"{name} {value} is not a file under the input root")
+    return real
+
+
+def resolve_input_root(value: str | os.PathLike | None) -> str | None:
+    """The operator's input root as a real directory path, or None (disabled)."""
+    if value is None or str(value) == "":
+        return None
+    root = os.path.realpath(os.path.expanduser(str(value)))
+    if not os.path.isdir(root):
+        raise ValueError(f"input root {value} is not a directory")
+    return root
+
+
+def max_body_bytes(value: float | None = None) -> int:
+    """The POST body cap in bytes: the argument (MiB), else
+    SLIMSERVE_VIDEO_MAX_BODY_MB, else DEFAULT_MAX_BODY_BYTES."""
+    if value is None:
+        env = os.environ.get("SLIMSERVE_VIDEO_MAX_BODY_MB")
+        if not env:
+            return DEFAULT_MAX_BODY_BYTES
+        value = float(env)
+    if value <= 0:
+        raise ValueError("the body size cap must be positive")
+    return int(value * (1 << 20))
 
 
 def normalize_request(body: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
@@ -247,7 +324,8 @@ def normalize_request(body: dict[str, Any], cfg: dict[str, Any]) -> dict[str, An
         raise BadRequest("image_strength needs an image")
     if body.get("images") is not None:
         params["images"] = [
-            still_field(item, frames, cfg["pipeline"]) for item in _list(body["images"])
+            still_field(item, frames, cfg["pipeline"], cfg)
+            for item in _list(body["images"])
         ]
     guided = cfg["pipeline"] in GUIDED_PIPELINES
     if "steps" in body:
@@ -276,22 +354,24 @@ def normalize_request(body: dict[str, Any], cfg: dict[str, Any]) -> dict[str, An
             _strength(pair[1], "lora_strengths", 2.0),
         )
     if body.get("loras") is not None:
-        params["loras"] = [lora_field(item) for item in _list(body["loras"], "loras")]
+        params["loras"] = [
+            lora_field(item, cfg) for item in _list(body["loras"], "loras")
+        ]
     params.update(keyframe_fields(body, cfg["pipeline"]))
     if cfg["pipeline"] == "ic_lora":
-        params.update(ic_lora_fields(body, params))
+        params.update(ic_lora_fields(body, params, cfg))
     elif cfg["pipeline"] == "alpha":
         extra = [k for k in IC_LORA_KEYS[1:] if k in body]
         if extra:
             raise BadRequest(f"{', '.join(extra)}: not an alpha-gen option")
-        params.update(ic_lora_fields(body, params))
+        params.update(ic_lora_fields(body, params, cfg))
     elif any(key in body for key in IC_LORA_KEYS):
         raise BadRequest(
             f"{', '.join(k for k in IC_LORA_KEYS if k in body)}: IC-LoRA options "
             "apply to the ic_lora pipeline only"
         )
     if cfg["pipeline"] == "a2vid":
-        params.update(a2vid_fields(body, params))
+        params.update(a2vid_fields(body, params, cfg))
     elif any(key in body for key in A2VID_KEYS):
         raise BadRequest(
             f"{', '.join(k for k in A2VID_KEYS if k in body)}: audio-to-video "
@@ -360,7 +440,9 @@ def normalize_t2a_request(
     if body.get("enhance_prompt") is True:
         params["enhance_prompt"] = True
     if body.get("loras") is not None:
-        params["loras"] = [lora_field(item) for item in _list(body["loras"], "loras")]
+        params["loras"] = [
+            lora_field(item, cfg) for item in _list(body["loras"], "loras")
+        ]
     return params
 
 
@@ -390,10 +472,8 @@ def normalize_source_request(
                 f"{key} does not apply to the retake pipeline (the source clip sets it)"
             )
     if body.get("video_path") is not None:
-        path = Path(str(body["video_path"])).expanduser()
-        if not path.is_file() and not path.is_dir():  # a clip, or an EXR frame folder
-            raise BadRequest(f"video_path {path} is not a file")
-        video_path = str(path)
+        # a clip, or an EXR frame folder
+        video_path = server_path(body["video_path"], "video_path", cfg, dirs=True)
     elif body.get("video") is not None:
         video_path = str(_store_video(body["video"]))
     else:
@@ -467,7 +547,9 @@ def normalize_source_request(
         if body["enhance_prompt"]:
             params["enhance_prompt"] = True
     if body.get("loras") is not None:
-        params["loras"] = [lora_field(item) for item in _list(body["loras"], "loras")]
+        params["loras"] = [
+            lora_field(item, cfg) for item in _list(body["loras"], "loras")
+        ]
     hdr_field(body, params)
     return params
 
@@ -491,10 +573,7 @@ def normalize_hdr_ic_lora_request(
                 f"{key} does not apply to the HDR IC-LoRA (the source sets it)"
             )
     if body.get("video_path") is not None:
-        path = Path(str(body["video_path"])).expanduser()
-        if not path.is_file() and not path.is_dir():
-            raise BadRequest(f"video_path {path} is not a file")
-        video_path = str(path)
+        video_path = server_path(body["video_path"], "video_path", cfg, dirs=True)
     elif body.get("video") is not None:
         video_path = str(_store_video(body["video"]))
     else:
@@ -544,13 +623,13 @@ def normalize_hdr_ic_lora_request(
     loras = body.get("loras")
     if not loras or not isinstance(loras, list) or len(loras) != 1:
         raise BadRequest("the HDR IC-LoRA needs exactly one adapter in `loras`")
-    params["loras"] = [lora_field(loras[0])]
+    params["loras"] = [lora_field(loras[0], cfg)]
     emb = body.get("text_embeddings")
-    if not isinstance(emb, str) or not Path(emb).expanduser().is_file():
+    if not isinstance(emb, str):
         raise BadRequest(
             "`text_embeddings` must name the adapter's scene embedding .safetensors"
         )
-    params["text_embeddings"] = str(Path(emb).expanduser())
+    params["text_embeddings"] = server_path(emb, "text_embeddings", cfg)
     for key in ("high_quality", "keyframes"):
         if key in body:
             if not isinstance(body[key], bool):
@@ -581,10 +660,7 @@ def normalize_dubit_request(
                 f"{key} does not apply to Dub-It (the reference clip sets it)"
             )
     if body.get("reference_video") is not None:
-        path = Path(str(body["reference_video"])).expanduser()
-        if not path.is_file() and not path.is_dir():
-            raise BadRequest(f"reference_video {path} is not a file")
-        ref = str(path)
+        ref = server_path(body["reference_video"], "reference_video", cfg, dirs=True)
     elif body.get("video") is not None:
         ref = str(_store_video(body["video"]))
     else:
@@ -642,7 +718,7 @@ def normalize_dubit_request(
         raise BadRequest(
             "Dub-It needs exactly one adapter in `loras` (the Dub-It IC-LoRA)"
         )
-    params["loras"] = [lora_field(loras[0])]
+    params["loras"] = [lora_field(loras[0], cfg)]
     decoder = str(body.get("decoder", cfg.get("decoder", "diffusion")))
     if decoder not in ("diffusion", "conv"):
         raise BadRequest(
@@ -656,7 +732,7 @@ def normalize_dubit_request(
         params["image_strength"] = _strength(body.get("image_strength", 1.0))
     if body.get("images") is not None:
         params["images"] = [
-            still_field(item, frames, "dubit") for item in _list(body["images"])
+            still_field(item, frames, "dubit", cfg) for item in _list(body["images"])
         ]
     params.update(keyframe_fields(body, "dubit"))
     chunk = chunk_config(body, "dubit")
@@ -679,8 +755,16 @@ def _store_blob(value: Any, name: str, stem: str) -> Path:
     data = _b64(value, name)
     target = output_dir() / f"{stem}_{uuid.uuid4().hex[:16]}.bin"
     target.parent.mkdir(parents=True, exist_ok=True)
+    uploads = _UPLOADS.get()
+    if uploads is not None:  # owned by the request being submitted
+        uploads.append(target)
     target.write_bytes(data)
     return target
+
+
+def _remove(paths: list[Path]) -> None:
+    for path in paths:
+        path.unlink(missing_ok=True)
 
 
 def _b64(value: Any, name: str = "video") -> bytes:
@@ -814,17 +898,16 @@ def guidance_fields(value: Any, pipeline: str) -> dict[str, Any]:
 A2VID_KEYS = ("audio_path", "audio", "audio_start_time", "audio_max_duration")
 
 
-def a2vid_fields(body: dict[str, Any], params: dict[str, Any]) -> dict[str, Any]:
+def a2vid_fields(
+    body: dict[str, Any], params: dict[str, Any], cfg: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """The A2Vid request: `audio_path` (a file on the server; any container
     with an audio stream) or `audio` (base64), `audio_start_time` (s),
     `audio_max_duration` (s; not with a clip length, as upstream). Without a
     length the clip follows the audio (capped at the envelope)."""
     out: dict[str, Any] = {}
     if body.get("audio_path") is not None:
-        path = Path(str(body["audio_path"])).expanduser()
-        if not path.is_file():
-            raise BadRequest(f"audio_path {path} is not a file")
-        out["audio_path"] = str(path)
+        out["audio_path"] = server_path(body["audio_path"], "audio_path", cfg or {})
     elif body.get("audio") is not None:
         out["audio_path"] = str(_store_blob(body["audio"], "audio", "source"))
     else:
@@ -961,7 +1044,9 @@ IC_LORA_KEYS = (
 )
 
 
-def ic_lora_fields(body: dict[str, Any], params: dict[str, Any]) -> dict[str, Any]:
+def ic_lora_fields(
+    body: dict[str, Any], params: dict[str, Any], cfg: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """The IC-LoRA request: `video_conditioning` ([{"path", "strength"}],
     reference clips on the server; required), `loras` (the IC-LoRA adapters;
     required), `attention_strength` (0-1), `attention_mask` (a grayscale mask
@@ -978,11 +1063,9 @@ def ic_lora_fields(body: dict[str, Any], params: dict[str, Any]) -> dict[str, An
     for item in _list(refs, "video_conditioning"):
         if not isinstance(item, dict) or not isinstance(item.get("path"), str):
             raise BadRequest('each video_conditioning entry needs a "path"')
-        path = Path(item["path"]).expanduser()
-        if not path.is_file() and not path.is_dir():
-            raise BadRequest(f"video_conditioning: {path} is not a file")
+        path = server_path(item["path"], "video_conditioning", cfg or {}, dirs=True)
         out["video_conditioning"].append(
-            (str(path), _strength(item.get("strength", 1.0), "reference strength"))
+            (path, _strength(item.get("strength", 1.0), "reference strength"))
         )
     if not params.get("loras"):
         raise BadRequest("the ic_lora pipeline needs `loras` (the IC-LoRA adapter)")
@@ -991,10 +1074,9 @@ def ic_lora_fields(body: dict[str, Any], params: dict[str, Any]) -> dict[str, An
             body["attention_strength"], "attention_strength"
         )
     if body.get("attention_mask") is not None:
-        mask = Path(str(body["attention_mask"])).expanduser()
-        if not mask.is_file():
-            raise BadRequest(f"attention_mask: {mask} is not a file")
-        out["attention_mask"] = str(mask)
+        out["attention_mask"] = server_path(
+            body["attention_mask"], "attention_mask", cfg or {}
+        )
     for key in ("skip_stage_2", "stage_2_ic_lora", "tile"):
         if key in body:
             if not isinstance(body[key], bool):
@@ -1015,19 +1097,21 @@ def ic_lora_fields(body: dict[str, Any], params: dict[str, Any]) -> dict[str, An
     return out
 
 
-def lora_field(item: Any) -> tuple[str, float]:
+def lora_field(item: Any, cfg: dict[str, Any] | None = None) -> tuple[str, float]:
     """One entry of `loras`: {"path": <.safetensors on the server>, "strength": 1.0}
     (upstream --lora PATH [STRENGTH]); the file is checked when the engine
     loads it."""
     if not isinstance(item, dict) or not isinstance(item.get("path"), str):
         raise BadRequest('each loras entry needs a "path"')
-    path = Path(item["path"]).expanduser()
-    if path.suffix != ".safetensors" or not path.is_file():
-        raise BadRequest(f"loras: {path} is not a .safetensors file")
-    return str(path), _strength(item.get("strength", 1.0), "lora strength", 2.0)
+    if not item["path"].endswith(".safetensors"):
+        raise BadRequest("loras: each path must be a .safetensors file")
+    path = server_path(item["path"], "loras", cfg or {})
+    return path, _strength(item.get("strength", 1.0), "lora strength", 2.0)
 
 
-def still_field(item: Any, frames: int | None, pipeline: str):
+def still_field(
+    item: Any, frames: int | None, pipeline: str, cfg: dict[str, Any] | None = None
+):
     """One entry of `images`: {"image": <base64 or data: URL>, "frame": N,
     "strength": 0-1, "crf": int} -> sampling.Still (upstream's --image PATH
     FRAME_IDX STRENGTH [CRF]). Frames must be inside the clip when its length
@@ -1047,10 +1131,7 @@ def still_field(item: Any, frames: int | None, pipeline: str):
     if crf is not None and (not isinstance(crf, int) or not 0 <= crf <= 51):
         raise BadRequest("image crf must be an integer in [0, 51] (0: no round trip)")
     if item.get("path") is not None:
-        path = Path(str(item["path"])).expanduser()
-        if not path.is_file():
-            raise BadRequest(f"images: {path} is not a file")
-        source: Any = str(path)
+        source: Any = server_path(item["path"], "images", cfg or {})
     else:
         source = decode_image_field(item["image"])
     return Still(source, frame, _strength(item.get("strength", 1.0)), crf)
@@ -1116,8 +1197,13 @@ class VideoService:
         model_name: str,
         output_dir: Path,
         engine_factory=None,
+        input_root: str | os.PathLike | None = None,
+        max_body: int = DEFAULT_MAX_BODY_BYTES,
     ):
+        # Requests may name server files only under input_root (None: never).
+        cfg = {**cfg, INPUT_ROOT: resolve_input_root(input_root)}
         self.cfg, self.model_name, self.output_dir = cfg, model_name, output_dir
+        self.max_body = max_body
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.jobs: dict[str, Job] = {}
         self.order: list[str] = []
@@ -1174,6 +1260,8 @@ class VideoService:
             job = self.queue.get()
             if job is None:
                 return
+            if job.status != "queued":  # failed by stop() while waiting
+                continue
             job.status, job.started_at = "in_progress", time.time()
             try:
                 self._generate(engine, job)
@@ -1182,6 +1270,8 @@ class VideoService:
             except Exception as exc:
                 job.status, job.error = "failed", f"{type(exc).__name__}: {exc}"
                 self.failed += 1
+            finally:
+                _remove(job.uploads)  # the uploaded sources are spent either way
             job.completed_at = time.time()
             job.done.set()
             self._trim()
@@ -1255,19 +1345,45 @@ class VideoService:
         job = self.jobs.pop(job_id, None)
         if job_id in self.order:
             self.order.remove(job_id)
-        if job and job.path:
-            job.path.unlink(missing_ok=True)
+        if job:
+            _remove(job.uploads)
+            if job.path:
+                job.path.unlink(missing_ok=True)
 
     # ---- API ---------------------------------------------------------------
+    def _queue_full(self) -> None:
+        waiting = sum(1 for j in self.jobs.values() if j.status == "queued")
+        if waiting >= MAX_QUEUED:
+            raise OverflowError(f"{waiting} requests already queued")
+
     def submit(self, body: dict[str, Any]) -> Job:
-        params = normalize_request(body, self.cfg)
+        # Refuse a full queue before decoding anything: normalising writes the
+        # request's base64 sources to disk.
         with self.lock:
-            waiting = sum(1 for j in self.jobs.values() if j.status == "queued")
-            if waiting >= MAX_QUEUED:
-                raise OverflowError(f"{waiting} requests already queued")
-            job = Job(id="video_" + uuid.uuid4().hex[:24], params=params)
-            self.jobs[job.id] = job
-            self.order.append(job.id)
+            self._queue_full()
+        uploads: list[Path] = []
+        token = _UPLOADS.set(uploads)
+        try:
+            params = normalize_request(body, self.cfg)
+            if params.get("enhance_prompt") and not self.cfg.get(
+                "prompt_enhancer", True
+            ):
+                raise BadRequest(
+                    "enhance_prompt: the prompt enhancer is not installed on this "
+                    "server (start it with --prompt-enhancer to fetch it)"
+                )
+            with self.lock:
+                self._queue_full()  # another request may have filled it meanwhile
+                job = Job(
+                    id="video_" + uuid.uuid4().hex[:24], params=params, uploads=uploads
+                )
+                self.jobs[job.id] = job
+                self.order.append(job.id)
+        except BaseException:
+            _remove(uploads)
+            raise
+        finally:
+            _UPLOADS.reset(token)
         self.queue.put(job)
         return job
 
@@ -1312,6 +1428,14 @@ class VideoService:
         return out
 
     def stop(self) -> None:
+        with self.lock:  # queued jobs will not run: fail them, free their uploads
+            for job in self.jobs.values():
+                if job.status == "queued":
+                    job.status = "failed"
+                    job.error = "the server stopped before this job ran"
+                    job.completed_at = time.time()
+                    _remove(job.uploads)
+                    job.done.set()
         self.queue.put(None)
 
 
@@ -1374,10 +1498,23 @@ def make_handler(service: VideoService):
             if service.load_error:
                 return self._error(503, service.load_error)
             try:
-                body = json.loads(
-                    self.rfile.read(int(self.headers.get("Content-Length", "0")))
-                    or b"{}"
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                self.close_connection = True
+                return self._error(400, "Content-Length must be an integer")
+            if length < 0:
+                self.close_connection = True
+                return self._error(400, "Content-Length must be an integer")
+            if length > service.max_body:
+                # the body is never read: drop the connection after answering
+                self.close_connection = True
+                return self._error(
+                    413, f"request body is larger than {service.max_body} bytes"
                 )
+            try:
+                body = json.loads(self.rfile.read(length) or b"{}")
+                if not isinstance(body, dict):
+                    raise BadRequest("the request body must be a JSON object")
                 job = service.submit(body)
             except (BadRequest, json.JSONDecodeError) as exc:
                 return self._error(400, str(exc))
@@ -1406,8 +1543,17 @@ def output_dir() -> Path:
     ).expanduser()
 
 
-def serve(cfg: dict[str, Any], model_name: str, host: str, port: int) -> int:
-    service = VideoService(cfg, model_name, output_dir())
+def serve(
+    cfg: dict[str, Any],
+    model_name: str,
+    host: str,
+    port: int,
+    input_root: str | os.PathLike | None = None,
+    max_body: int = DEFAULT_MAX_BODY_BYTES,
+) -> int:
+    service = VideoService(
+        cfg, model_name, output_dir(), input_root=input_root, max_body=max_body
+    )
     httpd = ThreadingHTTPServer((host, port), make_handler(service))
     httpd.daemon_threads = True
     try:
