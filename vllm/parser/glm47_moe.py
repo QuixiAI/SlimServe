@@ -70,6 +70,18 @@ def _glm47_arg_converter(raw_args: str, partial: bool) -> str:
     return json.dumps(params, ensure_ascii=False)
 
 
+def _glm47_custom_input(raw_args: str, partial: bool) -> str:
+    """Extract a Responses custom tool's synthetic ``input`` value."""
+    for match in _ARG_RE.finditer(raw_args):
+        if match.group("key").strip() == "input":
+            return match.group("value")
+    if partial:
+        match = _PARTIAL_ARG_RE.search(raw_args)
+        if match and match.group("key").strip() == "input":
+            return match.group("value")
+    return ""
+
+
 @functools.cache
 def glm47_moe_config(thinking: bool = True) -> ParserEngineConfig:
     arg_tag_transitions = {
@@ -166,6 +178,7 @@ def glm47_moe_config(thinking: bool = True) -> ParserEngineConfig:
             **arg_tag_transitions,
         },
         arg_converter=_glm47_arg_converter,
+        custom_tool_arg_converter=_glm47_custom_input,
         stream_arg_deltas=True,
         tool_args_json=False,
         validate_tool_names=True,
@@ -184,11 +197,16 @@ class Glm47MoeParser(ParserEngine):
         chat_kwargs = kwargs.get("chat_template_kwargs", {}) or {}
         thinking = chat_kwargs.get("thinking", None)
         enable_thinking = chat_kwargs.get("enable_thinking", None)
-        self.thinking_enabled = (
-            True
-            if thinking is None and enable_thinking is None
-            else bool(thinking) or bool(enable_thinking)
-        )
+        # ``enable_thinking`` is the GLM template's canonical switch.  Serving
+        # defaults may contain both aliases, so combining them with ``or``
+        # makes a request-level ``enable_thinking=False`` unable to override a
+        # default ``thinking=True`` and misclassifies all output as reasoning.
+        if enable_thinking is not None:
+            self.thinking_enabled = bool(enable_thinking)
+        elif thinking is not None:
+            self.thinking_enabled = bool(thinking)
+        else:
+            self.thinking_enabled = True
         kwargs.setdefault(
             "parser_engine_config",
             glm47_moe_config(thinking=self.thinking_enabled),

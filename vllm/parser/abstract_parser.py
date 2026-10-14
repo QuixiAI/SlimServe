@@ -33,7 +33,11 @@ from vllm.tool_parsers.streaming import (
     extract_named_tool_call_streaming,
     extract_required_tool_call_streaming,
 )
-from vllm.tool_parsers.utils import named_tool_choice_name
+from vllm.tool_parsers.utils import (
+    allowed_tool_choice_names,
+    named_tool_choice_name,
+    tool_choice_mode,
+)
 
 logger = init_logger(__name__)
 
@@ -417,7 +421,8 @@ class DelegatingParser(Parser):
         if tool_parser is None:
             return [], content
 
-        if request.tool_choice == "none":
+        choice_mode = tool_choice_mode(request.tool_choice)
+        if choice_mode == "none":
             if self._engine_based or tool_parser.handles_tool_choice_none:
                 result = self.extract_tool_calls(content or "", request=request)
                 return [], result.content
@@ -425,9 +430,9 @@ class DelegatingParser(Parser):
 
         supports_required_and_named = tool_parser.supports_required_and_named
         is_named_tool_choice = named_tool_choice_name(request.tool_choice) is not None
-        is_required_tool_choice = request.tool_choice == "required"
+        is_required_tool_choice = choice_mode == "required"
         is_auto_tool_choice = enable_auto_tools and (
-            request.tool_choice == "auto"
+            choice_mode == "auto"
             or request.tool_choice is None
             or (
                 not supports_required_and_named
@@ -520,8 +525,7 @@ class DelegatingParser(Parser):
             return request
 
         need_tool_calling = (
-            request.tool_choice == "auto"
-            or request.tool_choice == "required"
+            tool_choice_mode(request.tool_choice) in ("auto", "required")
             or named_tool_choice_name(request.tool_choice) is not None
         )
         if not need_tool_calling:
@@ -580,6 +584,19 @@ class DelegatingParser(Parser):
                 model_output,
                 request=request,  # type: ignore[arg-type]
             )
+            allowed_names = allowed_tool_choice_names(request.tool_choice)
+            if allowed_names is not None and result.tools_called:
+                disallowed_names = {
+                    call.function.name
+                    for call in result.tool_calls
+                    if call.function.name not in allowed_names
+                }
+                if disallowed_names:
+                    names = ", ".join(sorted(disallowed_names))
+                    raise ValueError(
+                        "Model generated tool call(s) outside the allowed_tools "
+                        f"subset: {names}"
+                    )
             is_tool_called = bool(result.tools_called)
         except Exception as e:
             is_tool_called = e
@@ -616,6 +633,17 @@ class DelegatingParser(Parser):
                 delta_token_ids,
                 request,  # type: ignore[arg-type]
             )
+            allowed_names = allowed_tool_choice_names(request.tool_choice)
+            if allowed_names is not None and result and result.tool_calls:
+                for call in result.tool_calls:
+                    name = call.function.name if call.function else None
+                    if name and not any(
+                        allowed.startswith(name) for allowed in allowed_names
+                    ):
+                        raise ValueError(
+                            "Model generated a tool call outside the allowed_tools "
+                            f"subset: {name}"
+                        )
             is_tool_called = bool(result and result.tool_calls)
         except Exception as e:
             is_tool_called = e
@@ -646,7 +674,8 @@ class DelegatingParser(Parser):
         assert self._tool_parser is not None
         supports_required_and_named = self._tool_parser.supports_required_and_named
 
-        if request.tool_choice == "none":
+        choice_mode = tool_choice_mode(request.tool_choice)
+        if choice_mode == "none":
             if self._engine_based or self._tool_parser.handles_tool_choice_none:
                 # Engine-backed parsers route content extraction through
                 # extract_tool_calls_streaming. Some token-based parsers also
@@ -680,7 +709,7 @@ class DelegatingParser(Parser):
             )
             return delta_message, function_name_returned
 
-        if supports_required_and_named and request.tool_choice == "required":
+        if supports_required_and_named and choice_mode == "required":
             delta_message, function_name_returned = (
                 extract_required_tool_call_streaming(
                     previous_text=previous_text,

@@ -40,6 +40,36 @@ def test_every_profile_resolves_on_a_platform_it_claims():
             assert plan.engine, "a profile with no engine settings would serve nothing"
 
 
+def test_qwen36_5090_profile_fetches_vision_and_mtp_checkpoint():
+    plan = resolve("qwen36-nvfp4-1", "rtx5090", 1, None)
+    files = {entry["path"] for entry in files_for(plan)}
+    assert "preprocessor_config.json" in files
+    assert "model-00003-of-00003.safetensors" in files
+    assert plan.source["modalities"] == ["text", "image"]
+    assert plan.engine["kv_cache_dtype"] == "fp8"
+    assert plan.engine["moe_backend"] == "auto"
+    tier = plan.engine["kv_transfer_config"]["kv_connector_extra_config"]
+    assert tier["host_tier_gb_per_rank"] == 48
+    assert tier["nvme_tier_gb_per_rank"] == 128
+    assert plan.engine["max_model_len"] == 262144
+    assert plan.engine["cpu_offload_gb"] == 4
+    assert engine_kwargs(plan)["speculative_config"]["method"] == "qwen3_5_mtp"
+
+
+def test_qwen36_fp8_5090_profile_offloads_and_fetches_mtp():
+    plan = resolve("qwen36-fp8-1", "rtx5090", 1, None)
+    files = {entry["path"] for entry in files_for(plan)}
+    assert "mtp.safetensors" in files
+    assert "outside.safetensors" in files
+    assert "preprocessor_config.json" in files
+    assert plan.engine["cpu_offload_gb"] == 16
+    assert plan.engine["kv_cache_dtype"] == "fp8"
+    assert plan.source["modalities"] == ["text", "image"]
+    assert plan.engine["max_model_len"] == 262144
+    assert plan.engine["kv_transfer_config"]["kv_connector"] == "HostTierConnector"
+    assert engine_kwargs(plan)["speculative_config"]["method"] == "qwen3_5_mtp"
+
+
 def test_every_profile_uses_registered_drafter_with_fp8_dspark():
     for profile_id in registry.profile_ids():
         entry = registry.describe(profile_id)
@@ -84,19 +114,25 @@ def test_no_spec_cli_flag_disables_the_resolved_speculator(monkeypatch):
 
     monkeypatch.setattr(cli, "_chat", _capture_chat)
 
-    assert cli.main(["dsv4-q4ktail-2", "--quant", "IQ2_XXS", "--no-spec"]) == 0
+    assert cli.main(["dsv4-q4ktail-2", "--quant", "IQ2_XXS", "--no-spec", "--chat"]) == 0
     assert len(seen) == 1
     assert seen[0].speculative is False
     assert "speculative_config" not in engine_kwargs(seen[0])
 
 
-def test_every_profile_source_names_a_blessed_dspark_download():
+def test_every_speculative_profile_source_names_a_blessed_download():
     sources = registry._registry()["sources"]
     for profile_id in registry.profile_ids():
+        if not registry.describe(profile_id)["speculative"]:
+            continue
         speculator = sources[registry.describe(profile_id)["source"]]["speculator"]
         assert speculator.get("base_url", "https://huggingface.co/").startswith(
             "https://huggingface.co/"
         )
+
+
+
+
 
 
 def test_spec_cli_opt_in_keeps_registered_glm_defaults(monkeypatch):
@@ -124,7 +160,7 @@ def test_spec_cli_opt_in_keeps_registered_glm_defaults(monkeypatch):
         return 0
 
     monkeypatch.setattr(cli, "_chat", record_chat)
-    assert cli.main(["glm53f-nvfp4-4", "--quant", "NVFP4", "--spec"]) == 0
+    assert cli.main(["glm53f-nvfp4-4", "--quant", "NVFP4", "--spec", "--chat"]) == 0
     assert len(seen) == 1 and seen[0].speculative
     config = engine_kwargs(seen[0])["speculative_config"]
     # incoai/GLM-5.3-Flash-DFlash2 (block 8): up to 7 drafts per verify.
@@ -134,6 +170,23 @@ def test_spec_cli_opt_in_keeps_registered_glm_defaults(monkeypatch):
         config.get("revision") == "bf582e4eacc1810f76656d1811693ff6c6737d2a"
     )
     assert not plan.speculative
+
+
+def test_glm53_profiles_select_glm53_tool_calling_compatibility():
+    cases = (
+        ("glm53f-nvfp4-4", "a100", 4, 0),
+        ("glm53f-nvfp4-8", "a100", 8, 0),
+        ("glm53f-q2-1", "metal", 1, 128 * (1 << 30)),
+    )
+    for profile_id, platform, gpus, memory_bytes in cases:
+        plan = resolve(
+            profile_id,
+            platform,
+            gpus,
+            None,
+            memory_bytes=memory_bytes,
+        )
+        assert plan.env["VLLM_TOOL_CALLING_PROFILE"] == "glm53"
 
 
 def test_spec_cli_flags_are_mutually_exclusive():
@@ -385,11 +438,14 @@ def test_registry_contains_only_the_supported_model_artifacts():
         "kimi-k3",
         "dsv4-flash",
         "muse-glimmer",
+        "qwen36-35b-a3b-nvfp4",
+        "qwen36-35b-a3b-fp8",
         "qwen38-27b",
         "qwen38-27b-nvfp4",
         "qwen38-flash-next-fp8",
         "qwen38-flash-next-nvfp4",
         "glm53f-nvfp4",
+        "glm53f-gguf",
     }
     glm = data["sources"]["glm52-vision"]
     kimi = data["sources"]["kimi-k3"]

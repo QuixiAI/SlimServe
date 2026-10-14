@@ -44,6 +44,7 @@ from vllm.entrypoints.openai.engine.protocol import FunctionCall
 from vllm.entrypoints.openai.responses.protocol import ResponseInputOutputItem
 from vllm.logger import init_logger
 from vllm.tool_parsers.utils import (
+    allowed_tool_choice_names,
     build_responses_tool_call_name_map,
     flat_namespace_tool_name,
     iter_response_function_tool_dicts,
@@ -433,14 +434,22 @@ def construct_tool_dicts(
         tool_dicts = None
     else:
         tool_dicts = []
+        allowed_names = allowed_tool_choice_names(tool_choice)
         for tool in tools:
             if isinstance(tool, CustomTool):
+                if allowed_names is not None and tool.name not in allowed_names:
+                    continue
                 # Preserve the Responses declaration. Model-specific renderers
                 # adapt raw-input custom tools to their native call syntax.
                 tool_dicts.append(tool.model_dump(mode="json", exclude_none=True))
                 continue
-            tool_dicts.extend(
-                convert_tool_responses_to_completions_format(function_tool)
-                for function_tool in iter_response_function_tool_dicts([tool])
-            )
+            for function_tool in iter_response_function_tool_dicts([tool]):
+                if (
+                    allowed_names is not None
+                    and function_tool.get("name") not in allowed_names
+                ):
+                    continue
+                tool_dicts.append(
+                    convert_tool_responses_to_completions_format(function_tool)
+                )
     return tool_dicts

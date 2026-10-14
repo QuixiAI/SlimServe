@@ -17,6 +17,7 @@ import json
 import sys
 import tempfile
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -123,12 +124,24 @@ def resolve_profiles(
 
 
 def validate_acceleration(plan: Plan) -> dict[str, Any]:
-    """Require the resolved plan to match its registered speculator exactly.
+    """Require a profile's registered speculator to resolve exactly.
 
     Every profile registers a drafter (DSpark with FP8 draft KV, a
     DFlash block drafter, or a checkpoint's own MTP head); the resolved
     executable configuration must carry every registered engine setting.
+
+    Some records run that drafter opt-in - a bring-up target qualification
+    (glm53f-q2-1) or a platform whose drafter is not qualified yet
+    (glm53f-nvfp4-4) - and resolve without a speculative configuration until
+    --spec is passed. Demanding one from the default plan aborted `slimserve
+    smoke` on those records before they downloaded a byte, so validate the
+    configuration --spec would produce instead. A profile whose source
+    registers no drafter at all still fails here.
     """
+    if plan.speculator is None:
+        raise RuntimeError("profile registers no speculative decoder")
+    if not plan.speculative:
+        plan = replace(plan, speculative=True)
     speculative = engine_kwargs(plan).get("speculative_config")
     if not isinstance(speculative, dict):
         raise RuntimeError("resolved plan has no speculative configuration")
