@@ -2,28 +2,46 @@
 
 Run against the real SlimServe profile; records exact API usage and SSE events.
 This is a local inventory workflow, not the external Evalhub benchmark.
+
+Sampling follows serving policy: temperature 1.0 / top_p 0.95 / top_k 20,
+seeded (request i uses seed + i), thinking left enabled. Raw output defaults
+to perf/results/<YYYY-MM-DD>/<run-id>/qwen_tool_protocol.json.
+
+Timing per round: ``response_created_s`` is the time to the first SSE event
+(``response.created``, emitted before any generation); ``first_output_delta_s``
+is the time to the first generated delta (reasoning, text or call arguments).
+A round that ends ``response.incomplete`` because it hit max_output_tokens is
+counted as ``incomplete_max_output_tokens``, separately from protocol errors.
 """
 
 import argparse
 import asyncio
 import json
 import time
+from datetime import datetime
 from pathlib import Path
 
 import httpx
 
-MODEL = "Qwen3.8-27B-Uncensored-FP8"
+# Served by the qwen38-27b profiles in slimserve/profiles.json.
+MODEL = "Qwen3.8-27B"
+
+OUTPUT_DELTA_TYPES = {
+    "response.output_text.delta",
+    "response.reasoning_text.delta",
+    "response.function_call_arguments.delta",
+}
 
 
-def payload(index, records):
+def payload(index, args):
     catalog = "\n".join(
         f"Item {i:04d}: category={i % 13}, quantity={i % 29}, "
         f"warehouse=W{i % 4}, inspected=yes, packaging=reusable, "
         f"handling=standard, label=CAT-{i:04d}."
-        for i in range(records)
+        for i in range(args.records)
     )
     return {
-        "model": MODEL,
+        "model": args.model,
         "instructions": "Review the inventory and use record_summary "
         "to record findings. "
         "Use the exact batch_id supplied. Keep observations factual and concise.",
@@ -57,20 +75,22 @@ def payload(index, records):
         "tool_choice": "required",
         "stream": True,
         "store": False,
-        "max_output_tokens": 3072,
-        "temperature": 0,
-        "seed": 17,
+        "max_output_tokens": args.max_output_tokens,
+        "temperature": args.temperature,
+        "top_p": args.top_p,
+        "top_k": args.top_k,
+        "seed": args.seed + index,
     }
 
 
 async def run_one(client, url, index, args):
-    body = payload(index, args.records)
-    body["model"] = args.model
+    body = payload(index, args)
     rounds = []
     for turn in range(args.turns):
         started = time.perf_counter()
         events = []
         first = None
+        first_delta = None
         async with client.stream("POST", url + "/v1/responses", json=body) as response:
             response.raise_for_status()
             async for line in response.aiter_lines():
@@ -79,10 +99,14 @@ async def run_one(client, url, index, args):
                 if first is None:
                     first = time.perf_counter() - started
                 try:
-                    events.append(json.loads(line[6:]))
+                    event = json.loads(line[6:])
                 except json.JSONDecodeError:
                     if line[6:] != "[DONE]":
                         raise
+                    continue
+                if first_delta is None and event.get("type") in OUTPUT_DELTA_TYPES:
+                    first_delta = time.perf_counter() - started
+                events.append(event)
         elapsed = time.perf_counter() - started
         terminal = [
             e
@@ -93,9 +117,18 @@ async def run_one(client, url, index, args):
         final = terminal[-1].get("response", {}) if terminal else {}
         calls = [o for o in final.get("output", []) if o.get("type") == "function_call"]
         errors = []
-        if final.get("status") != "completed":
+        truncated = (
+            final.get("status") == "incomplete"
+            and (final.get("incomplete_details") or {}).get("reason")
+            == "max_output_tokens"
+        )
+        if truncated:
+            # Not a protocol fault: the budget ran out. The round cannot be
+            # replayed, so the conversation stops here.
+            pass
+        elif final.get("status") != "completed":
             errors.append("missing successful terminal response")
-        if not calls:
+        elif not calls:
             errors.append("required request returned no call")
         for call in calls:
             try:
@@ -124,13 +157,15 @@ async def run_one(client, url, index, args):
             {
                 "turn": turn,
                 "elapsed_s": elapsed,
-                "first_event_s": first,
+                "response_created_s": first,
+                "first_output_delta_s": first_delta,
+                "incomplete_max_output_tokens": truncated,
                 "usage": final.get("usage", {}),
                 "errors": errors,
                 "events": events,
             }
         )
-        if errors:
+        if errors or truncated:
             break
         body["input"].extend(final.get("output", []))
         body["input"].extend(
@@ -151,6 +186,17 @@ async def run_one(client, url, index, args):
     return {"index": index, "rounds": rounds}
 
 
+def default_output():
+    now = datetime.now()
+    run_id = now.strftime("qwen-tool-protocol-%H%M%S")
+    return (
+        Path("perf/results")
+        / now.strftime("%Y-%m-%d")
+        / run_id
+        / "qwen_tool_protocol.json"
+    )
+
+
 async def main(args):
     started_at_unix = time.time()
     started = time.perf_counter()
@@ -166,23 +212,34 @@ async def main(args):
     errors = sum(bool(r["errors"]) for r in rounds) + sum(
         "error" in row for row in rows
     )
+    truncated = sum(r["incomplete_max_output_tokens"] for r in rounds)
     summary = {
         "started_at_unix": started_at_unix,
         "elapsed_s": elapsed,
         "output_tokens": tokens,
         "aggregate_output_tokens_per_s": tokens / elapsed,
-        "completed_rounds": len(rounds),
-        "errors": errors,
+        "rounds": len(rounds),
+        "completed_rounds": len(rounds) - truncated,
+        "protocol_errors": errors,
+        "incomplete_max_output_tokens": truncated,
+        "model": args.model,
+        "sampling": {
+            "temperature": args.temperature,
+            "top_p": args.top_p,
+            "top_k": args.top_k,
+            "seed": args.seed,
+        },
+        "max_output_tokens": args.max_output_tokens,
         "concurrency": args.concurrency,
         "turns": args.turns,
         "records": args.records,
     }
-    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-    Path(args.output).write_text(
-        json.dumps({"summary": summary, "results": rows}, indent=2)
-    )
+    output = Path(args.output) if args.output else default_output()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps({"summary": summary, "results": rows}, indent=2))
     print(json.dumps(summary, indent=2), flush=True)
-    if errors or len(rounds) != args.concurrency * args.turns:
+    print(f"raw: {output}", flush=True)
+    if errors or truncated or len(rounds) != args.concurrency * args.turns:
         raise SystemExit(1)
 
 
@@ -193,5 +250,15 @@ if __name__ == "__main__":
     parser.add_argument("--concurrency", type=int, default=8)
     parser.add_argument("--turns", type=int, default=2)
     parser.add_argument("--records", type=int, default=240)
-    parser.add_argument("--output", required=True)
+    parser.add_argument("--max-output-tokens", type=int, default=3072)
+    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--top-p", type=float, default=0.95)
+    parser.add_argument("--top-k", type=int, default=20)
+    parser.add_argument("--seed", type=int, default=17)
+    parser.add_argument(
+        "--output",
+        default=None,
+        help="raw JSON path (default: perf/results/<YYYY-MM-DD>/<run-id>/"
+        "qwen_tool_protocol.json)",
+    )
     asyncio.run(main(parser.parse_args()))
