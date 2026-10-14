@@ -39,7 +39,8 @@ class B12xDmaAllReduce:
         except ImportError:
             logger.warning(
                 "VLLM_B12X_DMA_AR_MIN_MB is set but b12x is not installed "
-                "(pip install b12x); large all-reduces stay on the custom "
+                "(the optional `b12x` extra: pip install 'b12x==1.3.0'); large "
+                "all-reduces stay on the custom "
                 "kernel / NCCL."
             )
             return

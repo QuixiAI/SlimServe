@@ -777,7 +777,8 @@ microbench GB/s and an e2e entry.
   a large kernel set (it exhausts host RAM and has crashed the box).
 - `b12x` (PyPI `b12x==1.3.0`, Apache-2.0; the control's own kernel library)
   is installed in the venv for the record's PCIe DMA-ring all-reduce
-  (`VLLM_B12X_DMA_AR_MIN_MB`). It is not a SlimServe requirement; the ring is
+  (`VLLM_B12X_DMA_AR_MIN_MB`). It is the optional `b12x` extra in setup.py,
+  not a hard requirement; the ring is
   skipped with a warning without it, and the record's prefill numbers do not
   hold then. (The `moe_backend: b12x` experiment, rejected for decode, was
   removed in the 2026-09-21 cleanup; the notebook keeps its measurements.)

@@ -1201,6 +1201,12 @@ setup(
         "helion": ["helion==1.1.0"],
         # Optional deps for gRPC server (vllm serve --grpc)
         "grpc": ["smg-grpc-servicer[vllm] >= 0.5.2"],
+        # Optional: the b12x PCIe DMA-ring all-reduce for prefill-sized
+        # messages on multi-GPU CUDA boxes without NVLink (validated on 4x
+        # RTX PRO 6000, sm_120; VLLM_B12X_DMA_AR_MIN_MB / B12X_PCIE_DMA_FP8).
+        # Without it the ring is skipped with a warning and those all-reduces
+        # stay on the custom all-reduce kernel.
+        "b12x": ["b12x == 1.3.0; sys_platform == 'linux'"],
         # Optional deps for OpenTelemetry tracing
         "otel": [
             "opentelemetry-sdk>=1.26.0",
