@@ -278,10 +278,12 @@ class Qwen35GGUFAdapter(GGUFWeightsAdapter):
             # The appended GGUF block is numbered after the target backbone,
             # while Qwen3_5MTP numbers its compact draft layers from zero.
             mtp_idx = int(text_config.num_hidden_layers)
-            name_map = {
-                "token_embd.weight": "model.embed_tokens.weight",
-                "output.weight": "lm_head.weight",
-            }
+            # token_embd / output are deliberately unmapped: the proposer
+            # replaces the draft's embed_tokens and lm_head with the target's
+            # (MTP drafts always share, as the HF embedded-MTP path does), so
+            # loading them would only dequantize a second ~2.5 GB embedding
+            # table and a second lm_head that are discarded right after.
+            name_map: dict[str, str] = {}
             per_layer = {**_COMMON_BLK_RENAMES, **_FULL_ATTN_BLK_RENAMES}
             for gguf_part, hf_part in per_layer.items():
                 name_map[f"blk.{mtp_idx}.{gguf_part}"] = f"mtp.layers.0.{hf_part}"

@@ -26300,3 +26300,29 @@ Phases, by value over risk:
 - Results: no new throughput measurement or hardware qualification claimed.
 - Decision: submit as a focused PR; preserve current-main behavior outside this fix.
 - Raw artifacts: local test output; no traffic captures or model data committed.
+- Follow-up (2026-10-14), root cause of the duplicate MTP attention
+  registration: build_qwen35_config_from_gguf is @cache'd and an embedded
+  MTP draft parses the same file, so without the parser's deepcopy the
+  target and draft ModelConfig share one config object.
+  SpeculativeConfig.hf_config_override rewrites its model_type and
+  architectures in place, and get_model_architecture reads
+  hf_config.architectures at load time, so the worker built the TARGET as
+  Qwen3_5MTP (17 tensors, one Attention at mtp.layers.0.self_attn.attn);
+  the real draft then failed with "Duplicate layer name". Reproduced on a
+  synthetic 4+1-layer qwen35 GGUF (tiled GDN K=4/V=12, Q4_K ssm_out, one
+  NextN block) on the RTX 5090 by removing the deepcopy. With the deepcopy
+  the registration never repeats on either runner, so
+  `_clear_stale_mtp_attention_context` (which deleted the bogus target's
+  registrations and hid the wrong target model) is removed and
+  qwen3_5_mtp.py is back to main.
+- Follow-up (2026-10-14), embedding/lm_head: the draft name map loaded
+  token_embd (dequantized to bf16, ~2.5 GB on Qwen3.8-27B) and output,
+  which both runners then discard because MTP drafts always take the
+  target's modules (V1 _maybe_share_*, V2 load_eagle_model; Qwen3_5MTP has
+  no has_own_* flags), the same as the HF embedded-MTP path. Both are now
+  unmapped: the draft reads 15 tensors and dequantizes 0 modules. Same
+  seeded V2 completion before and after.
+- Correctness: synthetic GGUF serve smoke on V2 and V1 runners (MTP k=1,
+  prefix caching, seeded temperature 1.0 / top_p 0.95 / top_k 20) reaches
+  generation; random weights, so no quality or acceptance claim. No real
+  Qwen3.8 GGUF or throughput run. Raw (operator box): ~/.local/scratch/results/2026-10-14/qwen35-gguf-mtp/ (builder, runner, logs).

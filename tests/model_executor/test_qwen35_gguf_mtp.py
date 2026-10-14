@@ -11,15 +11,12 @@ from vllm.model_executor.model_loader.gguf_adapters.qwen35 import (
 from vllm.model_executor.models.qwen3_5 import (
     _qwen35_mlp_kind,
 )
-from vllm.model_executor.models.qwen3_5_mtp import (
-    _clear_stale_mtp_attention_context,
-)
 from vllm.transformers_utils.configs.qwen3_5 import Qwen3_5TextConfig
 from vllm.transformers_utils.configs.qwen3_5_moe import Qwen3_5MoeTextConfig
 from vllm.transformers_utils.gguf_config_parser import GGUFConfigParser
 
 
-def test_qwen35_gguf_mtp_maps_only_embedded_nextn_and_shared_heads():
+def test_qwen35_gguf_mtp_maps_only_the_embedded_nextn_block():
     text_config = SimpleNamespace(num_hidden_layers=64)
     hf_config = SimpleNamespace(
         model_type="qwen3_5_mtp",
@@ -29,8 +26,10 @@ def test_qwen35_gguf_mtp_maps_only_embedded_nextn_and_shared_heads():
     adapter = Qwen35GGUFAdapter(hf_config)
     name_map = adapter.build_name_map(SimpleNamespace(hf_config=hf_config))
 
-    assert name_map["token_embd.weight"] == "model.embed_tokens.weight"
-    assert name_map["output.weight"] == "lm_head.weight"
+    # The draft shares the target's embedding and lm_head; it never loads
+    # (or dequantizes) its own copies.
+    assert "token_embd.weight" not in name_map
+    assert "output.weight" not in name_map
     assert "output_norm.weight" not in name_map
     assert name_map["blk.64.nextn.eh_proj.weight"] == "mtp.fc.weight"
     assert name_map["blk.64.nextn.enorm.weight"] == ("mtp.pre_fc_norm_embedding.weight")
@@ -51,23 +50,6 @@ def test_qwen35_mtp_model_type_preserves_dense_and_moe_mlp_dispatch():
     moe.model_type = "qwen3_5_mtp"
     moe.architectures = ["Qwen3_5MoeMTP"]
     assert _qwen35_mlp_kind(moe) == "moe"
-
-
-def test_qwen35_mtp_replaces_only_its_stale_attention_registrations():
-    target_layer = object()
-    stale_draft_layer = object()
-    context = {
-        "model.layers.0.self_attn.attn": target_layer,
-        "mtp.layers.0.self_attn.attn": stale_draft_layer,
-    }
-    config = SimpleNamespace(
-        compilation_config=SimpleNamespace(static_forward_context=context)
-    )
-
-    removed = _clear_stale_mtp_attention_context(config, "mtp")
-
-    assert removed == ("mtp.layers.0.self_attn.attn",)
-    assert context == {"model.layers.0.self_attn.attn": target_layer}
 
 
 def test_gguf_parser_detaches_cached_config_for_embedded_mtp_override():
@@ -95,3 +77,44 @@ def test_gguf_parser_detaches_cached_config_for_embedded_mtp_override():
     assert target is not cached
     assert target.model_type == "qwen3_5_text"
     assert target.architectures == ["Qwen3_5ForCausalLM"]
+
+
+def test_qwen35_gguf_mtp_draft_runs_on_the_target_embedding_and_lm_head():
+    """The GGUF draft never loads token_embd/output, so it must share.
+
+    Qwen3_5MTP declares no has_own_embed_tokens / has_own_lm_head, which is
+    what makes the V2 draft loader hand it the target's modules.
+    """
+    import torch.nn as nn
+
+    from vllm.model_executor.models.qwen3_5_mtp import Qwen3_5MTP
+    from vllm.v1.worker.gpu.spec_decode.eagle import utils as eagle_utils
+
+    draft = Qwen3_5MTP.__new__(Qwen3_5MTP)
+    nn.Module.__init__(draft)
+    draft.model = nn.Module()
+    draft.model.embed_tokens = nn.Embedding(4, 2)
+    draft.model.layers = nn.ModuleList([nn.Module()])
+    draft.lm_head = nn.Linear(2, 4)
+    target = nn.Module()
+    target.model = nn.Module()
+    target.model.embed_tokens = nn.Embedding(4, 2)
+    target.lm_head = nn.Linear(2, 4)
+    config = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            draft_model_config=object(), kv_cache_dtype=None
+        )
+    )
+
+    with (
+        mock.patch.object(eagle_utils, "get_model", return_value=draft),
+        mock.patch.object(
+            eagle_utils,
+            "get_pp_group",
+            return_value=SimpleNamespace(world_size=1),
+        ),
+    ):
+        loaded = eagle_utils.load_eagle_model(target, config)
+
+    assert loaded.model.embed_tokens is target.model.embed_tokens
+    assert loaded.lm_head is target.lm_head
