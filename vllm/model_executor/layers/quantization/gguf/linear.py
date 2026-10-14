@@ -310,6 +310,31 @@ def _fused_mul_mat_gguf_fake(
     return torch.empty(x.shape[0], qweight.shape[0], dtype=x.dtype, device=x.device)
 
 
+def _xpu_q8_split_enabled() -> bool:
+    """Opt-in (VLLM_XPU_GGUF_Q8_SPLIT=1): the split-plane Q8_0 layout and its
+    SYCL kernels have not been built or measured on B70 yet. The same flag
+    gates the raw-Q8_0 weight-stationary GEMV inside the XPU binding."""
+    return os.environ.get("VLLM_XPU_GGUF_Q8_SPLIT", "0").lower() in (
+        "1",
+        "true",
+        "on",
+        "yes",
+    )
+
+
+def _effective_shard_weight_types(layer: torch.nn.Module) -> list[int]:
+    """The per-shard GGUF types exactly as GGUFLinearMethod.apply resolves them."""
+    fallback_wtype = layer.qweight_type.weight_type
+    shard_id = getattr(layer.qweight, "shard_id", None)
+    if not shard_id:
+        return [fallback_wtype]
+    shard_id = ["q", "k", "v"] if "q" in shard_id else shard_id
+    return [
+        layer.qweight_type.shard_weight_type.get(idx, fallback_wtype)
+        for idx in shard_id
+    ]
+
+
 def _fused_mul_mat_gguf_split_q8(
     x: torch.Tensor, qweight: torch.Tensor
 ) -> torch.Tensor:
@@ -444,21 +469,13 @@ class GGUFLinearMethod(LinearMethodBase):
         order is final. The Parameter object and all loader/shard metadata are
         preserved; only its same-sized storage is replaced.
         """
-        if not current_platform.is_xpu():
+        if not current_platform.is_xpu() or not _xpu_q8_split_enabled():
             return
-        if os.environ.get("VLLM_XPU_GGUF_Q8_SPLIT", "1").lower() in (
-            "0",
-            "false",
-            "off",
-            "no",
-        ):
-            return
-        fallback_type = layer.qweight_type.weight_type
-        shard_types = list(layer.qweight_type.shard_weight_type.values())
-        weight_types = shard_types or [fallback_type]
-        if not weight_types or len(set(weight_types)) != 1:
-            return
-        if weight_types[0] != int(WeightType.Q8_0):
+        # Mirror apply(): a merged layer's shard ids resolve through
+        # shard_weight_type with the layer type as the fallback, so a shard
+        # missing from the map is judged by the type apply() will use for it.
+        weight_types = _effective_shard_weight_types(layer)
+        if len(set(weight_types)) != 1 or weight_types[0] != int(WeightType.Q8_0):
             return
         qweight = layer.qweight
         if qweight.dim() != 2 or qweight.shape[1] % 34 != 0:

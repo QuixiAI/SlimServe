@@ -1,31 +1,41 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Contracts for the XPU byte-neutral Q8_0 split layout."""
 
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
 import torch
 
 from vllm.model_executor.layers.quantization.gguf import linear
 
 
-def _layer(weight_types):
+def _layer(weight_types, shard_id=None, weight_type=8):
     qweight = torch.nn.Parameter(
         torch.arange(8 * 34, dtype=torch.int16).to(torch.uint8).reshape(8, 34),
         requires_grad=False,
     )
     qweight.loader_marker = object()
+    qweight.shard_id = list(shard_id or [])
     return SimpleNamespace(
         qweight=qweight,
         qweight_type=SimpleNamespace(
-            weight_type=8,
+            weight_type=weight_type,
             shard_weight_type=dict(weight_types),
         ),
     )
 
 
-def test_xpu_q8_split_replaces_only_storage_and_preserves_metadata(monkeypatch):
-    layer = _layer([("q", 8), ("k", 8), ("v", 8)])
+@pytest.fixture
+def split_enabled(monkeypatch):
+    monkeypatch.setenv("VLLM_XPU_GGUF_Q8_SPLIT", "1")
+
+
+def test_xpu_q8_split_replaces_only_storage_and_preserves_metadata(
+    monkeypatch, split_enabled
+):
+    layer = _layer([("q", 8), ("k", 8), ("v", 8)], shard_id=["q", "k", "v"])
     parameter = layer.qweight
     marker = parameter.loader_marker
     expected = parameter.detach().clone().bitwise_xor_(1)
@@ -45,8 +55,10 @@ def test_xpu_q8_split_replaces_only_storage_and_preserves_metadata(monkeypatch):
     torch.testing.assert_close(layer.qweight, expected)
 
 
-def test_xpu_q8_split_excludes_heterogeneous_merged_weight(monkeypatch):
-    layer = _layer([("q", 8), ("k", 1)])
+def test_xpu_q8_split_excludes_heterogeneous_merged_weight(
+    monkeypatch, split_enabled
+):
+    layer = _layer([("q", 8), ("k", 1)], shard_id=["q", "k", "v"])
     method = linear.GGUFLinearMethod.__new__(linear.GGUFLinearMethod)
     monkeypatch.setattr(linear.current_platform, "is_xpu", lambda: True)
     repack = mock.Mock()
@@ -110,3 +122,46 @@ def test_split_q8_empty_batch_avoids_native_kernel(monkeypatch):
 
     assert out.shape == (0, 3)
     native.assert_not_called()
+
+
+def test_xpu_q8_split_is_off_by_default(monkeypatch):
+    monkeypatch.delenv("VLLM_XPU_GGUF_Q8_SPLIT", raising=False)
+    layer = _layer([("q", 8), ("k", 8), ("v", 8)], shard_id=["q", "k", "v"])
+    method = linear.GGUFLinearMethod.__new__(linear.GGUFLinearMethod)
+    monkeypatch.setattr(linear.current_platform, "is_xpu", lambda: True)
+    repack = mock.Mock()
+    monkeypatch.setattr(linear.ops, "ggml_repack_q8_0_split", repack)
+
+    method._create_xpu_q8_split_weight(layer)
+
+    repack.assert_not_called()
+    assert not hasattr(layer, "_xpu_q8_split")
+
+
+def test_xpu_q8_split_judges_unmapped_shards_like_apply(monkeypatch, split_enabled):
+    # "v" is absent from shard_weight_type, so apply() reads it with the layer
+    # fallback type (Q4_0 here). The layer is heterogeneous and must keep the
+    # raw layout even though every *mapped* shard is Q8_0.
+    layer = _layer([("q", 8), ("k", 8)], shard_id=["q", "k", "v"], weight_type=2)
+    method = linear.GGUFLinearMethod.__new__(linear.GGUFLinearMethod)
+    monkeypatch.setattr(linear.current_platform, "is_xpu", lambda: True)
+    repack = mock.Mock()
+    monkeypatch.setattr(linear.ops, "ggml_repack_q8_0_split", repack)
+
+    method._create_xpu_q8_split_weight(layer)
+
+    repack.assert_not_called()
+    assert not hasattr(layer, "_xpu_q8_split")
+
+
+def test_xpu_q8_split_unsharded_layer_uses_layer_type(monkeypatch, split_enabled):
+    layer = _layer([], weight_type=8)
+    method = linear.GGUFLinearMethod.__new__(linear.GGUFLinearMethod)
+    monkeypatch.setattr(linear.current_platform, "is_xpu", lambda: True)
+    repack = mock.Mock(side_effect=lambda w, rows, cols: w.detach().clone())
+    monkeypatch.setattr(linear.ops, "ggml_repack_q8_0_split", repack)
+
+    method._create_xpu_q8_split_weight(layer)
+
+    repack.assert_called_once()
+    assert layer._xpu_q8_split is True

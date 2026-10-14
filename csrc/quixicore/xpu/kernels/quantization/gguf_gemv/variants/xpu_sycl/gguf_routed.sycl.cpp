@@ -24,7 +24,10 @@
 //
 // Numerics: fp32 accumulate; decoders follow ggml dequantize_row_* exactly.
 
+#include <cctype>
 #include <cstdint>
+#include <cstdlib>
+#include <string>
 
 #include "quantization/gguf_gemv/gguf_kernel.hpp"
 
@@ -139,8 +142,8 @@ struct IQ2_XXS {
 // to each (token, output) pair, which is necessary for independently routed
 // experts but rereads a dense matrix R times. Keep one subgroup on an output
 // row here and accumulate a small row bucket while each packed block is live.
-// On B70 Qwen3.8 TP4 this removes the concurrency-8 serving cliff: the matched
-// 742-in/128-out sweep improved from 22.5 to 67.0 aggregate output tok/s.
+// Opt-in with the split-plane layout (VLLM_XPU_GGUF_Q8_SPLIT=1): neither has
+// been built or measured on B70 yet.
 template <typename T, int RowBucket>
 sycl::event q8_dense_weight_stationary(sycl::queue& q, const std::uint8_t* w,
                                        const T* x, T* y, std::size_t R,
@@ -187,6 +190,19 @@ sycl::event q8_dense_weight_stationary(sycl::queue& q, const std::uint8_t* w,
           }
         }
       });
+}
+
+// Read once per process; mirrors _xpu_q8_split_enabled() in
+// vllm/model_executor/layers/quantization/gguf/linear.py.
+bool q8_weight_stationary_enabled() {
+  static const bool enabled = [] {
+    const char* v = std::getenv("VLLM_XPU_GGUF_Q8_SPLIT");
+    if (v == nullptr) return false;
+    std::string s(v);
+    for (auto& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s == "1" || s == "true" || s == "on" || s == "yes";
+  }();
+  return enabled;
 }
 
 template <typename T>
@@ -244,7 +260,8 @@ sycl::event routed_gemv_dispatch(sycl::queue& q, const std::uint8_t* w, const T*
                                  T* y, const std::int32_t* ids, std::size_t R,
                                  std::size_t N, std::size_t K, std::size_t top_k,
                                  int ggml_type, const std::uint64_t* grid) {
-  if (ids == nullptr && ggml_type == Q8_0::kType && R >= 2 && R <= 16) {
+  if (ids == nullptr && ggml_type == Q8_0::kType && R >= 2 && R <= 16 &&
+      q8_weight_stationary_enabled()) {
     return q8_dense_weight_stationary_dispatch(q, w, x, y, R, N, K);
   }
   switch (ggml_type) {
