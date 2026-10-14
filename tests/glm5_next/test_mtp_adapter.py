@@ -52,6 +52,7 @@ def _loader_fixture():
     model = Glm5NextMTP.__new__(Glm5NextMTP)
     nn.Module.__init__(model)
     model.config = SimpleNamespace(num_hidden_layers=45, num_nextn_predict_layers=1)
+    model._model_path = None  # no checkpoint directory: no MTP experts sidecar
     indexer = nn.Module()
     indexer.wk = nn.Linear(8, 4, bias=False)
     indexer.weights_proj = nn.Linear(8, 2, bias=False)
@@ -61,6 +62,7 @@ def _loader_fixture():
     block.self_attn = attention
     layer.mtp_block = block
     predictor.layers = nn.ModuleDict({"45": layer})
+    predictor.load_draft_lm_head = lambda: set()  # no draft-head sidecar
     model.model = predictor
     return model, indexer
 
