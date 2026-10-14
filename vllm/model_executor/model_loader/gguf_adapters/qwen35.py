@@ -27,6 +27,7 @@ perf/qwen38_metal_design.md):
   kernel).
 """
 
+import math
 from collections.abc import Iterable
 
 import gguf
@@ -144,6 +145,22 @@ def _vision_linear_modules(depth: int) -> list[str]:
     return names
 
 
+def _untile_v_head_runs(
+    tensor: torch.Tensor, *, axis: int, repeats: int, runs: int, run_width: int
+) -> torch.Tensor:
+    """Swap ``[repeats][runs]`` to ``[runs][repeats]`` over chunks of an axis."""
+    moved = tensor.movedim(axis, 0)
+    expected = repeats * runs * run_width
+    assert moved.shape[0] == expected, (moved.shape, expected)
+    rest = moved.shape[1:]
+    grouped = (
+        moved.reshape(repeats, runs, run_width, *rest)
+        .transpose(0, 1)
+        .reshape(expected, *rest)
+    )
+    return grouped.movedim(0, axis).contiguous()
+
+
 def _untile_v_head_axis(
     tensor: torch.Tensor,
     *,
@@ -151,20 +168,50 @@ def _untile_v_head_axis(
     num_k_heads: int,
     num_v_heads: int,
     values_per_head: int,
+    group: int = 1,
 ) -> torch.Tensor:
-    """Restore llama.cpp's [repeat, K-head] tiling to HF [K-head, repeat]."""
+    """Restore llama.cpp's [repeat, K-head] tiling toward HF [K-head, repeat].
+
+    With ``group == 1`` the result is HF grouped order: value head ``(k, j)``
+    lands at ``k * R + j``. With ``group == g > 1`` K-heads move in runs of
+    ``g`` and stay tiled inside each run: the order becomes
+    ``[k // g][j][k % g]``. That is what a packed GGUF axis whose quant block
+    spans ``g`` heads can reach without splitting a block; see
+    ``_out_proj_v_head_group``.
+    """
     repeats = num_v_heads // num_k_heads
     assert repeats * num_k_heads == num_v_heads
-    moved = tensor.movedim(axis, 0)
-    expected = num_v_heads * values_per_head
-    assert moved.shape[0] == expected, (moved.shape, expected)
-    rest = moved.shape[1:]
-    grouped = (
-        moved.reshape(repeats, num_k_heads, values_per_head, *rest)
-        .transpose(0, 1)
-        .reshape(expected, *rest)
+    assert num_k_heads % group == 0, (num_k_heads, group)
+    return _untile_v_head_runs(
+        tensor,
+        axis=axis,
+        repeats=repeats,
+        runs=num_k_heads // group,
+        run_width=group * values_per_head,
     )
-    return grouped.movedim(0, axis).contiguous()
+
+
+def _quant_block_heads(weight_type: str, head_dim: int) -> int:
+    """Smallest run of value heads that a GGUF quant block never straddles."""
+    quant_type = getattr(gguf.GGMLQuantizationType, weight_type)
+    block_size, _ = gguf.GGML_QUANT_SIZES[quant_type]
+    return block_size // math.gcd(head_dim, block_size)
+
+
+def _out_proj_v_head_group(weight_types: Iterable[str], head_dim: int) -> int:
+    """K-head run length the out_proj columns are restored in.
+
+    out_proj is quantized along its input (value-head) axis, so its tiled
+    columns can only be moved in whole quant blocks. Q8_0 (32) and
+    unquantized tensors divide head_dim=128 and restore fully (1); every
+    super-block format (K-quants, IQ*, block 256) spans two value heads (2),
+    which is all of the published UD-Q2_K_XL ssm_out tensors. One value is
+    used for every layer so the runtime needs a single activation order.
+    """
+    group = 1
+    for weight_type in weight_types:
+        group = math.lcm(group, _quant_block_heads(weight_type, head_dim))
+    return group
 
 
 def _untile_packed_v_head_columns(
@@ -174,21 +221,26 @@ def _untile_packed_v_head_columns(
     num_v_heads: int,
     head_dim: int,
     weight_type: str,
+    group: int = 1,
 ) -> torch.Tensor:
-    """Untile input-head columns without decoding aligned GGUF quant blocks."""
+    """Untile input-head columns without decoding GGUF quant blocks."""
     quant_type = getattr(gguf.GGMLQuantizationType, weight_type)
     block_size, type_size = gguf.GGML_QUANT_SIZES[quant_type]
-    if head_dim % block_size:
+    run = group * head_dim
+    if run % block_size:
         raise ValueError(
-            f"cannot untile {weight_type} columns: head_dim={head_dim} is not "
-            f"aligned to quant block_size={block_size}"
+            f"cannot untile {weight_type} columns in runs of {group} heads: "
+            f"{run} values are not aligned to quant block_size={block_size}"
         )
-    return _untile_v_head_axis(
+    repeats = num_v_heads // num_k_heads
+    assert repeats * num_k_heads == num_v_heads
+    assert num_k_heads % group == 0, (num_k_heads, group)
+    return _untile_v_head_runs(
         qweight,
         axis=1,
-        num_k_heads=num_k_heads,
-        num_v_heads=num_v_heads,
-        values_per_head=head_dim // block_size * type_size,
+        repeats=repeats,
+        runs=num_k_heads // group,
+        run_width=run // block_size * type_size,
     )
 
 
@@ -283,6 +335,32 @@ class Qwen35GGUFAdapter(GGUFWeightsAdapter):
             len(self._dequant_stems),
             sorted(_DEQUANT_TYPES),
         )
+        # out_proj columns are the one per-value-head axis that is quantized,
+        # so they can only be restored in whole quant blocks. When a block
+        # spans more than one head (every block-256 format at head_dim 128),
+        # the K-heads move in runs and the GDN module puts its out_proj input
+        # into the same order (QwenGatedDeltaNetAttention._out_proj_input). This keeps
+        # the weights quantized and is TP-safe: runs never straddle a rank.
+        self._out_proj_group = 1
+        if self._untile_v_heads:
+            self._out_proj_group = _out_proj_v_head_group(
+                (
+                    "F16"
+                    if name.removesuffix(".weight") in self._dequant_stems
+                    else weight_type
+                    for name, weight_type in weight_type_map.items()
+                    if name.endswith("linear_attn.out_proj.weight")
+                ),
+                int(text_config.linear_value_head_dim),
+            )
+        text_config.gdn_out_proj_v_head_group = self._out_proj_group
+        if self._out_proj_group > 1:
+            logger.info(
+                "qwen35 GGUF: out_proj quant blocks span %d value heads; "
+                "restoring its columns in K-head runs of %d",
+                self._out_proj_group,
+                self._out_proj_group,
+            )
         # The mmproj tower is entirely F16/F32 and is streamed by
         # `_vision_weights` rather than through `gguf_to_hf_name_map`, so the
         # base class's weight-type scan never sees it. Mark it unquantized
@@ -467,6 +545,7 @@ class Qwen35GGUFAdapter(GGUFWeightsAdapter):
             return torch.cat((q, k, v), dim=0)
 
         if stem.endswith("linear_attn.out_proj"):
+            group = getattr(self, "_out_proj_group", 1)
             if name.endswith(".qweight"):
                 weight_type = self._weight_type_map[stem + ".weight"]
                 return _untile_packed_v_head_columns(
@@ -475,6 +554,7 @@ class Qwen35GGUFAdapter(GGUFWeightsAdapter):
                     num_v_heads=num_v,
                     head_dim=head_dim,
                     weight_type=weight_type,
+                    group=group,
                 )
             return _untile_v_head_axis(
                 weight,
@@ -482,6 +562,7 @@ class Qwen35GGUFAdapter(GGUFWeightsAdapter):
                 num_k_heads=num_k,
                 num_v_heads=num_v,
                 values_per_head=head_dim,
+                group=group,
             )
         return weight
 

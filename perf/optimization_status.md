@@ -26269,3 +26269,23 @@ Phases, by value over risk:
 - Results: no new throughput measurement or hardware qualification claimed.
 - Decision: submit as a focused PR; preserve current-main behavior outside this fix.
 - Raw artifacts: local test output; no traffic captures or model data committed.
+- Follow-up (2026-10-14): the first version raised on every out_proj whose
+  quant block is wider than one 128-wide value head. All 48 ssm_out tensors
+  in the published Qwen3.8-27B-UD-Q2_K_XL.gguf are block-256 formats
+  (IQ3_XXS 19, IQ3_S 13, IQ2_S 5, IQ4_XS 4, IQ2_XS 4, Q3_K 2, Q4_K 1; read
+  from the file header), so qwen38-q2kxl-1 could not load. Dequantizing
+  those out_proj weights would cost ~+2.2 GiB fp16 and that much extra
+  decode bandwidth per token, so instead the columns move in whole blocks:
+  key heads travel in runs of g = 2 (order [k // g][r][k % g]) and the GDN
+  module gathers its grouped out_proj input into that order with one
+  index_select per layer (out_proj_v_head_order). Runs never cross a TP
+  rank while (key heads / TP) % g == 0 (16 key heads: TP <= 8); module
+  init raises otherwise. Q8_0 and unquantized out_proj keep g = 1 (no
+  gather). Every forward path (CUDA, HIP, XPU, CPU, MPS) goes through the
+  same _project_out.
+- Correctness: synthetic Q4_K test at TP1/TP2, plus a check against real
+  ssm_out bytes range-fetched from the published file (blk.0 Q4_K, blk.1
+  IQ3_S, blk.2 IQ4_XS; 256 rows each): block-moved weights plus the gather
+  equal the dequantized HF-grouped reference to 2.4e-14 at TP 1/2/4/8.
+  Live model parity and throughput remain unqualified (no Metal or MI300X
+  on the box); the per-layer gather is new decode work on qwen38-q2kxl-1.
