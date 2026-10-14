@@ -552,8 +552,10 @@ kernel void qgemm_sm_t2(
         }
         threadgroup_barrier(metal::mem_flags::mem_threadgroup);
     }
-    if (ABLATE == 2) {
-        // tail run keeps the staged tiles live at 1/steps of the cost
+    if (ABLATE == 2 && kb_beg < kb_end) {
+        // tail run keeps the staged tiles live at 1/steps of the cost; an
+        // empty K-slice staged nothing, so it skips the tail like the main
+        // loop and writes its zeroed partials
         dev_b tBt(X, metal::extents<int32_t, M_PAD, BK>());
         if ((kb_end & 1) == 0) {
             op.run(tA0, tBt, cT);
@@ -1003,7 +1005,9 @@ kernel void qgemm_sm_pa(
     }
     threadgroup_barrier(metal::mem_flags::mem_threadgroup);
 
-    if (ABLATE == 7) {
+    // empty K-slice: nothing was staged, so neither the hoisted fragment
+    // load (A=7) nor the tail MMA (A=3/7) may read the tiles
+    if (ABLATE == 7 && kb_beg < kb_end) {
         load(w_reg, sW[kb_beg & 1][warp], lane);
         load(x_reg, sX[kb_beg & 1], lane);
     }
@@ -1038,7 +1042,7 @@ kernel void qgemm_sm_pa(
             threadgroup_barrier(metal::mem_flags::mem_threadgroup);
         }
     }
-    if (ABLATE == 3 || ABLATE == 7) {
+    if ((ABLATE == 3 || ABLATE == 7) && kb_beg < kb_end) {
         // one tail MMA from freshly loaded fragments keeps every staged tile
         // live (runtime buffer index defeats store elimination) at 1/steps
         // of the per-step cost being ablated

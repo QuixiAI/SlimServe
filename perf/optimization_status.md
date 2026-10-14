@@ -26343,3 +26343,26 @@ Phases, by value over risk:
   oracle and test logs, metal4.0 error sets) and
   perf/results/2026-09-01/hardening_patched/ (patched build, tests,
   `ab_gdn_compare.log`, `apply_hardening.py`, `ab_gdn.py`).
+- Review follow-up (2026-10-14, source-only, NOT compiled here: no macOS
+  toolchain on the editing host):
+  - `gdn_recur_spec` bounded `num_accepted` and the per-position checkpoint
+    by the slot table's row STRIDE. With `mamba_cache_mode == "all"` the
+    table is a non-contiguous `[:, :num_spec+1]` column slice, so entries
+    between `size(1)` and the stride are other live slots and could be read
+    as checkpoints. The kernel now takes the logical width
+    (`table_width@16`, host passes `slot_table.size(1)`) and bounds both by
+    it; the stride is still used for row addressing.
+  - `qwen_gdn_conv_step` skips a sequence with `num_accepted < 1` without
+    writing `conved`; `qwen_gdn_scan_step` now receives `num_accepted` /
+    `use_accepted` (buffers 21/22) and treats the same sequences as NULL
+    entries (zero output, no `ssm_state` traffic) instead of consuming
+    unwritten scratch. The host also checks `num_accepted.numel() >= N`.
+  - `qgemm_sm` diagnostic ablations (`t2w8a2`, `p4a3`, `p4a7`): the tail
+    MMA and A=7's hoisted fragment load are skipped on empty K-slices, the
+    same guard as the main split-K path; these variants are host variants
+    21..27/28..30 only, never selected by serving.
+  - The extra kernel arguments are additive (an old metallib ignores the
+    new buffers), but the fixes only take effect once the metallib is
+    rebuilt. Owed on a macOS 26 box: rebuild, the three kernel test files,
+    plus a strided-slice `gdn_recur_spec` case and a `num_accepted == 0`
+    `qwen_gdn_step` case against the torch oracle.
