@@ -26296,8 +26296,8 @@ Phases, by value over risk:
 
 - Status: retained for review.
 - Baseline: `feat/qwen38-b70-q8-profile`; forward-port from the B70 serving integration.
-- Change: Keep the BF16 target and native draft in one checkpoint, retain vision assets and FP8 KV, and preserve the explicit qualification gate in the current variant registry.
+- Change: Keep the BF16 target and native draft in one checkpoint, retain vision assets and FP8 KV, and preserve the explicit qualification gate in the current variant registry. Review fixes: checkpoint pinned to revision 739e3c5b (every registered file size matches it); `tool_call_parser` set to `qwen3_xml` like every other Qwen3.8 record; the NVFP4-degradation rationale is marked unverified (out-of-tree evaluation, no raw artifacts here); host-tier KV deferred until the XPU backend exists.
 - Correctness: 75 registry and recipe checks passed on CPU; live BF16 serving remains gated after historical Xe copy-engine faults.
 - Results: no new throughput measurement or hardware qualification claimed.
 - Decision: submit as a focused PR; preserve current-main behavior outside this fix.
-- Raw artifacts: local test output; no traffic captures or model data committed.
+- Raw artifacts: none. CPU unit tests only (`tests/slimserve`); no performance measurement and no on-card run backs this entry.

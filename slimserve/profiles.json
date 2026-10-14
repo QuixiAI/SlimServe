@@ -1931,12 +1931,14 @@
         "image"
       ],
       "repo": "huihui-ai/Huihui-Qwen3.8-27B-abliterated",
-      "base_url": "https://huggingface.co/huihui-ai/Huihui-Qwen3.8-27B-abliterated/resolve/main",
+      "revision": "739e3c5b89849f6c238ce1e5b70008612ae42cdd",
+      "base_url": "https://huggingface.co/huihui-ai/Huihui-Qwen3.8-27B-abliterated/resolve/739e3c5b89849f6c238ce1e5b70008612ae42cdd",
       "local_dir": "Huihui-Qwen3.8-27B-abliterated",
       "shared_note": "Native vision-language BF16 checkpoint with embedded MTP. Main retains its vision tower and processor assets; text and image qualification is required.",
       "speculator": {
         "repo": "huihui-ai/Huihui-Qwen3.8-27B-abliterated",
-        "base_url": "https://huggingface.co/huihui-ai/Huihui-Qwen3.8-27B-abliterated/resolve/main",
+        "revision": "739e3c5b89849f6c238ce1e5b70008612ae42cdd",
+        "base_url": "https://huggingface.co/huihui-ai/Huihui-Qwen3.8-27B-abliterated/resolve/739e3c5b89849f6c238ce1e5b70008612ae42cdd",
         "local_dir": "Huihui-Qwen3.8-27B-abliterated",
         "engine": {
           "method": "mtp",
@@ -1951,7 +1953,7 @@
         "bf16": {
           "title": "Unquantised bf16 (HF safetensors, 18 shards)",
           "bytes": 55586059962,
-          "summary": "Full-precision weights. Chosen over NVFP4 because NVFP4 measurably degraded this model's capability on B70 (2026-09-14).",
+          "summary": "Full-precision weights. Chosen over NVFP4 after an out-of-tree B70 evaluation (2026-09-14) reported NVFP4 degraded this model's capability; that comparison is unverified here (no raw artifacts in this repository).",
           "min_gpus": {
             "b70": 4
           },
@@ -4059,7 +4061,7 @@
               "max_cudagraph_capture_size": 64
             },
             "enable_auto_tool_choice": true,
-            "tool_call_parser": "qwen3_coder",
+            "tool_call_parser": "qwen3_xml",
             "reasoning_parser": "qwen3",
             "served_model_name": "Qwen3.8-27B-BF16",
             "override_generation_config": {
@@ -4083,7 +4085,9 @@
             "FULL_DECODE_ONLY uses the qualified breakable XPU graph backend; VLLM_XPU_ENABLE_XPU_GRAPH=0 avoids the slower legacy graph route.",
             "FP8 E4M3 KV preserves long-context capacity while keeping the BF16 target and draft weights unchanged.",
             "The profile supplies a 2000-token thinking default for all reasoning efforts except none; an explicit request budget, including -1 for unlimited, takes precedence.",
-            "This recipe is gated pending fresh qualification on current main; earlier measurements apply only to the saved B70 integration checkout."
+            "This recipe is gated pending fresh qualification on current main; earlier measurements apply only to the saved B70 integration checkout.",
+            "Tool calls use qwen3_xml, matching every other Qwen3.8 record.",
+            "CPU-offloaded KV (the HostTierConnector host tier), the standing goal for every non-Metal profile, is deferred until the XPU serving backend exists; the connector has not been generalized to or validated on XPU."
           ],
           "platform": "b70"
         }
