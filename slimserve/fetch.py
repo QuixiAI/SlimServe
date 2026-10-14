@@ -161,6 +161,26 @@ def _download(entry: dict[str, Any], dest: Path) -> None:
 
     dest.parent.mkdir(parents=True, exist_ok=True)
     part = dest.with_suffix(dest.suffix + ".part")
+    if repo := entry.get("hf_repo"):
+        # The Hub client uses hf-xet's parallel chunk transfer when a repo is
+        # Xet-backed. Keep this behind an explicit source setting so existing
+        # range-resumable manifests retain their established transfer path.
+        from huggingface_hub import hf_hub_download
+
+        downloaded = Path(
+            hf_hub_download(
+                repo_id=repo,
+                filename=entry["path"],
+                revision=entry["hf_revision"],
+                local_dir=cache_root() / entry["local_dir"],
+                token=hf_token(),
+            )
+        )
+        if downloaded != dest or not _valid(downloaded, entry):
+            raise RuntimeError(f"{entry['path']}: Hub download failed validation")
+        part.unlink(missing_ok=True)
+        term.progress(f"{dest.name}: {term.human_bytes(entry['bytes'])} complete", done=True)
+        return
     have = part.stat().st_size if part.is_file() else 0
     if have > entry["bytes"]:
         part.unlink()
