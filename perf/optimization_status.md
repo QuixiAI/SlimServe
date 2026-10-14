@@ -26266,6 +26266,12 @@ Phases, by value over risk:
 - Baseline: `origin/main`; forward-port from the B70 serving integration.
 - Change: Add host-scoped Hugging Face authentication for registered artifacts while preserving explicit override headers and byte-range resumption.
 - Correctness: Four fetch-auth tests and 13 model-override tests passed on CPU.
+- Revision: the token comes from the module's own `hf_token()` (HF_TOKEN,
+  HUGGING_FACE_HUB_TOKEN, HUGGINGFACE_TOKEN, stored login), the lookup the
+  override and Hub-download paths already use, instead of
+  `huggingface_hub.get_token()`, which ignores HUGGINGFACE_TOKEN. A 401/403
+  from huggingface.co now carries the same accept-terms / HF_TOKEN hint as
+  the override path. tests/slimserve: 172 passed.
 - Results: no new throughput measurement or hardware qualification claimed.
 - Decision: submit as a focused PR; preserve current-main behavior outside this fix.
 - Raw artifacts: local test output; no traffic captures or model data committed.

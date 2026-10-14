@@ -156,24 +156,26 @@ def free_bytes(path: Path) -> int:
     return shutil.disk_usage(probe).free
 
 
+def _is_huggingface(url: str) -> bool:
+    parsed = urlsplit(url)
+    return parsed.scheme == "https" and parsed.hostname == "huggingface.co"
+
+
 def _request_headers(
     url: str, have: int, explicit: dict[str, str] | None = None
 ) -> dict[str, str]:
     headers = dict(explicit or {})
     if have:
         headers["Range"] = f"bytes={have}-"
-    parsed = urlsplit(url)
-    if (
-        parsed.scheme == "https"
-        and parsed.hostname == "huggingface.co"
-        and "authorization" not in {key.lower() for key in headers}
-    ):
-        # get_token observes HF_TOKEN and the token saved by `hf auth login`.
-        # requests strips Authorization if Hugging Face redirects the download
-        # to a CDN host, so the credential remains scoped to huggingface.co.
-        from huggingface_hub import get_token
-
-        if token := get_token():
+    if _is_huggingface(url) and "authorization" not in {
+        key.lower() for key in headers
+    }:
+        # hf_token() observes HF_TOKEN, HUGGING_FACE_HUB_TOKEN,
+        # HUGGINGFACE_TOKEN and the token saved by `hf auth login`, the same
+        # lookup the override and Hub-download paths use. requests strips
+        # Authorization if Hugging Face redirects the download to a CDN host,
+        # so the credential remains scoped to huggingface.co.
+        if token := hf_token():
             headers["Authorization"] = f"Bearer {token}"
     return headers
 
@@ -225,6 +227,15 @@ def _download(entry: dict[str, Any], dest: Path) -> None:
         if have and response.status_code == 200:
             # Server ignored the range; start over rather than corrupt the file.
             have = 0
+        if response.status_code in (401, 403) and _is_huggingface(entry["url"]):
+            repo = "/".join(urlsplit(entry["url"]).path.strip("/").split("/")[:2])
+            raise ProfileError(
+                f"{repo} is gated or private and this machine's Hugging Face "
+                f"token cannot download it (HTTP {response.status_code}). "
+                f"Accept the repo's terms at https://huggingface.co/{repo} "
+                "with the account that owns the token, or set HF_TOKEN to one "
+                "that already has access."
+            )
         response.raise_for_status()
         mode = "ab" if have else "wb"
         done = have
