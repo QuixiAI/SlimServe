@@ -20,6 +20,10 @@ from typing import Any
 from slimserve.term import human_bytes
 
 REGISTRY_PATH = Path(__file__).with_name("profiles.json")
+# Operator-private sources, profiles and platforms that must not live in the
+# repo. The file is git-ignored; SLIMSERVE_LOCAL_PROFILES points elsewhere.
+LOCAL_REGISTRY_PATH = Path(__file__).with_name("profiles.local.json")
+_MERGED_SECTIONS = ("sources", "platforms", "profiles")
 CHAT_TEMPLATE_DIR = Path(__file__).with_name("chat_templates")
 
 
@@ -32,10 +36,34 @@ def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def _local_registry_path() -> Path:
+    override = os.environ.get("SLIMSERVE_LOCAL_PROFILES")
+    return Path(override).expanduser() if override else LOCAL_REGISTRY_PATH
+
+
+def _merge_local(registry: dict[str, Any], path: Path) -> None:
+    """Add a local file's records; it may extend the registry, never redefine it."""
+    with path.open(encoding="utf-8") as fp:
+        local = json.load(fp, object_pairs_hook=_unique_object)
+    unknown = set(local) - set(_MERGED_SECTIONS) - {"comment"}
+    if unknown:
+        raise ValueError(f"{path}: unsupported sections {sorted(unknown)}")
+    for section in _MERGED_SECTIONS:
+        records = local.get(section, {})
+        clash = sorted(set(records) & set(registry[section]))
+        if clash:
+            raise ValueError(f"{path}: {section} already defined in profiles.json: {clash}")
+        registry[section].update(records)
+
+
 @lru_cache(maxsize=1)
 def _registry() -> dict[str, Any]:
     with REGISTRY_PATH.open(encoding="utf-8") as fp:
-        return json.load(fp, object_pairs_hook=_unique_object)
+        registry = json.load(fp, object_pairs_hook=_unique_object)
+    local = _local_registry_path()
+    if local.is_file():
+        _merge_local(registry, local)
+    return registry
 
 
 def profile_ids() -> list[str]:
