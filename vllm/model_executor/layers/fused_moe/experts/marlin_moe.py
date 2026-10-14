@@ -200,11 +200,19 @@ def _qc_nvfp4_decode_split(rows: int, topk: int) -> int:
     ceil(top_k / split) slots each (nine slots, the shared expert riding as
     expert E, split five and four: a split of 3 would be 192 CTAs on 188 SMs
     and a tail wave, 13.3 us against 12.3 unsplit). QC_NVFP4_DECODE_SPLIT
-    pins one value (1/2/3/4/8, at most top_k)."""
+    pins one value (1/2/3/4/8, at most top_k). A split above 1 launches as a
+    thread-block cluster, so parts below sm_90 always take 1."""
+    if not _qc_nvfp4_decode_clusters():
+        return 1
     forced = _qc_nvfp4_decode_split_env()
     if forced:
         return forced if forced <= topk else 1
     return 2 if rows <= topk else 1
+
+
+@functools.cache
+def _qc_nvfp4_decode_clusters() -> bool:
+    return current_platform.has_device_capability(90)
 
 
 def _qc_nvfp4_decode_applicable(

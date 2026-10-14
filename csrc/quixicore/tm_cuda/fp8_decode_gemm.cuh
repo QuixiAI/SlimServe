@@ -38,9 +38,20 @@ constexpr int WPAD = 16;    // bytes of padding per fp8 weight row in smem (conf
 
 // Two e4m3 values (packed low/high) -> bf16x2 of scale * value. e4m3 -> f16 is exact; the only
 // rounding is the final bf16 of the fp32 product, the same rounding a checkpoint dequant applies.
+// The hardware conversion (cvt ... e4m3x2) is sm_89+. The extension is also built for sm_80/86, where
+// the bytes are placed into f16 bit fields instead (sign to bit 15, exponent|mantissa to bits 13..7):
+// that f16 is exactly value * 2^-8 for every finite e4m3, subnormals included (both formats' bias gap
+// is 8), and the 2^8 is folded into the fp32 scale, an exact power-of-two product. The result is
+// bit-identical to the cvt path for finite weights; e4m3 NaN (0x7F/0xFF) is not preserved there.
 __device__ __forceinline__ uint32_t e4m3x2_scaled_to_bf16x2(uint16_t packed, float s) {
     uint32_t h2;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 890
+    const uint32_t p = packed;
+    h2 = ((p & 0x0080u) << 8) | ((p & 0x007Fu) << 7) | ((p & 0x8000u) << 16) | ((p & 0x7F00u) << 15);
+    s *= 256.0f;
+#else
     asm("cvt.rn.f16x2.e4m3x2 %0, %1;\n" : "=r"(h2) : "h"(packed));
+#endif
     const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&h2));
     const __nv_bfloat162 b = __floats2bfloat162_rn(f.x * s, f.y * s);
     return *reinterpret_cast<const uint32_t*>(&b);

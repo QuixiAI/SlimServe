@@ -64,6 +64,21 @@ struct SmemOptIn {
     bool pending() const { return !done[slot()]; }
     void mark() { done[slot()] = true; }
 };
+// The current device's compute capability as 10 * major + minor, cached per
+// device. The extension is built for sm_80 upward, so a kernel that needs a
+// newer part (thread-block clusters: sm_90) compiles to a trap on the older
+// targets and its launcher asks this before it launches.
+static int device_sm() {
+    static std::array<int, 64> cache{};
+    const int dev = SmemOptIn::slot();
+    if (cache[dev] == 0) {
+        int major = 0, minor = 0;
+        C10_CUDA_CHECK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev));
+        C10_CUDA_CHECK(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev));
+        cache[dev] = 10 * major + minor;
+    }
+    return cache[dev];
+}
 // Every operand of a launch is dereferenced on the first operand's device and
 // current stream: a binding requires that of each operand and selects the
 // device (CUDAGuard) for its allocations and launches, so a tensor from
@@ -2236,6 +2251,8 @@ static torch::Tensor py_nvfp4_moe_gemv2(torch::Tensor act, torch::Tensor b, torc
         sh = bp(shared.value());
     }
     const c10::cuda::CUDAGuard guard(act.device());
+    TORCH_CHECK(split == 1 || device_sm() >= 90, "nvfp4_moe_gemv2: split > 1 runs as a thread-block cluster (sm_90+); "
+                "this device is sm_", device_sm(), ", use split 1");
 #define QC_G2(NJ, KT) launch_nvfp4_gemv2<NJ, KT>(bp(act), b.data_ptr<int32_t>(), s.data_ptr<uint8_t>(), fp(g), \
                                                  topk_ids.data_ptr<int32_t>(), tw, sh, bpm(out), M, top_k, D, Ki, E, g.numel() == 1 ? 0 : 1, int(split))
     switch (nj * 16 + kt) {
@@ -2639,6 +2656,7 @@ static bool py_kda_block_serves(int64_t pairs, int64_t max_rows, bool conv_bf16,
     // `max_rows` rows each in one wave; the caller runs its Triton chain otherwise.
     using namespace tms::kda_block;
     if (pairs <= 0 || max_rows < 1 || max_rows > MAX_T) return false;
+    if (device_sm() < 90) return false;              // clusters + DSMEM: sm_90+
     int cl = 0;
 #define KDA_BLOCK_PICK(CT, ST, TT) cl = kda_block_pick_cl<CT, ST, TT>(int(pairs), 0);
     KDA_BLOCK_ROWS(max_rows, conv_bf16, state_bf16, KDA_BLOCK_PICK)
@@ -2653,6 +2671,8 @@ static void py_kda_block_decode(torch::Tensor mixed_qkv, torch::Tensor conv_stat
         double eps, int64_t cl) {
     const char* fn = "kda_block_decode";
     const c10::cuda::CUDAGuard guard(mixed_qkv.device());
+    TORCH_CHECK(device_sm() >= 90, fn, ": needs thread-block clusters (sm_90+), this device is sm_", device_sm(),
+                "; ask kda_block_serves first");
     const KdaBlockArgs a = kda_block_check(fn, mixed_qkv, conv_state, conv_weight, conv_idx, f_a, g_a, f_w, g_w, raw_beta,
                                            A_log, dt_bias, state, state_indices, cu_seqlens, accepted, norm_w, out);
     if (a.N == 0) return;

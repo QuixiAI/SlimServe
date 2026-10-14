@@ -47,6 +47,16 @@
 
 namespace tms::kda_block {
 
+// Thread-block clusters and distributed shared memory are sm_90+. The
+// extension is also built for sm_80/86/89 (A100, RTX 3090, ...): there the
+// kernel compiles to a trap, and the launcher refuses the call before any
+// launch (kda_block_supported), so the Triton chain serves those parts.
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900
+#define TMS_KDA_BLOCK_HAS_CLUSTERS 1
+#else
+#define TMS_KDA_BLOCK_HAS_CLUSTERS 0
+#endif
+
 constexpr int HD = 128;                  // head dim (K == V)
 constexpr int MAX_T = 8;                 // rows per request
 constexpr int CONV_W = 4;
@@ -107,10 +117,12 @@ __device__ __forceinline__ void block_launch_dependents() {
 #endif
 }
 
+#if TMS_KDA_BLOCK_HAS_CLUSTERS
 template <typename T>
 __device__ __forceinline__ const T* peer(cooperative_groups::cluster_group& cluster, const T* p, int rank) {
     return cluster.map_shared_rank(p, rank);
 }
+#endif
 
 template <typename CT, typename ST, int TT, int CL>
 __global__ void __launch_bounds__(Geom<CL>::THREADS) kda_block_kernel(
@@ -134,6 +146,9 @@ __global__ void __launch_bounds__(Geom<CL>::THREADS) kda_block_kernel(
         int64_t cs_seq, int64_t cs_dim, int64_t cs_tok, int stride_cidx,
         int64_t stride_state, int stride_idx, int64_t stride_out,
         float scale, float lower_bound, int use_lower_bound, float eps, int pdl) {
+#if !TMS_KDA_BLOCK_HAS_CLUSTERS
+    __trap();  // unreachable: the launcher declines below sm_90
+#else
     using G = Geom<CL>;
     constexpr int THREADS = G::THREADS, CONV_PER = G::CONV_PER, GATE_PER = G::GATE_PER, ROWS = G::ROWS;
     constexpr int KEEP = TT + CONV_W - 2;            // conv history columns a request can touch
@@ -379,6 +394,7 @@ __global__ void __launch_bounds__(Geom<CL>::THREADS) kda_block_kernel(
             __float2bfloat16_rn(s_y[t][j] * rstd * w * sigm(s_g2[t][j]));
     }
     cluster.sync();  // peers keep their shared memory until everyone has read it
+#endif  // TMS_KDA_BLOCK_HAS_CLUSTERS
 }
 
 }  // namespace tms::kda_block

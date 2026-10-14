@@ -441,8 +441,15 @@ __global__ void __launch_bounds__(THREADS) nvfp4_moe_gemv2_kernel(
     // Launched as a cluster of `split` CTAs along z, each takes ceil(top_k / split)
     // of the token's slots (the last rank the remainder: nine slots split in two
     // are five and four) and rank 0 sums the ranks' column sums in rank order (DSMEM).
+    // Clusters are sm_90+. Below that the kernel is the split == 1 form only
+    // (one CTA per token, no DSMEM); the launcher rejects split > 1 there.
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900
     cooperative_groups::cluster_group cluster = cooperative_groups::this_cluster();
     const int split = int(cluster.num_blocks()), rank = int(cluster.block_rank());
+#else
+    if (gridDim.z != 1) __trap();
+    constexpr int split = 1, rank = 0;
+#endif
     const int kmax = (top_k + split - 1) / split, k0 = rank * kmax;
     const int kper = max(min(kmax, top_k - k0), 0);
     unsigned char* ring = dyn + size_t(kmax) * Ki * 2;   // the rows area is sized for the fullest rank
@@ -545,6 +552,7 @@ __global__ void __launch_bounds__(THREADS) nvfp4_moe_gemv2_kernel(
         }
         return;
     }
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900
     for (int c = tid; c < 16 * NJ; c += THREADS) red_out[c] = warp_sum<NJ>(&red[0][0], c);
     cluster.sync();                                  // every rank's red_out is complete and visible
     if (rank == 0) {
@@ -556,6 +564,7 @@ __global__ void __launch_bounds__(THREADS) nvfp4_moe_gemv2_kernel(
         }
     }
     cluster.sync();                                  // peers keep their shared memory until rank 0 has read it
+#endif
 }
 
 }  // namespace tms::nvfp4dec

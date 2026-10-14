@@ -14,6 +14,7 @@
 // the end. x rows >= M are zero-filled by cp.async (src-size 0); the tile's rows
 // beyond N are clamped for the load and skipped for the store.
 // Requirements: K % KCHUNK == 0, KCHUNK % (16 * WARPS) == 0, 16-byte aligned rows.
+#include <array>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <cstdint>
@@ -97,14 +98,28 @@ __device__ __forceinline__ void touch_l2(const void* p) {
     asm volatile("" ::"r"(a), "r"(b), "r"(c), "r"(d));
 }
 
+// Programmatic dependent launch needs sm_90+; the extension also serves
+// sm_80/86/89, which keep the plain launch. Queried once per device (the
+// current one, where the launch goes).
+inline bool device_has_pdl() {
+    static std::array<signed char, 64> table{};   // 0 unknown, 1 yes, -1 no
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
+    if (table[dev] == 0) {
+        int major = 0;
+        const bool ok = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess;
+        table[dev] = (ok && major >= 9) ? 1 : -1;
+    }
+    return table[dev] == 1;
+}
 // QC_PDL: 0 off; 1 line-hint prefetch; 2 bulk L2 prefetch; 3 real loads;
-// 4 the attribute, trigger and wait only (no prefetch).
+// 4 the attribute, trigger and wait only (no prefetch). Always 0 below sm_90.
 inline int pdl_mode() {
     static const int v = [] {
         const char* e = std::getenv("QC_PDL");
         return e != nullptr ? std::atoi(e) : 4;   // default: mode 4 (record, 2026-09-17)
     }();
-    return v;
+    return v != 0 && device_has_pdl() ? v : 0;
 }
 inline bool use_pdl() { return pdl_mode() != 0; }
 
