@@ -27,8 +27,14 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.platforms import current_platform
 
+XpuFusedMoe = None
 if current_platform.is_xpu():
-    from vllm_xpu_kernels.fused_moe_interface import XpuFusedMoe
+    # Optional: this fork serves XPU through the vendored QuixiCore-XPU SYCL
+    # kernels; the Intel vllm-xpu-kernels MoE is used only when installed.
+    try:
+        from vllm_xpu_kernels.fused_moe_interface import XpuFusedMoe
+    except ImportError:
+        pass
 
 
 def prepare_fp8_moe_layer_for_xpu(

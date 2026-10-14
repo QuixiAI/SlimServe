@@ -282,7 +282,10 @@ def memory_profiling(
     until after profiling to get (c.).
     """
     gc.collect()
-    torch.accelerator.empty_cache()
+    # XPU: a device-wide cache purge walks transient SYCL queues and trips a
+    # UR queue-release fault; the allocator stats below are enough.
+    if not current_platform.is_xpu():
+        torch.accelerator.empty_cache()
     torch.accelerator.reset_peak_memory_stats(baseline_snapshot.device_)
 
     result = MemoryProfilingResult(
@@ -296,7 +299,8 @@ def memory_profiling(
     yield result
 
     gc.collect()
-    torch.accelerator.empty_cache()
+    if not current_platform.is_xpu():
+        torch.accelerator.empty_cache()
 
     result.after_profile.measure()
 
