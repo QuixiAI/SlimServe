@@ -19,6 +19,7 @@ import mlx.core as mx
 import numpy as np
 
 from slimserve.video.ltx25 import checkpoints, sampling
+from slimserve.video.ltx25 import lora as lora_mod
 from slimserve.video.ltx25.dit import (
     DiTConfig,
     LTX25DiT,
@@ -2701,9 +2702,7 @@ class LTX25Engine:
             )
             if stage_tiles is not None:
                 den = TiledDenoiser(den, f, h, w, extents, stage_tiles)
-            for lora, strength in adapters if lora_on else ():
-                lora.attach(dit, strength)
-            try:
+            with lora_mod.attached(dit, adapters if lora_on else ()):
                 return sampling.euler_loop(
                     den,
                     video,
@@ -2712,9 +2711,6 @@ class LTX25Engine:
                     on_step=stepper(stage),
                     step_cache=fast.cache() if stage_tiles is None else None,
                 )
-            finally:
-                for lora, _ in adapters if lora_on else ():
-                    lora.detach(dit)
 
         with tm.span("stage1"):
             video = sampling.noised_state(
@@ -3349,9 +3345,9 @@ class LTX25Engine:
         stage1: list[tuple] = []
         carry_v = carry_a = None
         incoming = None
-        for lora, strength in stage_loras[0]:
-            lora.attach(dit, strength)
-        with tm.span("stage1"):
+        # attached for the stage and detached even when a window fails: the
+        # DiT stays resident across requests
+        with lora_mod.attached(dit, stage_loras[0]), tm.span("stage1"):
             for i, layout in enumerate(plan):
                 stage_seed = seed + 1000 * i
                 video, slots, slot_frames, _ = window_state(
@@ -3400,9 +3396,6 @@ class LTX25Engine:
                 stage1.append((lat, a, planes, slot_frames))
                 del n
 
-        for lora, _ in stage_loras[0]:
-            lora.detach(dit)
-
         # ---- upscale ----
         with tm.span("upscale"):
             ups = []
@@ -3422,89 +3415,83 @@ class LTX25Engine:
         outputs: list[tuple] = []
         carry_v = carry_a = None
         incoming = None
-        for lora, strength in stage_loras[1]:
-            lora.attach(dit, strength)
-        try:
-            with tm.span("stage2"):
-                for i, (layout, (up, a1, planes_up, _)) in enumerate(zip(plan, ups)):
-                    stage_seed = seed + 1000 * i + 2
-                    video, slots, slot_frames, decode_kf = window_state(
-                        layout,
-                        h2,
-                        w2,
-                        stage_seed,
-                        s0,
-                        up,
-                        planes_up,
-                        incoming,
-                        carry_v,
-                        "stage2",
-                    )
-                    audio = audio_state(
-                        layout, stage_seed, s0, a1, carry_a, freeze_stage2_audio
-                    )
-                    if audio_extra is not None:
-                        audio = audio_extra(audio, layout, "stage2", a1)
-                    den = Denoiser(
-                        dit,
-                        video_text,
-                        audio_text,
-                        video_tiles=fast.tiles(
-                            layout.latent_frames, h2, w2, video.latent.shape[1]
-                        ),
-                    )
-                    v, a = run_loop(
-                        den,
-                        video,
-                        audio,
-                        stage2_sigmas,
-                        stage_seed,
-                        sampling.ANCESTRAL_STAGE_2_NOISE_SEED_OFFSET,
-                        "stage2",
-                    )
-                    f = layout.latent_frames
-                    lat = sampling.unpatchify(v[:, : f * h2 * w2], (f, h2, w2))
-                    tokens = sampling.audio_token_count(layout.pixel_frames, fps)
-                    a = (
-                        a1
-                        if freeze_stage2_audio or audio_src is not None
-                        else a[:, :tokens]
-                    )
-                    planes = (
-                        sampling.slots_to_latent(v, slots, len(slot_frames), h2, w2)
-                        if slots is not None
-                        else None
-                    )
-                    mx.eval(lat, a, *(() if planes is None else (planes,)))
-                    carry_v, carry_a = carry_of(lat, a, layout)
-                    # the decode's anchors: incoming carried slots and this window's
-                    keyframes = None
-                    if decode_with_keyframes:
-                        parts, frames_kf = [], []
-                        if incoming is not None:
-                            parts.append(incoming[0])
-                            frames_kf += incoming[1]
-                        if planes is not None:
-                            parts.append(planes)
-                            frames_kf += slot_frames
-                        kept = [
-                            (k, fr)
-                            for k, fr in enumerate(frames_kf)
-                            if 0 <= fr < layout.pixel_frames
-                        ]
-                        if kept:
-                            allp = mx.concatenate(parts, axis=2)
-                            keyframes = (
-                                mx.concatenate(
-                                    [allp[:, :, k : k + 1] for k, _ in kept], axis=2
-                                ),
-                                [fr for _, fr in kept],
-                            )
-                    incoming = outgoing(planes, slot_frames, layout)
-                    outputs.append((lat, a, keyframes))
-        finally:
-            for lora, _ in stage_loras[1]:
-                lora.detach(dit)
+        with lora_mod.attached(dit, stage_loras[1]), tm.span("stage2"):
+            for i, (layout, (up, a1, planes_up, _)) in enumerate(zip(plan, ups)):
+                stage_seed = seed + 1000 * i + 2
+                video, slots, slot_frames, decode_kf = window_state(
+                    layout,
+                    h2,
+                    w2,
+                    stage_seed,
+                    s0,
+                    up,
+                    planes_up,
+                    incoming,
+                    carry_v,
+                    "stage2",
+                )
+                audio = audio_state(
+                    layout, stage_seed, s0, a1, carry_a, freeze_stage2_audio
+                )
+                if audio_extra is not None:
+                    audio = audio_extra(audio, layout, "stage2", a1)
+                den = Denoiser(
+                    dit,
+                    video_text,
+                    audio_text,
+                    video_tiles=fast.tiles(
+                        layout.latent_frames, h2, w2, video.latent.shape[1]
+                    ),
+                )
+                v, a = run_loop(
+                    den,
+                    video,
+                    audio,
+                    stage2_sigmas,
+                    stage_seed,
+                    sampling.ANCESTRAL_STAGE_2_NOISE_SEED_OFFSET,
+                    "stage2",
+                )
+                f = layout.latent_frames
+                lat = sampling.unpatchify(v[:, : f * h2 * w2], (f, h2, w2))
+                tokens = sampling.audio_token_count(layout.pixel_frames, fps)
+                a = (
+                    a1
+                    if freeze_stage2_audio or audio_src is not None
+                    else a[:, :tokens]
+                )
+                planes = (
+                    sampling.slots_to_latent(v, slots, len(slot_frames), h2, w2)
+                    if slots is not None
+                    else None
+                )
+                mx.eval(lat, a, *(() if planes is None else (planes,)))
+                carry_v, carry_a = carry_of(lat, a, layout)
+                # the decode's anchors: incoming carried slots and this window's
+                keyframes = None
+                if decode_with_keyframes:
+                    parts, frames_kf = [], []
+                    if incoming is not None:
+                        parts.append(incoming[0])
+                        frames_kf += incoming[1]
+                    if planes is not None:
+                        parts.append(planes)
+                        frames_kf += slot_frames
+                    kept = [
+                        (k, fr)
+                        for k, fr in enumerate(frames_kf)
+                        if 0 <= fr < layout.pixel_frames
+                    ]
+                    if kept:
+                        allp = mx.concatenate(parts, axis=2)
+                        keyframes = (
+                            mx.concatenate(
+                                [allp[:, :, k : k + 1] for k, _ in kept], axis=2
+                            ),
+                            [fr for _, fr in kept],
+                        )
+                incoming = outgoing(planes, slot_frames, layout)
+                outputs.append((lat, a, keyframes))
         del ups
 
         # ---- decode and stitch (upstream decode_chunks) ----

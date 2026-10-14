@@ -14,6 +14,8 @@ User LoRAs (upstream --lora PATH [STRENGTH]) load the same way from a path.
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import mlx.core as mx
@@ -82,9 +84,32 @@ class Lora:
             dit.lora.setdefault(name, []).append((a, b, strength))
 
     def detach(self, dit: LTX25DiT) -> None:
+        """Undo one attach. Attaching an adapter twice adds its terms twice
+        (upstream applies a LoRA given twice twice); each detach removes the
+        most recent one, so attach/detach pairs nest like references."""
         for name, (a, _b) in self.pairs.items():
-            terms = [t for t in dit.lora.get(name, []) if t[0] is not a]
+            terms = dit.lora.get(name, [])
+            last = max((i for i, t in enumerate(terms) if t[0] is a), default=None)
+            if last is None:
+                continue
+            terms = terms[:last] + terms[last + 1 :]
             if terms:
                 dit.lora[name] = terms
             else:
                 dit.lora.pop(name, None)
+
+
+@contextmanager
+def attached(dit: LTX25DiT, adapters: Iterable[tuple[Lora, float]]) -> Iterator[None]:
+    """Attach (Lora, strength) pairs for the body of a `with`; whatever was
+    attached is detached on the way out, including when an attach or the body
+    raises, so a failed request never leaves an adapter on the resident DiT."""
+    done: list[Lora] = []
+    try:
+        for lora, strength in adapters:
+            lora.attach(dit, strength)
+            done.append(lora)
+        yield
+    finally:
+        for lora in reversed(done):
+            lora.detach(dit)
