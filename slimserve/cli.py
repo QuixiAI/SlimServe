@@ -101,7 +101,11 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--engine-log",
-        help="write the engine's own log here instead of discarding it",
+        help=(
+            "write the engine's own log here instead of discarding it; when "
+            "serving, the server's stdout/stderr are redirected (not copied) "
+            "to this file, which is truncated on each start"
+        ),
     )
     parser.add_argument(
         "--torch-profile-dir",
@@ -136,7 +140,11 @@ def _help() -> None:
         ("--download-only", "Fetch the weights and stop."),
         ("-y, --yes", "Do not ask before downloading."),
         ("--dry-run", "Print the resolved plan and stop."),
-        ("--engine-log FILE", "Keep the engine's own log instead of discarding it."),
+        (
+            "--engine-log FILE",
+            "Keep the engine's own log instead of discarding it. When serving,"
+            " output is redirected (not copied) here; truncated on each start.",
+        ),
         ("--torch-profile-dir DIR", "Capture a bounded engine profile trace."),
         (
             "--enable-return-routed-experts",
