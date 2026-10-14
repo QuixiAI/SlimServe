@@ -94,13 +94,15 @@ class MetalWorker(Worker):
         return nullcontext()
 
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
-        """Load weights without the CUDA-only staging warmup.
+        """Load weights through the Metal path, then make them resident.
 
-        The base GPU worker allocates pinned host memory and calls
-        ``torch.cuda.synchronize()`` before constructing the model.  Neither
-        operation exists on MPS, and unified memory does not need that staging
-        path in the first place.  Keep the otherwise-useful vLLM loading
-        context and communicator initialization.
+        The base GPU worker's HSA host-staging warmup (pinned host memory plus
+        ``torch.cuda.synchronize()``) now runs only on ROCm, so it no longer
+        needs avoiding here, and the base path's allocator scoping is a no-op
+        off CUDA.  The load block below therefore matches the base class; the
+        override remains for what follows it: pinning and sweeping the loaded
+        weights into unified-memory residency, and the optional Metal
+        diagnostics.
         """
         gc_was_enabled = gc.isenabled()
         gc.disable()
