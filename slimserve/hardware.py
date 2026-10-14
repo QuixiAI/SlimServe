@@ -19,7 +19,8 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class Machine:
-    # "mi300x", "a100", "rtx3090", "rtx6000", "metal", or None when unrecognized
+    # "mi300x", "a100", "rtx3090", "rtx5090", "rtx6000", "metal",
+    # or None when unrecognized
     platform: str | None
     device_name: str
     count: int  # visible devices, after the *_VISIBLE_DEVICES masks
@@ -167,6 +168,8 @@ def _classify(device_name: str) -> str | None:
         return "a100"
     if "3090" in lowered:
         return "rtx3090"
+    if "5090" in lowered:
+        return "rtx5090"
     if "rtx pro 6000" in lowered:
         return "rtx6000"
     return None

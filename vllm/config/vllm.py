@@ -86,6 +86,11 @@ DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES = frozenset(
         "InklingForConditionalGeneration",
         "LongcatFlashNgramForCausalLM",
         "Qwen2MoeForCausalLM",
+        # Qwen3.6 ships under Qwen3_5Moe architecture names. The registered
+        # RTX 5090 profiles use the V2 runner for target and checkpoint MTP.
+        "Qwen3_5MoeForCausalLM",
+        "Qwen3_5MoeForConditionalGeneration",
+        "Qwen3_5MoeMTP",
         "Qwen4ExpForCausalLM",
         "Qwen4ExpForConditionalGeneration",
         # The MTP drafter runs inside the V2 runner's speculator. Its draft

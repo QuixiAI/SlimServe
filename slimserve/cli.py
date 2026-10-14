@@ -118,7 +118,7 @@ def _parser() -> argparse.ArgumentParser:
 def _help() -> None:
     out = sys.stdout
     print(term.paint("slimserve", term.BOLD, out))
-    print("Run GLM-5.2-Vision, Kimi K3, DeepSeek-V4-Flash, or Qwen3.8-27B.\n")
+    print("Run a registered SlimServe model profile.\n")
     print(f"Usage: {USAGE}\n")
     machine = hardware.detect()
     _print_profiles(machine)
@@ -353,7 +353,7 @@ def main(argv: list[str] | None = None) -> int:
     if not machine.known:
         term.die(
             f"unrecognized hardware ({machine.device_name}); "
-            "slimserve runs on MI300X, A100, RTX 3090, RTX PRO 6000 and Apple Silicon"
+            "slimserve runs on MI300X, A100, RTX 3090, RTX 5090, RTX PRO 6000 and Apple Silicon"
         )
 
     if blocked := registry.profile_blocked(profile_id, machine.platform):
