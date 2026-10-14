@@ -1,0 +1,214 @@
+// SlimServe glue for the QuixiCore-XPU binding: the GGUF ops vLLM's
+// quantization layer calls (vllm/model_executor/layers/quantization/gguf/
+// ops.py) on Intel XPU. Kept out of qc_xpu_ext.sycl so that file stays a
+// clean copy of upstream's tk_xpu_ext.sycl; qc_xpu_ext.sycl calls
+// register_slimserve_ops() from PYBIND11_MODULE.
+//
+// Torch-side contracts (mirroring the CUDA _C ops and the Metal binding):
+//   ggml_mul_mat_vec_a8(W[N, bytes] u8, X[B, K], ggml_type, N) -> Y[B, N]
+//   ggml_moe_a8_vec(X, W[E, N, bytes], topk_ids, top_k, ggml_type, N, tokens)
+//       -> Y[tokens * top_k, N] in flat (token, k) order (row r reads
+//          X[r / top_k] and expert topk_ids.flat[r]; ids < 0 -> zero row)
+//   ggml_dequantize(W[N, bytes], ggml_type, N, K, dtype) -> [N, K]
+//   ggml_dequantize_into(W, ggml_type, N, K, out[N, K])
+// Supported ggml types: 8 (Q8_0), 10 (Q2_K), 16 (IQ2_XXS) — the DSV4 artifact.
+
+#include <torch/extension.h>
+
+#include <c10/xpu/XPUFunctions.h>
+#include <c10/xpu/XPUStream.h>
+#include <sycl/sycl.hpp>
+
+#include <cstdint>
+#include <cstring>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
+
+#include "quixicore/xpu/ops.hpp"
+#include "quixicore/xpu/runtime.hpp"
+
+// The iq2xxs codebook, from the vendored kernels/ tree (256 x uint64).
+#include "iq2xxs_grid_table.hpp"
+
+namespace qx = quixicore::xpu;
+
+namespace {
+
+qx::DType act_dtype(const torch::Tensor& t) {
+  switch (t.scalar_type()) {
+    case torch::kFloat32: return qx::DType::f32;
+    case torch::kFloat16: return qx::DType::f16;
+    case torch::kBFloat16: return qx::DType::bf16;
+    default: TORCH_CHECK(false, "quixicore-xpu gguf: unsupported activation dtype ", t.scalar_type());
+  }
+  return qx::DType::f32;
+}
+
+sycl::queue& queue_of(const torch::Tensor& t) {
+  return c10::xpu::getCurrentXPUStream(t.device().index()).queue();
+}
+
+// One device-resident copy of the iq2xxs grid per device index, uploaded on
+// first use (outside any graph capture: called at model load through the
+// first GEMV / dequant). Held as a torch tensor so the caching allocator owns
+// it and it dies with the process.
+const std::uint64_t* iq2xxs_grid_on(const torch::Device& device) {
+  static std::mutex mu;
+  static std::unordered_map<int, torch::Tensor> cache;
+  std::lock_guard<std::mutex> lock(mu);
+  const int idx = device.index();
+  auto it = cache.find(idx);
+  if (it == cache.end()) {
+    auto host = torch::from_blob(
+        const_cast<std::uint64_t*>(slimserve_iq2xxs_grid), {256},
+        torch::TensorOptions().dtype(torch::kInt64));
+    it = cache.emplace(idx, host.to(device)).first;
+    // The upload runs on the current stream; the kernels that read it are
+    // enqueued behind it on the same in-order queue.
+  }
+  return reinterpret_cast<const std::uint64_t*>(it->second.data_ptr<std::int64_t>());
+}
+
+void check_weight(const torch::Tensor& w) {
+  TORCH_CHECK(w.is_xpu(), "quixicore-xpu gguf: weight must be on XPU");
+  TORCH_CHECK(w.is_contiguous(), "quixicore-xpu gguf: weight must be contiguous");
+  TORCH_CHECK(w.scalar_type() == torch::kUInt8 || w.scalar_type() == torch::kInt8,
+              "quixicore-xpu gguf: weight must be raw GGUF bytes (uint8)");
+}
+
+torch::Tensor ggml_mul_mat_vec_a8(torch::Tensor W, torch::Tensor X, int64_t quant_type,
+                                  int64_t row) {
+  check_weight(W);
+  TORCH_CHECK(X.is_xpu() && X.dim() == 2, "quixicore-xpu gguf: X must be [B, K] on XPU");
+  TORCH_CHECK(qx::ops::gguf_routed_supports(static_cast<int>(quant_type)),
+              "quixicore-xpu gguf: unsupported ggml type ", quant_type);
+  auto x = X.contiguous();
+  const int64_t B = x.size(0), K = x.size(1);
+  TORCH_CHECK(K % 256 == 0 || (quant_type == 8 && K % 32 == 0),
+              "quixicore-xpu gguf: K must be a multiple of the block size");
+  auto y = torch::empty({B, row}, x.options());
+  if (B == 0) return y;
+  qx::ops::gguf_routed_gemv(queue_of(x), W.data_ptr(), x.data_ptr(), y.data_ptr(),
+                            nullptr, static_cast<std::size_t>(B),
+                            static_cast<std::size_t>(row), static_cast<std::size_t>(K),
+                            1, static_cast<int>(quant_type), act_dtype(x),
+                            iq2xxs_grid_on(x.device()), false);
+  return y;
+}
+
+torch::Tensor ggml_moe_a8_vec(torch::Tensor X, torch::Tensor W, torch::Tensor topk_ids,
+                              int64_t top_k, int64_t quant_type, int64_t row,
+                              int64_t tokens) {
+  check_weight(W);
+  TORCH_CHECK(W.dim() == 3, "quixicore-xpu gguf: expert weight must be [E, N, bytes]");
+  TORCH_CHECK(X.is_xpu() && X.dim() == 2, "quixicore-xpu gguf: X must be [rows, K] on XPU");
+  TORCH_CHECK(qx::ops::gguf_routed_supports(static_cast<int>(quant_type)),
+              "quixicore-xpu gguf: unsupported ggml type ", quant_type);
+  auto x = X.contiguous();
+  const int64_t K = x.size(1);
+  const int64_t R = tokens * top_k;
+  TORCH_CHECK(x.size(0) * top_k >= R, "quixicore-xpu gguf: X rows do not cover tokens*top_k");
+  auto ids = topk_ids.to(torch::kInt32).contiguous().flatten();
+  TORCH_CHECK(ids.numel() >= R, "quixicore-xpu gguf: topk_ids too short");
+  auto y = torch::empty({R, row}, x.options());
+  if (R == 0) return y;
+  qx::ops::gguf_routed_gemv(queue_of(x), W.data_ptr(), x.data_ptr(), y.data_ptr(),
+                            ids.data_ptr<int32_t>(), static_cast<std::size_t>(R),
+                            static_cast<std::size_t>(row), static_cast<std::size_t>(K),
+                            static_cast<std::size_t>(top_k), static_cast<int>(quant_type),
+                            act_dtype(x), iq2xxs_grid_on(x.device()), false);
+  return y;
+}
+
+void ggml_dequantize_into(torch::Tensor W, int64_t quant_type, int64_t m, int64_t n,
+                          torch::Tensor out) {
+  check_weight(W);
+  TORCH_CHECK(out.is_xpu() && out.is_contiguous() && out.numel() == m * n,
+              "quixicore-xpu gguf: dequant output must be a contiguous [m, n] XPU tensor");
+  TORCH_CHECK(qx::ops::gguf_routed_supports(static_cast<int>(quant_type)),
+              "quixicore-xpu gguf: unsupported ggml type ", quant_type);
+  qx::ops::gguf_dequantize(queue_of(out), W.data_ptr(), out.data_ptr(),
+                           static_cast<std::size_t>(m), static_cast<std::size_t>(n),
+                           static_cast<int>(quant_type), act_dtype(out),
+                           iq2xxs_grid_on(out.device()), false);
+}
+
+torch::Tensor ggml_dequantize(torch::Tensor W, int64_t quant_type, int64_t m, int64_t n,
+                              c10::optional<torch::ScalarType> dtype) {
+  auto out = torch::empty({m, n}, W.options().dtype(dtype.value_or(torch::kFloat16)));
+  ggml_dequantize_into(W, quant_type, m, n, out);
+  return out;
+}
+
+// ---- UVA: an XPU-typed view over pinned host memory ------------------------
+// Pinned host allocations on XPU are USM host memory, addressable from device
+// kernels; the shared V1 runner keeps small input-prep buffers there
+// (UvaBuffer) to skip explicit H2D copies. Same shape as vllm-xpu-kernels'
+// get_xpu_view_from_cpu_tensor: a custom allocator wraps the existing host
+// pointer and keeps the CPU tensor alive for the view's lifetime.
+class HostViewAllocator : public c10::Allocator {
+ public:
+  struct Owner { torch::Tensor owner; };
+  HostViewAllocator(void* host_ptr, size_t size, torch::Tensor owner)
+      : host_ptr_(host_ptr), size_(size), owner_(std::move(owner)) {}
+  c10::DataPtr allocate(size_t n) override {
+    TORCH_CHECK(n <= size_, "host view: requested size exceeds the pinned buffer");
+    auto ctx = std::make_unique<Owner>(Owner{owner_});
+    const auto device_id = c10::xpu::current_device();
+    c10::DataPtr data_ptr{host_ptr_, ctx.get(),
+                          [](void* p) { delete static_cast<Owner*>(p); },
+                          c10::Device(c10::DeviceType::XPU, device_id)};
+    ctx.release();
+    return data_ptr;
+  }
+  bool is_simple_data_ptr(const c10::DataPtr&) const override { return true; }
+  void copy_data(void* dest, const void* src, std::size_t count) const override {
+    std::memcpy(dest, src, count);
+  }
+ private:
+  void* const host_ptr_;
+  const size_t size_;
+  torch::Tensor owner_;
+};
+
+torch::Tensor get_xpu_view_from_cpu_tensor(torch::Tensor cpu_tensor) {
+  TORCH_CHECK(cpu_tensor.device().is_cpu(), "host view: input must be on CPU");
+  TORCH_CHECK(cpu_tensor.is_contiguous(), "host view: input must be contiguous");
+  TORCH_CHECK(cpu_tensor.is_pinned(), "host view: input must be pinned");
+  void* host_ptr = cpu_tensor.data_ptr();
+  const size_t byte_size = cpu_tensor.numel() * cpu_tensor.element_size();
+  HostViewAllocator allocator(host_ptr, byte_size, cpu_tensor);
+  c10::DataPtr data_ptr = allocator.allocate(byte_size);
+  c10::Storage storage(c10::Storage::use_byte_size_t(), byte_size, std::move(data_ptr));
+  auto impl = c10::make_intrusive<at::TensorImpl>(
+      std::move(storage), c10::DispatchKeySet(c10::DispatchKey::XPU),
+      at::scalarTypeToTypeMeta(cpu_tensor.scalar_type()));
+  impl->set_sizes_and_strides(cpu_tensor.sizes(), cpu_tensor.strides());
+  return torch::Tensor(std::move(impl));
+}
+
+// A tensor aliasing another's storage without owning it (graph capture keeps
+// weak refs to inputs so pool slots are not pinned across batch descriptors).
+torch::Tensor weak_ref_tensor(torch::Tensor tensor) {
+  TORCH_CHECK(tensor.is_xpu(), "weak_ref_tensor: tensor must be on XPU");
+  return torch::from_blob(tensor.data_ptr(), tensor.sizes().vec(),
+                          tensor.strides().vec(), tensor.options());
+}
+
+bool ggml_supports(int64_t quant_type) {
+  return qx::ops::gguf_routed_supports(static_cast<int>(quant_type));
+}
+
+}  // namespace
+
+void register_slimserve_ops(pybind11::module_& m) {
+  m.def("ggml_mul_mat_vec_a8", &ggml_mul_mat_vec_a8, "GGUF batched GEMV (Q8_0/Q2_K/IQ2_XXS)");
+  m.def("ggml_moe_a8_vec", &ggml_moe_a8_vec, "GGUF routed expert GEMV");
+  m.def("ggml_dequantize", &ggml_dequantize, "GGUF dequantize to a dense tensor");
+  m.def("ggml_dequantize_into", &ggml_dequantize_into, "GGUF dequantize into an existing tensor");
+  m.def("ggml_supports", &ggml_supports, "Whether a ggml type is supported by these kernels");
+  m.def("weak_ref_tensor", &weak_ref_tensor, "Non-owning alias of an XPU tensor");
+  m.def("get_xpu_view_from_cpu_tensor", &get_xpu_view_from_cpu_tensor,
+        "XPU-typed view over a pinned CPU tensor (UVA)");
+}

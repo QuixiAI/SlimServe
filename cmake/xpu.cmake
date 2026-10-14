@@ -56,22 +56,6 @@ if (NOT VLLM_XPU_OPS_SRC)
   message(FATAL_ERROR "No SYCL sources under ${QUIXICORE_XPU_DIR}; see its README.md.")
 endif()
 
-# oneDNN vendor variants are optional (Variant::vendor falls back to SYCL).
-option(VLLM_XPU_ENABLE_ONEDNN "Build the oneDNN vendor variants" ON)
-set(VLLM_XPU_HAS_ONEDNN OFF)
-if (VLLM_XPU_ENABLE_ONEDNN)
-  find_package(dnnl CONFIG QUIET)
-  if (dnnl_FOUND)
-    set(VLLM_XPU_HAS_ONEDNN ON)
-    file(GLOB_RECURSE VLLM_XPU_ONEDNN_SRC CONFIGURE_DEPENDS
-      "${QUIXICORE_XPU_DIR}/kernels/*.onednn.cpp")
-    list(APPEND VLLM_XPU_OPS_SRC ${VLLM_XPU_ONEDNN_SRC})
-    message(STATUS "QuixiCore XPU: oneDNN found; vendor variants enabled.")
-  else()
-    message(STATUS "QuixiCore XPU: oneDNN not found; vendor variants fall back to SYCL.")
-  endif()
-endif()
-
 # Header-only substrate: the compiler does report these as dependencies for
 # .cpp TUs (unlike Metal), but list them so a CONFIGURE_DEPENDS re-glob also
 # fires when a header is added.
@@ -89,18 +73,6 @@ target_include_directories(quixicore_xpu_ops
 target_compile_options(quixicore_xpu_ops PUBLIC ${VLLM_XPU_SYCL_FLAGS})
 target_link_options(quixicore_xpu_ops PUBLIC ${VLLM_XPU_SYCL_FLAGS})
 target_compile_options(quixicore_xpu_ops PRIVATE -O3)
-if (VLLM_XPU_HAS_ONEDNN)
-  target_compile_definitions(quixicore_xpu_ops PUBLIC QUIXICORE_XPU_HAS_ONEDNN)
-  target_link_libraries(quixicore_xpu_ops PUBLIC DNNL::dnnl)
-endif()
-find_library(VLLM_XPU_ZE_LOADER ze_loader)
-if (VLLM_XPU_ZE_LOADER)
-  target_compile_definitions(quixicore_xpu_ops PRIVATE QUIXICORE_XPU_HAS_LEVEL_ZERO)
-  target_link_libraries(quixicore_xpu_ops PUBLIC ${VLLM_XPU_ZE_LOADER})
-  message(STATUS "QuixiCore XPU: Level Zero loader found; IPC enabled.")
-else()
-  message(STATUS "QuixiCore XPU: Level Zero loader not found; IPC stubs.")
-endif()
 #
 # ONE SYCL runtime per process. torch+xpu wheels bundle their own libsycl.so.9 /
 # libur_* (pip intel-sycl-rt) next to site-packages, and libtorch_xpu resolves
@@ -109,8 +81,7 @@ endif()
 # and the first XPU allocation segfaults (measured 2026-08-18 on a 4x B70 host).
 # Pin ours to torch's runtime dir with DT_RPATH (--disable-new-dtags), which
 # outranks LD_LIBRARY_PATH; the compiler's own dir is the fallback for
-# non-torch environments. oneDNN's dir rides along so setvars is not needed
-# at import time either.
+# non-torch environments, so setvars is not needed at import time.
 #
 find_library(VLLM_XPU_TORCH_SYCL_LIB sycl
   NAMES libsycl.so.9 sycl
@@ -126,11 +97,6 @@ endif()
 set(VLLM_XPU_RPATH "\$ORIGIN")
 if (VLLM_XPU_SYCL_RUNTIME_DIR)
   list(APPEND VLLM_XPU_RPATH "${VLLM_XPU_SYCL_RUNTIME_DIR}")
-endif()
-if (VLLM_XPU_HAS_ONEDNN)
-  get_target_property(VLLM_XPU_DNNL_LOC DNNL::dnnl LOCATION)
-  get_filename_component(VLLM_XPU_DNNL_DIR "${VLLM_XPU_DNNL_LOC}" DIRECTORY)
-  list(APPEND VLLM_XPU_RPATH "${VLLM_XPU_DNNL_DIR}")
 endif()
 list(JOIN VLLM_XPU_RPATH ":" VLLM_XPU_RPATH_STR)
 
