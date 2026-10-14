@@ -146,3 +146,58 @@ def test_assistant_content_merges_with_reasoning_and_tool_calls(
         },
         {"role": "user", "content": "Summarize."},
     ]
+
+
+@pytest.mark.parametrize(
+    "parts, expected",
+    [
+        pytest.param(
+            [
+                {"type": "input_text", "text": "First. "},
+                {"type": "input_text", "text": "Second."},
+            ],
+            "First. Second.",
+            id="two-part",
+        ),
+        pytest.param([], "", id="empty"),
+    ],
+)
+def test_untyped_assistant_message_replays_all_parts(parts, expected):
+    # An easy-input assistant message stays a dict after request validation;
+    # it must replay every part, exactly like a typed output message.
+    request = ResponsesRequest.model_validate(
+        {
+            "model": "test-model",
+            "input": [
+                {"role": "user", "content": "Start."},
+                {"role": "assistant", "content": parts},
+                {"role": "user", "content": "Continue."},
+            ],
+        }
+    )
+    assert construct_input_messages(request_input=request.input) == [
+        {"role": "user", "content": "Start."},
+        {"role": "assistant", "content": expected},
+        {"role": "user", "content": "Continue."},
+    ]
+
+
+def test_untyped_assistant_message_replays_refusal_parts():
+    # Callers that hand construct_input_messages raw dicts (no schema pass)
+    # may carry output_text/refusal parts; those join like the typed path.
+    messages = construct_input_messages(
+        request_input=[
+            {"role": "user", "content": "Start."},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "output_text", "text": "First. "},
+                    {"type": "refusal", "refusal": "I cannot do that."},
+                ],
+            },
+        ]
+    )
+    assert messages[1] == {
+        "role": "assistant",
+        "content": "First. I cannot do that.",
+    }
