@@ -2800,3 +2800,42 @@ everywhere. The one open decode gap is acceptance: the same MTP head accepts
 in `perf/optimization_status.md` ("Acceptance audit, part 3") narrows to the
 two trees' target quantization. Every item behind the row: that notebook from
 Item D12 to Item D17; campaign index `docs/glm53f-rtx6000-campaign.md`.
+
+## GLM-5.3-Flash NVFP4 on 4x RTX PRO 6000 Blackwell (rtx6000 record), 2026-09-20 Phase 9 final record
+
+Record of `glm53f-nvfp4-4` / `rtx6000` at the end of Phase 9 (tree 6ea3ede34,
+the record's own environment, `chain_final.sh`): exact-token 1000/300. The
+protocol differs from the 09-15 snapshot above: plain is two passes (both
+listed), spec is the median of eight passes with the range. Raw:
+`perf/results/2026-09-20/final-{nospec,spec}-pass*/`,
+`final-nospec-gate{1..4}.json`. What changed since 09-15: the Phase 8
+series (dependent launch on the decode GEMMs, the fused all-reduce + mHC
+transition for every decode batch, the bf16 KDA state, the in_proj NVFP4
+sidecar, the DSA latent and indexer FP8 projections, the NVFP4 decode MoE
+pair) and Phase 9's draft-only NVFP4 lm_head (F5b).
+
+| arm | c1 | c8 | c16 | cold TTFT 32K / 128K | warm TTFT 32K / 128K |
+|---|---:|---:|---:|---|---|
+| record, no speculation (two passes) | 228.5 / 228.7 | 776.1 / 775.7 | 1127.6 / 1122.7 | 2.84 s / 11.77 s | 0.084 s / 0.267 s |
+| record, `--spec` (eight-pass median, range) | 304.4 (275.4-343.0) | 818.7 (739.4-846.5) | 1140.9 (1070.1-1184.4) | | |
+| control r28.1, no speculation | 166.5 | 687.9 | 966.8 | 2.93 s / 14.9 s | |
+| control r28.1, its own MTP-3 | 260.8 | 732.1 | 1005.8 | | |
+
+Against the control: no speculation +37 / +13 / +17 %, with speculation
++17 / +12 / +13 %, cold TTFT -3 % at 32K and -21 % at 128K. Gates -2.432 /
+-2.457 / -2.449 / -2.463 (all-position -3.264..-3.271), canaries text /
+tool / image pass, 0.981 accepted per draft. The c1 spec median does not
+resolve +-7 % (275-334 on identical code in one session). Cold TTFT is +5 %
+on the 09-15 snapshot's 2.70 s / 11.2 s; the notebook leaves that as an
+open check for the next prefill pass.
+
+Re-validation on the branch head after the b12x native MoE backend was
+removed (2026-09-21, notebook "B12X NATIVE MOE BACKEND REMOVED"; no raw
+path recorded there): plain 228.8 / 778.3 / 1119.8 and 228.7 / 771.9 /
+1116.2, spec eight-pass medians 301.7 / 805.3 / 1125.3, gates -2.441 /
+-2.457, 0.975 accepted per draft. The prefill rows depend on the optional
+`b12x` package (the PCIe DMA all-reduce); without it the ring is skipped
+with a warning and the cold TTFT above does not hold. Every item behind the
+row: `perf/optimization_status.md` from "PHASE 8 / P1" to "B12X NATIVE MOE
+BACKEND REMOVED"; campaign index `docs/glm53f-rtx6000-campaign.md`
+section 16.

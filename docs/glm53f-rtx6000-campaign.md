@@ -1257,7 +1257,8 @@ plain c1/c8/c16 +1.5/+1.9/+4.2 % on the head; P1 closed; P6 landed at +3 /
 stream is spent, the plan's +13 % rested on a flush-in-graph microbench
 that overstated the cold rates): P8 landed (bf16 KDA recurrent state, `mamba_ssm_cache_dtype: bfloat16`
 on the record: plain +0.5 / +0.6 / +1.5 %, spec inside its spread with
-c16's best pass at 1141; gates, canaries and the acceptance probe
+c16's best pass at 1141 - one pass of two, not a median; the
+Phase 9 1140.9 in section 16 is an eight-pass median; gates, canaries and the acceptance probe
 unchanged), then P4 (arms running), P5, P7, P1b, each 1-3 %. The
 record after P2/P3/P6 (2026-09-17 21:00 PDT, exact, two passes, record
 boots with no extra environment): plain 198-203 / 756-760 / 1086-1092,
