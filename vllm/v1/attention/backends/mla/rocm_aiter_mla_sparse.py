@@ -48,6 +48,20 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _qc_sparse_decode_available() -> bool:
+    try:
+        import vllm._quixicore_C as qc
+    except ImportError:
+        return False
+    return hasattr(qc, "mla_sparse_decode_fwd")
+
+
+def envs_get(name: str, default: str) -> str:
+    import os
+
+    return os.environ.get(name, default)
+
+
 def _quixicore_disabled() -> bool:
     """VLLM_QC_DISABLE_NATIVE=1 forces the Triton path.
 
@@ -656,6 +670,7 @@ class ROCMAiterMLASparseMetadataBuilder(
             torch.cuda.current_stream(self.device).synchronize()
             self._prev_metadata_key = metadata_key
 
+        assert self.reorder_batch_threshold is not None
         num_decodes, num_prefills, num_decode_tokens, _ = split_decodes_and_prefills(
             common_attn_metadata,
             decode_threshold=self.reorder_batch_threshold,
@@ -853,6 +868,46 @@ class ROCMAiterMLASparseImpl(MLAAttentionImpl[ROCMAiterMLASparseMetadata]):
             NUM_TOPK_TOKENS=attn_metadata.topk_tokens,
         )
 
+        # Prefer the QuixiCore gfx942 sparse decode when it can serve this
+        # cache: aiter's mla_decode_fwd flattens the cache with
+        # view(-1, 1, 1, head), which requires block-contiguous storage and
+        # rejects the packed cross-layer KV slab (each layer is a
+        # block-strided view of one slab); the QuixiCore kernel takes the
+        # block stride as a parameter, and its head count is a grid
+        # dimension rather than baked into a pre-assembled code object.
+        # VLLM_QC_ROCM_MLA_SPARSE=0 restores the aiter path (bf16,
+        # contiguous caches only - it still rejects the packed slab).
+        if (
+            not fp8_attention
+            and _qc_sparse_decode_available()
+            and envs_get("VLLM_QC_ROCM_MLA_SPARSE", "1") == "1"
+        ):
+            import vllm._quixicore_C as qc
+
+            attn_out = torch.empty(
+                (q.shape[0], self.num_heads, self.kv_lora_rank),
+                dtype=q.dtype,
+                device=q.device,
+            )
+            if envs_get("VLLM_QC_MLA_SPARSE_ORACLE", "0") == "1":
+                # Diagnostic: pure-torch attention for EVERY token, replacing
+                # the kernel outright. Slow; splits "attention" from
+                # "everything else" in corruption bisects.
+                self._oracle_forward(q, kv_c_and_k_pe_cache, attn_metadata, attn_out)
+            else:
+                qc.mla_sparse_decode_fwd(
+                    q,
+                    kv_c_and_k_pe_cache,
+                    attn_metadata.paged_kv_indptr,
+                    attn_metadata.paged_kv_indices,
+                    attn_out,
+                    self.scale,
+                    attn_metadata.topk_tokens,
+                )
+            if envs_get("VLLM_QC_MLA_SPARSE_SHADOW", "0") == "1":
+                self._shadow_check(q, kv_c_and_k_pe_cache, attn_metadata, attn_out)
+            return attn_out, None
+
         # write the latent and rope to kv cache
         if fp8_attention:
             kv_c_and_k_pe_cache = kv_c_and_k_pe_cache.view(current_platform.fp8_dtype())
@@ -866,3 +921,79 @@ class ROCMAiterMLASparseImpl(MLAAttentionImpl[ROCMAiterMLASparseMetadata]):
         )
 
         return attn_out, None
+
+    def _oracle_forward(self, q, cache, attn_metadata, attn_out) -> None:
+        """Vectorized pure-torch sparse attention (diagnostic). Pads each
+        token's span to the max span of a 512-token slab, gathers rows and
+        runs one masked bmm per slab."""
+        indptr = attn_metadata.paged_kv_indptr
+        indices = attn_metadata.paged_kv_indices
+        nb, bs, entry = cache.shape
+        T, H, _ = q.shape
+        lens = (indptr[1 : T + 1] - indptr[:T]).long()
+        for s0 in range(0, T, 512):
+            s1 = min(s0 + 512, T)
+            m = int(lens[s0:s1].max())
+            if m == 0:
+                attn_out[s0:s1].zero_()
+                continue
+            ar = torch.arange(m, device=q.device)
+            pos = indptr[s0:s1].long().unsqueeze(1) + ar.unsqueeze(0)
+            valid = ar.unsqueeze(0) < lens[s0:s1].unsqueeze(1)
+            idx = torch.where(
+                valid, indices[pos.clamp(max=indices.shape[0] - 1)].long(), -1
+            )
+            live = idx >= 0
+            safe = idx.clamp(min=0)
+            rows = cache[safe // bs, safe % bs].float()  # [n, m, entry]
+            scores = torch.einsum("nhd,nmd->nhm", q[s0:s1].float(), rows) * self.scale
+            scores = scores.masked_fill(~live.unsqueeze(1), float("-inf"))
+            probs = torch.softmax(scores, dim=-1)
+            probs = torch.nan_to_num(probs)
+            out = torch.einsum("nhm,nmd->nhd", probs, rows[..., : self.kv_lora_rank])
+            attn_out[s0:s1] = out.to(attn_out.dtype)
+
+    _shadow_calls = 0
+
+    def _shadow_check(self, q, cache, attn_metadata, attn_out) -> None:
+        """Diagnostic: replay the first tokens of this call through a pure
+        torch softmax over the same live indices and log the divergence.
+        Bounded (first 8 calls, then every 256th); never on the hot path."""
+        if torch.cuda.is_current_stream_capturing():
+            return
+        cls = type(self)
+        cls._shadow_calls += 1
+        n = cls._shadow_calls
+        if n > 8 and n % 256 != 0:
+            return
+        torch.cuda.synchronize()
+        indptr = attn_metadata.paged_kv_indptr.cpu()
+        indices = attn_metadata.paged_kv_indices
+        nb, bs, entry = cache.shape
+        worst = 0.0
+        checked = 0
+        for t in range(min(q.shape[0], 3)):
+            sp = indices[int(indptr[t]) : int(indptr[t + 1])]
+            sp = sp[sp >= 0].long()
+            if sp.numel() == 0:
+                continue
+            rows = cache[sp // bs, sp % bs].float()  # [K, entry]
+            scores = (q[t].float() @ rows.T) * self.scale
+            probs = torch.softmax(scores, dim=-1)
+            ref = probs @ rows[:, : self.kv_lora_rank]
+            d = (attn_out[t].float() - ref).abs().max().item()
+            worst = max(worst, d)
+            checked += 1
+        logger.info(
+            "qc-mla-shadow: call %d tokens=%d checked=%d maxdiff=%.5f "
+            "span0=%d cache=%dx%dx%d stride0=%d",
+            n,
+            q.shape[0],
+            checked,
+            worst,
+            int(indptr[1] - indptr[0]),
+            nb,
+            bs,
+            entry,
+            cache.stride(0),
+        )

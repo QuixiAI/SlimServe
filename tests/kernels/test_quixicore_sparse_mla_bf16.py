@@ -1,0 +1,160 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""bf16 sparse MLA decode (quixicore mla_decode_fp8_v, NFP8 == 0):
+partitioned vs unpartitioned launches and both bf16 geometries against a
+float32 torch reference. Guards the lane-parallel vectorized row path
+(VECBF16) added 2026-09-03."""
+
+import math
+
+import pytest
+import torch
+
+pytest.importorskip("vllm._quixicore_C")
+from vllm.quixicore import quixicore_ops as qc  # noqa: E402
+
+if not torch.cuda.is_available():
+    pytest.skip("CUDA required", allow_module_level=True)
+
+DEV = "cuda"
+BS, N_BLOCKS, MAX_TOPK = 64, 64, 2080
+LENS = [0, 1, 37, 1000, 2048]
+
+
+def _inputs(width, heads):
+    torch.manual_seed(0)
+    B = len(LENS)
+    kv = (torch.randn(N_BLOCKS, BS, width, device=DEV) * 0.5).to(torch.bfloat16)
+    q = (torch.randn(B, heads, width, device=DEV) * 0.2).to(torch.bfloat16)
+    bt = torch.arange(N_BLOCKS, device=DEV, dtype=torch.int32).repeat(B, 1)
+    idx = torch.full((B, MAX_TOPK), -1, device=DEV, dtype=torch.int32)
+    for b, L in enumerate(LENS):
+        idx[b, :L] = torch.randperm(N_BLOCKS * BS, device=DEV)[:L].to(torch.int32)
+    # interleaved -1 holes on one row: the kernel must skip, not stop
+    idx[3, 5::7] = -1
+    tlen = torch.tensor(LENS, device=DEV, dtype=torch.int32)
+    return q, kv, bt, idx, tlen
+
+
+def _reference(q, kv, idx, value_width):
+    width = kv.shape[-1]
+    scale = 1.0 / math.sqrt(width)
+    outs = []
+    for b in range(q.shape[0]):
+        toks = idx[b][idx[b] >= 0].long()
+        if toks.numel() == 0:
+            outs.append(torch.zeros(q.shape[1], value_width, device=DEV))
+            continue
+        rows = kv.reshape(-1, width)[toks].float()
+        s = (q[b].float() @ rows.T) * scale
+        outs.append(torch.softmax(s, dim=-1) @ rows[:, :value_width])
+    return torch.stack(outs)
+
+
+@pytest.mark.parametrize("heads", [8, 16])
+@pytest.mark.parametrize("partition_size", [0, 256, 128])
+def test_nope_512_matches_reference(heads, partition_size):
+    q, kv, bt, idx, tlen = _inputs(512, heads)
+    out = qc.mla_decode_bf16_sparse_nope(
+        q, kv.reshape(-1), bt, idx, tlen, BS, 1.0 / math.sqrt(512), partition_size
+    )
+    ref = _reference(q, kv, idx, 512)
+    err = (out.float() - ref).abs().max().item() / ref.abs().max().item()
+    assert err < 5e-3, err
+
+
+def test_nope_partitioned_matches_unpartitioned():
+    q, kv, bt, idx, tlen = _inputs(512, 8)
+    scale = 1.0 / math.sqrt(512)
+    a = qc.mla_decode_bf16_sparse_nope(q, kv.reshape(-1), bt, idx, tlen, BS, scale, 0)
+    b = qc.mla_decode_bf16_sparse_nope(q, kv.reshape(-1), bt, idx, tlen, BS, scale, 128)
+    assert (a.float() - b.float()).abs().max().item() < 1e-3
+
+
+@pytest.mark.parametrize("heads", [8, 16])
+@pytest.mark.parametrize("partition_size", [0, 128])
+def test_glm_576_matches_reference(heads, partition_size):
+    q, kv, bt, idx, tlen = _inputs(576, heads)
+    out = qc.mla_decode_bf16_sparse_glm(
+        q, kv.reshape(-1), bt, idx, tlen, BS, 1.0 / math.sqrt(576), partition_size
+    )
+    ref = _reference(q, kv, idx, 512)
+    err = (out.float() - ref).abs().max().item() / ref.abs().max().item()
+    assert err < 5e-3, err
+
+
+def _packed_view(kv: torch.Tensor, stride_mult: int = 3, offset_pages: int = 1):
+    """A [N_BLOCKS, BS, W] view whose block stride is stride_mult pages, at a
+    page offset inside each row: the packed cross-layer slab geometry."""
+    n, bs, w = kv.shape
+    page = bs * w
+    slab = torch.zeros(n * stride_mult * page, dtype=kv.dtype, device=DEV)
+    view = slab.view(n, stride_mult * page)[:, offset_pages * page : (offset_pages + 1) * page]
+    view = view.view(n, bs, w)
+    view.copy_(kv)
+    return view
+
+
+@pytest.mark.parametrize("partition_size", [0, 128])
+def test_nope_512_strided_pages(partition_size):
+    q, kv, bt, idx, tlen = _inputs(512, 8)
+    dense = qc.mla_decode_bf16_sparse_nope(
+        q, kv.reshape(-1), bt, idx, tlen, BS, 1.0 / math.sqrt(512), partition_size
+    )
+    view = _packed_view(kv)
+    assert not view.is_contiguous()
+    strided = qc.mla_decode_bf16_sparse_nope(
+        q, view, bt, idx, tlen, BS, 1.0 / math.sqrt(512), partition_size,
+        view.stride(0) * view.element_size(),
+    )
+    assert torch.equal(dense, strided)
+
+
+def test_glm_576_strided_pages():
+    q, kv, bt, idx, tlen = _inputs(576, 8)
+    dense = qc.mla_decode_bf16_sparse_glm(
+        q, kv.reshape(-1), bt, idx, tlen, BS, 1.0 / math.sqrt(576), 128
+    )
+    view = _packed_view(kv)
+    strided = qc.mla_decode_bf16_sparse_glm(
+        q, view, bt, idx, tlen, BS, 1.0 / math.sqrt(576), 128,
+        view.stride(0) * view.element_size(),
+    )
+    assert torch.equal(dense, strided)
+
+
+# ---- fp8 (e4m3) NoPE latent: the NFP8=512 instantiation (2026-09-11) ----
+
+
+def _fp8_inputs(heads, kv_scale):
+    q, kv, bt, idx, tlen = _inputs(512, heads)
+    # Store kv / kv_scale as e4m3; the kernel multiplies decoded values by
+    # kv_scale (SMODE 1, vLLM's per-tensor fp8 MLA layout).
+    stored = (kv.float() / kv_scale).to(torch.float8_e4m3fn)
+    dequant = (stored.float() * kv_scale).to(torch.bfloat16)
+    return q, stored.view(torch.uint8), dequant, bt, idx, tlen
+
+
+@pytest.mark.parametrize("heads", [8, 16])
+@pytest.mark.parametrize("partition_size", [0, 128])
+@pytest.mark.parametrize("kv_scale", [1.0, 2.0])
+def test_nope_512_fp8_matches_reference(heads, partition_size, kv_scale):
+    q, data, dequant, bt, idx, tlen = _fp8_inputs(heads, kv_scale)
+    out = qc.mla_decode_fp8_sparse_nope(
+        q, data.reshape(-1), bt, idx, tlen, BS, 1.0 / math.sqrt(512), kv_scale,
+        partition_size,
+    )
+    ref = _reference(q, dequant, idx, 512)
+    err = (out.float() - ref).abs().max().item() / ref.abs().max().item()
+    assert err < 5e-3, err
+
+
+def test_nope_512_fp8_tracks_bf16_within_fp8_error():
+    """fp8 storage vs the bf16 kernel on the same latents: the difference is
+    the e4m3 rounding, bounded well inside a few percent."""
+    q, kv, bt, idx, tlen = _inputs(512, 16)
+    data = kv.to(torch.float8_e4m3fn).view(torch.uint8)
+    a = qc.mla_decode_bf16_sparse_nope(q, kv.reshape(-1), bt, idx, tlen, BS, 1.0 / math.sqrt(512), 128)
+    b = qc.mla_decode_fp8_sparse_nope(q, data.reshape(-1), bt, idx, tlen, BS, 1.0 / math.sqrt(512), 1.0, 128)
+    err = (a.float() - b.float()).abs().max().item() / a.float().abs().max().item()
+    assert err < 5e-2, err

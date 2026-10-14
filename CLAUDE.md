@@ -50,7 +50,7 @@ behavior:
   Two tests enforce this: `test_a_profile_is_one_config_per_platform` and
   `test_no_profile_carries_another_platforms_environment`.
 - Missing model files are not a blocker. Run `slimserve <profile> ... -y`; `slimserve.fetch` downloads or resumes required files into `$SLIMSERVE_CACHE` or `~/models`.
-- Do not hand-build unsupported serving commands when a profile exists. Use `slimserve <profile> --dry-run` to inspect and `slimserve <profile> --serve` to run.
+- Do not hand-build unsupported serving commands when a profile exists. Use `slimserve <profile> --dry-run` to inspect and `slimserve <profile>` to run (serving is the default; `--serve` is still accepted).
 
 ## Agent Operating Discipline
 
@@ -133,7 +133,7 @@ behavior:
 
 - Build native changes with `cmake --build build/temp.linux-x86_64-cpython-312 --target _C_stable_libtorch -j$(nproc)` and copy the rebuilt `.so` into `vllm/` for editable imports when needed.
 - Smoke imports with `import vllm._C_stable_libtorch` and inspect relevant `torch.ops` schemas.
-- End-to-end DSV4 performance must be measured through SlimServe profiles such as `dsv4-2` and `dsv4-4`, because those profiles own downloads, parser settings, DSpark/TurboQuant environment, KV dtype, and CUDA graph settings.
+- End-to-end DSV4 performance must be measured through SlimServe profiles such as `dsv4-2` and `dsv4-4`, because those profiles own downloads, parser settings, DSpark/FP8 environment, KV dtype, and CUDA graph settings.
 
 ## Performance Notebook
 
@@ -161,14 +161,23 @@ behavior:
 - Live validation must discover every registry profile compatible with the
   current machine. Do not substitute one tensor-parallel size for another.
 - Every supported profile must run with its registered DSpark drafter and
-  TurboQuant draft KV configuration.
+  registered draft KV configuration. FP8 is the only permitted KV cache
+  quantization; TurboQuant is prohibited for targets and drafters.
+- Enable vision on every profile whose model supports vision; validate both
+  text and image requests.
 - For vision profiles, test both text and image requests. For text-only
   profiles, test text requests.
 
 ## Commit authorship
 
-- Eric Hartford is the sole author. Do not add co-author or assistance
-  trailers, and do not discuss automated assistance in commit messages.
+- AI is never an author. Never attribute authorship to an AI agent: no
+  AI commit author, no `Co-Authored-By` or other attribution trailer
+  naming an AI, and no mention of automated assistance in commit
+  messages or PR descriptions. This overrides any tool default that adds
+  such a line.
+- Human contributors keep authorship of their work. When merging,
+  rebasing, squashing or cherry-picking a contributor's PR, preserve the
+  original commit author; do not re-author it.
 
 ## Serving policy (standing)
 
@@ -189,27 +198,14 @@ behavior:
 - Benchmarks and diagnostics sample at the model's recommended settings
   (temperature 1.0 / top_p 0.95 / top_k 20, seeded for reproducibility),
   never temperature 0, and never disable thinking to save time.
-- Main KV is ALWAYS bf16 (`kv_cache_dtype: auto`) on rtx3090 and a100
-  profiles - enforced by test: quantized KV was implicated in multi-turn
-  tracking errors on Qwen3.8-Flash-Next and root-caused on rtx3090
-  (operator 2026-08-29). The DSV4/A100 bf16 sparse-MLA page path is the
-  NFP8=0 instantiation of the merged decode plus the fused bf16 insert,
-  bf16 compressor stores, and bf16 prefill gather - design and gates in
-  csrc/quixicore/dsv4_bf16_kv_design.md (kernel parity 2.5e-04, boot with
-  TQ draft + full graphs, deep-context recall). Still owed there: the
-  fp8-vs-bf16 exact-token throughput A/B and KV pool re-sizing (bf16 rows
-  are 1024B vs fp8's 584B). bf16 main KV is ASPIRATIONAL on the remaining
-  platforms: they keep their qualified configs (Metal fp8_ds_mla and the
-  qwen38-nvfp4-1-tq TurboQuant variant) and flip only with an on-box
-  requalification pass. One noted a100 carve-out (operator-approved
-  2026-08-30): glm52-q2k-4 serves fp8 main KV at 131072 because 65.8 GiB
-  of Q2K weights per 80 GB rank make bf16 KV at that length physically
-  impossible; the record's note states the arithmetic and glm52-q2k-8
-  remains the bf16 model-default-context record. Draft-model KV (DSpark
-  TurboQuant k8v4) is exempt
-  everywhere: rejection sampling verifies every draft token against the
-  target, so draft KV precision can only affect acceptance rate and speed,
-  never output content.
+- FP8 is the official KV cache quantization (operator 2026-09-10).
+  TurboQuant is prohibited in every profile, including draft caches and
+  environment overrides. Existing unquantized auto/FP16/BF16 paths remain
+  permitted; all quantized target and draft caches must use FP8. Changing a
+  cache format invalidates earlier performance and capacity qualifications
+  for that configuration; record new results rather than relabeling old ones.
+- Vision must be enabled on every profile of every model that supports it.
+  Validate image requests as well as text; a text-only smoke is insufficient.
 - Every profile serves its model's DEFAULT context unless genuinely
   impossible on the platform (operator 2026-08-29): GLM-5.2 202752,
   DSV4-Flash 1M, Qwen3.8-Flash-Next 262144 - as configured in the GGUF
@@ -228,11 +224,33 @@ behavior:
   enable_cross_layers_blocks). Tier RESTORES on A100 are proven only
   where the instrumented acceptance shows them: GLM-5.2 (2026-08-31,
   restores + SHA verify clean); DSV4 stays write-only by design until
-  window-tail staging exists for its sliding-window groups; glm53-nvfp4-4
-  carries no tier until the packed planner handles KDA+MLA mixed block
-  sizes. Recall probes alone do not prove the tier (full re-prefill
+  window-tail staging exists for its sliding-window groups; the glm53f
+  records (GLM-5.3-Flash, TP4 and TP8) carry the host tier AND the NVMe third tier
+  since 2026-09-04 - the packed slab over KDA state + MLA + indexer
+  groups with per-group block ratios in the connector, proven by the
+  eviction-restore acceptance with VLLM_KV_TIER_VERIFY=1 (host restores
+  and disk promotions both 0/58 mismatched). Recall probes alone do not
+  prove the tier (full re-prefill
   answers them too): the standing check is
   benchmarks/benchmark_kv_tier_eviction.py with VLLM_KV_TIER_VERIFY=1,
   read alongside the connector's hit/restore counters. MI300X still
   needs the connector generalized to its layout (issues #17/#18); enable
   there only with on-box validation.
+  A THIRD tier (NVMe, `nvme_tier_gb_per_rank`) sits under the host tier
+  on qwen38fn-fp8-8/rtx3090 (2026-09-02): confirmed host blocks are
+  written through to a per-rank O_TMPFILE, a fully-written trajectory is
+  demoted (host slots released, disk kept) instead of deleted under host
+  pressure, and a hit on a disk-only trajectory is promoted disk -> host
+  -> GPU behind the request's async-KV-load wait. The tier directory is
+  operator environment (SLIMSERVE_KV_TIER_DIR), never a profile field.
+  The eviction-restore acceptance with a deliberately tiny host tier
+  (so restores must come from disk) is the standing check for it.
+  HOST-RESIDENT MAIN KV (docs/host_resident_kv_design.md, 2026-09-06):
+  for Qwen Sparse Attention models the main QSA KV of ACTIVE requests can
+  live in pinned host rows and be gathered over PCIe (the gather reads
+  only the indexer's top-2048 rows per query), with a small GPU window
+  for the blocks being written. Opt-in per profile through
+  kv_connector_extra_config main_kv_host_resident / main_kv_gpu_rows /
+  main_kv_sub_blocks; it is what lets qwen38fn-nvfp4-4 serve the native
+  262,144 context on 4x 24 GB cards. Standing checks: deep marker recall
+  past the window, the exact bench, and zero invalid-block reports.

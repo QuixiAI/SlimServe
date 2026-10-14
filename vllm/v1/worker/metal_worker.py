@@ -122,14 +122,40 @@ class MetalWorker(Worker):
                 gc.enable()
         gc.freeze()
         if not load_dummy_weights:
-            self._make_weights_resident()
+            # Keep early pages resident while the sweep touches later ones.
+            # Sweeping pageable weights first can repeatedly decompress and
+            # recompress the same model before residency is requested.
             self._pin_weights_resident()
+            self._make_weights_resident()
             if os.environ.get("VLLM_QC_STEP_TAPE", "0") != "0":
                 from vllm.models.deepseek_v4.metal_tape import (
                     maybe_install_tape,
                 )
 
                 maybe_install_tape(self.model_runner.model)
+            if os.environ.get("VLLM_METAL_FINITE_PROBE", "0") == "1":
+                # Diagnostic only: serialize each module and stop at the first
+                # nonfinite output instead of generating a stream of token 0.
+                from torch.utils._pytree import tree_flatten
+
+                def check_output(name):
+                    def check(module, inputs, output):
+                        for tensor in tree_flatten(output)[0]:
+                            if (
+                                isinstance(tensor, torch.Tensor)
+                                and tensor.is_floating_point()
+                                and not torch.isfinite(tensor).all().item()
+                            ):
+                                raise RuntimeError(
+                                    f"Metal finite probe: {name} "
+                                    f"({type(module).__name__}) output "
+                                    f"{tuple(tensor.shape)} {tensor.dtype} is nonfinite"
+                                )
+
+                    return check
+
+                for name, module in self.model_runner.model.named_modules():
+                    module.register_forward_hook(check_output(name))
 
     @staticmethod
     def _compressor_bytes() -> int:
@@ -253,9 +279,11 @@ class MetalWorker(Worker):
         # enough for every dispatch path. Each sum also materializes a
         # same-size transient copy; the periodic synchronize keeps those from
         # accumulating in one command stream.
-        chunk_elems = 128 << 20
-        sync_window = 2 << 30
-        unsynced_bytes = 0
+        # Integer reductions otherwise promote to int64, materializing up
+        # to eight times the input bytes. Bound each launch and synchronize
+        # inside the tensor loop: one expert tensor can itself exceed the
+        # old 2 GiB window and queue many GiB of temporaries before a fence.
+        chunk_elems = 16 << 20
         for t in self._weight_tensors():
             nbytes = t.numel() * t.element_size()
             total_bytes += nbytes
@@ -265,13 +293,11 @@ class MetalWorker(Worker):
                 flat = None
             if flat is None:
                 t.detach().sum()
+                torch.mps.synchronize()
             else:
                 for off in range(0, flat.numel(), chunk_elems):
-                    flat[off : off + chunk_elems].sum()
-            unsynced_bytes += nbytes
-            if unsynced_bytes >= sync_window:
-                torch.mps.synchronize()
-                unsynced_bytes = 0
+                    flat[off : off + chunk_elems].sum(dtype=torch.int32)
+                    torch.mps.synchronize()
         torch.mps.synchronize()
         logger.info(
             "Resident sweep touched %.2f GiB of MPS weights in %.2f s",

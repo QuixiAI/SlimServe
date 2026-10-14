@@ -63,6 +63,9 @@ METAL_FUNC void rejection_row_stats(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     const float global_max = scratch_value[0];
+    // Every SIMD group must read the reduced maximum before thread zero
+    // reuses scratch_value[0] for its sum (sparse rows can finish early).
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     float local_sum = 0.0f;
     if (global_max > -INFINITY) {
         for (int v = lo; v < hi; ++v) {

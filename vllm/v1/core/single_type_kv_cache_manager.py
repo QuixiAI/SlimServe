@@ -6,6 +6,7 @@ from collections import defaultdict
 from collections.abc import Sequence
 from typing import ClassVar
 
+from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
@@ -33,6 +34,9 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
+
+
+logger = init_logger(__name__)
 
 
 class SingleTypeKVCacheManager(ABC):
@@ -313,9 +317,29 @@ class SingleTypeKVCacheManager(ABC):
             return
 
         req_blocks = self.req_to_blocks[request_id]
-        allocated_blocks = self.block_pool.get_new_blocks(
-            cdiv(num_total_computed_tokens, self.block_size) - len(req_blocks)
+        num_new_blocks = cdiv(num_total_computed_tokens, self.block_size) - len(
+            req_blocks
         )
+        if num_new_blocks < 0:
+            # The local cache hit already covers more blocks than the
+            # external tokens extend to. Asking the pool for a negative
+            # count used to reach popleft_n(-k), which silently added k to
+            # the free-list count and, after ~35 minutes of tier restores,
+            # popped blocks that were still referenced (2026-09-10/11 legs).
+            logger.warning_once(
+                "%s (group %d, block %d): local hit holds %d blocks but "
+                "local %d + external %d computed tokens need %d; keeping the "
+                "extra blocks, allocating none",
+                type(self).__name__,
+                self.kv_cache_group_id,
+                self.block_size,
+                len(req_blocks),
+                num_local_computed_tokens,
+                num_external_computed_tokens,
+                cdiv(num_total_computed_tokens, self.block_size),
+            )
+            num_new_blocks = 0
+        allocated_blocks = self.block_pool.get_new_blocks(num_new_blocks)
         req_blocks.extend(allocated_blocks)
         if self._record_new_block_ids:
             self.new_block_ids.extend(b.block_id for b in allocated_blocks)

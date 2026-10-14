@@ -17,10 +17,10 @@ hidden. Prefer utility functions defined elsewhere and call them from here,
 instead of embedding feature-specific logic directly.
 """
 
-import functools
 import gc
 import os
 import time
+from collections import deque
 from copy import deepcopy
 from typing import Any, NamedTuple
 
@@ -44,6 +44,7 @@ from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
 )
 from vllm.model_executor.model_loader import get_model_loader
+from vllm.model_executor.offloader import create_offloader, set_offloader
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.encoder_budget import (
     MultiModalBudget,
@@ -176,6 +177,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         self.output_copy_stream = make_output_copy_stream(self.device)
 
+        # post_update row-guard reporting (GLM-5.2/MI300X root cause,
+        # 2026-09-01): the kernel validates every sampled row before writing
+        # and records the first violation in this int64[40] device buffer. Each
+        # step enqueues an async D2H of it behind the kernel; completed copies
+        # are checked on later steps without ever blocking the host, so the
+        # check cannot perturb the very timing that exposes the corruption.
+        self._pu_guard_enabled = self.device.type != "mps"
+        self._pu_diag: torch.Tensor | None = (
+            torch.zeros(40, dtype=torch.int64, device=self.device)
+            if self._pu_guard_enabled
+            else None
+        )
+        self._pu_pending: deque[tuple[torch.Tensor, torch.cuda.Event, int, int]] = (
+            deque()
+        )
+        self._pu_step = 0
+
         # Pipeline parallelism.
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.is_first_pp_rank = get_pp_group().is_first_rank
@@ -194,11 +212,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Data parallelism.
         self.dp_size = self.parallel_config.data_parallel_size
         self.dp_rank = self.parallel_config.data_parallel_rank
+        # Replicated-MoE DP has no per-step cross-replica collective, so the
+        # batch descriptor is dispatched locally (as with dp_size 1).
+        self.dp_sync_size = (
+            1 if self.parallel_config.data_parallel_replicate_moe else self.dp_size
+        )
 
         # Detect EP all2all peer faults to prevent emitting corrupted output.
         # Only meaningful for MoE + DP with an FT-capable all2all backend.
         self.check_ep_fault = False
-        if self.dp_size > 1 and self.model_config.is_moe:
+        if (
+            self.dp_size > 1
+            and self.model_config.is_moe
+            and not self.parallel_config.data_parallel_replicate_moe
+        ):
             self.check_ep_fault = get_ep_all2all_manager().support_fault_tolerance
 
         # Decode context parallelism.
@@ -309,6 +336,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         time_before_load = time.perf_counter()
         if load_dummy_weights:
             self.load_config.load_format = "dummy"
+        # Construct layers with the configured CPU weight offloader active.
+        # V1 does this in its runner initializer; without it, V2 allocates
+        # every FP8 expert on GPU before loading and OOMs on a single 5090.
+        set_offloader(create_offloader(self.vllm_config.offload_config))
         self.eplb.prepare_load()
         eplb_models_added = False
         with DeviceMemoryProfiler() as m:
@@ -456,9 +487,46 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.vllm_config.model_config = self.model_config
         self.vllm_config.load_config = self.load_config
 
-    @functools.cached_property
+    def _stream_debug(self, tag: str) -> None:
+        """VLLM_QC_STREAM_DEBUG=1: log which stream the worker thread is on
+        at the step's key points (first calls only), alongside vLLM's
+        dedicated stream and the default stream."""
+        if os.environ.get("VLLM_QC_STREAM_DEBUG") != "1":
+            return
+        counts = self.__dict__.setdefault("_stream_debug_counts", {})
+        n = counts.get(tag, 0)
+        if n >= 10:
+            return
+        counts[tag] = n + 1
+        from vllm.utils.torch_utils import current_stream as vllm_current_stream
+
+        def sid(s) -> int:
+            v = getattr(s, "cuda_stream", None)
+            return int(v) if v is not None else int(getattr(s, "stream_id", -1))
+
+        cur = torch.cuda.current_stream(self.device)
+        logger.info(
+            "[STREAM DEBUG] %s #%d: torch current=0x%x vllm_helper=0x%x "
+            "default=0x%x copy=0x%x thread=%s",
+            tag,
+            n,
+            sid(cur),
+            sid(vllm_current_stream()),
+            sid(torch.cuda.default_stream(self.device)),
+            sid(self.output_copy_stream),
+            __import__("threading").current_thread().name,
+        )
+
+    @property
     def main_stream(self) -> torch.Stream:
-        # Cache the default accelerator stream to avoid lookup overhead.
+        # Queried live, never cached. A cached_property here captured the
+        # DEFAULT stream when first touched before vLLM installed its
+        # dedicated per-process stream; the AsyncOutput stream context then
+        # restored that stale value after every output copy and parked the
+        # main thread on the null stream - a second hardware queue with no
+        # ordering against the sampler and the forward. Root cause of the
+        # GLM-5.2/MI300X KV garbling and page faults (2026-09-01); see
+        # async_utils.stream(). Two lookups per step cost nothing.
         return torch.accelerator.current_stream(self.device)
 
     def get_kv_cache_spec(self):
@@ -580,6 +648,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.vllm_config,
         )
         self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
+        # Host-resident main KV (docs/host_resident_kv_design.md): size the
+        # per-step tables and mirror the main-KV group's block ids on the CPU.
+        from vllm.v1.worker.gpu.kv_residency import get_main_kv_residency
+
+        self.main_kv_residency = get_main_kv_residency()
+        if self.main_kv_residency is not None:
+            res = self.main_kv_residency
+            table = self.block_tables.input_block_tables[res.group_id]
+            res.bind(
+                res.group_id,
+                res.block_size,
+                table.shape[0],
+                table.shape[1],
+                self.block_tables.slot_mappings.shape[1],
+            )
+            self.block_tables.enable_cpu_mirror(res.group_id)
 
     def _init_kv_zero_meta(self) -> None:
         """Build KV-block zeroing metadata; invoked from gpu_worker."""
@@ -1179,6 +1263,62 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         return block_tables, slot_mappings
 
+    def _prepare_main_kv_residency(
+        self,
+        input_batch: InputBatch,
+        block_tables: tuple[torch.Tensor, ...],
+        slot_mappings: torch.Tensor,
+        dummy: bool,
+    ) -> None:
+        """Feed the host-resident main-KV residency this step's writes.
+
+        Blocks written this step are the ones covering each scheduled
+        request's [num_computed, num_computed + scheduled) positions; every
+        request's tail block is protected from demotion (a partially filled
+        block keeps its row until it is full)."""
+        res = getattr(self, "main_kv_residency", None)
+        if res is None:
+            return
+        gid = res.group_id
+        if dummy:
+            res.prepare_step(block_tables[gid], slot_mappings[gid], [], [], dummy=True)
+            return
+        sub_tokens = res.block_size  # residency row = kernel page
+        sub = res.sub_blocks
+        mirror = self.block_tables.mirror_np
+        counts = self.block_tables.num_blocks.np[gid]
+        written: list[int] = []
+        tails: list[int] = []
+
+        def row_id(req_row, g):  # global kernel page g -> residency row id
+            b = int(req_row[g // sub])
+            return -1 if b < 0 else b * sub + g % sub
+
+        for r in range(input_batch.num_reqs):
+            req_index = int(input_batch.idx_mapping_np[r])
+            n = int(input_batch.num_scheduled_tokens[r])
+            nb = int(counts[req_index])
+            if nb <= 0:
+                continue
+            req_row = mirror[req_index]
+            # Batch-ordered (gathered by idx_mapping), unlike the mirror/counts.
+            start = int(input_batch.num_computed_tokens_np[r])
+            max_g = nb * sub - 1
+            # Protect the row holding the last computed token and the next.
+            for pos in (max(start - 1, 0), start):
+                g = pos // sub_tokens
+                if g <= max_g and (rid := row_id(req_row, g)) >= 0:
+                    tails.append(rid)
+            if n <= 0:
+                continue
+            for g in range(
+                start // sub_tokens, min((start + n - 1) // sub_tokens, max_g) + 1
+            ):
+                rid = row_id(req_row, g)
+                if rid >= 0:
+                    written.append(rid)
+        res.prepare_step(block_tables[gid], slot_mappings[gid], written, tails)
+
     def prepare_dummy_attn(
         self, input_batch: InputBatch
     ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
@@ -1315,7 +1455,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # token that disagrees).
             self.thinking_budget_state.apply_mask(logits, input_batch)
 
-        if input_batch.num_draft_tokens == 0 or self.rejection_sampler is None:
+        # Metal's verifier uses a position-keyed inverse CDF, while the plain
+        # sampler uses Gumbel noise. Keep zero-draft rows on the verifier too:
+        # otherwise an unrelated request's drafts change their seeded draw.
+        if self.rejection_sampler is None or (
+            input_batch.num_draft_tokens == 0 and logits.device.type != "mps"
+        ):
             assert self.sampler is not None
             sampler_output = self.sampler(logits, input_batch)
         else:
@@ -1357,6 +1502,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             output_bin_counts = self.sampler.penalties_state.output_bin_counts
         else:
             output_bin_counts = None
+        self._check_post_update_guard()
+        self._stream_debug("post_update.before")
         post_update(
             idx_mapping,
             self.req_states.num_computed_tokens.gpu,
@@ -1368,10 +1515,60 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             query_start_loc,
             self.req_states.all_token_ids.gpu,
             self.req_states.total_len.gpu,
+            diag=self._pu_diag,
         )
+        self._pu_last: tuple[torch.Tensor, torch.cuda.Event] | None = None
+        if self._pu_guard_enabled and self._pu_diag is not None:
+            host = torch.empty(40, dtype=torch.int64, pin_memory=True)
+            host.copy_(self._pu_diag, non_blocking=True)
+            event = torch.cuda.Event()
+            event.record()
+            self._pu_pending.append(
+                (host, event, self._pu_step, int(idx_mapping.shape[0]))
+            )
+            self._pu_last = (host, event)
+        self._pu_step += 1
 
         self.model_state.postprocess_state(
             idx_mapping, num_sampled, self.req_states.num_computed_tokens.gpu
+        )
+
+    def _check_post_update_guard(self) -> None:
+        """Consume completed guard copies; fail loudly on the first violation.
+
+        Only copies whose event has completed are read (event.query()), so this
+        never blocks the host on the GPU.
+        """
+        while self._pu_pending and self._pu_pending[0][1].query():
+            host, _, step, num_reqs = self._pu_pending.popleft()
+            if int(host[0]) == 0:
+                continue
+            self._post_update_guard_failure(host, num_reqs, step)
+
+    def _post_update_guard_failure(
+        self, host: torch.Tensor, num_reqs: int, step: int = -1
+    ) -> None:
+        reasons = {
+            1: "num_sampled outside [0, sampled_cols]",
+            2: "total_len + num_sampled outside the all_token_ids row",
+            3: "sampled token id outside [0, vocab_size)",
+        }
+        v = host.tolist()
+        raw = [w & 0xFFFFFFFF for x in v[8:40] for w in (x, x >> 32)]
+        logger.error(
+            "post_update row guard: raw int32 words at the sampled_tokens row: %s",
+            raw,
+        )
+        raise RuntimeError(
+            f"post_update row guard tripped: {reasons.get(v[1], '?')} (reason "
+            f"{v[1]}) at step {step} (num_reqs={num_reqs}): count={v[0]} "
+            f"batch_row={v[2]} req_state_idx={v[3]} num_sampled={v[4]} "
+            f"total_len={v[5]} sampled_tokens[row][0]={v[6]} "
+            f"(0x{v[6] & ((1 << 64) - 1):x}) num_rejected={v[7]}. The "
+            "sampler's per-step num_sampled/sampled_tokens buffers held "
+            "foreign data when the post-update kernel ran; serving stops here "
+            "instead of scribbling the GPU pool (see "
+            "perf/optimization_status.md 2026-09-01)."
         )
 
     @torch.inference_mode()
@@ -1384,6 +1581,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        self._stream_debug("execute_model.entry")
         if not dummy_run:
             # Update the request states.
             self.update_pp_decode_requests()
@@ -1439,7 +1637,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_reqs,
             num_toks,
             uniform_tok_count,
-            self.dp_size,
+            self.dp_sync_size,
             self.dp_rank,
             need_eager=is_profile or skip_compiled,
             num_active_loras=num_active_loras,
@@ -1455,6 +1653,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Prepare all the inputs and copy to the input buffers.
             input_batch = self.prepare_inputs(scheduler_output, batch_desc)
             block_tables, slot_mappings = self.prepare_attn(input_batch)
+            self._prepare_main_kv_residency(
+                input_batch, block_tables, slot_mappings, False
+            )
             # Mamba "align" pre-copy: migrate recurrent state across block
             # boundaries before the forward. Runs only on real batches, and
             # before model_state.prepare_attn gathers num_accepted_tokens so the
@@ -1483,6 +1684,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             if not skip_attn_for_dummy_run:
                 block_tables, slot_mappings = self.prepare_dummy_attn(input_batch)
+                self._prepare_main_kv_residency(
+                    input_batch, block_tables, slot_mappings, True
+                )
             else:
                 assert batch_desc.cg_mode != CUDAGraphMode.FULL, (
                     "Attention metadata must be prepared for dummy runs when using "
@@ -1607,8 +1811,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         )
                 else:
                     # Eager (NONE): call the raw model directly.
+                    self._stream_debug("forward.before")
                     with _qc_phase("target_forward"):
                         model_output = self.model(**model_inputs)
+        self._stream_debug("forward.after")
 
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:
@@ -1647,6 +1853,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def sample_tokens(
         self, grammar_output: GrammarOutput | None
     ) -> AsyncOutput | ModelRunnerOutput | None:
+        self._stream_debug("sample_tokens.entry")
         if self.execute_model_state is None:
             # The prior execute_model call must have failed.
             return None
@@ -1866,6 +2073,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         raw_id & 0xFFFFFFFFFFFFFFFF,
                     )
 
+        # Hand the post_update guard record to the output: get_output() waits
+        # for the sampler copies anyway, so it can report a corrupted sampler
+        # row before the scheduler consumes the tokens.
+        async_output.post_update_guard = getattr(self, "_pu_last", None)
+        async_output.post_update_guard_check = self._post_update_guard_failure
         return async_output
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:

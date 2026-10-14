@@ -1,5 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# DEPRECATED (operator directive, 2026-09-10): the V1 GPU model runner is
+# frozen. SlimServe serves every profile on the V2 runner
+# (vllm/v1/worker/gpu/model_runner.py); any model, speculator or feature
+# that V2 lacks gets ADDED to V2 rather than run here. Do not extend this
+# file, do not qualify new records on it, and treat any boot that reaches
+# it (see the warning in gpu_worker.py) as a configuration bug.
 
 import functools
 import gc
@@ -204,6 +211,7 @@ from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
 from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
+from vllm.v1.spec_decode.glm5_next import Glm5NextMTPProposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.ngram_proposer_gpu import (
@@ -671,6 +679,8 @@ class GPUModelRunner(
                 self.drafter = Step3p5MTPProposer(self.vllm_config, self.device, self)
             elif self.speculative_config.use_qwen4_exp_mtp():
                 self.drafter = Qwen4ExpMTPProposer(self.vllm_config, self.device, self)
+            elif self.speculative_config.use_glm5_next_mtp():
+                self.drafter = Glm5NextMTPProposer(self.vllm_config, self.device, self)
             elif self.speculative_config.use_dflash():
                 self.drafter = DFlashProposer(self.vllm_config, self.device, self)
                 self.use_aux_hidden_state_outputs = True
@@ -2655,7 +2665,7 @@ class GPUModelRunner(
                     spec_decode_common_attn_metadata = cm
             # Capture per-group block tables for multi-group proposers.
             if self.speculative_config and isinstance(
-                self.drafter, Qwen4ExpMTPProposer
+                self.drafter, (Qwen4ExpMTPProposer, Glm5NextMTPProposer)
             ):
                 self.drafter.set_per_group_block_table(
                     kv_cache_gid, cm.block_table_tensor
@@ -4145,6 +4155,24 @@ class GPUModelRunner(
             num_reqs=num_reqs,
             force_uniform_decode=force_uniform_decode,
         )
+        # A uniform token count is not sufficient for hybrid decode. GDN/KDA
+        # treats a one-token prompt (including a chunked-prefill tail) as
+        # prefill and does not update its captured decode state-index buffer.
+        # Replaying FULL in that case writes the previous request's state
+        # slots, which may now belong to another request's attention cache.
+        # Match the metadata builder's CPU phase test; ordinary decode keeps
+        # full graphs, and explicit dummy/capture overrides remain authoritative.
+        hybrid_prefill = (
+            force_uniform_decode is None
+            and uniform_decode
+            and self.model_config.is_hybrid
+            and bool(np.any(
+                self.input_batch.num_computed_tokens_cpu[:num_reqs]
+                < self.input_batch.num_prompt_tokens[:num_reqs]
+            ))
+        )
+        if hybrid_prefill:
+            uniform_decode = False
         # Encoder-decoder models only support CG for decoder_step > 0 (no enc_output
         # is present). Also, chunked-prefill is disabled, so batch are uniform.
         has_encoder_output = (
@@ -4168,7 +4196,8 @@ class GPUModelRunner(
                 uniform_decode=uniform_decode,
                 num_active_loras=num_active_loras,
                 valid_modes={CUDAGraphMode.NONE} if force_eager else valid_modes,
-                invalid_modes={CUDAGraphMode.FULL} if disable_full else None,
+                invalid_modes={CUDAGraphMode.FULL}
+                if disable_full or hybrid_prefill else None,
             )
 
         cudagraph_mode, batch_descriptor = dispatch_cudagraph(
@@ -7731,14 +7760,30 @@ class GPUModelRunner(
                     has_mamba = True
                     raw_tensor = kv_cache_raw_tensors[layer_name]
                     page_size_bytes = kv_cache_spec.page_size_bytes
-                    # Hold a single contiguous [num_blocks, 1, 1, page_size_bytes]
-                    # int8 page view per layer; the layer's bind_kv_cache unpacks
+                    # Hold a single [num_blocks, 1, 1, page_size_bytes] int8
+                    # page view per layer; the layer's bind_kv_cache unpacks
                     # each block's bytes into its conv/ssm state views. Keeping
                     # one tensor per layer lets the KV connector register it
                     # without special-casing Mamba.
-                    kv_caches[layer_name] = raw_tensor[
-                        : num_blocks * page_size_bytes
-                    ].view(num_blocks, 1, 1, page_size_bytes)
+                    if packing is not None:
+                        # Packed cross-layer slab (host KV tier): block b's
+                        # page for this layer is row b of the slab at the
+                        # layer's byte offset, exactly as the attention views
+                        # and the tier's row DMA address it. A contiguous
+                        # first-bytes view would alias the other layers'
+                        # rows (GLM-5.3 KDA + MLA, 2026-09-03).
+                        offset, blk_stride = packing
+                        kv_caches[layer_name] = (
+                            raw_tensor.view(-1, blk_stride)[
+                                :, offset : offset + page_size_bytes
+                            ]
+                            .unsqueeze(1)
+                            .unsqueeze(1)
+                        )
+                    else:
+                        kv_caches[layer_name] = raw_tensor[
+                            : num_blocks * page_size_bytes
+                        ].view(num_blocks, 1, 1, page_size_bytes)
                 else:
                     raise NotImplementedError
 

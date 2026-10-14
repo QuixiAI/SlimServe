@@ -30,6 +30,13 @@ from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 logger = init_logger(__name__)
 
 
+def _min_pool_blocks(kv_cache_config) -> int:
+    """Smallest block pool (multi-pool packed slab); dummy block ids must be
+    valid in every group's pool."""
+    pools = getattr(kv_cache_config, "pool_num_blocks", None)
+    return min(pools) if pools else kv_cache_config.num_blocks
+
+
 def run_mixed_prefill_decode_warmup(
     model_runner: GPUModelRunner,
     worker_execute_model: Callable[[SchedulerOutput], Any],
@@ -69,11 +76,11 @@ def run_mixed_prefill_decode_warmup(
         cdiv(prefill_len, block_size) for block_size in group_block_sizes
     ]
     required_blocks = sum(decode_block_counts) + sum(prefill_block_counts)
-    if model_runner.kv_cache_config.num_blocks <= required_blocks:
+    if _min_pool_blocks(model_runner.kv_cache_config) <= required_blocks:
         logger.warning(
             "Skipping V2 mixed prefill+decode warmup because only %d KV blocks "
             "are available for %d required warmup blocks.",
-            model_runner.kv_cache_config.num_blocks,
+            _min_pool_blocks(model_runner.kv_cache_config),
             required_blocks,
         )
         return False
@@ -228,7 +235,7 @@ def warmup_kernels(
         model_runner.scheduler_config.max_num_batched_tokens
         // max(prompt_len, decode_query_len),
         # Reserve block 0 (null block) and ensure we have enough blocks.
-        max(1, (model_runner.kv_cache_config.num_blocks - 1) // max_blocks_per_req),
+        max(1, (_min_pool_blocks(model_runner.kv_cache_config) - 1) // max_blocks_per_req),
     )
 
     req_ids = [f"_warmup_{i}_" for i in range(num_reqs)]

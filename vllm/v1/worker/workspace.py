@@ -3,6 +3,7 @@
 
 import inspect
 import os
+import os as _os_ws
 from collections.abc import Callable
 from itertools import accumulate
 from math import prod
@@ -154,6 +155,8 @@ class WorkspaceManager:
                     f"{required_bytes / _MB:.2f} MB, current size is "
                     f"{current_size / _MB:.2f} MB"
                 )
+            if _WS_GRAVEYARD and workspace is not None:
+                _ws_graveyard.append(workspace)
             workspaces[ubatch_id] = torch.empty(
                 (required_bytes,), dtype=torch.uint8, device=self._device
             )
@@ -219,14 +222,24 @@ class WorkspaceManager:
             # ubatches resize lazily on their next get_simultaneous call.
             # Resizing all ubatches here would orphan the other ubatch's
             # old tensor when it still holds views into it (DBO leak).
-            self._current_workspaces[ubatch_id] = None
-            del current_workspace
-            # Release the freed segment back to CUDA so the caching
-            # allocator can reuse the GPU memory for the larger
-            # allocation below. Without this, each resize may leave a
-            # dead segment in reserved memory which can cause higher peak
-            # memory usage.
-            torch.accelerator.empty_cache()
+            if _WS_GRAVEYARD:
+                # Diagnostic (VLLM_QC_WS_GRAVEYARD=1): never free an
+                # outgrown workspace - park it forever. Removes any
+                # use-after-free window at the cost of leaked VRAM; if
+                # corruption stops under this mode, a consumer still
+                # references freed workspace memory when it is reused.
+                _ws_graveyard.append(current_workspace)
+                self._current_workspaces[ubatch_id] = None
+                del current_workspace
+            else:
+                self._current_workspaces[ubatch_id] = None
+                del current_workspace
+                # Release the freed segment back to CUDA so the caching
+                # allocator can reuse the GPU memory for the larger
+                # allocation below. Without this, each resize may leave a
+                # dead segment in reserved memory which can cause higher
+                # peak memory usage.
+                torch.accelerator.empty_cache()
             self._current_workspaces[ubatch_id] = torch.empty(
                 (required_bytes,), dtype=torch.uint8, device=self._device
             )
@@ -243,6 +256,10 @@ class WorkspaceManager:
                 )
 
         return current_workspace
+
+
+_WS_GRAVEYARD = _os_ws.environ.get("VLLM_QC_WS_GRAVEYARD", "0") == "1"
+_ws_graveyard: list = []
 
 
 def current_workspace_manager() -> "WorkspaceManager":

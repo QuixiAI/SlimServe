@@ -190,16 +190,44 @@ def _expand_qsa_indices_kernel(
 
 
 @triton.jit
+def _e4m3_to_bf16(bits):
+    """Decode float8_e4m3fn bytes arithmetically (SM86 has no fp8 cvt).
+
+    value = (-1)^s * 2^(e-7) * (1 + m/8) for e > 0, subnormal m * 2^-9 for
+    e == 0, NaN for 0x7f/0xff. exp2 keeps this a handful of ALU ops.
+    """
+    b = bits.to(tl.int32, bitcast=False)
+    sign = (b >> 7) & 1
+    exp = (b >> 3) & 0xF
+    man = b & 0x7
+    normal = (8 + man).to(tl.float32) * tl.math.exp2((exp - 10).to(tl.float32))
+    subnormal = man.to(tl.float32) * 0.001953125  # 2**-9
+    value = tl.where(exp > 0, normal, subnormal)
+    value = tl.where(sign == 1, -value, value)
+    nan = (b & 0x7F) == 0x7F
+    value = tl.where(nan, float("nan"), value)
+    return value.to(tl.bfloat16)
+
+
+# Null-page marker in a pointer-table (page offset) table: offsets are
+# element counts relative to the slab pointer and may be negative, so a
+# far-out value stands in for "no page" instead of a sign check.
+PTR_SENTINEL = -(1 << 62)
+
+
+@triton.jit
 def _qsa_sparse_paged_gqa_splitk_kernel(
     q_ptr,
     k_cache_ptr,
     v_cache_ptr,
     indices_ptr,
     block_table_ptr,
+    block_base_ptr,
     token_to_req_ptr,
     partial_output_ptr,
     partial_lse_ptr,
     output_ptr,
+    v_page_offset,
     stride_q_row,
     stride_q_head,
     stride_k_block,
@@ -225,10 +253,13 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     NUM_TILES: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    KV_FP8: tl.constexpr = False,
     KV_TQ: tl.constexpr = False,
     TQ_KPS: tl.constexpr = 0,
     TQ_VAL_BYTES: tl.constexpr = 0,
     TQ_E4B15: tl.constexpr = True,
+    PTR_TABLE: tl.constexpr = False,
+    PTR_SENTINEL: tl.constexpr = -(1 << 62),
 ) -> None:
     row = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -273,14 +304,28 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
             & (logical_token >= 0)
             & (logical_page < PAGE_TABLE_WIDTH)
         )
-        physical_page = tl.load(
-            block_table_ptr
-            + safe_request * stride_table_req
-            + tl.minimum(logical_page, PAGE_TABLE_WIDTH - 1),
-            mask=valid,
-            other=-1,
-        )
-        valid &= (physical_page >= 0) & (physical_page < num_cache_blocks)
+        if PTR_TABLE:
+            # The offset table is indexed like the block table but at the
+            # kernel page (sub-row) granularity; a null page is the sentinel.
+            page_delta = tl.load(
+                block_base_ptr
+                + safe_request * stride_table_req
+                + tl.minimum(logical_page, PAGE_TABLE_WIDTH - 1),
+                mask=valid,
+                other=PTR_SENTINEL,
+            ).to(tl.int64)
+            valid &= page_delta != PTR_SENTINEL
+            page_delta = tl.multiple_of(page_delta, 16)
+            physical_page = tl.zeros_like(logical_page)
+        else:
+            physical_page = tl.load(
+                block_table_ptr
+                + safe_request * stride_table_req
+                + tl.minimum(logical_page, PAGE_TABLE_WIDTH - 1),
+                mask=valid,
+                other=-1,
+            )
+            valid &= (physical_page >= 0) & (physical_page < num_cache_blocks)
         # physical_page * block stride can overflow int32 for large caches.
         safe_page = tl.maximum(physical_page, 0).to(tl.int64)
         if KV_TQ:
@@ -341,6 +386,36 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
             values = (
                 v_zero[:, None] + v_scale[:, None] * nib.to(tl.float32)
             ).to(tl.bfloat16)
+        elif PTR_TABLE:
+            # Host-resident main KV: every page carries its own location (a
+            # GPU row of the hot window or a pinned-host row readable over
+            # PCIe through UVA) as an element offset from the slab pointer
+            # (int64, negative allowed), loaded above with the same single
+            # dependent table load the base path spends on the block table
+            # (a second dependent load or an int-to-pointer cast measured
+            # 1.35-1.6x slower; the alignment hint keeps vectorized loads).
+            keys = tl.load(
+                k_cache_ptr
+                + page_delta[None, :]
+                + page_offset[None, :] * stride_k_token
+                + kv_head * stride_k_head
+                + dim_offsets[:, None],
+                mask=valid[None, :],
+                other=0.0,
+            )
+            values = tl.load(
+                k_cache_ptr
+                + page_delta[:, None]
+                + v_page_offset
+                + page_offset[:, None] * stride_v_token
+                + kv_head * stride_v_head
+                + dim_offsets[None, :],
+                mask=valid[:, None],
+                other=0.0,
+            )
+            if KV_FP8:
+                keys = _e4m3_to_bf16(keys)
+                values = _e4m3_to_bf16(values)
         else:
             keys = tl.load(
                 k_cache_ptr
@@ -360,6 +435,12 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
                 mask=valid[:, None],
                 other=0.0,
             )
+            if KV_FP8:
+                # The caches arrive as uint8 views of float8_e4m3fn (unit
+                # scale); decode arithmetically since SM86 lacks the fp8 cvt
+                # instruction.
+                keys = _e4m3_to_bf16(keys)
+                values = _e4m3_to_bf16(values)
         scores = tl.dot(query, keys)
         # Scaling scores avoids re-quantizing a scaled query to BF16.
         scores *= softmax_scale_log2
@@ -872,6 +953,27 @@ def qsa_select_paged_tokens(
     return out
 
 
+def page_offsets_from_table(
+    block_table: torch.Tensor,
+    page_base: torch.Tensor,
+    k_cache: torch.Tensor,
+) -> torch.Tensor:
+    """Per-request page offset table for ``qsa_sparse_paged_attention``.
+
+    ``page_base`` is int64 [num_physical_pages] of absolute byte addresses
+    (GPU hot-window rows or pinned-host arena rows); ``k_cache`` supplies the
+    slab pointer and element size. Null block-table entries (< 0) become
+    ``PTR_SENTINEL``. Built once per step and shared by every QSA layer.
+    """
+    elem = k_cache.element_size()
+    delta = page_base - k_cache.data_ptr()
+    if elem != 1:
+        delta = delta // elem
+    safe = block_table.clamp_min(0).to(torch.int64)
+    offsets = delta[safe]
+    return torch.where(block_table >= 0, offsets, torch.full_like(offsets, PTR_SENTINEL))
+
+
 def qsa_sparse_paged_attention(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -881,8 +983,18 @@ def qsa_sparse_paged_attention(
     token_to_req: torch.Tensor,
     out: torch.Tensor | None = None,
     tq_slot_size: int | None = None,
+    page_offsets: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run sparse GQA directly over paged BF16, FP8, or TQ-k8v4 K/V caches.
+
+    With ``page_offsets`` (int64 [num_requests, pages]: each logical KERNEL
+    page's - ``k_cache.shape[1]`` tokens - offset from ``k_cache``'s slab
+    pointer in cache elements, or ``PTR_SENTINEL`` for a null page; see
+    ``page_offsets_from_table``), the
+    kernel reads each page at that location instead of indexing the slab:
+    pages may live in a GPU hot window or in a cudaHostRegister-ed (MAPPED)
+    host arena. ``k_cache``/``v_cache`` then only supply dtype, strides and
+    the V offset; the table is built once per step, not per layer.
 
     With ``tq_slot_size``, ``k_cache``/``v_cache`` are the same uint8
     TurboQuant slab shaped [blocks, block_size, kv_heads, slot] as written
@@ -913,9 +1025,16 @@ def qsa_sparse_paged_attention(
     elif q.shape[2] != k_cache.shape[3] or q.shape[1] % k_cache.shape[2]:
         raise ValueError("QSA sparse attention requires valid grouped-query heads")
     assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
+    kv_fp8 = not kv_tq and k_cache.dtype == torch.float8_e4m3fn
+    ptr_table = page_offsets is not None
+    if ptr_table:
+        assert not kv_tq, "pointer-table pages are not supported with TQ slabs"
+        assert page_offsets.dtype == torch.int64 and page_offsets.dim() == 2
+        assert page_offsets.shape[0] == block_table.shape[0]
+        assert page_offsets.device == q.device and page_offsets.stride(1) == 1
     assert q.dtype == torch.bfloat16
     assert k_cache.dtype == v_cache.dtype
-    assert kv_tq or k_cache.dtype == torch.bfloat16
+    assert kv_tq or kv_fp8 or k_cache.dtype == torch.bfloat16
     assert logical_indices.dtype == block_table.dtype == torch.int32
     assert token_to_req.dtype == torch.int32
     assert q.device == k_cache.device == v_cache.device
@@ -950,20 +1069,34 @@ def qsa_sparse_paged_attention(
         block_n, target_splits, partial_warps = 64, 4, 2
     else:
         block_n, target_splits, partial_warps = 64, 1, 2
-    if kv_tq:
+    if kv_tq or kv_fp8:
         # In-register dequant is ALU-heavy: wide tiles with 2 warps cannot
-        # hide it (measured 3.8x at 48 rows on SM86). Keep narrow tiles and
-        # 4 warps for quantized KV.
+        # hide it (measured 3.8x for TQ and 23x for arithmetic-e4m3 at 48
+        # rows on SM86). Keep narrow tiles and 4 warps for quantized KV.
+        # (E10, 2026-09-07: 64-key tiles / 32 splits / 8 warps were 1.7x on
+        # a GPU-resident microbench but only 306 -> 275 us in serving at c8
+        # and slower at c1, because the serving gather reads host-resident
+        # pages over PCIe; perf/optimization_status.md.)
         if block_n > 16:
             block_n, partial_warps = 16, 4
             target_splits = max(target_splits, 8)
-
     num_tiles = triton.cdiv(logical_indices.shape[1], block_n)
     # Avoid empty splits when the selection width is smaller than the profile.
     max_useful_splits = 1 << (num_tiles.bit_length() - 1)
     num_splits = min(max_useful_splits, target_splits)
 
     # Split=1 writes output directly and compiles out all workspace accesses.
+    if kv_fp8:
+        # Triton on SM86 rejects fp8e4nv tensors outright; hand the kernel
+        # raw bytes and decode in-register.
+        k_cache = k_cache.view(torch.uint8)
+        v_cache = v_cache.view(torch.uint8)
+    v_page_offset = 0
+    if ptr_table:
+        elem = k_cache.element_size()
+        delta = v_cache.data_ptr() - k_cache.data_ptr()
+        assert delta % elem == 0
+        v_page_offset = delta // elem
     if num_splits == 1:
         partial_output = out
         partial_lse = out
@@ -986,10 +1119,12 @@ def qsa_sparse_paged_attention(
         v_cache,
         logical_indices,
         block_table,
+        page_offsets if ptr_table else block_table,
         token_to_req,
         partial_output,
         partial_lse,
         out,
+        v_page_offset,
         q.stride(0),
         q.stride(1),
         k_cache.stride(0),
@@ -999,7 +1134,7 @@ def qsa_sparse_paged_attention(
         v_cache.stride(1),
         v_cache.stride(2),
         logical_indices.stride(0),
-        block_table.stride(0),
+        page_offsets.stride(0) if ptr_table else block_table.stride(0),
         out.stride(0),
         out.stride(1),
         q.shape[0],
@@ -1007,7 +1142,7 @@ def qsa_sparse_paged_attention(
         block_table.shape[0],
         TOPK=logical_indices.shape[1],
         PAGE_SIZE=k_cache.shape[1],
-        PAGE_TABLE_WIDTH=block_table.shape[1],
+        PAGE_TABLE_WIDTH=page_offsets.shape[1] if ptr_table else block_table.shape[1],
         GROUP_SIZE=group_size,
         HEAD_DIM=q.shape[2],
         NUM_QUERY_HEADS=q.shape[1],
@@ -1015,6 +1150,7 @@ def qsa_sparse_paged_attention(
         NUM_TILES=num_tiles,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
+        KV_FP8=kv_fp8,
         KV_TQ=kv_tq,
         TQ_KPS=head_dim if kv_tq else 0,
         TQ_VAL_BYTES=head_dim // 2 if kv_tq else 0,
@@ -1023,6 +1159,7 @@ def qsa_sparse_paged_attention(
             if kv_tq
             else True
         ),
+        PTR_TABLE=ptr_table,
         num_warps=partial_warps,
         num_stages=2,
     )

@@ -7,6 +7,7 @@
 # Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
 # ruff: noqa: E501
 
+import os
 import torch
 
 from vllm.third_party.flash_linear_attention.ops.op import exp, log
@@ -165,6 +166,7 @@ def fused_recurrent_kda_fwd_kernel(
     HAS_DT_BIAS: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
     num_stages: tl.constexpr,
+    STORE_STATES: tl.constexpr = True,
 ):
     pid = tl.program_id(0)
     i_v = pid % tl.cdiv(V, BV)
@@ -263,22 +265,23 @@ def fused_recurrent_kda_fwd_kernel(
             eviction_policy="evict_first",
         )
 
-        final_state_index = tl.load(state_indices + i_n * stride_indices_seq + i_t).to(
-            tl.int64
-        )
-        if final_state_index > 0:
-            p_final_state = (
-                state
-                + final_state_index * stride_state_token
-                + i_h * V * K
-                + o_v[:, None] * K
-                + o_k[None, :]
+        if STORE_STATES:
+            final_state_index = tl.load(state_indices + i_n * stride_indices_seq + i_t).to(
+                tl.int64
             )
-            tl.store(
-                p_final_state,
-                b_state.to(p_final_state.dtype.element_ty),
-                mask=m_state,
-            )
+            if final_state_index > 0:
+                p_final_state = (
+                    state
+                    + final_state_index * stride_state_token
+                    + i_h * V * K
+                    + o_v[:, None] * K
+                    + o_k[None, :]
+                )
+                tl.store(
+                    p_final_state,
+                    b_state.to(p_final_state.dtype.element_ty),
+                    mask=m_state,
+                )
 
         p_q += stride_qkv_token
         p_k += stride_qkv_token
@@ -287,6 +290,200 @@ def fused_recurrent_kda_fwd_kernel(
         p_beta += stride_beta_token
         p_out += stride_out_token
 
+
+
+@triton.heuristics(
+    {
+        "HAS_DT_BIAS": lambda args: args["dt_bias"] is not None,
+        "USE_LOWER_BOUND": lambda args: args["lower_bound"] is not None,
+    }
+)
+@triton.jit(do_not_specialize=["N", "T"])
+def fused_recurrent_kda_commit_kernel(
+    k,
+    v,
+    g,
+    beta,
+    A_log,
+    dt_bias,
+    state,
+    cu_seqlens,
+    state_indices,
+    prev_accepted,
+    new_accepted,
+    boundary_row,
+    lower_bound,
+    N: tl.int64,
+    T: tl.int64,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    stride_qkv_token: tl.constexpr,
+    stride_g_token: tl.constexpr,
+    stride_beta_token: tl.constexpr,
+    stride_state_token: tl.constexpr,
+    stride_indices_seq: tl.constexpr,
+    USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
+    USE_GATE_IN_KERNEL: tl.constexpr,
+    APPLY_BETA_SIGMOID: tl.constexpr,
+    HAS_DT_BIAS: tl.constexpr,
+    USE_LOWER_BOUND: tl.constexpr,
+    num_stages: tl.constexpr,
+):
+    """Deferred commit for the speculative path: replay the ACCEPTED rows of
+    the step from the state the forward started at and store only what the
+    next step and the align bookkeeping read - the state after the last
+    accepted row (column ``new_accepted - 1``) and, when a block boundary
+    falls inside the accepted rows, the state after that row (column
+    ``boundary_row``). The forward itself stores nothing (STORE_STATES=False),
+    so per layer per step the state moves once in and once out instead of
+    once in and once per draft row out."""
+    pid = tl.program_id(0)
+    i_v = pid % tl.cdiv(V, BV)
+    i_nh = pid // tl.cdiv(V, BV)
+    i_n, i_h = i_nh // H, i_nh % H
+    bos = tl.load(cu_seqlens + i_n).to(tl.int64)
+    eos = tl.load(cu_seqlens + i_n + 1).to(tl.int64)
+    sequence_length = eos - bos
+    if sequence_length == 0:
+        return
+    n_replay = tl.minimum(tl.load(new_accepted + i_n).to(tl.int64), sequence_length)
+    if n_replay <= 0:
+        return
+    b_row = tl.load(boundary_row + i_n).to(tl.int64)
+    o_k = tl.arange(0, BK)
+    o_v = i_v * BV + tl.arange(0, BV)
+    m_k = o_k < K
+    m_v = o_v < V
+    m_state = m_v[:, None] & m_k[None, :]
+    initial_token = tl.load(prev_accepted + i_n).to(tl.int64) - 1
+    state_index = tl.load(state_indices + i_n * stride_indices_seq + initial_token).to(
+        tl.int64
+    )
+    if state_index <= 0:
+        return
+    p_state = (
+        state
+        + state_index * stride_state_token
+        + i_h * V * K
+        + o_v[:, None] * K
+        + o_k[None, :]
+    )
+    b_state = tl.load(p_state, mask=m_state, other=0.0).to(tl.float32)
+    p_k = k + bos * stride_qkv_token + i_h * K + o_k
+    p_v = v + bos * stride_qkv_token + i_h * V + o_v
+    p_g = g + bos * stride_g_token + i_h * K + o_k
+    p_beta = beta + bos * stride_beta_token + i_h
+    for i_t in tl.range(0, n_replay, num_stages=num_stages):
+        b_k = tl.load(p_k, mask=m_k, other=0.0).to(tl.float32)
+        b_v = tl.load(p_v, mask=m_v, other=0.0).to(tl.float32)
+        if USE_QK_L2NORM_IN_KERNEL:
+            b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
+        b_gate = tl.load(p_g, mask=m_k, other=0.0).to(tl.float32)
+        if USE_GATE_IN_KERNEL:
+            if HAS_DT_BIAS:
+                b_bias = tl.load(dt_bias + i_h * K + o_k, mask=m_k, other=0.0).to(
+                    tl.float32
+                )
+                b_gate += b_bias
+            b_a = exp(tl.load(A_log + i_h).to(tl.float32))
+            if USE_LOWER_BOUND:
+                b_gate = lower_bound * tl.sigmoid(b_a * b_gate)
+            else:
+                b_softplus = tl.where(
+                    b_gate > 20.0,
+                    b_gate,
+                    log(1.0 + tl.exp(b_gate)),
+                )
+                b_gate = -b_a * b_softplus
+        b_state *= exp(b_gate[None, :])
+        b_v -= tl.sum(b_state * b_k[None, :], axis=1)
+        b_beta = tl.load(p_beta).to(tl.float32)
+        if APPLY_BETA_SIGMOID:
+            b_beta = tl.sigmoid(b_beta)
+        b_v *= b_beta
+        b_state += b_v[:, None] * b_k[None, :]
+        if (i_t == n_replay - 1) | (i_t == b_row):
+            final_state_index = tl.load(
+                state_indices + i_n * stride_indices_seq + i_t
+            ).to(tl.int64)
+            if final_state_index > 0:
+                p_final_state = (
+                    state
+                    + final_state_index * stride_state_token
+                    + i_h * V * K
+                    + o_v[:, None] * K
+                    + o_k[None, :]
+                )
+                tl.store(
+                    p_final_state,
+                    b_state.to(p_final_state.dtype.element_ty),
+                    mask=m_state,
+                )
+        p_k += stride_qkv_token
+        p_v += stride_qkv_token
+        p_g += stride_g_token
+        p_beta += stride_beta_token
+
+
+def fused_recurrent_kda_commit(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    raw_g: torch.Tensor,
+    raw_beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor | None,
+    lower_bound: float | None,
+    state: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    ssm_state_indices: torch.Tensor,
+    prev_accepted: torch.Tensor,
+    new_accepted: torch.Tensor,
+    boundary_row: torch.Tensor,
+) -> None:
+    """Replay the accepted rows of a speculative step (see the kernel)."""
+    B, T, H, K = k.shape
+    V = v.shape[-1]
+    assert B == 1 and v.shape == (B, T, H, V) and raw_g.shape == (B, T, H, K)
+    assert ssm_state_indices.ndim == 2 and ssm_state_indices.stride(1) == 1
+    N = cu_seqlens.numel() - 1
+    BV = int(os.getenv("KDA_DECODE_BV", "32"))
+    num_warps = int(os.getenv("KDA_DECODE_WARPS", "4"))
+    grid = (cdiv(V, BV) * N * H,)
+    fused_recurrent_kda_commit_kernel[grid](
+        k=k,
+        v=v,
+        g=raw_g,
+        beta=raw_beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        state=state,
+        cu_seqlens=cu_seqlens,
+        state_indices=ssm_state_indices,
+        prev_accepted=prev_accepted,
+        new_accepted=new_accepted,
+        boundary_row=boundary_row,
+        lower_bound=lower_bound,
+        N=N,
+        T=T,
+        H=H,
+        K=K,
+        V=V,
+        BK=next_power_of_2(K),
+        BV=BV,
+        stride_qkv_token=k.stride(1),
+        stride_g_token=raw_g.stride(1),
+        stride_beta_token=raw_beta.stride(1),
+        stride_state_token=state.stride(0),
+        stride_indices_seq=ssm_state_indices.stride(0),
+        USE_QK_L2NORM_IN_KERNEL=True,
+        USE_GATE_IN_KERNEL=True,
+        APPLY_BETA_SIGMOID=True,
+        num_warps=num_warps,
+        num_stages=2,
+    )
 
 def fused_recurrent_kda_fwd(
     q: torch.Tensor,
@@ -307,6 +504,7 @@ def fused_recurrent_kda_fwd(
     use_gate_in_kernel: bool = False,
     use_beta_sigmoid_in_kernel: bool = False,
     out: torch.Tensor | None = None,
+    store_states: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Launch recurrent KDA with dense inner dimensions and row strides."""
     B, T, H, K = q.shape
@@ -344,8 +542,8 @@ def fused_recurrent_kda_fwd(
     if scale is None:
         scale = K**-0.5
 
-    BV = 32 if use_gate_in_kernel else 8
-    num_warps = 4 if use_gate_in_kernel else 1
+    BV = int(os.getenv("KDA_DECODE_BV", "32")) if use_gate_in_kernel else 8
+    num_warps = int(os.getenv("KDA_DECODE_WARPS", "4")) if use_gate_in_kernel else 1
     grid = (cdiv(V, BV) * N * H,)
     fused_recurrent_kda_fwd_kernel[grid](
         q=q,
@@ -381,6 +579,7 @@ def fused_recurrent_kda_fwd(
         APPLY_BETA_SIGMOID=use_beta_sigmoid_in_kernel,
         num_warps=num_warps,
         num_stages=2,
+        STORE_STATES=store_states,
     )
     return out, initial_state
 
@@ -400,6 +599,7 @@ def fused_recurrent_kda(
     num_accepted_tokens: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
     fuse_gate: bool | None = None,
+    store_states: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run recurrent KDA from raw gate and beta inputs.
 
@@ -440,6 +640,7 @@ def fused_recurrent_kda(
         use_gate_in_kernel=fuse_gate,
         use_beta_sigmoid_in_kernel=fuse_gate,
         out=out,
+        store_states=store_states,
     )
 
 
@@ -587,7 +788,20 @@ def fused_recurrent_kda_packed_decode(
         raise ValueError("`state_indices` must contain one entry per token.")
 
     BK = next_power_of_2(K)
-    BV = min(next_power_of_2(V), 32)
+    if K == 128 and V == 128 and os.getenv("KDA_DECODE_CUDA", "0") == "1":
+        # QuixiCore CUDA port (csrc/quixicore/serving/kda_decode_kernels.cuh):
+        # warp-per-row, 128-bit lane loads; same math as the kernel below.
+        from vllm.quixicore import quixicore_ops as qc
+
+        out = qc.kda_decode(
+            mixed_qkv, raw_g, raw_beta, A_log, dt_bias, initial_state,
+            state_indices, K**-0.5 if scale is None else scale, lower_bound,
+        )
+        return out, initial_state
+    # Tile/warp choice is an experiment hook (2026-09-11 GLM-5.3 profile:
+    # 0.56 TB/s effective at 32 decode rows); defaults are the vendored ones.
+    BV = min(next_power_of_2(V), int(os.getenv("KDA_DECODE_BV", "32")))
+    decode_warps = int(os.getenv("KDA_DECODE_WARPS", "4"))
     if scale is None:
         scale = K**-0.5
 
@@ -615,7 +829,7 @@ def fused_recurrent_kda_packed_decode(
         BV=BV,
         SOFTPLUS_THRESHOLD=20.0,
         USE_LOWER_BOUND=lower_bound is not None,
-        num_warps=4,
+        num_warps=decode_warps,
         num_stages=2,
     )
     return out, initial_state

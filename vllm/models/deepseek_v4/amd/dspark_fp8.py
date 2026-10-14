@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""TurboQuant MLA attention for the DeepSeek-V4 0731 DSpark draft.
+"""FP8 MLA attention for the DeepSeek-V4 0731 DSpark draft.
 
 The target keeps its specialized sparse-MLA kernels and FP8 cache. The three
 standalone 0731 draft layers are sliding-window-only and use ordinary paged
 attention after their compressed MLA K/V row is projected and rotary-encoded.
 This adapter preserves those trained projections while giving only the draft a
-TurboQuant cache.
+FP8 cache.
 """
 
 import torch
@@ -27,8 +27,8 @@ from vllm.platforms import current_platform
 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import rocm_inv_rope_einsum
 
 
-class DeepseekV4TurboQuantDraftAttention(nn.Module):
-    """DeepSeek MLA draft attention backed by TurboQuant paged KV."""
+class DeepseekV4FP8DraftAttention(nn.Module):
+    """DeepSeek MLA draft attention backed by FP8 paged KV."""
 
     def __init__(self, vllm_config: VllmConfig, prefix: str) -> None:
         super().__init__()
@@ -103,7 +103,7 @@ class DeepseekV4TurboQuantDraftAttention(nn.Module):
             max_position_embeddings=config.max_position_embeddings,
             compress_ratio=1,
         )
-        self.tq_attn = Attention(
+        self.paged_attn = Attention(
             self.n_local_heads,
             self.head_dim,
             self.scale,
@@ -111,13 +111,13 @@ class DeepseekV4TurboQuantDraftAttention(nn.Module):
             cache_config=cache_config,
             quant_config=quant_config,
             per_layer_sliding_window=self.window_size,
-            prefix=f"{prefix}.tq_attn",
+            prefix=f"{prefix}.paged_attn",
             sinks=self.attn_sink,
         )
 
     @property
     def cache_layer_name(self) -> str:
-        return self.tq_attn.layer_name
+        return self.paged_attn.layer_name
 
     def _rotate_kv(self, kv: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         rotated, _ = self.rotary_emb(positions, kv.unsqueeze(1), None)
@@ -130,12 +130,12 @@ class DeepseekV4TurboQuantDraftAttention(nn.Module):
         slot_mapping: torch.Tensor,
     ) -> None:
         rotated = self._rotate_kv(kv, positions)
-        assert hasattr(self.tq_attn.impl, "do_kv_cache_update")
-        self.tq_attn.impl.do_kv_cache_update(  # type: ignore[attr-defined]
-            self.tq_attn,
+        assert hasattr(self.paged_attn.impl, "do_kv_cache_update")
+        self.paged_attn.impl.do_kv_cache_update(  # type: ignore[attr-defined]
+            self.paged_attn,
             rotated,
             rotated,
-            self.tq_attn.kv_cache,
+            self.paged_attn.kv_cache,
             slot_mapping,
         )
 
@@ -166,7 +166,9 @@ class DeepseekV4TurboQuantDraftAttention(nn.Module):
         kv = kv.unsqueeze(1)
         q, key = self.rotary_emb(positions, q, kv)
         assert key is not None
-        output = self.tq_attn(q, key, key).view(-1, self.n_local_heads, self.head_dim)
+        output = self.paged_attn(q, key, key).view(
+            -1, self.n_local_heads, self.head_dim
+        )
         if current_platform.is_metal():
             o_ref, _ = self.rotary_emb.forward_native(
                 positions, output, key=None, inverse=True

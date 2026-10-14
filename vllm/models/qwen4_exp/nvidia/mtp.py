@@ -22,8 +22,21 @@ from torch import nn
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig, replace, set_current_vllm_config
 from vllm.distributed import get_pp_group
+from vllm.model_executor.layers.fused_moe import (
+    RoutedExperts,
+    UnquantizedFusedMoEMethod,
+)
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
-from vllm.model_executor.layers.linear import ColumnParallelLinear
+from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
+    LinearBase,
+    UnquantizedLinearMethod,
+)
+from vllm.model_executor.layers.quantization.base_config import (
+    QuantizationConfig,
+    QuantizeMethodBase,
+)
+from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -103,6 +116,78 @@ def _remap_mtp_weight_name(name: str) -> str | None:
     return None
 
 
+class Qwen4ExpDraftBlockFp8Config(Fp8Config):
+    """Block-FP8 config for the MTP drafter of a ModelOpt MIXED_PRECISION
+    release (nvidia/Qwen3.8-Flash-Next-NVFP4).
+
+    That release keeps the drafter's 512 experts in block-128 FP8 with
+    ``weight_scale_inv`` scales - the exact tensor layout of the official FP8
+    release - while ModelOpt's own FP8 MoE method only knows per-tensor
+    scales. The drafter therefore serves its experts through the same
+    :class:`Fp8Config` / Fp8MoEMethod path the FP8 profile validated
+    (Marlin W8A16 block-FP8 on SM86), and every other draft module (QSA,
+    hyper-connections, gate, shared expert, fc/norm heads) stays bf16, which
+    is what the release stores for them.
+    """
+
+    def __init__(self, expert_prefixes: set[str], group_size: int) -> None:
+        super().__init__(
+            is_checkpoint_fp8_serialized=True,
+            activation_scheme="dynamic",
+            ignored_layers=[],
+            weight_block_size=[group_size, group_size],
+        )
+        self.expert_prefixes = set(expert_prefixes)
+
+    def get_quant_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> "QuantizeMethodBase | None":
+        if isinstance(layer, RoutedExperts):
+            if prefix in self.expert_prefixes:
+                return super().get_quant_method(layer, prefix)
+            return UnquantizedFusedMoEMethod(layer.moe_config)
+        if isinstance(layer, LinearBase):
+            return UnquantizedLinearMethod()
+        return None
+
+
+def _draft_quant_config_from_modelopt_mixed(
+    quant_config: QuantizationConfig,
+    mtp_start_layer_idx: int,
+) -> QuantizationConfig | None:
+    """Translate the target's MIXED_PRECISION ``quantized_layers`` into the
+    drafter's config: ``mtp.layers.<i>...`` keys are renumbered onto the
+    draft model's layer indices (``mtp_start_layer_idx + i``), and their FP8
+    expert groups become a :class:`Qwen4ExpDraftBlockFp8Config`."""
+    quantized_layers = getattr(quant_config, "quantized_layers", None) or {}
+    experts: dict[str, int] = {}
+    for key, info in quantized_layers.items():
+        if not key.startswith("mtp."):
+            continue
+        algo = str(info.get("quant_algo", "")).upper()
+        new_key = re.sub(
+            r"(?<=\.layers\.)\d+",
+            lambda m: str(mtp_start_layer_idx + int(m.group(0))),
+            key,
+        )
+        # The release stores the drafter's experts as block-128 FP8 with
+        # dynamic per-token activations; this fork's ModelOpt parser labels
+        # that group FP8_PB_WO (per-block, weight-only), older layouts FP8.
+        if algo not in ("FP8", "FP8_PB_WO"):
+            raise NotImplementedError(
+                f"Qwen4Exp MTP: unsupported ModelOpt quant_algo {algo!r} for {key}"
+            )
+        experts[new_key] = int(info.get("group_size") or 128)
+    if not experts:
+        return None
+    groups = set(experts.values())
+    if len(groups) != 1:
+        raise NotImplementedError(
+            f"Qwen4Exp MTP: mixed FP8 block sizes {sorted(groups)} across experts"
+        )
+    return Qwen4ExpDraftBlockFp8Config(set(experts), groups.pop())
+
+
 def _make_draft_vllm_config(
     vllm_config: VllmConfig,
     mtp_start_layer_idx: int,
@@ -113,6 +198,10 @@ def _make_draft_vllm_config(
         raise ValueError("speculative_config.draft_model_config must be set")
 
     draft_quant_config = get_draft_quant_config(vllm_config)
+    if draft_quant_config is not None and draft_quant_config.get_name() == "modelopt_mixed":
+        draft_quant_config = _draft_quant_config_from_modelopt_mixed(
+            draft_quant_config, mtp_start_layer_idx
+        )
 
     # inject packed and ignored modules to the quantization config of draft model
     if draft_quant_config is not None:
