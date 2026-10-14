@@ -208,10 +208,15 @@ def test_fused_forward_uses_packed_entrypoint() -> None:
         in_proj_qkvz=lambda _: (mixed_qkvz, None),
         in_proj_ba=lambda _: (ba, None),
         out_proj=lambda x: (x, None),
+        # GGUF block-run out_proj ordering, inert for HF checkpoints.
+        _out_proj_head_order=None,
     )
-    layer.forward_cuda = types.MethodType(
-        QwenGatedDeltaNetAttention.forward_cuda, layer
-    )
+    for name in ("forward_cuda", "_project_out", "_out_proj_input"):
+        setattr(
+            layer,
+            name,
+            types.MethodType(getattr(QwenGatedDeltaNetAttention, name), layer),
+        )
 
     def packed_op(
         actual_qkvz: torch.Tensor,

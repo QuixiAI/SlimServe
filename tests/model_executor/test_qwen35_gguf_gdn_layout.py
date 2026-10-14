@@ -2,18 +2,26 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Focused contracts for the Qwen3.5 GGUF fused GDN projections."""
 
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest import mock
 
+import gguf
+import numpy as np
 import pytest
 import torch
+from gguf.quants import dequantize
 
+from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+    QwenGatedDeltaNetAttention,
+    out_proj_v_head_order,
+)
 from vllm.model_executor.model_loader.gguf_adapters.base import GGUFLoadSpec
 from vllm.model_executor.model_loader.gguf_adapters.default import (
     GGUFWeightsAdapter,
 )
 from vllm.model_executor.model_loader.gguf_adapters.qwen35 import (
     Qwen35GGUFAdapter,
+    _out_proj_v_head_group,
     _untile_packed_v_head_columns,
     _untile_v_head_axis,
 )
@@ -131,7 +139,7 @@ def test_qwen35_gguf_untile_q8_columns_moves_whole_quant_blocks():
     assert chunks[1, :, -1].tolist() == [0, 2, 4, 1, 3, 5]
 
 
-def test_qwen35_gguf_untile_rejects_split_quant_blocks():
+def test_qwen35_gguf_untile_rejects_a_run_that_splits_quant_blocks():
     with pytest.raises(ValueError, match="not aligned"):
         _untile_packed_v_head_columns(
             torch.empty(1, 1, dtype=torch.uint8),
@@ -139,7 +147,78 @@ def test_qwen35_gguf_untile_rejects_split_quant_blocks():
             num_v_heads=6,
             head_dim=128,
             weight_type="Q4_K",
+            group=1,
         )
+
+
+def test_qwen35_gguf_out_proj_group_covers_block_256_formats():
+    # Every ssm_out type in the published UD-Q2_K_XL file is a 256 block.
+    ud_q2kxl = ["Q4_K", "IQ3_S", "IQ4_XS", "IQ3_XXS", "IQ2_S", "IQ2_XS", "Q3_K"]
+    assert _out_proj_v_head_group(ud_q2kxl, 128) == 2
+    assert _out_proj_v_head_group(["Q8_0", "F16", "BF16"], 128) == 1
+    assert _out_proj_v_head_group([], 128) == 1
+
+
+def _random_q4k_blocks(rows: int, blocks: int, seed: int) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    raw = rng.integers(0, 256, (rows, blocks, 144), dtype=np.uint8)
+    scale = rng.uniform(0.005, 0.02, (rows, blocks, 2)).astype(np.float16)
+    raw[..., :4] = scale.view(np.uint8)  # sane d / dmin
+    return raw.reshape(rows, blocks * 144)
+
+
+@pytest.mark.parametrize("tp_size", [1, 2])
+def test_qwen35_gguf_k_quant_out_proj_loads_quantized_and_matches_hf(tp_size):
+    """A Q4_K out_proj (block 256 spans two 128-wide heads) loads quantized.
+
+    The columns move in whole blocks to the run-tiled order, the GDN module
+    gathers its grouped activations into that order per rank, and the
+    projection must equal the HF grouped reference at TP1 and TP2.
+    """
+    num_k, num_v, head_dim, rows = 4, 12, 128, 3
+    qtype = gguf.GGMLQuantizationType.Q4_K
+    tiled_raw = _random_q4k_blocks(rows, num_v * head_dim // 256, seed=0)
+    tiled_deq = torch.from_numpy(dequantize(tiled_raw, qtype)).double()
+    reference = _untile_v_head_axis(
+        tiled_deq,
+        axis=1,
+        num_k_heads=num_k,
+        num_v_heads=num_v,
+        values_per_head=head_dim,
+    )
+
+    group = _out_proj_v_head_group(["Q4_K"], head_dim)
+    packed = _untile_packed_v_head_columns(
+        torch.from_numpy(tiled_raw),
+        num_k_heads=num_k,
+        num_v_heads=num_v,
+        head_dim=head_dim,
+        weight_type="Q4_K",
+        group=group,
+    )
+    assert packed.dtype == torch.uint8 and packed.shape == tiled_raw.shape
+    loaded = torch.from_numpy(dequantize(packed.numpy(), qtype)).double()
+
+    x = torch.randn(5, num_v * head_dim, dtype=torch.float64)
+    expected = x @ reference.T
+    local_k = num_k // tp_size
+    order = out_proj_v_head_order(local_k, num_v // num_k, group)
+    width = num_v * head_dim // tp_size
+    out = torch.zeros_like(expected)
+    for rank in range(tp_size):
+        # RowParallelLinear: each rank owns a contiguous column slice and
+        # the grouped core output for its own key heads.
+        cols = slice(rank * width, (rank + 1) * width)
+        x_local = x[:, cols].reshape(5, -1, head_dim)
+        x_local = x_local.index_select(1, order).reshape(5, -1)
+        out += x_local @ loaded[:, cols].T
+    torch.testing.assert_close(out, expected)
+
+
+def test_qwen35_gguf_out_proj_order_is_identity_without_runs():
+    torch.testing.assert_close(out_proj_v_head_order(4, 3, 1), torch.arange(12))
+    # Runs of two key heads, tiled inside: (k0j0 k1j0 k0j1 k1j1 ...).
+    assert out_proj_v_head_order(2, 3, 2).tolist() == [0, 3, 1, 4, 2, 5]
 
 
 def test_qwen35_gguf_untile_covers_all_per_v_head_tensors():
@@ -199,6 +278,7 @@ def test_qwen35_gguf_prepare_loading_disables_runtime_tiled_layout():
         gdn_tiled_v_head_layout=True,
         linear_num_key_heads=2,
         linear_num_value_heads=6,
+        linear_value_head_dim=128,
     )
     model_config = SimpleNamespace(
         hf_config=SimpleNamespace(get_text_config=lambda: text_config)
@@ -210,9 +290,73 @@ def test_qwen35_gguf_prepare_loading_disables_runtime_tiled_layout():
         mock.patch.object(
             GGUFWeightsAdapter, "prepare_loading", return_value=base_spec
         ),
-        mock.patch.object(adapter, "get_weight_type_map", return_value={}),
+        mock.patch.object(
+            adapter,
+            "get_weight_type_map",
+            return_value={
+                "model.layers.0.linear_attn.out_proj.weight": "Q4_K",
+                "model.layers.1.linear_attn.out_proj.weight": "Q8_0",
+            },
+        ),
     ):
         adapter.prepare_loading("target.gguf", model_config)
 
     assert adapter._untile_v_heads is True
     assert text_config.gdn_tiled_v_head_layout is False
+    # Q4_K blocks span two value heads; the module must gather in runs of 2.
+    assert text_config.gdn_out_proj_v_head_group == 2
+
+
+def test_qwen35_gguf_adapter_untiles_k_quant_out_proj_in_runs():
+    config = SimpleNamespace(
+        linear_num_key_heads=4,
+        linear_num_value_heads=12,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+    )
+    adapter = Qwen35GGUFAdapter(SimpleNamespace())
+    adapter._weight_type_map = {"model.layers.0.linear_attn.out_proj.weight": "Q4_K"}
+    adapter._out_proj_group = 2
+    # Each Q4_K block holds two adjacent tiled heads (r, 2b) and (r, 2b + 1):
+    # tiled block order is (r0 run0, r0 run1, r1 run0, ...). Tag each block.
+    tiled = torch.cat(
+        [torch.full((2, 144), block, dtype=torch.uint8) for block in range(6)],
+        dim=1,
+    )
+    result = adapter._untile_gdn_weight(
+        "model.layers.0.linear_attn.out_proj.qweight", tiled, config
+    )
+    blocks = result.reshape(2, 6, 144)
+    assert blocks[:, :, 0].tolist() == [[0, 2, 4, 1, 3, 5]] * 2
+    assert (blocks == blocks[:, :, :1]).all()  # blocks moved whole
+
+
+def test_qwen35_gdn_project_out_gathers_into_run_order():
+    """The module's out_proj input gather matches the block-moved columns."""
+    num_k, rep, head_dim, hidden = 4, 3, 2, 5
+    num_v = num_k * rep
+    tiled = torch.randn(hidden, num_v * head_dim, dtype=torch.float64)
+    reference = _untile_v_head_axis(
+        tiled, axis=1, num_k_heads=num_k, num_v_heads=num_v, values_per_head=2
+    )
+    run_ordered = _untile_v_head_axis(
+        tiled,
+        axis=1,
+        num_k_heads=num_k,
+        num_v_heads=num_v,
+        values_per_head=2,
+        group=2,
+    )
+    layer = SimpleNamespace(
+        head_v_dim=head_dim,
+        _out_proj_head_order=out_proj_v_head_order(num_k, rep, 2),
+        out_proj=lambda x: (x @ run_ordered.T, None),
+    )
+    for name in ("_project_out", "_out_proj_input"):
+        setattr(
+            layer,
+            name,
+            MethodType(getattr(QwenGatedDeltaNetAttention, name), layer),
+        )
+    x = torch.randn(7, num_v * head_dim, dtype=torch.float64)
+    torch.testing.assert_close(layer._project_out(x), x @ reference.T)

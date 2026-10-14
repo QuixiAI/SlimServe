@@ -212,6 +212,10 @@ def build_qwen35_config_from_gguf(gguf_path: str) -> Any:
     # (tile), rather than HF's grouped i_k = i_hv // (num_v_heads /
     # num_k_heads). The GGUF adapter restores every affected tensor to HF
     # grouped order before TP slicing, then clears the runtime layout flag.
+    # The exception is a quantized out_proj whose blocks span two heads
+    # (block-256 formats): its columns move in whole blocks, keeping runs of
+    # key heads tiled, and the GDN module gathers its input to match
+    # (gdn_out_proj_v_head_group).
     cfg.gguf_gdn_tiled_weights = True
     cfg.gdn_tiled_v_head_layout = True
     logger.info(
