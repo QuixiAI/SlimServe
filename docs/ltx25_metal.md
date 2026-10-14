@@ -455,7 +455,7 @@ Resident set while serving: distilled about 71 GiB (transformer 40, Gemma 28,
 VAE/audio 3), dev about 80 GiB (plus the 8 GiB LoRA). The profiles are gated
 to 128 GiB machines because that is what was validated.
 
-Development rule (HANDOFF.md): one model-loading process at a time, through
+Development rule (HANDOFF-LTX25.md): one model-loading process at a time, through
 `perf/ltx25_harness/gpu_run.py`.
 
 ## Layout

@@ -13,7 +13,7 @@ Why: on 2026-10-02 four model-loading processes ran at once (84.7 + 64.2 +
 18.1 GiB resident and one more loading, on 128 GiB, with the wired limit at
 122880). GPU memory is wired and cannot be compressed or swapped, the
 compressor ran out of space, watchdogd was starved for 90 s and the kernel
-panicked. See HANDOFF.md, "Ops constraints".
+panicked. See HANDOFF-LTX25.md, "Ops constraints".
 """
 
 import argparse

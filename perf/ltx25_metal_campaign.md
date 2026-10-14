@@ -397,7 +397,7 @@ path (resident serving keeps it: 28 + 40 GiB).
 Four model-loading processes at once (84.7 + 64.2 + 18.1 GiB resident plus
 a 39 GiB DiT loading, 128 GiB box, `iogpu.wired_limit_mb=122880`) exhausted
 the compressor; watchdogd starved for 90 s; forced power-off. Rules now in
-HANDOFF.md: one model-loading process at a time through `gpu_run.py`
+HANDOFF-LTX25.md: one model-loading process at a time through `gpu_run.py`
 (exclusive lock, headroom check, 16 GiB reserve, refuses a wired limit above
 110000), agents never touch the GPU, the engine sets an MLX memory limit of
 RAM - 24 GiB and plans VAE decode inside what is left.
