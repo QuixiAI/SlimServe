@@ -18,9 +18,12 @@ ceiling, the gate. Bit-exact where possible; ULP with the reversion
 sentinel otherwise; re-pin with the teacher-forced check when numerics
 change on purpose.
 
-**Speculation.** Whichever drafter is fastest on this box ships: the
-checkpoint's own MTP block, a published DFlash / DFlash2 / DSpark / EAGLE
-head, or none. Same gate for each candidate, acceptance recorded per
+**Speculation.** Every supported profile runs with its registered drafter
+and registered draft KV configuration (CLAUDE.md); FP8 is the only
+permitted quantized draft KV. Choose which drafter to register by
+measurement: the checkpoint's own MTP block, a published DFlash / DFlash2 /
+DSpark / EAGLE head. "None" is not a verdict for a model that has a
+drafter. Same gate for each candidate, acceptance recorded per
 position, k swept on paired step ms (small k for recurrent mixers), a
 batch-size schedule so speculation turns off where it loses. Judge on
 step rate and tok/s on non-degenerate text, not on a looping prompt.

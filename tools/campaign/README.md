@@ -21,7 +21,7 @@ cd ~/Code/slimserve/SlimServe
 cat > ~/.local/scratch/brief-glm53f-q2-1.md <<'B'
 Beat antirez's ds4 on his GLM-5.3-Flash Q2 GGUF on this Mac Studio the way DSV4 was beaten.
 Study ds4's kernels for this layout, the vLLM/SGLang/llama.cpp PRs for glm5-next, and the
-perf notes from the DSV4 and Qwen3.8 Metal campaigns. Whichever drafter is fastest ships.
+perf notes from the DSV4 and Qwen3.8 Metal campaigns. Register the drafter measured fastest here.
 B
 nohup python3 tools/campaign/run_campaign.py start \
     --id glm53f-q2-1 --model-ref antirez/glm-5.3-flash-gguf --quant Q2 \
@@ -60,10 +60,17 @@ needed, `FINAL_REPORT.md` at the end.
 | phase | exit (validated by the driver) |
 | --- | --- |
 | discover | profile registered, registry tests pass, bar recorded in `perf/baseline_status.md`, plan is the top of HANDOFF.md |
-| bringup | profile boots, N0 pins recorded, notebook entry exists |
-| decode | single-stream vs bar, drafter verdict, concurrency curve and scaling ratios in the marker |
-| prefill | prefill table vs bar at >= 2 lengths |
-| cleanup | tracked tree committed, registry tests + `guard.sh` pass, record `supported` (or reason), PR description drafted |
+| bringup | profile boots, N0 pins recorded, notebook entry exists, profile invariants hold (below), default context served or its impossibility stated, image canary passed for a vision model |
+| decode | single-stream vs bar, drafter verdict, concurrency curve and scaling ratios in the marker, profile invariants hold |
+| prefill | prefill table vs bar at >= 2 lengths, profile invariants hold |
+| cleanup | tracked tree committed, registry tests + `guard.sh` pass, profile invariants + context + vision evidence as at bringup, record `supported` (or reason), PR description drafted |
+
+"Profile invariants" are the CLAUDE.md rules the registry tests already
+enforce (`INVARIANT_TESTS` in `run_campaign.py`: one record per platform,
+prefix caching true, FP8-only quantized KV / no TurboQuant, registered
+drafter with FP8 draft KV, thinking and tool calling on, vision not
+disableable), plus a check that the campaign's record exists for the
+detected platform and states it.
 | pr | PR exists on the branch, guard passes |
 | review | PR not draft, 0 unresolved threads, CodeRabbit reviewed the current head, Astra clean or recorded unavailable |
 | port | optional (`--port-repo`): kernels ported to the QuixiCore library |
@@ -133,8 +140,11 @@ the target repo, the Codex CLI logged in with the Astra model available
 `slimserve` and `vllm`, `uvx` present for ruff, and the worktree's git
 identity a `users.noreply.github.com` address (set the global default to
 that address too, so a fresh clone on any machine cannot leak a real
-email). The machine must be free to run inference: the campaign kills any
-local server when it needs the memory.
+email). The machine must be free to run inference. The agent stops only
+servers the campaign booted; if another server holds the memory it writes a
+`blocked` marker naming it. Pass `--allow-kill-servers` (to `start` or
+`resume`; it is per launch and not remembered) to let it stop local
+inference servers it did not start, which it then reports.
 
 During: nothing. `status` shows the phase and attempts; `campaign.log` and
 `runs/*.jsonl` show what the agent is doing; HANDOFF.md's top section is

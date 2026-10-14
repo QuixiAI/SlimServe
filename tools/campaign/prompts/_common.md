@@ -44,8 +44,7 @@ HANDOFF.md, and keep going.
    rejected wave with a message that states the numbers.
 3. Journal before committing: notebook entry with raw artifact path, pins
    in `perf/baseline_status.md`, status log entry at the top of HANDOFF.md.
-4. Boot servers detached; never rebuild while one runs; kill whatever holds
-   the memory when the campaign needs it and say so.
+4. Boot servers detached; never rebuild while one runs. {{SERVER_POLICY}}
 5. Never end the turn at a milestone. End it only with the phase marker
    written (done or blocked). If context is getting long, write the HANDOFF
    status entry first so the resumed session loses nothing.

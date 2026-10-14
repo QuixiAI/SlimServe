@@ -53,17 +53,24 @@ STATE_ROOT = Path(
         "SLIMSERVE_CAMPAIGN_ROOT", str(Path.home() / ".local/scratch/campaigns")
     )
 )
-DEFAULT_REF_TREES = [
+# The reference trees CLAUDE.md names. Override the whole list with
+# SLIMSERVE_CAMPAIGN_REF_TREES (os.pathsep-separated) or add to it with
+# --ref-tree; trees that do not exist on this machine are dropped.
+CLAUDE_MD_REF_TREES = [
     "~/llama.cpp",
     "~/ds4",
-    "~/.local/scratch/ds4-upstream",
-    "~/QuixiCore",
-    "~/Code/QuixiCore-Metal",
-    "~/Code/QuixiCore-CUDA",
-    "~/Code/QuixiCore-ROCm",
-    "~/models",
-    "~/.local/scratch",
+    "~/QuixiCore/QuixiCore-ROCm",
+    "~/QuixiCore/QuixiCore-Metal",
 ]
+
+
+def default_ref_trees() -> list[str]:
+    env = os.environ.get("SLIMSERVE_CAMPAIGN_REF_TREES")
+    if env is not None:
+        return [p for p in env.split(os.pathsep) if p.strip()]
+    return list(CLAUDE_MD_REF_TREES)
+
+
 NOREPLY = "users.noreply.github.com"
 DELEGATION_TEXT = {
     "none": (
@@ -87,6 +94,28 @@ DELEGATION_TEXT = {
         "tests and microbenches against an oracle and shapes you specify, which "
         "you run and read before trusting. Serving-path code (csrc/, vllm/, "
         "slimserve/) stays yours."
+    ),
+}
+
+# Whether the agent may stop servers it did not start. Never by default: the
+# operator opts in per launch with --allow-kill-servers, and the choice is not
+# carried over to a later `resume` that omits the flag.
+SERVER_POLICY_TEXT = {
+    False: (
+        "Server policy for this launch: you may stop only servers this campaign "
+        "booted (track their PIDs). Never kill, signal or restart any other "
+        "process that holds GPU / unified memory. If another server holds the "
+        "memory a boot needs, do not stop it: write a `blocked` marker naming "
+        "the process (PID, command, memory held) and stop. The operator can "
+        "relaunch with `--allow-kill-servers`."
+    ),
+    True: (
+        "Server policy for this launch: the operator passed "
+        "`--allow-kill-servers`, so you may stop a local inference server you "
+        "did not start when the campaign needs its memory. Stop it by PID "
+        "lineage, record in HANDOFF.md and the phase marker exactly what was "
+        "stopped (PID, command, memory held, time), and never touch "
+        "non-inference processes."
     ),
 }
 
@@ -318,13 +347,14 @@ def preflight(c: Campaign, args: argparse.Namespace) -> None:
         warn_only=args.no_astra,
     )
     trees = [
-        str(Path(p).expanduser()) for p in DEFAULT_REF_TREES + (args.ref_tree or [])
+        str(Path(p).expanduser()) for p in default_ref_trees() + (args.ref_tree or [])
     ]
     c.state["ref_trees"] = [p for p in trees if Path(p).exists()]
     req(
         bool(c.state["ref_trees"]),
         f"reference trees ({len(c.state['ref_trees'])} of {len(trees)})",
-        "none of the usual reference trees exist; pass --ref-tree",
+        "none of the CLAUDE.md reference trees exist; pass --ref-tree or set "
+        "SLIMSERVE_CAMPAIGN_REF_TREES",
         warn_only=True,
     )
 
@@ -459,6 +489,7 @@ def render_prompt(c: Campaign, phase: str, feedback: str = "") -> str:
         "FEEDBACK": feedback.strip(),
         "DATE": dt.date.today().isoformat(),
         "DELEGATION": DELEGATION_TEXT[c.state.get("delegate", "research")],
+        "SERVER_POLICY": SERVER_POLICY_TEXT[bool(c.state.get("allow_kill_servers"))],
     }
     common = (PROMPTS_DIR / "_common.md").read_text()
     body = (PROMPTS_DIR / f"{phase}.md").read_text()
@@ -631,7 +662,7 @@ def run_attempt(
             "SLIMSERVE_CAMPAIGN_WORKTREE": str(c.worktree),
             "SLIMSERVE_CAMPAIGN_PYTHON": c.python,
             "SLIMSERVE_CAMPAIGN_TOOLS": str(TOOLS_DIR),
-            "CAMPAIGN_PRIVATE_EMAILS": private_emails(),
+            "CAMPAIGN_PRIVATE_EMAILS": private_emails(c.state.get("git_email", "")),
         }
     )
     c.log(
@@ -705,8 +736,12 @@ def run_attempt(
     return summary
 
 
-def private_emails() -> str:
-    """Addresses that must never appear in anything pushed. Kept outside the repo."""
+def private_emails(allowed: str = "") -> str:
+    """Addresses that must never appear in anything pushed. Kept outside the repo.
+
+    ``allowed`` is the operator's --git-email: an identity they chose to commit
+    under is authorship, not a leak.
+    """
     found: list[str] = []
     listing = STATE_ROOT / "private_emails.txt"
     if listing.exists():
@@ -718,7 +753,7 @@ def private_emails() -> str:
     glob_email = run(["git", "config", "--global", "user.email"]).stdout.strip()
     if glob_email and not glob_email.endswith(NOREPLY):
         found.append(glob_email)
-    return ":".join(dict.fromkeys(found))
+    return ":".join(e for e in dict.fromkeys(found) if e != allowed)
 
 
 # ---------------------------------------------------------------------------
@@ -734,16 +769,19 @@ def profiles_json(c: Campaign) -> dict[str, Any]:
     return json.loads((c.worktree / "slimserve/profiles.json").read_text())
 
 
-def registry_tests_pass(c: Campaign) -> tuple[bool, str]:
+def registry_tests_pass(
+    c: Campaign, targets: list[str] | None = None
+) -> tuple[bool, str]:
     env = dict(os.environ, PYTHONPATH=str(c.worktree))
+    stop_first = [] if targets else ["-x"]
     out = run(
         [
             c.python,
             "-m",
             "pytest",
-            "tests/slimserve",
+            *(targets or ["tests/slimserve"]),
             "-q",
-            "-x",
+            *stop_first,
             "-p",
             "no:cacheprovider",
         ],
@@ -751,13 +789,107 @@ def registry_tests_pass(c: Campaign) -> tuple[bool, str]:
         env=env,
         timeout=900,
     )
-    tail = (out.stdout + out.stderr).strip().splitlines()[-3:]
-    return out.returncode == 0, " | ".join(tail)
+    lines = (out.stdout + out.stderr).strip().splitlines()
+    failed = [ln for ln in lines if ln.startswith(("FAILED", "ERROR"))]
+    return out.returncode == 0, " | ".join(failed[:8] + lines[-2:])
+
+
+# The registry tests that enforce the CLAUDE.md profile invariants. The
+# driver runs these (they are the source of truth) instead of re-deriving the
+# rules; profile_invariant_gaps() adds only what no registry test can see
+# (the campaign record's own platform entry, the model's default context and
+# whether the model has vision, both of which the agent measures).
+_PROFILE_TESTS = "tests/slimserve/test_profiles.py::"
+INVARIANT_TESTS = [
+    _PROFILE_TESTS + name
+    for name in (
+        # one record per platform, no borrowed platform environment
+        "test_a_profile_is_one_config_per_platform",
+        "test_no_profile_carries_another_platforms_environment",
+        # prefix caching stated and true
+        "test_every_profile_states_prefix_caching_explicitly",
+        # thinking and automatic tool calling on
+        "test_every_profile_serves_with_tool_calling_and_thinking",
+        "test_every_profile_serves_thinking_and_tool_calling_by_default",
+        # FP8-only quantized KV, no TurboQuant, registered drafter, FP8 draft KV
+        "test_quantized_main_kv_is_an_explicit_validated_choice",
+        "test_turboquant_profile_is_removed",
+        "test_every_profile_uses_registered_drafter_with_fp8_dspark",
+    )
+] + [
+    # vision on wherever the model supports it; FP8-only cache policy
+    "tests/slimserve/test_cache_vision_policy.py",
+]
+
+
+def profile_invariant_gaps(
+    c: Campaign, ev: dict[str, Any], need_evidence: bool
+) -> list[str]:
+    """CLAUDE.md profile invariants for this campaign's record."""
+    why: list[str] = []
+    ok, tail = registry_tests_pass(c, INVARIANT_TESTS)
+    if not ok:
+        why.append(f"profile-invariant registry tests fail: {tail}")
+    platform = c.state.get("platform", {}).get("platform")
+    prof = profiles_json(c).get("profiles", {}).get(c.id) or {}
+    record = (prof.get("variants") or {}).get(platform) if platform else None
+    if not isinstance(record, dict):
+        why.append(
+            f"{c.id} has no variants[{platform!r}] record (one record per platform; "
+            "never widen another platform's record)"
+        )
+        return why
+    if record.get("platform") != platform:
+        why.append(f"{c.id}/{platform} record does not state platform={platform!r}")
+    if not need_evidence:
+        return why
+    engine = record.get("engine") or {}
+    ctx = ev.get("context")
+    if not isinstance(ctx, dict) or not _num(ctx.get("model_default")):
+        why.append(
+            "evidence.context must give model_default (the context configured in "
+            "the GGUF / config.json) and max_model_len"
+        )
+    else:
+        served = engine.get("max_model_len")
+        if served != ctx.get("max_model_len"):
+            why.append(
+                f"evidence.context.max_model_len={ctx.get('max_model_len')!r} does "
+                f"not match the record's engine.max_model_len={served!r}"
+            )
+        if (
+            _num(served)
+            and served < ctx["model_default"]
+            and len(str(ctx.get("impossibility", ""))) < 60
+        ):
+            why.append(
+                f"the record serves {served} tokens, below the model default "
+                f"{ctx['model_default']}; CLAUDE.md requires the default unless it "
+                "is genuinely impossible here, and evidence.context.impossibility "
+                "must say why (with the arithmetic). The CPU-offloaded KV tier, not "
+                "a max_model_len cap, provides deep-context concurrency"
+            )
+    vis = ev.get("vision")
+    if not isinstance(vis, dict) or not isinstance(vis.get("model_supports"), bool):
+        why.append(
+            "evidence.vision must state model_supports (true/false) and, when "
+            "true, image_canary (the passing image-request result)"
+        )
+    elif vis["model_supports"] and not vis.get("image_canary"):
+        # The record itself cannot disable vision: test_cache_vision_policy.py
+        # (in INVARIANT_TESTS) rejects that.
+        why.append(
+            "the model supports vision but evidence.vision.image_canary is "
+            "empty (validate an image request, not only text)"
+        )
+    return why
 
 
 def guard_passes(c: Campaign) -> tuple[bool, str]:
     env = dict(
-        os.environ, CAMPAIGN_PRIVATE_EMAILS=private_emails(), CAMPAIGN_PYTHON=c.python
+        os.environ,
+        CAMPAIGN_PRIVATE_EMAILS=private_emails(c.state.get("git_email", "")),
+        CAMPAIGN_PYTHON=c.python,
     )
     out = run(
         [
@@ -842,6 +974,7 @@ def validate_marker(
                 "evidence.boots must be true (the profile reached /health through "
                 "slimserve --serve)"
             )
+        why += profile_invariant_gaps(c, ev, need_evidence=True)
     elif phase == "decode":
         ss = ev.get("single_stream") or {}
         if not (_num(ss.get("ours")) and _num(ss.get("bar"))):
@@ -881,6 +1014,7 @@ def validate_marker(
                 "single-stream is below the bar and evidence.ceiling_defended does not "
                 "explain why (roofline + residual)"
             )
+        why += profile_invariant_gaps(c, ev, need_evidence=False)
     elif phase == "prefill":
         pf = ev.get("prefill")
         if not (
@@ -889,6 +1023,7 @@ def validate_marker(
             and all(isinstance(r, dict) and _num(r.get("ours")) for r in pf)
         ):
             why.append("evidence.prefill must list >= 2 lengths {tokens, ours, bar}")
+        why += profile_invariant_gaps(c, ev, need_evidence=False)
     elif phase == "cleanup":
         dirty = git(wt, "status", "--porcelain", "--untracked-files=no", check=False)
         if dirty:
@@ -902,6 +1037,7 @@ def validate_marker(
         ok, tail = guard_passes(c)
         if not ok:
             why.append("tools/campaign/guard.sh fails:\n" + tail)
+        why += profile_invariant_gaps(c, ev, need_evidence=True)
         prof = profiles_json(c).get("profiles", {}).get(c.id, {})
         statuses = [prof.get("status")] + [
             v.get("status") for v in (prof.get("variants") or {}).values()
@@ -1184,6 +1320,8 @@ def cmd_start(args: argparse.Namespace) -> int:
     if args.pr:
         c.state["pr"] = args.pr
     c.state["delegate"] = args.delegate or "research"
+    c.state["allow_kill_servers"] = bool(args.allow_kill_servers)
+    c.state["git_email"] = args.git_email or ""
     ensure_worktree(c, args)
     c.state["platform"] = detect_platform(c.repo, c.python)
     c.log(f"platform: {c.state['platform']}")
@@ -1220,7 +1358,8 @@ def cmd_resume(args: argparse.Namespace) -> int:
         c.state["phase"] = args.from_phase
     if args.delegate:
         c.state["delegate"] = args.delegate
-    c.log("resuming")
+    c.state["allow_kill_servers"] = bool(args.allow_kill_servers)
+    c.log(f"resuming (allow_kill_servers={c.state['allow_kill_servers']})")
     return main_loop(c, args)
 
 
@@ -1354,6 +1493,13 @@ def build_parser() -> argparse.ArgumentParser:
         )
         sp.add_argument("--from-phase", choices=PHASES[:-1], default=None)
         sp.add_argument(
+            "--allow-kill-servers",
+            action="store_true",
+            help="let the agent stop local inference servers it did not start when "
+            "it needs their memory (default: never; it writes a blocked marker "
+            "instead). Applies to this launch only; `resume` must pass it again.",
+        )
+        sp.add_argument(
             "--delegate",
             choices=sorted(DELEGATION_TEXT),
             default=None,
@@ -1407,8 +1553,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument(
         "--git-email",
         default="",
-        help="an additional allowed commit email (must still be a noreply address to "
-        "pass the guard)",
+        help="an additional allowed commit email for a human identity that is not "
+        "a noreply address (never an AI identity; the guard rejects those)",
     )
     s.add_argument("--astra-model", default="gpt-6-astra")
     s.add_argument(

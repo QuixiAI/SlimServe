@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
-# Claude Code PreToolUse hook (matcher: Bash). Blocks commands that would
-# forge authorship, add attribution trailers, mention the tooling in a commit
-# or PR text, or post a private address. Exit 2 = block, with the reason on
-# stderr for the model. Reads the hook JSON on stdin.
+# Claude Code PreToolUse hook (matcher: Bash). Enforces CLAUDE.md "Commit
+# authorship": AI is never an author, human contributors keep theirs. Blocks
+# commands that set an AI commit identity, add a Co-authored-by (or other
+# attribution trailer) naming an AI, mention automated assistance in a commit
+# or PR text, or post a private address. Preserving a human contributor's
+# authorship (--author, GIT_AUTHOR_*, a human Co-authored-by) is allowed.
+# Exit 2 = block, with the reason on stderr for the model. Reads the hook
+# JSON on stdin.
 set -u
 input=$(cat)
 cmd=$(printf '%s' "$input" | python3 -c 'import json,sys
@@ -12,17 +16,21 @@ except Exception: print("")' 2>/dev/null)
 [ -z "$cmd" ] && exit 0
 block() { printf 'BLOCKED by block-ai-attribution: %s\n' "$*" >&2; exit 2; }
 
-# identity forgery
-if printf '%s' "$cmd" | grep -qE 'GIT_(AUTHOR|COMMITTER)_(NAME|EMAIL)|git commit[^|;&]* --author|git config[^|;&]* user\.(name|email)'; then
-  if printf '%s' "$cmd" | grep -qE 'user\.email[^|;&]*users\.noreply\.github\.com'; then :; else
-    block "never set GIT_AUTHOR_*/GIT_COMMITTER_*, --author, or a non-noreply user.email; commit with the machine's configured identity"
-  fi
+# Names and addresses that identify an AI tool or model, never a person.
+AI_ID='claude|anthropic|codex|openai|chatgpt|copilot|gemini|\bgpt\b|gpt-[0-9]|\b(ai|llm) (agent|assistant)\b'
+# AI commit identity: an author/committer set to an AI name or address.
+# Setting a human identity (preserving a contributor's authorship) passes.
+ident=$(printf '%s' "$cmd" | grep -oiE "GIT_(AUTHOR|COMMITTER)_(NAME|EMAIL)=(\"[^\"]*\"|'[^']*'|[^ ]*)|--author[= ](\"[^\"]*\"|'[^']*'|[^ ]*)|user\.(name|email)[= ](\"[^\"]*\"|'[^']*'|[^ ]*)" || true)
+if [ -n "$ident" ] && printf '%s' "$ident" | grep -qiE "$AI_ID"; then
+  block "AI is never a commit author or committer (CLAUDE.md Commit authorship); commit with the human operator's or contributor's identity"
 fi
 # attribution / tooling mentions in commit or PR text
-if printf '%s' "$cmd" | grep -qE 'git commit|gh pr (create|edit|comment|review)|gh api [^|;&]*(comments|reviews|pulls)'; then
-  ATTRIB='co-authored-by|generated (with|by)|signed-off-by:.*(claude|codex|anthropic|openai|gpt)|(assisted|written|authored|produced|drafted|implemented) (by|with) (claude|codex|anthropic|openai|gpt|an? (ai|llm|model|agent)\b)|with (the )?(help|assistance) of (claude|codex|an? (ai|llm|model|agent))|ai[- ]assisted|automated assistance'
-  if printf '%s' "$cmd" | grep -qiE "$ATTRIB"; then
-    block "commit messages, PR bodies and review replies must not credit a tool or model as author or assistant"
+if printf '%s' "$cmd" | grep -qE 'git (commit|merge|tag)|gh pr (create|edit|comment|review)|gh api [^|;&]*(comments|reviews|pulls)'; then
+  # trailers naming an AI (a human Co-authored-by is legitimate)
+  TRAILER="(co-authored-by|signed-off-by|assisted-by|generated-by|helped-by):.*($AI_ID)"
+  ATTRIB="generated (with|by) \\[?($AI_ID|an? (ai|llm|model|agent)\b)|(assisted|written|authored|produced|drafted|implemented) (by|with) ($AI_ID|an? (ai|llm|model|agent)\b)|with (the )?(help|assistance) of ($AI_ID|an? (ai|llm|model|agent))|ai[- ]assisted|automated assistance"
+  if printf '%s' "$cmd" | grep -qiE "$TRAILER|$ATTRIB"; then
+    block "commit messages, PR bodies and review replies must not credit an AI as author, co-author or assistant (CLAUDE.md Commit authorship)"
   fi
 fi
 # private addresses anywhere in a git/gh command

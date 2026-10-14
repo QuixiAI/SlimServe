@@ -30,7 +30,7 @@ Read next, in this order, before doing anything in a phase:
 | --- | --- |
 | discover | artifact verified; source + profile registered (`status: in-progress`); memory budget and per-token bytes derived; research digest written; the bar engine measured on this box and recorded in `perf/baseline_status.md`; the campaign plan is the top section of HANDOFF.md; registry tests pass |
 | bringup | the profile boots to health through `slimserve <id> --serve`, produces coherent text, passes per-layer or teacher-forced parity against a reference and a needle at moderate context; the first exact-token pins (N0) are recorded |
-| decode | byte-ordered kernel waves done, speculation decided (whichever drafter is fastest here), single-stream decode beats the bar, and **multi-stream decode scales** (concurrent exact-token gates pinned; batching earns its keep or the notebook proves the ceiling); every wave journaled |
+| decode | byte-ordered kernel waves done, drafter measured, registered and on in every gate (CLAUDE.md: every supported profile runs its registered drafter), single-stream decode beats the bar, and **multi-stream decode scales** (concurrent exact-token gates pinned; batching earns its keep or the notebook proves the ceiling); every wave journaled |
 | prefill | prefill throughput and TTFT beat the bar at short, mid and deep context; concurrent prefill measured; every change journaled |
 | cleanup | failed experiments deleted, kill switches audited, tests for every shape gate, ruff clean, other profiles re-gated bit-exact, profile flipped to `supported` (or its gate reason stated), domain-sliced commits, `tools/campaign/guard.sh` passes, PR description drafted |
 | pr | `origin/main` merged (semantically, never one side wholesale), pins re-gated on the merged build, branch pushed, draft PR open with the bar table first, CodeRabbit triggered |
@@ -112,8 +112,11 @@ not negotiable inside a campaign.
 - **Servers are detached.** Boot the server with `start_new_session=True`
   (see `references/platform-ops.md`); the agent harness kills background
   task trees once a model pins tens of GiB. Never rebuild while a server
-  runs. The operator has authorized killing any local server whenever the
-  campaign needs the memory; report what was stopped.
+  runs. Stop only servers this campaign booted. A server the campaign did
+  not start is never killed unless the operator launched this run with
+  `run_campaign.py ... --allow-kill-servers` (the prompt states which); without
+  it, write a `blocked` marker naming the process that holds the memory.
+  With it, record in HANDOFF.md and the marker exactly what was stopped.
 - **Never stop at a milestone.** A finished wave, a written handoff or a
   passed gate is not a stopping point; begin the next ranked item in the
   same turn. End the turn only with a phase marker written, or blocked on
@@ -126,10 +129,15 @@ not negotiable inside a campaign.
 - **Wait in the foreground.** Boots and gates under ten minutes run in
   foreground Bash with a long timeout; only runs past the Bash ceiling go to
   the background, and then batch the follow-on work before ending the turn.
-- **Speculation is a measurement, not a preference.** Whichever drafter is
-  fastest on this hardware ships (native MTP, DFlash, DSpark, whatever is
-  published for the model); acceptance is recorded in every gate; a
-  batch-adaptive schedule turns it off where it loses.
+- **Every supported profile runs with its registered drafter** and its
+  registered draft KV configuration (CLAUDE.md "Profile validation"); FP8 is
+  the only permitted quantized draft or target KV, TurboQuant never. Which
+  drafter gets registered is a measurement (native MTP, DFlash, DSpark,
+  whatever is published for the model): measure the candidates on this
+  hardware, register the winner, and from then on every gate runs with it
+  and records acceptance. Shipping without a drafter is not an option for a
+  model that has one. A batch-adaptive schedule may turn speculation off at
+  batch sizes where it loses; the drafter stays registered.
 - **Prefer the repo's own precedent.** Study the optimized path on another
   platform before writing a new one; preserve its layouts, fusion
   boundaries and lessons unless this hardware gives a measured reason.

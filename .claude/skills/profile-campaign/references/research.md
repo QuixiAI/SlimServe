@@ -30,7 +30,8 @@ exists", "unsupported upstream", "nobody has published speeds", search:
   Record the protocol beside every number; most are not our shape.
 - Drafters for the model: MTP heads in the checkpoint, DFlash / DFlash2,
   DSpark, EAGLE-3, published on HF (`incoai`, `z-lab`, the model lab's
-  org). Licenses noted; the fastest one on this box ships.
+  org). Licenses noted; the one measured fastest on this box is registered, and the
+  supported profile always runs with it.
 - Upstream vLLM issues for the model (acceptance bugs, parser defaults,
   hybrid-model prefix-caching defaults) so known defects are not
   rediscovered.

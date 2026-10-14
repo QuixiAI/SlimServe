@@ -11,8 +11,7 @@ box teaches you something new.
   win over the installed package. Lint with `uvx ruff check` /
   `uvx ruff format --check` on changed files.
 - Boot only through the profile: `slimserve <id> --serve --host 127.0.0.1
-  --port 8000 -y` (`--spec` / `--no-spec` to pin the drafter arm). A record
-  with `status: in-progress` boots with `SLIMSERVE_SERVE_IN_PROGRESS=1`.
+  --port 8000 -y` (`--spec` / `--no-spec` to pin the drafter arm).
   `slimserve <id> --dry-run` shows the resolved command.
 - Boot **detached** so the agent harness cannot kill the server with the
   session's process tree:
@@ -25,9 +24,11 @@ box teaches you something new.
   then poll `http://127.0.0.1:8000/health` until 200 (boots take 2-5 min),
   primer request, ramp request, then gates. Keep the boot script under
   `perf/results/<date>/` so the next session reuses it.
-- Kill by PID lineage (`pgrep -f "vllm.entrypoints.openai.api_server"`,
+- Stop the campaign's own servers by PID lineage (`pgrep -f "vllm.entrypoints.openai.api_server"`,
   then the `EngineCore` children), wait for memory to release before the
-  next boot. Never `pkill -f` a pattern the calling shell contains.
+  next boot. Never `pkill -f` a pattern the calling shell contains. A server
+  this campaign did not boot is stopped only on a launch with
+  `--allow-kill-servers`; otherwise write a `blocked` marker.
 - One model resident at a time. Never rebuild native code while a server
   runs. Downloads are SlimServe's job (`slimserve <id> -y` fetches and
   resumes); do not block on a missing file, start the download and work on

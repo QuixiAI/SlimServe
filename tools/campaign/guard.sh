@@ -3,8 +3,8 @@
 #
 #   tools/campaign/guard.sh [--base origin/main] [--allow-metallib]
 #
-# Fails (exit 1) on anything that has burned a campaign before: a commit
-# identity that is not a GitHub noreply address, attribution trailers, a
+# Fails (exit 1) on anything that has burned a campaign before: an AI commit
+# identity, AI attribution trailers or mentions, a private commit address, a
 # private email or a session scratchpad path in the diff, deployment
 # configuration, a Metal library binary, lint errors, or failing registry
 # tests. Env: CAMPAIGN_PRIVATE_EMAILS (colon-separated, never committed),
@@ -28,34 +28,51 @@ cd "$top"
 git rev-parse --verify --quiet "$BASE" >/dev/null || { echo "base $BASE not found (git fetch?)" >&2; exit 2; }
 merge_base=$(git merge-base "$BASE" HEAD)
 
-# 1. identity
+# 1-2. authorship (CLAUDE.md "Commit authorship"): AI is never an author or
+# committer and is never credited in a trailer or message; human contributors
+# keep their authorship, so a human identity is never a failure here. Private
+# addresses (CAMPAIGN_PRIVATE_EMAILS) are. A non-noreply address is a warning:
+# the campaign's own commits should use the noreply identity.
+AI_ID='claude|anthropic|codex|openai|chatgpt|copilot|gemini|\bgpt\b|gpt-[0-9]|\b(ai|llm) (agent|assistant)\b'
+IFS=':' read -r -a privs <<< "${CAMPAIGN_PRIVATE_EMAILS:-}"
+is_private() { local e="$1" p; for p in ${privs[@]+"${privs[@]}"}; do [ -n "$p" ] && [ "$e" = "$p" ] && return 0; done; return 1; }
 email=$(git config user.email || true)
 name=$(git config user.name || true)
-case "$email" in
-  *@users.noreply.github.com) ok "commit identity $name <$email>";;
-  *) bad "git user.email is '$email'; must be a users.noreply.github.com address (git config user.email <id>+<login>@users.noreply.github.com)";;
-esac
+if printf '%s %s' "$name" "$email" | grep -qiE "$AI_ID"; then
+  bad "git identity '$name <$email>' names an AI; AI is never a commit author"
+elif is_private "$email"; then
+  bad "git user.email is a private address; use a users.noreply.github.com address"
+else
+  case "$email" in
+    *@users.noreply.github.com) ok "commit identity $name <$email>";;
+    *) say "warn: git user.email '$email' is not a users.noreply.github.com address";;
+  esac
+fi
 
-# 2. commits since base: identities and messages
-while IFS=$'\t' read -r sha ae ce; do
-  case "$ae" in *@users.noreply.github.com) ;; *) bad "commit $sha author email '$ae' is not a noreply address";; esac
-  case "$ce" in *@users.noreply.github.com) ;; *) bad "commit $sha committer email '$ce' is not a noreply address";; esac
-done < <(git log --format='%h%x09%ae%x09%ce' "$merge_base..HEAD")
+while IFS=$'\t' read -r sha an ae cn ce; do
+  for who in "$an <$ae>" "$cn <$ce>"; do
+    if printf '%s' "$who" | grep -qiE "$AI_ID"; then bad "commit $sha has an AI author/committer: $who"; fi
+  done
+  for e in "$ae" "$ce"; do
+    if is_private "$e"; then bad "commit $sha carries a private address ${e%%@*}@..."; fi
+  done
+done < <(git log --no-merges --format='%h%x09%an%x09%ae%x09%cn%x09%ce' "$merge_base..HEAD")
 msgs=$(git log --format='%h %B' "$merge_base..HEAD")
 # Attribution phrasing, not bare product names: a commit may describe tooling
-# that drives an agent or a model whose name contains "gpt"; it may not credit one.
-ATTRIB='co-authored-by|generated (with|by)|signed-off-by:.*(claude|codex|anthropic|openai|gpt)|(assisted|written|authored|produced|drafted|implemented) (by|with) (claude|codex|anthropic|openai|gpt|an? (ai|llm|model|agent)\b)|with (the )?(help|assistance) of (claude|codex|an? (ai|llm|model|agent))|ai[- ]assisted|automated assistance'
-if printf '%s' "$msgs" | grep -niE "$ATTRIB" >/dev/null; then
-  bad "a commit message since $BASE carries an attribution line:"; printf '%s' "$msgs" | grep -niE "$ATTRIB" | head -5
+# that drives an agent or a model whose name contains "gpt"; it may not credit
+# one. A Co-authored-by naming a human is legitimate.
+TRAILER="(co-authored-by|signed-off-by|assisted-by|generated-by|helped-by):.*($AI_ID)"
+ATTRIB="generated (with|by) \[?($AI_ID|an? (ai|llm|model|agent)\b)|(assisted|written|authored|produced|drafted|implemented) (by|with) ($AI_ID|an? (ai|llm|model|agent)\b)|with (the )?(help|assistance) of ($AI_ID|an? (ai|llm|model|agent))|ai[- ]assisted|automated assistance"
+if printf '%s' "$msgs" | grep -niE "$TRAILER|$ATTRIB" >/dev/null; then
+  bad "a commit message since $BASE credits an AI:"; printf '%s' "$msgs" | grep -niE "$TRAILER|$ATTRIB" | head -5
 else
-  ok "commit messages carry no attribution lines ($(git rev-list --count "$merge_base..HEAD") commits)"
+  ok "commit messages carry no AI attribution ($(git rev-list --count "$merge_base..HEAD") commits)"
 fi
 
 # 3. the diff: private emails, scratchpad paths, host paths in code
 # The guard and the hook carry these patterns themselves; exclude them from the scan.
 SELF=(':!tools/campaign/guard.sh' ':!tools/campaign/hooks/*')
 added=$(git diff "$merge_base" --unified=0 -- . ':!*.lock' ':!*.metallib' "${SELF[@]}" | grep -E '^\+' | grep -vE '^\+\+\+' || true)
-IFS=':' read -r -a privs <<< "${CAMPAIGN_PRIVATE_EMAILS:-}"
 for p in ${privs[@]+"${privs[@]}"}; do
   [ -z "$p" ] && continue
   if printf '%s' "$added" | grep -F -q -- "$p"; then bad "private address present in the diff: ${p%%@*}@..."; fi

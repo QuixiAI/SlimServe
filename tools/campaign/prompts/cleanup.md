@@ -47,4 +47,7 @@ the full gate set must pass bit-exact at the end.
 Marker evidence keys: `commits` (list of {sha, subject}), `tests` ({files,
 passed, build}), `anchors` (list of {profile, result, consecutive}),
 `status` (`supported` or the gate reason), `status_reason` (if gated),
-`pr_description` (path), `guard` (`pass`).
+`pr_description` (path), `guard` (`pass`), `context` ({max_model_len, model_default, impossibility
+if the record serves less than the model default}), `vision`
+({model_supports, image_canary when true}) as finally
+validated. The profile-invariant registry tests run again here.
