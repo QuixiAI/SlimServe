@@ -17,7 +17,10 @@ from vllm.entrypoints.openai.responses.protocol import (
     ResponsesRequest,
     ResponsesResponse,
 )
-from vllm.entrypoints.openai.responses.serving import OpenAIServingResponses
+from vllm.entrypoints.openai.responses.serving import (
+    RESPONSE_CANCELLED_CODE,
+    OpenAIServingResponses,
+)
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.parser.qwen3 import Qwen3Parser, qwen3_config
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
@@ -250,6 +253,11 @@ def test_abort_keeps_cancelled_storage_and_does_not_emit_completion():
         in ("response.completed", "response.failed", "response.incomplete")
         for event in events
     )
+    # Responses has no response.cancelled event: the stream still ends, with
+    # a typed error event that names the cancellation.
+    assert events[-1]["type"] == "error"
+    assert events[-1]["code"] == RESPONSE_CANCELLED_CODE
+    assert [event["sequence_number"] for event in events] == list(range(len(events)))
 
 
 @pytest.mark.parametrize(
@@ -292,5 +300,150 @@ def test_response_status_does_not_rewrite_emitted_item_status(
         serving._make_response_output_items.assert_not_called()
         if response_status == "failed":
             assert response.error.code == "server_error"
+
+    asyncio.run(run())
+
+
+def _logprob_outputs():
+    from vllm.logprobs import Logprob
+
+    # Two deltas of two tokens; top-2 alternatives per position. "é" checks
+    # that token bytes are the UTF-8 encoding, as in the non-streamed path.
+    tokens = [(11, "Hé"), (12, "llo"), (13, ", "), (14, "world")]
+    outputs = []
+    for start in (0, 2):
+        chunk = tokens[start : start + 2]
+        outputs.append(
+            CompletionOutput(
+                index=0,
+                text="".join(text for _, text in chunk),
+                token_ids=[token_id for token_id, _ in chunk],
+                cumulative_logprob=None,
+                logprobs=[
+                    {
+                        token_id: Logprob(-0.25, rank=1, decoded_token=text),
+                        99: Logprob(-2.5, rank=2, decoded_token="alt"),
+                    }
+                    for token_id, text in chunk
+                ],
+                finish_reason="stop" if start else None,
+            )
+        )
+    return outputs
+
+
+def _logprob_serving():
+    serving = object.__new__(OpenAIServingResponses)
+    serving.use_harmony = False
+    serving.parser = None
+    serving.enable_auto_tools = False
+    serving.enable_log_outputs = False
+    serving.return_tokens_as_token_ids = False
+    serving._initialize_tool_sessions = AsyncMock()
+    serving.response_store = {}
+    serving.response_store_lock = asyncio.Lock()
+    return serving
+
+
+def _logprob_request():
+    return ResponsesRequest(
+        model="test",
+        input="test",
+        store=False,
+        include=["message.output_text.logprobs"],
+        top_logprobs=2,
+    )
+
+
+async def _logprob_context(context, request):
+    for output in _logprob_outputs():
+        context.append_output(
+            RequestOutput(
+                request_id=request.request_id,
+                prompt="test",
+                prompt_token_ids=[1],
+                prompt_logprobs=None,
+                finished=output.finish_reason is not None,
+                outputs=[output],
+            )
+        )
+        yield context
+
+
+def test_streamed_terminal_output_keeps_requested_logprobs():
+    async def run():
+        request = _logprob_request()
+        params = SamplingParams(max_tokens=16, logprobs=2)
+        context = SimpleContext()
+        events = [
+            event
+            async for event in _logprob_serving().responses_stream_generator(
+                request,
+                params,
+                _logprob_context(context, request),
+                context,
+                "test",
+                None,
+                RequestResponseMetadata(request_id=request.request_id),
+            )
+        ]
+        streamed = [
+            logprob.model_dump()
+            for event in events
+            if event.type == "response.output_text.delta"
+            for logprob in event.logprobs
+        ]
+        assert [logprob["token"] for logprob in streamed] == [
+            "Hé",
+            "llo",
+            ", ",
+            "world",
+        ]
+
+        # The same request, not streamed, is the reference.
+        context = SimpleContext()
+        async for _ in _logprob_context(context, request):
+            pass
+        reference = await _logprob_serving().responses_full_generator(
+            request,
+            params,
+            _logprob_context(SimpleContext(), request),
+            context,
+            "test",
+            None,
+            RequestResponseMetadata(request_id=request.request_id),
+        )
+        expected = reference.output[0].content[0].logprobs
+        assert expected is not None and len(expected) == 4
+        assert expected[0].bytes == list("Hé".encode())
+
+        terminal = events[-1]
+        assert terminal.type == "response.completed"
+        part = terminal.response.output[0].content[0]
+        assert part.text == "Héllo, world"
+        assert part.logprobs == expected
+        text_done = next(e for e in events if e.type == "response.output_text.done")
+        assert [logprob.model_dump() for logprob in text_done.logprobs] == streamed
+
+    asyncio.run(run())
+
+
+def test_streamed_terminal_output_omits_unrequested_logprobs():
+    async def run():
+        request = ResponsesRequest(model="test", input="test", store=False)
+        context = SimpleContext()
+        events = [
+            event
+            async for event in _logprob_serving().responses_stream_generator(
+                request,
+                SamplingParams(max_tokens=16),
+                _logprob_context(context, request),
+                context,
+                "test",
+                None,
+                RequestResponseMetadata(request_id=request.request_id),
+            )
+        ]
+        assert events[-1].response.output[0].content[0].logprobs is None
 
     asyncio.run(run())
