@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     VLLM_DEBUG_LOG_API_SERVER_RESPONSE: bool = False
     VLLM_BAD_REQUEST_LOG_PATH: str | None = None
     VLLM_BAD_REQUEST_LOG_MAX_BYTES: int = 262144
+    VLLM_BAD_REQUEST_LOG_MAX_FILE_BYTES: int = 67108864
     S3_ACCESS_KEY_ID: str | None = None
     S3_SECRET_ACCESS_KEY: str | None = None
     S3_ENDPOINT_URL: str | None = None
@@ -778,6 +779,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_BAD_REQUEST_LOG_PATH": lambda: os.getenv("VLLM_BAD_REQUEST_LOG_PATH"),
     "VLLM_BAD_REQUEST_LOG_MAX_BYTES": lambda: int(
         os.getenv("VLLM_BAD_REQUEST_LOG_MAX_BYTES", "262144")
+    ),
+    # Size cap for the bad-request capture file; past it the file is rotated
+    # once to <path>.1 (replacing any older rotation).
+    "VLLM_BAD_REQUEST_LOG_MAX_FILE_BYTES": lambda: int(
+        os.getenv("VLLM_BAD_REQUEST_LOG_MAX_FILE_BYTES", "67108864")
     ),
     # S3 access information, used for tensorizer to load model from S3
     "S3_ACCESS_KEY_ID": lambda: os.environ.get("S3_ACCESS_KEY_ID", None),

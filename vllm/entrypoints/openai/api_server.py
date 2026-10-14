@@ -361,19 +361,26 @@ def build_app(
         )
         app.middleware("http")(log_response)
 
+    # The capture wraps AuthenticationMiddleware (and admission control, so
+    # 429s are visible); it never records 401/403 itself, so unauthenticated
+    # clients cannot make the server write to disk. File size is capped.
     if bad_request_log_path := envs.VLLM_BAD_REQUEST_LOG_PATH:
         bad_request_log_max_bytes = envs.VLLM_BAD_REQUEST_LOG_MAX_BYTES
+        bad_request_log_max_file_bytes = envs.VLLM_BAD_REQUEST_LOG_MAX_FILE_BYTES
         app.add_middleware(
             BadRequestBodyCaptureMiddleware,
             path=bad_request_log_path,
             max_body_bytes=bad_request_log_max_bytes,
+            max_file_bytes=bad_request_log_max_file_bytes,
         )
         logger.warning(
-            "Bad-request body capture enabled at %s (max %d bytes per body). "
-            "The file can contain sensitive prompt/tool data and is forced "
-            "to owner-only permissions.",
+            "Bad-request body capture enabled at %s (max %d bytes per body, "
+            "file rotated once to .1 past %d bytes). The file can contain "
+            "sensitive prompt/tool data and is forced to owner-only "
+            "permissions.",
             os.path.abspath(bad_request_log_path),
             bad_request_log_max_bytes,
+            bad_request_log_max_file_bytes,
         )
 
     for middleware in args.middleware:

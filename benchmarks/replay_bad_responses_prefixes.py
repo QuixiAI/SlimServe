@@ -213,7 +213,12 @@ def main() -> None:
     parser.add_argument("output_dir", type=Path)
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
     parser.add_argument("--api-key", default=os.environ.get("OPENAI_API_KEY"))
-    parser.add_argument("--first-record", type=int, default=5)
+    parser.add_argument(
+        "--first-record",
+        type=int,
+        default=1,
+        help="1-based diagnostics record to start from (default: the first)",
+    )
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--timeout", type=float, default=300)
     args = parser.parse_args()

@@ -138,3 +138,84 @@ def test_success_is_not_recorded(tmp_path):
         assert not log_path.exists()
 
     asyncio.run(run())
+
+
+def test_unauthenticated_requests_are_not_recorded(tmp_path):
+    """The capture wraps AuthenticationMiddleware in build_app; a client
+    without a valid key must not be able to make the server write to disk."""
+    from vllm.entrypoints.serve.utils.server_utils import AuthenticationMiddleware
+
+    async def bad_request(_scope, receive, send):
+        await receive()
+        await send({"type": "http.response.start", "status": 400, "headers": []})
+        await send({"type": "http.response.body", "body": b"bad"})
+
+    async def run():
+        log_path = tmp_path / "bad-requests.jsonl"
+        # Same nesting as build_app: capture outside authentication.
+        middleware = BadRequestBodyCaptureMiddleware(
+            AuthenticationMiddleware(bad_request, tokens=["right-key"]),
+            path=str(log_path),
+            max_body_bytes=1024,
+        )
+        scope = _scope(authorization="Bearer wrong-key")
+        scope["path"] = "/v1/responses"
+        await middleware(scope, _receive_chunks(b"{}"), _sink)
+        assert not log_path.exists()
+
+        await middleware(
+            _scope(authorization="Bearer right-key"),
+            _receive_chunks(b"{}"),
+            _sink,
+        )
+        assert json.loads(log_path.read_text())["status"] == 400
+
+    asyncio.run(run())
+
+
+def test_forbidden_status_is_not_recorded(tmp_path):
+    async def forbidden(_scope, receive, send):
+        await receive()
+        await send({"type": "http.response.start", "status": 403, "headers": []})
+        await send({"type": "http.response.body", "body": b"no"})
+
+    async def run():
+        log_path = tmp_path / "bad-requests.jsonl"
+        middleware = BadRequestBodyCaptureMiddleware(
+            forbidden, path=str(log_path), max_body_bytes=1024
+        )
+        await middleware(_scope(), _receive_chunks(b"{}"), _sink)
+        assert not log_path.exists()
+
+    asyncio.run(run())
+
+
+def test_file_is_capped_and_rotated_once(tmp_path):
+    async def bad_request(_scope, receive, send):
+        await receive()
+        await send({"type": "http.response.start", "status": 400, "headers": []})
+        await send({"type": "http.response.body", "body": b"x" * 100})
+
+    async def run():
+        log_path = tmp_path / "bad-requests.jsonl"
+        rotated = tmp_path / "bad-requests.jsonl.1"
+        middleware = BadRequestBodyCaptureMiddleware(
+            bad_request,
+            path=str(log_path),
+            max_body_bytes=1024,
+            max_file_bytes=2048,
+        )
+        for _ in range(40):
+            await middleware(_scope(), _receive_chunks(b"y" * 100), _sink)
+            assert log_path.stat().st_size <= 2048
+            if rotated.exists():
+                assert rotated.stat().st_size <= 2048
+        assert rotated.exists()
+        assert stat.S_IMODE(rotated.stat().st_mode) == 0o600
+        assert not (tmp_path / "bad-requests.jsonl.2").exists()
+        # Every surviving line is a complete record.
+        for path in (log_path, rotated):
+            for line in path.read_text().splitlines():
+                assert json.loads(line)["status"] == 400
+
+    asyncio.run(run())

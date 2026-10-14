@@ -62,16 +62,36 @@ class BadRequestBodyCaptureMiddleware:
     JSONL file, never include request headers (especially ``Authorization``),
     and are written only for 4xx responses. Body hashes cover the complete
     streams even when the recorded prefix is truncated.
+
+    401/403 responses are never recorded. This middleware sits outside
+    ``AuthenticationMiddleware``, so without that exclusion any
+    unauthenticated client could make the server write to disk; the
+    exclusion holds whatever order operator ``--middleware`` entries or
+    future registrations put it in. The file is also capped at
+    ``max_file_bytes``: once the next record would exceed it, the file is
+    rotated once to ``<path>.1`` (replacing any older rotation), so the
+    capture never holds more than about twice the cap on disk.
     """
 
-    def __init__(self, app: ASGIApp, path: str, max_body_bytes: int) -> None:
+    SKIPPED_STATUSES = frozenset({401, 403})
+
+    def __init__(
+        self,
+        app: ASGIApp,
+        path: str,
+        max_body_bytes: int,
+        max_file_bytes: int = 64 * 1024 * 1024,
+    ) -> None:
         if not path:
             raise ValueError("bad-request capture path must not be empty")
         if max_body_bytes <= 0:
             raise ValueError("bad-request capture size must be positive")
+        if max_file_bytes <= 0:
+            raise ValueError("bad-request capture file cap must be positive")
         self.app = app
         self.path = os.path.abspath(path)
         self.max_body_bytes = max_body_bytes
+        self.max_file_bytes = max_file_bytes
 
     @staticmethod
     def _append_prefix(destination: bytearray, chunk: bytes, limit: int) -> None:
@@ -79,19 +99,37 @@ class BadRequestBodyCaptureMiddleware:
         if remaining > 0:
             destination.extend(chunk[:remaining])
 
-    def _write_record(self, record: dict) -> None:
+    def _open_log(self) -> tuple[int, int]:
         flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
         flags |= getattr(os, "O_CLOEXEC", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
         fd = os.open(self.path, flags, 0o600)
         try:
             os.fchmod(fd, 0o600)
-            if not stat.S_ISREG(os.fstat(fd).st_mode):
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
                 raise OSError(f"diagnostic path is not a regular file: {self.path}")
-            payload = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
-            os.write(fd, payload.encode("utf-8") + b"\n")
-        finally:
+        except BaseException:
             os.close(fd)
+            raise
+        return fd, st.st_size
+
+    def _write_record(self, record: dict) -> None:
+        payload = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+        data = payload.encode("utf-8") + b"\n"
+        fd, size = self._open_log()
+        try:
+            if size > 0 and size + len(data) > self.max_file_bytes:
+                # Rotate once: the previous window survives as <path>.1 and
+                # the live file starts empty. Disk use stays near 2x the cap.
+                os.close(fd)
+                fd = -1
+                os.replace(self.path, self.path + ".1")
+                fd, _ = self._open_log()
+            os.write(fd, data)
+        finally:
+            if fd >= 0:
+                os.close(fd)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -140,6 +178,8 @@ class BadRequestBodyCaptureMiddleware:
         await self.app(scope, capture_receive, capture_send)
 
         if status_code is None or not 400 <= status_code < 500:
+            return
+        if status_code in self.SKIPPED_STATUSES:
             return
 
         request_headers = Headers(scope=scope)
