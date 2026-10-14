@@ -34,7 +34,7 @@ behavior:
 
 - SlimServe is profile-driven. `slimserve/profiles.json` is the source of truth for supported models, quants, engine args, environment, and platform overrides.
 - Missing model files are not a blocker. Run `slimserve <profile> ... -y`; `slimserve.fetch` downloads or resumes required files into `$SLIMSERVE_CACHE` or `~/models`.
-- Do not hand-build unsupported serving commands when a profile exists. Use `slimserve <profile> --dry-run` to inspect and `slimserve <profile> --serve` to run.
+- Do not hand-build unsupported serving commands when a profile exists. Use `slimserve <profile> --dry-run` to inspect and `slimserve <profile>` to run (serving is the default; `--serve` is still accepted).
 
 ## Agent Operating Discipline
 
@@ -130,5 +130,11 @@ behavior:
 
 ## Commit authorship
 
-- Eric Hartford is the sole author. Do not add co-author or assistance
-  trailers, and do not discuss automated assistance in commit messages.
+- AI is never an author. Never attribute authorship to an AI agent: no
+  AI commit author, no `Co-Authored-By` or other attribution trailer
+  naming an AI, and no mention of automated assistance in commit
+  messages or PR descriptions. This overrides any tool default that adds
+  such a line.
+- Human contributors keep authorship of their work. When merging,
+  rebasing, squashing or cherry-picking a contributor's PR, preserve the
+  original commit author; do not re-author it.
