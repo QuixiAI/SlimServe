@@ -1,5 +1,19 @@
 # SlimServe Optimization Status
 
+## 2026-09-24 - Qwen3.6-35B-A3B on one RTX 5090
+
+- Status: in progress; NVFP4 V1 diagnostic passes short, full-length and host-tier restore checks. Qwen3.6 V2 runner work and FP8 qualification are active.
+- Scope: `qwen36-nvfp4-1` (nvidia revision `1355db6a052410cfd62085d94b58866fd0f2c3c5`) and `qwen36-fp8-1` (Qwen revision `95a723d08a9490559dae23d0cff1d9466213d989`), TP1, GeForce RTX 5090 32 GB, driver 595.91.07, CUDA toolkit 13.3, home venv `/home/eric/.venv`, working tree based on `11e644b6c`.
+- Baseline: no prior Qwen3.6/5090 exact-token TPS existed. Other Qwen and 3090 records are architectural precedents, not numerical baselines. Prompt source SHA256 `1262c000f00dd7ebb97e085c417cd22b7963eba8615faee281c069dfd3e0d9ea`; exact 1000-in/2000-out c1 and c8, temperature 1, top_p .95, top_k 20, seed 42, eight-output-token warmup, one timed sample each.
+- Hypothesis: native 262144-token context can fit after reserving GPU for the active FP8 KV and moving a bounded portion of weights to CPU; the existing HostTierConnector can store completed hybrid trajectories in pinned host RAM and spill to NVMe. The 48 GiB host and 128 GiB NVMe tier sizes are capacity budgets on this 120 GiB RAM / 915 GB SSD machine, not throughput results.
+- Change: registered both pinned Hugging Face manifests, CUDA auto MoE selection (Marlin target plus Triton unquantized MTP), checkpoint MTP k=2, vision, FP8 KV, Qwen parsers, native context, host/NVMe tiers and CPU weight offload (NVFP4 4 GiB; FP8 16 GiB). Fixed `cutlass_scaled_mm` in the functionalization pass, which otherwise blocked torch.compile on the first real profile forward. Installed the CUDA 13.3 compatibility libraries and profile-scoped their path: R595 could not JIT the CUDA 13.3 PTX used by the native Marlin path; a reduced Marlin-repack/FP8-scale repro passes with those libraries. Restored the missing DeepGEMM build helper and built native extensions in the home venv.
+- Correctness: 78 registry/hardware tests pass; both dry runs resolve on the detected 5090; both checkpoints downloaded through SlimServe. NVFP4 reached HTTP health, advertised 262144 max length, loaded target + checkpoint MTP + vision, and returned 200 for text and image requests. The 128- and 512-output-token image requests ended in reasoning only; with 2300 allowed output tokens it stopped normally and described the diagram's Proxy API server, vLLM prefill, vLLM decode, KV transfer and tokens. Exact-token c1 and c8 passed all 9 output-count and nondegeneracy checks with positive MTP draft/accept counters. A cold 261000-input/128-output exact-token request also completed; its model output was not graded for long-range recall. A second disjoint 261000-token prompt evicted the first from GPU; replay of the first got 257488 external-prefix-hit tokens, zero GPU-prefix hits, and exactly matched the GPU-cache replay response SHA256, with a host-tier restore trace. This is host-tier restore evidence, not NVMe-spill evidence (disk_reads=0).
+- Results: NVFP4 exact-token c1 **93.407** aggregate output tok/s (21.41 s, 2000 tokens, 1844 drafted/1078 accepted); c8 **254.965** aggregate output tok/s (62.75 s, 16000 tokens, 14594 drafted/8702 accepted), one sample each, no preemptions. Cold 261000-input/128-output completed in 178.16 s (prefill 261000 tokens, one KV preemption); its 0.718 output tok/s is inclusive of the enormous cold prefill and is not a decode TPS baseline. The GPU KV pool is 5.32 GiB / 458752 tokens; 48 GiB pinned host and 128 GiB NVMe tiers initialized. The 4 GiB setting is CPU **weight** offload, distinct from KV tier capacity. At 0.90 utilization startup refused 26.54 GiB free against 28.22 GiB requested. At 0.82 without weight offload, 262144 tokens required 3.04 GiB GPU KV but only 1.33-1.35 GiB remained; reducing profiling batch 8192 -> 2048 did not improve capacity. The 65536-token arm was diagnostic only and was not retained.
+- Decision: retain full native context and both KV tiers. The NVFP4 run was on V1 despite repository policy requiring V2, so its numbers are diagnostic until the V2 rerun. Long-range semantic recall and NVMe spill/restore remain open. FP8 reached health on V2 after wiring the existing CPU weight offloader into V2, defunctionalizing static FP8 activation quantization, and raising the batch limit above the hybrid KV page size. No optimization claim versus another profile is supported by a single sample.
+- Raw: `perf/results/2026-09-24/qwen36-5090-profile/`, especially `serve-full-tier48-offload4-retry.log`, `nvfp4-c1.json`, `nvfp4-c8.json`, `nvfp4-fullctx.json`, `nvfp4-fullctx-repeat.json`, `nvfp4-fullctx-filler.json`, `nvfp4-fullctx-restore.json`, `nvfp4-image-2300.json`, `native-build-retry.log`, profile tests and source. Serve command: `/home/eric/.venv/bin/python -m slimserve.cli qwen36-nvfp4-1 --serve -y`. Exact harness: `/home/eric/.venv/bin/python benchmarks/benchmark_dsv4_exact.py --model /home/eric/models/Qwen3.6-35B-A3B-NVFP4 --served-model-name Qwen3.6-35B-A3B --source perf/results/2026-09-24/qwen36-5090-profile/source.md --concurrency {1,8} --input-tokens 1000 --output-tokens 2000 --temperature 1 --top-p 0.95 --top-k 20 --seed 42`; long-context variant uses `--repeat-source --warmup-output-tokens 0 --input-tokens 261000` and output 128/32/16 as named in JSON; filler uses `--prompt-offset 1`.
+- FP8 V2 follow-up: the Qwen3_5Moe target and MTP architecture were added to V2 runner selection. V2 initially OOMed during expert construction because it did not activate the existing CPU weight offloader; wiring `create_offloader`/`set_offloader` before `load_model` fixed the allocation. Its first compilation exposed an unhandled `_C.static_scaled_fp8_quant` mutation; mapping output `result` in the functionalization pass fixed compilation. The FP8 hybrid KV page is 2128 tokens, so max batched tokens was raised 2048 -> 8192. On the registered FP8 profile, V2 reached health, initialized 292984 GPU KV tokens (1.12x full context), 48 GiB pinned host and 128 GiB NVMe tiers, and passed exact 1000-in/2000-out c1 **35.058** output tok/s (57.05 s, 1680 drafted/1159 accepted) and c8 **68.103** aggregate tok/s (234.94 s, 14084 drafted/8958 accepted). One timed sample each, all nine exact outputs, no preemptions. The image request stopped normally and correctly described the three diagram columns. A cold 261000-input/128-output request completed in **400.67 s**, with three KV preemptions; the output hash equaled the NVFP4 V1 cold-context canary, but it is not a semantic recall grade. Host restore and disk restore have not been shown for FP8. Raw: `fp8-v2-batch8192-serve.log`, `fp8-v2-c1.json`, `fp8-v2-c8.json`, `fp8-v2-image.json`, `fp8-v2-fullctx.json`, plus failed startup logs in the same result directory. Serve command: `/home/eric/.venv/bin/python -m slimserve.cli qwen36-fp8-1 --serve -y`; benchmark command substitutes the FP8 local model and served name into the exact harness command above. Decision: retain the V2 path and both tiers, but optimize costly long-context preemptions and qualify tier restore before production use.
+- NVFP4 V2 follow-up: the registered `qwen36-nvfp4-1` booted with V2, 4.05 GiB CPU weight offload, and 489592 GPU KV tokens (1.87x full context). Exact 1000-in/2000-out one-sample rates were c1 **100.165** and c8 **269.990** aggregate tok/s, all nine exact output counts, zero preemptions. This supersedes the V1 numbers above for short-request performance comparison. Full-context and host-tier restore were only run on V1 and remain V2 qualification gaps. Raw: `nvfp4-v2-serve.log`, `nvfp4-v2-c1.json`, `nvfp4-v2-c8.json`.
+
 ## 2026-09-11 - Native quantized prefill GEMM on Metal; FP8-KV directive state; two walls found
 
 - Directive (operator): CT weights stay in native quantized form ALWAYS -
@@ -26198,6 +26212,52 @@ Phases, by value over risk:
   live server is dominated by noise and competing traffic (110-162 across
   runs today), so the c1 gap is not established. Single-stream decode with
   ignore_eos: 141-187 tok/s.
+- PROD ON nvidia/GLM-5.3-Flash-NVFP4 (2026-09-22, operator directive; the
+  checkpoint is known good and was not modified). ModelOpt NVFP4 export under
+  the glm53f-nvfp4-8 configuration with speculative decoding OFF (operator).
+  Two serving-code fixes were required, both ours: (1) the multimodal
+  wrapper lacked the hf_to_vllm_mapper the loader hands to quantization
+  configs, so ModelOpt's exclude list (checkpoint names) matched nothing and
+  bf16 attention would have gone through the NVFP4 path (f1c14fd78);
+  (2) resolving kv_cache_dtype 'auto' from the checkpoint's
+  kv_cache_quant_algo FP8 reformatted EVERY cache group of this hybrid model
+  - KDA states, indexer pools, the drafter's windows - and the boot died
+  selecting an attention backend for the drafter; hybrid models now keep
+  'auto' and quantize attention KV per layer as before (16050a904). The
+  attention KV IS fp8 e4m3, through glm5_next_main_kv_fp8, same as the
+  record. The export also quantizes the three dense MLPs (RedHat: bf16);
+  they run MarlinNvFp4LinearKernel, first use of that path on this profile.
+  Validation (localhost, prod down): canaries PASS, pool 4,165,129 tokens
+  (record 2,818,758 + the drafter's cache + smaller dense MLPs), exact c1
+  97.8 / c8 563.8; live prod: canaries PASS, c1 97.8 / c8 567.2 (record
+  136 / 572 - the c1 gap is speculation off, c8 at parity). Raw:
+  perf/results/2026-09-21/glm53f-nvidia/, 2026-09-22/glm53f-nvidia-prod/.
+  INCIDENTS: --model keyed its cache directory on the repo name alone and
+  wrote nvidia's shards over the registered RedHat checkpoint twice (the dev
+  tree before d9ba82bbd; then the pinned prod worktree, still on the old
+  commit, during the switch - a 30-min stall and an automatic rollback).
+  Both times only config.json/generation_config.json were overwritten and
+  were restored from the hub cache; weights untouched. Rule: a fix to the
+  override path must move the prod worktree in the same step.
+- PROD ON Lazarus-Ai/GLM-5.3-Flash-UnCut-NVFP4 (2026-09-23, operator).
+  Another ModelOpt NVFP4 export, so the 2026-09-22 fixes (exclusion-name
+  mapping, hybrid KV-dtype rule) carried over untouched. One NEW loader gap:
+  this export uses the upstream tensor spelling - KDA forget gate in a
+  forget_gate submodule, mHC as attn_hc/ffn_hc instead of hc_attn_*/hc_ffn_*,
+  and ONE pre-fused conv1d of 3 x 8192 rows where the RedHat/nvidia exports
+  ship q/k/v_conv1d separately - and it has no MTP layer (45 layers, not 46).
+  load_weights hit the fused parameter by name and called its shard-taking
+  loader with no shard id: TypeError before the first layer (2edd11a1d adds
+  the three renames and splits a pre-fused convolution into its thirds;
+  shapes are identical across all three exports, verified on disk).
+  Validation (localhost, prod down, spec off): canaries PASS, pool 4,165,129
+  tokens, exact c1 97.8 / c8 562.2 - within noise of nvidia's 97.8 / 563.8.
+  Live prod: canaries PASS, c1 97.6, cron canary clean, 0 restarts, fp8 e4m3
+  attention KV, MarlinNvFp4LinearKernel for the dense NVFP4 layers.
+  The deploy now moves the pinned prod worktree to the dev commit and refuses
+  to switch if the prod tree would resolve the override to a directory with
+  no checkpoint - the guard Monday's 30-minute stall needed.
+  Raw: perf/results/2026-09-23/glm53f-lazarus/.
 
 
 ## 2026-09-19 - Authenticate registered Hugging Face downloads without losing resume headers

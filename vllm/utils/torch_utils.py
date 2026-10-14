@@ -371,6 +371,17 @@ def resolve_kv_cache_dtype_string(
     if kv_cache_dtype != "auto":
         return kv_cache_dtype
 
+    # A hybrid model's cache holds more than attention KV: recurrent states,
+    # pooled indexer rows, a block drafter's own windows. The checkpoint's
+    # kv_cache_quant_algo describes only its attention KV, so applying it
+    # engine-wide would quantize state groups that have no quantized backend.
+    # A ModelOpt GLM-5.3-Flash export declaring FP8 KV booted with every
+    # group at fp8 and died selecting an attention backend for the drafter
+    # (2026-09-22). Such models quantize their main KV per layer through
+    # their own configuration (glm5_next_main_kv_fp8), so "auto" stays auto.
+    if getattr(model_config, "is_hybrid", False):
+        return "auto"
+
     hf_cfg = getattr(model_config, "hf_config", None)
     if hf_cfg is not None:
         quant_cfg = getattr(hf_cfg, "quantization_config", None)

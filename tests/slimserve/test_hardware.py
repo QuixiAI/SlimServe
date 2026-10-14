@@ -3,6 +3,10 @@ from types import SimpleNamespace
 from slimserve import hardware
 
 
+def test_rtx5090_is_detected_as_its_own_platform():
+    assert hardware._classify("NVIDIA GeForce RTX 5090") == "rtx5090"
+
+
 def test_nvidia_smi_probe_detects_a100s(monkeypatch):
     def fake_run(*args, **kwargs):
         return SimpleNamespace(
