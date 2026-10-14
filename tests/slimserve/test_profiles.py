@@ -131,38 +131,8 @@ def test_every_speculative_profile_source_names_a_blessed_download():
         )
 
 
-def test_affine_king_production_profile_has_full_context_and_no_draft():
-    plan = resolve("affine-king-nvfp4-1", "rtx5090", 1, "NVFP4")
-    engine = engine_kwargs(plan)
-    assert not plan.speculative
-    assert "speculative_config" not in engine
-    assert engine["max_model_len"] == 262144
-    assert engine["max_num_seqs"] == 64
-    assert engine["kv_cache_dtype"] == "fp8"
-    assert engine["kv_transfer_config"]["kv_connector"] == "HostTierConnector"
-    assert plan.engine["tool_call_parser"] == "qwen3_xml"
-    source_id = registry.describe("affine-king-nvfp4-1")["source"]
-    assert registry._registry()["sources"][source_id]["modalities"] == [
-        "text",
-        "image",
-    ]
 
 
-def test_affine_king_optional_dspark_fetches_complete_pinned_checkpoint():
-    plan = replace(
-        resolve("affine-king-nvfp4-1", "rtx5090", 1, "NVFP4"),
-        speculative=True,
-    )
-    draft_files = [entry for entry in files_for(plan) if entry["role"] == "speculator"]
-    assert {entry["path"] for entry in draft_files} == {
-        "config.json",
-        "config.py",
-        "model.safetensors",
-    }
-    assert {entry["hf_revision"] for entry in draft_files} == {
-        "53814b238c3a6ce5f332066a6bedb9d179777ede"
-    }
-    assert engine_kwargs(plan)["speculative_config"]["method"] == "dspark"
 
 
 def test_spec_cli_opt_in_keeps_registered_glm_defaults(monkeypatch):
@@ -478,7 +448,6 @@ def test_registry_contains_only_the_supported_model_artifacts():
         "kimi-k3",
         "dsv4-flash",
         "muse-glimmer",
-        "affine-king-r21-grpo5-s75-vision-nvfp4",
         "qwen36-35b-a3b-nvfp4",
         "qwen36-35b-a3b-fp8",
         "qwen38-27b",
