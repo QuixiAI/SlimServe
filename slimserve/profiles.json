@@ -3467,7 +3467,9 @@
       "gpus": 1,
       "summary": "GLM-5.3-Flash Q2 (antirez's GGUF: IQ2_XXS gate/up + Q2_K down experts) resident on one 128 GiB Apple Silicon machine, text only, 131072-token context, the GGUF's own nextn block as the K=1 MTP drafter. M1 Ultra single-stream: decode 34-40 tok/s, prefill 237-258 t/s; ds4 on the same box 22.5 / 143. Concurrent (1000-token prompts, 1000 output): 27.5 / 48.4 / 58.2 / 63.1 / 60.2 tok/s at c=1/4/8/16/32; ds4 batched on the same box 16.2 / 22.1 / 23.8 at c=1/4/8 and cannot fit 16 sessions.",
       "speculative": true,
-      "status": "supported",
+      "status": "in-progress",
+      "status_reason": "open serving-policy items: vision off, context capped, prefix cache 0.0% hits, greedy-only benchmarks",
+      "status_detail": "Held back from supported (review, 2026-10-14) until four open items close: (1) vision is off (language_model_only); the registered GLM-5.3-Flash vision encoder is not loaded or qualified on Metal, and policy requires vision with image requests validated; (2) max_model_len is 131072 against the GGUF default 1048576, without a stated impossibility; (3) the 2026-09-15 concurrent baseline measured a 0.0% prefix-cache hit rate on this hybrid layout although enable_prefix_caching is true; (4) every recorded benchmark ran at temperature 0, and must be rerun seeded at temperature 1.0 / top_p 0.95 / top_k 20. Engine settings are unchanged; the throughput in the notes is the greedy measurement.",
       "variants": {
         "metal": {
           "platform": "metal",
