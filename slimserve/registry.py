@@ -20,6 +20,10 @@ from typing import Any
 from slimserve.term import human_bytes
 
 REGISTRY_PATH = Path(__file__).with_name("profiles.json")
+# Operator-private sources, profiles and platforms that must not live in the
+# repo. The file is git-ignored; SLIMSERVE_LOCAL_PROFILES points elsewhere.
+LOCAL_REGISTRY_PATH = Path(__file__).with_name("profiles.local.json")
+_MERGED_SECTIONS = ("sources", "platforms", "profiles")
 CHAT_TEMPLATE_DIR = Path(__file__).with_name("chat_templates")
 
 
@@ -32,10 +36,34 @@ def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def _local_registry_path() -> Path:
+    override = os.environ.get("SLIMSERVE_LOCAL_PROFILES")
+    return Path(override).expanduser() if override else LOCAL_REGISTRY_PATH
+
+
+def _merge_local(registry: dict[str, Any], path: Path) -> None:
+    """Add a local file's records; it may extend the registry, never redefine it."""
+    with path.open(encoding="utf-8") as fp:
+        local = json.load(fp, object_pairs_hook=_unique_object)
+    unknown = set(local) - set(_MERGED_SECTIONS) - {"comment"}
+    if unknown:
+        raise ValueError(f"{path}: unsupported sections {sorted(unknown)}")
+    for section in _MERGED_SECTIONS:
+        records = local.get(section, {})
+        clash = sorted(set(records) & set(registry[section]))
+        if clash:
+            raise ValueError(f"{path}: {section} already defined in profiles.json: {clash}")
+        registry[section].update(records)
+
+
 @lru_cache(maxsize=1)
 def _registry() -> dict[str, Any]:
     with REGISTRY_PATH.open(encoding="utf-8") as fp:
-        return json.load(fp, object_pairs_hook=_unique_object)
+        registry = json.load(fp, object_pairs_hook=_unique_object)
+    local = _local_registry_path()
+    if local.is_file():
+        _merge_local(registry, local)
+    return registry
 
 
 def profile_ids() -> list[str]:
@@ -239,7 +267,13 @@ def parse_model_override(spec: str) -> ModelOverride:
             f"--model {spec}: expected a local directory or a Hugging Face "
             "repo id of the form owner/name"
         )
-    return ModelOverride(spec=text, repo=text, directory=cache_root() / parts[1])
+    # The directory carries the owner too. Repos from different owners share
+    # repo names all the time (nvidia/GLM-5.3-Flash-NVFP4 beside
+    # RedHatAI/GLM-5.3-Flash-NVFP4), and keying on the name alone wrote one
+    # checkpoint's files over another's (2026-09-21).
+    return ModelOverride(
+        spec=text, repo=text, directory=cache_root() / f"{parts[0]}--{parts[1]}"
+    )
 
 
 def _config_of(directory: Path) -> dict[str, Any]:
@@ -281,15 +315,40 @@ def override_conflicts(registered: Path, override: Path) -> list[str]:
         mine, other = ours.get(key), theirs.get(key)
         if mine != other:
             problems.append(f"{key}: profile has {mine!r}, override has {other!r}")
-    mine = (ours.get("quantization_config") or {}).get("quant_algo") or (
-        ours.get("quantization_config") or {}
-    ).get("quant_method")
-    other = (theirs.get("quantization_config") or {}).get("quant_algo") or (
-        theirs.get("quantization_config") or {}
-    ).get("quant_method")
+    mine = _quant_scheme(ours)
+    other = _quant_scheme(theirs)
     if mine != other:
         problems.append(f"quantization: profile has {mine!r}, override has {other!r}")
     return problems
+
+
+def _quant_scheme(config: dict[str, Any]) -> str | None:
+    """The numeric scheme a checkpoint's experts use, container aside.
+
+    compressed-tensors (RedHatAI) and ModelOpt (nvidia) are two serializations
+    of the same NVFP4 arithmetic - e2m1 weights, e4m3 group-16 scales, an fp32
+    global scale - and the fork converts both into the same Marlin kernel
+    format at load, so they are interchangeable under a profile qualified on
+    either. The scheme is what must match; the container is not.
+    """
+    q = config.get("quantization_config")
+    if not q:
+        return None  # an unquantized checkpoint
+    method = q.get("quant_method")
+    algo = q.get("quant_algo")
+    if method == "modelopt":
+        return str(algo or "").upper() or None
+    if method == "compressed-tensors":
+        groups = q.get("config_groups") or {}
+        for group in groups.values():
+            weights = group.get("weights") or {}
+            fmt = group.get("format") or q.get("format")
+            if weights.get("num_bits") == 4 and weights.get("type") == "float":
+                return "NVFP4"
+            if fmt == "float-quantized" and weights.get("num_bits") == 8:
+                return "FP8"
+        return q.get("format")
+    return algo or method
 
 
 class ProfileError(Exception):
@@ -606,6 +665,14 @@ def files_for(plan: Plan) -> list[dict[str, Any]]:
                 "url": f"{base}/{entry['path']}",
                 "local_dir": plan.source["local_dir"],
                 "role": "model",
+                **(
+                    {
+                        "hf_repo": plan.source["repo"],
+                        "hf_revision": plan.source["revision"],
+                    }
+                    if plan.source.get("download_strategy") == "hf_hub"
+                    else {}
+                ),
             }
         )
     for entry in plan.source.get("shared") or []:
@@ -619,13 +686,26 @@ def files_for(plan: Plan) -> list[dict[str, Any]]:
             }
         )
     spec = plan.speculator if plan.speculative else None
-    if spec and (entry := spec.get("file")):
-        wanted.append(
-            {
-                **entry,
-                "url": f"{spec['base_url']}/{entry['path']}",
-                "local_dir": spec["local_dir"],
-                "role": "speculator",
-            }
-        )
+    if spec:
+        entries = [spec["file"]] if spec.get("file") else spec.get("files", [])
+        spec_base = spec.get("base_url")
+        if not spec_base:
+            spec_base = (
+                f"https://huggingface.co/{spec['repo']}/resolve/"
+                f"{spec.get('revision', 'main')}"
+            )
+        for entry in entries:
+            wanted.append(
+                {
+                    **entry,
+                    "url": f"{spec_base}/{entry['path']}",
+                    "local_dir": spec["local_dir"],
+                    "role": "speculator",
+                    **(
+                        {"hf_repo": spec["repo"], "hf_revision": spec["revision"]}
+                        if spec.get("download_strategy") == "hf_hub"
+                        else {}
+                    ),
+                }
+            )
     return wanted

@@ -1097,12 +1097,17 @@ def _reject_json_constant(value: str) -> None:
 
 
 def valid_function_call_arguments(arguments: str) -> bool:
-    """Check JSON syntax only; schema adherence belongs to strict decoding."""
+    """Check that arguments are one JSON object; nothing more.
+
+    Function arguments are a JSON object of named parameters, so other JSON
+    values ("[]", "42", "null") are not callable arguments. Schema adherence
+    beyond that belongs to strict decoding.
+    """
     try:
-        json.loads(arguments, parse_constant=_reject_json_constant)
+        parsed = json.loads(arguments, parse_constant=_reject_json_constant)
     except (ValueError, RecursionError):
         return False
-    return True
+    return isinstance(parsed, dict)
 
 
 def emit_simple_tool_call_done(
