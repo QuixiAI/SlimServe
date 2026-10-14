@@ -351,6 +351,288 @@
         }
       }
     },
+    "qwen36-35b-a3b-nvfp4": {
+      "title": "Qwen3.6-35B-A3B",
+      "modalities": ["text", "image"],
+      "format": "safetensors",
+      "repo": "nvidia/Qwen3.6-35B-A3B-NVFP4",
+      "base_url": "https://huggingface.co/nvidia/Qwen3.6-35B-A3B-NVFP4/resolve/1355db6a052410cfd62085d94b58866fd0f2c3c5",
+      "local_dir": "Qwen3.6-35B-A3B-NVFP4",
+      "speculator": {
+        "repo": "nvidia/Qwen3.6-35B-A3B-NVFP4",
+        "local_dir": "Qwen3.6-35B-A3B-NVFP4",
+        "engine": {"method": "qwen3_5_mtp", "num_speculative_tokens": 2},
+        "note": "The checkpoint includes its one-layer MTP head in model-00003-of-00003.safetensors; it shares the target directory and embeddings."
+      },
+      "quants": {
+        "NVFP4": {
+          "title": "NVFP4 (ModelOpt mixed FP8/NVFP4)",
+          "bytes": 23457713942,
+          "summary": "40-layer vision-language MoE with 256 experts, 8 active per token, 3:1 linear-to-full attention, and 262144-token context. The ModelOpt checkpoint uses W4A16 NVFP4 for experts, shared experts and lm_head, FP8 for attention projections, and BF16 elsewhere.",
+          "min_gpus": {"rtx5090": 1},
+          "files": [
+            {"path": "chat_template.jinja", "bytes": 7764},
+            {"path": "config.json", "bytes": 58110},
+            {"path": "generation_config.json", "bytes": 202},
+            {"path": "hf_quant_config.json", "bytes": 35085},
+            {"path": "model-00001-of-00003.safetensors", "bytes": 10006877608},
+            {"path": "model-00002-of-00003.safetensors", "bytes": 10003595752},
+            {"path": "model-00003-of-00003.safetensors", "bytes": 3413864960},
+            {"path": "model.safetensors.index.json", "bytes": 13726227},
+            {"path": "preprocessor_config.json", "bytes": 390},
+            {"path": "tokenizer.json", "bytes": 12807982},
+            {"path": "tokenizer_config.json", "bytes": 16718},
+            {"path": "video_preprocessor_config.json", "bytes": 385},
+            {"path": "vocab.json", "bytes": 6722759}
+          ]
+        }
+      }
+    },
+    "qwen36-35b-a3b-fp8": {
+      "title": "Qwen3.6-35B-A3B",
+      "modalities": [
+        "text",
+        "image"
+      ],
+      "format": "safetensors",
+      "repo": "Qwen/Qwen3.6-35B-A3B-FP8",
+      "base_url": "https://huggingface.co/Qwen/Qwen3.6-35B-A3B-FP8/resolve/95a723d08a9490559dae23d0cff1d9466213d989",
+      "local_dir": "Qwen3.6-35B-A3B-FP8",
+      "speculator": {
+        "repo": "Qwen/Qwen3.6-35B-A3B-FP8",
+        "revision": "95a723d08a9490559dae23d0cff1d9466213d989",
+        "local_dir": "Qwen3.6-35B-A3B-FP8",
+        "engine": {
+          "method": "qwen3_5_mtp",
+          "num_speculative_tokens": 2
+        },
+        "note": "The checkpoint includes its native one-layer MTP head in mtp.safetensors; it shares target embeddings and tokenizer."
+      },
+      "quants": {
+        "FP8": {
+          "title": "FP8 (dynamic E4M3, block 128x128)",
+          "bytes": 37492937900,
+          "summary": "Official Qwen dynamic FP8 release of the 40-layer vision-language MoE; 42 layer shards, a separate MTP shard, BF16 vision tower and unquantized small tensors. One RTX 5090 requires CPU weight offload because the 34.9 GiB checkpoint exceeds 32 GB VRAM.",
+          "min_gpus": {
+            "rtx5090": 1
+          },
+          "files": [
+            {
+              "path": "chat_template.jinja",
+              "bytes": 7764
+            },
+            {
+              "path": "config.json",
+              "bytes": 37000
+            },
+            {
+              "path": "configuration.json",
+              "bytes": 58
+            },
+            {
+              "path": "generation_config.json",
+              "bytes": 202
+            },
+            {
+              "path": "layers-0.safetensors",
+              "bytes": 843713608
+            },
+            {
+              "path": "layers-1.safetensors",
+              "bytes": 843713608
+            },
+            {
+              "path": "layers-10.safetensors",
+              "bytes": 843715168
+            },
+            {
+              "path": "layers-11.safetensors",
+              "bytes": 837094000
+            },
+            {
+              "path": "layers-12.safetensors",
+              "bytes": 843715168
+            },
+            {
+              "path": "layers-13.safetensors",
+              "bytes": 843715168
+            },
+            {
+              "path": "layers-14.safetensors",
+              "bytes": 843715168
+            },
+            {
+              "path": "layers-15.safetensors",
+              "bytes": 837094000
+            },
+            {
+              "path": "layers-16.safetensors",
+              "bytes": 843715168
+            },
+            {
+              "path": "layers-17.safetensors",
+              "bytes": 843715168
+            },
+            {
+              "path": "layers-18.safetensors",
+              "bytes": 843715168
+            },
+            {
+              "path": "layers-19.safetensors",
+              "bytes": 837094000
+            },
+            {
+              "path": "layers-2.safetensors",
+              "bytes": 843713608
+            },
+            {
+              "path": "layers-20.safetensors",
+              "bytes": 843715168
+            },
+            {
+              "path": "layers-21.safetensors",
+              "bytes": 843715168
+            },
+            {
+              "path": "layers-22.safetensors",
+              "bytes": 843715168
+            },
+            {
+              "path": "layers-23.safetensors",
+              "bytes": 837094000
+            },
+            {
+              "path": "layers-24.safetensors",
+              "bytes": 843715168
+            },
+            {
+              "path": "layers-25.safetensors",
+              "bytes": 843715168
+            },
+            {
+              "path": "layers-26.safetensors",
+              "bytes": 843715168
+            },
+            {
+              "path": "layers-27.safetensors",
+              "bytes": 837094000
+            },
+            {
+              "path": "layers-28.safetensors",
+              "bytes": 843715168
+            },
+            {
+              "path": "layers-29.safetensors",
+              "bytes": 843715168
+            },
+            {
+              "path": "layers-3.safetensors",
+              "bytes": 837092440
+            },
+            {
+              "path": "layers-30.safetensors",
+              "bytes": 843715168
+            },
+            {
+              "path": "layers-31.safetensors",
+              "bytes": 837094000
+            },
+            {
+              "path": "layers-32.safetensors",
+              "bytes": 843715168
+            },
+            {
+              "path": "layers-33.safetensors",
+              "bytes": 843715168
+            },
+            {
+              "path": "layers-34.safetensors",
+              "bytes": 843715168
+            },
+            {
+              "path": "layers-35.safetensors",
+              "bytes": 837094000
+            },
+            {
+              "path": "layers-36.safetensors",
+              "bytes": 843715168
+            },
+            {
+              "path": "layers-37.safetensors",
+              "bytes": 843715168
+            },
+            {
+              "path": "layers-38.safetensors",
+              "bytes": 843715168
+            },
+            {
+              "path": "layers-39.safetensors",
+              "bytes": 837094000
+            },
+            {
+              "path": "layers-4.safetensors",
+              "bytes": 843713608
+            },
+            {
+              "path": "layers-5.safetensors",
+              "bytes": 843713608
+            },
+            {
+              "path": "layers-6.safetensors",
+              "bytes": 843713608
+            },
+            {
+              "path": "layers-7.safetensors",
+              "bytes": 837092440
+            },
+            {
+              "path": "layers-8.safetensors",
+              "bytes": 843713608
+            },
+            {
+              "path": "layers-9.safetensors",
+              "bytes": 843713608
+            },
+            {
+              "path": "merges.txt",
+              "bytes": 3353259
+            },
+            {
+              "path": "model.safetensors.index.json",
+              "bytes": 6329223
+            },
+            {
+              "path": "mtp.safetensors",
+              "bytes": 853860608
+            },
+            {
+              "path": "outside.safetensors",
+              "bytes": 2927422112
+            },
+            {
+              "path": "preprocessor_config.json",
+              "bytes": 390
+            },
+            {
+              "path": "tokenizer.json",
+              "bytes": 12807982
+            },
+            {
+              "path": "tokenizer_config.json",
+              "bytes": 16718
+            },
+            {
+              "path": "video_preprocessor_config.json",
+              "bytes": 385
+            },
+            {
+              "path": "vocab.json",
+              "bytes": 6722759
+            }
+          ]
+        }
+      }
+    },
     "qwen38-27b-nvfp4": {
       "title": "Qwen3.8-27B",
       "modalities": [
@@ -1583,21 +1865,30 @@
           ]
         }
       },
-      "chat_template_asset": "qwen38_tool_calling.jinja",
       "format": "safetensors"
     },
     "qwen38-hauhau-aggressive-gguf": {
       "title": "Qwen3.8-27B Uncensored HauhauCS Aggressive GGUF",
       "modalities": [
-        "text"
+        "text",
+        "image"
       ],
       "repo": "HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF",
-      "base_url": "https://huggingface.co/HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF/resolve/main",
+      "revision": "993a5971fda8f30dd1b7eb2654792ba4415c7460",
+      "base_url": "https://huggingface.co/HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF/resolve/993a5971fda8f30dd1b7eb2654792ba4415c7460",
       "local_dir": "Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF",
-      "shared_note": "Aggressive uncensoring variant. The Q8 target preserves its embedded NextN head; the separate FastMTP sidecar needs its trimmed-vocabulary d2t loader before vLLM can use it.",
+      "shared": [
+        {
+          "path": "mmproj-Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-BF16.gguf",
+          "bytes": 931146624,
+          "sha256": "5681b690bcb8eb10cd28d62d078cb4e01521a3ea4880a3fc7d54de72de2dd142"
+        }
+      ],
+      "shared_note": "Aggressive uncensoring variant. The Q8 target preserves its embedded NextN head; the separate FastMTP sidecar needs its trimmed-vocabulary d2t loader before vLLM can use it. The repo publishes a BF16 mmproj of the shared Qwen3.5 vision tower; it is discovered by globbing mmproj* next to the text GGUF, as for qwen38-27b, so both live in the repo root of the local dir.",
       "speculator": {
         "repo": "HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF",
-        "base_url": "https://huggingface.co/HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF/resolve/main",
+        "revision": "993a5971fda8f30dd1b7eb2654792ba4415c7460",
+        "base_url": "https://huggingface.co/HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF/resolve/993a5971fda8f30dd1b7eb2654792ba4415c7460",
         "local_dir": "Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF",
         "file": {
           "path": "Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q8_K_P.gguf",
@@ -1831,6 +2122,13 @@
         "No multi-device story: Apple exposes one GPU per machine, so every Metal profile is tensor_parallel_size 1 and scaling past one box means separate machines."
       ]
     },
+    "rtx5090": {
+      "title": "NVIDIA GeForce RTX 5090",
+      "compute_capability": [12, 0],
+      "vram_bytes": 34190917632,
+      "gate": "gpus",
+      "status": "supported"
+    },
     "rtx3090": {
       "title": "NVIDIA GeForce RTX 3090",
       "compute_capability": [
@@ -1849,7 +2147,9 @@
       "title": "Intel Arc Pro B70",
       "vram_bytes": 34242101248,
       "gate": "gpus",
-      "status": "supported",
+      "status": "in-progress",
+      "status_reason": "no XPU serving backend on main yet",
+      "status_detail": "SlimServe detects the Intel Arc Pro B70, but main does not yet carry the XPU platform (worker, attention and quantized-MoE paths) that serving on it needs. The CLI keeps every B70 profile gated until that backend lands and each profile is validated on the card.",
       "notes": [
         "32 GiB per card (32656 MiB reported by xpu-smi). Serving requires the XPU implementation; each model profile records its own qualification status."
       ]
@@ -2770,6 +3070,129 @@
         }
       }
     },
+    "qwen36-nvfp4-1": {
+      "title": "Qwen3.6-35B-A3B NVFP4 on 1 GPU",
+      "source": "qwen36-35b-a3b-nvfp4",
+      "gpus": 1,
+      "summary": "NVIDIA ModelOpt mixed FP8/NVFP4 vision-language MoE on one RTX 5090, with its checkpoint MTP drafter.",
+      "speculative": true,
+      "variants": {
+        "rtx5090": {
+          "platform": "rtx5090",
+          "default_quant": "NVFP4",
+          "engine": {
+            "tensor_parallel_size": 1,
+            "max_model_len": 262144,
+            "max_num_seqs": 8,
+            "max_num_batched_tokens": 8192,
+            "gpu_memory_utilization": 0.82,
+            "cpu_offload_gb": 4,
+            "kv_cache_dtype": "fp8",
+            "moe_backend": "auto",
+            "linear_backend": "auto",
+            "kernel_config": {"moe_backend": "auto", "linear_backend": "auto"},
+            "compilation_config": {
+              "cudagraph_mode": "FULL_DECODE_ONLY",
+              "max_cudagraph_capture_size": 24
+            },
+            "kv_transfer_config": {
+              "kv_connector": "HostTierConnector",
+              "kv_role": "kv_both",
+              "kv_connector_extra_config": {
+                "host_tier_gb_per_rank": 48,
+                "nvme_tier_gb_per_rank": 128,
+                "enable_cross_layers_blocks": "True"
+              }
+            },
+            "reasoning_parser": "qwen3",
+            "tool_call_parser": "qwen3_xml",
+            "served_model_name": "Qwen3.6-35B-A3B",
+            "enable_prefix_caching": true,
+            "enable_chunked_prefill": true,
+            "default_chat_template_kwargs": {
+              "reasoning_effort": "low",
+              "preserve_thinking": true,
+              "thinking": true,
+              "enable_thinking": true
+            },
+            "override_generation_config": {"thinking_token_budget": 2000}
+          },
+          "env": {"LD_LIBRARY_PATH": "/usr/local/cuda-13.3/compat"},
+          "notes": [
+            "On the tested R595 driver with a CUDA 13.3 native build, cuda-compat-13-3 is required for PTX JIT; this profile adds its library directory to child processes via LD_LIBRARY_PATH. A matching R610+ driver can use its own CUDA libraries.",
+            "HostTierConnector keeps completed hybrid KV trajectories in 48 GiB pinned RAM and spills to a 128 GiB NVMe tier. The tier preserves prefixes across eviction; its exact restore behavior requires on-box validation. Active-request KV residency remains GPU-side until a separate host-resident attention path is implemented.",
+            "FP8 target KV and the native 262144-token context are retained. At an 8192-token profiling batch, the 5090 left only 1.35 GiB for KV against a 3.04 GiB single-request requirement; reducing the prefill batch to 2048 did not increase available KV; 4 GiB of CPU weight offload frees room for the live GPU KV. Full-context validation remains required.",
+            "gpu_memory_utilization 0.82 leaves room for the display and CUDA context on the tested desktop 5090: at 0.90, engine initialization saw 26.54 GiB free against a 28.22 GiB reservation and stopped before weight loading.",
+            "The checkpoint's one-layer MTP head is in the third safetensors shard and is served through qwen3_5_mtp at k=2. The 24-row graph ceiling covers 8 concurrent requests times 3 verify rows; draft KV follows the registered MTP path.",
+            "ModelOpt mixed precision uses CUDA automatic backend selection for quantized target experts and the unquantized checkpoint MTP experts. A global Marlin override fails on the MTP head because unquantized MoE has no Marlin backend.",
+            "The checkpoint includes a native vision tower and processor; text and image requests are both required for live validation."
+          ]
+        }
+      }
+    },
+    "qwen36-fp8-1": {
+      "title": "Qwen3.6-35B-A3B FP8 on 1 GPU",
+      "source": "qwen36-35b-a3b-fp8",
+      "gpus": 1,
+      "summary": "Official dynamic FP8 vision-language MoE on one RTX 5090 with CPU weight offload and checkpoint MTP.",
+      "speculative": true,
+      "variants": {
+        "rtx5090": {
+          "platform": "rtx5090",
+          "default_quant": "FP8",
+          "engine": {
+            "tensor_parallel_size": 1,
+            "max_model_len": 262144,
+            "max_num_seqs": 8,
+            "max_num_batched_tokens": 8192,
+            "gpu_memory_utilization": 0.78,
+            "kv_cache_dtype": "fp8",
+            "moe_backend": "auto",
+            "linear_backend": "auto",
+            "kernel_config": {
+              "moe_backend": "auto",
+              "linear_backend": "auto"
+            },
+            "compilation_config": {
+              "cudagraph_mode": "FULL_DECODE_ONLY",
+              "max_cudagraph_capture_size": 24
+            },
+            "kv_transfer_config": {
+              "kv_connector": "HostTierConnector",
+              "kv_role": "kv_both",
+              "kv_connector_extra_config": {
+                "host_tier_gb_per_rank": 48,
+                "nvme_tier_gb_per_rank": 128,
+                "enable_cross_layers_blocks": "True"
+              }
+            },
+            "reasoning_parser": "qwen3",
+            "tool_call_parser": "qwen3_xml",
+            "served_model_name": "Qwen3.6-35B-A3B-FP8",
+            "enable_prefix_caching": true,
+            "enable_chunked_prefill": true,
+            "default_chat_template_kwargs": {
+              "reasoning_effort": "low",
+              "preserve_thinking": true,
+              "thinking": true,
+              "enable_thinking": true
+            },
+            "override_generation_config": {
+              "thinking_token_budget": 2000
+            },
+            "cpu_offload_gb": 16
+          },
+          "env": {"LD_LIBRARY_PATH": "/usr/local/cuda-13.3/compat"},
+          "notes": [
+            "On the tested R595 driver with a CUDA 13.3 native build, cuda-compat-13-3 is required for PTX JIT; this profile adds its library directory to child processes via LD_LIBRARY_PATH. A matching R610+ driver can use its own CUDA libraries.",
+            "HostTierConnector keeps completed hybrid KV trajectories in 48 GiB pinned RAM and spills to a 128 GiB NVMe tier. The tier preserves prefixes across eviction; its exact restore behavior requires on-box validation. Active-request KV residency remains GPU-side until a separate host-resident attention path is implemented.",
+            "The official dynamic FP8 checkpoint is 37.49 GB on disk, larger than this 32 GB GPU. 16 GiB CPU weight offload is a capacity setting and needs live TPS and correctness validation.",
+            "Target and MTP draft KV use FP8; the separate mtp.safetensors is included in the same pinned source revision.",
+            "Vision tower and processor are included; text and image requests are required for validation."
+          ]
+        }
+      }
+    },
     "qwen38-nvfp4-1": {
       "title": "Qwen3.8-27B NVFP4 on 1 GPU",
       "source": "qwen38-27b-nvfp4",
@@ -3500,16 +3923,18 @@
             "VLLM_XPU_TRITON_ATTN_NUM_PAR_SOFTMAX_SEGMENTS": "16"
           },
           "notes": [
-            "Disable Triton tensor descriptors on B70: the repaired attention path passed ragged-tail reference tests, and the 2026-09-19 local c8 tool workload measured 97.8 tok/s with descriptors versus 205.5 tok/s without. See perf/optimization_status.md for scope and raw evidence.",
+            "Disable Triton tensor descriptors on B70 (VLLM_TRITON_USE_TD=0): on the out-of-tree B70 integration branch the descriptor path was markedly slower on a c8 tool workload. Historical and unverified here: no raw artifacts are in this repository, so re-measure once the XPU backend lands.",
             "The checkpoint is serialized offline FP8; do not add --quantization fp8, which is reserved here for online conversion of BF16 weights.",
             "linear_backend=xpu selects XPUFp8BlockScaledMMKernel for the checkpoint 128x128 block scales; benchmark triton as the small-batch fallback.",
             "FULL_DECODE_ONLY breakable graphs with VLLM_XPU_ENABLE_XPU_GRAPH=0 were validated on TP4 and improved aggregate output throughput at concurrency 1, 8, and 32; keep this mode.",
-            "Native MTP k=3 uses token-width-aware graph sizes; its matched baseline peaked at 72.4, 219.2, and 321.4 aggregate output tok/s for concurrency 1, 8, and 32. The full coding evaluation is the current promotion gate; earlier synthetic measurements are not a correctness qualification.",
+            "Native MTP k=3 uses token-width-aware graph sizes (multiples of the 4-token verification width). Throughput for this recipe was only measured on the out-of-tree B70 integration branch, with no raw artifacts here; it is historical and unverified until re-measured through this profile. The full coding evaluation is the promotion gate.",
             "FP8 E4M3 KV uses weight savings for cache capacity; the checkpoint has no calibrated KV scales, so vLLM uses 1.0.",
             "The source repository is gated. Fully present local files skip fetching; automatic repair requires an authenticated Hugging Face fetch path.",
             "The profile supplies a 2000-token thinking default for all reasoning efforts except none; an explicit request budget, including -1 for unlimited, takes precedence.",
-            "The 2026-09-19 local c8 workload passed, but subsequent live traffic stalled with sample_tokens RPC timeout. Long-running stability remains unqualified; see docs/deployment/qwen38-b70.md.",
-            "This recipe is gated pending fresh qualification on current main; earlier measurements apply only to the saved B70 integration checkout."
+            "On the out-of-tree integration branch a local c8 workload passed, but later live traffic stalled with a sample_tokens RPC timeout. Long-running stability remains unqualified.",
+            "This recipe is gated pending fresh qualification on current main; earlier measurements apply only to the saved B70 integration checkout.",
+            "Chat template: the checked-in Qwen3.8 tool-calling template (qwen38_tool_calling.jinja) arrives with PR #61; until then this record serves the checkpoint's own chat_template.jinja. Wire chat_template_asset into the source once that template is on main.",
+            "CPU-offloaded KV (the HostTierConnector host tier), the standing goal for every non-Metal profile, is deferred until the XPU serving backend exists; the connector has not been generalized to or validated on XPU."
           ],
           "platform": "b70",
           "status": "in-progress",
@@ -3557,7 +3982,7 @@
               "max_cudagraph_capture_size": 64
             },
             "enable_auto_tool_choice": true,
-            "tool_call_parser": "qwen3_coder",
+            "tool_call_parser": "qwen3_xml",
             "reasoning_parser": "qwen3",
             "served_model_name": "Qwen3.8-27B-HauhauCS-Aggressive-Q8_K_P",
             "override_generation_config": {
@@ -3575,12 +4000,15 @@
           },
           "notes": [
             "The Qwen3.5 GGUF adapter maps the appended block as a native Qwen3_5MTP draft while leaving it excluded from the target backbone.",
-            "Embedded MTP defaults to measured depth 1; it beat depth 2 at concurrency 8 and 32 while tying at concurrency 1.",
+            "Embedded MTP defaults to depth 1. On the out-of-tree B70 integration branch depth 1 was reported ahead of depth 2 at concurrency 8 and 32; that comparison is historical and unverified here (no raw artifacts in this repository), so re-measure depth once the XPU backend lands.",
             "The FastMTP-32K sidecar is not selected here: its full-vocabulary embedding plus trimmed 32K output head and d2t map need a dedicated vLLM draft model contract.",
-            "FULL_DECODE_ONLY breakable graphs with k=1 verification-width capture sizes improve single-stream throughput while preserving concurrent throughput and MTP acceptance.",
+            "FULL_DECODE_ONLY breakable graphs with k=1 verification-width capture sizes (multiples of 2) are the historical recipe; their throughput effect is unverified on current main.",
             "The profile supplies a 2000-token thinking default for all reasoning efforts except none; an explicit request budget, including -1 for unlimited, takes precedence.",
             "This recipe is gated pending fresh qualification on current main; earlier measurements apply only to the saved B70 integration checkout.",
-            "Target KV uses fp8_e4m3 and native MTP draft KV uses fp8. These preserve the historical recipe; fresh current-main accuracy and cache-reuse qualification is required."
+            "Target KV uses fp8_e4m3 and native MTP draft KV uses fp8. These preserve the historical recipe; fresh current-main accuracy and cache-reuse qualification is required.",
+            "Vision: the published BF16 mmproj loads through the same Qwen3.5 GGUF vision path as qwen38-27b; image requests on XPU are unvalidated and are part of this record's qualification.",
+            "Tool calls use qwen3_xml, matching every other Qwen3.8 record.",
+            "CPU-offloaded KV (the HostTierConnector host tier), the standing goal for every non-Metal profile, is deferred until the XPU serving backend exists; the connector has not been generalized to or validated on XPU."
           ],
           "platform": "b70",
           "status": "in-progress",
