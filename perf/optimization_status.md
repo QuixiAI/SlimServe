@@ -26258,3 +26258,16 @@ Phases, by value over risk:
   to switch if the prod tree would resolve the override to a directory with
   no checkpoint - the guard Monday's 30-minute stall needed.
   Raw: perf/results/2026-09-23/glm53f-lazarus/.
+- GLM-5.3 native tools keep thinking on (2026-10-14, PR #85). The glm53
+  tool-calling profile (glm53f-nvfp4-4/a100, glm53f-nvfp4-8/a100,
+  glm53f-q2-1/metal) defaulted every request that OFFERED native function
+  tools to non-thinking, which switched reasoning off for essentially all
+  agentic traffic. It now leaves native-tool requests at the serving default
+  (thinking on; a client may still send enable_thinking=false) and forces
+  non-thinking only for custom/free-form tools, whose structural grammar is
+  corrupted behind the thinking preamble. Evidence: CPU unit tests only
+  (tests/tool_use/test_glm53_tool_thinking_compat.py). NOT yet validated
+  live: owed is a tool canary on a glm53f record with thinking on covering
+  tool_choice auto / required / parallel calls and a multi-turn tool
+  conversation (tool result fed back), checking the glm47 parser still
+  extracts calls after a think block. No throughput claim.
