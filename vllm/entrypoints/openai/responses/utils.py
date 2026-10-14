@@ -234,14 +234,37 @@ def construct_chat_messages_with_tool_call(
     Some chat messages span multiple response items (e.g., reasoning + tool calls).
     """
     messages: list[ChatCompletionMessageParam] = []
-    for item in input_messages:
-        message = _construct_message_from_response_item(
-            item, prev_msg=messages[-1] if messages else None
-        )
+    anchor = len(input_messages) - 1 if _continues_final_message(input_messages) else -1
+    for index, item in enumerate(input_messages):
+        prev_msg = messages[-1] if messages else None
+        if (
+            index == anchor
+            and prev_msg is not None
+            and (prev_msg.get("tool_calls") or prev_msg.get("content") is not None)
+        ):
+            # The final partial message is what continue_final_message
+            # resumes, so it must stay the final rendered message. Absorbing
+            # it into an earlier turn would resume that turn instead: an
+            # already-finished message, or a tool-call turn whose calls the
+            # template renders after the content and the continuation cut
+            # would drop. Only a reasoning-only turn takes it in, since that
+            # is the same assistant message, still being written.
+            prev_msg = None
+        message = _construct_message_from_response_item(item, prev_msg=prev_msg)
         if message is not None:
             messages.append(message)
 
     return messages
+
+
+def _continues_final_message(input_messages: list[ResponseInputOutputItem]) -> bool:
+    """True when the last item is a partial assistant message to resume."""
+    if not input_messages or not should_continue_final_message(input_messages):
+        return False
+    last = input_messages[-1]
+    if isinstance(last, ResponseOutputMessage):
+        return True
+    return isinstance(last, dict) and last.get("role") == "assistant"
 
 
 def _response_output_message_text(item: ResponseOutputMessage) -> str:

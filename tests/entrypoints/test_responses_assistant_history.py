@@ -335,3 +335,107 @@ def test_empty_message_does_not_fabricate_a_call_for_orphan_tool_result():
     assert messages[1] == {"role": "assistant", "content": ""}
     assert "tool_calls" not in messages[1]
     assert messages[2]["tool_call_id"] == "missing_call"
+
+
+# Content renders before tool calls, as in the real templates, so a
+# continuation cut placed inside a tool-call turn would drop its calls.
+CONTINUATION_TEMPLATE = (
+    "{% for m in messages %}<|{{ m.role }}|>"
+    "{% if m.reasoning %}<think>{{ m.reasoning }}</think>{% endif %}"
+    "{{ m.content or '' }}"
+    "{% for c in m.tool_calls or [] %}<call>{{ c.function.name }}</call>"
+    "{% endfor %}<|end|>{% endfor %}"
+    "{% if add_generation_prompt %}<|assistant|>{% endif %}"
+)
+
+
+def render_request(request):
+    from transformers.utils.chat_template_utils import render_jinja_template
+
+    params = request.build_chat_params(None, "auto")
+    kwargs = params.chat_template_kwargs
+    rendered, _ = render_jinja_template(
+        conversations=[construct_input_messages(request_input=request.input)],
+        chat_template=CONTINUATION_TEMPLATE,
+        add_generation_prompt=kwargs["add_generation_prompt"],
+        continue_final_message=kwargs["continue_final_message"],
+    )
+    return kwargs["continue_final_message"], rendered[0]
+
+
+@pytest.mark.parametrize("content", [[], [{"type": "output_text", "text": ""}]])
+def test_empty_in_progress_final_message_does_not_resume_tool_turn(content):
+    # The empty item is the continuation anchor, not a stray trailing item:
+    # it must not be absorbed into the tool-call turn, or the continuation
+    # would resume that turn and cut its calls out of the prompt.
+    request = ResponsesRequest.model_validate(
+        {
+            "model": "test-model",
+            "input": [
+                {"role": "user", "content": "Check inventory."},
+                history_call(1),
+                {
+                    **output_message(content),
+                    "id": "msg_partial",
+                    "status": "in_progress",
+                },
+            ],
+        }
+    )
+    messages = construct_input_messages(request_input=request.input)
+    assert [m["role"] for m in messages] == ["user", "assistant", "assistant"]
+    assert [c["id"] for c in messages[1]["tool_calls"]] == ["call_1"]
+    assert messages[2] == {"role": "assistant", "content": ""}
+
+    continued, prompt = render_request(request)
+    assert continued
+    assert prompt == (
+        "<|user|>Check inventory.<|end|>"
+        "<|assistant|><call>inventory</call><|end|>"
+        "<|assistant|>"
+    )
+
+
+def test_empty_in_progress_final_message_does_not_resume_finished_message():
+    request = ResponsesRequest.model_validate(
+        {
+            "model": "test-model",
+            "input": [
+                {"role": "user", "content": "Hello."},
+                output_message(
+                    [{"type": "output_text", "text": "Done.", "annotations": []}]
+                ),
+                {**output_message([]), "id": "msg_partial", "status": "in_progress"},
+            ],
+        }
+    )
+    continued, prompt = render_request(request)
+    assert continued
+    assert prompt == "<|user|>Hello.<|end|><|assistant|>Done.<|end|><|assistant|>"
+
+
+def test_in_progress_final_message_still_joins_its_reasoning():
+    request = ResponsesRequest.model_validate(
+        {
+            "model": "test-model",
+            "input": [
+                {"role": "user", "content": "Hello."},
+                {
+                    "id": "rs_partial",
+                    "type": "reasoning",
+                    "summary": [],
+                    "content": [{"type": "reasoning_text", "text": "Greet."}],
+                },
+                {
+                    **output_message(
+                        [{"type": "output_text", "text": "Hi", "annotations": []}]
+                    ),
+                    "id": "msg_partial",
+                    "status": "in_progress",
+                },
+            ],
+        }
+    )
+    continued, prompt = render_request(request)
+    assert continued
+    assert prompt == "<|user|>Hello.<|end|><|assistant|><think>Greet.</think>Hi"
