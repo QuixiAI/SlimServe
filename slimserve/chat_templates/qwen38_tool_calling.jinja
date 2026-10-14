@@ -33,13 +33,21 @@
 {%- endmacro %}
 {%- if not messages %}{{- raise_exception('No messages provided.') }}{%- endif %}
 
-{#- Keep effort as a prompt hint only. The server enforces its configured token budget. -#}
-{%- set thinking_enabled = enable_thinking if enable_thinking is defined else true %}
-{%- set resolved_reasoning_effort = reasoning_effort|default('xhigh') %}
-{%- if resolved_reasoning_effort == 'high' %}{%- set resolved_reasoning_effort = 'xhigh' %}{%- endif %}
-{%- if resolved_reasoning_effort == 'none' %}{%- set thinking_enabled = false %}{%- endif %}
-{%- if resolved_reasoning_effort not in ('xhigh', 'medium', 'low', 'none') %}
-    {{- raise_exception('Unexpected reasoning effort ' ~ reasoning_effort ~ '. Supported types are high/xhigh, medium, low, and none.') }}
+{#- Keep effort as a prompt hint only. The server enforces its configured token budget.
+    Every value the API accepts renders: minimal maps to low, high and max to xhigh, and
+    anything else falls back to the default rather than failing the request (as the GLM
+    template does). An explicit enable_thinking always wins, because the Qwen3 parser
+    reads that flag: effort none only turns thinking off when enable_thinking is unset,
+    and with thinking forced on it just drops the effort hint. -#}
+{%- set resolved_reasoning_effort = reasoning_effort if reasoning_effort is defined and reasoning_effort is not none else 'xhigh' %}
+{%- if resolved_reasoning_effort in ('high', 'max') %}{%- set resolved_reasoning_effort = 'xhigh' %}
+{%- elif resolved_reasoning_effort == 'minimal' %}{%- set resolved_reasoning_effort = 'low' %}
+{%- elif resolved_reasoning_effort not in ('xhigh', 'medium', 'low', 'none') %}{%- set resolved_reasoning_effort = 'xhigh' %}
+{%- endif %}
+{%- if enable_thinking is defined and enable_thinking is not none %}
+    {%- set thinking_enabled = enable_thinking %}
+{%- else %}
+    {%- set thinking_enabled = resolved_reasoning_effort != 'none' %}
 {%- endif %}
 {%- set reasoning_instructions = '' %}
 {%- if thinking_enabled %}
@@ -47,7 +55,7 @@
         {%- set reasoning_instructions = 'Reasoning effort is set to high. Think carefully, validate key assumptions, and finish within the available thinking budget.' %}
     {%- elif resolved_reasoning_effort == 'low' %}
         {%- set reasoning_instructions = 'Reasoning effort is set to low. Keep thinking brief and focused, and finish within the available thinking budget.' %}
-    {%- else %}
+    {%- elif resolved_reasoning_effort == 'medium' %}
         {%- set reasoning_instructions = 'Finish your reasoning within the available thinking budget.' %}
     {%- endif %}
 {%- endif %}
@@ -120,8 +128,17 @@
     {%- elif message.role == 'user' %}
         {{- '<|im_start|>user\n' + content + '<|im_end|>\n' }}
     {%- elif message.role == 'assistant' %}
-        {%- set reasoning_content = message.reasoning_content if message.reasoning_content is string else (message.reasoning if message.reasoning is string else '') %}
-        {%- set reasoning_content = reasoning_content|trim %}
+        {%- set reasoning_content = message.reasoning_content if message.reasoning_content is string else (message.reasoning if message.reasoning is string else none) %}
+        {#- As the stock Qwen template does: reasoning a client left inline as
+            <think>...</think> in content is lifted out, so it renders once,
+            inside the think block, and not again as visible content. -#}
+        {%- if '</think>' in content %}
+            {%- if reasoning_content is none %}
+                {%- set reasoning_content = content.split('</think>')[0].rstrip('\n').split('<think>')[-1].lstrip('\n') %}
+            {%- endif %}
+            {%- set content = content.split('</think>')[-1].lstrip('\n') %}
+        {%- endif %}
+        {%- set reasoning_content = (reasoning_content or '')|trim %}
         {%- if preserve_thinking is undefined or preserve_thinking is true or loop.index0 > ns.last_query_index %}
             {{- '<|im_start|>assistant\n<think>\n' + reasoning_content + '\n</think>\n\n' + content }}
         {%- else %}

@@ -140,3 +140,101 @@ def test_qwen38_template_preserves_image_placeholders_with_tools():
     )
     assert "Describe it<|vision_start|><|image_pad|><|vision_end|>" in prompt
     assert prompt.endswith("<|im_start|>assistant\n<think>\n")
+
+
+@pytest.mark.parametrize(
+    ("effort", "hint"),
+    [
+        ("minimal", "Reasoning effort is set to low."),
+        ("max", "Reasoning effort is set to high."),
+        ("medium", "Finish your reasoning within the available thinking budget."),
+    ],
+)
+def test_qwen38_template_accepts_every_api_reasoning_effort(effort, hint):
+    # The chat-completions protocol accepts minimal and max; rendering them
+    # must map to a hint, never fail the request.
+    prompt = _render(
+        [{"role": "user", "content": "Answer"}],
+        tool_choice="auto",
+        enable_thinking=True,
+        reasoning_effort=effort,
+    )
+
+    assert hint in prompt
+    assert prompt.endswith("<|im_start|>assistant\n<think>\n")
+
+
+def test_qwen38_template_unknown_reasoning_effort_falls_back():
+    prompt = _render(
+        [{"role": "user", "content": "Answer"}],
+        tool_choice="auto",
+        reasoning_effort="extreme",
+    )
+
+    assert "Reasoning effort is set to high." in prompt
+    assert prompt.endswith("<|im_start|>assistant\n<think>\n")
+
+
+def test_qwen38_template_explicit_enable_thinking_beats_effort_none():
+    # The Qwen3 parser reads enable_thinking and expects reasoning when it is
+    # true, so the template must open the think block too; the effort hint
+    # is dropped.
+    prompt = _render(
+        [{"role": "user", "content": "Answer"}],
+        tool_choice="auto",
+        enable_thinking=True,
+        reasoning_effort="none",
+    )
+
+    assert prompt.endswith("<|im_start|>assistant\n<think>\n")
+    assert "Reasoning effort is set" not in prompt
+    assert "thinking budget" not in prompt
+
+
+def test_qwen38_template_effort_none_alone_disables_thinking():
+    prompt = _render(
+        [{"role": "user", "content": "Answer"}],
+        tool_choice="auto",
+        reasoning_effort="none",
+    )
+
+    assert prompt.endswith("<|im_start|>assistant\n<think>\n\n</think>\n\n")
+
+
+def test_qwen38_template_lifts_inline_think_from_history_content():
+    prompt = _render(
+        [
+            {"role": "user", "content": "Hi"},
+            {
+                "role": "assistant",
+                "content": "<think>\nGreet back.\n</think>\n\nHello!",
+            },
+            {"role": "user", "content": "Again"},
+        ],
+        tool_choice="auto",
+        enable_thinking=True,
+    )
+
+    assert prompt.count("Greet back.") == 1
+    assert "<|im_start|>assistant\n<think>\nGreet back.\n</think>\n\nHello!<|im_end|>" in (
+        prompt
+    )
+
+
+def test_qwen38_template_explicit_reasoning_wins_over_inline_think():
+    prompt = _render(
+        [
+            {"role": "user", "content": "Hi"},
+            {
+                "role": "assistant",
+                "content": "<think>stale</think>Hello!",
+                "reasoning_content": "Greet back.",
+            },
+            {"role": "user", "content": "Again"},
+        ],
+        tool_choice="auto",
+        enable_thinking=True,
+    )
+
+    assert "stale" not in prompt
+    assert "<think>\nGreet back.\n</think>\n\nHello!<|im_end|>" in prompt
