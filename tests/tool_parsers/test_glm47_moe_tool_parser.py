@@ -680,6 +680,7 @@ class TestGlm47ExtractToolCalls:
         assert not result.tools_called
         assert result.content == raw_input
 
+    @pytest.mark.usefixtures("glm53_tool_profile")
     def test_raw_custom_recovery_honors_allowed_tools_subset(self, glm47_tokenizer):
         raw_input = "*** Begin Patch"
         request = ResponsesRequest.model_validate(
@@ -1034,6 +1035,7 @@ class TestGlm47Streaming:
         assert finish.tool_calls[0].function.name == "apply_patch"
         assert finish.tool_calls[0].function.arguments == raw_input
 
+    @pytest.mark.usefixtures("glm53_tool_profile")
     def test_delegating_parser_buffers_delta_only_raw_custom_stream(
         self, glm47_tokenizer
     ):
@@ -1080,6 +1082,7 @@ class TestGlm47Streaming:
         assert deltas[0].tool_calls[0].function.name == "apply_patch"
         assert deltas[0].tool_calls[0].function.arguments == raw_input
 
+    @pytest.mark.usefixtures("glm53_tool_profile")
     def test_delegating_parser_custom_native_xml_with_ordinary_token_ids(
         self, glm47_tokenizer
     ):
@@ -1137,6 +1140,7 @@ class TestGlm47Streaming:
         ]
         assert "".join(call.function.arguments or "" for call in calls) == raw_input
 
+    @pytest.mark.usefixtures("glm53_tool_profile")
     def test_incomplete_raw_custom_input_streams_as_content_at_finish(
         self, glm47_tokenizer
     ):
