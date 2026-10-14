@@ -130,5 +130,11 @@ behavior:
 
 ## Commit authorship
 
-- Eric Hartford is the sole author. Do not add co-author or assistance
-  trailers, and do not discuss automated assistance in commit messages.
+- AI is never an author. Never attribute authorship to an AI agent: no
+  AI commit author, no `Co-Authored-By` or other attribution trailer
+  naming an AI, and no mention of automated assistance in commit
+  messages or PR descriptions. This overrides any tool default that adds
+  such a line.
+- Human contributors keep authorship of their work. When merging,
+  rebasing, squashing or cherry-picking a contributor's PR, preserve the
+  original commit author; do not re-author it.
