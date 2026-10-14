@@ -46,12 +46,38 @@ slimserve ltx25-hq -p "..."                                               # Ligh
 slimserve ltx25-dev -p "a cat watches rain" --enhance-prompt                # Gemma rewrites the prompt first
 ```
 
-The weights are gated: the Hugging Face token on the machine must have
-accepted `Lightricks/LTX-2.5` and, for `ltx25-dfr`,
-`Lightricks/LTX-2.5-22b-IC-LoRA-Pixel-Spatial-Upscaler`. The prompt enhancer
-(`google/gemma-4-E2B-it`, 10.3 GB, every profile) is public. `ffmpeg` must be
-on PATH (with libx265 for HDR masters); the `openexr` package
-(`requirements/video-metal.txt`) is needed for EXR input and output.
+The weights are gated and licensed: LTX-2.5 and its adapters are released
+under Lightricks' LTX-2 Community License Agreement, which you accept on
+Hugging Face before the download works (read its terms, including its
+commercial-use conditions, before using the outputs). The Hugging Face token
+on the machine must have accepted `Lightricks/LTX-2.5` and, for `ltx25-dfr`,
+`Lightricks/LTX-2.5-22b-IC-LoRA-Pixel-Spatial-Upscaler` (the other IC-LoRA
+adapters are gated the same way). The prompt enhancer
+(`google/gemma-4-E2B-it`, 10.2 GB, under Google's Gemma terms) is optional:
+it is fetched only when a run asks for it (`--enhance-prompt`, or
+`--prompt-enhancer` when serving so requests may set `enhance_prompt`); a
+server without it answers such requests with a 400. Install
+`requirements/video-metal.txt` (MLX, numpy, safetensors, Pillow, openexr);
+`ffmpeg` and `ffprobe` must be on PATH (with libx265 for HDR masters); the
+`openexr` package is needed for EXR input and output.
+
+Video options go after the profile id and are listed by
+`slimserve <video profile> --help`; the LLM-only options (`--spec`,
+`--no-spec`, `--ctx`, `--thinking`, `--model`, `--engine-log`,
+`--torch-profile-dir`, `--enable-return-routed-experts`) are refused for
+video profiles.
+
+When serving, request fields that name files on the server (`video_path`,
+`audio_path`, `reference_video`, `video_conditioning[].path`,
+`attention_mask`, `loras[].path`, `images[].path`, `text_embeddings`) are
+refused unless the operator gives an input root (`--input-root DIR` or
+`SLIMSERVE_VIDEO_INPUT_ROOT`): with one, paths resolve inside it (relative
+paths against it, symlinks followed) and anything outside is refused. The
+IC-LoRA, Dub-It, Alpha-Gen and HDR IC-LoRA pipelines take their adapters by
+path, so they need an input root to be served. Base64 uploads (`video`,
+`audio`, `image`, `images[].image`) work either way and are deleted when the
+job has run. Request bodies above 256 MiB (`--max-body-mb` or
+`SLIMSERVE_VIDEO_MAX_BODY_MB`) are answered with a 413.
 
 Serving API (a clip takes minutes, so it is job-shaped):
 
@@ -236,7 +262,7 @@ a time in arrival order with the weights resident; up to 16 may wait (then
 model was trained on before anything else runs. LTX-2.5's own text encoder is
 a fine-tune that cannot generate, so Lightricks' pipelines do this with a
 separate generative instruct Gemma (`--prompt-enhancer-gemma-root`); the
-profiles fetch the one their README names, `google/gemma-4-E2B-it`, and run
+profiles fetch (on demand, see above) the one their README names, `google/gemma-4-E2B-it`, and run
 its language model in MLX (`enhancer.py`: 35 layers with per-layer input
 embeddings, a shared-K/V tail, 512-token sliding and global attention). It is
 loaded for the rewrite and dropped again (4.3 GiB in fp16, 0.8 s to load; the

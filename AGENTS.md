@@ -128,6 +128,26 @@ behavior:
 - For vision profiles, test both text and image requests. For text-only
   profiles, test text requests.
 
+## Non-LLM generation engines
+
+- SlimServe also hosts non-LLM generation engines. A source declares its
+  engine with `kind`: `"llm"` (the default, served by vLLM) or `"video"`
+  (LTX-2.5 audio+video generation on Metal, `slimserve/video/`). The
+  registry rejects any other kind, and every non-LLM kind must dispatch to
+  a registered non-vLLM engine; a test enforces both.
+- The LLM serving policies (prefix caching, tool calling, thinking,
+  non-greedy sampling, KV cache dtype, default context, drafters, KV tiers)
+  apply to `kind: "llm"` sources and are not meaningful for video sources.
+  The LLM policy tests assert a non-zero count of LLM profiles so a mass
+  exemption is visible.
+- Video profiles still follow every other rule: one record per platform,
+  pinned revisions for every download, no deployment configuration in the
+  repo, and notebook entries with raw-artifact evidence for every measured
+  claim.
+- The LTX-2.5 prompt enhancer (Gemma) decodes greedily because the upstream
+  pipeline does; that is a model-level exception for the enhancer, not a
+  precedent for any chat model.
+
 ## Commit authorship
 
 - AI is never an author. Never attribute authorship to an AI agent: no

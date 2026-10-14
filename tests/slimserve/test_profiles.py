@@ -5,6 +5,7 @@ that is not a tested configuration, before a multi-hundred-GiB load finds out.
 """
 
 import hashlib
+import json
 import signal
 from dataclasses import replace
 from unittest.mock import Mock
@@ -30,12 +31,54 @@ def _big_enough(profile_id: str, platform: str) -> int:
     return source["quants"][default_quant]["min_memory_bytes"][platform]
 
 
+def _language_model_ids():
+    """The profiles the LLM serving policy applies to. Asserting a non-zero
+    count keeps an exemption of every profile (say, a wrong default kind)
+    from passing the policy tests vacuously."""
+    ids = registry.language_model_profile_ids()
+    assert ids, "no language-model profiles: the LLM policy tests would be vacuous"
+    return ids
+
+
 def _language_model_records():
     """Chat-serving policy (prefix caching, tool calling, thinking, graph
     modes) is defined for language-model profiles; video profiles are covered
     by tests/slimserve/test_video_profiles.py."""
     profiles = registry._registry()["profiles"]
-    return [(pid, profiles[pid]) for pid in registry.language_model_profile_ids()]
+    return [(pid, profiles[pid]) for pid in _language_model_ids()]
+
+
+def test_every_source_kind_is_allowlisted():
+    sources = registry._registry()["sources"]
+    for name, source in sources.items():
+        assert source.get("kind", "llm") in registry.SOURCE_KINDS, name
+    assert set(registry.ENGINE_MODULES) == registry.SOURCE_KINDS - {"llm"}
+
+
+def test_every_non_llm_source_dispatches_to_a_registered_non_vllm_engine():
+    import importlib
+
+    sources = registry._registry()["sources"]
+    for name, source in sources.items():
+        kind = registry.source_kind(source)
+        if kind == "llm":
+            continue
+        module_name = registry.engine_module(kind)
+        assert not module_name.startswith(("vllm", "slimserve.server")), name
+        module = importlib.import_module(module_name)
+        for hook in ("parser", "prepare", "run"):
+            assert callable(getattr(module, hook, None)), (name, hook)
+
+
+def test_an_unknown_kind_is_a_validation_error(monkeypatch, tmp_path):
+    local = tmp_path / "profiles.local.json"
+    local.write_text(json.dumps({"sources": {"x-audio": {"kind": "audio"}}}))
+    monkeypatch.setenv("SLIMSERVE_LOCAL_PROFILES", str(local))
+    registry._registry.cache_clear()
+    with pytest.raises(ValueError, match="kind 'audio'"):
+        registry._registry()
+    with pytest.raises(registry.ProfileError):
+        registry.source_kind({"kind": "audio"})
 
 
 def test_every_profile_resolves_on_a_platform_it_claims():
@@ -122,9 +165,7 @@ def test_no_spec_cli_flag_disables_the_resolved_speculator(monkeypatch):
 
     monkeypatch.setattr(cli, "_chat", _capture_chat)
 
-    assert (
-        cli.main(["dsv4-q4ktail-2", "--quant", "IQ2_XXS", "--no-spec", "--chat"]) == 0
-    )
+    assert cli.main(["dsv4-q4ktail-2", "--quant", "IQ2_XXS", "--no-spec", "--chat"]) == 0
     assert len(seen) == 1
     assert seen[0].speculative is False
     assert "speculative_config" not in engine_kwargs(seen[0])
@@ -734,7 +775,7 @@ def test_engine_kwargs_drop_server_only_settings():
 
 
 def _all_plans():
-    for profile_id in registry.language_model_profile_ids():
+    for profile_id in _language_model_ids():
         for platform in registry.describe(profile_id)["platforms"]:
             yield resolve(profile_id, platform, 8, None, memory_bytes=512 * 1024**3)
 
@@ -797,7 +838,7 @@ def test_profiles_use_their_validated_graph_mode():
     """Graph mode is per-platform evidence: DSpark/TurboQuant DSV4 runs eager
     on MI300X/Metal, while the A100 profiles qualified PIECEWISE capture
     (128K lifecycle, perf/optimization_status.md)."""
-    for profile_id in registry.language_model_profile_ids():
+    for profile_id in _language_model_ids():
         for platform in registry.describe(profile_id)["platforms"]:
             engine = resolve(
                 profile_id,
@@ -1377,7 +1418,6 @@ def test_scalar_list_engine_args_render_space_separated():
     """vLLM's nargs list flags (numa_bind_nodes) take space-separated values;
     a JSON-rendered list is rejected at parse time (2026-09-11 NUMA arm)."""
     from dataclasses import replace
-
     from slimserve.engine import serve_argv
 
     plan = resolve("glm53f-nvfp4-8", "a100", 8, None)

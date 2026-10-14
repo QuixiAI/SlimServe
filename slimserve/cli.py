@@ -13,6 +13,7 @@ anything that is not in there, before a 244 GiB load discovers it the hard way.
 from __future__ import annotations
 
 import argparse
+import importlib
 import os
 import sys
 from dataclasses import replace
@@ -71,242 +72,6 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="disable speculative decoding for performance diagnosis",
     )
-    video = parser.add_argument_group("video profiles (with --prompt)")
-    video.add_argument(
-        "--output", help="where to write the clip (default <pipeline>-<seed>.mp4)"
-    )
-    video.add_argument(
-        "--size", help="WIDTHxHEIGHT, multiples of 64 (default: the profile's)"
-    )
-    video.add_argument(
-        "--seconds", type=float, help="clip length (default: predicted from the prompt)"
-    )
-    video.add_argument("--seed", type=int, help="random seed (default 42)")
-    video.add_argument(
-        "--negative-prompt",
-        help="guided pipelines only (dev, hq, keyframes, one_stage)",
-    )
-    video.add_argument(
-        "--enhance-prompt",
-        action="store_true",
-        help="rewrite the prompt into the model's caption style first "
-        "(Gemma-4 E2B-it, looking at --image when given; upstream's "
-        "--enhance-prompt)",
-    )
-    video.add_argument(
-        "--temporal-upscalings",
-        type=int,
-        choices=(0, 1, 2),
-        help="DFR only: x2 frame-rate rounds (each re-denoises the clip at 2x fps)",
-    )
-    video.add_argument(
-        "--spatial-upscalings",
-        type=int,
-        choices=(1, 2),
-        help="DFR only: 2 = stage 1 at a quarter, stage 2 at half, then the tiled "
-        "full-resolution detailing epilogue (sizes multiples of 128)",
-    )
-    video.add_argument(
-        "--image",
-        nargs="+",
-        action="append",
-        metavar=("PATH", "FRAME STRENGTH CRF"),
-        help="a conditioning still (repeatable): PATH [FRAME [STRENGTH [CRF]]]. "
-        "Frame 0 (the default) is image-to-video; another frame pins that "
-        "moment as a keyframe; CRF overrides the H.264 round trip (0: none)",
-    )
-    video.add_argument(
-        "--image-strength",
-        type=float,
-        help="strength of the first --image, 0-1 (default 1.0)",
-    )
-    video.add_argument("--video-path", help="retake: the source clip (mp4/mov)")
-    video.add_argument(
-        "--start-time", type=float, help="retake: start of the region to regenerate (s)"
-    )
-    video.add_argument(
-        "--end-time", type=float, help="retake: end of the region to regenerate (s)"
-    )
-    video.add_argument(
-        "--hdr",
-        choices=["srgb_linear", "acescg", "acescct"],
-        help="HDR: the colour space of EXR inputs (stills, frame folders) and of the "
-        "outputs (an EXR frame folder beside an HLG master in place of the mp4)",
-    )
-    video.add_argument(
-        "--frame-rate",
-        type=float,
-        help="the clip's frame rate (default 24; required for EXR frame-folder "
-        "sources, which carry none)",
-    )
-    video.add_argument(
-        "--input-colorspace",
-        choices=["srgb_gamma", "srgb", "acescg", "acescct"],
-        help="hdr-ic-lora: the source's encoding (srgb_gamma: display mp4; srgb: "
-        "linear mp4 or EXR; acescg / acescct: EXR folders)",
-    )
-    video.add_argument(
-        "--exr-colorspace",
-        choices=["srgb_linear", "acescg", "acescct"],
-        help="hdr-ic-lora: the EXR sidecar's colour space (default acescg)",
-    )
-    video.add_argument(
-        "--text-embeddings",
-        help="hdr-ic-lora: the adapter's scene embedding .safetensors",
-    )
-    video.add_argument(
-        "--high-quality",
-        action="store_true",
-        help="hdr-ic-lora: generate 2N - 1 frames",
-    )
-    video.add_argument(
-        "--no-keyframes", action="store_true", help="hdr-ic-lora: no DFR seam keyframes"
-    )
-    video.add_argument(
-        "--keyframe-strength", type=float, help="hdr-ic-lora: seam keyframe strength"
-    )
-    video.add_argument(
-        "--chunked",
-        action="store_true",
-        help="long clips in overlapping temporal windows (97-frame windows, 25-frame "
-        "carry, crossfade over the carry); distilled, dev, a2vid",
-    )
-    video.add_argument(
-        "--chunk-pixel-frames", type=int, help="chunked: frames per window (8k + 1)"
-    )
-    video.add_argument(
-        "--chunk-carry-frames",
-        type=int,
-        help="chunked: frames each window hands to the next (8k + 1, at least 17)",
-    )
-    video.add_argument(
-        "--chunk-blend-frames",
-        type=int,
-        help="chunked: decoded frames crossfaded at each seam (default: the carry)",
-    )
-    video.add_argument(
-        "--num-generated-keyframes",
-        type=int,
-        help="extra generated keyframe slots at evenly spaced interior frames "
-        "(distilled, dev, hq, one-stage, a2vid, ic-lora, dubit; DFR has its own)",
-    )
-    video.add_argument(
-        "--decode-with-keyframes",
-        action="store_true",
-        help="anchor the diffusion decode on the generated keyframes",
-    )
-    video.add_argument("--audio-path", help="a2vid: the driving audio (any container)")
-    video.add_argument(
-        "--audio-start-time", type=float, help="a2vid: where in the audio to start (s)"
-    )
-    video.add_argument(
-        "--audio-max-duration",
-        type=float,
-        help="a2vid: at most this many seconds of audio (not with --seconds)",
-    )
-    video.add_argument(
-        "--reference-video", help="dubit: the clip to dub (video + audio)"
-    )
-    video.add_argument(
-        "--reference-strength",
-        type=float,
-        help="dubit: strength of the video reference tokens (default 1.0)",
-    )
-    video.add_argument(
-        "--video-conditioning",
-        nargs="+",
-        action="append",
-        metavar=("PATH", "STRENGTH"),
-        help="ic_lora: a reference video (the control signal) and its strength "
-        "(default 1.0), repeatable",
-    )
-    video.add_argument(
-        "--conditioning-attention-mask",
-        nargs=2,
-        metavar=("MASK_PATH", "STRENGTH"),
-        help="ic_lora: a grayscale mask video scaling the reference attention per "
-        "region, times STRENGTH",
-    )
-    video.add_argument(
-        "--skip-stage-2", action="store_true", help="ic_lora: ship stage 1 (half size)"
-    )
-    video.add_argument(
-        "--stage-2-ic-lora",
-        action="store_true",
-        help="ic_lora: keep the adapter and the references in stage 2",
-    )
-    video.add_argument(
-        "--tile",
-        action="store_true",
-        help="ic_lora: run each transformer call over pinned spatial windows",
-    )
-    video.add_argument("--tile-height", type=int, help="ic_lora --tile: window height")
-    video.add_argument("--tile-width", type=int, help="ic_lora --tile: window width")
-    video.add_argument(
-        "--lora",
-        nargs="+",
-        action="append",
-        metavar=("PATH", "STRENGTH"),
-        help="a user LoRA (.safetensors, ComfyUI LTXV layout) and optional "
-        "strength (default 1.0), repeatable; applied in every stage",
-    )
-    video.add_argument(
-        "--num-inference-steps",
-        type=int,
-        help="guided pipelines: denoising steps of the guided stage (default 30; "
-        "hq 15)",
-    )
-    for modality, other in (("video", "a2v"), ("audio", "v2a")):
-        video.add_argument(
-            f"--{modality}-cfg-guidance-scale",
-            type=float,
-            help=f"guided pipelines: {modality} CFG scale (1.0 = off)",
-        )
-        video.add_argument(
-            f"--{modality}-stg-guidance-scale",
-            type=float,
-            help=f"guided pipelines: {modality} STG scale (0.0 = off)",
-        )
-        video.add_argument(
-            f"--{modality}-stg-blocks",
-            type=int,
-            nargs="+",
-            help=f"guided pipelines: transformer blocks perturbed for {modality} STG",
-        )
-        video.add_argument(
-            f"--{modality}-rescale-scale",
-            type=float,
-            help=f"guided pipelines: {modality} guidance rescale, 0-1",
-        )
-        video.add_argument(
-            f"--{other}-guidance-scale",
-            type=float,
-            help=f"guided pipelines: {other} cross-modality guidance scale (1.0 = off)",
-        )
-        video.add_argument(
-            f"--{modality}-skip-step",
-            type=int,
-            help=f"guided pipelines: run the {modality} stream only on every "
-            "(N + 1)th step (0 = every step)",
-        )
-    video.add_argument(
-        "--distilled-lora-strength-stage-1",
-        type=float,
-        help="hq only: distilled LoRA strength in stage 1 (default 0.25)",
-    )
-    video.add_argument(
-        "--distilled-lora-strength-stage-2",
-        type=float,
-        help="hq only: distilled LoRA strength in stage 2 (default 0.5)",
-    )
-    video.add_argument(
-        "--decoder",
-        choices=["diffusion", "conv"],
-        help=(
-            "video decoder: diffusion (default, sharper) "
-            "or conv (about 4x faster decode)"
-        ),
-    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument(
@@ -349,6 +114,60 @@ def _parser() -> argparse.ArgumentParser:
         help="diagnostic: return per-token MoE expert IDs (adds memory and copies)",
     )
     return parser
+
+
+# Options that configure the vLLM engine (or its plan) and mean nothing to a
+# non-LLM engine. A video profile refuses them rather than ignoring them.
+_LLM_ONLY = (
+    ("model", "--model"),
+    ("spec", "--spec"),
+    ("no_spec", "--no-spec"),
+    ("ctx", "--ctx"),
+    ("thinking", "--thinking"),
+    ("engine_log", "--engine-log"),
+    ("torch_profile_dir", "--torch-profile-dir"),
+    ("enable_return_routed_experts", "--enable-return-routed-experts"),
+)
+
+
+def _engine_options(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+    extra: list[str],
+    profile_id: str,
+) -> argparse.Namespace:
+    """Check the options against the profile's engine family.
+
+    The main parser holds the options every profile shares plus the LLM ones.
+    A non-LLM engine parses what is left with its own parser; an LLM profile
+    has nothing left over, as before.
+    """
+    kind = registry.profile_kind(profile_id)
+    if kind == "llm":
+        if extra:
+            parser.error(f"unrecognized arguments: {' '.join(extra)}")
+        return args
+    used = [flag for dest, flag in _LLM_ONLY if getattr(args, dest)]
+    if used:
+        parser.error(
+            f"{profile_id} is a {kind} profile; {', '.join(used)} "
+            "configure the LLM engine and do not apply to it"
+        )
+    engine = importlib.import_module(registry.engine_module(kind))
+    own = engine.parser().parse_args(extra)
+    return argparse.Namespace(**{**vars(args), **vars(own)})
+
+
+def _engine_help(profile_id: str) -> bool:
+    """Print a non-LLM profile's own options; False for an LLM profile."""
+    try:
+        kind = registry.profile_kind(profile_id)
+    except ProfileError:
+        return False
+    if kind == "llm":
+        return False
+    importlib.import_module(registry.engine_module(kind)).parser().print_help()
+    return True
 
 
 def _help() -> None:
@@ -527,6 +346,8 @@ def _show(plan: Plan) -> None:
         spec = plan.speculator
         method = spec["engine"].get("method", "dspark")
         print(f"  spec      {method} k={spec['engine']['num_speculative_tokens']}")
+    for group in plan.optional:
+        print(f"  optional  {group}")
     for key, value in sorted(plan.env.items()):
         print(f"  env       {key}={value}")
     for note in plan.notes:
@@ -556,14 +377,17 @@ def _chat(plan: Plan, prompt: str | None, log_path: str | None) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
-    args = parser.parse_args(argv)
+    # Options left over belong to a non-LLM profile's own parser (video); they
+    # are checked against the profile once it is known.
+    args, extra = parser.parse_known_args(argv)
     if args.serve and args.prompt:
-        parser.error(
-            "--prompt runs one conversation and cannot be combined with --serve"
-        )
+        parser.error("--prompt runs one conversation and cannot be combined with --serve")
+    if extra and not args.profile:
+        parser.error(f"unrecognized arguments: {' '.join(extra)}")
 
     if args.help:
-        _help()
+        if not (args.profile and _engine_help(args.profile)):
+            _help()
         return 0
 
     if args.cache:
@@ -586,7 +410,13 @@ def main(argv: list[str] | None = None) -> int:
         registry.describe(profile_id)
     except ProfileError as error:
         term.fail(str(error))
+        if extra:
+            term.fail(
+                f"unrecognized arguments: {' '.join(extra)} "
+                "(profile options go after the profile id)"
+            )
         return 2
+    args = _engine_options(parser, args, extra, profile_id)
 
     if not machine.known:
         term.die(
@@ -679,6 +509,11 @@ def main(argv: list[str] | None = None) -> int:
             },
         )
 
+    if not registry.is_language_model(plan.source):
+        # a non-LLM engine may add optional files (the LTX-2.5 prompt enhancer)
+        engine = importlib.import_module(registry.engine_module(plan.source["kind"]))
+        plan = engine.prepare(plan, args)
+
     if args.dry_run:
         _show(plan)
         return 0
@@ -715,9 +550,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if not registry.is_language_model(plan.source):
-        from slimserve.video import cli as video_cli
-
-        return video_cli.run(plan, args)
+        return engine.run(plan, args)
 
     if args.chat or args.prompt:
         return _chat(plan, args.prompt, args.engine_log)

@@ -6,7 +6,6 @@ conversation is the mode you ask for. `--serve` stays accepted because units,
 benchmark harnesses and documented commands pass it, and it must keep meaning
 exactly what it always did.
 """
-
 import pytest
 
 from slimserve import cli
@@ -55,10 +54,7 @@ def test_a_bare_profile_serves(calls):
 
 
 def test_serve_flag_still_serves_and_still_takes_host_and_port(calls):
-    assert (
-        cli.main([PROFILE, "--serve", "--host", "0.0.0.0", "--port", "27830", "-y"])
-        == 0
-    )
+    assert cli.main([PROFILE, "--serve", "--host", "0.0.0.0", "--port", "27830", "-y"]) == 0
     assert calls["mode"] == "serve"
     assert (calls["host"], calls["port"]) == ("0.0.0.0", 27830)
 

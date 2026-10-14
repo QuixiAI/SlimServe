@@ -1762,33 +1762,35 @@
       "revision": "5e6e71018ee1756ed329b697a7b4aedc934dfce9",
       "base_url": "https://huggingface.co/Lightricks/LTX-2.5/resolve/5e6e71018ee1756ed329b697a7b4aedc934dfce9",
       "local_dir": "ltx-2.5/official",
-      "shared_comment": "The prompt enhancer: google/gemma-4-E2B-it, the generative instruct Gemma Lightricks' --prompt-enhancer-gemma-root names for 2.5 (the LTX text encoder is a fine-tune that cannot generate). Shared by every quant; only its language model is loaded (4.3 GiB fp16, per request, dropped after the rewrite), and only when a request sets enhance_prompt. Pinned to the repo revision in the URLs.",
-      "shared": [
-        {
-          "path": "prompt_enhancer/gemma-4-E2B-it/model.safetensors",
-          "bytes": 10246621918,
-          "sha256": "2db5482b20d746879bb3ef79b5203e9075a2e2b98f54ec7c2f281c1477ddc550",
-          "url": "https://huggingface.co/google/gemma-4-E2B-it/resolve/3e22461f65e89153144f8adb70e3b8c2cc9845a7/model.safetensors"
-        },
-        {
-          "path": "prompt_enhancer/gemma-4-E2B-it/config.json",
-          "bytes": 4954,
-          "sha256": "1b28f3d2c3100f6c594754b81107428bd7b822a7f48272ca681dae9d2ec38330",
-          "url": "https://huggingface.co/google/gemma-4-E2B-it/resolve/3e22461f65e89153144f8adb70e3b8c2cc9845a7/config.json"
-        },
-        {
-          "path": "prompt_enhancer/gemma-4-E2B-it/generation_config.json",
-          "bytes": 208,
-          "sha256": "d4226bbe3117d2d253ba4609720ba82c6c4ce4627a9a6ae05387c78983ac03de",
-          "url": "https://huggingface.co/google/gemma-4-E2B-it/resolve/3e22461f65e89153144f8adb70e3b8c2cc9845a7/generation_config.json"
-        },
-        {
-          "path": "prompt_enhancer/gemma-4-E2B-it/tokenizer.json",
-          "bytes": 32169626,
-          "sha256": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f",
-          "url": "https://huggingface.co/google/gemma-4-E2B-it/resolve/3e22461f65e89153144f8adb70e3b8c2cc9845a7/tokenizer.json"
-        }
-      ],
+      "optional_comment": "prompt_enhancer: google/gemma-4-E2B-it, the generative instruct Gemma Lightricks' --prompt-enhancer-gemma-root names for 2.5 (the LTX text encoder is a fine-tune that cannot generate). Optional for every quant: fetched only when the run asks for it (--enhance-prompt, or --prompt-enhancer to serve requests that set enhance_prompt), so the 10.2 GB download is not part of every install; only its language model is loaded (4.3 GiB fp16, per request, dropped after the rewrite), and only when a request sets enhance_prompt. Pinned to the repo revision in the URLs. Gemma is under Google's Gemma Terms of Use.",
+      "optional": {
+        "prompt_enhancer": [
+          {
+            "path": "prompt_enhancer/gemma-4-E2B-it/model.safetensors",
+            "bytes": 10246621918,
+            "sha256": "2db5482b20d746879bb3ef79b5203e9075a2e2b98f54ec7c2f281c1477ddc550",
+            "url": "https://huggingface.co/google/gemma-4-E2B-it/resolve/3e22461f65e89153144f8adb70e3b8c2cc9845a7/model.safetensors"
+          },
+          {
+            "path": "prompt_enhancer/gemma-4-E2B-it/config.json",
+            "bytes": 4954,
+            "sha256": "1b28f3d2c3100f6c594754b81107428bd7b822a7f48272ca681dae9d2ec38330",
+            "url": "https://huggingface.co/google/gemma-4-E2B-it/resolve/3e22461f65e89153144f8adb70e3b8c2cc9845a7/config.json"
+          },
+          {
+            "path": "prompt_enhancer/gemma-4-E2B-it/generation_config.json",
+            "bytes": 208,
+            "sha256": "d4226bbe3117d2d253ba4609720ba82c6c4ce4627a9a6ae05387c78983ac03de",
+            "url": "https://huggingface.co/google/gemma-4-E2B-it/resolve/3e22461f65e89153144f8adb70e3b8c2cc9845a7/generation_config.json"
+          },
+          {
+            "path": "prompt_enhancer/gemma-4-E2B-it/tokenizer.json",
+            "bytes": 32169626,
+            "sha256": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f",
+            "url": "https://huggingface.co/google/gemma-4-E2B-it/resolve/3e22461f65e89153144f8adb70e3b8c2cc9845a7/tokenizer.json"
+          }
+        ]
+      },
       "shared_note": "Official Lightricks bf16 safetensors, loaded directly by slimserve/video/ltx25 (no converted pack). Gated: the Hugging Face token must have accepted Lightricks/LTX-2.5, and Lightricks/LTX-2.5-22b-IC-LoRA-Pixel-Spatial-Upscaler for the DFR quant. Nothing is quantized on M1-M4: bf16 converts to fp16 exactly and fp16 is the only matrix-multiply-accumulate those GPUs have.",
       "quants": {
         "bf16-distilled": {

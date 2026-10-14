@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 """Routing diagnosis must preserve the registered engine and stay opt-in."""
-
 from unittest.mock import Mock
 
 import pytest
@@ -13,20 +12,10 @@ from slimserve.registry import resolve
 @pytest.mark.parametrize("enabled", [False, True])
 def test_routing_capture_preserves_registered_plan(monkeypatch, enabled):
     original = resolve("glm53f-nvfp4-8", "a100", 8, "NVFP4")
-    monkeypatch.setattr(
-        cli.hardware,
-        "detect",
-        Mock(
-            return_value=Mock(
-                known=True,
-                platform="a100",
-                count=8,
-                memory_bytes=0,
-                host_ram_bytes=0,
-                device_name="A100",
-            )
-        ),
-    )
+    monkeypatch.setattr(cli.hardware, "detect", Mock(return_value=Mock(
+        known=True, platform="a100", count=8, memory_bytes=0,
+        host_ram_bytes=0, device_name="A100",
+    )))
     monkeypatch.setattr(cli.registry, "resolve", Mock(return_value=original))
     ensure = Mock()
     monkeypatch.setattr(cli.fetch, "ensure", ensure)

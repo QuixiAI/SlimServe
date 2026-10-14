@@ -24,6 +24,14 @@ REGISTRY_PATH = Path(__file__).with_name("profiles.json")
 # repo. The file is git-ignored; SLIMSERVE_LOCAL_PROFILES points elsewhere.
 LOCAL_REGISTRY_PATH = Path(__file__).with_name("profiles.local.json")
 _MERGED_SECTIONS = ("sources", "platforms", "profiles")
+# The engines a source may name with `kind`. "llm" (the default) is served by
+# vLLM and carries the LLM serving policy; every other kind is a non-LLM
+# generation engine and must name the module that runs it: `parser()` returns
+# the argparse parser for its own options, `prepare(plan, args)` returns the
+# plan to fetch (optional file groups), and `run(plan, args)` serves or
+# renders.
+SOURCE_KINDS = frozenset({"llm", "video"})
+ENGINE_MODULES: dict[str, str] = {"video": "slimserve.video.cli"}
 CHAT_TEMPLATE_DIR = Path(__file__).with_name("chat_templates")
 
 
@@ -63,6 +71,12 @@ def _registry() -> dict[str, Any]:
     local = _local_registry_path()
     if local.is_file():
         _merge_local(registry, local)
+    for name, source in registry["sources"].items():
+        kind = source.get("kind", "llm")
+        if kind not in SOURCE_KINDS:
+            raise ValueError(
+                f"source {name!r}: kind {kind!r} is not one of {sorted(SOURCE_KINDS)}"
+            )
     return registry
 
 
@@ -186,7 +200,10 @@ class Plan:
     # source-level speculator.
     variant_speculator: dict[str, Any] | None = None
     # Operator-supplied checkpoint served in place of the registered one.
-    model_override: ModelOverride | None = None
+    model_override: "ModelOverride | None" = None
+    # Groups of the source's `optional` files this run fetches as well (the
+    # LTX-2.5 prompt enhancer); the rest are never downloaded.
+    optional: tuple[str, ...] = ()
 
     @property
     def speculator(self) -> dict[str, Any] | None:
@@ -475,13 +492,34 @@ _SERVING_DEFAULTS: dict[str, Any] = {
 }
 
 
+def source_kind(source: dict[str, Any]) -> str:
+    """The engine family a source is served by; one of SOURCE_KINDS."""
+    kind = source.get("kind", "llm")
+    if kind not in SOURCE_KINDS:
+        raise ProfileError(f"kind {kind!r} is not one of {sorted(SOURCE_KINDS)}")
+    return kind
+
+
 def is_language_model(source: dict[str, Any]) -> bool:
     """False for sources served by a non-LLM engine (`"kind": "video"`).
 
     The LLM serving policy (prefix caching, tool calling, thinking, drafters,
     KV tiers) is defined for chat endpoints and does not apply to them.
     """
-    return source.get("kind", "llm") == "llm"
+    return source_kind(source) == "llm"
+
+
+def profile_kind(profile_id: str) -> str:
+    """The engine family of a profile's source (see SOURCE_KINDS)."""
+    entry = describe(profile_id)
+    return source_kind(_registry()["sources"][entry["source"]])
+
+
+def engine_module(kind: str) -> str:
+    """The module that runs a non-LLM kind."""
+    if kind not in ENGINE_MODULES:
+        raise ProfileError(f"no engine is registered for kind {kind!r}")
+    return ENGINE_MODULES[kind]
 
 
 def language_model_profile_ids() -> list[str]:
@@ -698,13 +736,29 @@ def files_for(plan: Plan) -> list[dict[str, Any]]:
                 ),
             }
         )
+    optional = plan.source.get("optional") or {}
+    for group in plan.optional:
+        if group not in optional:
+            raise ProfileError(
+                f"{plan.profile_id} has no optional file group {group!r}; "
+                f"it has {', '.join(sorted(optional)) or 'none'}"
+            )
+        for entry in optional[group]:
+            wanted.append(
+                {
+                    **entry,
+                    "url": entry.get("url") or f"{base}/{entry['path']}",
+                    "local_dir": plan.source["local_dir"],
+                    "role": "optional",
+                }
+            )
     for entry in plan.source.get("shared") or []:
         entry_base = entry.get("base_url", base)
         wanted.append(
             {
                 **entry,
                 # A shared file from another repository names its own URL and
-                # keeps its own local path (the LTX-2.5 prompt enhancer).
+                # keeps its own local path.
                 "url": entry.get("url") or f"{entry_base}/{entry['path']}",
                 "local_dir": plan.source["local_dir"],
                 "role": "shared",
