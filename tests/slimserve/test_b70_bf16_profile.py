@@ -27,3 +27,12 @@ def test_b70_bf16_recipe_preserves_vision_and_qualification_gate(tmp_path, monke
     artifacts = files_for(plan)
     assert all(f["bytes"] > 0 for f in artifacts)
     assert any("preprocessor" in f["path"] for f in artifacts)
+
+
+def test_b70_bf16_recipe_pins_its_checkpoint_and_uses_the_qwen_parser():
+    plan = resolve("qwen38-bf16-4", "b70", 4, None)
+    revision = plan.source["revision"]
+    assert len(revision) == 40
+    assert plan.source["base_url"].endswith(f"/resolve/{revision}")
+    assert plan.speculator["base_url"] == plan.source["base_url"]
+    assert plan.engine["tool_call_parser"] == "qwen3_xml"

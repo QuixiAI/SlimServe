@@ -12,7 +12,10 @@ def test_b70_fp8_recipe_is_gated_and_preserves_vision_and_native_mtp(
     assert profile_blocked(profile, "b70")
     assert plan.entry_file == plan.model_dir
     assert plan.source["modalities"] == ["text", "image"]
-    assert plan.chat_template_file.name == "qwen38_tool_calling.jinja"
+    # The Qwen3.8 tool-calling template arrives with PR #61; until then the
+    # checkpoint's own chat_template.jinja serves.
+    assert plan.chat_template_file is None
+    assert "chat_template" not in plan.engine
     plan.model_dir.mkdir(parents=True)
     config = engine_kwargs(plan)["speculative_config"]
     assert config["model"] == str(plan.entry_file)
