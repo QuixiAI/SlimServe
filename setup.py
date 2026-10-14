@@ -1112,7 +1112,7 @@ if _build_custom_ops():
 
 package_data = {
     # Every configuration slimserve is allowed to run.
-    "slimserve": ["profiles.json"],
+    "slimserve": ["profiles.json", "chat_templates/*.jinja"],
     "vllm": [
         "py.typed",
         "quixicore_metal.metallib",

@@ -92,9 +92,9 @@ and every entry in it is measured on the hardware it ships for.
 One command, a fixed set of tested profiles, no flag archaeology:
 
 ```bash
-slimserve                 # pick a profile, then chat
+slimserve                 # pick a profile, then serve it
 slimserve glm52-q2k-2     # or name one
-slimserve k3-xxs-6 --serve  # OpenAI-compatible endpoint
+slimserve k3-xxs-6 --chat   # talk to it here instead
 ```
 
 It is **opinionated**. Every configuration it will run lives in
@@ -195,9 +195,9 @@ What the specialization buys:
 ## Quick start
 
 ```bash
-slimserve                      # pick a profile, then chat
-slimserve glm52-q2k-2          # chat on 2 GPUs
-slimserve glm52-q2k-4 --serve  # OpenAI-compatible endpoint on :8000
+slimserve                      # pick a profile, then serve it
+slimserve glm52-q2k-4          # OpenAI-compatible endpoint on :8000
+slimserve glm52-q2k-2 --chat   # talk to it on 2 GPUs
 slimserve k3-xxs-6 -p "2 + 2?" # one shot, then exit
 ```
 
@@ -207,9 +207,10 @@ else. Weights download on first use into `~/models` (override with `--cache` or
 included in the same download confirmation, checksum-verified, and reused on
 later runs.
 
-Output streams token by token in both modes. The prompt is an SSE client of the
-same OpenAI-compatible endpoint `--serve` exposes, so an interactive answer and
-an API answer come from one engine with one configuration.
+Output streams token by token in both modes. `--chat` and `-p` are SSE clients
+of the same OpenAI-compatible endpoint the default mode exposes, so an
+interactive answer and an API answer come from one engine with one
+configuration.
 
 Profile ids follow one scheme everywhere: `<model>-<quant>-<gpus>`. A
 profile exists for exactly the platforms it is validated on — if it is
@@ -462,7 +463,7 @@ slimserve dsv4-xxs-1                # smallest target on one GPU or a Mac
 slimserve dsv4-q4ktail-2            # mixed Q4_K tail on two GPUs
 slimserve dsv4-mxfp4-4              # MXFP4 on 4 GPUs, the tuned path
 slimserve dsv4-q4k-8                # highest-quality Q4_K on 8 MI300X
-slimserve dsv4-mxfp4-4 --serve      # any profile can expose the API
+slimserve dsv4-mxfp4-4              # any profile exposes the API by default
 ```
 
 All four 0731 quants from [antirez/deepseek-v4-gguf][ds4w] load and serve.
