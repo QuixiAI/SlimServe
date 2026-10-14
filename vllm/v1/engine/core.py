@@ -1379,7 +1379,9 @@ class EngineCoreProc(EngineCore):
                 # before the main loop can remain blocked on an outstanding
                 # executor future. This state is deliberately separate from
                 # executor cleanup so the later shutdown still runs.
-                engine_core.model_executor.notify_shutdown_requested()
+                executor = getattr(engine_core, "model_executor", None)
+                if executor is not None:
+                    executor.notify_shutdown_requested()
                 engine_core.shutdown_state = EngineShutdownState.REQUESTED
                 signal_callback.trigger()
 

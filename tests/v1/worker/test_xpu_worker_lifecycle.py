@@ -16,7 +16,9 @@ def test_xpu_prepare_shutdown_drains_before_idempotent_cleanup():
     stream = MagicMock()
     stream.synchronize.side_effect = lambda: calls.append("stream")
     allocator = MagicMock()
-    allocator.release_pools.side_effect = lambda: calls.append("pools")
+    allocator.release_pools.side_effect = lambda **kw: calls.append(
+        ("pools", kw.get("synchronize"))
+    )
 
     with (
         patch("vllm.v1.worker.gpu_worker.Worker.shutdown") as base_shutdown,
@@ -29,7 +31,9 @@ def test_xpu_prepare_shutdown_drains_before_idempotent_cleanup():
         worker.shutdown()
         worker.shutdown()
 
-    assert calls == ["stream", "base", "pools"]
+    # The rank was drained by prepare_shutdown, so the pools are released
+    # without a second device-wide sync.
+    assert calls == ["stream", "base", ("pools", False)]
 
 
 def test_xpu_shutdown_does_not_drain_rank_independently():
@@ -38,7 +42,9 @@ def test_xpu_shutdown_does_not_drain_rank_independently():
     worker.local_rank = 2
     calls = []
     allocator = MagicMock()
-    allocator.release_pools.side_effect = lambda: calls.append("pools")
+    allocator.release_pools.side_effect = lambda **kw: calls.append(
+        ("pools", kw.get("synchronize"))
+    )
 
     with (
         patch("vllm.v1.worker.gpu_worker.Worker.shutdown") as base_shutdown,
@@ -49,4 +55,5 @@ def test_xpu_shutdown_does_not_drain_rank_independently():
         worker.shutdown()
 
     current_stream.assert_not_called()
-    assert calls == ["base", "pools"]
+    # No coordinated drain ran (failure or atexit path): keep the device sync.
+    assert calls == ["base", ("pools", True)]

@@ -208,7 +208,12 @@ class XPUWorker(Worker):
 
                 allocator = XpuMemAllocator.instance
                 if allocator is not None:
-                    allocator.release_pools()
+                    # Skip the device sync only when prepare_shutdown already
+                    # drained this rank; direct shutdowns (failure, atexit)
+                    # still synchronize before the pools are freed.
+                    allocator.release_pools(
+                        synchronize=not getattr(self, "_xpu_shutdown_prepared", False)
+                    )
             except Exception:
                 logger.exception("XPU allocator-pool release failed during shutdown")
         finally:

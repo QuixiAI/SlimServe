@@ -236,12 +236,17 @@ class XpuMemAllocator:
             )
             data.cpu_backup_tensor = None
 
-    def release_pools(self) -> None:
+    def release_pools(self, synchronize: bool = True) -> None:
         """Drop Python references to MemPool/pluggable allocators eagerly.
 
         This prevents pool destruction from being deferred to interpreter
         finalization, which can happen after parts of XPU runtime are already
         torn down.
+
+        ``synchronize=False`` is only for callers that have already drained
+        this rank's device work (XPUWorker after the coordinated
+        prepare_shutdown). The atexit and failure paths keep the device sync
+        so no kernel can still be using a pool block when it is freed.
         """
         if not self.allocator_and_pools:
             return
@@ -256,6 +261,14 @@ class XpuMemAllocator:
         mem_pools = [entry[0] for entry in pool_entries]
         allocators = [entry[1] for entry in pool_entries]
         pool_entries.clear()
+
+        if synchronize:
+            xpu_sync = getattr(torch.xpu, "synchronize", None)
+            if callable(xpu_sync):
+                try:
+                    xpu_sync()
+                except Exception:
+                    logger.debug("torch.xpu.synchronize() failed during release_pools")
 
         # Phase 1: drop MemPool refs while allocators are still strongly held.
         mem_pools.clear()

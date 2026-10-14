@@ -118,6 +118,11 @@ class MultiprocExecutor(Executor):
         # It is separate from shutting_down because expected worker exits may
         # begin before executor cleanup, and cleanup must still run later.
         self._worker_exit_expected = threading.Event()
+        # Set once the response queues were cancelled because a worker exited
+        # while a shutdown was requested; no further RPC can be answered.
+        self._response_queues_cancelled = False
+        # True while the XPU prepare_shutdown RPC is outstanding.
+        self._quiesce_in_progress = False
 
         tp_size, pp_size, pcp_size = self._get_parallel_sizes()
         assert self.world_size == tp_size * pp_size * pcp_size, (
@@ -295,18 +300,31 @@ class MultiprocExecutor(Executor):
             sentinels = [h.proc.sentinel for h in workers]
             died = multiprocessing.connection.wait(sentinels)
             _self = self_ref()
-            expected_exit = (
-                _self is not None
-                and getattr(_self, "_worker_exit_expected", None) is not None
-                and _self._worker_exit_expected.is_set()
-            )
-            if not _self or getattr(_self, "shutting_down", False) or expected_exit:
-                logger.debug(
-                    "MultiprocWorkerMonitor: worker exit expected during shutdown"
+            if not _self:
+                return
+            proc = next(h.proc for h in workers if h.proc.sentinel == died[0])
+            shutting_down = getattr(_self, "shutting_down", False)
+            expected = getattr(_self, "_worker_exit_expected", None)
+            if expected is not None and expected.is_set():
+                # A shutdown signal reached the workers as well as the engine.
+                # Not a failure, so no error report or failure callback; but
+                # the engine may be blocked reading this rank's response (an
+                # outstanding execute_model, or the XPU quiesce RPC), and a
+                # dead rank never answers. Cancel the response queues so that
+                # read fails now instead of hanging until the grace period.
+                (logger.debug if shutting_down else logger.info)(
+                    "Worker proc %s exited during requested shutdown "
+                    "(exit code: %s).",
+                    proc.name,
+                    proc.exitcode,
                 )
+                if not shutting_down or getattr(_self, "_quiesce_in_progress", False):
+                    _self._cancel_response_queues()
+                return
+            if shutting_down:
+                logger.debug("MultiprocWorkerMonitor: shutdown already initiated")
                 return
             _self.is_failed = True
-            proc = next(h.proc for h in workers if h.proc.sentinel == died[0])
             logger.error(
                 "Worker proc %s died unexpectedly (exit code: %s), "
                 "shutting down executor.",
@@ -339,6 +357,12 @@ class MultiprocExecutor(Executor):
         if expected is None:
             expected = self._worker_exit_expected = threading.Event()
         expected.set()
+
+    def _cancel_response_queues(self) -> None:
+        """Wake every reader blocked on a worker response (idempotent)."""
+        self._response_queues_cancelled = True
+        for mq in list(getattr(self, "response_mqs", None) or []):
+            mq.shutdown()
 
     def execute_model(  # type: ignore[override]
         self, scheduler_output: SchedulerOutput, non_block: bool = False
@@ -390,6 +414,8 @@ class MultiprocExecutor(Executor):
         )
         if self.is_failed:
             raise RuntimeError("Executor failed.")
+        if getattr(self, "_response_queues_cancelled", False):
+            raise RuntimeError("Executor is shutting down; a worker has exited.")
 
         deadline = None if timeout is None else time.monotonic() + timeout
         kwargs = kwargs or {}
@@ -510,24 +536,43 @@ class MultiprocExecutor(Executor):
                     return shutdown_timeout
                 return max(0.0, deadline - time.monotonic())
 
-            # Keep every worker and its process group alive until all ranks
-            # acknowledge that device work is drained. Only then signal the
-            # worker busy loops to exit and begin distributed-state teardown.
+            # XPU: keep every worker and its process group alive until all
+            # ranks acknowledge that device work is drained; only then signal
+            # the worker busy loops to exit (oneCCL / Level Zero need the
+            # ordered release). Skipped when any rank is already gone: a dead
+            # rank cannot answer, and the monitor cancels the read if a rank
+            # dies while the RPC is outstanding. Other platforms tear down as
+            # before.
             if workers := getattr(self, "workers", None):
                 if (
-                    getattr(self, "rpc_broadcast_mq", None) is not None
+                    current_platform.is_xpu()
+                    and getattr(self, "rpc_broadcast_mq", None) is not None
                     and not self.is_failed
+                    and not getattr(self, "_response_queues_cancelled", False)
                 ):
+                    # Flag first, then check liveness: a rank that dies after
+                    # the check is seen by the monitor with the flag set.
+                    self._quiesce_in_progress = True
                     try:
-                        self.collective_rpc(
-                            "prepare_shutdown", timeout=remaining_grace()
-                        )
-                        logger.info_once("[shutdown] Executor: all workers quiesced")
+                        if all(w.proc.is_alive() for w in workers):
+                            self.collective_rpc(
+                                "prepare_shutdown", timeout=remaining_grace()
+                            )
+                            logger.info_once(
+                                "[shutdown] Executor: all workers quiesced"
+                            )
+                        else:
+                            logger.info(
+                                "[shutdown] Executor: a worker already exited; "
+                                "skipping the quiesce RPC"
+                            )
                     except Exception:
                         logger.exception(
                             "[shutdown] Executor: worker quiesce failed; "
                             "continuing process teardown"
                         )
+                    finally:
+                        self._quiesce_in_progress = False
 
                 for w in workers:
                     # Close death_writer to signal child processes to exit.
