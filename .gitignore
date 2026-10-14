@@ -259,3 +259,20 @@ csrc/cpu/cpu_attn_dispatch_generated.h
 # Deployment configuration is machine-specific and often holds live
 # credentials; it does not belong in the repo. Keep it out of tree.
 deploy/
+
+# systemd units are deployment configuration (see above); keep them on the
+# machine that runs them.
+systemd/
+
+# Operator-private serving records, merged into profiles.json at load time by
+# slimserve.registry (SLIMSERVE_LOCAL_PROFILES overrides the path).
+slimserve/profiles.local.json
+
+# Affine King is operator-private: its profile lives in profiles.local.json and
+# its tools stay on the serving machine.
+*affine-king*
+*affine_king*
+*AffineKing*
+tools/*affine*
+tools/diagnose_qwen36_gap.sh
+tools/profile_qwen36_gap.sh
