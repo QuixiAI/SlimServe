@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Extended live OpenAI Responses/structured-output smoke tests for GLM-5.3-Flash."""
+"""Extended live OpenAI Responses/structured-output smoke tests for GLM-5.3-Flash.
+
+Requests use glm53f_tool_matrix's sampling (temperature 1.0, top_p 0.95,
+top_k 20, seeded) and thinking on; the one thinking-off request is a labelled
+compatibility case.
+"""
 
 from __future__ import annotations
 
@@ -49,8 +54,9 @@ def response_payload(model: str, prompt: str) -> dict[str, Any]:
     return {
         "model": model,
         "input": prompt,
-        "temperature": 0,
-        "max_output_tokens": 128,
+        **base.SAMPLING,
+        "max_output_tokens": base.MAX_TOKENS,
+        "chat_template_kwargs": dict(base.THINKING_ON),
     }
 
 
@@ -156,15 +162,12 @@ def nonstream_cases(model: str):
     function_named_thinking.update(
         {
             "tool_choice": {"type": "function", "name": "get_weather"},
-            "chat_template_kwargs": {"thinking": True, "enable_thinking": True},
+            "chat_template_kwargs": dict(base.THINKING_ON),
         }
     )
 
     function_required_thinking = copy.deepcopy(function_required)
-    function_required_thinking["chat_template_kwargs"] = {
-        "thinking": True,
-        "enable_thinking": True,
-    }
+    function_required_thinking["chat_template_kwargs"] = dict(base.THINKING_ON)
 
     function_auto_call = copy.deepcopy(function_required)
     function_auto_call["tool_choice"] = "auto"
@@ -227,7 +230,6 @@ def nonstream_cases(model: str):
             "tool_choice": "required",
             "parallel_tool_calls": True,
             "max_tool_calls": 2,
-            "max_output_tokens": 256,
         }
     )
 
@@ -242,7 +244,6 @@ def nonstream_cases(model: str):
     )
     responses_schema.update(
         {
-            "chat_template_kwargs": {"thinking": False, "enable_thinking": False},
             "text": {
                 "format": {
                     "type": "json_schema",
@@ -262,9 +263,9 @@ def nonstream_cases(model: str):
                 "content": 'Return JSON with code 7 and label "ok". Do not add other fields.',
             }
         ],
-        "temperature": 0,
-        "max_tokens": 128,
-        "chat_template_kwargs": {"thinking": False, "enable_thinking": False},
+        **base.SAMPLING,
+        "max_tokens": base.MAX_TOKENS,
+        "chat_template_kwargs": dict(base.THINKING_ON),
         "response_format": {
             "type": "json_schema",
             "json_schema": {
@@ -274,6 +275,11 @@ def nonstream_cases(model: str):
             },
         },
     }
+
+    # Compatibility only: clients that switch thinking off must still get
+    # schema-constrained output. Not how SlimServe serves.
+    chat_schema_thinking_off_compat = copy.deepcopy(chat_schema)
+    chat_schema_thinking_off_compat["chat_template_kwargs"] = dict(base.THINKING_OFF)
 
     patch_prompt = (
         "greeting.txt contains exactly `Hello, world!\\n`. Call apply_patch "
@@ -288,7 +294,7 @@ def nonstream_cases(model: str):
     custom_named_thinking.update(
         {
             "tool_choice": {"type": "custom", "name": "apply_patch"},
-            "chat_template_kwargs": {"thinking": True, "enable_thinking": True},
+            "chat_template_kwargs": dict(base.THINKING_ON),
         }
     )
 
@@ -305,7 +311,7 @@ def nonstream_cases(model: str):
     custom_none = base.custom_payload(
         model, "Do not call a tool. Reply exactly CUSTOM_NONE_OK"
     )
-    custom_none.update({"tool_choice": "none", "max_output_tokens": 64})
+    custom_none.update({"tool_choice": "none"})
 
     allowed_custom_required = copy.deepcopy(custom_required)
     allowed_custom_required["tool_choice"] = {
@@ -350,6 +356,7 @@ def nonstream_cases(model: str):
         ("responses_allowed_custom_lark_auto_text", "/v1/responses", allowed_custom_auto_text, lambda r: exact_text_without_any_tool(r, "ALLOWED_CUSTOM_AUTO_TEXT_OK")),
         ("responses_json_schema", "/v1/responses", responses_schema, structured_text),
         ("chat_json_schema", "/v1/chat/completions", chat_schema, structured_chat),
+        ("chat_json_schema_thinking_off_compat", "/v1/chat/completions", chat_schema_thinking_off_compat, structured_chat),
     ]
 
 
@@ -436,7 +443,6 @@ def streaming_cases(model: str):
     )
     schema_payload.update(
         {
-            "chat_template_kwargs": {"thinking": False, "enable_thinking": False},
             "text": {
                 "format": {
                     "type": "json_schema",
@@ -610,10 +616,13 @@ def post_status(
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
-    parser.add_argument("--model", default="GLM-5.3-Flash-FP8")
+    # served_model_name of every GLM-5.3-Flash record in slimserve/profiles.json.
+    parser.add_argument("--model", default="GLM-5.3-Flash")
     parser.add_argument("--api-key", default=os.environ.get("OPENAI_API_KEY"))
+    base.add_sampling_args(parser)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
+    base.configure_sampling(args)
 
     results: list[dict[str, Any]] = []
     for name, path, payload, validate in nonstream_cases(args.model):
@@ -731,6 +740,8 @@ def main() -> int:
     report = {
         "model": args.model,
         "base_url": args.base_url,
+        "sampling": dict(base.SAMPLING),
+        "max_tokens": base.MAX_TOKENS,
         "passed": sum(result["passed"] for result in results),
         "total": len(results),
         "results": results,

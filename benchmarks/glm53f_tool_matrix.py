@@ -2,6 +2,9 @@
 """Live OpenAI-compatible tool matrix for GLM-5.3-Flash.
 
 Exercises Chat Completions function tools and Responses custom Lark tools.
+Requests sample at the model's recommended settings (temperature 1.0, top_p
+0.95, top_k 20) with a fixed seed, and with thinking on: that is how SlimServe
+serves, so it is what the matrix qualifies.
 The server under test may use speculative decoding; acceptance/throughput is
 reported separately by vLLM's /metrics endpoint and benchmark harnesses.
 """
@@ -53,6 +56,54 @@ def function_tool(name: str, description: str) -> dict[str, Any]:
 
 WEATHER_TOOL = function_tool("get_weather", "Return the weather for a city.")
 TIME_TOOL = function_tool("get_time", "Return the local time for a city.")
+# SlimServe serves with thinking on; every case inherits it unless it is an
+# explicitly labelled compatibility case.
+THINKING_ON = {"thinking": True, "enable_thinking": True}
+THINKING_OFF = {"thinking": False, "enable_thinking": False}
+
+# Room for the reasoning that precedes a tool call or answer.
+DEFAULT_MAX_TOKENS = 4096
+
+# Recommended sampling for GLM-5.3-Flash; overridden from the command line by
+# configure_sampling(). Never greedy.
+SAMPLING: dict[str, Any] = {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 20,
+    "seed": 0,
+}
+MAX_TOKENS = DEFAULT_MAX_TOKENS
+
+
+def add_sampling_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--top-p", type=float, default=0.95)
+    parser.add_argument("--top-k", type=int, default=20)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Base request seed; repetition r of a case uses seed + r.",
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=DEFAULT_MAX_TOKENS,
+        help="Generation budget per request, including reasoning.",
+    )
+
+
+def configure_sampling(args: argparse.Namespace) -> None:
+    global MAX_TOKENS
+    SAMPLING.update(
+        temperature=args.temperature,
+        top_p=args.top_p,
+        top_k=args.top_k,
+        seed=args.seed,
+    )
+    MAX_TOKENS = args.max_tokens
+
+
 PATCH_TOOL = {
     "type": "custom",
     "name": "apply_patch",
@@ -152,8 +203,9 @@ def native_payload(model: str, prompt: str) -> dict[str, Any]:
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "tools": [WEATHER_TOOL],
-        "temperature": 0,
-        "max_tokens": 256,
+        **SAMPLING,
+        "max_tokens": MAX_TOKENS,
+        "chat_template_kwargs": dict(THINKING_ON),
     }
 
 
@@ -162,8 +214,9 @@ def custom_payload(model: str, prompt: str) -> dict[str, Any]:
         "model": model,
         "input": prompt,
         "tools": [PATCH_TOOL],
-        "temperature": 0,
-        "max_output_tokens": 128,
+        **SAMPLING,
+        "max_output_tokens": MAX_TOKENS,
+        "chat_template_kwargs": dict(THINKING_ON),
     }
 
 
@@ -182,7 +235,7 @@ def cases(model: str) -> list[tuple[str, str, dict[str, Any], Callable[[dict[str
         {
             "tool_choice": {"type": "function", "function": {"name": "get_weather"}},
             "parallel_tool_calls": False,
-            "chat_template_kwargs": {"thinking": True, "enable_thinking": True},
+            "chat_template_kwargs": dict(THINKING_ON),
         }
     )
 
@@ -190,7 +243,7 @@ def cases(model: str) -> list[tuple[str, str, dict[str, Any], Callable[[dict[str
     native_auto.update({"tool_choice": "auto", "parallel_tool_calls": False})
 
     native_none = native_payload(model, "Do not call a tool. Reply exactly NATIVE_NONE_OK")
-    native_none.update({"tool_choice": "none", "max_tokens": 32})
+    native_none.update({"tool_choice": "none"})
 
     native_parallel = native_payload(
         model,
@@ -217,7 +270,7 @@ def cases(model: str) -> list[tuple[str, str, dict[str, Any], Callable[[dict[str
             "max_tool_calls": 1,
             # GLM-5.3-Flash custom tools deliberately override this unsafe
             # combination to non-thinking in the compatibility policy.
-            "chat_template_kwargs": {"thinking": True, "enable_thinking": True},
+            "chat_template_kwargs": dict(THINKING_ON),
         }
     )
 
@@ -227,7 +280,7 @@ def cases(model: str) -> list[tuple[str, str, dict[str, Any], Callable[[dict[str
     )
 
     custom_none = custom_payload(model, "Do not call a tool. Reply exactly CUSTOM_NONE_OK")
-    custom_none.update({"tool_choice": "none", "max_output_tokens": 32})
+    custom_none.update({"tool_choice": "none"})
 
     return [
         ("native_required", "/v1/chat/completions", native_required, one_native_call),
@@ -272,8 +325,10 @@ def cases(model: str) -> list[tuple[str, str, dict[str, Any], Callable[[dict[str
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
-    parser.add_argument("--model", default="GLM-5.3-Flash-FP8")
+    # served_model_name of every GLM-5.3-Flash record in slimserve/profiles.json.
+    parser.add_argument("--model", default="GLM-5.3-Flash")
     parser.add_argument("--api-key", default=os.environ.get("OPENAI_API_KEY"))
+    add_sampling_args(parser)
     parser.add_argument("--repetitions", type=int, default=1)
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument(
@@ -289,6 +344,7 @@ def main() -> int:
         parser.error("--repetitions must be at least 1")
     if args.concurrency < 1:
         parser.error("--concurrency must be at least 1")
+    configure_sampling(args)
 
     selected_cases = cases(args.model)
     if args.case_names:
@@ -312,12 +368,14 @@ def main() -> int:
     def run_case(job):
         repetition, case_index, case = job
         name, path, payload, validate = case
+        payload = copy.deepcopy(payload)
+        payload["seed"] = args.seed + repetition
         started = time.perf_counter()
         try:
             response = post(
                 args.base_url,
                 path,
-                copy.deepcopy(payload),
+                payload,
                 api_key=args.api_key,
             )
             passed = validate(response)
@@ -358,6 +416,8 @@ def main() -> int:
         "base_url": args.base_url,
         "concurrency": args.concurrency,
         "repetitions": args.repetitions,
+        "sampling": dict(SAMPLING),
+        "max_tokens": MAX_TOKENS,
         "cases": [case[0] for case in selected_cases],
         "passed": sum(result["passed"] for result in results),
         "total": len(results),
