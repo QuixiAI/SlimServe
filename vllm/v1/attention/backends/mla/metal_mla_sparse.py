@@ -114,7 +114,22 @@ def _scatter_rows(
     if kv_cache.device.type != "mps" or _page_extent(kv_cache) <= _INDEX32_LIMIT:
         kv_cache[blk, off] = vals
         return
-    win = max(1, _INDEX32_LIMIT // max(1, kv_cache.stride(0)))
+    _scatter_rows_windowed(
+        kv_cache, blk, off, vals, max(1, _INDEX32_LIMIT // max(1, kv_cache.stride(0)))
+    )
+
+
+def _scatter_rows_windowed(
+    kv_cache: torch.Tensor,
+    blk: torch.Tensor,
+    off: torch.Tensor,
+    vals: torch.Tensor,
+    win: int,
+) -> None:
+    """The windowed scatter behind _scatter_rows; split out so the parking
+    logic is testable on CPU with a small window."""
+    if vals.shape[0] == 0:
+        return
     for b0 in range(0, kv_cache.shape[0], win):
         b1 = min(kv_cache.shape[0], b0 + win)
         sub = kv_cache[b0:b1]
@@ -125,10 +140,13 @@ def _scatter_rows(
         # writes land in an undefined order, so every writer of that slot
         # must agree: if a live entry of this call targets (b0, 0) the parked
         # rows carry its value, otherwise the row's current contents. Slots
-        # are unique within a call, so the masked sum is that one row. No
-        # host sync.
-        hit = (inwin & (local == 0) & (loff == 0)).to(vals.dtype)
-        park = (vals * hit[:, None]).sum(0) + (1 - hit.sum().clamp(max=1)) * sub[0, 0]
+        # are unique within a call, so at most one row hits; it is selected,
+        # not multiplied by a 0/1 mask, so a non-finite value in a non-hit
+        # row (or in the parked row) cannot turn 0 * Inf into NaN in a live
+        # row. No host sync.
+        hit = inwin & (local == 0) & (loff == 0)
+        first = hit.to(torch.int32).argmax().view(1)
+        park = torch.where(hit.any(), vals.index_select(0, first)[0], sub[0, 0])
         sub[local, loff] = torch.where(inwin[:, None], vals, park[None, :])
 
 

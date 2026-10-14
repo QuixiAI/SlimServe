@@ -329,3 +329,36 @@ def test_backend_surface():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-x", "-q"])
+
+
+# ------------------------------------------------- windowed scatter parking
+
+
+def _windowed_scatters():
+    from vllm.model_executor.layers import glm5_next_indexer as gi
+
+    return [mm._scatter_rows_windowed, gi._scatter_rows_windowed]
+
+
+@pytest.mark.parametrize("scatter", _windowed_scatters())
+@pytest.mark.parametrize("hit", [False, True])
+def test_windowed_scatter_parks_without_nan(scatter, hit):
+    """Out-of-window rows are parked on each window's row (b0, 0). The parked
+    value must be the live write to that row (when this call has one) or the
+    row's current contents, never a 0 * Inf product of a non-hit row. The
+    window is two blocks, so (2, 0) is a live cache row."""
+    nblk, bs, d = 6, 4, 8
+    cache = torch.arange(nblk * bs * d, dtype=torch.float32).view(nblk, bs, d)
+    cache[4, 0] = float("inf")  # the parked row of window b0=4 is non-finite
+    blk = [2, 0, 5] if hit else [3, 0, 5]
+    off = [0, 3, 1]
+    blk_t = torch.tensor(blk)
+    off_t = torch.tensor(off)
+    vals = torch.full((3, d), 7.0)
+    vals[1] = float("inf")  # a non-hit row of every window
+    vals[2] = -float("inf")
+    ref = cache.clone()
+    ref[blk_t, off_t] = vals
+    scatter(cache, blk_t, off_t, vals, 2)
+    assert not torch.isnan(cache).any()
+    torch.testing.assert_close(cache, ref)

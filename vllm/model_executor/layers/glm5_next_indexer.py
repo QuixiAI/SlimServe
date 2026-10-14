@@ -417,15 +417,34 @@ def _scatter_cache_rows(
     if cache.device.type != "mps" or _cache_extent(cache) <= _INDEX32_LIMIT:
         cache[blk, off] = vals
         return
-    win = max(1, _INDEX32_LIMIT // max(1, cache.stride(0)))
+    _scatter_rows_windowed(
+        cache, blk, off, vals, max(1, _INDEX32_LIMIT // max(1, cache.stride(0)))
+    )
+
+
+def _scatter_rows_windowed(
+    cache: torch.Tensor,
+    blk: torch.Tensor,
+    off: torch.Tensor,
+    vals: torch.Tensor,
+    win: int,
+) -> None:
+    """The windowed scatter behind _scatter_cache_rows; split out so the parking
+    logic is testable on CPU with a small window."""
+    if vals.shape[0] == 0:
+        return
     for b0 in range(0, cache.shape[0], win):
         b1 = min(cache.shape[0], b0 + win)
         sub = cache[b0:b1]
         inwin = (blk >= b0) & (blk < b1)
         local = torch.where(inwin, blk - b0, 0)
         loff = torch.where(inwin, off, 0)
-        hit = (inwin & (local == 0) & (loff == 0)).to(vals.dtype)
-        park = (vals * hit[:, None]).sum(0) + (1 - hit.sum().clamp(max=1)) * sub[0, 0]
+        # Select the hit row rather than multiplying by a 0/1 mask: a
+        # non-finite value in any non-hit row (or in the parked row itself)
+        # would otherwise turn 0 * Inf into NaN in a live row.
+        hit = inwin & (local == 0) & (loff == 0)
+        first = hit.to(torch.int32).argmax().view(1)
+        park = torch.where(hit.any(), vals.index_select(0, first)[0], sub[0, 0])
         sub[local, loff] = torch.where(inwin[:, None], vals, park[None, :])
 
 
