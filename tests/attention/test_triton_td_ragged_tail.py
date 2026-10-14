@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tensor descriptors must not let unwritten page-tail NaNs enter attention.
 
 Run on XPU; deterministic random data models Qwen TP4's non-power-of-two
