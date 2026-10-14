@@ -49,6 +49,14 @@ def test_invalid_evenly_spaced_boundary_is_replaced():
     assert all(len(prompt) == 5 for prompt in prompts)
 
 
+def test_replacement_windows_skip_duplicate_prompts():
+    # Starts 0, 2, 4 are tried first; 4 ("fab") does not round-trip.  The
+    # first untried start, 1, repeats start 0's "aaa" and must be skipped.
+    prompts = exact_prompts(OneBadBoundaryTokenizer(), "aaaafab", 3, 3, 0, False)
+    assert prompts == ["aaa", "aaf", "afa"]
+    assert len(set(prompts)) == len(prompts)
+
+
 @pytest.mark.parametrize("repeat", [False, True])
 def test_empty_source_has_clear_error(repeat):
     with pytest.raises(ValueError, match="at least one token"):

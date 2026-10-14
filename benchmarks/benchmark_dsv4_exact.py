@@ -201,6 +201,10 @@ def exact_prompts(
             text = tokenizer.decode(source_ids[candidate : candidate + token_count])
             if len(tokenizer.encode(text, add_special_tokens=False)) != token_count:
                 continue
+            # A short or periodic source repeats its windows; identical
+            # prompts would turn concurrent requests into prefix-cache hits.
+            if text in prompts:
+                continue
             prompts.append(text)
             if len(prompts) == count:
                 break
