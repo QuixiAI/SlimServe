@@ -1,5 +1,73 @@
 # SlimServe Optimization Status
 
+## 2026-10-14 - PR #29 (glm53f-rtx6000) validated on the 8x A100 box; three Ampere fixes
+
+- Scope: the branch's shared code on the a100 records (`glm53f-nvfp4-8`,
+  TP4 x DP2): hybrid KV-cache core (partial hits), speculator and rejection
+  sampler, KDA Triton kernels, QuixiCore decode kernels, DSV4 router kernel
+  signature, tool-thinking defaults. The a100 records themselves are
+  byte-identical to main apart from notes. Head validated: cf8acbf84 plus
+  the three fixes below. Production (nvidia/GLM-5.3-Flash-NVFP4 under
+  glm53f-nvfp4-8, spec off) was stopped for three windows: 02:25-03:01,
+  03:34-04:15 and 04:16-04:25 UTC; prod smoke and the cron canary were clean
+  after each restart.
+- Baseline (same box, same day, main at 11e644b6c on the live prod unit,
+  exact 1000/300, temperature 1.0 / top-p 0.95 / top-k 20, seed 42):
+  c1 97.6 / 97.8, c8 566.0 / 565.1, c16 827.5 / 826.9 tok/s
+  (`perf/results/2026-10-14/pr29-validation/main-prod-ref/`, `prod-smoke/`).
+- Fix 1 (serving, blocking): `vllm/triton_utils/pdl.py` enabled programmatic
+  dependent launch on every CUDA device; `griddepcontrol` is sm_90+, so
+  ptxas rejected every KDA Triton kernel on sm_80 (69 tests in
+  tests/glm5_next; no GLM-5.3-Flash boot possible on A100 or RTX 3090).
+  Gated on `current_platform.is_arch_support_pdl()`, the check the native
+  kernels and gather_initial_states already use. Commit b58b0dfa1.
+- Fix 2 (serving): the compressed-tensors w8a8 FP8 scheme handed block- and
+  channel-FP8 linears to the QuixiCore decode GEMM op on any sm_80+ device,
+  and above 16 tokens the op runs the CUTLASS fp8 GEMM, absent below sm_89
+  (`cutlass_scaled_mm_sm80_epilogue` at prefill). The op is sm_89+ now;
+  Ampere keeps the scheme's Marlin W8A16 path for every M. Commit 962ebcffd
+  (also makes the cluster-only kernel tests skip below sm_90 / sm_89,
+  matching what kda_block_serves and _qc_nvfp4_decode_split already do on
+  those parts: 84 passed, 196 skipped on A100).
+- Fix 3 (performance): the QuixiCore NVFP4 decode MoE pair defaulted to its
+  sm_120 cap of 32 assignment rows everywhere, i.e. up to 4 tokens per
+  replica with top-8. On A100 it wins the one-token batch and loses the
+  four-token batch to Marlin: prod configuration, three passes,
+  c1 109.1 / c8 535.6-536.6 / c16 871.6-878.7 (c8 -5.3 % against main,
+  c16 is Marlin and +6 %). Default cap is now 8 rows (one token) below
+  sm_100; QC_NVFP4_DECODE_ROWS still pins any value. Re-measured with the
+  cap: c1 109.9 / 109.9, c8 603.8 / 601.5 (+12.6 % / +6.6 % over main).
+  Raw: `armA/`, `armE/` (before), `armF/` (after).
+- Correctness: CPU suites (registry, tool-thinking compat, hybrid partial-hit
+  alignment, sampling masks, cudagraph dispatch) pass; GPU kernel suites
+  1619 passed with the only failures the three test-side device checks
+  above. Every boot passed the text, reasoning, image and tool canaries;
+  every exact pass reports exact token counts. Pool on the prod
+  configuration 4,154,832 tokens (2026-09-22 record 4,165,129).
+- Speculative path (arm B, `glm53f-nvfp4-8 --model nvidia/GLM-5.3-Flash-NVFP4
+  --spec`, the registered DFlash2 drafter over the served export,
+  VLLM_KV_TIER_VERIFY=1): canaries pass, pool 2,881,309 tokens, exact
+  c1 126.1 / c8 621.2 / c16 881.8 (registered record on main 128.0 / 567.1 /
+  875.6); draft acceptance over the boot 5,944 / 10,636 tokens. Measured
+  before fix 3, so its c8 carries the 32-row cap.
+- Host/NVMe tier on the same boot: eviction-restore acceptance 6/6 markers
+  recalled after a 3,543,636-token churn of the 2,881,309-token pool; 24
+  verify batches, every one 0/67 restores mismatched
+  (`armB-acceptance.json`, `armB-server.log`).
+- Not run (operator cut the downtime): `glm53f-nvfp4-4` and
+  `dsv4-q4ktail-4` boots on the branch. The DSV4 router kernel change is
+  signature-only (experts count as an argument) and is covered by
+  tests/kernels/test_quixicore_router_gemm.py on A100. The registered RedHat
+  checkpoint is not kept on this box (operator); the arms used the nvidia
+  export through `--model`.
+- Decision: mergeable for the A100 fleet with the three fixes; the a100
+  records stay as registered (no Ampere record is changed by the branch).
+  Open item for whoever owns the a100 records: the NVFP4 decode pair at 2-3
+  tokens per replica is unmeasured on A100 (the cap excludes it), and the
+  spec arm could be re-run with the cap for a clean c8.
+- Raw: `perf/results/2026-10-14/pr29-validation/` (armA, armB incl. the tier
+  acceptance, armE, armF, main-prod-ref, prod-smoke, server logs).
+
 ## 2026-09-24 - Qwen3.6-35B-A3B on one RTX 5090
 
 - Status: in progress; NVFP4 V1 diagnostic passes short, full-length and host-tier restore checks. Qwen3.6 V2 runner work and FP8 qualification are active.
