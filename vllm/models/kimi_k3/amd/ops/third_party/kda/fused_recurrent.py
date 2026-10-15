@@ -15,6 +15,7 @@ from vllm.triton_utils import tl, triton
 
 # Programmatic dependent launch: see vllm/triton_utils/pdl.py.
 from vllm.triton_utils.pdl import PDL as _PDL  # noqa: E402
+from vllm.triton_utils.pdl import PDL_LAUNCH as _PDL_LAUNCH  # noqa: E402
 from vllm.triton_utils.pdl import gdc_launch_dependents, gdc_wait  # noqa: E402, F401
 
 from vllm.utils.math_utils import cdiv, next_power_of_2
@@ -500,7 +501,7 @@ def fused_recurrent_kda_commit(
         num_stages=2,
     
         PDL=_PDL,
-        launch_pdl=_PDL,
+        **_PDL_LAUNCH,
     )
 
 def fused_recurrent_kda_fwd(
@@ -600,7 +601,7 @@ def fused_recurrent_kda_fwd(
         STORE_STATES=store_states,
     
         PDL=_PDL,
-        launch_pdl=_PDL,
+        **_PDL_LAUNCH,
     )
     return out, initial_state
 
@@ -865,6 +866,6 @@ def fused_recurrent_kda_packed_decode(
         num_stages=2,
     
         PDL=_PDL,
-        launch_pdl=_PDL,
+        **_PDL_LAUNCH,
     )
     return out, initial_state

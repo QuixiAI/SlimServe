@@ -116,6 +116,9 @@ kernel void paged_attention_partition(
 // its per-row causal boundary (row i sees ctx_len - m + i + 1) and window.
 // Partials layout matches paged_attention_partition, so the existing reduce
 // merges them unchanged (rows act as B). Grid: (H, 1, P), threads m*32.
+// No logit soft-capping: paged_attention_partition applies `softcap`, this
+// kernel takes none, so hosts must not route soft-capped models here
+// (SlimServe's Metal attention backend rejects them at construction).
 // ---------------------------------------------------------------------------
 
 template <typename T, int D>
@@ -159,6 +162,7 @@ kernel void paged_attention_verify(
 
     threadgroup T kt[TILE][D];
     threadgroup T vt[TILE][D];
+    threadgroup int kvalid[TILE];  // block >= 0 for the staged token
 
     const long q_base = ((long)row * num_heads + head) * D;
     const long stat_idx = ((long)row * num_heads + head) * num_partitions + part;
@@ -183,6 +187,7 @@ kernel void paged_attention_verify(
             const int block_col = tok / block_size;
             const int slot = tok - block_col * block_size;
             const int block = block_table[block_col];
+            if (d == 0) kvalid[tt] = (block >= 0) ? 1 : 0;
             if (block >= 0) {
                 const long cb = (long)block * (long)kv_block_stride +
                     ((long)slot * num_kv_heads + kv_head) * D;
@@ -196,7 +201,9 @@ kernel void paged_attention_verify(
         threadgroup_barrier(metal::mem_flags::mem_threadgroup);
         for (int tt = 0; tt < tile_n; ++tt) {
             const int tok = t0 + tt;
-            if (tok >= row_start && tok < row_end) {
+            // skip unmapped blocks like paged_attention_partition does,
+            // rather than scoring the zero tile they were staged as
+            if (tok >= row_start && tok < row_end && kvalid[tt] != 0) {
                 float partial = 0.0f;
                 for (int i = 0; i < VALUES_PER_LANE; ++i) {
                     const int d = (int)lane + 32 * i;

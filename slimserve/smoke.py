@@ -71,8 +71,10 @@ def compatible_profile_ids(machine: hardware.Machine) -> list[str]:
     if not machine.known or machine.platform is None:
         return []
 
+    # The live smoke drives chat completions; video profiles have their own
+    # gate (perf/ltx25_harness/n6_serve_check.py).
     compatible: list[str] = []
-    for profile_id in registry.profile_ids():
+    for profile_id in registry.language_model_profile_ids():
         try:
             registry.resolve(
                 profile_id,
