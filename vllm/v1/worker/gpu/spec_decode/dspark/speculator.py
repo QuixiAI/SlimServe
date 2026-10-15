@@ -164,6 +164,7 @@ class DSparkSpeculator(DFlashSpeculator):
                     output_processed_logits=self.draft_logits,
                     output_processed_logits_col=self._step_cols[i],
                     use_fp64=self.use_fp64_gumbel,
+                    is_drafting=True,
                 )
             else:
                 draft_sampled_i = self.model.map_draft_to_target(
