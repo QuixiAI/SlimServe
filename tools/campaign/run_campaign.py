@@ -26,6 +26,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -53,7 +54,8 @@ STATE_ROOT = Path(
         "SLIMSERVE_CAMPAIGN_ROOT", str(Path.home() / ".local/scratch/campaigns")
     )
 )
-# The reference trees CLAUDE.md names. Override the whole list with
+# The reference trees CLAUDE.md names, plus QuixiCore-CUDA (CLAUDE.md's port
+# target for finished kernels). Override the whole list with
 # SLIMSERVE_CAMPAIGN_REF_TREES (os.pathsep-separated) or add to it with
 # --ref-tree; trees that do not exist on this machine are dropped.
 CLAUDE_MD_REF_TREES = [
@@ -61,6 +63,7 @@ CLAUDE_MD_REF_TREES = [
     "~/ds4",
     "~/QuixiCore/QuixiCore-ROCm",
     "~/QuixiCore/QuixiCore-Metal",
+    "~/QuixiCore/QuixiCore-CUDA",
 ]
 
 
@@ -99,19 +102,26 @@ DELEGATION_TEXT = {
 
 # Whether the agent may stop servers it did not start. Never by default: the
 # operator opts in per launch with --allow-kill-servers, and the choice is not
-# carried over to a later `resume` that omits the flag.
+# carried over to a later `resume` that omits the flag. The prompt states the
+# policy; the PreToolUse hook (hooks/command_guard.py kill) enforces it from
+# SLIMSERVE_CAMPAIGN_ALLOW_KILL and the campaign PID file.
 SERVER_POLICY_TEXT = {
     False: (
-        "Server policy for this launch: you may stop only servers this campaign "
-        "booted (track their PIDs). Never kill, signal or restart any other "
+        "Server policy for this launch: boot every server with "
+        "`tools/campaign/boot_server.py --log <file> -- <cmd>` (it records the "
+        "PID as campaign-owned); you may stop only those servers, by PID "
+        "(`kill <pid>`, `kill -- -<pid>` for its process group). A hook blocks "
+        "every other kill, pkill, killall, fuser -k, systemctl/docker stop. "
+        "Never kill, signal or restart any other "
         "process that holds GPU / unified memory. If another server holds the "
         "memory a boot needs, do not stop it: write a `blocked` marker naming "
         "the process (PID, command, memory held) and stop. The operator can "
         "relaunch with `--allow-kill-servers`."
     ),
     True: (
-        "Server policy for this launch: the operator passed "
-        "`--allow-kill-servers`, so you may stop a local inference server you "
+        "Server policy for this launch: boot every server with "
+        "`tools/campaign/boot_server.py --log <file> -- <cmd>`. The operator "
+        "passed `--allow-kill-servers`, so you may stop a local inference server you "
         "did not start when the campaign needs its memory. Stop it by PID "
         "lineage, record in HANDOFF.md and the phase marker exactly what was "
         "stopped (PID, command, memory held, time), and never touch "
@@ -419,6 +429,37 @@ def ensure_worktree(c: Campaign, args: argparse.Namespace) -> None:
         else sys.executable
     )
     c.state["python"] = python
+    install_git_hooks(c)
+
+
+def guard_base(c: Campaign) -> str:
+    return f"{c.state['remote']}/{c.state['base'].split('/')[-1]}"
+
+
+def install_git_hooks(c: Campaign) -> None:
+    """Run tools/campaign/guard.sh as the campaign worktree's pre-push hook.
+
+    The hooks directory lives in the campaign state dir and is set as
+    core.hooksPath in the worktree's own config (extensions.worktreeConfig),
+    so the operator's other worktrees keep their hooks. The PreToolUse hook
+    blocks --no-verify and core.hooksPath overrides."""
+    hooks = c.dir / "githooks"
+    hooks.mkdir(parents=True, exist_ok=True)
+    pre_push = hooks / "pre-push"
+    pre_push.write_text(
+        "#!/usr/bin/env bash\n"
+        "# Installed by tools/campaign/run_campaign.py: the campaign guard runs\n"
+        "# before every push from this worktree.\n"
+        "export CAMPAIGN_PYTHON="
+        f"{shlex.quote(c.state.get('python') or sys.executable)}\n"
+        f"exec bash {shlex.quote(str(TOOLS_DIR / 'guard.sh'))} "
+        f"--base {shlex.quote(guard_base(c))}\n"
+    )
+    pre_push.chmod(0o755)
+    git(c.repo, "config", "extensions.worktreeConfig", "true")
+    git(c.worktree, "config", "--worktree", "core.hooksPath", str(hooks))
+    c.state["git_hooks"] = str(hooks)
+    c.log(f"pre-push guard installed ({hooks}, worktree core.hooksPath)")
 
 
 def write_brief(c: Campaign, args: argparse.Namespace) -> None:
@@ -509,28 +550,48 @@ def render_prompt(c: Campaign, phase: str, feedback: str = "") -> str:
 # ---------------------------------------------------------------------------
 
 
-def claude_command(
-    c: Campaign, phase: str, args_model: str, args_effort: str, resume_sid: str | None
-) -> list[str]:
-    skill_text = (c.worktree / SKILL_REL).read_text()
-    settings = {
+def session_settings() -> dict[str, Any]:
+    """Claude Code settings for a campaign session. The session runs with
+    bypassPermissions, so these hooks are the only enforcement of the
+    authorship rule and the server policy."""
+    guard = (
+        f"{shlex.quote(sys.executable)} "
+        f"{shlex.quote(str(TOOLS_DIR / 'hooks' / 'command_guard.py'))}"
+    )
+
+    def hook(command: str) -> dict[str, Any]:
+        return {"type": "command", "command": command, "timeout": 20}
+
+    return {
+        # No Co-authored-by trailer or "Generated with" line from the CLI
+        # itself: AI is never an author (CLAUDE.md Commit authorship).
+        "includeCoAuthoredBy": False,
+        "attribution": {"commit": "", "pr": ""},
         "hooks": {
             "PreToolUse": [
                 {
                     "matcher": "Bash",
                     "hooks": [
-                        {
-                            "type": "command",
-                            "command": str(
-                                TOOLS_DIR / "hooks" / "block-ai-attribution.sh"
-                            ),
-                            "timeout": 10,
-                        }
+                        hook(str(TOOLS_DIR / "hooks" / "block-ai-attribution.sh")),
+                        hook(f"{guard} git-bypass"),
+                        hook(f"{guard} kill"),
                     ],
-                }
+                },
+                {
+                    # the campaign PID file and git hooks are driver-owned
+                    "matcher": "Write|Edit|MultiEdit|NotebookEdit",
+                    "hooks": [hook(f"{guard} kill")],
+                },
             ]
         },
     }
+
+
+def claude_command(
+    c: Campaign, phase: str, args_model: str, args_effort: str, resume_sid: str | None
+) -> list[str]:
+    skill_text = (c.worktree / SKILL_REL).read_text()
+    settings = session_settings()
     cmd = [
         which("claude") or "claude",
         "-p",
@@ -636,6 +697,40 @@ def fingerprint(c: Campaign, phase: str) -> str:
     return h.hexdigest()
 
 
+def pid_file(c: Campaign) -> Path:
+    """Servers this campaign booted (tools/campaign/boot_server.py appends)."""
+    p = c.dir / "servers.pids"
+    if not p.exists():
+        c.dir.mkdir(parents=True, exist_ok=True)
+        p.touch()
+    return p
+
+
+def session_env(c: Campaign, phase: str) -> dict[str, str]:
+    """Environment of a campaign session (and so of its hooks)."""
+    env = dict(os.environ)
+    env.update(
+        {
+            "SLIMSERVE_CAMPAIGN_ID": c.id,
+            "SLIMSERVE_CAMPAIGN_DIR": str(c.dir),
+            "SLIMSERVE_CAMPAIGN_PHASE": phase,
+            "SLIMSERVE_CAMPAIGN_WORKTREE": str(c.worktree),
+            "SLIMSERVE_CAMPAIGN_PYTHON": c.python,
+            "SLIMSERVE_CAMPAIGN_TOOLS": str(TOOLS_DIR),
+            "CAMPAIGN_PRIVATE_EMAILS": private_emails(c.state.get("git_email", "")),
+            # servers booted through tools/campaign/boot_server.py
+            "SLIMSERVE_CAMPAIGN_PID_FILE": str(pid_file(c)),
+            "SLIMSERVE_CAMPAIGN_GIT_HOOKS": str(c.dir / "githooks"),
+        }
+    )
+    # The server policy the PreToolUse hook enforces: set only on a launch
+    # with --allow-kill-servers, never inherited from the operator's shell.
+    env.pop("SLIMSERVE_CAMPAIGN_ALLOW_KILL", None)
+    if c.state.get("allow_kill_servers"):
+        env["SLIMSERVE_CAMPAIGN_ALLOW_KILL"] = "1"
+    return env
+
+
 def run_attempt(
     c: Campaign, phase: str, args: argparse.Namespace, feedback: str
 ) -> dict[str, Any]:
@@ -653,18 +748,7 @@ def run_attempt(
     if n > 1 and not args.fresh_sessions:
         resume_sid = c.state.get("last_session", {}).get(phase)
     cmd = claude_command(c, phase, args.model, args.effort, resume_sid)
-    env = dict(os.environ)
-    env.update(
-        {
-            "SLIMSERVE_CAMPAIGN_ID": c.id,
-            "SLIMSERVE_CAMPAIGN_DIR": str(c.dir),
-            "SLIMSERVE_CAMPAIGN_PHASE": phase,
-            "SLIMSERVE_CAMPAIGN_WORKTREE": str(c.worktree),
-            "SLIMSERVE_CAMPAIGN_PYTHON": c.python,
-            "SLIMSERVE_CAMPAIGN_TOOLS": str(TOOLS_DIR),
-            "CAMPAIGN_PRIVATE_EMAILS": private_emails(c.state.get("git_email", "")),
-        }
-    )
+    env = session_env(c, phase)
     c.log(
         f"phase {phase} attempt {n}: launching claude "
         f"({'resume ' + resume_sid if resume_sid else 'fresh session'}); "
@@ -892,12 +976,7 @@ def guard_passes(c: Campaign) -> tuple[bool, str]:
         CAMPAIGN_PYTHON=c.python,
     )
     out = run(
-        [
-            "bash",
-            str(TOOLS_DIR / "guard.sh"),
-            "--base",
-            f"{c.state['remote']}/{c.state['base'].split('/')[-1]}",
-        ],
+        ["bash", str(TOOLS_DIR / "guard.sh"), "--base", guard_base(c)],
         cwd=c.worktree,
         env=env,
         timeout=1800,
@@ -1360,6 +1439,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
         c.state["delegate"] = args.delegate
     c.state["allow_kill_servers"] = bool(args.allow_kill_servers)
     c.log(f"resuming (allow_kill_servers={c.state['allow_kill_servers']})")
+    install_git_hooks(c)
     return main_loop(c, args)
 
 

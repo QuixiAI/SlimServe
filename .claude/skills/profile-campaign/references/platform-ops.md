@@ -14,19 +14,24 @@ box teaches you something new.
   --port 8000 -y` (`--spec` / `--no-spec` to pin the drafter arm).
   `slimserve <id> --dry-run` shows the resolved command.
 - Boot **detached** so the agent harness cannot kill the server with the
-  session's process tree:
+  session's process tree. In a campaign, boot through the driver's launcher,
+  which does exactly that and records the PID as campaign-owned (the
+  PreToolUse hook lets you stop only those):
 
-  ```python
-  subprocess.Popen(cmd, cwd=worktree, env=env, stdin=subprocess.DEVNULL,
-                   stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+  ```bash
+  tools/campaign/boot_server.py --log perf/results/<date>/<run>/server.log -- <cmd>
   ```
+
+  Outside a campaign the equivalent is
+  `subprocess.Popen(cmd, ..., stdin=subprocess.DEVNULL, start_new_session=True)`.
 
   then poll `http://127.0.0.1:8000/health` until 200 (boots take 2-5 min),
   primer request, ramp request, then gates. Keep the boot script under
   `perf/results/<date>/` so the next session reuses it.
-- Stop the campaign's own servers by PID lineage (`pgrep -f "vllm.entrypoints.openai.api_server"`,
-  then the `EngineCore` children), wait for memory to release before the
-  next boot. Never `pkill -f` a pattern the calling shell contains. A server
+- Stop the campaign's own servers by PID: `kill -- -<pid>` takes the
+  booted process group (API server and its `EngineCore` children), or
+  `kill $(cat "$SLIMSERVE_CAMPAIGN_PID_FILE")` for all of them; wait for
+  memory to release before the next boot. Never `pkill -f` a pattern the calling shell contains. A server
   this campaign did not boot is stopped only on a launch with
   `--allow-kill-servers`; otherwise write a `blocked` marker.
 - One model resident at a time. Never rebuild native code while a server

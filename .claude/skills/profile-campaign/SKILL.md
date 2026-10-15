@@ -109,8 +109,9 @@ not negotiable inside a campaign.
 - **Durable paths.** Working state that must survive a crash goes under
   `~/.local/scratch/` or `perf/results/`, never `/tmp` or `/private/tmp`.
   Long-lived harness inputs are copied to `perf/results/harness_assets/`.
-- **Servers are detached.** Boot the server with `start_new_session=True`
-  (see `references/platform-ops.md`); the agent harness kills background
+- **Servers are detached.** Boot the server with
+  `tools/campaign/boot_server.py` (detached, PID recorded as campaign-owned;
+  see `references/platform-ops.md`); the agent harness kills background
   task trees once a model pins tens of GiB. Never rebuild while a server
   runs. Stop only servers this campaign booted. A server the campaign did
   not start is never killed unless the operator launched this run with

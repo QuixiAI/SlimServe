@@ -3,8 +3,9 @@
 # authorship": AI is never an author, human contributors keep theirs. Blocks
 # commands that set an AI commit identity, add a Co-authored-by (or other
 # attribution trailer) naming an AI, mention automated assistance in a commit
-# or PR text, or post a private address. Preserving a human contributor's
-# authorship (--author, GIT_AUTHOR_*, a human Co-authored-by) is allowed.
+# or PR text (inline or in a file the command reads), or post a private
+# address. Preserving a human contributor's authorship (--author,
+# GIT_AUTHOR_*, a human Co-authored-by) is allowed.
 # Exit 2 = block, with the reason on stderr for the model. Reads the hook
 # JSON on stdin.
 set -u
@@ -14,6 +15,12 @@ try:
     d=json.load(sys.stdin); print(d.get("tool_input",{}).get("command",""))
 except Exception: print("")' 2>/dev/null)
 [ -z "$cmd" ] && exit 0
+# The text to scan: the command plus every file it hands git / gh as message
+# text (-F/--file, --body-file, --template, $(cat FILE), < FILE, ...), so a
+# message written to a file first is scanned like an inline -m.
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+scan=$(printf '%s' "$input" | python3 "$here/command_guard.py" expand 2>/dev/null) || scan=$cmd
+[ -z "$scan" ] && scan=$cmd
 block() { printf 'BLOCKED by block-ai-attribution: %s\n' "$*" >&2; exit 2; }
 
 # Names and addresses that identify an AI tool or model, never a person.
@@ -29,7 +36,7 @@ if printf '%s' "$cmd" | grep -qE 'git (commit|merge|tag)|gh pr (create|edit|comm
   # trailers naming an AI (a human Co-authored-by is legitimate)
   TRAILER="(co-authored-by|signed-off-by|assisted-by|generated-by|helped-by):.*($AI_ID)"
   ATTRIB="generated (with|by) \\[?($AI_ID|an? (ai|llm|model|agent)\b)|(assisted|written|authored|produced|drafted|implemented) (by|with) ($AI_ID|an? (ai|llm|model|agent)\b)|with (the )?(help|assistance) of ($AI_ID|an? (ai|llm|model|agent))|ai[- ]assisted|automated assistance"
-  if printf '%s' "$cmd" | grep -qiE "$TRAILER|$ATTRIB"; then
+  if printf '%s' "$scan" | grep -qiE "$TRAILER|$ATTRIB"; then
     block "commit messages, PR bodies and review replies must not credit an AI as author, co-author or assistant (CLAUDE.md Commit authorship)"
   fi
 fi
@@ -37,7 +44,7 @@ fi
 IFS=':' read -r -a privs <<< "${CAMPAIGN_PRIVATE_EMAILS:-}"
 if printf '%s' "$cmd" | grep -qE '\bgit\b|\bgh\b'; then
   for p in ${privs[@]+"${privs[@]}"}; do
-    [ -n "$p" ] && printf '%s' "$cmd" | grep -qF -- "$p" && block "a private email address must never reach git or GitHub"
+    [ -n "$p" ] && printf '%s' "$scan" | grep -qF -- "$p" && block "a private email address must never reach git or GitHub"
   done
 fi
 # never stage the Metal library or a deploy dir

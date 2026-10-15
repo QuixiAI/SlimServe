@@ -85,9 +85,9 @@ marker (a decision only the operator can make) does the same immediately.
 
 ## Guard rails
 
-- `guard.sh` (run by the driver before `pr` / `review` accept, and by the
-  agent before every push): noreply commit identity on every commit since
-  base, no attribution or tooling lines in messages, no private emails or
+- `guard.sh` (run by the driver before `pr` / `review` accept, and as the
+  campaign worktree's git `pre-push` hook): noreply commit identity on every
+  commit since base, merge commits included, no attribution or tooling lines in messages, no private emails or
   scratchpad paths in the diff, no `deploy/`, `.env` or credential-shaped
   literals (the CI guard's rules), no Metal library or compiled binaries,
   ruff clean on changed Python, registry tests pass.
@@ -95,7 +95,29 @@ marker (a decision only the operator can make) does the same immediately.
   campaign session (through `--settings`, independent of the user's own
   settings.json): blocks `GIT_AUTHOR_*`, `--author`, non-noreply
   `user.email`, attribution trailers, tooling mentions in commit / PR text,
-  private addresses in any git or gh command, and staging the metallib.
+  private addresses in any git or gh command, and staging the metallib. It
+  scans message files too: `-F/--file`, `--body-file`, `--template`,
+  `$(cat FILE)`, `< FILE`, and `cat FILE |` piped into git or gh.
+- `hooks/command_guard.py` runs beside it. `git-bypass` blocks
+  `--no-verify` on commit / push (and `git commit -n`) and any
+  `core.hooksPath` override, so the pre-push guard always runs. `kill`
+  enforces the server policy: `kill`, `pkill`, `killall`, `fuser -k`,
+  `systemctl stop|restart|kill`, `docker stop|kill`, `tmux kill-*`,
+  `os.kill` in `python -c` (also behind `sudo`, `bash -c`, `xargs`,
+  `$(...)` and shell here-documents) are blocked unless the launch passed
+  `--allow-kill-servers` (the driver then exports
+  `SLIMSERVE_CAMPAIGN_ALLOW_KILL=1`) or every target PID is a server the
+  campaign booted through `boot_server.py` (listed in the campaign's
+  `servers.pids`, its process group, or a child). The PID file and the
+  hooks directory are driver-owned; the hook blocks writes to them. These
+  hooks guard against overreach, not against a determined script: a file
+  the agent writes and then runs is not inspected.
+- The session settings also turn off Claude Code's own commit / PR
+  attribution (`includeCoAuthoredBy: false`, empty `attribution`).
+- The pre-push hook lives in the campaign state dir (`githooks/`) and is set
+  as `core.hooksPath` in the campaign worktree's own config
+  (`extensions.worktreeConfig`), so the operator's other worktrees are
+  unaffected.
 - Private addresses come from `~/.local/scratch/campaigns/private_emails.txt`
   (one per line, never in the repo) plus the machine's global git email when
   it is not a noreply address.
@@ -103,6 +125,7 @@ marker (a decision only the operator can make) does the same immediately.
   own machine, `--model fable --effort xhigh` by default
   (`SLIMSERVE_CAMPAIGN_MODEL` / `SLIMSERVE_CAMPAIGN_EFFORT` or flags), and
   the reference trees that exist (`~/llama.cpp`, `~/ds4`,
+  `~/QuixiCore/QuixiCore-{ROCm,Metal,CUDA}`,
   `~/.local/scratch/ds4-upstream`, `~/QuixiCore`, `~/Code/QuixiCore-*`,
   `~/models`) added as readable directories.
 

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Pre-push guard for a SlimServe campaign branch. Run from the worktree.
+# Pre-push guard for a SlimServe campaign branch. Run from the worktree; the
+# campaign driver also installs it as the worktree's git pre-push hook.
 #
 #   tools/campaign/guard.sh [--base origin/main] [--allow-metallib]
 #
@@ -49,6 +50,8 @@ else
   esac
 fi
 
+# Merge commits included: a merge carries an author and committer like any
+# other commit.
 while IFS=$'\t' read -r sha an ae cn ce; do
   for who in "$an <$ae>" "$cn <$ce>"; do
     if printf '%s' "$who" | grep -qiE "$AI_ID"; then bad "commit $sha has an AI author/committer: $who"; fi
@@ -56,7 +59,7 @@ while IFS=$'\t' read -r sha an ae cn ce; do
   for e in "$ae" "$ce"; do
     if is_private "$e"; then bad "commit $sha carries a private address ${e%%@*}@..."; fi
   done
-done < <(git log --no-merges --format='%h%x09%an%x09%ae%x09%cn%x09%ce' "$merge_base..HEAD")
+done < <(git log --format='%h%x09%an%x09%ae%x09%cn%x09%ce' "$merge_base..HEAD")
 msgs=$(git log --format='%h %B' "$merge_base..HEAD")
 # Attribution phrasing, not bare product names: a commit may describe tooling
 # that drives an agent or a model whose name contains "gpt"; it may not credit
