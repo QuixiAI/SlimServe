@@ -55,12 +55,21 @@ def test_empty_batch_is_a_noop():
     assert dma.flush() == []
 
 
-def _mem_available_mib() -> int:
-    with open("/proc/meminfo") as f:
+def _process_rss_mib() -> int:
+    """This process's resident set (anon + file + shmem), in MiB.
+
+    Measured per process, not from the system-wide MemAvailable: other
+    processes allocating or freeing memory (page cache, a serving engine on
+    the same box) would otherwise land in the delta. Both arena paths are
+    resident once pinned: cudaHostRegister faults in and locks the anon
+    pages it owns, and the caching pinned allocator's power-of-two block is
+    mapped into this process as shmem.
+    """
+    with open("/proc/self/status") as f:
         for line in f:
-            if line.startswith("MemAvailable:"):
+            if line.startswith("VmRSS:"):
                 return int(line.split()[1]) // 1024
-    raise RuntimeError("no MemAvailable")
+    raise RuntimeError("no VmRSS")
 
 
 def test_arena_costs_exactly_its_size_not_the_next_power_of_two():
@@ -76,9 +85,9 @@ def test_arena_costs_exactly_its_size_not_the_next_power_of_two():
     slots = 1536  # 1.5 GiB: not a power of two
     backing = torch.zeros(2 * stride, dtype=torch.int8, device=device)
     torch.cuda.synchronize()
-    before = _mem_available_mib()
+    before = _process_rss_mib()
     dma = KVTierDMA(backing, stride, slots, device)
-    used = before - _mem_available_mib()
+    used = _process_rss_mib() - before
     assert dma.arena.is_pinned()
     assert dma.arena.numel() == slots * stride
     # Power-of-two rounding would show ~2048 MiB here.
