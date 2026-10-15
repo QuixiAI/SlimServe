@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import subprocess
+import sys
+
 import pytest
 from openai.types.responses import ResponseCustomToolCall
 from xgrammar import Grammar
@@ -501,3 +504,50 @@ def test_streaming_empty_custom_input_still_emits_done_event():
     done = processor.close_current()
     assert done[0].type == "response.custom_tool_call_input.done"
     assert done[0].input == ""
+
+
+def test_structural_tag_lookup_does_not_depend_on_parser_import_order():
+    """Each format's owner module is loaded by the registry itself.
+
+    Run in a fresh interpreter: inside a larger pytest session some other test
+    has usually imported every tool parser already, which hid this.
+    """
+    code = """
+import sys
+from openai.types.responses import CustomTool
+from vllm.tool_parsers import structural_tag_registry as reg
+
+assert not any(m.endswith("glm47_moe_tool_parser") for m in sys.modules)
+tool = CustomTool(type="custom", name="raw", description="raw input")
+for model in sorted(reg._STRUCTURAL_TAG_OWNER_MODULES):
+    tag = reg.get_model_structural_tag(model, [tool], "required", reasoning=False)
+    assert tag is not None, model
+    assert model in reg._CUSTOM_TOOL_FORMAT_ADAPTERS, model
+"""
+    subprocess.run([sys.executable, "-c", code], check=True)
+
+
+def test_every_registered_format_has_an_owner_module():
+    """A module that registers a format must be in the registry's owner map.
+
+    Scanned from source because several parsers have optional dependencies
+    that are not importable everywhere.
+    """
+    from pathlib import Path
+
+    import vllm.tool_parsers as parsers
+    from vllm.tool_parsers import structural_tag_registry as reg
+
+    owners = set(reg._STRUCTURAL_TAG_OWNER_MODULES.values())
+    registering = set()
+    for path in Path(parsers.__path__[0]).glob("*.py"):
+        if path.name == "structural_tag_registry.py":
+            continue
+        source = path.read_text()
+        if (
+            "@register_custom_tool_format(" in source
+            or "@register_vllm_structural_tag(" in source
+        ):
+            registering.add(f"{parsers.__name__}.{path.stem}")
+    assert registering
+    assert registering <= owners, registering - owners
