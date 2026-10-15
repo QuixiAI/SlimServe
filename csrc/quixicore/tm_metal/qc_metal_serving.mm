@@ -1788,7 +1788,8 @@ void muse_q38_run(const at::Tensor& x, const at::Tensor& residual_out,
         tk::launch_gdn_recur_spec(
             e, g.gq, g.gk, g.gv, g.gdecay, g.gbeta, L.ssm_state, l_cu, l_table,
             l_accepted, g.gy, reqs, g.gHk, g.gHv, g.gDv, g.gDk, L.ssm_stride,
-            static_cast<int>(l_table.stride(0)), "float32");
+            static_cast<int>(l_table.stride(0)),
+            static_cast<int>(l_table.size(1)), "float32");
         tk::launch_gdn_gated_rmsnorm_f32(
             e, g.gy, g.z_view, L.gated_norm_w, g.gnormed, m * g.gHv, g.gHv,
             g.gDv, static_cast<int>(g.qkvz.stride(0)), L.norm_eps, "bfloat16");
@@ -5799,7 +5800,8 @@ at::Tensor gdn_recur_spec(const at::Tensor& q, const at::Tensor& k,
     tk::launch_gdn_recur_spec(
         e, q, k, v, g, beta, state_pool, cu_seqlens, slot_table, num_accepted,
         y, R, Hk, Hv, Dv, Dk, static_cast<int>(ssm_stride64),
-        static_cast<int>(table_stride64), activation_type_name(q));
+        static_cast<int>(table_stride64),
+        static_cast<int>(slot_table.size(1)), activation_type_name(q));
   });
   return y;
 }
@@ -6342,8 +6344,9 @@ void qwen_gdn_step(const at::Tensor& x, const at::Tensor& a,
   const bool use_acc = num_accepted.has_value();
   if (use_acc) {
     check_mps(*num_accepted, "num_accepted");
-    TORCH_CHECK(num_accepted->scalar_type() == at::kInt,
-                "quixicore(metal): num_accepted must be int32");
+    TORCH_CHECK(num_accepted->scalar_type() == at::kInt &&
+                    num_accepted->numel() >= N,
+                "quixicore(metal): num_accepted must be int32 [>= N]");
   }
   if (N == 0) return;
 
@@ -6414,6 +6417,8 @@ void qwen_gdn_step(const at::Tensor& x, const at::Tensor& a,
     e.bytes(ss_rs, 18);
     e.bytes(out_rs, 19);
     e.bytes(v_scale, 20);
+    e.in(use_acc ? *num_accepted : resume_slot, 21);
+    e.bytes(v_use_acc, 22);
     e.dispatch(scan_grid, Hv, N, 256, 1, 1);
   });
 }

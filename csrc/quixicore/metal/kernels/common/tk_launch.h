@@ -1586,7 +1586,9 @@ void launch_gdn_fused_prepare(
 }
 
 // ----- gdn_recur_spec: gdn_recur with per-request slot rows. slot_table@7
-//        is int32 [R, S] with row stride table_stride@15; the initial state
+//        is int32 [R, S] with row stride table_stride@15 and logical width
+//        S = table_width@16 (stride may exceed S for a column slice of a
+//        wider table; only the first S entries belong to the row); the initial state
 //        loads from slot_table[r, num_accepted[r]-1] and the state after
 //        every timestep t is checkpointed to slot_table[r, t]. -----
 template <class E>
@@ -1597,7 +1599,7 @@ void launch_gdn_recur_spec(E& e, typename E::in_t q, typename E::in_t k,
                            typename E::in_t slot_table,
                            typename E::in_t num_accepted, typename E::out_t y,
                            int R, int Hk, int Hv, int Dv, int Dk,
-                           int state_stride, int table_stride,
+                           int state_stride, int table_stride, int table_width,
                            const std::string& type_name) {
   e.pipeline("gdn_recur_spec_" + type_name + "_d" + std::to_string(Dk));
   e.in(q, 0);
@@ -1616,6 +1618,7 @@ void launch_gdn_recur_spec(E& e, typename E::in_t q, typename E::in_t k,
   e.bytes(Dv, 13);
   e.bytes(state_stride, 14);
   e.bytes(table_stride, 15);
+  e.bytes(table_width, 16);
   e.dispatch(Dv, 1, R * Hv, 32, 1, 1);
 }
 
@@ -5071,6 +5074,9 @@ void launch_paged_attention_partition(
 // Multi-query verify partition: the m expanded rows cooperate per (head,
 // partition) threadgroup, staging each K/V tile once. Partial layout matches
 // paged_attention_partition with batch == m, so the same reduce merges.
+// Unlike launch_paged_attention_partition there is no softcap argument:
+// the verify kernel never soft-caps, so callers must not route
+// soft-capped models through it.
 template <class E>
 void launch_paged_attention_verify(
     E& e, typename E::in_t q, typename E::in_t key_cache,
