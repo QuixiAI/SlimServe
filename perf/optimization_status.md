@@ -34603,3 +34603,29 @@ than PyPI 1.3.0), and the FP8 GEMMs.
 - Results: no new throughput measurement or hardware qualification claimed.
 - Decision: submit as a focused PR; preserve current-main behavior outside this fix.
 - Raw artifacts: local test output; no traffic captures or model data committed.
+- GLM-5.3 TOOL-CALL LEAKS, ROOT CAUSE (2026-10-15, reported by HexisPro:
+  ~10% of real 43-tool agent turns returned no tool_calls with raw
+  <tool_call>/<arg_key> markup in message content, both APIs, streamed and
+  not; an array-valued argument in every captured case). The streaming
+  parser switches to GLM-5.3's bare JSON-array call format when the text it
+  sees starts with "[". An <arg_value> holding an array makes that true
+  while a native <tool_call> envelope is already OPEN: the parser latched
+  into array mode, buffered every later chunk waiting for a closing bracket
+  that could never validate as a call list, and at stream end dumped the
+  buffer into content - the argument value, the closing delimiters and every
+  later call. Streaming only; the non-streaming path reaches that branch
+  solely as a post-failure fallback, which is why 15 live non-streamed calls
+  were clean while 15 streamed ones leaked identically.
+  FIX (1dcc099d05): the array branch also requires that the state machine is
+  not already inside a native call. Verified on the captured shape: streamed
+  arguments complete as {"query": ..., "sources": ["history", "memory"]},
+  a second call after an array argument survives, string-only args
+  unchanged, genuine JSON-array replies still parse. Live after deploy:
+  15/15 streamed and 15/15 non-streamed clean (was 15/15 streamed leaking).
+  Also added, as a backstop: the non-streaming parser rebuilds calls from
+  markup the engine fails to claim (same arg regex + schema coercion, never
+  inventing an unoffered name) and logs the raw output whenever anything
+  leaks, so the next deviation arrives with evidence. NOT the cause, and
+  reverted: the tool_call_parser name (glm47 is correct and is what vLLM's
+  own GLM-5.3-Flash recipe specifies), and an ordinary-token-spelling
+  relaxation in the engine (wrong hypothesis, fixed nothing).
