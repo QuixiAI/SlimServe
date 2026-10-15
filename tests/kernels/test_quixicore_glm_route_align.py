@@ -7,7 +7,8 @@ routing (E=288, top-8, one expert group) at M = 1..16."""
 
 import pytest
 import torch
-import triton
+
+triton = pytest.importorskip("triton")  # CUDA-only kernel; the suite still collects on Metal
 
 pytest.importorskip("vllm._quixicore_C")
 from vllm.quixicore.ops import quixicore_ops as qc  # noqa: E402
