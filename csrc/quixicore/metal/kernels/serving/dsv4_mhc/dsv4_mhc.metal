@@ -28,6 +28,8 @@ constant constexpr int SHM_PARTIAL = 0;     // [MIXES + 1] dot totals + sqsum
 constant constexpr int SHM_PRE = MIXES + 1; // [HC] pre-mix gates
 constant constexpr int SHM_COEFF = SHM_PRE + HC; // [HC + HC*HC] prev post+comb
 constant constexpr int SHM_SIZE = SHM_COEFF + HC + HC * HC;
+constant constexpr int SHM_FIN_NORM = HC;               // finalize: [SIMDGROUPS] after the gates
+constant constexpr int SHM_FIN_SIZE_NORM = HC + SIMDGROUPS;
 
 inline float sigmoid_f(float v) { return 1.0f / (1.0f + exp(-v)); }
 
@@ -51,6 +53,42 @@ inline float row_reduce_max(float v) {
   return v;
 }
 
+// Optional fused RMSNorm over the layer input just written (finalize):
+//   layer_input[d] = T(float(li[d]) * rsqrt(mean(li^2) + norm_eps) * w[d])
+// with li the T-rounded mix (the statistic is taken from the ROUNDED values,
+// as the eager `x = mix; x = rms_norm(x)` chain does, and the second pass
+// re-reads the elements this thread itself wrote). Rounding matches
+// rms_norm_dyn (one rounding of x*inv*w).
+template <typename T>
+inline void mhc_fused_norm_epilogue(device T* li_t, device const T* norm_w,
+                                    float norm_eps, float sq, uint H, uint tid,
+                                    uint sg, uint lane, threadgroup float* part) {
+  sq = simd_sum(sq);
+  if (lane == 0) part[sg] = sq;
+  threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+  float ss = 0.0f;
+  for (int i = 0; i < SIMDGROUPS; ++i) ss += part[i];
+  const float inv = rsqrt(ss / float(H) + norm_eps);
+  for (uint d = tid; d < H; d += THREADS) {
+    li_t[d] = T(float(li_t[d]) * inv * float(norm_w[d]));
+  }
+}
+
+// ---- split pre: dots + finalize --------------------------------------------
+// The pre block runs as (a) a dots pass with one simdgroup per
+// (token, row|sqsum) job -- 25*tokens threadgroups, which keeps a wide GPU
+// occupied at decode token counts -- and (b) a small finalize pass that is
+// mhc_pre_body's phase 2+3 with the threadgroup partials read from the
+// scratch buffer instead. Both passes keep the per-lane stride-32
+// accumulation order and the simd_sum tree of the fused body, so their
+// outputs are bit-identical to it.
+
+// ---- fused post+pre monolith (pre-campaign form) ----------------------------
+// One threadgroup per token doing post mix, the 24 fn dots + sqsum, and the
+// pre finalize in a single kernel. This is the kernel every non-GLM mHC
+// profile (dsv4-xxs-1) was gated with; the host encodes it whenever no fused
+// norm is requested and takes the split sequence below only for the GLM
+// norm-fused call.
 template <typename T>
 inline void mhc_pre_body(
     device const T* x,            // [tokens, H]
@@ -191,15 +229,6 @@ inline void mhc_pre_body(
         post_mult, sinkhorn_repeat, tgid.x, tid, sg, lane, shm);             \
   }
 
-// ---- split pre: dots + finalize --------------------------------------------
-// The pre block runs as (a) a dots pass with one simdgroup per
-// (token, row|sqsum) job -- 25*tokens threadgroups, which keeps a wide GPU
-// occupied at decode token counts -- and (b) a small finalize pass that is
-// mhc_pre_body's phase 2+3 with the threadgroup partials read from the
-// scratch buffer instead. Both passes keep the per-lane stride-32
-// accumulation order and the simd_sum tree of the fused body, so their
-// outputs are bit-identical to it.
-
 template <typename T>
 inline void mhc_pre_dots_body(device const T* residual, device const float* fn,
                               device float* scratch, uint H, uint token,
@@ -317,7 +346,8 @@ inline void mhc_pre_finalize_body(
     device float* next_post, device float* next_comb, device T* layer_input,
     uint H, float rms_eps, float pre_eps, float sink_eps, float post_mult,
     int sinkhorn_repeat, uint token, uint tid, uint sg, uint lane,
-    threadgroup float* shm) {
+    threadgroup float* shm, device const T* norm_w = nullptr,
+    float norm_eps = 0.0f) {
   const uint total = HC * H;
   device const T* res_t = residual + token * total;
   device const float* sc_t = scratch + token * (MIXES + 1);
@@ -347,10 +377,18 @@ inline void mhc_pre_finalize_body(
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
   const float p0 = shm[0], p1 = shm[1], p2 = shm[2], p3 = shm[3];
+  device T* li_t = layer_input + token * H;
+  float nsq = 0.0f;
   for (uint d = tid; d < H; d += THREADS) {
     const float v = p0 * float(res_t[d]) + p1 * float(res_t[H + d]) +
                     p2 * float(res_t[2 * H + d]) + p3 * float(res_t[3 * H + d]);
-    layer_input[token * H + d] = T(v);
+    const T r = T(v);
+    li_t[d] = r;
+    nsq += float(r) * float(r);
+  }
+  if (norm_w != nullptr) {
+    mhc_fused_norm_epilogue<T>(li_t, norm_w, norm_eps, nsq, H, tid, sg, lane,
+                               shm + SHM_FIN_NORM);
   }
 }
 
@@ -409,6 +447,36 @@ inline void mhc_pre_finalize_body(
                                        rms_eps, pre_eps, sink_eps, post_mult, \
                                        sinkhorn_repeat, tgid.x, tid, sg,      \
                                        lane, shm);                            \
+  }
+
+#define instantiate_mhc_pre_finalize_norm(tname, T)                           \
+  [[host_name("dsv4_mhc_pre_finalize_norm_" #tname)]] kernel void             \
+  dsv4_mhc_pre_finalize_norm_##tname(                                         \
+      device const T* residual [[buffer(0)]],                                 \
+      device const float* scratch [[buffer(1)]],                              \
+      device const float* scale [[buffer(2)]],                                \
+      device const float* base [[buffer(3)]],                                 \
+      device float* next_post [[buffer(4)]],                                  \
+      device float* next_comb [[buffer(5)]],                                  \
+      device T* layer_input [[buffer(6)]],                                    \
+      constant uint& H [[buffer(7)]],                                         \
+      constant float& rms_eps [[buffer(8)]],                                  \
+      constant float& pre_eps [[buffer(9)]],                                  \
+      constant float& sink_eps [[buffer(10)]],                                \
+      constant float& post_mult [[buffer(11)]],                               \
+      constant int& sinkhorn_repeat [[buffer(12)]],                           \
+      device const T* norm_w [[buffer(13)]],                                  \
+      constant float& norm_eps [[buffer(14)]],                                \
+      uint3 tgid [[threadgroup_position_in_grid]],                            \
+      uint tid [[thread_index_in_threadgroup]],                               \
+      uint sg [[simdgroup_index_in_threadgroup]],                             \
+      uint lane [[thread_index_in_simdgroup]]) {                              \
+    threadgroup float shm[dsv4_mhc::SHM_FIN_SIZE_NORM];                       \
+    dsv4_mhc::mhc_pre_finalize_body<T>(residual, scratch, scale, base,        \
+                                       next_post, next_comb, layer_input, H,  \
+                                       rms_eps, pre_eps, sink_eps, post_mult, \
+                                       sinkhorn_repeat, tgid.x, tid, sg,      \
+                                       lane, shm, norm_w, norm_eps);          \
   }
 
 // ---- standalone post -------------------------------------------------------
@@ -528,14 +596,16 @@ inline void hc_head_body(device const T* residual, device const float* fn,
 
 }  // namespace dsv4_mhc
 
+instantiate_mhc_fused(float16, half);
+instantiate_mhc_fused(bfloat16, bfloat);
 instantiate_mhc_pre_dots(float16, half);
 instantiate_mhc_pre_dots(bfloat16, bfloat);
 instantiate_mhc_pre_dots_tg(float16, half);
 instantiate_mhc_pre_dots_tg(bfloat16, bfloat);
 instantiate_mhc_pre_finalize(float16, half);
 instantiate_mhc_pre_finalize(bfloat16, bfloat);
-instantiate_mhc_fused(float16, half);
-instantiate_mhc_fused(bfloat16, bfloat);
+instantiate_mhc_pre_finalize_norm(float16, half);
+instantiate_mhc_pre_finalize_norm(bfloat16, bfloat);
 instantiate_mhc_post(float16, half);
 instantiate_mhc_post(bfloat16, bfloat);
 instantiate_hc_head(float16, half);
