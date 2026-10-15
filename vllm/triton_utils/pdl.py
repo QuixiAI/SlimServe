@@ -18,7 +18,11 @@ def _pdl_enabled() -> bool:
     if os.environ.get("QC_PDL", "4") == "0":
         return False
     try:
-        return torch.cuda.is_available() and torch.version.hip is None
+        from vllm.platforms import current_platform
+
+        # griddepcontrol is an sm_90+ instruction: ptxas rejects the kernels
+        # on sm_80/sm_86 (A100, RTX 3090) when it is emitted there.
+        return current_platform.is_cuda() and current_platform.is_arch_support_pdl()
     except Exception:
         return False
 
