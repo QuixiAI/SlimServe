@@ -439,3 +439,28 @@ def test_in_progress_final_message_still_joins_its_reasoning():
     continued, prompt = render_request(request)
     assert continued
     assert prompt == "<|user|>Hello.<|end|><|assistant|><think>Greet.</think>Hi"
+
+
+def test_untyped_assistant_part_without_text_falls_through_unchanged():
+    # A part carrying neither text nor refusal (here an image) cannot be
+    # flattened to a string without losing it. The whole message falls
+    # through to the generic handling and is passed on unmodified, rather
+    # than being truncated to the text of its first part.
+    parts = [
+        {"type": "output_text", "text": "See the chart: "},
+        {"type": "input_image", "image_url": "https://example.com/chart.png"},
+    ]
+    assistant = {"role": "assistant", "content": parts}
+    messages = construct_input_messages(
+        request_input=[
+            {"role": "user", "content": "Start."},
+            assistant,
+            {"role": "user", "content": "Continue."},
+        ]
+    )
+    assert messages == [
+        {"role": "user", "content": "Start."},
+        {"role": "assistant", "content": parts},
+        {"role": "user", "content": "Continue."},
+    ]
+    assert messages[1] is assistant
