@@ -8,6 +8,25 @@ from benchmarks.glm5_next_sparse_scratch_candidate import (
 )
 
 
+def _skip_if_tile_does_not_fit(fn):
+    """Skip when this device cannot host the tile the candidate asks for.
+
+    The candidate mirrors the SM80 split table (128 above eight rows), whose
+    tile is 144 KB; sm_120 has 99 KB. Those shapes are not served here, so
+    they are skipped rather than reported as failures. See the sm_120 branch
+    in quixicore_mla_sparse._sparse_tc_split.
+    """
+    from triton.runtime.errors import OutOfResources
+
+    try:
+        return fn()
+    except OutOfResources as err:
+        pytest.skip(
+            f"tile needs {err.required} B of shared memory, device has "
+            f"{err.limit} B"
+        )
+
+
 def test_all_decode_shapes_share_fixed_nonoverlapping_views():
     owner = SparseTCWorkspace(32, 2080, 8, "cpu")
     assert owner.tiles == 544
@@ -75,7 +94,7 @@ def test_shared_scratch_sequential_layers_changed_graph(rows):
         return [sparse_tc_nope(*state, 1 / 16, split=split, workspace=workspace)
                 for state in states]
 
-    run(owner)
+    _skip_if_tile_does_not_fit(lambda: run(owner))
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
