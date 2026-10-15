@@ -80,7 +80,9 @@ for p in ${privs[@]+"${privs[@]}"}; do
   [ -z "$p" ] && continue
   if printf '%s' "$added" | grep -F -q -- "$p"; then bad "private address present in the diff: ${p%%@*}@..."; fi
 done
-other_emails=$(printf '%s' "$added" | grep -oE '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' | grep -vE 'users\.noreply\.github\.com|example\.com|vllm\.ai|@(users|noreply)' | sort -u || true)
+# (the local part starts with a letter or digit: the diff's own '+' marker
+# before a decorator such as @pytest.fixture is not an address)
+other_emails=$(printf '%s' "$added" | sed 's/^+//' | grep -oE '[A-Za-z0-9][A-Za-z0-9._%+-]*@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' | grep -vE 'users\.noreply\.github\.com|example\.com|vllm\.ai|@(users|noreply)' | sort -u || true)
 if [ -n "$other_emails" ]; then bad "email addresses added by this branch (allowed: noreply only):"; printf '%s\n' "$other_emails" | head -5; else ok "no email addresses added"; fi
 if printf '%s' "$added" | grep -nE '/private/tmp/|/tmp/claude|/scratchpad/|claude-[0-9]+/' >/dev/null; then
   bad "session scratchpad / tmp paths in the diff:"; printf '%s' "$added" | grep -nE '/private/tmp/|/tmp/claude|/scratchpad/|claude-[0-9]+/' | head -5

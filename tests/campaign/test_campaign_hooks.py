@@ -352,6 +352,27 @@ def test_guard_checks_merge_commit_authors(tmp_path):
     assert "AI author/committer" in out.stdout
 
 
+@pytest.mark.parametrize(
+    "line,flagged",
+    # the address is assembled so this file's own diff carries none
+    [("@pytest.fixture", False), ('owner = "jane' + "@" + 'corp.com"', True)],
+)
+def test_guard_email_scan_ignores_decorators(tmp_path, line, flagged):
+    repo, env = _repo(tmp_path)
+    (repo / "notes.txt").write_text(line + "\n")
+    _git(repo, "add", "notes.txt")
+    _git(repo, "commit", "-qm", "notes", env=env)
+    out = subprocess.run(
+        ["bash", str(GUARD_SH), "--base", "origin/main"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=600,
+    )
+    assert ("FAIL: email addresses added" in out.stdout) is flagged, out.stdout
+
+
 def test_pre_push_guard_installed_in_the_campaign_worktree(tmp_path, monkeypatch):
     repo, env = _repo(tmp_path)
     wt = tmp_path / "wt"
