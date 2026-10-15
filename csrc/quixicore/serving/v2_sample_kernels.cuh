@@ -754,7 +754,10 @@ __global__ void v2_resample_k(
     const float t_lse = target_rejected_lse[req_idx];
     const float d_lse = HAS_DRAFT ? draft_rejected_lse[req_idx] : 0.0f;
     const int64_t rejected_draft =
-        (!is_bonus && !HAS_DRAFT) ? int64_t(draft_sampled[rtok + 1]) : 0;
+        !is_bonus ? int64_t(draft_sampled[rtok + 1]) : 0;
+    // -1 marks a padded placeholder draft with no draft distribution: its
+    // row resamples from the target directly.
+    const bool from_target = is_bonus || rejected_draft < 0;
 
     VT best = VT(V2S_NEG_INF);
     int best_g = block_idx * 1024;  // never a sentinel: all--inf/NaN rows resolve to the block base
@@ -764,7 +767,7 @@ __global__ void v2_resample_k(
         const float tl_v =
             in_range ? target_logits[rtok * target_stride + g] : V2S_NEG_INF;
         float residual;
-        if (is_bonus) {
+        if (from_target) {
             residual = tl_v;
         } else if (HAS_DRAFT) {
             const float dl_v =

@@ -14,6 +14,7 @@ from vllm.v1.sample.ops.topk_topp_sampler import (
 )
 from vllm.v1.worker.gpu.input_batch import InputBatch, get_num_sampled_and_rejected
 from vllm.v1.worker.gpu.metrics.logits import get_num_nans
+from vllm.v1.worker.gpu.sample import topk_sample
 from vllm.v1.worker.gpu.sample.bad_words import BadWordsState
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
@@ -227,7 +228,29 @@ class Sampler:
         )
 
         # Sample the next token.
-        if use_flashinfer:
+        if topk_sample.eligible(
+            self.sampling_states,
+            top_k,
+            idx_mapping_np,
+            processed_logits,
+            pos,
+            needs_processed_logits=(
+                return_logprobs and self.logprobs_mode in PROCESSED_LOGPROBS_MODES
+            ),
+        ):
+            # Fused top-k/top-p mask and Gumbel-max draw; the returned
+            # processed_logits stay unmasked, which only processed-logprobs
+            # callers would notice, and they take the branch below.
+            sampled = topk_sample.sample(
+                processed_logits,
+                top_k,
+                top_p,
+                expanded_idx_mapping,
+                self.sampling_states.seeds.gpu,
+                pos,
+                self.use_fp64_gumbel,
+            )
+        elif use_flashinfer:
             sampled = flashinfer_sample(processed_logits, top_k, top_p).to(torch.int64)
         else:
             processed_logits = apply_top_k_top_p(processed_logits, top_k, top_p)
