@@ -37,7 +37,7 @@ from vllm.v1.core.encoder_cache_manager import (
 )
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.kv_cache_utils import KVCacheBlock, prompt_tail_boundary
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -249,11 +249,11 @@ class Scheduler(SchedulerInterface):
             )
         speculative_config = vllm_config.speculative_config
         self.use_eagle = False
+        self.eagle_drop = False
         self.num_spec_tokens = vllm_config.num_speculative_tokens
         self.num_lookahead_tokens = 0
         self.dynamic_sd_lookup: list[int] | None = None
         self.sd_accept_throttle = None
-        self._dynamic_prev_spec_tokens: int = self.num_spec_tokens
         if speculative_config is not None:
             if speculative_config.num_speculative_tokens_per_batch_size:
                 self.dynamic_sd_lookup = build_dynamic_sd_schedule_lookup(
@@ -268,6 +268,12 @@ class Scheduler(SchedulerInterface):
             if speculative_config.use_eagle():
                 self.use_eagle = True
                 self.num_lookahead_tokens = self.num_spec_tokens
+                # Drafters that pair hidden state i with token i+1 (EAGLE,
+                # MTP) have no draft KV for the last computed position, so a
+                # prefix hit drops its last unit and recomputes it. DFlash
+                # keys its context on hidden state i alone and writes it in
+                # the step that computed it, so its hits are exact.
+                self.eagle_drop = not speculative_config.use_dflash()
             if speculative_config.uses_draft_model():
                 self.num_lookahead_tokens = self.num_spec_tokens
             if speculative_config.use_dflash():
@@ -290,7 +296,7 @@ class Scheduler(SchedulerInterface):
             max_model_len=self.max_model_len,
             max_in_flight_tokens=vllm_config.max_in_flight_tokens,
             enable_caching=self.cache_config.enable_prefix_caching,
-            use_eagle=self.use_eagle,
+            use_eagle=self.eagle_drop,
             log_stats=self.log_stats,
             enable_kv_cache_events=self.enable_kv_cache_events,
             dcp_world_size=self.dcp_world_size,
@@ -332,12 +338,19 @@ class Scheduler(SchedulerInterface):
         self.need_mamba_block_aligned_split = (
             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
         )
-        # A finer prefix_match_unit is configured: a mamba partial tail entry
-        # can only be registered by a step ending exactly at the prompt's last
-        # hash boundary, so the split adds that stop.
+        # The hash block is finer than the scheduler block (a finer
+        # prefix_match_unit, or a group whose block the page-size unification
+        # scaled up): a mamba partial tail entry can only be registered by a
+        # step ending exactly at the prompt's last hash boundary, so the split
+        # adds that stop.
         self.mamba_partial_cache_hit = (
             self.need_mamba_block_aligned_split
             and self.hash_block_size < self.block_size
+        )
+        # Where that tail sits: the replay boundary when the coordinator keys
+        # Mamba states off the hash grid, else the last hash boundary.
+        self.prompt_tail_replay = bool(
+            getattr(self.kv_cache_manager.coordinator, "prompt_tail_replay", False)
         )
 
         # Counts of non-empty steps scheduled / processed. update_from_output
@@ -406,7 +419,7 @@ class Scheduler(SchedulerInterface):
         # Eagle, FullAttn prunes the last matching block, so back off one
         # block to avoid a Mamba cache miss.
         last_cache_position = request.num_tokens - request.num_tokens % block_size
-        if self.use_eagle:
+        if self.eagle_drop:
             last_cache_position = max(last_cache_position - block_size, 0)
 
         end = start + num_new_tokens
@@ -418,7 +431,9 @@ class Scheduler(SchedulerInterface):
 
         next_block_boundary = (start // block_size + 1) * block_size
         tail_boundary = (
-            request.num_prompt_tokens // self.hash_block_size * self.hash_block_size
+            prompt_tail_boundary(
+                request.num_prompt_tokens, self.hash_block_size, self.prompt_tail_replay
+            )
             if self.mamba_partial_cache_hit
             else 0
         )
@@ -432,9 +447,12 @@ class Scheduler(SchedulerInterface):
             # Never run past the last cacheable block boundary mid-chunk.
             last_cache_position,
             # Fine-grained hits: the prompt's partial-tail entry can only be
-            # registered by a chunk ending exactly at its last hash boundary.
+            # registered by a chunk ending exactly at its tail boundary (the
+            # replay boundary, so a repeated prompt recomputes one token). The
+            # last cacheable block boundary is a stop of its own.
             tail_boundary
-            if last_cache_position < tail_boundary < request.num_prompt_tokens
+            if 0 < tail_boundary < request.num_prompt_tokens
+            and tail_boundary != last_cache_position
             else 0,
             # Marconi shared-prefix junction, block-floored (a sub-block
             # junction's state is not separately cacheable): cache its state
@@ -830,8 +848,6 @@ class Scheduler(SchedulerInterface):
                 encoder_inputs_to_schedule = None
                 external_load_encoder_input = []
                 new_encoder_compute_budget = encoder_compute_budget
-                pad_spec_decode = False
-                pad_spec_width = 1 + self.num_spec_tokens
 
                 if load_kv_async:
                     # KVTransfer: loading remote KV, do not allocate for new work.
@@ -847,34 +863,13 @@ class Scheduler(SchedulerInterface):
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
-
-                    # Pad new decode requests to uniform spec decoding size to
-                    # preserve full cudagraph for this step.
-                    # Not for diffusion where draft tokens can't be padded.
-                    if (
-                        self.num_spec_tokens > 0
-                        and self.num_sampled_tokens_per_step > 0
-                        and num_new_tokens == 1
-                        and (scheduled_running_reqs and not prefill_scheduled)
-                    ):
-                        # With a dynamic schedule, running decode requests
-                        # carry the k drafted LAST step; pad the newcomer to
-                        # match that uniform width, not the configured max.
-                        pad_spec = (
-                            self.num_spec_tokens
-                            if self.dynamic_sd_lookup is None
-                            and self.sd_accept_throttle is None
-                            else self._dynamic_prev_spec_tokens
-                        )
-                        num_new_tokens = 1 + pad_spec
-                        pad_spec_width = num_new_tokens
-                        if (
-                            num_new_tokens > token_budget
-                            or num_computed_tokens + num_new_tokens > self.max_model_len
-                        ):
-                            # Prefer to not schedule than schedule un-padded here.
-                            break
-                        pad_spec_decode = True
+                    # A newcomer whose prompt has one token left (the tail of
+                    # a prefix-cache replay) is scheduled as that one token,
+                    # never padded to the running requests' speculative width:
+                    # the runner holds no drafts for it, and a prompt tail of
+                    # spec width takes the prefill path while its rows are
+                    # verified as decode rows. The one-token tail runs as a
+                    # decode row (see promote_prompt_tail_rows).
 
                     threshold = self.scheduler_config.long_prefill_token_threshold
                     if 0 < threshold < num_new_tokens:
@@ -921,15 +916,6 @@ class Scheduler(SchedulerInterface):
                     )
                     if num_new_tokens == 0:
                         break
-                    if pad_spec_decode and num_new_tokens != pad_spec_width:
-                        # Alignment clipped the placeholder rows. The split
-                        # aligns prefill chunks, but the padded tail rows are
-                        # speculative positions, not prefill tokens. A padded
-                        # request must keep all 1 + num_spec rows or the
-                        # sampler's row count stops matching its query rows,
-                        # so drop the padding instead of shortening it.
-                        num_new_tokens = 1
-                        pad_spec_decode = False
 
                 # During async KV load, no forward pass is run yet.
                 # Allocate speculative lookahead slots later to avoid
@@ -1062,11 +1048,6 @@ class Scheduler(SchedulerInterface):
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
-                if pad_spec_decode:
-                    assert num_new_tokens == pad_spec_width
-                    scheduled_spec_decode_tokens[request_id] = [-1] * (
-                        pad_spec_width - 1
-                    )
                 # Only track requests that will still be prefilling after this chunk.
                 if num_computed_tokens + num_new_tokens < request.num_tokens:
                     self._inflight_prefills.add(request)
@@ -1173,14 +1154,6 @@ class Scheduler(SchedulerInterface):
             num_spec_tokens_to_schedule = self.sd_accept_throttle.gate(
                 num_spec_tokens_to_schedule, len(num_scheduled_tokens)
             )
-        if (
-            self.dynamic_sd_lookup is not None or self.sd_accept_throttle is not None
-        ) and len(num_scheduled_tokens) > 0:
-            # Remembered for next step's new-decode-request padding: the
-            # drafts produced under this step's k -- AFTER the acceptance
-            # throttle's gate -- are what get verified then.
-            self._dynamic_prev_spec_tokens = num_spec_tokens_to_schedule
-
         scheduled_encoder_input_stats = None
         if (
             self.log_stats
@@ -2770,9 +2743,7 @@ class Scheduler(SchedulerInterface):
                     req_num_computed_tokens + block_size - 1
                 ) // block_size
                 group_marked = False
-                for idx, block_id in zip(
-                    range(req_num_computed_blocks), req_block_ids
-                ):
+                for idx, block_id in zip(range(req_num_computed_blocks), req_block_ids):
                     if block_id not in invalid_block_ids:
                         continue
 

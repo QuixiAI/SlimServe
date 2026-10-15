@@ -2,8 +2,6 @@
 """QuixiCore NVFP4 prefill MoE GEMM (csrc/quixicore/serving/nvfp4_moe_prefill_ampere.cuh)
 against Marlin on identical packed weights: the direct GEMMs (w13 and the
 topk-weighted w2) and the fused MoE end to end through fused_marlin_moe."""
-import os
-
 import pytest
 import torch
 
@@ -60,6 +58,13 @@ def _close(out, ref, rel_max=2e-2, mean_rel=3e-3):
 def test_direct_gemms_match_marlin(weights, M, stages):
     import vllm._custom_ops as ops
     from vllm.quixicore.ops import quixicore_ops
+
+    need = quixicore_ops.nvfp4_moe_gemm_smem_bytes(stages)
+    have = torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).shared_memory_per_block_optin
+    if need > have:
+        pytest.skip(f"cfg {stages} needs {need} B of shared memory; the device opts in to {have}")
 
     w13, w13_s, w13_s2, w2, w2_s, w2_s2 = weights
     dev = "cuda"
@@ -118,3 +123,57 @@ def test_fused_moe_matches_marlin_path(weights, M, monkeypatch):
     monkeypatch.setenv("VLLM_QC_NVFP4_PREFILL_MOE_MIN_ROWS", "1")
     assert M * TOPK >= E  # the threshold admits this batch
     _close(run(), ref)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two CUDA devices")
+def test_every_operand_must_sit_on_the_activation_device(weights):
+    from vllm.quixicore.ops import quixicore_ops
+
+    w13, w13_s, w13_s2, _, _, _ = weights
+    M = 37
+    torch.manual_seed(M)
+    _, tids = _routing(M)
+    sid, eid, npp = moe_align_block_size(tids, 128, E)
+    a = (torch.randn(M, K, device="cuda") * 0.5).to(torch.bfloat16)
+    operands = dict(
+        b=w13, s=w13_s.view(torch.uint8), g=w13_s2, sorted_ids=sid, expert_ids=eid,
+        num_post_padded=npp, c=torch.zeros(M * TOPK, 2 * N, dtype=torch.bfloat16, device="cuda"),
+    )
+
+    def run(moved=None):
+        o = {k: (v.to("cuda:1") if k == moved else v) for k, v in operands.items()}
+        return quixicore_ops.nvfp4_moe_gemm(
+            a, o["b"], o["s"], o["g"], o["sorted_ids"], o["expert_ids"],
+            o["num_post_padded"], None, o["c"], TOPK, False, 2,
+        )
+
+    run()
+    for name in operands:
+        with pytest.raises(RuntimeError, match="must be on a's device"):
+            run(name)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two CUDA devices")
+def test_a_second_device_gets_its_own_shared_memory_opt_in(weights):
+    # cudaFuncSetAttribute is per device: after the first launch configured
+    # cuda:0, the same kernel on cuda:1 must be configured there too (a shared
+    # "set once" flag launched it with 80 KB against the 48 KB default).
+    from vllm.quixicore.ops import quixicore_ops
+
+    w13, w13_s, w13_s2, _, _, _ = weights
+    M = 37
+    torch.manual_seed(M)
+    _, tids = _routing(M)
+    sid, eid, npp = moe_align_block_size(tids, 128, E)
+    a = (torch.randn(M, K, device="cuda") * 0.5).to(torch.bfloat16)
+    operands = [a, w13, w13_s.view(torch.uint8), w13_s2, sid, eid, npp]
+
+    def run(device):
+        moved = [t.to(device) for t in operands]
+        c = torch.zeros(M * TOPK, 2 * N, dtype=torch.bfloat16, device=device)
+        return quixicore_ops.nvfp4_moe_gemm(*moved, None, c, TOPK, False, 2)
+
+    first = run("cuda:0")
+    second = run("cuda:1")
+    torch.cuda.synchronize("cuda:1")
+    assert torch.equal(first.cpu(), second.cpu())
