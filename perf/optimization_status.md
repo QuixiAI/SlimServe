@@ -34352,3 +34352,19 @@ than PyPI 1.3.0), and the FP8 GEMMs.
 - Results: no new throughput measurement or hardware qualification claimed.
 - Decision: submit as a focused PR; preserve current-main behavior outside this fix.
 - Raw artifacts: local test output; no traffic captures or model data committed.
+
+## 2026-09-19 - Stop speculative grammar validation at the stop token
+
+- Status: retained for review.
+- Baseline: `origin/main`; forward-port from the B70 serving integration.
+- Change: Do not probe unreachable speculative suffixes after the grammar matcher terminates.
+- Scope: log-noise fix, not a correctness fix. Real xgrammar already rejects
+  any token offered after the stop token (`accept_token` returns False), so
+  the accepted prefix was already correct; it also logs "The matcher has
+  terminated after accepting the stop token, but is trying to accept new
+  token" for every such probe, which speculative windows that end in a stop
+  token triggered on every step. Verified against the installed xgrammar.
+- Correctness: Two XGrammar stop-token regression tests passed on CPU.
+- Results: no new throughput measurement or hardware qualification claimed.
+- Decision: submit as a focused PR (log noise only); preserve current-main behavior outside this fix.
+- Raw artifacts: local test output; no traffic captures or model data committed.
