@@ -42,6 +42,7 @@ from vllm.entrypoints.serve.utils.api_utils import (
 )
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 from vllm.entrypoints.serve.utils.server_utils import (
+    BadRequestBodyCaptureMiddleware,
     engine_error_handler,
     exception_handler,
     generation_error_handler,
@@ -359,6 +360,31 @@ def build_app(
             "avoided in production."
         )
         app.middleware("http")(log_response)
+
+    # The capture wraps AuthenticationMiddleware (and admission control, so
+    # 429s are visible). It records only API-path (GUARDED_PREFIX) requests
+    # and, when API keys are configured, only those carrying a valid key, so
+    # an unauthenticated client cannot make the server write to disk (auth
+    # itself exempts non-API paths and OPTIONS). File size is capped.
+    if bad_request_log_path := envs.VLLM_BAD_REQUEST_LOG_PATH:
+        bad_request_log_max_bytes = envs.VLLM_BAD_REQUEST_LOG_MAX_BYTES
+        bad_request_log_max_file_bytes = envs.VLLM_BAD_REQUEST_LOG_MAX_FILE_BYTES
+        app.add_middleware(
+            BadRequestBodyCaptureMiddleware,
+            path=bad_request_log_path,
+            max_body_bytes=bad_request_log_max_bytes,
+            max_file_bytes=bad_request_log_max_file_bytes,
+            tokens=tokens,
+        )
+        logger.warning(
+            "Bad-request body capture enabled at %s (max %d bytes per body, "
+            "file rotated once to .1 past %d bytes). The file can contain "
+            "sensitive prompt/tool data and is forced to owner-only "
+            "permissions.",
+            os.path.abspath(bad_request_log_path),
+            bad_request_log_max_bytes,
+            bad_request_log_max_file_bytes,
+        )
 
     for middleware in args.middleware:
         module_path, object_name = middleware.rsplit(".", 1)

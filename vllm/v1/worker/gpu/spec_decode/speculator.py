@@ -36,6 +36,26 @@ from vllm.v1.worker.utils import AttentionGroup
 logger = init_logger(__name__)
 
 
+def _get_draft_hidden_size(draft_model_config) -> int:
+    """Return the target-state width consumed by a draft model.
+
+    One rule: the draft's ``hc_mult`` is the number of hyper-connection
+    residual streams its input carries, and the hidden buffer is widened by
+    it. DeepSeek V4's MTP and DSpark drafts take the target's pre-hc_head
+    ``(T, hc_mult * hidden_size)`` residual; Qwen4-exp MTP takes its
+    multi-stream feedback (``hc_mult`` comes from the text config's
+    ``hc_count``). GLM-5.3-Flash's nextn head takes the hc-combined
+    ``(T, hidden_size)`` state, so ``SpeculativeConfig.hf_config_override``
+    sets its draft ``hc_mult`` to 1 on every path that builds a
+    ``glm5_next_mtp`` draft: the safetensors checkpoint and the Metal
+    ``glm5-next`` GGUF alike (the trunk's 4 stays on the target config).
+    Non-HC drafts default to ``hc_mult=1``. Do not key this on model_type:
+    an allowlist silently narrows every HC drafter left off it.
+    """
+    hidden_size = draft_model_config.get_hidden_size()
+    return hidden_size * getattr(draft_model_config.hf_config, "hc_mult", 1)
+
+
 def mask_draft_logits(
     logits: torch.Tensor,
     idx_mapping: torch.Tensor,
@@ -135,18 +155,7 @@ class DraftModelSpeculator(BaseSpeculator):
         # We need to get the hidden size from the draft model config because
         # the draft model's hidden size can be different from the target model's
         # hidden size (e.g., Llama 3.3 70B).
-        self.hidden_size = self.draft_model_config.get_hidden_size()
-        # Widen for HC-multiplexed residuals: DeepSeek V4 feeds the MTP
-        # draft the target's pre-hc_head (T, hc_mult * hidden_size) residual.
-        # Only that family drafts from the multiplexed stream; GLM-5.3-Flash
-        # also carries hc_mult (mHC, 4 streams) but its nextn head consumes
-        # the hc-combined (T, hidden_size) pre-final-norm state, exactly as
-        # ds4 feeds hnorm. Non-HC models default to hc_mult=1.
-        draft_hf = self.draft_model_config.hf_config
-        hc_mult = getattr(draft_hf, "hc_mult", 1)
-        if getattr(draft_hf, "model_type", "") not in ("deepseek_v4",):
-            hc_mult = 1
-        self.hidden_size = self.hidden_size * hc_mult
+        self.hidden_size = _get_draft_hidden_size(self.draft_model_config)
         self.vocab_size = self.draft_model_config.get_vocab_size()
         self.dtype = vllm_config.model_config.dtype
         self.use_fp64_gumbel = vllm_config.model_config.use_fp64_gumbel
