@@ -427,9 +427,18 @@ def test_qwen35_gdn_module_wires_config_group_into_out_proj_order():
     with torch.no_grad():
         layer.out_proj.weight.copy_(run_cols.reshape(32, -1))
     x = torch.randn(5, 12 * 8)
-    torch.testing.assert_close(
-        layer._project_out(x), x @ grouped.T, rtol=1e-4, atol=1e-4
-    )
+    # CPU tensors on a CUDA/ROCm host: the unquantized linear dispatches to
+    # the platform's GEMM op (ROCm's is registered for CUDA tensors only), so
+    # pin the plain torch GEMM for this CPU check.
+    from vllm.model_executor.layers.utils import default_unquantized_gemm
+
+    with mock.patch(
+        "vllm.model_executor.layers.linear.dispatch_unquantized_gemm",
+        return_value=default_unquantized_gemm,
+    ):
+        torch.testing.assert_close(
+            layer._project_out(x), x @ grouped.T, rtol=1e-4, atol=1e-4
+        )
 
     plain = _build_gdn(_gdn_text_config(), prefix="model.layers.1.linear_attn")
     assert plain.out_proj_v_head_group == 1
