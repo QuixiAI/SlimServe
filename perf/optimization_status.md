@@ -1,5 +1,56 @@
 # SlimServe Optimization Status
 
+## 2026-10-14 - PR #23 (Metal kernel hardening) gated end to end on a Mac Studio M4 Max; the Xcode 27 toolchain break
+
+- Box: Mac Studio M4 Max (40-core GPU, 128 GiB, macOS 27.0.1), Xcode 27.0
+  with Metal toolchain 32023.921 (metalfe-32023.921.6), Python 3.12.15,
+  torch 2.13.0. Fresh machine: nothing of SlimServe was on it before this
+  session, every number below is from a clean build of this branch merged
+  with main at 288fefb51 (PR #29).
+- Toolchain finding (blocking for every Metal build on Xcode 27, main
+  included): the implied-packed `tensor<device uint4b_format, extents<NT,
+  32>>` constructor in the two tensor-ops u4 kernels of `qgemm_sm.metal`
+  now fails a static stride check (`__is_implied_stride_aligned_v`: a packed
+  numeric format needs extent(0) * bits to be a multiple of 128 bytes, NT =
+  64 is 32 bytes), so `xcrun metal -std=metal4.0` rejects the whole
+  metallib on both this box and an M5 Max with the same toolchain
+  (`vllm/quixicore_metal.metallib` in the tree predates the check). Fix
+  9d70625b7d: the strided constructor with the same packed {1, NT} layout,
+  as the A operand already uses. 98 kernels compile clean after it; the
+  branch's own review note (14 errors on Xcode 26.3, "this toolchain lacks
+  the type") is that older toolchain missing `uint4b_format`.
+- Tracked metallib: the PR's open item "not rebuilt" is closed with
+  7b3f48174, built on this box from the branch's sources. Lesson recorded
+  the hard way: `git reset --hard` restores the committed binary over a
+  fresh build; the first native-build test run failed
+  `test_verify_skips_unmapped_blocks` by exactly the PR's "before" number
+  (0.195 max abs) because the stale binary had come back.
+- Tests on this box, native build: new tests
+  tests/kernels/test_metal_paged_attention_verify.py (4) and
+  test_metal_indexer_topk_decode.py pass; the Metal kernel suite
+  (`tests/kernels -k metal`) and tests/slimserve (180 passed, 1 skipped)
+  pass; the CUDA route-align test now importorskips triton so the kernel
+  directory collects on Metal (ecdae62f0d).
+- End-to-end profile gate (the PR's other open item): `qwen38-q2kxl-1`
+  (Q2_K_XL Qwen3.8-27B GGUF, DFlash2 drafter, vision on, 131072 context,
+  KV pool 144,491 tokens) booted through `slimserve ... --serve -y` and
+  passed the text, reasoning, image and tool canaries. Exact-token bench
+  (benchmarks/benchmark_dsv4_exact.py, 1000 in / 1000 out, temperature 1.0
+  / top-p 0.95 / top-k 20, seed 42, exact at both widths):
+  c1 **19.85** tok/s (506 accepted / 1485 drafted), c8 **37.56** tok/s
+  aggregate (5163 / 8517). No same-box main baseline exists (main does not
+  build on this toolchain without the fix above); the M5 Max record for
+  this profile is c1 16.1 / c8 41.8 with the host tier on. The GDN, verify,
+  qk-norm, dflash-prepare and indexer guards the PR adds are all on this
+  profile's path (GDN layers, DFlash2 verify, vision) and changed nothing
+  visible: every bench pass is token-exact and the canaries are clean.
+- Decision: mergeable. Merge order for the open Metal PRs: this one first
+  (it carries the toolchain fix and the rebuilt metallib), then #30 and
+  #86, which were merged with main on top of the same fix.
+- Raw: `perf/results/2026-10-14/pr23-metal/` on studio128 (server log,
+  canaries.json, exact_c{1,8}.json), build and test logs under
+  `~/.local/scratch/prval/`.
+
 ## 2026-10-14 - PR #29 (glm53f-rtx6000) validated on the 8x A100 box; three Ampere fixes
 
 - Scope: the branch's shared code on the a100 records (`glm53f-nvfp4-8`,
