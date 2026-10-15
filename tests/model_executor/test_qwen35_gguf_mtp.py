@@ -118,3 +118,99 @@ def test_qwen35_gguf_mtp_draft_runs_on_the_target_embedding_and_lm_head():
 
     assert loaded.model.embed_tokens is target.model.embed_tokens
     assert loaded.lm_head is target.lm_head
+
+
+def _mtp_name_map(pp_size: int) -> dict[str, str]:
+    from vllm.config import VllmConfig, set_current_vllm_config
+
+    text_config = SimpleNamespace(num_hidden_layers=64)
+    hf_config = SimpleNamespace(
+        model_type="qwen3_5_mtp",
+        architectures=["Qwen3_5MTP"],
+        get_text_config=lambda: text_config,
+    )
+    vllm_config = VllmConfig()
+    object.__setattr__(vllm_config.parallel_config, "pipeline_parallel_size", pp_size)
+    adapter = Qwen35GGUFAdapter(hf_config)
+    with set_current_vllm_config(vllm_config):
+        return adapter.build_name_map(SimpleNamespace(hf_config=hf_config))
+
+
+def test_qwen35_gguf_mtp_loads_its_own_embedding_only_under_pp():
+    """PP=1: the runners share the target embedding, so token_embd stays
+    unmapped. PP>1: neither runner shares it, so the draft must load it
+    or embed through an uninitialised table. lm_head is shared either way
+    (the target's lives on the draft's last rank)."""
+    single = _mtp_name_map(1)
+    assert "token_embd.weight" not in single
+    assert "output.weight" not in single
+
+    pipelined = _mtp_name_map(2)
+    assert pipelined["token_embd.weight"] == "model.embed_tokens.weight"
+    assert "output.weight" not in pipelined
+    assert pipelined["blk.64.nextn.eh_proj.weight"] == "mtp.fc.weight"
+
+
+def _toy_mtp_draft_and_target():
+    import torch.nn as nn
+
+    from vllm.model_executor.models.qwen3_5_mtp import Qwen3_5MTP
+
+    draft = Qwen3_5MTP.__new__(Qwen3_5MTP)
+    nn.Module.__init__(draft)
+    draft.model = nn.Module()
+    draft.model.embed_tokens = nn.Embedding(4, 2)
+    draft.model.layers = nn.ModuleList([nn.Module()])
+    draft.lm_head = nn.Linear(2, 4)
+    target = nn.Module()
+    target.model = nn.Module()
+    target.model.embed_tokens = nn.Embedding(4, 2)
+    target.lm_head = nn.Linear(2, 4)
+    return draft, target
+
+
+def test_qwen35_gguf_mtp_v1_proposer_shares_target_embedding_and_lm_head():
+    """V1 mirror of the V2 load_eagle_model sharing contract."""
+    from vllm.v1.spec_decode import llm_base_proposer
+
+    draft, target = _toy_mtp_draft_and_target()
+    proposer = llm_base_proposer.SpecDecodeBaseProposer.__new__(
+        llm_base_proposer.SpecDecodeBaseProposer
+    )
+    proposer.model = draft
+    proposer.vllm_config = SimpleNamespace(speculative_config=None)
+    proposer.use_local_argmax_reduction = False
+    with mock.patch.object(
+        llm_base_proposer,
+        "get_pp_group",
+        return_value=SimpleNamespace(world_size=1),
+    ):
+        proposer._maybe_share_embeddings(target)
+        proposer._maybe_share_lm_head(target)
+
+    assert draft.model.embed_tokens is target.model.embed_tokens
+    assert draft.lm_head is target.lm_head
+
+
+def test_qwen35_gguf_mtp_v1_proposer_keeps_draft_embedding_under_pp():
+    """Under PP the V1 runner keeps the draft's own (loaded) embedding."""
+    from vllm.v1.spec_decode import llm_base_proposer
+
+    draft, target = _toy_mtp_draft_and_target()
+    own = draft.model.embed_tokens
+    proposer = llm_base_proposer.SpecDecodeBaseProposer.__new__(
+        llm_base_proposer.SpecDecodeBaseProposer
+    )
+    proposer.model = draft
+    proposer.vllm_config = SimpleNamespace(speculative_config=None)
+    proposer.use_local_argmax_reduction = False
+    with mock.patch.object(
+        llm_base_proposer,
+        "get_pp_group",
+        return_value=SimpleNamespace(world_size=2),
+    ):
+        proposer._maybe_share_embeddings(target)
+        proposer._maybe_share_lm_head(target)
+
+    assert draft.model.embed_tokens is own
+    assert draft.lm_head is target.lm_head
