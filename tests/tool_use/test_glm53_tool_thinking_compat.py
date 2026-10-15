@@ -38,7 +38,7 @@ def _chat_params(request):
     )
 
 
-def test_glm53_native_tools_default_to_non_thinking() -> None:
+def test_glm53_native_tools_keep_thinking_by_default() -> None:
     request = ChatCompletionRequest(
         model="GLM-5.3-Flash-FP8",
         messages=[],
@@ -46,8 +46,8 @@ def test_glm53_native_tools_default_to_non_thinking() -> None:
         tool_choice="required",
     )
     kwargs = _chat_params(request).chat_template_kwargs
-    assert kwargs["thinking"] is False
-    assert kwargs["enable_thinking"] is False
+    assert kwargs["thinking"] is True
+    assert kwargs["enable_thinking"] is True
 
 
 def test_chat_params_preserve_and_render_tool_choice_metadata() -> None:
@@ -123,11 +123,13 @@ def test_glm53_custom_tools_force_non_thinking() -> None:
 
 
 def test_profile_policy_does_not_depend_on_the_served_model_alias() -> None:
-    request = ChatCompletionRequest(
-        model="production-model-alias",
-        messages=[],
-        tools=[FUNCTION_TOOL],
-        tool_choice="required",
+    request = ResponsesRequest.model_validate(
+        {
+            "model": "production-model-alias",
+            "input": "Patch the file.",
+            "tools": [CUSTOM_TOOL],
+            "tool_choice": {"type": "custom", "name": "apply_patch"},
+        }
     )
     kwargs = _chat_params(request).chat_template_kwargs
     assert kwargs["thinking"] is False
