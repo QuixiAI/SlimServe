@@ -17,6 +17,7 @@ written in the scripts:
 | `LTX25_UPSTREAM` | the `packages/` directory of a Lightricks/LTX-2 checkout (`ltx-core`, `ltx-pipelines`) | `~/.local/scratch/ltx25/upstream/packages` |
 | `LTX25_SCRATCH` | captured inputs, import stubs (`n11/oiio_stub.py`) and reference kernels (`n8/ltxkf`) | `~/.local/scratch/ltx25` |
 | `LTX25_MODEL_ROOT` | the official LTX-2.5 weights as `slimserve ltx25-* --download-only` lays them out | `$SLIMSERVE_CACHE/ltx-2.5/official`, else `~/models/ltx-2.5/official` |
+| `LTX25_BF16_PACK` | the dgrauet/ltx-2-mlx bf16 pack the early N2/N7 parity scripts compare against | `$SLIMSERVE_CACHE/ltx-2.5/dgrauet-bf16`, else `~/models/ltx-2.5/dgrauet-bf16` |
 
 ## Baseline runner
 
