@@ -72,3 +72,27 @@ def test_no_repeat_does_not_silently_extend_source():
 def test_invalid_shapes_rejected(count, tokens, offset):
     with pytest.raises(ValueError, match="must be positive"):
         exact_prompts(CharacterTokenizer(), "abc", count, tokens, offset, True)
+
+
+def test_periodic_source_first_pass_skips_duplicates():
+    # Period-3 source: the evenly spaced starts 0, 6, 12 all decode to
+    # "abc".  Every returned prompt must be distinct, filled from untried
+    # starts.
+    prompts = exact_prompts(CharacterTokenizer(), "abcabcabcabcabc", 3, 3, 0, False)
+    assert len(set(prompts)) == 3
+    assert prompts == ["abc", "bca", "cab"]
+
+
+def test_periodic_source_with_too_few_distinct_windows_is_rejected():
+    with pytest.raises(ValueError, match="only 3 distinct exact 3-token"):
+        exact_prompts(CharacterTokenizer(), "abcabcabcabcabc", 4, 3, 0, False)
+
+
+def test_repeated_short_source_cannot_fake_distinct_windows():
+    # Cycling a 4-token source has only 4 distinct windows; 8 requests
+    # cannot all receive distinct prompts, so fail clearly instead of
+    # returning duplicates.
+    with pytest.raises(ValueError, match="only 4 distinct exact"):
+        exact_prompts(CharacterTokenizer(), "abcd", 8, 3, 0, True)
+    prompts = exact_prompts(CharacterTokenizer(), "abcd", 4, 3, 0, True)
+    assert len(set(prompts)) == 4
