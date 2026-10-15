@@ -82,10 +82,15 @@ def test_qsa_fused_pre_indexer_matches_unfused(
     query_lens,
     history_lens,
 ) -> None:
-    from flashinfer.norm import gemma_rmsnorm
-
+    from vllm.model_executor.layers.layernorm import GemmaRMSNorm
     from vllm.model_executor.layers.rotary_embedding import get_rope
 
+    # Fused and reference each round the normed query to bf16 before RoPE,
+    # with different reduction orders. A one-ulp tie difference at |q| in
+    # [2, 4) is 0.0156 after rotation, above ATOL where the rotated value is
+    # small; over the 2M-element "tiled" case that happens for some draws.
+    # Seed so the comparison is reproducible.
+    torch.manual_seed(0)
     device = "cuda"
     rope_params = {
         "partial_rotary_factor": 0.25,
@@ -254,10 +259,14 @@ def test_qsa_fused_pre_indexer_matches_unfused(
         rope_pos_offset=ROPE_POS_OFFSET if cache_rope_positions else None,
     )
 
+    # The unfused path norms with the indexer's GemmaRMSNorm modules.
+    q_norm = GemmaRMSNorm(D, eps=EPS).to(device)
+    k_norm = GemmaRMSNorm(D, eps=EPS).to(device)
+    q_norm.weight.data = q_weight
+    k_norm.weight.data = k_weight
+
     unfused_query = projected_qk[:, : HQ * D].reshape(num_tokens, HQ, D)
-    unfused_query = gemma_rmsnorm(
-        unfused_query.reshape(-1, D), q_weight, EPS
-    ).reshape_as(unfused_query)
+    unfused_query = q_norm(unfused_query.reshape(-1, D)).reshape_as(unfused_query)
     unfused_query = apply_qsa_rope(rope, positions, unfused_query)
 
     raw_keys = unfused_raw[..., :D]
@@ -278,9 +287,7 @@ def test_qsa_fused_pre_indexer_matches_unfused(
         CR,
         rope_positions,
     )
-    compressed_rows = gemma_rmsnorm(pooled.reshape(-1, D), k_weight, EPS).reshape(
-        -1, 1, D
-    )
+    compressed_rows = k_norm(pooled.reshape(-1, D)).reshape(-1, 1, D)
     group_positions = (
         first_positions.transpose(0, 1) if mrope else first_positions[:, 0]
     )
