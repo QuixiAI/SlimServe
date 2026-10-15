@@ -34305,3 +34305,182 @@ than PyPI 1.3.0), and the FP8 GEMMs.
 - Results: no new throughput measurement or hardware qualification claimed.
 - Decision: submit as a focused PR; preserve current-main behavior outside this fix.
 - Raw artifacts: local test output; no traffic captures or model data committed.
+
+## 2026-09-19 - Preserve empty and multipart Responses assistant history
+
+- Status: retained for review.
+- Baseline: `origin/main`; forward-port from the B70 serving integration.
+- Change: Replay every text and refusal part as one assistant message, including empty content; preserve current custom-tool history handling.
+- Correctness: 20 assistant-history regression tests passed on CPU.
+- Results: no new throughput measurement or hardware qualification claimed.
+- Decision: submit as a focused PR; preserve current-main behavior outside this fix.
+- Raw artifacts: local test output; no traffic captures or model data committed.
+
+
+## 2026-09-19 - Keep trailing empty Responses items with their assistant tool turn
+
+- Status: retained for review.
+- Baseline: `fix/responses-assistant-history`; forward-port from the B70 serving integration.
+- Change: Forward-port 4c41dad47: absorb empty typed and dictionary assistant items into the preceding turn without losing tool calls or separating their results; retain nonempty message boundaries and orphan-result rejection.
+- Correctness: 36 conversion regressions passed on the PR base; all 49 conversion/template tests passed with the Qwen template from PR #61. The 13 template cases skip when that separate asset is absent. Ruff passed.
+- Results: no new throughput measurement or hardware qualification claimed.
+- Decision: submit as a focused PR; preserve current-main behavior outside this fix.
+- Raw artifacts: local test output; no traffic captures or model data committed.
+
+## 2026-09-19 - Respect grammar masks when enforcing thinking budgets
+
+- Status: retained for review.
+- Baseline: `origin/main`; forward-port from the B70 serving integration.
+- Change: Forward-port af784bf19 while retaining main natural-close semantics; preserve prohibited logits in both sampler implementations and avoid duplicate closers across speculative and split-token boundaries.
+- Correctness: 85 CPU budget and grammar regression tests passed, including real XGrammar masks, plain/target/bonus rows, simulated ROCm indexing, V2 closing/nudging and existing natural-close tests; Ruff passed. CPU transfer helpers were stubbed to avoid the local accelerator pinned allocator.
+- Results: no new throughput measurement or hardware qualification claimed.
+- Decision: submit as a focused PR; preserve current-main behavior outside this fix.
+- Raw artifacts: local test output; no traffic captures or model data committed.
+- Follow-up (review): with a multi-token end marker whose tail the grammar
+  forbids (allows `A`, always blocks `B`), both samplers restarted the marker
+  and re-forced `A` forever, splicing it into every other reasoning token
+  until max_tokens. Now a forced token blocked AFTER part of the marker
+  landed releases the budget for that reasoning block (V2 -> DONE, V1
+  `budget_released` until the block closes); a blocked FIRST token still
+  stays forced. That reasoning block is then bounded by a natural close or
+  max_tokens; the next block gets a fresh, enforced budget. V1 (plain and
+  speculative) and V2 (plain and speculative span) regression tests fail
+  without the change. 104 sample/structured-output and 150
+  spec_decode/worker CPU tests pass. No throughput claim.
+
+## 2026-09-19 - Honor thinking budgets in Responses sampling parameters
+
+- Status: retained for review.
+- Baseline: `origin/main`; forward-port from the B70 serving integration.
+- Change: Use the existing Chat Completions budget resolver for Responses, including profile effort defaults, explicit disabling and completion-token ceilings.
+- Correctness: 13 Responses budget precedence, effort-map, token-ceiling and invalid-input tests passed on CPU.
+- Results: no new throughput measurement or hardware qualification claimed.
+- Decision: submit as a focused PR; preserve current-main behavior outside this fix.
+- Raw artifacts: local test output; no traffic captures or model data committed.
+
+## 2026-09-19 - Count Qwen reasoning opened by the chat template
+
+- Status: retained for review.
+- Baseline: `origin/main`; forward-port from the B70 serving integration.
+- Change: Count the implicit initial reasoning span and stop at reasoning or tool delimiters.
+- Correctness: 12 Qwen reasoning-usage regression tests passed on CPU.
+- Results: no new throughput measurement or hardware qualification claimed.
+- Decision: submit as a focused PR; preserve current-main behavior outside this fix.
+- Raw artifacts: local test output; no traffic captures or model data committed.
+
+## 2026-09-19 - Emit stable Qwen tool arguments when each call closes
+
+- Status: retained for review.
+- Baseline: `origin/main`; forward-port from the B70 serving integration.
+- Change: Avoid emitting JSON prefixes invalidated by repeated XML parameter names; retain incremental tool headers and custom-tool conversion.
+- Correctness: 39 argument-prefix tests passed; 17 existing custom-tool tests passed and four GLM tests failed identically on untouched main with local XGrammar 0.2.7.
+- Scope: `nemotron_v3_config` is built by `dataclasses.replace` over
+  `qwen3_config` and `SeedOssParser` subclasses `Qwen3Parser`, so Nemotron V3
+  and Seed-OSS also stop streaming argument deltas and emit each call's
+  arguments once it closes.
+- Results: no new throughput measurement or hardware qualification claimed.
+- Decision: submit as a focused PR; preserve current-main behavior outside this fix.
+- Raw artifacts: local test output; no traffic captures or model data committed.
+
+## 2026-09-19 - Stop speculative grammar validation at the stop token
+
+- Status: retained for review.
+- Baseline: `origin/main`; forward-port from the B70 serving integration.
+- Change: Do not probe unreachable speculative suffixes after the grammar matcher terminates.
+- Scope: log-noise fix, not a correctness fix. Real xgrammar already rejects
+  any token offered after the stop token (`accept_token` returns False), so
+  the accepted prefix was already correct; it also logs "The matcher has
+  terminated after accepting the stop token, but is trying to accept new
+  token" for every such probe, which speculative windows that end in a stop
+  token triggered on every step. Verified against the installed xgrammar.
+- Correctness: Two XGrammar stop-token regression tests passed on CPU.
+- Results: no new throughput measurement or hardware qualification claimed.
+- Decision: submit as a focused PR (log noise only); preserve current-main behavior outside this fix.
+- Raw artifacts: local test output; no traffic captures or model data committed.
+
+## 2026-09-19 - Stop advancing rejected drafts across reasoning boundaries
+
+- Status: retained for review.
+- Baseline: `origin/main`; forward-port from the B70 serving integration.
+- Change: After reasoning ends inside a draft window, stop simulating the grammar after its first invalid draft and roll back only accepted advances.
+- Correctness: Three reasoning-boundary speculative-decoding tests passed on CPU.
+- Results: no new throughput measurement or hardware qualification claimed.
+- Decision: submit as a focused PR; preserve current-main behavior outside this fix.
+- Raw artifacts: local test output; no traffic captures or model data committed.
+
+## 2026-09-19 - Add a Qwen tool-policy chat template with native thinking tokens
+
+- Status: retained for review.
+- Baseline: `origin/main`; forward-port from the B70 serving integration.
+- Change: Render required/named/none/auto tool policy and reasoning hints while preserving native Qwen thinking, tool history and vision placeholders.
+- Correctness: Seven Qwen policy/history/vision-placeholder tests and the existing GLM asset test passed on CPU; existing package-data glob includes the asset.
+- Review follow-up (2026-10-14): every reasoning_effort the API accepts now renders (minimal -> low, high/max -> xhigh, unknown -> default; no raise); an explicit enable_thinking wins over effort none so the template and the Qwen3 parser (which reads enable_thinking) agree, with the effort hint omitted; assistant history with inline <think>...</think> in content is lifted into the think block as the stock Qwen template does, so it is not rendered twice. 15 template tests pass on CPU (6 of the new ones fail on the pre-fix template); tests/slimserve 180 passed.
+- Review follow-up (2026-10-15): inline <think> lifting now applies only when the message has no reasoning_content/reasoning field, exactly as stock Qwen; a message with explicit (even empty) reasoning keeps its content verbatim, so a literal "</think>" in visible text is no longer truncated. 17 template tests pass (3 fail on the previous template).
+- Results: no new throughput measurement or hardware qualification claimed.
+- Decision: submit as a focused PR; preserve current-main behavior outside this fix.
+- Raw artifacts: local test output; no traffic captures or model data committed.
+
+## 2026-09-19 - Limit HSA host-staging probes to ROCm workers
+
+- Status: retained for review.
+- Baseline: `origin/main`; forward-port from the B70 serving integration.
+- Change: Avoid pinned host allocations and CUDA-alias synchronization on non-ROCm workers while preserving the existing HSA warmup on ROCm.
+- Correctness: The mocked platform-selection regression passed on CPU; no hardware startup claim.
+- Results: no new throughput measurement or hardware qualification claimed.
+- Decision: submit as a focused PR; preserve current-main behavior outside this fix.
+- Raw artifacts: local test output; no traffic captures or model data committed.
+
+## 2026-09-19 - Add a multi-turn Responses tool protocol benchmark
+
+- Status: retained for review.
+- Baseline: `origin/main`; forward-port from the B70 serving integration.
+- Change: Exercise required inventory-summary tool calls at configurable concurrency and model ID, retain raw events and exact API usage, and fail on missing calls or argument delta/done mismatches.
+- Revision (2026-10-14): samples at serving policy (temperature 1.0 / top_p 0.95 / top_k 20, seed + request index) instead of temperature 0; `--model` defaults to `Qwen3.8-27B` (served by the qwen38-27b profiles); raw JSON defaults to `perf/results/<YYYY-MM-DD>/<run-id>/`; per-round timing is `response_created_s` (first SSE event) plus `first_output_delta_s`; rounds truncated by `max_output_tokens` are counted as `incomplete_max_output_tokens`, separately from `protocol_errors`.
+- Revision (2026-10-15): raw JSON defaults to `<repo>/perf/results/<YYYY-MM-DD>/<run-id>/` regardless of CWD, with a microsecond + random-suffix run id; `completed_rounds` excludes rounds with protocol errors as well as truncated rounds; truncated rounds skip argument validation and count only as `incomplete_max_output_tokens`. Accounting covered by `tests/slimserve/test_qwen_tool_protocol_benchmark.py` (mocked SSE).
+- Correctness: CLI help, Ruff and a mock-SSE two-turn call/replay check passed; no fresh live throughput measurement.
+- Results: no new throughput measurement or hardware qualification claimed.
+- Decision: submit as a focused PR; preserve current-main behavior outside this fix.
+- Raw artifacts: local test output; no traffic captures or model data committed.
+
+## 2026-09-19 - Report interrupted Responses tool calls as incomplete
+
+- Status: retained for review.
+- Baseline: `origin/main`; forward-port from the B70 serving integration.
+- Change: Do not advertise truncated or invalid JSON arguments as completed calls; emit matching incomplete/failed Responses terminal events and stop background replay on each terminal status.
+- Correctness: 23 function-completion and terminal-event regression tests passed on CPU.
+- Results: no new throughput measurement or hardware qualification claimed.
+- Decision: submit as a focused PR; preserve current-main behavior outside this fix.
+- Raw artifacts: local test output; no traffic captures or model data committed.
+
+
+## 2026-09-19 - Emit typed Responses failure events for generation errors
+
+- Status: retained for review.
+- Baseline: `fix/responses-incomplete-tools`; forward-port from the B70 serving integration.
+- Change: Preserve the original generation or finalization error in a typed response.failed event and stored response, with monotonic event sequence numbers.
+- Correctness: Eight generation-error SSE/storage cases and 23 inherited completion tests passed on CPU.
+- Results: no new throughput measurement or hardware qualification claimed.
+- Decision: submit as a focused PR; preserve current-main behavior outside this fix.
+- Raw artifacts: local test output; no traffic captures or model data committed.
+
+
+## 2026-09-19 - Prevent required tool requests from stopping during reasoning
+
+- Status: retained for review.
+- Baseline: `fix/responses-generation-errors`; forward-port from the B70 serving integration.
+- Change: Mask stop IDs until the required tool grammar activates, including speculative and parallel rows; propagate required/named/allowed-tools policy and fail Responses that omit the required call.
+- Correctness: 12 required-tool mask/metadata tests and 47 Responses completion/error tests passed on CPU.
+- Results: no new throughput measurement or hardware qualification claimed.
+- Decision: submit as a focused PR; preserve current-main behavior outside this fix.
+- Raw artifacts: local test output; no traffic captures or model data committed.
+
+
+## 2026-09-19 - Preserve streamed item identity in terminal Responses output
+
+- Status: retained for review.
+- Baseline: `fix/required-tool-reasoning-stop`; forward-port from the B70 serving integration.
+- Change: Use finalized streamed items as terminal output so item IDs, call IDs, arguments and statuses match events already delivered; preserve cancellation.
+- Correctness: 16 stream/final identity cases and 47 inherited completion/error cases passed on CPU.
+- Results: no new throughput measurement or hardware qualification claimed.
+- Decision: submit as a focused PR; preserve current-main behavior outside this fix.
+- Raw artifacts: local test output; no traffic captures or model data committed.

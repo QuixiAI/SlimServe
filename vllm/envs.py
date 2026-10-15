@@ -28,6 +28,9 @@ if TYPE_CHECKING:
     VLLM_API_KEY: str | None = None
     VLLM_ADMISSION_MAX_CONCURRENT: int | None = None
     VLLM_DEBUG_LOG_API_SERVER_RESPONSE: bool = False
+    VLLM_BAD_REQUEST_LOG_PATH: str | None = None
+    VLLM_BAD_REQUEST_LOG_MAX_BYTES: int = 262144
+    VLLM_BAD_REQUEST_LOG_MAX_FILE_BYTES: int = 67108864
     S3_ACCESS_KEY_ID: str | None = None
     S3_SECRET_ACCESS_KEY: str | None = None
     S3_ENDPOINT_URL: str | None = None
@@ -106,6 +109,7 @@ if TYPE_CHECKING:
     VERBOSE: bool = False
     VLLM_ALLOW_LONG_MAX_MODEL_LEN: bool = False
     VLLM_HTTP_TIMEOUT_KEEP_ALIVE: int = 5  # seconds
+    VLLM_SSE_KEEPALIVE_INTERVAL_S: float = 30.0
     VLLM_MAX_N_SEQUENCES: int = 16384
     VLLM_MAX_COMPLETION_PROMPTS: int = 1024
     VLLM_PLUGINS: list[str] | None = None
@@ -774,6 +778,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DEBUG_LOG_API_SERVER_RESPONSE": lambda: (
         os.environ.get("VLLM_DEBUG_LOG_API_SERVER_RESPONSE", "False").lower() == "true"
     ),
+    # Optional owner-only JSONL capture of bounded request/response bodies for
+    # 4xx diagnostics. Authorization headers are never recorded.
+    "VLLM_BAD_REQUEST_LOG_PATH": lambda: os.getenv("VLLM_BAD_REQUEST_LOG_PATH"),
+    "VLLM_BAD_REQUEST_LOG_MAX_BYTES": lambda: int(
+        os.getenv("VLLM_BAD_REQUEST_LOG_MAX_BYTES", "262144")
+    ),
+    # Size cap for the bad-request capture file; past it the file is rotated
+    # once to <path>.1 (replacing any older rotation).
+    "VLLM_BAD_REQUEST_LOG_MAX_FILE_BYTES": lambda: int(
+        os.getenv("VLLM_BAD_REQUEST_LOG_MAX_FILE_BYTES", "67108864")
+    ),
     # S3 access information, used for tensorizer to load model from S3
     "S3_ACCESS_KEY_ID": lambda: os.environ.get("S3_ACCESS_KEY_ID", None),
     "S3_SECRET_ACCESS_KEY": lambda: os.environ.get("S3_SECRET_ACCESS_KEY", None),
@@ -1071,6 +1086,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Timeout in seconds for keeping HTTP connections alive in API server
     "VLLM_HTTP_TIMEOUT_KEEP_ALIVE": lambda: int(
         os.environ.get("VLLM_HTTP_TIMEOUT_KEEP_ALIVE", "5")
+    ),
+    # Seconds of upstream silence after which an SSE response emits a
+    # ": keepalive" comment so idle-timeout proxies keep the stream open
+    # (e.g. during a long prefill or thinking phase). <= 0 disables it.
+    "VLLM_SSE_KEEPALIVE_INTERVAL_S": lambda: float(
+        os.environ.get("VLLM_SSE_KEEPALIVE_INTERVAL_S", "30")
     ),
     # Maximum allowed value for the `n` sampling parameter (number of output
     # sequences per request). Limits resource consumption to prevent
@@ -2235,6 +2256,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS",
         "VLLM_ENGINE_ITERATION_TIMEOUT_S",
         "VLLM_HTTP_TIMEOUT_KEEP_ALIVE",
+        "VLLM_SSE_KEEPALIVE_INTERVAL_S",
         "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS",
         "VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS",
         "VLLM_KEEP_ALIVE_ON_ENGINE_DEATH",

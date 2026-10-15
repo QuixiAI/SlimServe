@@ -224,6 +224,27 @@ class Parser:
             The extracted content token IDs.
         """
 
+    def content_token_count(
+        self,
+        output_token_ids: Sequence[int],
+        prompt_token_ids: Sequence[int] | None = None,
+    ) -> int:
+        """Number of trailing output tokens that belong to the content phase.
+
+        Reasoning tokens and the end-of-reasoning marker are excluded. The
+        Responses API uses this to attribute output_text logprobs to exactly
+        the message's tokens, identically when streaming (by the difference
+        between successive prefixes) and when not. Mirrors ``parse_delta``:
+        reasoning closed by the prompt makes every output token content.
+        """
+        if self._reasoning_parser is None:
+            return len(output_token_ids)
+        if prompt_token_ids is not None and self.is_reasoning_end(
+            list(prompt_token_ids)
+        ):
+            return len(output_token_ids)
+        return len(self.extract_content_ids(list(output_token_ids)))
+
     @abstractmethod
     def extract_reasoning(
         self,
@@ -541,6 +562,10 @@ class DelegatingParser(Parser):
         structural_tag = json.dumps(structure_tag.model_dump())
         request.structured_outputs = StructuredOutputsParams(
             structural_tag=structural_tag,
+            _required_tool_call=(
+                tool_choice_mode(request.tool_choice) == "required"
+                or named_tool_choice_name(request.tool_choice) is not None
+            ),
         )
         if isinstance(request, ResponsesRequest):
             request.text = None
