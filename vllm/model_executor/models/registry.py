@@ -78,6 +78,8 @@ _TEXT_GENERATION_MODELS = {
     "DeepseekV32ForCausalLM": ("deepseek_v2", "DeepseekV3ForCausalLM"),
     "DeepseekV4ForCausalLM": ("vllm.models.deepseek_v4", "DeepseekV4ForCausalLM"),
     "GlmMoeDsaForCausalLM": ("deepseek_v2", "GlmMoeDsaForCausalLM"),
+    # GLM-5.3-Flash text backbone alone (the GGUF ships no vision tensors).
+    "Glm5NextForCausalLM": ("glm5_next", "Glm5NextForCausalLM"),
     "InternLM3ForCausalLM": ("llama", "LlamaForCausalLM"),
     "IQuestCoderForCausalLM": ("llama", "LlamaForCausalLM"),
     "LagunaForCausalLM": ("laguna", "LagunaForCausalLM"),

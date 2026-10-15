@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import functools
+import os
 from collections.abc import Callable
 from dataclasses import dataclass, field, fields, make_dataclass
 from typing import (
@@ -990,6 +991,28 @@ def mamba_get_block_table_tensor_triton(
     return state_indices
 
 
+_METAL_MAMBA_LB: bool | None = None
+
+
+def _metal_mamba_last_blocks() -> bool:
+    """quixicore mamba_last_blocks is built and the profile opted in
+    (VLLM_METAL_MAMBA_LB=1, the glm53f-q2-1 env block); other hybrid
+    profiles keep the torch chain they were gated with."""
+    global _METAL_MAMBA_LB
+    if _METAL_MAMBA_LB is None:
+        _METAL_MAMBA_LB = False
+        if os.getenv("VLLM_METAL_MAMBA_LB", "0") == "1":
+            try:
+                from vllm.quixicore import quixicore_ops
+
+                _METAL_MAMBA_LB = quixicore_ops.is_available() and quixicore_ops.has(
+                    "mamba_last_blocks"
+                )
+            except ImportError:
+                _METAL_MAMBA_LB = False
+    return _METAL_MAMBA_LB
+
+
 def mamba_get_block_table_tensor(
     block_table: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -1017,6 +1040,19 @@ def mamba_get_block_table_tensor(
     assert isinstance(kv_cache_spec, MambaSpec)
     if HAS_TRITON and block_table.is_cuda and seq_lens.is_cuda:
         return mamba_get_block_table_tensor_triton(block_table, seq_lens, kv_cache_spec)
+    if block_table.device.type == "mps" and _metal_mamba_last_blocks():
+        # One launch instead of the six-op torch chain below (per KV group,
+        # per step). Same values: start = max((seq_lens - 1) // bs, 0).
+        from vllm.quixicore import quixicore_ops
+
+        ncols = 1 + kv_cache_spec.num_speculative_blocks
+        out = torch.empty(
+            (block_table.shape[0], ncols), dtype=torch.int32, device=block_table.device
+        )
+        quixicore_ops.mamba_last_blocks(
+            block_table, seq_lens, out, kv_cache_spec.block_size
+        )
+        return out
 
     # NOTE: For 0-length requests in CUDA graph, use a start_index of 0
     # to handle the invalid block table.
