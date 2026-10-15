@@ -62,8 +62,13 @@ def _speculative_config(plan: Plan) -> dict[str, Any] | None:
         return None
     from slimserve.registry import cache_root
 
-    local = cache_root() / spec["local_dir"]
     config: dict[str, Any] = {}
+    if spec.get("model") == "target":
+        # The drafter lives inside the target checkpoint (a GGUF's nextn
+        # block): the draft model path is the target file itself.
+        draft = str(plan.entry_file)
+        return {"model": draft, **spec["engine"], **plan.speculative_overrides}
+    local = cache_root() / spec["local_dir"]
     if file := spec.get("file"):
         draft = str(local / file["path"])
     elif local.is_dir():

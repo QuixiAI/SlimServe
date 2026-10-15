@@ -16,8 +16,14 @@ def calls(monkeypatch):
     """Record which mode main() dispatched to, without starting an engine."""
     seen = {}
 
-    def fake_exec_server(plan, host, port):
-        seen.update(mode="serve", profile=plan.profile_id, host=host, port=port)
+    def fake_exec_server(plan, host, port, log_path=None):
+        seen.update(
+            mode="serve",
+            profile=plan.profile_id,
+            host=host,
+            port=port,
+            log_path=log_path,
+        )
         return 0
 
     def fake_chat(plan, prompt, log_path):
