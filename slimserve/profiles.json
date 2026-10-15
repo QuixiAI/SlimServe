@@ -1867,6 +1867,63 @@
         }
       },
       "format": "safetensors"
+    },
+    "qwen38-hauhau-aggressive-gguf": {
+      "title": "Qwen3.8-27B Uncensored HauhauCS Aggressive GGUF",
+      "modalities": [
+        "text",
+        "image"
+      ],
+      "repo": "HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF",
+      "revision": "993a5971fda8f30dd1b7eb2654792ba4415c7460",
+      "base_url": "https://huggingface.co/HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF/resolve/993a5971fda8f30dd1b7eb2654792ba4415c7460",
+      "local_dir": "Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF",
+      "shared": [
+        {
+          "path": "mmproj-Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-BF16.gguf",
+          "bytes": 931146624,
+          "sha256": "5681b690bcb8eb10cd28d62d078cb4e01521a3ea4880a3fc7d54de72de2dd142"
+        }
+      ],
+      "shared_note": "Aggressive uncensoring variant. The Q8 target preserves its embedded NextN head; the separate FastMTP sidecar needs its trimmed-vocabulary d2t loader before vLLM can use it. The repo publishes a BF16 mmproj of the shared Qwen3.5 vision tower; it is discovered by globbing mmproj* next to the text GGUF, as for qwen38-27b, so both live in the repo root of the local dir.",
+      "speculator": {
+        "repo": "HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF",
+        "revision": "993a5971fda8f30dd1b7eb2654792ba4415c7460",
+        "base_url": "https://huggingface.co/HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF/resolve/993a5971fda8f30dd1b7eb2654792ba4415c7460",
+        "local_dir": "Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF",
+        "file": {
+          "path": "Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q8_K_P.gguf",
+          "bytes": 31457990784,
+          "sha256": "4e7735df4d1e2ec721f2551f531b815702a2f89123238c564797eda4b0304bc2"
+        },
+        "engine": {
+          "method": "mtp",
+          "num_speculative_tokens": 1,
+          "quantization": "gguf",
+          "draft_tensor_parallel_size": 4,
+          "use_local_argmax_reduction": true,
+          "kv_cache_dtype": "fp8"
+        },
+        "note": "Embedded one-layer NextN head. Measured depth 1 is the Q8 throughput default; the target verifies every proposed token."
+      },
+      "quants": {
+        "Q8_K_P": {
+          "title": "HauhauCS Q8_K_P (GGUF)",
+          "bytes": 31457990784,
+          "summary": "HauhauCS model-specific Q8_K_P recipe: Q8_0 text tensors with selected BF16 tensors, including the embedded NextN block.",
+          "min_gpus": {
+            "b70": 4
+          },
+          "min_memory_bytes": {},
+          "files": [
+            {
+              "path": "Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q8_K_P.gguf",
+              "bytes": 31457990784,
+              "sha256": "4e7735df4d1e2ec721f2551f531b815702a2f89123238c564797eda4b0304bc2"
+            }
+          ]
+        }
+      }
     }
   },
   "platforms": {
@@ -3829,6 +3886,80 @@
             "On the out-of-tree integration branch a local c8 workload passed, but later live traffic stalled with a sample_tokens RPC timeout. Long-running stability remains unqualified.",
             "This recipe is gated pending fresh qualification on current main; earlier measurements apply only to the saved B70 integration checkout.",
             "Chat template: the checked-in Qwen3.8 tool-calling template (qwen38_tool_calling.jinja) arrives with PR #61; until then this record serves the checkpoint's own chat_template.jinja. Wire chat_template_asset into the source once that template is on main.",
+            "CPU-offloaded KV (the HostTierConnector host tier), the standing goal for every non-Metal profile, is deferred until the XPU serving backend exists; the connector has not been generalized to or validated on XPU."
+          ],
+          "platform": "b70",
+          "status": "in-progress",
+          "status_reason": "Forward-ported B70 recipe awaits current-main hardware qualification",
+          "status_detail": "Historical B70 serving evidence does not qualify this forward port. Merge the XPU and serving prerequisites, then validate cold boot, text/image canaries, native MTP, correctness and sustained load before promotion."
+        }
+      }
+    },
+    "qwen38-hauhau-q8-4": {
+      "title": "HauhauCS Qwen3.8-27B Aggressive Q8_K_P on 4 Intel Arc Pro B70",
+      "source": "qwen38-hauhau-aggressive-gguf",
+      "gpus": 4,
+      "summary": "Q8_K_P GGUF target with its embedded NextN MTP head at measured depth 1 and decode graphs on TP4 XPU.",
+      "speculative": true,
+      "variants": {
+        "b70": {
+          "default_quant": "Q8_K_P",
+          "engine": {
+            "tensor_parallel_size": 4,
+            "quantization": "gguf",
+            "max_model_len": 262144,
+            "max_num_seqs": 32,
+            "max_num_batched_tokens": 16384,
+            "gpu_memory_utilization": 0.9,
+            "kv_cache_dtype": "fp8_e4m3",
+            "attention_backend": "FLASH_ATTN",
+            "enable_prefix_caching": true,
+            "compilation_config": {
+              "mode": 0,
+              "cudagraph_mode": "FULL_DECODE_ONLY",
+              "cudagraph_capture_sizes": [
+                2,
+                4,
+                6,
+                8,
+                12,
+                16,
+                20,
+                24,
+                32,
+                40,
+                48,
+                64
+              ],
+              "max_cudagraph_capture_size": 64
+            },
+            "enable_auto_tool_choice": true,
+            "tool_call_parser": "qwen3_xml",
+            "reasoning_parser": "qwen3",
+            "served_model_name": "Qwen3.8-27B-HauhauCS-Aggressive-Q8_K_P",
+            "override_generation_config": {
+              "thinking_token_budget": 2000
+            }
+          },
+          "env": {
+            "VLLM_USE_BREAKABLE_CUDAGRAPH": "1",
+            "VLLM_XPU_ENABLE_XPU_GRAPH": "0",
+            "ZES_ENABLE_SYSMAN": "1",
+            "FI_TCP_IFACE": "lo",
+            "TORCHDYNAMO_DISABLE": "1",
+            "CCL_TOPO_FABRIC_VERTEX_CONNECTION_CHECK": "0",
+            "VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS": "120"
+          },
+          "notes": [
+            "The Qwen3.5 GGUF adapter maps the appended block as a native Qwen3_5MTP draft while leaving it excluded from the target backbone.",
+            "Embedded MTP defaults to depth 1. On the out-of-tree B70 integration branch depth 1 was reported ahead of depth 2 at concurrency 8 and 32; that comparison is historical and unverified here (no raw artifacts in this repository), so re-measure depth once the XPU backend lands.",
+            "The FastMTP-32K sidecar is not selected here: its full-vocabulary embedding plus trimmed 32K output head and d2t map need a dedicated vLLM draft model contract.",
+            "FULL_DECODE_ONLY breakable graphs with k=1 verification-width capture sizes (multiples of 2) are the historical recipe; their throughput effect is unverified on current main.",
+            "The profile supplies a 2000-token thinking default for all reasoning efforts except none; an explicit request budget, including -1 for unlimited, takes precedence.",
+            "This recipe is gated pending fresh qualification on current main; earlier measurements apply only to the saved B70 integration checkout.",
+            "Target KV uses fp8_e4m3 and native MTP draft KV uses fp8. These preserve the historical recipe; fresh current-main accuracy and cache-reuse qualification is required.",
+            "Vision: the published BF16 mmproj loads through the same Qwen3.5 GGUF vision path as qwen38-27b; image requests on XPU are unvalidated and are part of this record's qualification.",
+            "Tool calls use qwen3_xml, matching every other Qwen3.8 record.",
             "CPU-offloaded KV (the HostTierConnector host tier), the standing goal for every non-Metal profile, is deferred until the XPU serving backend exists; the connector has not been generalized to or validated on XPU."
           ],
           "platform": "b70",

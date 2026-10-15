@@ -31416,3 +31416,14 @@ than PyPI 1.3.0), and the FP8 GEMMs.
 - Results: no new throughput measurement or hardware qualification claimed.
 - Decision: submit as a focused PR; preserve current-main behavior outside this fix.
 - Raw artifacts: none. CPU unit tests only (`tests/slimserve`); no performance measurement and no on-card run backs this entry.
+
+
+## 2026-09-19 - Register a gated Qwen3.8-27B Q8_K_P recipe for B70
+
+- Status: retained for review.
+- Baseline: `feat/qwen38-b70-fp8-profile`; forward-port from the B70 serving integration.
+- Change: Register the Q8_K_P target and its identical embedded draft artifact using current variants, FP8 draft KV and token-width-aware graphs; keep historical depth evidence separate from fresh qualification. Review fixes: source pinned to revision 993a5971; vision enabled through the repo's published BF16 mmproj (the same Qwen3.5 GGUF vision path as `qwen38-27b`, so text-only had no model-level reason); `tool_call_parser` set to `qwen3_xml` like every other Qwen3.8 record; the depth-1-versus-depth-2 comparison is marked historical and unverified; host-tier KV deferred until the XPU backend exists.
+- Correctness: 74 profile and registry checks passed on CPU; GGUF model parity and B70 serving remain unqualified.
+- Results: no new throughput measurement or hardware qualification claimed.
+- Decision: submit as a focused PR; preserve current-main behavior outside this fix.
+- Raw artifacts: none. CPU unit tests only (`tests/slimserve`); no performance measurement and no on-card run backs this entry.
