@@ -223,22 +223,91 @@ class PlainHolder:
         return int(logits.argmax())
 
 
-def test_v1_blocked_second_end_token_does_not_release_the_budget():
+def test_v1_blocked_end_marker_tail_releases_the_block():
     run = PlainHolder(1, [END, SECOND_END])
     run.emit(120)  # exhausted
     assert run.forced() == END
     run.emit(END)
     assert run.forced() == SECOND_END
-    run.emit(BLOCKED)  # the grammar blocked SECOND_END
-    # Not counted as emitted: thinking is still open and the marker restarts,
-    # since "END BLOCKED" is no prefix of it.
-    assert run.holder._state[0]["in_end"]
-    assert run.forced() == END
-    run.emit(END)
-    assert run.forced() == SECOND_END
-    run.emit(SECOND_END)
+    run.emit(BLOCKED)  # the grammar blocked SECOND_END after END landed
+    # Restarting would splice another lone END into the reasoning; the block
+    # is released instead and nothing more is forced in it.
     assert not run.holder._state[0]["in_end"]
     assert run.forced() is None
+    run.emit(120, 121)
+    assert run.forced() is None
+
+
+def test_v1_permanently_blocked_end_marker_tail_is_never_spliced_repeatedly():
+    # Grammar allows END but always forbids SECOND_END. Previously the marker
+    # was restarted forever, splicing END into every other reasoning token.
+    run = PlainHolder(1, [END, SECOND_END])
+    run.emit(120)  # exhausted
+    trace = []
+    for _ in range(12):
+        forced = run.forced()
+        emitted = BLOCKED if forced == SECOND_END else (forced or 120)
+        trace.append((forced, emitted))
+        run.emit(emitted)
+    assert trace[:2] == [(END, END), (SECOND_END, BLOCKED)]
+    assert all(forced is None for forced, _ in trace[2:])
+    # A natural close ends the block; the next reasoning block gets a fresh,
+    # enforced budget.
+    run.emit(END, SECOND_END, START, 120)
+    assert run.forced() == END
+
+
+def test_v1_speculative_blocked_end_marker_tail_releases_the_block():
+    holder = ThinkingBudgetStateHolder(
+        SimpleNamespace(
+            reasoning_start_token_ids=[START],
+            reasoning_end_token_ids=[END, SECOND_END],
+        ),
+        1,
+        3,
+        torch.device("cpu"),
+        False,
+    )
+    holder.sync_batch(
+        BatchUpdate(
+            batch_size=1,
+            removed=[],
+            added=[(0, SamplingParams(thinking_token_budget=1), [START], [])],
+            moved=[],
+        )
+    )
+    drafts = [120, 120, 120]
+
+    def verify(output):
+        holder.update_state([list(output)], [drafts])
+        logits = torch.zeros(len(drafts), VOCAB_SIZE + 1)
+        holder.apply_to_logits(logits, False, [drafts])
+        bonus = torch.zeros(1, VOCAB_SIZE + 1)
+        holder.apply_to_logits(bonus, True, [drafts])
+        forced = {
+            row: int(logits[row].argmax())
+            for row in range(len(drafts))
+            if logits[row].max() >= 1e9
+        }
+        if bonus.max() >= 1e9:
+            forced["bonus"] = int(bonus.argmax())
+        return forced
+
+    output = [120]  # exhausted: row 0 forces END; draft 120 is rejected there
+    assert verify(output) == {0: END}
+    output += [END]
+    assert verify(output) == {0: SECOND_END}
+    # The grammar blocked SECOND_END at row 0, the target sampled 120, which
+    # accepted the whole draft plus a bonus token.
+    output += [120, 120, 120, 121]
+    assert verify(output) == {}
+    output += [120, 120, 120, 120]
+    assert verify(output) == {}
+    # A natural close ends the released block; the next block is enforced.
+    output += [END, SECOND_END]
+    assert verify(output) == {}
+    output += [START, 120]
+    assert verify(output) == {0: END}
 
 
 def test_v1_blocked_first_end_token_is_forced_again_not_half_marker():

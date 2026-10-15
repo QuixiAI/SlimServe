@@ -31405,3 +31405,14 @@ than PyPI 1.3.0), and the FP8 GEMMs.
 - Results: no new throughput measurement or hardware qualification claimed.
 - Decision: submit as a focused PR; preserve current-main behavior outside this fix.
 - Raw artifacts: local test output; no traffic captures or model data committed.
+- Follow-up (review): with a multi-token end marker whose tail the grammar
+  forbids (allows `A`, always blocks `B`), both samplers restarted the marker
+  and re-forced `A` forever, splicing it into every other reasoning token
+  until max_tokens. Now a forced token blocked AFTER part of the marker
+  landed releases the budget for that reasoning block (V2 -> DONE, V1
+  `budget_released` until the block closes); a blocked FIRST token still
+  stays forced. That reasoning block is then bounded by a natural close or
+  max_tokens; the next block gets a fresh, enforced budget. V1 (plain and
+  speculative) and V2 (plain and speculative span) regression tests fail
+  without the change. 104 sample/structured-output and 150
+  spec_decode/worker CPU tests pass. No throughput claim.

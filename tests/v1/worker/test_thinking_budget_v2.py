@@ -463,16 +463,48 @@ def test_blocked_first_closer_token_is_forced_again_not_half_closer():
     assert forced_now(st, 0) is None  # DONE
 
 
-def test_blocked_second_closer_token_restarts_the_closer():
+def test_blocked_second_closer_token_releases_the_block():
     st = make_state(starts=(80, 81), ends=(90, 91))
     st.add_request(0, [80, 81], sp(1))
     st.apply_staged_writes()
     run_tokens(st, 0, [10, 90])  # exhausted, first closer token landed
     assert forced_now(st, 0) == 91
-    step(st, 0, BLOCKED)  # "90 13" is no closer prefix
-    assert forced_now(st, 0) == 90
-    run_tokens(st, 0, [90, 91])
+    step(st, 0, BLOCKED)  # the grammar blocked 91 after 90 landed
+    # Restarting would splice another lone 90 into the reasoning; the block
+    # is released instead.
     assert forced_now(st, 0) is None
+
+
+def test_permanently_blocked_closer_tail_is_never_spliced_repeatedly():
+    # Grammar allows 90 but always forbids 91. Previously the closer was
+    # restarted forever: (90,90),(91,13),(90,90),(91,13),... until max_tokens.
+    st = make_state(starts=(80, 81), ends=(90, 91))
+    st.add_request(0, [80, 81], sp(1))
+    st.apply_staged_writes()
+    step(st, 0, 10)  # exhausted
+    trace = []
+    for _ in range(12):
+        forced = forced_now(st, 0)
+        emitted = BLOCKED if forced == 91 else (forced if forced else 10)
+        trace.append((forced, emitted))
+        step(st, 0, emitted)
+    assert trace[:2] == [(90, 90), (91, BLOCKED)]
+    assert all(forced is None for forced, _ in trace[2:])
+    # A later reasoning block gets a fresh budget and is enforced again.
+    run_tokens(st, 0, [90, 91, 80, 81, 10])
+    assert forced_now(st, 0) == 90
+
+
+def test_blocked_closer_tail_in_speculative_span_releases_later_rows():
+    st = make_state(starts=(80, 81), ends=(90, 91))
+    st.add_request(0, [80, 81], sp(1))
+    st.apply_staged_writes()
+    step(st, 0, 10)  # exhausted
+    # Row 0 forces 90, row 1 forces 91 (draft 90 assumed landed); a draft
+    # that ends up accepted at row 1 as BLOCKED means 91 was blocked, so
+    # row 2 must not restart the closer.
+    batch = make_batch([0], [3], [0, 90, BLOCKED])
+    assert forced_map(st, batch) == {0: 90, 1: 91}
 
 
 def test_blocked_single_token_closer_keeps_the_budget_enforced():

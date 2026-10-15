@@ -156,8 +156,54 @@ class ThinkingBudgetStateHolder:
             else:
                 state["spec_token_ids"] = []
             state["in_spec_mode"] = self.in_spec_mode
+            self._release_if_closer_tail_blocked(state)
             state["force_index"] = []
             self._update_think_state(state)
+            self._record_pending_force(state)
+
+    def _record_pending_force(self, state: dict[str, Any]) -> None:
+        """Remember which end token is forced at which output position."""
+        state["pending_force"] = None
+        if state.get("in_end", False) and state.get("force_index"):
+            end_count = state.get("end_count", 0)
+            if end_count < len(self.think_end_token_ids):
+                state["pending_force"] = (
+                    len(state.get("output_tok_ids") or []) + state["force_index"][0],
+                    self.think_end_token_ids[end_count],
+                )
+
+    def _release_if_closer_tail_blocked(self, state: dict[str, Any]) -> None:
+        """Release the budget when the grammar blocked the end marker's tail.
+
+        Forcing only boosts a token the grammar allows. If the forced
+        position was reached, a different token was emitted there, and part
+        of the end marker already precedes it, the grammar cannot accept the
+        marker in this context: restarting it would splice another partial
+        marker into the reasoning on every attempt until max_tokens. Stop
+        forcing for this reasoning block instead; it then ends naturally or
+        at max_tokens. A blocked FIRST end token splices nothing and stays
+        forced (the budget remains enforced until the grammar allows it).
+        """
+        pending = state.get("pending_force")
+        if not pending or not state.get("in_end", False):
+            return
+        position, token = pending
+        output = state.get("output_tok_ids") or []
+        if len(output) <= position or output[position] == token:
+            return
+        if self._committed_end_progress(output[:position]) == 0:
+            return
+        state.update(
+            {
+                "in_end": False,
+                "in_think": True,
+                "end_count": 0,
+                "force_index": [],
+                "bonus_token_forced": False,
+                "budget_released": True,
+                "pending_force": None,
+            }
+        )
 
     def apply_to_logits(
         self,
@@ -249,6 +295,8 @@ class ThinkingBudgetStateHolder:
             "bonus_token_forced": False,
             "continue_thinking": continue_thinking,
             "scan_offset": 0,
+            "pending_force": None,
+            "budget_released": False,
         }
 
     def _update_think_state(self, state: dict[str, Any]) -> None:
@@ -302,6 +350,7 @@ class ThinkingBudgetStateHolder:
             state["start_thinking"] = -1
             state["end_thinking"] = -1
             state["scan_offset"] = len(state.get("output_tok_ids", []))
+            state["budget_released"] = False
             state["check_count_down"] = state["thinking_token_budget"]
             return
 
@@ -357,6 +406,7 @@ class ThinkingBudgetStateHolder:
                     len(state["spec_token_ids"]) + 1 > remaining_budget
                     and not natural_spec_close_in_budget
                     and not self._utf8_hold(state)
+                    and not state.get("budget_released", False)
                 ):
                     state["in_think"] = False
                     state["in_end"] = True
@@ -388,6 +438,7 @@ class ThinkingBudgetStateHolder:
                     len(state["spec_token_ids"]) + 1 > remaining_budget
                     and not natural_spec_close_in_budget
                     and not self._utf8_hold(state)
+                    and not state.get("budget_released", False)
                 ):
                     state["in_think"] = False
                     state["in_end"] = True
@@ -456,6 +507,7 @@ class ThinkingBudgetStateHolder:
                     state["start_thinking"] = -1
                     state["end_thinking"] = -1
                     state["scan_offset"] = len(state.get("output_tok_ids", []))
+                    state["budget_released"] = False
 
             elif absolute_start_pos >= 0 and not state["continue_thinking"]:
                 # Found think start - entering think mode
@@ -471,6 +523,7 @@ class ThinkingBudgetStateHolder:
                 state["start_thinking"] = -1
                 state["end_thinking"] = -1
                 state["scan_offset"] = len(state.get("output_tok_ids", []))
+                state["budget_released"] = False
 
             elif state["in_think"]:
                 # A prompt-open block counts from the first generated token;
@@ -511,6 +564,7 @@ class ThinkingBudgetStateHolder:
                 and total_thinking_tokens > state["thinking_token_budget"]
                 and not natural_spec_close_in_budget
                 and not self._utf8_hold(state)
+                and not state.get("budget_released", False)
             ):
                 # Calculate force_index: position within spec_token_ids where
                 # forcing starts. If we're already over budget without spec
