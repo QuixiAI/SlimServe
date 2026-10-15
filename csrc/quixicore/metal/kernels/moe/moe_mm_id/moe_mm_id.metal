@@ -32,6 +32,8 @@ static_assert(sizeof(block_iq2_xxs_t) == 66, "iq2_xxs block must pack to 66B");
 
 // --------------------------------- map0 ------------------------------------
 
+constant constexpr short QC_MOE_MAP0_MAX_E = 512;
+
 template <short NE20>
 kernel void qc_moe_mm_map0(
     device const int *topk_ids [[buffer(0)]],  // (tokens, NE20) i32
@@ -44,9 +46,13 @@ kernel void qc_moe_mm_map0(
     device uint *wcount64      [[buffer(7)]],  // (1)
     ushort tpitg [[thread_position_in_threadgroup]],
     ushort ntg   [[threads_per_threadgroup]]) {
-  threadgroup ushort sids[256 * NE20];  // E <= 256 host-checked (DSV4: 256)
-  threadgroup uint tcnt[256];
-  threadgroup uint toff[256];
+  // E <= QC_MOE_MAP0_MAX_E host-checked (DSV4: 256 experts, GLM-5.3-Flash:
+  // 288). The threadgroup is one thread per expert, so the cap is bounded
+  // by the 1024-thread threadgroup limit, not by these arrays (12 KiB at
+  // 512 x top-8).
+  threadgroup ushort sids[QC_MOE_MAP0_MAX_E * NE20];
+  threadgroup uint tcnt[QC_MOE_MAP0_MAX_E];
+  threadgroup uint toff[QC_MOE_MAP0_MAX_E];
 
   const short ide = tpitg;  // this thread's expert id
   uint n_all = 0;
@@ -54,7 +60,7 @@ kernel void qc_moe_mm_map0(
 
   for (int i21 = 0; i21 < tokens; i21 += ntg) {
     // Cooperative stage of ntg tokens' routes. Negative ids cast to large
-    // ushorts and never match an expert (< 256), so they are silently
+    // ushorts and never match an expert (< QC_MOE_MAP0_MAX_E), so they are silently
     // dropped.
     if (i21 + tpitg < tokens) {
       device const int *src = topk_ids + (i21 + tpitg) * NE20;

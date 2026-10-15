@@ -443,7 +443,11 @@ class OpenAIServingResponses(GenerateBaseServing):
             )
 
             sampling_params = request.to_sampling_params(
-                default_max_tokens, self.default_sampling_params
+                default_max_tokens,
+                self.default_sampling_params,
+                default_reasoning_effort=self.chat_template_kwargs.get(
+                    "reasoning_effort"
+                ),
             )
 
             trace_headers = (
