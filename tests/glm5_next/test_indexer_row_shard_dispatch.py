@@ -102,7 +102,8 @@ def test_opaque_decode_forwards_policy(monkeypatch, rows, enabled):
         torch.empty(rows, 32, 128), torch.empty(rows, 256), torch.empty(rows, 32),
         torch.empty(4, 128), "cache", torch.empty(2, 576, 64),
         torch.empty(rows, 2080, dtype=torch.int32), torch.empty(rows, 512),
-        512, 512, 4, 128**-0.5, row_shard_decode=enabled,
+        512, 512, 4, 128**-0.5, torch.empty(rows, dtype=torch.int32),
+        row_shard_decode=enabled,
     )
     assert select.call_count == 1
     assert select.call_args.kwargs["row_shard"] == (enabled and rows in (16, 32))

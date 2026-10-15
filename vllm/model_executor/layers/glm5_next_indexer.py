@@ -1224,6 +1224,14 @@ class Glm5NextPooledIndexer(nn.Module):
         # float/layer_norm/to/cat/mul glue (built lazily after weight load).
         self._fused_kgw: torch.Tensor | None = None
         self._k_norm_f32: tuple[torch.Tensor, torch.Tensor] | None = None
+        # wk | compress gate | weights_proj packed as one [2 * head_dim +
+        # n_heads, hidden] bf16 projection (build_packed_projection): the
+        # three separate small-N GEMMs cost 28 us per layer at decode, the
+        # 128 + 128 + 32 = 288-row projection is one router-shaped GEMV.
+        # The source rows stay resident (about 25 MB per rank over the
+        # model): the separate path still reads them and a weight reload
+        # rewrites them, so the pack is a copy, not an alias.
+        self.packed_kw: torch.Tensor | None = None
 
     def _metal_pack_inputs(
         self, hidden_states: torch.Tensor
@@ -1274,14 +1282,6 @@ class Glm5NextPooledIndexer(nn.Module):
             self.n_head_scale,
         )
         return packed, weights
-        # wk | compress gate | weights_proj packed as one [2 * head_dim +
-        # n_heads, hidden] bf16 projection (build_packed_projection): the
-        # three separate small-N GEMMs cost 28 us per layer at decode, the
-        # 128 + 128 + 32 = 288-row projection is one router-shaped GEMV.
-        # The source rows stay resident (about 25 MB per rank over the
-        # model): the separate path still reads them and a weight reload
-        # rewrites them, so the pack is a copy, not an alias.
-        self.packed_kw: torch.Tensor | None = None
 
     def build_packed_projection(self) -> None:
         """Pack wk, the pool-compress gate and weights_proj into one bf16

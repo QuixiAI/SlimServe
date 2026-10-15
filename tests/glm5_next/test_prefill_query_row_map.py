@@ -30,6 +30,7 @@ def invoke(monkeypatch, chunk, q, cache, table_expected=None):
         q, torch.empty(rows, 256, device=q.device, dtype=torch.bfloat16),
         weights, ape, "test", cache, output,
         torch.empty(rows, 262144, device=q.device), 262144, 512, 4, 128**-0.5,
+        torch.empty(rows, device=q.device, dtype=torch.int32),
     )
     if table_expected is not None:
         selected_output = output[chunk.token_start:chunk.token_end]

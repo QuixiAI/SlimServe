@@ -31,6 +31,13 @@ if torch.backends.mps.is_available():
 E, TOPK, SCALE_F = 288, 8, 2.5
 
 
+@pytest.fixture(autouse=True)
+def _torch_grouped_topk(monkeypatch):
+    # The routing tests pin the torch grouped_topk; on a CUDA host the
+    # fused CUDA kernel would otherwise take CPU tensors.
+    monkeypatch.setenv("VLLM_USE_FUSED_MOE_GROUPED_TOPK", "0")
+
+
 def _ref_route(logits: torch.Tensor, bias: torch.Tensor):
     """Independent float64 GLM router: sigmoid scores, +bias only for the
     choice, weights from the unbiased scores, renormalize, x2.5."""

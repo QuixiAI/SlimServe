@@ -509,9 +509,6 @@ class Glm5NextDecoderLayer(nn.Module):
                 or current_platform.is_device_capability_family(120)
             )
         ) or _metal_mhc_norm_fusion_available()
-        self.is_linear = (
-            config.layer_types[self.layer_idx] == "linear_attention"
-        )
         self.is_linear = config.layer_types[self.layer_idx] == "linear_attention"
         # Each transition site reduces its producer's TP partial inside the
         # transition launch (glm5_next_mhc_ar); the producers then keep
