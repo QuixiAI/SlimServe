@@ -23,11 +23,14 @@ def is_available() -> bool:
     try:
         import cutlass  # noqa: F401
         import cutlass.cute  # noqa: F401
+        import quack.compile_utils  # noqa: F401
 
         _cutedsl_available = True
     except ImportError:
         _cutedsl_available = False
-        logger.info("cuteDSL (CUTLASS Python) not available, ll_bf16_gemm disabled")
+        logger.info(
+            "cuteDSL (CUTLASS Python) or quack not available, ll_bf16_gemm disabled"
+        )
     return _cutedsl_available
 
 
