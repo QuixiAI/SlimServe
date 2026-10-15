@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import importlib
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, TypeAlias
@@ -89,6 +90,26 @@ SUPPORTED_STRUCTURAL_TAG_MODELS = (
 _VLLM_STRUCTURAL_TAG_REGISTRY: dict[str, StructuralTagBuilder] = {}
 _CUSTOM_TOOL_FORMAT_ADAPTERS: dict[str, CustomToolFormatAdapter] = {}
 _MODEL_TOOL_STOP_SENTINELS = {"glm_4_7": "<|observation|>"}
+
+# Structural-tag builders and custom-tool adapters are registered by decorators
+# in the tool-parser module that owns each format. Lookups must not depend on
+# whether some caller happened to import that module first, so the registry
+# imports the owner on demand.
+_STRUCTURAL_TAG_OWNER_MODULES: dict[str, str] = {
+    "deepseek_v4": "vllm.tool_parsers.deepseekv4_engine_tool_parser",
+    "glm_4_7": "vllm.tool_parsers.glm47_moe_tool_parser",
+    "kimi_k3": "vllm.tool_parsers.kimi_k3_tool_parser",
+    "muse_glimmer": "vllm.tool_parsers.muse_glimmer_tool_parser",
+    "qwen_3_5": "vllm.tool_parsers.qwen3_engine_tool_parser",
+    "qwen_3_coder": "vllm.tool_parsers.qwen3_engine_tool_parser",
+}
+
+
+def _load_structural_tag_owner(model: str) -> None:
+    """Import the module that registers ``model``'s builder and adapters."""
+    module = _STRUCTURAL_TAG_OWNER_MODULES.get(model)
+    if module is not None:
+        importlib.import_module(module)
 
 
 def register_vllm_structural_tag(model: str):
@@ -207,6 +228,7 @@ def get_model_structural_tag(
     if tool_choice == "auto" and not _any_tool_strict(tools):
         return None
 
+    _load_structural_tag_owner(model)
     custom_tools = {tool.name: tool for tool in tools if isinstance(tool, CustomTool)}
     custom_tool_adapter = _CUSTOM_TOOL_FORMAT_ADAPTERS.get(model)
     if custom_tools and custom_tool_adapter is None:

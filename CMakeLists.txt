@@ -611,8 +611,17 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
     else()
       cuda_archs_loose_intersection(MARLIN_FP8_ARCHS "8.9;12.0a;12.1a" "${CUDA_ARCHS}")
     endif()
-    # marlin arches for other files
-    cuda_archs_loose_intersection(MARLIN_OTHER_ARCHS "7.5;8.0+PTX" "${CUDA_ARCHS}")
+    # marlin arches for other files (marlin.cu, the int4/fp8 preprocess and the
+    # gptq/awq repack kernels). These must carry SASS for every family the
+    # template kernels above are built for: with only 8.0+PTX an SM12x GPU has
+    # to JIT the compute_80 PTX at first launch, which fails with
+    # cudaErrorUnsupportedPtxVersion whenever the toolkit is newer than the
+    # driver (CUDA 13.3 build on an R595/13.2 driver).
+    if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
+      cuda_archs_loose_intersection(MARLIN_OTHER_ARCHS "7.5;8.0+PTX;12.0f" "${CUDA_ARCHS}")
+    else()
+      cuda_archs_loose_intersection(MARLIN_OTHER_ARCHS "7.5;8.0+PTX;12.0a;12.1a" "${CUDA_ARCHS}")
+    endif()
 
     if (MARLIN_OTHER_ARCHS)
 
@@ -1098,7 +1107,13 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
   endif()
 
   # Hadacore kernels
-  cuda_archs_loose_intersection(HADACORE_ARCHS "8.0+PTX;9.0+PTX" "${CUDA_ARCHS}")
+  # SM12x gets SASS so it does not depend on JIT of the 9.0 PTX (see
+  # MARLIN_OTHER_ARCHS).
+  if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
+    cuda_archs_loose_intersection(HADACORE_ARCHS "8.0+PTX;9.0+PTX;12.0f" "${CUDA_ARCHS}")
+  else()
+    cuda_archs_loose_intersection(HADACORE_ARCHS "8.0+PTX;9.0+PTX;12.0a;12.1a" "${CUDA_ARCHS}")
+  endif()
   if(HADACORE_ARCHS)
     set(HADACORE_SRCS "csrc/libtorch_stable/quantization/hadamard/hadacore/hadamard_transform_cuda.cu")
     set_gencode_flags_for_srcs(
@@ -1225,8 +1240,13 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
   else()
     cuda_archs_loose_intersection(MARLIN_MOE_FP8_ARCHS "8.9;12.0a;12.1a" "${CUDA_ARCHS}")
   endif()
-  # moe marlin arches for other files
-  cuda_archs_loose_intersection(MARLIN_MOE_OTHER_ARCHS "7.5;8.0+PTX" "${CUDA_ARCHS}")
+  # moe marlin arches for other files (ops.cu: dispatch and permute_cols).
+  # SASS for SM12x, not just 8.0 PTX, for the same reason as MARLIN_OTHER_ARCHS.
+  if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
+    cuda_archs_loose_intersection(MARLIN_MOE_OTHER_ARCHS "7.5;8.0+PTX;12.0f" "${CUDA_ARCHS}")
+  else()
+    cuda_archs_loose_intersection(MARLIN_MOE_OTHER_ARCHS "7.5;8.0+PTX;12.0a;12.1a" "${CUDA_ARCHS}")
+  endif()
   if (MARLIN_MOE_OTHER_ARCHS)
 
     #
