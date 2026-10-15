@@ -164,7 +164,15 @@ def _qc_nvfp4_prefill_applicable(
 def _qc_nvfp4_decode_rows() -> int:
     if os.environ.get("QC_NVFP4_DECODE", "1") == "0":
         return 0
-    return int(os.environ.get("QC_NVFP4_DECODE_ROWS", "32"))
+    forced = os.environ.get("QC_NVFP4_DECODE_ROWS")
+    if forced is not None:
+        return int(forced)
+    # The 32-row cap is the sm_120 measurement. On A100 (glm53f-nvfp4-8, TP4 x
+    # DP2, exact 1000/300, 2026-10-14) the pair wins the one-token batch
+    # (c1 97.6 -> 109.1 tok/s) and loses the four-token batch to Marlin
+    # (c8 566 -> 536), so parts below sm_100 serve one token (top_k rows)
+    # and leave the rest to Marlin until they are measured.
+    return 32 if current_platform.has_device_capability(100) else 8
 
 
 @functools.cache
