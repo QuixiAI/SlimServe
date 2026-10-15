@@ -3197,5 +3197,3 @@ kernel void qgemv_moe_mr_iq2_xxs_swiglu_texm_grp(
 
 instantiate_qgemv_moe_mr_swiglu_texm_grp("qgemv_iq2_xxs_moe_mr_swiglu_texm_grp", half, 2, 2)
 instantiate_qgemv_moe_mr_swiglu_texm_grp("qgemv_iq2_xxs_moe_mr_swiglu_texm_grp_bfloat16", mittens::bf16, 2, 2)
-  }
-}
