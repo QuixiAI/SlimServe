@@ -32,22 +32,34 @@ class Machine:
         return self.platform is not None
 
 
-_VISIBLE_VARS = (
-    "ROCR_VISIBLE_DEVICES",
-    "HIP_VISIBLE_DEVICES",
-    "CUDA_VISIBLE_DEVICES",
-    "ZE_AFFINITY_MASK",
-)
+# Each vendor's runtime honours its own device mask, so only that vendor's
+# variables may shrink the count: a CUDA_VISIBLE_DEVICES left over in the
+# environment says nothing about how many Intel cards Level Zero exposes.
+# HIP also honours CUDA_VISIBLE_DEVICES, so it stays in the AMD list.
+_VISIBLE_VARS = {
+    "amd": ("ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"),
+    "nvidia": ("CUDA_VISIBLE_DEVICES",),
+    "intel": ("ZE_AFFINITY_MASK",),
+}
 
 
-def _visible_limit() -> int | None:
-    """How many devices the environment masks us down to, if it does."""
-    for var in _VISIBLE_VARS:
+def _mask_entries(var: str, value: str) -> int:
+    entries = [item.strip() for item in value.split(",") if item.strip()]
+    if var == "ZE_AFFINITY_MASK":
+        # Level Zero masks address sub-devices as "card.tile"; "0.0,0.1" is
+        # both tiles of one card, and the probe counts cards.
+        return len({item.split(".", 1)[0] for item in entries})
+    return len(entries)
+
+
+def _visible_limit(vendor: str) -> int | None:
+    """How many of this vendor's devices the environment masks us down to."""
+    for var in _VISIBLE_VARS.get(vendor, ()):
         value = os.environ.get(var)
         if value:
-            entries = [item for item in value.split(",") if item.strip()]
-            if entries:
-                return len(entries)
+            count = _mask_entries(var, value)
+            if count:
+                return count
     return None
 
 
@@ -218,11 +230,20 @@ def detect() -> Machine:
     apple = _probe_apple()
     if apple is not None:
         return apple
-    probed = _probe_amd() or _probe_nvidia() or _probe_intel_xpu()
+    probed = None
+    vendor = None
+    for vendor, probe in (
+        ("amd", _probe_amd),
+        ("nvidia", _probe_nvidia),
+        ("intel", _probe_intel_xpu),
+    ):
+        probed = probe()
+        if probed is not None:
+            break
     if probed is None:
         return Machine(platform=None, device_name="none detected", count=0)
     device_name, count = probed
-    limit = _visible_limit()
+    limit = _visible_limit(vendor)
     if limit is not None:
         count = min(count, limit)
     return Machine(
