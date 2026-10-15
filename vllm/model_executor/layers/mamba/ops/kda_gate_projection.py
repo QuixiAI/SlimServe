@@ -14,6 +14,7 @@ from vllm.triton_utils import tl, triton
 
 # Programmatic dependent launch: see vllm/triton_utils/pdl.py.
 from vllm.triton_utils.pdl import PDL as _PDL  # noqa: E402
+from vllm.triton_utils.pdl import PDL_LAUNCH as _PDL_LAUNCH  # noqa: E402
 from vllm.triton_utils.pdl import gdc_launch_dependents, gdc_wait  # noqa: E402, F401
 
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -102,7 +103,7 @@ def kda_gate_pair(
         num_warps=4,
     
         PDL=_PDL,
-        launch_pdl=_PDL,
+        **_PDL_LAUNCH,
     )
     return out_f, out_g
 
