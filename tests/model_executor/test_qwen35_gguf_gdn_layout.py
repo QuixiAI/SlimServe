@@ -360,3 +360,134 @@ def test_qwen35_gdn_project_out_gathers_into_run_order():
         )
     x = torch.randn(7, num_v * head_dim, dtype=torch.float64)
     torch.testing.assert_close(layer._project_out(x), x @ reference.T)
+
+
+def _gdn_text_config(**overrides):
+    from transformers import PretrainedConfig
+
+    config = PretrainedConfig()
+    values = dict(
+        hidden_size=32,
+        hidden_act="silu",
+        rms_norm_eps=1e-6,
+        linear_num_key_heads=4,
+        linear_num_value_heads=12,
+        linear_key_head_dim=8,
+        linear_value_head_dim=8,
+        linear_conv_kernel_dim=4,
+    )
+    values.update(overrides)
+    for name, value in values.items():
+        setattr(config, name, value)
+    return config
+
+
+def _build_gdn(config, tp_size: int = 1, prefix: str = "model.layers.0.linear_attn"):
+    """Construct the real module with a faked tensor-parallel group size."""
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.distributed import parallel_state
+
+    tp_group = SimpleNamespace(world_size=tp_size, rank_in_group=0)
+    vllm_config = VllmConfig()
+    # Only the fields the GDN constructor reads; a real ModelConfig would
+    # need a checkpoint on disk.
+    object.__setattr__(
+        vllm_config,
+        "model_config",
+        SimpleNamespace(hf_text_config=config, dtype=torch.float32),
+    )
+    with (
+        set_current_vllm_config(vllm_config),
+        mock.patch.object(parallel_state, "_TP", tp_group),
+    ):
+        return QwenGatedDeltaNetAttention(config, vllm_config, prefix=prefix)
+
+
+def test_qwen35_gdn_module_rejects_runs_that_straddle_tp_ranks():
+    """(key heads / TP) % group != 0 must fail at init, not mis-gather."""
+    config = _gdn_text_config(
+        linear_num_key_heads=6,
+        linear_num_value_heads=18,
+        gdn_out_proj_v_head_group=2,
+    )
+    # 6 key heads at TP=2 leaves 3 per rank: a run of 2 would straddle ranks.
+    with pytest.raises(ValueError, match="multiple of 2 key heads per rank"):
+        _build_gdn(config, tp_size=2)
+
+
+def test_qwen35_gdn_module_wires_config_group_into_out_proj_order():
+    config = _gdn_text_config(gdn_out_proj_v_head_group=2)
+    layer = _build_gdn(config)
+    assert layer.out_proj_v_head_group == 2
+    assert torch.equal(layer._out_proj_head_order, out_proj_v_head_order(4, 3, 2))
+    # Real gather on the real module: run-ordered out_proj columns applied to
+    # the gathered input equal the grouped-order projection.
+    grouped = torch.randn(32, 12 * 8)
+    run_cols = grouped.reshape(32, 12, 8)[:, layer._out_proj_head_order]
+    with torch.no_grad():
+        layer.out_proj.weight.copy_(run_cols.reshape(32, -1))
+    x = torch.randn(5, 12 * 8)
+    torch.testing.assert_close(
+        layer._project_out(x), x @ grouped.T, rtol=1e-4, atol=1e-4
+    )
+
+    plain = _build_gdn(_gdn_text_config(), prefix="model.layers.1.linear_attn")
+    assert plain.out_proj_v_head_group == 1
+    assert plain._out_proj_head_order is None
+
+
+def test_qwen35_gdn_forward_paths_never_call_out_proj_directly():
+    """Every forward path must go through _project_out so the run gather
+    cannot be skipped; only _project_out itself may call self.out_proj."""
+    import ast
+    import inspect
+
+    import vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn as gdn
+
+    tree = ast.parse(inspect.getsource(gdn))
+    offenders = []
+    for cls in ast.walk(tree):
+        if not isinstance(cls, ast.ClassDef):
+            continue
+        for fn in cls.body:
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if fn.name == "_project_out":
+                continue
+            for node in ast.walk(fn):
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "out_proj"
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "self"
+                ):
+                    offenders.append(f"{cls.name}.{fn.name}:{node.lineno}")
+    assert offenders == []
+
+
+def test_muse_rejects_run_ordered_out_proj():
+    """muse feeds out_proj without the input gather; it must refuse."""
+    from vllm.model_executor.models import muse_q38_metal
+
+    proj = object()
+    plain = SimpleNamespace(out_proj=proj, out_proj_v_head_group=1)
+    assert muse_q38_metal._plain_out_proj(plain, 3) is proj
+    runs = SimpleNamespace(out_proj=proj, out_proj_v_head_group=2)
+    with pytest.raises(RuntimeError, match="run-ordered GDN out_proj"):
+        muse_q38_metal._plain_out_proj(runs, 3)
+    # Every out_proj access in muse goes through the guard.
+    import ast
+    import inspect
+
+    tree = ast.parse(inspect.getsource(muse_q38_metal))
+    users = [
+        fn.name
+        for fn in ast.walk(tree)
+        if isinstance(fn, ast.FunctionDef)
+        and any(
+            isinstance(node, ast.Attribute) and node.attr == "out_proj"
+            for node in ast.walk(fn)
+        )
+    ]
+    assert users == ["_plain_out_proj"]
