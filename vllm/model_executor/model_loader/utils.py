@@ -30,6 +30,7 @@ from vllm.model_executor.model_loader.reload import (
     set_torchao_reload_attrs,
 )
 from vllm.model_executor.models.interfaces import SupportsQuant
+from vllm.platforms import current_platform
 from vllm.tracing import instrument
 from vllm.utils.mem_utils import release_device_memory_under_pressure
 from vllm.utils.platform_utils import is_pin_memory_available
@@ -216,9 +217,14 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
             if name in uva_offloaded_parameters and not getattr(
                 p, "_vllm_is_uva_offloaded", False
             ):
-                # The UVA view op requires a contiguous CPU tensor; some
-                # processed weights (e.g. packed NVFP4) are strided.
-                cpu_data = p.data.to(device="cpu").contiguous()
+                cpu_data = p.data.to(device="cpu")
+                # The XPU UVA view op requires a contiguous CPU tensor; some
+                # processed weights (e.g. packed NVFP4) are strided. Only
+                # XPU needs this: CUDA/ROCm UVA views keep the CPU tensor's
+                # strides, and kernels such as CUTLASS scaled_mm require the
+                # column-major layout a `.t()` replacement produces.
+                if current_platform.is_xpu():
+                    cpu_data = cpu_data.contiguous()
                 if use_pin_memory:
                     cpu_data = cpu_data.pin_memory()
                 p.data = get_accelerator_view_from_cpu_tensor(cpu_data)
