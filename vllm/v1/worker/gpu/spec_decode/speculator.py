@@ -44,10 +44,13 @@ def _get_draft_hidden_size(draft_model_config) -> int:
     it. DeepSeek V4's MTP and DSpark drafts take the target's pre-hc_head
     ``(T, hc_mult * hidden_size)`` residual; Qwen4-exp MTP takes its
     multi-stream feedback (``hc_mult`` comes from the text config's
-    ``hc_count``). GLM-5.3-Flash's checkpoint MTP head takes the contracted
-    post-norm state, so ``SpeculativeConfig.hf_config_override`` sets its
-    draft ``hc_mult`` to 1 (the trunk's 4 stays on the target config).
-    Non-HC drafts default to ``hc_mult=1``.
+    ``hc_count``). GLM-5.3-Flash's nextn head takes the hc-combined
+    ``(T, hidden_size)`` state, so ``SpeculativeConfig.hf_config_override``
+    sets its draft ``hc_mult`` to 1 on every path that builds a
+    ``glm5_next_mtp`` draft: the safetensors checkpoint and the Metal
+    ``glm5-next`` GGUF alike (the trunk's 4 stays on the target config).
+    Non-HC drafts default to ``hc_mult=1``. Do not key this on model_type:
+    an allowlist silently narrows every HC drafter left off it.
     """
     hidden_size = draft_model_config.get_hidden_size()
     return hidden_size * getattr(draft_model_config.hf_config, "hc_mult", 1)
