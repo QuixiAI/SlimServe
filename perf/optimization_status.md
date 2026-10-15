@@ -34318,3 +34318,13 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   speculative) and V2 (plain and speculative span) regression tests fail
   without the change. 104 sample/structured-output and 150
   spec_decode/worker CPU tests pass. No throughput claim.
+
+## 2026-09-19 - Honor thinking budgets in Responses sampling parameters
+
+- Status: retained for review.
+- Baseline: `origin/main`; forward-port from the B70 serving integration.
+- Change: Use the existing Chat Completions budget resolver for Responses, including profile effort defaults, explicit disabling and completion-token ceilings.
+- Correctness: 13 Responses budget precedence, effort-map, token-ceiling and invalid-input tests passed on CPU.
+- Results: no new throughput measurement or hardware qualification claimed.
+- Decision: submit as a focused PR; preserve current-main behavior outside this fix.
+- Raw artifacts: local test output; no traffic captures or model data committed.
