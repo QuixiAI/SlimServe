@@ -1,0 +1,8 @@
+# The LTX-2.5 video profiles on Apple Silicon (slimserve/video). Not needed
+# for language-model serving. System tools: ffmpeg and ffprobe must be on PATH
+# (ffmpeg with libx265 for the HDR masters).
+mlx>=0.31.2
+numpy
+tokenizers
+Pillow  # stills: image-to-video conditioning, the enhancer's image input
+openexr>=3.3  # HDR: EXR stills and frame folders in, EXR frames out (--hdr)
