@@ -3,6 +3,31 @@
 This file holds stable baseline snapshots for comparison. Raw outputs belong in
 `perf/results/`; summarize only the numbers needed to compare future work.
 
+## LTX-2.5 video / Apple M1 Ultra (Metal) - 2026-10-08
+
+- Profiles `ltx25-*` (`kind: "video"`), official Lightricks/LTX-2.5 bf16
+  weights loaded as fp16 (exact conversion), no quantization. One machine:
+  M1 Ultra 64-core GPU, 128 GiB, macOS 15.7.2, MLX 0.31.2/0.32.2; seed 42,
+  fox prompt. Not validated on any other Apple Silicon.
+- "Exact" = no output-changing approximations; fp16 operands with fp32
+  accumulate and glue, **not bit-exact**: per-forward rel-L2 vs fp32 video
+  0.0069, audio 0.0011 (baseline runner as shipped: 0.042 / 0.025).
+- Baseline: dgrauet/ltx-2-mlx v0.15.12 q8 pack, cold process.
+
+| clip | profile | baseline q8 | exact | fast |
+| --- | --- | ---: | ---: | ---: |
+| 768x512x121 | `ltx25-distilled`, conv decoder | 116.9 s | 86 s cold, 71 s resident | |
+| 768x512x121 | `ltx25-dev` (30 steps) | 606.9 s | 343 s | |
+| 768x512x121 | `ltx25-dfr` | 170.9 s | 125 s | |
+| 1536x1024x121 | `ltx25-distilled` | 504.9 s (tiled, lossy) | 413.5 s resident (406.6 s cold, diffusion decoder) | 277.9 s (29.6 dB vs exact) |
+| 1536x1024x121 | `ltx25-dev` | cannot run | 1513.4 s | 644.2 s (21.4 dB) |
+| 1536x1024x121 | `ltx25-dfr` | not measured | 680.7 s | 421.0 s (27.1 dB) |
+
+- Serving, 768x512x49, resident: distilled 40.7 s/clip (68.6 GiB), DFR
+  51.9 s (68.9 GiB), dev 194-203 s (76.9 GiB); one generation at a time.
+- Ledger: `perf/ltx25_metal_campaign.md` sections 6, 9, 13, 15-17, 22, 24.
+  Raw: `perf/results/2026-10-01-ltx25-baseline/`,
+  `perf/results/2026-10-02-ltx25-n2/` (on the validating machine).
 ## GLM-5.3-Flash Q2 (antirez GGUF) Metal M1 Ultra - ds4 base-recipe bar - 2026-09-11
 
 The bar the `glm53f-q2-1` campaign must beat, measured on this box with

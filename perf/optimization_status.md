@@ -1,5 +1,125 @@
 # SlimServe Optimization Status
 
+## 2026-10-14 - PR #86 (LTX-2.5 on Apple Silicon) render and serve check on a Mac Studio M4 Max
+
+- Box: Mac Studio M4 Max (40-core GPU, 128 GiB, macOS 27.0.1), Xcode 27.0
+  / Metal toolchain 32023.921, Python 3.12.15, MLX from
+  requirements/video-metal.txt, static ffmpeg 9.0.2. Branch merged with
+  main at 288fefb51 (92352dd4ad, notebook conflict only) plus the
+  qgemm_sm stride fix cherry-picked from PR #23 (26a4a1424) so the
+  language-model extension builds on this toolchain; nothing of this PR
+  touches the Metal kernels.
+- Two fixes a fresh install needed, both pushed to the branch:
+  - 58ac6ad4dc `slimserve/fetch.py`: registry-manifest downloads sent no
+    Authorization header (only `--model` override entries did), so the
+    gated Lightricks files answered 401 with a token that had accepted the
+    terms. The token is now sent for every huggingface.co manifest URL.
+  - 24ecc16be4 `ltx25` source manifest: the diffusion video VAE decoder
+    (`vae/ltx-2.5-video-vae-bf16.safetensors`, the records' default
+    decoder since 2026-10-05), the duration head and, for `bf16-dfr`, the
+    temporal latent upscaler were missing from every quant: the first
+    render ran both stages and died at decode with FileNotFoundError.
+    Quant byte totals and summaries updated; tests/slimserve 104 passed.
+- Registry and video tests on this box: tests/slimserve 377 passed, 1
+  skipped (after building the extension; `test_turboquant_cache` imports
+  the attention stack and needs `_quixicore_C` even for a video-only
+  check).
+- Render (`slimserve ltx25-distilled -p "A red fox trotting through a snowy
+  pine forest at dawn, birds chirping" --size 768x512 --seconds 5 --seed
+  42`, cold process, diffusion decoder): 768x512x121 in **104.0 s** (text
+  5.4, load 5.9, stage 1 27.6, upscale 0.3, stage 2 42.8, VAE decode 19.6,
+  audio decode 1.9, mux 0.4). ffprobe: h264 768x512, 121 frames, 5.04 s;
+  aac 5.01 s. A mid-clip frame is a coherent fox in a snowy pine forest
+  at sunset. The PR's M1 Ultra (64-core) figure for this clip is 86 s cold
+  with the conv decoder; the diffusion decoder alone is ~20 s of the 104
+  here, so the M4 Max is in the expected band, not a same-box comparison.
+- Serving check (`perf/ltx25_harness/n6_serve_check.py distilled 2 768x512
+  2`): PASS. Ready in 6.1 s (69.4 GiB resident), the oversize request
+  (3072x2048) refused with 400, two concurrent 768x512 2 s requests served
+  one at a time (gen 45.7 s and 41.5 s, peak 72.5 / 72.0 GiB, both mp4s
+  probe h264 49 frames + aac), the follow-up in 42.0 s, resident flat at
+  41.3 GiB after the burst and after the follow-up, 0 failed.
+- Decision: the engine, the profile CLI and the job-shaped serving API work
+  on an M4 Max from a clean install once the two fixes above are in; the
+  other 22 profiles (dev, DFR, HQ, retake, IC-LoRA, ...) and the enhancer
+  were not run here. Mergeable after #23 (it carries the toolchain fix this
+  branch cherry-picked).
+- Raw: `perf/results/2026-10-14/pr86-metal/` on studio128 (render.log,
+  fox_768x512_5s.mp4, n6_serve_check.log).
+
+## 2026-10-01..08 - LTX-2.5 audio+video generation on Apple Silicon (`kind: "video"`)
+
+Summary of the campaign ledger `perf/ltx25_metal_campaign.md` (sections cited
+as "ledger N"); every number below is from it, and the handoff is
+`HANDOFF-LTX25.md`. Validated on **one machine only**: M1 Ultra (64-core GPU,
+128 GiB unified, macOS 15.7.2, MLX 0.31.2 and 0.32.2), seed 42, the fox
+prompt. M2-M5 are unmeasured; M3+ native bf16 and the M5 int8 path will be
+their own profile records.
+
+**Terminology.** "Exact" in these profiles and in the ledger means *no
+output-changing approximation* (same steps, guidance passes, decoder and
+attention as Lightricks' pipelines). It is **not bit-exact**: DiT matrix
+multiplies and attention take fp16 operands with fp32 accumulation, and the
+residual stream, norms, AdaLN and model boundary stay fp32. Per-forward
+rel-L2 against an fp32 run of the same weights on identical captured inputs:
+video 0.0069 (0.00692 with split-K), audio 0.0011; the baseline runner as
+shipped is 0.042 video / 0.025 audio (ledger 9, 13). Components: text
+encoder rel-L2 0.0003-0.0007 vs fp32; video VAE decode fp32, 89.7 dB vs the
+runner's fp32 path (ledger 13). The `-fast` profiles are output-changing by
+design and are judged by PSNR against exact, never by parity.
+
+- **Baseline**: dgrauet/ltx-2-mlx v0.15.12, q8 pack (its recommended config)
+  and bf16 pack, cold process, prompt to mp4 (ledger 6).
+- **Hypothesis**: fp16 MMA operands with fp32 glue on the official bf16
+  weights (bf16 -> fp16 is exact) beat the q8 baseline in speed and accuracy
+  with no quantization; MLX's kernels are close enough to the M1 MMA
+  ceiling (19.4 TF/s measured, ledger 17) that the remaining wins are
+  structural, not hand-written Metal.
+- **Retained** (each measured, ledger 13, 15-17, 22): fp16-operand precision
+  path; split-K for the K=16384 FFN GEMM (13.71 -> 11.92 s per 6k forward,
+  error unchanged); compiled glue (-> 11.52 s, bit-identical); temporal-slab
+  VAE convs (peak 60 -> 14.4 GiB, output unchanged); batched/forked dev
+  guidance; diffusion-decoder NA kernel QW=2 + core-only queries (decoder
+  121.8 -> 91.3 s at 1536x1024x121, parity gates unchanged) and a lent
+  buffer cache (HD distilled 480.2 -> 406.6 s, frames identical).
+- **Rejected** (ledger 15, 22, 23, 24): hand-written simdgroup GEMM (9.2 TF/s
+  vs MLX 18.7, 45x the error); query-chunked attention; fp16 VAE decode as a
+  default (55.1 dB from fp32; opt-in only); fused decoder RoPE (0.6%, 1 ulp);
+  step cache on the distilled/DFR ancestral schedules (never fires); tiled
+  stage-2 attention on distilled and dev (visible seam).
+- **Measured throughput** (cold process unless noted):
+
+| clip | pipeline | baseline q8 | SlimServe | vs q8 |
+| --- | --- | ---: | ---: | ---: |
+| 768x512x121 | distilled, conv decoder | 116.9 s | 86 s (CLI), 71 s resident | 1.36x |
+| 768x512x121 | dev, 30 steps | 606.9 s | 343 s | 1.77x |
+| 768x512x121 | DFR | 170.9 s | 125 s | 1.37x |
+| 1536x1024x121 | distilled | 504.9 s (tiled, lossy; untiled dies in decode) | 343 s conv decoder; 406.6 s diffusion decoder | 1.47x (conv) |
+
+  Fast tier at 1536x1024x121, resident engine (ledger 24): distilled-fast
+  277.9 s vs exact 413.5 s (1.49x, 29.6 dB); dev-fast 644.2 s vs 1513.4 s
+  (2.35x, 21.4 dB, same shot); dfr-fast 421.0 s vs 680.7 s (1.62x, 27.1 dB,
+  no seam). Serving (ledger 15, 768x512x49, weights resident, requests
+  strictly one at a time): distilled 40.7 s/clip at 68.6 GiB resident, DFR
+  51.9 s at 68.9 GiB, dev 194-203 s at 76.9 GiB; all PASS.
+- **Correctness**: per-component and end-to-end parity against the runner
+  and Lightricks' torch sources (ledger 13, 20, 21, 28-43); the audit of
+  ledger 20 found and fixed a missing BOS token and six further deviations.
+  No remaining output-preserving avenue is both above the 1% epsilon and
+  achievable (ledger 23).
+- **Decision**: ship the exact profiles as the reference and the `-fast`
+  profiles as the documented output-changing tier; no custom GEMM/attention
+  kernel on M1-M4; revisit kernels on M5 (int8 MMA).
+- **Raw artifacts** (on the validating machine; `perf/results/` is
+  git-ignored): `perf/results/2026-10-01-ltx25-baseline/`,
+  `perf/results/2026-10-02-ltx25-n2/`, baseline clips and logs under
+  `~/.local/scratch/ltx25/baseline/`, fast-tier A/B under
+  `~/.local/scratch/ltx25/n10/`. Scripts: `perf/ltx25_harness/`.
+- **Not run in review** (2026-10-14, PR #86 fixes on Linux): none of the
+  above was re-measured; the review changes (CLI option split, server input
+  root / body cap / upload cleanup, LoRA detach, optional enhancer download)
+  were checked by CPU tests only and need one Mac rerun of
+  `perf/ltx25_harness/n6_serve_check.py` before the numbers are restated.
 ## 2026-10-14 - PR #30 (GLM-5.3-Flash Q2 on Metal) merged with main and re-benchmarked sampled on a Mac Studio M4 Max
 
 - Box: Mac Studio M4 Max (40-core GPU, 128 GiB, macOS 27.0.1), Xcode 27.0 /
@@ -34140,3 +34260,19 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   canaries pass, gates -2.441 / -2.457, plain 228.8 / 778.3 / 1119.8 and
   228.7 / 771.9 / 1116.2, spec eight-pass medians 301.7 / 805.3 / 1125.3,
   0.975 per draft.
+
+## 2026-09-19 - Authenticate registered Hugging Face downloads without losing resume headers
+
+- Status: retained for review.
+- Baseline: `origin/main`; forward-port from the B70 serving integration.
+- Change: Add host-scoped Hugging Face authentication for registered artifacts while preserving explicit override headers and byte-range resumption.
+- Correctness: Four fetch-auth tests and 13 model-override tests passed on CPU.
+- Revision: the token comes from the module's own `hf_token()` (HF_TOKEN,
+  HUGGING_FACE_HUB_TOKEN, HUGGINGFACE_TOKEN, stored login), the lookup the
+  override and Hub-download paths already use, instead of
+  `huggingface_hub.get_token()`, which ignores HUGGINGFACE_TOKEN. A 401/403
+  from huggingface.co now carries the same accept-terms / HF_TOKEN hint as
+  the override path. tests/slimserve: 172 passed.
+- Results: no new throughput measurement or hardware qualification claimed.
+- Decision: submit as a focused PR; preserve current-main behavior outside this fix.
+- Raw artifacts: local test output; no traffic captures or model data committed.

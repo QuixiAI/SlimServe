@@ -221,6 +221,9 @@ of origin/main and were joined rather than reconciled.
   4. GLM-5.3-Flash on 4x RTX PRO 6000 (rtx6000)     -- the section above this comment
 -->
 
+> LTX-2.5 audio+video generation on Apple Silicon (`kind: "video"`
+> profiles) has its own handoff: `HANDOFF-LTX25.md`.
+
 # HANDOFF — GLM-5.3-Flash Q2 on Metal (`glm53f-q2-1`), campaign plan 2026-09-10 and status log (PR #30 open, 2026-09-14)
 
 Read this first when resuming the campaign. Companion documents:
