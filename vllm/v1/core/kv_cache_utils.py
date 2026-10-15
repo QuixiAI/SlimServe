@@ -787,21 +787,70 @@ def resolve_kv_cache_block_sizes(
     return scheduler_block_size, hash_block_size
 
 
-def get_request_block_hasher(
-    hash_block_size: int,
-    caching_hash_fn: Callable[[Any], bytes],
-) -> Callable[[Request], list[BlockHash]]:
-    """
-    Returns a function which computes the list of un-computed block hashes
-    of a request.
+def prompt_tail_boundary(
+    num_prompt_tokens: int, hash_block_size: int, replay: bool
+) -> int:
+    """The prompt position whose state a prefill materializes and registers as
+    the prompt's partial prefix-cache tail.
 
-    Hashes are computed at ``hash_block_size`` granularity and chained over the
-    full prefix, so each hash uniquely fingerprints the prefix ending at its
-    boundary. Coarser group block sizes and partial-cache boundaries reuse
-    these hashes directly (see ``BlockHashListWithBlockSize``).
+    With ``replay`` it is the replay boundary, ``num_prompt_tokens - 1``: a
+    repeated prompt then hits everything but its last token, and that token
+    runs as a one-token (decode-shaped) step instead of an eager prefill chunk.
+    Otherwise it is the prompt's last hash boundary (the only positions a
+    state can be keyed at when the Mamba block is the hash block, and the
+    positions EAGLE-style hits, which drop one hash unit, land on).
+    """
+    if replay:
+        return num_prompt_tokens - 1
+    return num_prompt_tokens // hash_block_size * hash_block_size
+
+
+class RequestBlockHasher:
+    """Hashes a request's prefix at ``hash_block_size`` granularity.
+
+    Hashes are chained over the full prefix, so each hash uniquely
+    fingerprints the prefix ending at its boundary. Coarser group block sizes
+    and partial-cache boundaries reuse these hashes directly (see
+    ``BlockHashListWithBlockSize``). ``hash_prefix`` extends the chain to a
+    prefix ending inside a hash block (a prompt tail), which is how the prefix
+    cache keys the prompt's replay boundary exactly.
     """
 
-    def request_block_hasher(request: Request) -> list[BlockHash]:
+    def __init__(
+        self, hash_block_size: int, caching_hash_fn: Callable[[Any], bytes]
+    ) -> None:
+        self.hash_block_size = hash_block_size
+        self.caching_hash_fn = caching_hash_fn
+
+    def hash_prefix(self, request: Request, end: int) -> BlockHash | None:
+        """The hash of the request's first ``end`` tokens: the block hash when
+        ``end`` is a hash boundary, else the hash of the tail tokens chained
+        from the boundary below it. None when that boundary's hash is not
+        computed yet or the request carries multi-modal or embedded inputs
+        (their extra keys are only defined per hash block)."""
+        hash_block_size = self.hash_block_size
+        if end <= 0 or end > request.num_tokens:
+            return None
+        num_full = end // hash_block_size
+        if num_full > len(request.block_hashes):
+            return None
+        parent = request.block_hashes[num_full - 1] if num_full > 0 else None
+        if end % hash_block_size == 0:
+            return parent
+        if request.mm_features or request.prompt_embeds is not None:
+            return None
+        start = num_full * hash_block_size
+        extra_keys, _ = generate_block_hash_extra_keys(request, start, end, 0)
+        return hash_block_tokens(
+            self.caching_hash_fn,
+            parent,
+            request.all_token_ids[start:end],
+            extra_keys,
+        )
+
+    def __call__(self, request: Request) -> list[BlockHash]:
+        hash_block_size = self.hash_block_size
+        caching_hash_fn = self.caching_hash_fn
         start_token_idx = len(request.block_hashes) * hash_block_size
         num_tokens = request.num_tokens
 
@@ -844,7 +893,16 @@ def get_request_block_hasher(
 
         return new_block_hashes
 
-    return request_block_hasher
+
+def get_request_block_hasher(
+    hash_block_size: int,
+    caching_hash_fn: Callable[[Any], bytes],
+) -> RequestBlockHasher:
+    """The engine's block hasher factory under its long-standing name (the
+    engine core and the tests import it): a ``RequestBlockHasher`` computes
+    a request's un-computed block hashes (callable) and its prompt-tail
+    hashes (``hash_prefix``)."""
+    return RequestBlockHasher(hash_block_size, caching_hash_fn)
 
 
 def _check_enough_kv_cache_memory(

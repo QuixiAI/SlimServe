@@ -7,6 +7,15 @@ def test_rtx5090_is_detected_as_its_own_platform():
     assert hardware._classify("NVIDIA GeForce RTX 5090") == "rtx5090"
 
 
+def test_rtx_pro_6000_is_detected_as_its_own_platform():
+    for name in (
+        "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+        "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+        "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    ):
+        assert hardware._classify(name) == "rtx6000"
+
+
 def test_nvidia_smi_probe_detects_a100s(monkeypatch):
     def fake_run(*args, **kwargs):
         return SimpleNamespace(
