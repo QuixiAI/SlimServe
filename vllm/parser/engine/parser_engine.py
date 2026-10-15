@@ -627,6 +627,32 @@ class ParserEngine(Parser):
                     return input_ids[i + 1 :]
         return input_ids
 
+    def content_token_count(
+        self,
+        output_token_ids: Sequence[int],
+        prompt_token_ids: Sequence[int] | None = None,
+    ) -> int:
+        """See :meth:`Parser.content_token_count`.
+
+        The engine ignores the prompt (its config fixes the initial state) and
+        leaves reasoning at the FIRST end marker; later markers are absorbed as
+        content, so the content tokens are everything after that first one.
+        """
+        if (
+            not self._has_reasoning
+            or self.parser_engine_config.initial_state != ParserState.REASONING
+        ):
+            return len(output_token_ids)
+        end_id = self._reasoning_end_token_id
+        if end_id is None:
+            # Text-only end marker: no token-level boundary is available.
+            return len(self.extract_content_ids(list(output_token_ids)))
+        ids = list(output_token_ids)
+        try:
+            return len(ids) - ids.index(end_id) - 1
+        except ValueError:
+            return 0
+
     def get_streaming_fallback_content(
         self,
         text: str,

@@ -34412,3 +34412,46 @@ than PyPI 1.3.0), and the FP8 GEMMs.
 - Results: no new throughput measurement or hardware qualification claimed.
 - Decision: submit as a focused PR; preserve current-main behavior outside this fix.
 - Raw artifacts: local test output; no traffic captures or model data committed.
+
+## 2026-09-19 - Report interrupted Responses tool calls as incomplete
+
+- Status: retained for review.
+- Baseline: `origin/main`; forward-port from the B70 serving integration.
+- Change: Do not advertise truncated or invalid JSON arguments as completed calls; emit matching incomplete/failed Responses terminal events and stop background replay on each terminal status.
+- Correctness: 23 function-completion and terminal-event regression tests passed on CPU.
+- Results: no new throughput measurement or hardware qualification claimed.
+- Decision: submit as a focused PR; preserve current-main behavior outside this fix.
+- Raw artifacts: local test output; no traffic captures or model data committed.
+
+
+## 2026-09-19 - Emit typed Responses failure events for generation errors
+
+- Status: retained for review.
+- Baseline: `fix/responses-incomplete-tools`; forward-port from the B70 serving integration.
+- Change: Preserve the original generation or finalization error in a typed response.failed event and stored response, with monotonic event sequence numbers.
+- Correctness: Eight generation-error SSE/storage cases and 23 inherited completion tests passed on CPU.
+- Results: no new throughput measurement or hardware qualification claimed.
+- Decision: submit as a focused PR; preserve current-main behavior outside this fix.
+- Raw artifacts: local test output; no traffic captures or model data committed.
+
+
+## 2026-09-19 - Prevent required tool requests from stopping during reasoning
+
+- Status: retained for review.
+- Baseline: `fix/responses-generation-errors`; forward-port from the B70 serving integration.
+- Change: Mask stop IDs until the required tool grammar activates, including speculative and parallel rows; propagate required/named/allowed-tools policy and fail Responses that omit the required call.
+- Correctness: 12 required-tool mask/metadata tests and 47 Responses completion/error tests passed on CPU.
+- Results: no new throughput measurement or hardware qualification claimed.
+- Decision: submit as a focused PR; preserve current-main behavior outside this fix.
+- Raw artifacts: local test output; no traffic captures or model data committed.
+
+
+## 2026-09-19 - Preserve streamed item identity in terminal Responses output
+
+- Status: retained for review.
+- Baseline: `fix/required-tool-reasoning-stop`; forward-port from the B70 serving integration.
+- Change: Use finalized streamed items as terminal output so item IDs, call IDs, arguments and statuses match events already delivered; preserve cancellation.
+- Correctness: 16 stream/final identity cases and 47 inherited completion/error cases passed on CPU.
+- Results: no new throughput measurement or hardware qualification claimed.
+- Decision: submit as a focused PR; preserve current-main behavior outside this fix.
+- Raw artifacts: local test output; no traffic captures or model data committed.

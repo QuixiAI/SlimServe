@@ -7,11 +7,13 @@ from collections import deque
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping, Sequence
 from contextlib import AsyncExitStack
 from copy import copy
+from dataclasses import dataclass, field
 from http import HTTPStatus
 from typing import Any, Final
 
 from fastapi import Request
 from openai.types.responses import (
+    ResponseErrorEvent,
     ResponseFunctionToolCall,
     ResponseOutputItem,
     ResponseOutputMessage,
@@ -19,10 +21,10 @@ from openai.types.responses import (
     ResponseStatus,
     response_text_delta_event,
 )
+from openai.types.responses.response_error import ResponseError
 from openai.types.responses.response_output_text import Logprob, LogprobTopLogprob
 from openai.types.responses.tool import Mcp, Tool
 from openai_harmony import Message as OpenAIHarmonyMessage
-from pydantic import TypeAdapter
 
 from vllm import envs
 from vllm.config.utils import replace
@@ -65,6 +67,8 @@ from vllm.entrypoints.openai.responses.protocol import (
     OutputTokensDetails,
     ResponseCompletedEvent,
     ResponseCreatedEvent,
+    ResponseFailedEvent,
+    ResponseIncompleteEvent,
     ResponseInProgressEvent,
     ResponseInputOutputItem,
     ResponseInputOutputMessage,
@@ -81,6 +85,7 @@ from vllm.entrypoints.openai.responses.streaming_events import (
     emit_previous_item_done_events,
     emit_tool_action_events,
     split_delta,
+    valid_function_call_arguments,
 )
 from vllm.entrypoints.openai.responses.utils import (
     build_response_output_items,
@@ -106,6 +111,37 @@ from vllm.utils import random_uuid
 from vllm.utils.collection_utils import as_list
 
 logger = init_logger(__name__)
+
+
+# Events after which a Responses stream carries nothing more. Cancellation has
+# no response.* event in the Responses API; it is reported as a typed `error`
+# event with this code, and the response itself is available by retrieval.
+_TERMINAL_STREAM_EVENTS: Final = frozenset(
+    ("response.completed", "response.incomplete", "response.failed", "error")
+)
+RESPONSE_CANCELLED_CODE: Final = "response_cancelled"
+
+
+def _response_cancelled_event(response_id: str) -> ResponseErrorEvent:
+    return ResponseErrorEvent(
+        type="error",
+        code=RESPONSE_CANCELLED_CODE,
+        message=f"Response {response_id} was cancelled.",
+        param=None,
+        sequence_number=-1,
+    )
+
+
+@dataclass
+class _BackgroundEventLog:
+    """Events of one background streamed response, for (re)play by readers."""
+
+    events: deque[StreamingResponsesResponse] = field(default_factory=deque)
+    signal: asyncio.Event = field(default_factory=asyncio.Event)
+    # Set once the producer has stopped, however it stopped. Readers must not
+    # wait for events after this, or a producer that ended without a terminal
+    # event (task cancellation, an exception) would hang them forever.
+    done: bool = False
 
 
 def _extract_allowed_tools_from_mcp_requests(
@@ -234,9 +270,7 @@ class OpenAIServingResponses(GenerateBaseServing):
         # HACK(wuhang): This is a hack. We should use a better store.
         # FIXME: If enable_store=True, this may cause a memory leak since we
         # never remove events from the store.
-        self.event_store: dict[
-            str, tuple[deque[StreamingResponsesResponse], asyncio.Event]
-        ] = {}
+        self.event_store: dict[str, _BackgroundEventLog] = {}
 
         self.background_tasks: dict[str, asyncio.Task] = {}
 
@@ -787,6 +821,7 @@ class OpenAIServingResponses(GenerateBaseServing):
         tokenizer: TokenizerLike,
         request_metadata: RequestResponseMetadata,
         created_time: int | None = None,
+        streamed_output: list[ResponseOutputItem] | None = None,
     ) -> ErrorResponse | ResponsesResponse:
         if created_time is None:
             created_time = int(time.time())
@@ -863,12 +898,22 @@ class OpenAIServingResponses(GenerateBaseServing):
             # Check if generation was stopped due to max_tokens
             if final_output.finish_reason == "length":
                 status = "incomplete"
+            elif final_output.finish_reason == "abort":
+                status = "cancelled"
 
-            output = self._make_response_output_items(
-                request,
-                final_output,
-                tokenizer,
-                parser=context.response_parser,
+            # The stream already assigned call IDs and serialized arguments.
+            # Reparsing can replace an incomplete streamed call with different,
+            # apparently valid JSON. Its finalized items are authoritative.
+            output = (
+                streamed_output
+                if streamed_output is not None
+                else self._make_response_output_items(
+                    request,
+                    final_output,
+                    tokenizer,
+                    parser=context.response_parser,
+                    prompt_token_ids=final_res.prompt_token_ids,
+                )
             )
 
             if request.enable_response_messages:
@@ -878,6 +923,42 @@ class OpenAIServingResponses(GenerateBaseServing):
             # Calculate usage.
             assert final_res.prompt_token_ids is not None
             num_tool_output_tokens = 0
+
+        invalid_function_arguments = False
+        for item in output:
+            # Custom tool calls carry freeform input and are deliberately exempt.
+            if item.type == "function_call" and (
+                not valid_function_call_arguments(item.arguments)
+                or (streamed_output is not None and item.status == "incomplete")
+            ):
+                item.status = "incomplete"
+                invalid_function_arguments = True
+        if invalid_function_arguments and status == "completed":
+            status = "failed"
+        # SimpleContext cannot execute built-in tools internally, so a required
+        # call must be present in the returned items. Other contexts may have
+        # already executed a built-in call before producing their final answer.
+        missing_required_tool_call = (
+            status == "completed"
+            and isinstance(context, SimpleContext)
+            and sampling_params.structured_outputs is not None
+            and sampling_params.structured_outputs._required_tool_call
+            and not any(
+                item.type in ("function_call", "custom_tool_call") for item in output
+            )
+        )
+        if missing_required_tool_call:
+            status = "failed"
+        if (
+            streamed_output is None
+            and status == "incomplete"
+            and output
+            and output[-1].type == "function_call"
+        ):
+            # The last active call was interrupted, even if its current argument
+            # prefix happens to be parseable (for example, a complete object
+            # without the model's closing tool envelope).
+            output[-1].status = "incomplete"
 
         assert isinstance(context, (SimpleContext, HarmonyContext, ParsableContext))
         num_prompt_tokens = context.num_prompt_tokens
@@ -938,6 +1019,17 @@ class OpenAIServingResponses(GenerateBaseServing):
             kv_transfer_params=context.kv_transfer_params,
             ec_transfer_params=context.ec_transfer_params,
         )
+
+        if invalid_function_arguments and status == "failed":
+            response.error = ResponseError(
+                code="server_error",
+                message="Model generated incomplete or invalid JSON function arguments",
+            )
+        elif missing_required_tool_call:
+            response.error = ResponseError(
+                code="server_error",
+                message="Model completed without the required tool call",
+            )
 
         if request.store:
             async with self.response_store_lock:
@@ -1043,6 +1135,7 @@ class OpenAIServingResponses(GenerateBaseServing):
         final_output: CompletionOutput,
         tokenizer: TokenizerLike,
         parser: Parser | None = None,
+        prompt_token_ids: list[int] | None = None,
     ) -> list[ResponseOutputItem]:
         # Log complete response if output logging is enabled
         if self.enable_log_outputs and self.request_logger:
@@ -1076,6 +1169,14 @@ class OpenAIServingResponses(GenerateBaseServing):
             if not request.include_reasoning:
                 reasoning = None
                 logprobs = None
+            elif logprobs is not None:
+                # output_text carries only the message's own tokens: not the
+                # reasoning or its end marker. The streaming path attributes
+                # each chunk with the same parser boundary.
+                content_tokens = parser.content_token_count(
+                    final_output.token_ids, prompt_token_ids
+                )
+                logprobs = logprobs[len(logprobs) - content_tokens :] or None
             return build_response_output_items(
                 reasoning=reasoning,
                 content=content,
@@ -1217,16 +1318,28 @@ class OpenAIServingResponses(GenerateBaseServing):
         *args,
         **kwargs,
     ):
-        event_deque: deque[StreamingResponsesResponse] = deque()
-        new_event_signal = asyncio.Event()
-        self.event_store[request.request_id] = (event_deque, new_event_signal)
+        log = _BackgroundEventLog()
+        self.event_store[request.request_id] = log
         generator = self.responses_stream_generator(request, *args, **kwargs)
         try:
             async for event in generator:
-                event_deque.append(event)
-                new_event_signal.set()  # Signal new event available
+                log.events.append(event)
+                log.signal.set()  # Signal new event available
+        except asyncio.CancelledError:
+            # cancel_responses cancels this task, so the generator never
+            # reaches its own terminal event. Close the replay with one.
+            last_type = getattr(log.events[-1], "type", None) if log.events else None
+            if last_type not in _TERMINAL_STREAM_EVENTS:
+                event = _response_cancelled_event(request.request_id)
+                last_sequence = (
+                    getattr(log.events[-1], "sequence_number", -1) if log.events else -1
+                )
+                event.sequence_number = last_sequence + 1
+                log.events.append(event)
+            raise
         finally:
-            new_event_signal.set()
+            log.done = True
+            log.signal.set()
 
     async def _run_background_request(
         self,
@@ -1257,22 +1370,26 @@ class OpenAIServingResponses(GenerateBaseServing):
                 value=response_id,
             )
 
-        event_deque, new_event_signal = self.event_store[response_id]
+        log = self.event_store[response_id]
         start_index = 0 if starting_after is None else starting_after + 1
         current_index = start_index
 
         while True:
-            new_event_signal.clear()
+            log.signal.clear()
 
             # Yield existing events from start_index
-            while current_index < len(event_deque):
-                event = event_deque[current_index]
+            while current_index < len(log.events):
+                event = log.events[current_index]
                 yield event
-                if getattr(event, "type", "unknown") == "response.completed":
+                if getattr(event, "type", "unknown") in _TERMINAL_STREAM_EVENTS:
                     return
                 current_index += 1
 
-            await new_event_signal.wait()
+            # No await separates the drain above from this check, so a
+            # finished producer has no events left for this reader.
+            if log.done:
+                return
+            await log.signal.wait()
 
     async def retrieve_responses(
         self,
@@ -1349,22 +1466,37 @@ class OpenAIServingResponses(GenerateBaseServing):
         ],
     ) -> AsyncGenerator[StreamingResponsesResponse, None]:
         processor = SimpleStreamingEventProcessor(tools=request.tools)
+        finish_reason = None
 
         hide_stream_metadata = not request.include_reasoning and self.parser is not None
+
+        # Message logprobs are attributed with the parser's reasoning boundary
+        # (Parser.content_token_count), as in the non-streaming response: a
+        # chunk that ends reasoning and starts the message contributes only
+        # its message tokens. Content-phase tokens whose text the parser has
+        # not surfaced yet (deferred whitespace, the template scaffold) wait
+        # here and are reported with the next content delta.
+        generated_token_ids: list[int] = []
+        content_tokens_so_far = 0
+        pending_token_ids: list[int] = []
+        pending_logprobs: SampleLogprobs = []
 
         def _get_logprobs(
             output: CompletionOutput,
         ) -> list[response_text_delta_event.Logprob]:
             if not request.is_include_output_logprobs():
                 return []
-            if hide_stream_metadata:
+            if hide_stream_metadata or not pending_token_ids:
                 return []
-            return self._create_stream_response_logprobs(
-                token_ids=output.token_ids,
-                logprobs=output.logprobs,
+            logprobs = self._create_stream_response_logprobs(
+                token_ids=list(pending_token_ids),
+                logprobs=list(pending_logprobs),
                 tokenizer=tokenizer,
                 top_logprobs=request.top_logprobs,
             )
+            pending_token_ids.clear()
+            pending_logprobs.clear()
+            return logprobs
 
         async for ctx in result_generator:
             assert isinstance(ctx, SimpleContext)
@@ -1372,9 +1504,30 @@ class OpenAIServingResponses(GenerateBaseServing):
                 continue
 
             output = ctx.last_output.outputs[0]
+            finish_reason = output.finish_reason
             self._raise_if_error(output.finish_reason, request.request_id)
             delta_text = output.text
             delta_token_ids = as_list(output.token_ids)
+
+            if request.is_include_output_logprobs() and output.logprobs:
+                chunk_content_tokens = len(delta_token_ids)
+                if ctx.response_parser:
+                    generated_token_ids.extend(delta_token_ids)
+                    # Once the message has started every later token is
+                    # content; only rescan while still inside reasoning.
+                    if not content_tokens_so_far:
+                        content_tokens_so_far = ctx.response_parser.content_token_count(
+                            generated_token_ids,
+                            ctx.last_output.prompt_token_ids,
+                        )
+                        chunk_content_tokens = min(
+                            content_tokens_so_far, len(delta_token_ids)
+                        )
+                    else:
+                        content_tokens_so_far += len(delta_token_ids)
+                if chunk_content_tokens:
+                    pending_token_ids.extend(delta_token_ids[-chunk_content_tokens:])
+                    pending_logprobs.extend(output.logprobs[-chunk_content_tokens:])
 
             if ctx.response_parser:
                 delta_message = ctx.response_parser.parse_delta(
@@ -1404,7 +1557,7 @@ class OpenAIServingResponses(GenerateBaseServing):
                 for event in processor.emit_delta(dm, output, _get_logprobs):
                     yield _increment_sequence_number_and_return(event)
 
-        for event in processor.close_current():
+        for event in processor.close_current(incomplete=finish_reason != "stop"):
             yield _increment_sequence_number_and_return(event)
 
     async def _process_harmony_streaming_events(
@@ -1495,7 +1648,32 @@ class OpenAIServingResponses(GenerateBaseServing):
                 output=[],
                 status="in_progress",
                 usage=None,
-            ).model_dump(mode="json", by_alias=True)
+            )
+
+            async def failed_event(message: str) -> ResponseFailedEvent:
+                # HTTP error envelopes are not Responses SSE events. Build a
+                # terminal response directly, without parsing failed generation
+                # output again and potentially masking the original error.
+                response = initial_response.model_copy(
+                    update={
+                        "status": "failed",
+                        "error": ResponseError(code="server_error", message=message),
+                    }
+                )
+                if request.store:
+                    async with self.response_store_lock:
+                        stored_response = self.response_store.get(response.id)
+                        if (
+                            stored_response is None
+                            or stored_response.status != "cancelled"
+                        ):
+                            self.response_store[response.id] = response
+                return _increment_sequence_number_and_return(
+                    ResponseFailedEvent(
+                        type="response.failed", sequence_number=-1, response=response
+                    )
+                )
+
             yield _increment_sequence_number_and_return(
                 ResponseCreatedEvent(
                     type="response.created",
@@ -1511,6 +1689,9 @@ class OpenAIServingResponses(GenerateBaseServing):
                 )
             )
 
+            streamed_output: list[ResponseOutputItem] | None = (
+                [] if isinstance(context, SimpleContext) else None
+            )
             try:
                 async for event_data in processor(
                     request,
@@ -1523,12 +1704,14 @@ class OpenAIServingResponses(GenerateBaseServing):
                     created_time,
                     _increment_sequence_number_and_return,
                 ):
+                    if (
+                        streamed_output is not None
+                        and event_data.type == "response.output_item.done"
+                    ):
+                        streamed_output.append(event_data.item)
                     yield event_data
             except GenerationError as e:
-                error_json = self._convert_generation_error_to_streaming_response(e)
-                yield _increment_sequence_number_and_return(
-                    TypeAdapter(StreamingResponsesResponse).validate_json(error_json)
-                )
+                yield await failed_event(str(e))
                 return
 
             async def empty_async_generator():
@@ -1537,19 +1720,39 @@ class OpenAIServingResponses(GenerateBaseServing):
                 if False:
                     yield
 
-            final_response = await self.responses_full_generator(
-                request,
-                sampling_params,
-                empty_async_generator(),
-                context,
-                model_name,
-                tokenizer,
-                request_metadata,
-                created_time=created_time,
-            )
+            try:
+                final_response = await self.responses_full_generator(
+                    request,
+                    sampling_params,
+                    empty_async_generator(),
+                    context,
+                    model_name,
+                    tokenizer,
+                    request_metadata,
+                    created_time=created_time,
+                    streamed_output=streamed_output,
+                )
+            except GenerationError as e:
+                yield await failed_event(str(e))
+                return
+            if isinstance(final_response, ErrorResponse):
+                yield await failed_event(final_response.error.message)
+                return
+            if final_response.status == "cancelled":
+                # Responses defines no response.cancelled event; end the stream
+                # with a typed error event so readers see that it is over. The
+                # cancelled response itself is available by retrieval.
+                yield _increment_sequence_number_and_return(
+                    _response_cancelled_event(final_response.id)
+                )
+                return
+            terminal_event = {
+                "incomplete": ResponseIncompleteEvent,
+                "failed": ResponseFailedEvent,
+            }.get(final_response.status, ResponseCompletedEvent)
             yield _increment_sequence_number_and_return(
-                ResponseCompletedEvent(
-                    type="response.completed",
+                terminal_event(
+                    type=f"response.{final_response.status}",
                     sequence_number=-1,
                     response=final_response,
                 )
