@@ -6,10 +6,11 @@ import json, subprocess, sys, threading, time, urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from slimserve.video import server
+from paths import SCRATCH
 pipeline = sys.argv[1]; n = int(sys.argv[2]) if len(sys.argv) > 2 else 3
 size = sys.argv[3] if len(sys.argv) > 3 else "768x512"; seconds = float(sys.argv[4]) if len(sys.argv) > 4 else 2
 cfg = {"pipeline": pipeline, "width": 1536, "height": 1024, "num_frames": 121, "fps": 24.0, "max_video_tokens": 24576}
-out = Path.home() / ".local/scratch/ltx25/n6/videos"
+out = Path(SCRATCH) / "n6/videos"
 svc = server.VideoService(cfg, "LTX-2.5", out)
 httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.make_handler(svc)); port = httpd.server_address[1]
 threading.Thread(target=httpd.serve_forever, daemon=True).start()

@@ -109,14 +109,15 @@ better than distilled and DFR); never pick a mode on speed grounds. DFR must be 
 768x512x121 (stage 1 at 384x256).
 
 Flow (standing): bring the engine up inside SlimServe, validate, then
-upstream every kernel to QuixiCore-Metal (`~/Code/QuixiCore-Metal`,
+upstream every kernel to QuixiCore-Metal (`<QuixiCore-Metal checkout>`,
 `kernels/<family>/<op>/`, MLX + torch-MPS bindings) as a separate PR.
 
 ## Hard rules
 
-- Commit identity: repo-local `auroter <7332587+auroter@users.noreply.github.com>`
-  only (verified in this worktree). No real emails, no Eric Hartford as
-  author, no attribution trailers, no AI credit anywhere public.
+- Commit identity: the contributor's repo-local
+  `<name> <id+handle@users.noreply.github.com>` only (verify it in the
+  worktree). No real emails, no attribution trailers, no AI credit anywhere
+  public.
 - Scope: the three ids above on platform `metal`; M5 variants are separate
   records later. Never widen a profile to a platform it was not validated on
   (`test_a_profile_is_one_config_per_platform`).
@@ -292,7 +293,8 @@ reuse, VAE budget.
 
 ## Ops constraints and gotchas (each cost time already)
 
-- HF token on this machine is auroter; gated acceptances live on auroter.
+- HF token on this machine is `<hf-account>`; the gated acceptances live on
+  that account.
   Downloads: use `HF_HUB_ENABLE_HF_TRANSFER=1 HF_HUB_DISABLE_XET=1`
   (xet path was 1 MB/s per file; hf_transfer 20+ MB/s).
 - Detached long jobs: `nohup` fails under this shell; use

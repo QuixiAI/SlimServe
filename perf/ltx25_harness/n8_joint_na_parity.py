@@ -5,7 +5,7 @@
   cmp  REF.npz OURS.npz
 
 The reference is Lightricks' `fallback_na/joint_eager.py` staged standalone in
-~/.local/scratch/ltx25/n8/ltxkf (torch + no einops). Run `ref` in the torch
+$LTX25_SCRATCH/n8/ltxkf (torch + no einops). Run `ref` in the torch
 env (conda vllm-mlx) and `ours` in venv-slimserve through gpu_run.py.
 Usage: python n8_joint_na_parity.py <mode> ..."""
 

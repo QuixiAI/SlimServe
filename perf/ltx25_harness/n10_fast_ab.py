@@ -20,12 +20,12 @@ import numpy as np
 
 from slimserve.video.ltx25 import mux, pipeline
 from slimserve.video.ltx25.dit import StepCache
+from paths import SCRATCH
 
 MODE, OUT = sys.argv[1], Path(sys.argv[2]).expanduser()
 OUT.mkdir(parents=True, exist_ok=True)
 PROMPT = (
-    Path("~/.local/scratch/ltx25/demo/v4/prompt_beat1d.txt")
-    .expanduser()
+    Path(SCRATCH, "demo/v4/prompt_beat1d.txt")
     .read_text()
     .strip()
 )

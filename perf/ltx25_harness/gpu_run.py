@@ -22,8 +22,9 @@ import os
 import subprocess
 import sys
 import time
+from paths import SCRATCH
 
-LOCK = os.path.expanduser("~/.local/scratch/ltx25/gpu.lock")
+LOCK = f"{SCRATCH}/gpu.lock"
 OS_RESERVE_GB = 16  # never plan into the last 16 GiB
 MAX_WIRED_LIMIT_MB = 110_000  # 128 GiB box: leave the OS at least ~20 GiB unwireable
 

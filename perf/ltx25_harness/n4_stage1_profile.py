@@ -3,9 +3,10 @@ dev-batch (4 x 1,536) and a 24,576-token HD forward, all with the same instrumen
 Usage: PYTHONPATH=<worktree> python n4_stage1_profile.py  (gpu_run.py --need-gb 48)"""
 import os, pickle, time, collections, mlx.core as mx
 from slimserve.video.ltx25 import checkpoints, dit as D, sampling
+from paths import SCRATCH
 weights, _, tcfg = checkpoints.load_dit("distilled")
 m = D.LTX25DiT(weights, D.DiTConfig.from_checkpoint(tcfg))
-d = pickle.load(open(os.path.expanduser("~/.local/scratch/ltx25/gate/out/stage2_inputs.pkl"), "rb"))["kw"]
+d = pickle.load(open(f"{SCRATCH}/gate/out/stage2_inputs.pkl", "rb"))["kw"]
 vt, at = mx.array(d["video_text_embeds"][1]), mx.array(d["audio_text_embeds"][1])
 def inputs(f, h, w, b=1):
     rep = lambda x: mx.repeat(x, b, axis=0)

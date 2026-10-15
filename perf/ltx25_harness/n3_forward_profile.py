@@ -3,9 +3,10 @@ synchronously (inputs first), so absolutes are inflated; shares and per-op TF/s 
 Usage: PYTHONPATH=<worktree> python n3_forward_profile.py   (through gpu_run.py --need-gb 48)"""
 import os, pickle, time, collections, numpy as np, mlx.core as mx
 from slimserve.video.ltx25 import checkpoints, dit as D
+from paths import SCRATCH
 weights, _, tcfg = checkpoints.load_dit("distilled")
 m = D.LTX25DiT(weights, D.DiTConfig.from_checkpoint(tcfg))
-d = pickle.load(open(os.path.expanduser("~/.local/scratch/ltx25/gate/out/stage2_inputs.pkl"), "rb"))["kw"]
+d = pickle.load(open(f"{SCRATCH}/gate/out/stage2_inputs.pkl", "rb"))["kw"]
 g = lambda k: None if d.get(k) is None else mx.array(d[k][1])
 args = dict(video_latent=g("video_latent"), audio_latent=g("audio_latent"), timestep=g("timestep"), video_text=g("video_text_embeds"),
             audio_text=g("audio_text_embeds"), video_positions=g("video_positions"), audio_positions=g("audio_positions"), video_keyframes_mask=g("video_keyframes_mask"))

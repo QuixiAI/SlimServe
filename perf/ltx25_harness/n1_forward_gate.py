@@ -5,9 +5,10 @@ Usage: PYTHONPATH=<worktree> python n1_forward_gate.py [distilled|dev] [OUT.npz]
 import os, sys, time, pickle, numpy as np, mlx.core as mx
 from slimserve.video.ltx25 import checkpoints
 from slimserve.video.ltx25.dit import LTX25DiT, DiTConfig
+from paths import SCRATCH
 variant = sys.argv[1] if len(sys.argv) > 1 else "distilled"
 out = sys.argv[2] if len(sys.argv) > 2 else None
-GATE = os.path.expanduser("~/.local/scratch/ltx25/gate/out")
+GATE = f"{SCRATCH}/gate/out"
 t0 = time.perf_counter()
 weights, connectors, tcfg = checkpoints.load_dit(variant)
 mx.synchronize(); t_load = time.perf_counter() - t0

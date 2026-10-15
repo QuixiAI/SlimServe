@@ -7,7 +7,7 @@
   cmp  REF.npz OURS.npz
 Add `--plain` after the mode for the keyframe-less decode of the same latent.
 
-Upstream is imported from ~/.local/scratch/ltx25/upstream (ltx-core + ltx-pipelines
+Upstream is imported from $LTX25_UPSTREAM (paths.py; ltx-core + ltx-pipelines
 sources on sys.path); run `ref` in the torch env (conda vllm-mlx), `ours` through
 gpu_run.py in venv-slimserve. Small on purpose: 3x8x8 latent (17 frames of
 256x256), planes at pixel frames 4 and 12."""

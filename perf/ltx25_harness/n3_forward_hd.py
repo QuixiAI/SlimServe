@@ -3,8 +3,9 @@ Usage: PYTHONPATH=<worktree> python n3_forward_hd.py F H W [batch]   (16 32 48 =
 import os, sys, pickle, time, numpy as np, mlx.core as mx
 from slimserve.video.ltx25 import sampling
 from slimserve.video.ltx25.pipeline import LTX25Engine
+from paths import SCRATCH
 f, h, w = (int(x) for x in sys.argv[1:4]); b = int(sys.argv[4]) if len(sys.argv) > 4 else 1
-d = pickle.load(open(os.path.expanduser("~/.local/scratch/ltx25/gate/out/stage2_inputs.pkl"), "rb"))["kw"]
+d = pickle.load(open(f"{SCRATCH}/gate/out/stage2_inputs.pkl", "rb"))["kw"]
 rep = lambda x: mx.repeat(x, b, axis=0)
 eng = LTX25Engine(); dit = eng.load_dit(); at = sampling.audio_token_count(8 * f - 7, 24.0)
 st = sampling.noised_state((b, f * h * w, 128), rep(sampling.video_positions(f, h, w, 24.0)), 1, sigma=0.9, tokens_per_frame=h * w)

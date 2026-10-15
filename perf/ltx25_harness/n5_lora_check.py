@@ -2,14 +2,15 @@
 Also checks runtime low-rank == fused weights on a few linears, and attach/detach restores the base exactly."""
 import os, pickle, time, numpy as np, mlx.core as mx
 from slimserve.video.ltx25.pipeline import LTX25Engine
+from paths import SCRATCH
 eng = LTX25Engine(variant="dev"); dit = eng.load_dit(); lora = eng.load_distilled_lora()
-d = pickle.load(open(os.path.expanduser("~/.local/scratch/ltx25/gate/out/stage2_inputs.pkl"), "rb"))["kw"]
+d = pickle.load(open(f"{SCRATCH}/gate/out/stage2_inputs.pkl", "rb"))["kw"]
 g = lambda k: None if d.get(k) is None else mx.array(d[k][1])
 args = dict(video_latent=g("video_latent"), audio_latent=g("audio_latent"), timestep=g("timestep"), video_text=g("video_text_embeds"),
             audio_text=g("audio_text_embeds"), video_positions=g("video_positions"), audio_positions=g("audio_positions"), video_keyframes_mask=g("video_keyframes_mask"))
 def run():
     mx.synchronize(); t = time.perf_counter(); v, a = dit(**args); mx.eval(v, a); mx.synchronize(); return time.perf_counter() - t, np.array(v), np.array(a)
-ref = np.load(os.path.expanduser("~/.local/scratch/ltx25/n1/n1_splitk.npz"))
+ref = np.load(f"{SCRATCH}/n1/n1_splitk.npz")
 def cmp(name, x, y):
     x, y = x.astype(np.float64), y.astype(np.float64)
     print(f"[lora] {name:44s} rel-L2 {np.linalg.norm(x-y)/np.linalg.norm(y):.4f} cos {(x*y).sum()/np.linalg.norm(x)/np.linalg.norm(y):.6f}", flush=True)

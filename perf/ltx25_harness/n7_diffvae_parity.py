@@ -4,7 +4,8 @@ runner's port, same latent and seed, with per-stage taps. One process per mode.
   ours OUT.npz OPERAND   engine; prints rel-L2 per tap and pixel PSNR against OUT_REF.npz if present
 Usage: PYTHONPATH=<worktree> python n7_diffvae_parity.py ref|ours ..."""
 import os, sys, time, numpy as np, mlx.core as mx
-LAT = os.path.expanduser("~/.local/scratch/ltx25/gate/out/ref_bf16.video.npy")   # (1,128,7,16,24) 768x512x49
+from paths import BF16_PACK, SCRATCH
+LAT = f"{SCRATCH}/gate/out/ref_bf16.video.npy"   # (1,128,7,16,24) 768x512x49
 lat = mx.array(np.load(LAT)).astype(mx.float32)
 mode = sys.argv[1]; out = sys.argv[2]
 taps = {}
@@ -12,7 +13,7 @@ def tap(name, x): mx.eval(x); taps[name] = np.array(x.astype(mx.float32))
 if mode == "ref":
     from mlx.utils import tree_map
     from ltx_core_mlx.model.video_vae.diffusion_decoder.decoder import load_diffusion_decoder
-    dec = load_diffusion_decoder(os.path.expanduser("~/models/ltx-2.5/dgrauet-bf16/vae_decoder_av.safetensors"))
+    dec = load_diffusion_decoder(f"{BF16_PACK}/vae_decoder_av.safetensors")
     dec.update(tree_map(lambda p: p.astype(mx.float32), dec.parameters())); mx.eval(dec.parameters())
     mx.synchronize(); t = time.perf_counter(); px = dec.decode(lat, seed=42, tap=tap); mx.eval(px); mx.synchronize()
     print(f"[diffvae ref] runner fp32 decode {time.perf_counter()-t:.1f} s peak {mx.get_peak_memory()/2**30:.1f} GiB shape {px.shape}", flush=True)
@@ -29,7 +30,7 @@ else:
     mx.synchronize(); t = time.perf_counter(); px2 = dec.decode_raw(lat, seed=42); mx.eval(px2); mx.synchronize(); dt2 = time.perf_counter() - t
     print(f"[diffvae ours {sys.argv[3]}] decode {dt:.1f} s (warm {dt2:.1f} s) peak {mx.get_peak_memory()/2**30:.1f} GiB shape {px.shape}", flush=True)
     np.savez(out, pixels=np.array(px), **taps)
-    ref_path = os.path.expanduser("~/.local/scratch/ltx25/n7/diffvae_ref.npz")
+    ref_path = f"{SCRATCH}/n7/diffvae_ref.npz"
     if os.path.exists(ref_path):
         r = np.load(ref_path)
         for k in taps:

@@ -7,9 +7,10 @@ Usage: PYTHONPATH=<worktree> python n2_audio_parity.py [LATENT.npy] [RUNNER_PACK
 import json, os, subprocess, sys, time, numpy as np, mlx.core as mx
 from mlx.utils import tree_map
 from slimserve.video.ltx25 import audio, mux
-LAT = sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser("~/.local/scratch/ltx25/gate/out/ref_bf16.audio.npy")
-PACK = sys.argv[2] if len(sys.argv) > 2 else os.path.expanduser("~/models/ltx-2.5/dgrauet-bf16")
-OUT = sys.argv[3] if len(sys.argv) > 3 else os.path.expanduser("~/.local/scratch/ltx25/n2_audio")
+from paths import BF16_PACK, SCRATCH
+LAT = sys.argv[1] if len(sys.argv) > 1 else f"{SCRATCH}/gate/out/ref_bf16.audio.npy"
+PACK = sys.argv[2] if len(sys.argv) > 2 else BF16_PACK
+OUT = sys.argv[3] if len(sys.argv) > 3 else f"{SCRATCH}/n2_audio"
 os.makedirs(OUT, exist_ok=True)
 lat = mx.array(np.load(LAT)); T = lat.shape[2]
 def snr(x, ref, name):

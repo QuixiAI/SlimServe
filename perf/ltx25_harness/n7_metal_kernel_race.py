@@ -1,5 +1,6 @@
 import os, sys, numpy as np, mlx.core as mx
 import slimserve.video.ltx25.diffvae as D
+from paths import SCRATCH
 mx.set_cache_limit(16 << 30)
 variant = sys.argv[1]
 orig = D.na3d
@@ -47,7 +48,7 @@ elif variant == "shape_cached":
             return _shapes[key]
         return real_array(data, dtype=dtype, **kw) if dtype is not None else real_array(data, **kw)
     D.mx.array = cached_array
-lat = mx.array(np.load(os.path.expanduser("~/.local/scratch/ltx25/demo/d2_latents.npz"))["video"])
+lat = mx.array(np.load(f"{SCRATCH}/demo/d2_latents.npz")["video"])
 dec = D.DiffusionVAE().load()
 padded, _, _ = dec._pad_to_floor(lat.astype(mx.float32))
 fails = 0

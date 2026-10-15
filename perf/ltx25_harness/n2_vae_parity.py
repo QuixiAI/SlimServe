@@ -1,15 +1,16 @@
 """N2 parity: engine video VAE + latent upscalers (official files) vs the baseline runner (converted pack).
 Usage: PYTHONPATH=<worktree> <runner venv python> n2_vae_parity.py decode|tiled|encode|upscale|bench121|profile121
 Latent: a real final latent of the 768x512x49 distilled clip (gate/out/ref_bf16.video.npy, (1,128,7,16,24)).
-Timings are rough when other GPU jobs run. Results: ~/.local/scratch/ltx25/n2_vae/."""
+Timings are rough when other GPU jobs run. Results: $LTX25_SCRATCH/n2_vae/."""
 import os, sys, time, json, numpy as np, mlx.core as mx
 from mlx.utils import tree_map
 from slimserve.video.ltx25 import vae as V
 from slimserve.video.ltx25.vae import VideoVAE, Tiling
 from slimserve.video.ltx25.upscaler import LatentUpscaler
-PACK = os.path.expanduser("~/models/ltx-2.5/dgrauet-bf16")
-OUT = os.path.expanduser("~/.local/scratch/ltx25/n2_vae")
-LAT = mx.array(np.load(os.path.expanduser("~/.local/scratch/ltx25/gate/out/ref_bf16.video.npy")).astype(np.float32))
+from paths import BF16_PACK, SCRATCH
+PACK = BF16_PACK
+OUT = f"{SCRATCH}/n2_vae"
+LAT = mx.array(np.load(f"{SCRATCH}/gate/out/ref_bf16.video.npy").astype(np.float32))
 mode = sys.argv[1]
 
 def timed(fn):
