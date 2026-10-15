@@ -109,7 +109,10 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
     # MTP shares topk_indices_buffer with the target model. We update
     # every module in the draft that holds a buffer reference so that
     # the per-layer indexer and sparse-attention backends all point to
-    # the target's buffer.
+    # the target's buffer. The sparse attention impl (not an nn.Module,
+    # reached through MLAAttention.impl) captured the draft's own buffer at
+    # construction and reads the selections the indexer writes, so it must
+    # move with the indexer or the draft attends over unwritten indices.
     if hasattr(target_inner, "topk_indices_buffer"):
         target_buffer = target_inner.topk_indices_buffer
         if target_buffer is not None:

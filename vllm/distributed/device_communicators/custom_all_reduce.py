@@ -4,6 +4,7 @@
 from contextlib import contextmanager
 from typing import cast
 
+import os
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
@@ -46,6 +47,16 @@ def _can_p2p(rank: int, world_size: int) -> bool:
 
 
 from vllm.distributed.utils import is_weak_contiguous  # noqa: E402
+
+# GLM-5.3 mHC transition fused with the all-reduce
+# (quixicore/serving/glm5_mhc_allreduce.cuh): the stream geometry the kernel
+# is built for and the size of its per-token arrival counter buffer.
+_GLM5_MHC_HIDDEN = 4096
+_GLM5_MHC_HC = 4
+# fp32 [blocks, partial columns] per token (the kernel's NBLOCKS x
+# PARTIAL_STRIDE).
+_GLM5_MHC_PARTIAL_SHAPE = (32, 32)
+_GLM5_MHC_ARRIVAL_SLOTS = 1024
 
 
 class CustomAllreduce:
@@ -208,6 +219,12 @@ class CustomAllreduce:
             self.meta_ptrs, self.rank_data, rank, self.fully_connected
         )
         ops.register_buffer(self._ptr, self.buffer_ptrs)
+        # GLM-5.3 mHC fusion: per-token arrival counters, zero between
+        # launches (the block that completes a token resets its slot); one
+        # persistent buffer so graph replays see the same address.
+        self._glm5_mhc_arrivals = torch.zeros(
+            _GLM5_MHC_ARRIVAL_SLOTS, dtype=torch.int32, device=self.device
+        )
 
     @contextmanager
     def capture(self):
@@ -360,6 +377,168 @@ class CustomAllreduce:
             return self.all_reduce_add_rms_norm(
                 input, residual, weight, epsilon, registered=False
             )
+
+    # ---- GLM-5.3 mHC transition fused with the all-reduce -------------
+    # (quixicore/serving/glm5_mhc_allreduce.cuh; one plain launch for
+    # decode-sized batches, bf16 [T, 4096] partials, T <= 64.)
+    _GLM5_MHC_MAX_TOKENS = 64
+    # Above this batch the split path (one-shot all-reduce + the Triton pair)
+    # is faster: the fused kernel walks the tokens of a group serially per
+    # block, the Triton partials kernel spreads them over the whole GPU.
+    # With QC_MHC_RS=<n> (the reduce-scatter exchange from n tokens up, see
+    # glm5_mhc_allreduce.cuh) the fused site serves every decode batch.
+    _GLM5_MHC_FUSE_TOKENS = 64 if int(os.environ.get("QC_MHC_RS", "5")) > 0 else 8
+    # Serving fuses inside captured decode graphs only. Eager fused launches
+    # (a newcomer's tail or a tiny prompt beside a decoding request) were
+    # seen on 2026-09-14 beside a corruption that the placeholder-draft fix
+    # of the same day turned out to own (same trigger, same signature); the
+    # eager path re-probed clean on the fixed tree (2026-09-17, notebook
+    # "Item D5, re-test"). The gate stays because it is the configuration
+    # every retained arm measured, and the eager steps it covers are rare
+    # (~1 us more per site on them). Tests set this True to exercise the
+    # kernel eagerly.
+    _GLM5_MHC_FUSE_EAGER = False
+
+    def should_fuse_glm5_mhc(self, inp: torch.Tensor, residual: torch.Tensor) -> bool:
+        return (
+            self.world_size in (2, 4, 8)
+            and inp.dtype == torch.bfloat16
+            and inp.dim() == 2
+            and inp.shape[1] == _GLM5_MHC_HIDDEN
+            and 0 < inp.shape[0] <= self._GLM5_MHC_FUSE_TOKENS
+            and (
+                self._GLM5_MHC_FUSE_EAGER or torch.cuda.is_current_stream_capturing()
+            )
+            and residual.dtype == torch.bfloat16
+            and residual.shape == (inp.shape[0], _GLM5_MHC_HC, _GLM5_MHC_HIDDEN)
+            and self.should_custom_ar(inp)
+        )
+
+    def all_reduce_glm5_mhc(
+        self,
+        inp: torch.Tensor,
+        residual: torch.Tensor,
+        post_mix: torch.Tensor,
+        comb_mix: torch.Tensor,
+        fn: torch.Tensor,
+        scale: torch.Tensor,
+        base: torch.Tensor,
+        norm_weight: torch.Tensor | None,
+        rms_eps: float,
+        hc_eps: float,
+        post_multiplier: float,
+        sinkhorn_repeat: int,
+        norm_eps: float,
+        *,
+        registered: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        tokens = inp.shape[0]
+        device = inp.device
+        residual_out = torch.empty_like(residual)
+        partial = torch.empty(
+            (tokens, *_GLM5_MHC_PARTIAL_SHAPE), dtype=torch.float32, device=device
+        )
+        next_post = torch.empty(
+            (tokens, _GLM5_MHC_HC, 1), dtype=torch.float32, device=device
+        )
+        next_comb = torch.empty(
+            (tokens, _GLM5_MHC_HC, _GLM5_MHC_HC), dtype=torch.float32, device=device
+        )
+        layer_input = torch.empty(
+            (tokens, _GLM5_MHC_HIDDEN), dtype=inp.dtype, device=device
+        )
+        from vllm.quixicore.ops import quixicore_ops
+
+        quixicore_ops.glm5_mhc_allreduce(
+            self._ptr,
+            inp,
+            residual,
+            post_mix,
+            comb_mix,
+            fn,
+            residual_out,
+            partial,
+            self._glm5_mhc_arrivals,
+            scale,
+            base,
+            next_post,
+            next_comb,
+            layer_input,
+            norm_weight,
+            rms_eps,
+            hc_eps,
+            post_multiplier,
+            sinkhorn_repeat,
+            norm_eps,
+            0 if registered else self.buffer_ptrs[self.rank],
+            0 if registered else self.max_size,
+        )
+        return residual_out, next_post, next_comb, layer_input
+
+    def fused_all_reduce_glm5_mhc(
+        self,
+        inp: torch.Tensor,
+        residual: torch.Tensor,
+        post_mix: torch.Tensor,
+        comb_mix: torch.Tensor,
+        fn: torch.Tensor,
+        scale: torch.Tensor,
+        base: torch.Tensor,
+        norm_weight: torch.Tensor | None,
+        rms_eps: float,
+        hc_eps: float,
+        post_multiplier: float,
+        sinkhorn_repeat: int,
+        norm_eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """CUDA-graph-aware entry; None when the fused path does not apply
+        and the caller must all-reduce and run the transition itself."""
+        if self.disabled or not self.should_fuse_glm5_mhc(inp, residual):
+            return None
+        args = (
+            inp,
+            residual,
+            post_mix,
+            comb_mix,
+            fn,
+            scale,
+            base,
+            norm_weight,
+            rms_eps,
+            hc_eps,
+            post_multiplier,
+            sinkhorn_repeat,
+            norm_eps,
+        )
+        if self._IS_CAPTURING:
+            if torch.cuda.is_current_stream_capturing():
+                return self.all_reduce_glm5_mhc(*args, registered=True)
+            # Warmup only mimics the allocation pattern.
+            tokens = inp.shape[0]
+            device = inp.device
+            return (
+                torch.empty_like(residual),
+                torch.empty(
+                    (tokens, _GLM5_MHC_HC, 1), dtype=torch.float32, device=device
+                ),
+                torch.empty(
+                    (tokens, _GLM5_MHC_HC, _GLM5_MHC_HC),
+                    dtype=torch.float32,
+                    device=device,
+                ),
+                torch.empty((tokens, _GLM5_MHC_HIDDEN), dtype=inp.dtype, device=device),
+            )
+        return self.all_reduce_glm5_mhc(*args, registered=False)
+
+    def join_glm5_mhc(self) -> None:
+        """Every consumer of a fused site's comb output (the next site, the
+        model's stream reads) orders itself behind the deferred sinkhorn; a
+        graph capture must join before it ends."""
+        if self.disabled:
+            return
+        from vllm.quixicore.ops import quixicore_ops
+
+        quixicore_ops.glm5_mhc_join(self._ptr)
 
     def should_fuse_dsv4_mhc(
         self, inp: torch.Tensor, residual: torch.Tensor

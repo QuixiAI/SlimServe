@@ -54,7 +54,8 @@ from vllm.model_executor.layers.glm5_next_pool_cache import (
     cached_pool_logits,
     update_pool_cache,
 )
-from vllm.model_executor.layers.linear import ReplicatedLinear
+import vllm.model_executor.layers.fused_moe.router.gate_linear  # noqa: F401  (registers torch.ops.vllm.dsv4_ampere_router_gemm)
+from vllm.model_executor.layers.linear import ReplicatedLinear, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
 )
@@ -89,6 +90,16 @@ _ROW_DIM = 2 * _K_DIM  # [k | gate]
 _POOL_PROGRAMS = 128  # programs per row on the pool axis (stride loop inside)
 
 
+def _compact_cache_qualified() -> bool:
+    # Parts where the compact page format has passed its parity and serving
+    # gates: A100 (2026-09-09) and RTX PRO 6000 Blackwell (2026-09-12,
+    # perf/optimization_status.md Phase 5).
+    return current_platform.is_cuda() and (
+        current_platform.is_device_capability((8, 0))
+        or current_platform.is_device_capability((12, 0))
+    )
+
+
 def _compact_decode_options(vllm_config, heads):
     extra = vllm_config.additional_config or {}
     flags = []
@@ -113,8 +124,7 @@ def _row_shard_option(vllm_config, heads):
         return False
     parallel = vllm_config.parallel_config
     if (
-        not current_platform.is_cuda()
-        or not current_platform.is_device_capability((8, 0))
+        not _compact_cache_qualified()
         or heads != 32
         or parallel.tensor_parallel_size not in (4, 8)
         or parallel.pipeline_parallel_size != 1
@@ -123,8 +133,8 @@ def _row_shard_option(vllm_config, heads):
         # Rows are sharded over the replica's own TP group, so DP replicas
         # are independent; TP4 shards 16/32 rows as 4/8 per rank.
         raise ValueError(
-            "Indexer row sharding requires SM80, TP4 or TP8 with PP1, "
-            "32 indexer heads and the compact cache"
+            "Indexer row sharding requires SM80 or SM120, TP4 or TP8 with "
+            "PP1, 32 indexer heads and the compact cache"
         )
     return True
 
@@ -140,17 +150,28 @@ def _row_shard_dispatch(enabled, rows, num_prefills, next_n):
 
 def _cache_row_dim(vllm_config: VllmConfig, kp: int) -> int:
     extra = vllm_config.additional_config
-    enabled = extra.get("glm5_next_compact_indexer_cache", False) if isinstance(extra, dict) else False
+    enabled = (
+        extra.get("glm5_next_compact_indexer_cache", False)
+        if isinstance(extra, dict)
+        else False
+    )
     if not isinstance(enabled, bool):
         raise ValueError("glm5_next_compact_indexer_cache must be a boolean")
     if not enabled:
         return _ROW_DIM
-    if not (current_platform.is_cuda() and current_platform.is_device_capability((8, 0))):
-        raise ValueError("Compact GLM indexer cache is currently qualified only on SM80")
-    num_spec = (vllm_config.speculative_config.num_speculative_tokens
-                if vllm_config.speculative_config else 0)
+    if not _compact_cache_qualified():
+        raise ValueError(
+            "Compact GLM indexer cache is qualified on SM80 and SM120 only"
+        )
+    num_spec = (
+        vllm_config.speculative_config.num_speculative_tokens
+        if vllm_config.speculative_config
+        else 0
+    )
     if kp != 4 or num_spec > 5:
-        raise ValueError("Compact GLM indexer cache requires kpool=4 and at most five speculative tokens")
+        raise ValueError(
+            "Compact GLM indexer cache requires kpool=4 and at most five speculative tokens"
+        )
     return POOL_CACHE_HEAD_DIM
 
 
@@ -196,7 +217,7 @@ def _insert_rows_kernel(
     cache_ptr,
     slot_ptr,
     num_tokens,
-    page_stride,    # elements between consecutive blocks' pages
+    page_stride,  # elements between consecutive blocks' pages
     BLOCK_SIZE: tl.constexpr,
     ROW: tl.constexpr,
     BLOCK_T: tl.constexpr,
@@ -226,17 +247,17 @@ def _insert_rows_kernel(
 
 @triton.jit
 def _pooled_logits_kernel(
-    q_ptr,          # [R, H, D] bf16
-    w_ptr,          # [R, H] fp32 (already * n_heads^-0.5)
-    ape_ptr,        # [KP, D] fp32
-    cache_ptr,      # [num_slots, ROW] bf16
-    bt_ptr,         # [num_bt_rows, bt_stride] int32
-    row_req_ptr,    # [R] int32: block-table row per query row
-    vis_ptr,        # [R] int32: visible tokens per query row
-    out_ptr,        # [R, max_pools] fp32
+    q_ptr,  # [R, H, D] bf16
+    w_ptr,  # [R, H] fp32 (already * n_heads^-0.5)
+    ape_ptr,  # [KP, D] fp32
+    cache_ptr,  # [num_slots, ROW] bf16
+    bt_ptr,  # [num_bt_rows, bt_stride] int32
+    row_req_ptr,  # [R] int32: block-table row per query row
+    vis_ptr,  # [R] int32: visible tokens per query row
+    out_ptr,  # [R, max_pools] fp32
     max_pools,
     bt_stride,
-    page_stride,    # elements between consecutive blocks' pages
+    page_stride,  # elements between consecutive blocks' pages
     softmax_scale,
     BLOCK_SIZE: tl.constexpr,
     H: tl.constexpr,
@@ -277,13 +298,12 @@ def _pooled_logits_kernel(
             mask=pmask[:, None],
             other=0,
         )
-        base = cache_ptr + (
-            blk.to(tl.int64) * page_stride + (tok % BLOCK_SIZE) * ROW
-        )[:, :, None]  # [P, KP, 1]
+        base = (
+            cache_ptr
+            + (blk.to(tl.int64) * page_stride + (tok % BLOCK_SIZE) * ROW)[:, :, None]
+        )  # [P, KP, 1]
         k = tl.load(base + d[None, None, :], mask=pmask[:, None, None], other=0.0)
-        g = tl.load(
-            base + D + d[None, None, :], mask=pmask[:, None, None], other=0.0
-        )
+        g = tl.load(base + D + d[None, None, :], mask=pmask[:, None, None], other=0.0)
         logits_g = g.to(tl.float32) + ape[None, :, :]  # [P, KP, D]
         # softmax over the pool members (axis 1), per channel
         mx = tl.max(logits_g, axis=1)  # [P, D]
@@ -301,9 +321,9 @@ def _pooled_logits_kernel(
 
 @triton.jit
 def _expand_topk_kernel(
-    sel_ptr,        # [R, KSEL] int32 pool indices (-1 invalid), valid first
-    vis_ptr,        # [R] int32
-    out_ptr,        # [R, OUT_W] int32
+    sel_ptr,  # [R, KSEL] int32 pool indices (-1 invalid), valid first
+    vis_ptr,  # [R] int32
+    out_ptr,  # [R, OUT_W] int32
     sel_stride,
     KP: tl.constexpr,
     KSEL: tl.constexpr,
@@ -342,7 +362,9 @@ def _expand_topk_kernel(
     for c0 in range(0, OUT_W, 256):
         c = c0 + tl.arange(0, 256)
         cm = (c >= pad0) & (c < OUT_W)
-        tl.store(out_ptr + r.to(tl.int64) * OUT_W + c, tl.full((256,), -1, tl.int32), mask=cm)
+        tl.store(
+            out_ptr + r.to(tl.int64) * OUT_W + c, tl.full((256,), -1, tl.int32), mask=cm
+        )
 
 # ------------------------------------------------- native (Metal / CPU) producer
 #
@@ -740,22 +762,21 @@ def _prefill_query_requests(chunk) -> torch.Tensor:
     # need not belong to the R queries. Each query's cu_seqlen_ks identifies
     # its request's start in that KV span, so gather the map at those starts.
     # No device-to-host readback; int32 index_select preserves the row dtype.
-    assert (chunk.local_cu_seq_lens is None
-            or chunk.local_cu_seq_lens is chunk.cu_seq_lens), (
-        "GLM pooled prefill query mapping requires unsharded KV row bounds"
-    )
+    assert (
+        chunk.local_cu_seq_lens is None or chunk.local_cu_seq_lens is chunk.cu_seq_lens
+    ), "GLM pooled prefill query mapping requires unsharded KV row bounds"
     return torch.index_select(chunk.token_to_seq, 0, chunk.cu_seqlen_ks)
 
 
 def _pooled_topk(
-    q: torch.Tensor,           # [R, H, D] bf16
-    weights: torch.Tensor,     # [R, H] fp32
-    ape: torch.Tensor,         # [KP, D] fp32
-    cache: torch.Tensor,       # [num_blocks, BS, ROW] bf16 (pages may be strided)
-    block_table: torch.Tensor, # [rows_bt, stride] int32
-    row_req: torch.Tensor,     # [R] int32
-    visible: torch.Tensor,     # [R] int32
-    logits: torch.Tensor,      # [R, max_pools] fp32 workspace
+    q: torch.Tensor,  # [R, H, D] bf16
+    weights: torch.Tensor,  # [R, H] fp32
+    ape: torch.Tensor,  # [KP, D] fp32
+    cache: torch.Tensor,  # [num_blocks, BS, ROW] bf16 (pages may be strided)
+    block_table: torch.Tensor,  # [rows_bt, stride] int32
+    row_req: torch.Tensor,  # [R] int32
+    visible: torch.Tensor,  # [R] int32
+    logits: torch.Tensor,  # [R, max_pools] fp32 workspace
     max_pools: int,
     block_size: int,
     softmax_scale: float,
@@ -777,7 +798,9 @@ def _pooled_topk(
                 adaptive_pool_logits,
             )
 
-            adaptive_pool_logits(q, weights, cache, block_table, row_req, visible, logits)
+            adaptive_pool_logits(
+                q, weights, cache, block_table, row_req, visible, logits
+            )
         elif 2 <= group <= 8 and R % group == 0:
             # Speculative verify rows of one request share their history:
             # read each pool tile once for all `group` rows.
@@ -792,16 +815,37 @@ def _pooled_topk(
             cached_pool_logits(q, weights, cache, block_table, row_req, visible, logits)
     else:
         _pooled_logits_kernel[grid](
-            q, weights, ape, cache, block_table, row_req, visible,
-            logits, max_pools, block_table.stride(0), cache.stride(0), softmax_scale,
-            BLOCK_SIZE=block_size, H=H, D=D, KP=kp, ROW=_ROW_DIM, BLOCK_P=BLOCK_P,
+            q,
+            weights,
+            ape,
+            cache,
+            block_table,
+            row_req,
+            visible,
+            logits,
+            max_pools,
+            block_table.stride(0),
+            cache.stride(0),
+            softmax_scale,
+            BLOCK_SIZE=block_size,
+            H=H,
+            D=D,
+            KP=kp,
+            ROW=_ROW_DIM,
+            BLOCK_P=BLOCK_P,
         )
     # top-k over pools: prefill-style ranges [0, n_pools) per row.
     n_pools = torch.div(visible, kp, rounding_mode="floor").to(torch.int32)
     zeros = torch.zeros_like(n_pools)
     sel = torch.empty((R, ksel), dtype=torch.int32, device=q.device)
     ops.top_k_per_row_prefill(
-        logits[:R], zeros, n_pools, sel, R, logits.stride(0), logits.stride(1),
+        logits[:R],
+        zeros,
+        n_pools,
+        sel,
+        R,
+        logits.stride(0),
+        logits.stride(1),
         ksel,
     )
     return sel
@@ -830,7 +874,9 @@ def _pooled_select(
         from vllm.distributed import get_tp_group
 
         group = get_tp_group()
-        assert group.world_size in (4, 8) and 0 <= group.rank_in_group < group.world_size
+        assert (
+            group.world_size in (4, 8) and 0 <= group.rank_in_group < group.world_size
+        )
         assert R in (16, 32) and q.shape[1:] == (32, 128)
         assert cache.shape[-1] == POOL_CACHE_HEAD_DIM and kp == 4 and ksel == 512
         assert not adaptive_score
@@ -843,9 +889,19 @@ def _pooled_select(
         lo = group.rank_in_group * local_rows
         hi = lo + local_rows
         local_sel = _pooled_topk(
-            q[lo:hi], weights[lo:hi], ape, cache, block_table,
-            row_req[lo:hi], visible[lo:hi], logits[:local_rows],
-            max_pools, block_size, softmax_scale, ksel, kp,
+            q[lo:hi],
+            weights[lo:hi],
+            ape,
+            cache,
+            block_table,
+            row_req[lo:hi],
+            visible[lo:hi],
+            logits[:local_rows],
+            max_pools,
+            block_size,
+            softmax_scale,
+            ksel,
+            kp,
             group=row_group if local_rows % max(row_group, 1) == 0 else 1,
         )
         sel = torch.empty((R, ksel), dtype=torch.int32, device=q.device)
@@ -855,13 +911,31 @@ def _pooled_select(
         pynccl.all_gather(sel, local_sel)
     else:
         sel = _pooled_topk(
-            q, weights, ape, cache, block_table, row_req, visible, logits,
-            max_pools, block_size, softmax_scale, ksel, kp, adaptive_score,
+            q,
+            weights,
+            ape,
+            cache,
+            block_table,
+            row_req,
+            visible,
+            logits,
+            max_pools,
+            block_size,
+            softmax_scale,
+            ksel,
+            kp,
+            adaptive_score,
             group=row_group,
         )
     _expand_topk_kernel[(R,)](
-        sel, visible, topk_out, sel.stride(0),
-        KP=kp, KSEL=ksel, OUT_W=topk_out.shape[1], BLOCK_S=64,
+        sel,
+        visible,
+        topk_out,
+        sel.stride(0),
+        KP=kp,
+        KSEL=ksel,
+        OUT_W=topk_out.shape[1],
+        BLOCK_S=64,
     )
 
 
@@ -910,8 +984,14 @@ def glm5_next_pooled_indexer(
             _insert_rows_native(packed[:num_tokens], cache, md.slot_mapping)
     else:
         _insert_rows_kernel[(triton.cdiv(num_tokens, BLOCK_T),)](
-            packed[:num_tokens], cache, md.slot_mapping, num_tokens, cache.stride(0),
-            BLOCK_SIZE=block_size, ROW=_ROW_DIM, BLOCK_T=BLOCK_T,
+            packed[:num_tokens],
+            cache,
+            md.slot_mapping,
+            num_tokens,
+            cache.stride(0),
+            BLOCK_SIZE=block_size,
+            ROW=_ROW_DIM,
+            BLOCK_T=BLOCK_T,
         )
     topk_indices_buffer[: q.shape[0]] = -1
     # Valid prefix length per row (Metal native producer writes the exact
@@ -928,9 +1008,7 @@ def glm5_next_pooled_indexer(
             visible = (chunk.cu_seqlen_ke - chunk.cu_seqlen_ks).to(torch.int32)
             row_req = _prefill_query_requests(chunk)
             max_pools = max(1, chunk.max_seq_len // kp)
-            logits = torch.empty(
-                (R, max_pools), dtype=torch.float32, device=q.device
-            )
+            logits = torch.empty((R, max_pools), dtype=torch.float32, device=q.device)
             _pooled_select(
                 q[chunk.token_start:chunk.token_end],
                 weights[chunk.token_start:chunk.token_end],
@@ -952,17 +1030,26 @@ def glm5_next_pooled_indexer(
         else:
             next_n = max(1, R // max(1, seq_lens.shape[0]))
             j = torch.arange(R, device=q.device, dtype=torch.int32) % next_n
-            visible = (
-                seq_lens.repeat_interleave(next_n)[:R] - next_n + j + 1
-            ).to(torch.int32)
-        row_req = (
-            torch.arange(R, device=q.device, dtype=torch.int32) // next_n
-        )
+            visible = (seq_lens.repeat_interleave(next_n)[:R] - next_n + j + 1).to(
+                torch.int32
+            )
+        row_req = torch.arange(R, device=q.device, dtype=torch.int32) // next_n
         max_pools = decode_logits.shape[1]
         _pooled_select(
-            q[:R], weights[:R], ape, cache, dm.block_table, row_req, visible,
-            decode_logits, max_pools, block_size, softmax_scale, ksel,
-            topk_indices_buffer[:R], kp,
+            q[:R],
+            weights[:R],
+            ape,
+            cache,
+            dm.block_table,
+            row_req,
+            visible,
+            decode_logits,
+            max_pools,
+            block_size,
+            softmax_scale,
+            ksel,
+            topk_indices_buffer[:R],
+            kp,
             adaptive_score=adaptive_score,
             row_shard=_row_shard_dispatch(row_shard_decode, R, md.num_prefills, next_n),
             # Decode rows are request-major (row_req = arange // next_n), so a
@@ -1000,6 +1087,44 @@ direct_register_custom_op(
 # --------------------------------------------------------------------- module
 
 
+def packed_indexer_projection(
+    wk: nn.Module, gate: torch.Tensor, weights_proj: nn.Module
+) -> torch.Tensor | None:
+    """[wk | gate | weights_proj] rows as one contiguous bf16 [N, hidden]
+    weight, or None when a row set is not a plain bf16 projection (a
+    quantized wk / weights_proj keeps the separate path)."""
+    rows = []
+    for module in (wk, weights_proj):
+        weight = getattr(module, "weight", None)
+        if (
+            getattr(module, "quant_method", None) is not None
+            and not isinstance(module.quant_method, UnquantizedLinearMethod)
+        ) or not isinstance(weight, torch.Tensor):
+            return None
+        if weight.dtype != torch.bfloat16 or weight.dim() != 2:
+            return None
+        rows.append(weight.data)
+    if gate.dim() != 2 or gate.shape[1] != rows[0].shape[1]:
+        return None
+    rows.insert(1, gate.data.to(torch.bfloat16))
+    return torch.cat(rows, dim=0).contiguous()
+
+
+def apply_packed_indexer_projection(
+    hidden_states: torch.Tensor, packed_kw: torch.Tensor, head_dim: int, n_heads: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """One fp32-accumulating projection over the packed rows -> (k fp32
+    [T, head_dim], gate bf16 [T, head_dim], weights fp32 [T, n_heads])."""
+    if hidden_states.dtype == torch.bfloat16 and hidden_states.shape[-1] == 4096:
+        # The router GEMV (historical dsv4_ampere name, gate_linear.py):
+        # any bf16 [T, 4096] x [N, 4096] fp32-out projection at decode.
+        out = torch.ops.vllm.dsv4_ampere_router_gemm(hidden_states, packed_kw)
+    else:
+        out = torch.mm(hidden_states, packed_kw.T.to(hidden_states.dtype)).float()
+    k, gate, weights = out.split([head_dim, head_dim, n_heads], dim=-1)
+    return k, gate.to(torch.bfloat16), weights
+
+
 class Glm5NextPooledIndexer(nn.Module):
     def __init__(
         self,
@@ -1018,7 +1143,9 @@ class Glm5NextPooledIndexer(nn.Module):
         )
         self.row_shard_decode = _row_shard_option(vllm_config, self.n_heads)
         if self.row_shard_decode and self.adaptive_score:
-            raise ValueError("Row sharding does not support experimental adaptive scoring")
+            raise ValueError(
+                "Row sharding does not support experimental adaptive scoring"
+            )
         self.head_dim = config.index_head_dim
         assert self.head_dim == _K_DIM
         self.index_topk = config.index_topk
@@ -1040,17 +1167,26 @@ class Glm5NextPooledIndexer(nn.Module):
         )
 
         self.wq_b = ReplicatedLinear(
-            config.q_lora_rank, self.n_heads * self.head_dim, bias=False,
-            quant_config=quant_config, prefix=f"{prefix}.wq_b",
+            config.q_lora_rank,
+            self.n_heads * self.head_dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.wq_b",
         )
         self.wk = ReplicatedLinear(
-            config.hidden_size, self.head_dim, bias=False,
-            quant_config=quant_config, prefix=f"{prefix}.wk",
+            config.hidden_size,
+            self.head_dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.wk",
         )
         self.k_norm = nn.LayerNorm(self.head_dim, eps=1e-6)
         self.weights_proj = ReplicatedLinear(
-            config.hidden_size, self.n_heads, bias=False,
-            quant_config=quant_config, prefix=f"{prefix}.weights_proj",
+            config.hidden_size,
+            self.n_heads,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.weights_proj",
         )
         self.index_kpool_compress_ape = nn.Parameter(
             torch.zeros(self.kp, self.head_dim), requires_grad=False
@@ -1138,6 +1274,25 @@ class Glm5NextPooledIndexer(nn.Module):
             self.n_head_scale,
         )
         return packed, weights
+        # wk | compress gate | weights_proj packed as one [2 * head_dim +
+        # n_heads, hidden] bf16 projection (build_packed_projection): the
+        # three separate small-N GEMMs cost 28 us per layer at decode, the
+        # 128 + 128 + 32 = 288-row projection is one router-shaped GEMV.
+        # The source rows stay resident (about 25 MB per rank over the
+        # model): the separate path still reads them and a weight reload
+        # rewrites them, so the pack is a copy, not an alias.
+        self.packed_kw: torch.Tensor | None = None
+
+    def build_packed_projection(self) -> None:
+        """Pack wk, the pool-compress gate and weights_proj into one bf16
+        projection once the weights are loaded (unquantized rows only)."""
+        if self.packed_kw is not None:
+            return
+        packed = packed_indexer_projection(
+            self.wk, self.index_kpool_compress_gate, self.weights_proj
+        )
+        if packed is not None:
+            self.packed_kw = packed
 
     def forward(
         self,
@@ -1154,20 +1309,25 @@ class Glm5NextPooledIndexer(nn.Module):
         if fused_pack is not None:
             packed, weights = fused_pack
         else:
-            k, _ = self.wk(hidden_states)
+            if self.packed_kw is not None:
+                k, gate, weights = apply_packed_indexer_projection(
+                    hidden_states, self.packed_kw, self.head_dim, self.n_heads
+                )
+            else:
+                k = self.wk(hidden_states)[0].float()
+                gate = torch.nn.functional.linear(
+                    hidden_states, self.index_kpool_compress_gate.to(hidden_states.dtype)
+                ).to(torch.bfloat16)
+                weights = self.weights_proj(hidden_states)[0].float()
             k = torch.nn.functional.layer_norm(
-                k.float(),
+                k,
                 (self.head_dim,),
                 self.k_norm.weight.float(),
                 self.k_norm.bias.float(),
                 self.k_norm.eps,
             ).to(torch.bfloat16)
-            gate = torch.nn.functional.linear(
-                hidden_states, self.index_kpool_compress_gate.to(hidden_states.dtype)
-            ).to(torch.bfloat16)
             packed = torch.cat([k, gate], dim=-1).contiguous()
-            weights, _ = self.weights_proj(hidden_states)
-            weights = (weights.float() * self.n_head_scale).contiguous()
+            weights = (weights * self.n_head_scale).contiguous()
         if self._ape_f32 is None or self._ape_f32.device != q.device:
             self._ape_f32 = self.index_kpool_compress_ape.float().contiguous()
         with _qc_phase("idx_op"):

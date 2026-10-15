@@ -24,10 +24,13 @@
 # limitations under the License.
 """Inference-only DeepseekV2/DeepseekV3 model."""
 
-import os
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
+
+import functools
+import os
+import re
 
 import torch
 from torch import nn
@@ -232,6 +235,14 @@ class DeepseekAttention(nn.Module):
         return output
 
 
+def silu_and_mul(swiglu_limit: float | None) -> nn.Module:
+    """SwiGLU, clamped when the checkpoint sets ``swiglu_limit`` (GLM-5.3:
+    gate capped at the limit, up clamped to +-limit before silu(gate) * up)."""
+    if swiglu_limit is None:
+        return SiluAndMul()
+    return SiluAndMulWithClamp(swiglu_limit)
+
+
 class DeepseekV2MLP(nn.Module):
     def __init__(
         self,
@@ -271,17 +282,14 @@ class DeepseekV2MLP(nn.Module):
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
-        # swiglu_limit (GLM-5.3-Flash `glm5-next.swiglu_limit` = 10): the
-        # DSV4-style clamp silu(min(gate, L)) * clamp(up, -L, L) that ds4
-        # applies on the dense, shared and routed FFNs alike. None keeps the
-        # plain SiluAndMul for every DeepSeek config that lacks the field.
-        if swiglu_limit is not None:
-            self.act_fn = SiluAndMulWithClamp(float(swiglu_limit))
-        else:
-            self.act_fn = SiluAndMul()
+        self.act_fn = silu_and_mul(swiglu_limit)
 
     def forward(self, x):
+        # Metal GGUF q8_0 pair-SwiGLU dispatch (opt-in), else the CUDA
+        # block-FP8 gated decode GEMM (opt-in), else the plain chain.
         act = _metal_pair_swiglu(self, x)
+        if act is None:
+            act = _fused_gate_up_act(self, x)
         if act is None:
             gate_up, _ = self.gate_up_proj(x)
             act = self.act_fn(gate_up)
@@ -348,6 +356,67 @@ def _metal_flags() -> dict[str, bool]:
     return {"shexp": _METAL_SHEXP}
 
 
+@functools.cache
+def _fp8_gated_enabled() -> bool:
+    """QC_FP8_GATED=1 folds the activation into the gate/up GEMM (one launch).
+    Off by default: measured level on the rtx6000 record (2026-09-18, notebook
+    "P15"): the shared experts run on a side stream that is not the decode
+    layer's critical path, so the saved launch buys nothing there."""
+    return os.environ.get("QC_FP8_GATED", "0") == "1"
+
+
+def _fused_gate_up_act(mlp: "DeepseekV2MLP", x: torch.Tensor) -> torch.Tensor | None:
+    """silu(clamp(gate)) * clamp(up) in the gate/up GEMM's epilogue for a decode
+    batch on the QuixiCore block-FP8 decode GEMM (the shared experts and the
+    dense MLP at M <= 16): one launch instead of the GEMM plus the activation
+    kernel. None when the layer, the batch or the platform is not the kernel's."""
+    if not _fp8_gated_enabled() or not current_platform.is_cuda():
+        return None
+    from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
+    from vllm.model_executor.layers.utils import (
+        DECODE_GEMM_MAX_TOKENS,
+        decode_gemm_fp8_enabled,
+        decode_gemm_fp8_supports,
+    )
+
+    act = mlp.act_fn
+    if isinstance(act, SiluAndMulWithClamp):
+        if act.alpha != 1.0 or act.beta != 0.0:
+            return None
+        clamp = act.swiglu_limit
+    elif isinstance(act, SiluAndMul):
+        clamp = None
+    else:
+        return None
+    layer = mlp.gate_up_proj
+    weight = getattr(layer, "weight", None)
+    scale = getattr(layer, "weight_scale", None)
+    if (
+        weight is None
+        or scale is None
+        or getattr(layer, "bias", None) is not None
+        or weight.dtype != torch.float8_e4m3fn
+        or weight.dim() != 2
+        or scale.dtype != torch.float32
+        or scale.dim() != 2
+        or x.dtype != torch.bfloat16
+        or not decode_gemm_fp8_enabled()
+    ):
+        return None
+    x2 = x.reshape(-1, x.shape[-1])
+    n, k = weight.shape
+    if x2.shape[0] == 0 or x2.shape[0] > DECODE_GEMM_MAX_TOKENS or n % 64 or not decode_gemm_fp8_supports(n, k):
+        return None
+    if scale.shape != ((n + 127) // 128, k // 128):
+        return None
+    from vllm.quixicore.ops import quixicore_ops
+
+    if not quixicore_ops.has_decode_gemm_fp8_gated():
+        return None
+    out = quixicore_ops.decode_gemm_fp8_gated(x2.contiguous(), weight, scale, clamp)
+    return out.view(*x.shape[:-1], n // 2)
+
+
 def _fused_ar_rms_norm(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
@@ -368,6 +437,19 @@ def _fused_ar_rms_norm(
             return out, residual
     hidden_states = tensor_model_parallel_all_reduce(hidden_states)
     return norm(hidden_states, residual)
+
+
+def _shared_expert_sidecar_serves(prefix: str) -> bool:
+    """Whether the NVFP4 shared-expert sidecar (SLIMSERVE_NVFP4_SHARED_SWAPSET)
+    serves the shared expert of the MoE layer at ``prefix`` as expert E."""
+    from slimserve.nvfp4_swapset import shared_expert_layers
+
+    model_config = get_current_vllm_config().model_config
+    layers = shared_expert_layers(model_config.model if model_config else None)
+    if not layers:
+        return False
+    m = re.search(r"\.layers\.(\d+)\.", prefix)
+    return m is not None and int(m.group(1)) in layers
 
 
 class DeepseekV2MoE(nn.Module):
@@ -393,6 +475,9 @@ class DeepseekV2MoE(nn.Module):
         self.n_shared_experts: int = config.n_shared_experts
 
         self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
+        # GLM-5.3 clamps the SwiGLU inputs in every expert (checkpoint field
+        # swiglu_limit); DeepSeek configs carry no such field.
+        self.swiglu_limit: float | None = getattr(config, "swiglu_limit", None)
 
         if config.hidden_act != "silu":
             raise ValueError(
@@ -446,7 +531,15 @@ class DeepseekV2MoE(nn.Module):
             # Accumulates in fp32; avoids bf16->fp32 cast.
             self.gate.set_out_dtype(self.gate.weight.dtype)
 
-        if config.n_shared_experts is None or self.is_fusion_moe_shared_experts_enabled:
+        # The NVFP4 shared-expert sidecar (slimserve.nvfp4_swapset
+        # --shared-experts) serves this layer's shared expert as one more
+        # routed-format expert: no shared MLP, one fused slot per token.
+        self.fuse_shared_expert_sidecar = _shared_expert_sidecar_serves(prefix)
+        if (
+            config.n_shared_experts is None
+            or self.is_fusion_moe_shared_experts_enabled
+            or self.fuse_shared_expert_sidecar
+        ):
             self.shared_experts = None
         else:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
@@ -459,12 +552,11 @@ class DeepseekV2MoE(nn.Module):
                 is_sequence_parallel=self.is_sequence_parallel,
                 reduce_results=False,
                 prefix=f"{prefix}.shared_experts",
-                swiglu_limit=getattr(config, "swiglu_limit", None),
+                swiglu_limit=self.swiglu_limit,
             )
 
         self.experts = FusedMoE(
             shared_experts=self.shared_experts,
-            swiglu_limit=getattr(config, "swiglu_limit", None),
             gate=self.gate,
             num_experts=config.n_routed_experts,
             top_k=config.num_experts_per_tok,
@@ -485,9 +577,11 @@ class DeepseekV2MoE(nn.Module):
             is_sequence_parallel=self.is_sequence_parallel,
             reduce_results=reduce_results,
             n_shared_experts=config.n_shared_experts
-            if self.is_fusion_moe_shared_experts_enabled
+            if self.is_fusion_moe_shared_experts_enabled or self.fuse_shared_expert_sidecar
             else None,
+            fuse_shared_experts=self.fuse_shared_expert_sidecar,
             router_logits_dtype=self.gate.out_dtype,
+            swiglu_limit=self.swiglu_limit,
         )
 
         if (
