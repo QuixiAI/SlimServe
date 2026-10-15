@@ -160,6 +160,9 @@ behavior:
 
 - Live validation must discover every registry profile compatible with the
   current machine. Do not substitute one tensor-parallel size for another.
+  It covers LLM (`kind: "llm"`) profiles by serving and smoking each one;
+  video profiles are validated by `perf/ltx25_harness/n6_serve_check.py`
+  run on a Mac against the real profile.
 - Every supported profile must run with its registered DSpark drafter and
   registered draft KV configuration. FP8 is the only permitted KV cache
   quantization; TurboQuant is prohibited for targets and drafters.
@@ -205,8 +208,9 @@ behavior:
   calling, and thinking enabled, and NEVER uses greedy sampling. These are
   enforced as registry-level `_SERVING_DEFAULTS` plus explicit per-profile
   values and a registry test. Prefix caching admits NO opt-out: every
-  platform record states `enable_prefix_caching: true` and the registry
-  test rejects anything else (operator directive 2026-08-30). For the
+  LLM (`kind: "llm"`) platform record states `enable_prefix_caching: true`
+  and the registry test rejects anything else (operator directive
+  2026-08-30). For the
   others, a profile may opt out only for a model-level impossibility,
   stated in a note.
 - Never rely on engine-layer defaults for these: vLLM silently defaults

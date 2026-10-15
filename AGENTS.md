@@ -120,6 +120,9 @@ behavior:
 
 - Live validation must discover every registry profile compatible with the
   current machine. Do not substitute one tensor-parallel size for another.
+  It covers LLM (`kind: "llm"`) profiles by serving and smoking each one;
+  video profiles are validated by `perf/ltx25_harness/n6_serve_check.py`
+  run on a Mac against the real profile.
 - Every supported profile must run with its registered DSpark drafter and
   registered draft KV configuration. FP8 is the only permitted KV cache
   quantization; TurboQuant is prohibited for targets and drafters.
