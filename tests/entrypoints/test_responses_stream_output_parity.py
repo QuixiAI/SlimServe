@@ -447,3 +447,160 @@ def test_streamed_terminal_output_omits_unrequested_logprobs():
         assert events[-1].response.output[0].content[0].logprobs is None
 
     asyncio.run(run())
+
+
+_SPANNING_CHUNKS = [
+    # The second chunk carries the end marker with the first message tokens.
+    [(200, "<think>"), (21, "plan")],
+    [(201, "</think>"), (22, "Hi"), (23, " there")],
+]
+_SCAFFOLD_CHUNKS = [
+    # The template scaffold arrives alone and produces no text delta.
+    [(200, "<think>"), (21, "plan")],
+    [(201, "</think>")],
+    [(24, "\n\n")],
+    [(22, "Hi"), (23, " there")],
+]
+
+
+def _reasoning_logprob_outputs(chunks):
+    from vllm.logprobs import Logprob
+
+    outputs = []
+    for i, chunk in enumerate(chunks):
+        last = i == len(chunks) - 1
+        outputs.append(
+            CompletionOutput(
+                index=0,
+                text="".join(text for _, text in chunk),
+                token_ids=[token_id for token_id, _ in chunk],
+                cumulative_logprob=None,
+                logprobs=[
+                    {token_id: Logprob(-0.5, rank=1, decoded_token=text)}
+                    for token_id, text in chunk
+                ],
+                finish_reason="stop" if last else None,
+            )
+        )
+    return outputs
+
+
+@pytest.mark.parametrize(
+    ("chunks", "expected"),
+    [
+        (_SPANNING_CHUNKS, ["Hi", " there"]),
+        (_SCAFFOLD_CHUNKS, ["\n\n", "Hi", " there"]),
+    ],
+)
+def test_output_text_logprobs_cover_only_message_tokens_with_reasoning_parser(
+    chunks, expected
+):
+    """Streamed and non-streamed output_text logprobs exclude reasoning and
+    its markers, even when one chunk spans the reasoning boundary."""
+
+    tokenizer = make_mock_tokenizer({"<think>": 200, "</think>": 201})
+
+    def parsed_context():
+        context = SimpleContext()
+        context.response_parser = Qwen3Parser(tokenizer, tools=[])
+        return context
+
+    async def feed(context, request):
+        for output in _reasoning_logprob_outputs(chunks):
+            context.append_output(
+                RequestOutput(
+                    request_id=request.request_id,
+                    prompt="test",
+                    prompt_token_ids=[1],
+                    prompt_logprobs=None,
+                    finished=output.finish_reason is not None,
+                    outputs=[output],
+                )
+            )
+            yield context
+
+    async def run():
+        request = ResponsesRequest(
+            model="test",
+            input="test",
+            store=False,
+            include=["message.output_text.logprobs"],
+        )
+        params = SamplingParams(max_tokens=16, logprobs=1)
+
+        context = parsed_context()
+        events = [
+            event
+            async for event in _logprob_serving().responses_stream_generator(
+                request,
+                params,
+                feed(context, request),
+                context,
+                "test",
+                tokenizer,
+                RequestResponseMetadata(request_id=request.request_id),
+            )
+        ]
+        streamed = [
+            logprob.token
+            for event in events
+            if event.type == "response.output_text.delta"
+            for logprob in event.logprobs
+        ]
+        terminal = events[-1]
+        assert terminal.type == "response.completed"
+        message = next(i for i in terminal.response.output if i.type == "message")
+        streamed_part = message.content[0]
+
+        context = parsed_context()
+        async for _ in feed(context, request):
+            pass
+        reference = await _logprob_serving().responses_full_generator(
+            request,
+            params,
+            feed(SimpleContext(), request),
+            context,
+            "test",
+            tokenizer,
+            RequestResponseMetadata(request_id=request.request_id),
+        )
+        reference_message = next(i for i in reference.output if i.type == "message")
+        reference_part = reference_message.content[0]
+
+        assert streamed_part.text == reference_part.text == "Hi there"
+        assert streamed == expected
+        assert [lp.token for lp in reference_part.logprobs] == expected
+        assert streamed_part.logprobs == reference_part.logprobs
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("output", "prompt", "expected"),
+    [
+        ([200, 21], [1], 0),  # still reasoning
+        ([200, 21, 201], [1], 0),  # end marker is not content
+        ([200, 21, 201, 22, 23], [1], 2),
+        ([22, 23], [200, 5, 201], 2),  # prompt already closed reasoning
+    ],
+)
+def test_delegating_parser_content_token_count(output, prompt, expected):
+    from vllm.parser.abstract_parser import DelegatingParser
+    from vllm.reasoning.deepseek_r1_reasoning_parser import (
+        DeepSeekR1ReasoningParser,
+    )
+
+    class _Parser(DelegatingParser):
+        reasoning_parser_cls = DeepSeekR1ReasoningParser
+
+    parser = _Parser(make_mock_tokenizer({"<think>": 200, "</think>": 201}))
+    assert parser.content_token_count(output, prompt) == expected
+
+
+@pytest.mark.parametrize(
+    ("output", "expected"),
+    [([200, 21], 0), ([200, 21, 201], 0), ([21, 201, 22, 201, 23], 3)],
+)
+def test_engine_parser_content_token_count(output, expected):
+    tokenizer = make_mock_tokenizer({"<think>": 200, "</think>": 201})
+    assert Qwen3Parser(tokenizer, tools=[]).content_token_count(output) == expected

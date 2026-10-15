@@ -908,6 +908,7 @@ class OpenAIServingResponses(GenerateBaseServing):
                     final_output,
                     tokenizer,
                     parser=context.response_parser,
+                    prompt_token_ids=final_res.prompt_token_ids,
                 )
             )
 
@@ -1130,6 +1131,7 @@ class OpenAIServingResponses(GenerateBaseServing):
         final_output: CompletionOutput,
         tokenizer: TokenizerLike,
         parser: Parser | None = None,
+        prompt_token_ids: list[int] | None = None,
     ) -> list[ResponseOutputItem]:
         # Log complete response if output logging is enabled
         if self.enable_log_outputs and self.request_logger:
@@ -1163,6 +1165,14 @@ class OpenAIServingResponses(GenerateBaseServing):
             if not request.include_reasoning:
                 reasoning = None
                 logprobs = None
+            elif logprobs is not None:
+                # output_text carries only the message's own tokens: not the
+                # reasoning or its end marker. The streaming path attributes
+                # each chunk with the same parser boundary.
+                content_tokens = parser.content_token_count(
+                    final_output.token_ids, prompt_token_ids
+                )
+                logprobs = logprobs[len(logprobs) - content_tokens :] or None
             return build_response_output_items(
                 reasoning=reasoning,
                 content=content,
@@ -1456,19 +1466,33 @@ class OpenAIServingResponses(GenerateBaseServing):
 
         hide_stream_metadata = not request.include_reasoning and self.parser is not None
 
+        # Message logprobs are attributed with the parser's reasoning boundary
+        # (Parser.content_token_count), as in the non-streaming response: a
+        # chunk that ends reasoning and starts the message contributes only
+        # its message tokens. Content-phase tokens whose text the parser has
+        # not surfaced yet (deferred whitespace, the template scaffold) wait
+        # here and are reported with the next content delta.
+        generated_token_ids: list[int] = []
+        content_tokens_so_far = 0
+        pending_token_ids: list[int] = []
+        pending_logprobs: SampleLogprobs = []
+
         def _get_logprobs(
             output: CompletionOutput,
         ) -> list[response_text_delta_event.Logprob]:
             if not request.is_include_output_logprobs():
                 return []
-            if hide_stream_metadata:
+            if hide_stream_metadata or not pending_token_ids:
                 return []
-            return self._create_stream_response_logprobs(
-                token_ids=output.token_ids,
-                logprobs=output.logprobs,
+            logprobs = self._create_stream_response_logprobs(
+                token_ids=list(pending_token_ids),
+                logprobs=list(pending_logprobs),
                 tokenizer=tokenizer,
                 top_logprobs=request.top_logprobs,
             )
+            pending_token_ids.clear()
+            pending_logprobs.clear()
+            return logprobs
 
         async for ctx in result_generator:
             assert isinstance(ctx, SimpleContext)
@@ -1480,6 +1504,26 @@ class OpenAIServingResponses(GenerateBaseServing):
             self._raise_if_error(output.finish_reason, request.request_id)
             delta_text = output.text
             delta_token_ids = as_list(output.token_ids)
+
+            if request.is_include_output_logprobs() and output.logprobs:
+                chunk_content_tokens = len(delta_token_ids)
+                if ctx.response_parser:
+                    generated_token_ids.extend(delta_token_ids)
+                    # Once the message has started every later token is
+                    # content; only rescan while still inside reasoning.
+                    if not content_tokens_so_far:
+                        content_tokens_so_far = ctx.response_parser.content_token_count(
+                            generated_token_ids,
+                            ctx.last_output.prompt_token_ids,
+                        )
+                        chunk_content_tokens = min(
+                            content_tokens_so_far, len(delta_token_ids)
+                        )
+                    else:
+                        content_tokens_so_far += len(delta_token_ids)
+                if chunk_content_tokens:
+                    pending_token_ids.extend(delta_token_ids[-chunk_content_tokens:])
+                    pending_logprobs.extend(output.logprobs[-chunk_content_tokens:])
 
             if ctx.response_parser:
                 delta_message = ctx.response_parser.parse_delta(
