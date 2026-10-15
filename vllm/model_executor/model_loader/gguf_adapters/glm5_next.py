@@ -548,10 +548,23 @@ class Glm5NextGGUFAdapter(GGUFWeightsAdapter):
         self._mtp_layer = int(text_config.num_hidden_layers) if is_mtp else None
 
         present: dict[str, tuple[int, ...]] = {}
-        for gguf_file in self._get_all_gguf_files(model_config.model):
+        gguf_files = self._get_all_gguf_files(model_config.model)
+        for gguf_file in gguf_files:
             for tensor in gguf_reader(gguf_file).tensors:
                 present[tensor.name] = tuple(int(d) for d in reversed(tensor.shape))
-        verify_tensor_shapes(present, text_config)
+        verify_cfg: Any = text_config
+        if is_mtp:
+            # The draft config carries hc_mult 1 (the nextn head drafts from
+            # the contracted post-norm state, SpeculativeConfig.hf_config_override),
+            # but the file's trunk blocks are still hc_mult streams wide:
+            # verify them against the width the file declares.
+            from vllm.transformers_utils.gguf_glm5_next import (
+                text_config_fields_from_gguf,
+            )
+
+            verify_cfg = dict(text_config.to_dict())
+            verify_cfg["hc_mult"] = text_config_fields_from_gguf(gguf_files[0])["hc_mult"]
+        verify_tensor_shapes(present, verify_cfg)
 
         name_map = build_name_map_for(text_config, present, mtp=is_mtp)
         logger.info(
