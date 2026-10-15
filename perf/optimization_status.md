@@ -1,5 +1,97 @@
 # SlimServe Optimization Status
 
+## 2026-10-14 - PR #30 (GLM-5.3-Flash Q2 on Metal) merged with main and re-benchmarked sampled on a Mac Studio M4 Max
+
+- Box: Mac Studio M4 Max (40-core GPU, 128 GiB, macOS 27.0.1), Xcode 27.0 /
+  Metal toolchain 32023.921, Python 3.12.15, torch 2.13.0, transformers
+  5.19.0 (native glm5_next config classes). Clean machine; nothing of this
+  branch had run here before. The record's author box is an M1 Ultra
+  (64-core GPU, 128 GiB); numbers are not same-box comparable with the PR
+  description's, and ds4 was not rebuilt here, so the ds4 columns are not
+  re-measured.
+- What had to change before anything booted (all on the branch):
+  - c67458e00d `qgemv.metal`: two stray closing braces after the
+    swiglu_texm_grp instantiations (since 1059fd213e, 2026-09-25) left one
+    more `}` than `{`; the Metal library had not compiled from this branch
+    since then and the tracked metallib was never rebuilt from it.
+  - 1d3a5d7711 merge of main (PR #29): ten files in conflict, every one
+    resolved by keeping both sides - this branch's Metal phase profiler
+    wrappers, router-region overlap, pair-SwiGLU dispatch, native indexer
+    producer with the valid-prefix buffer and accumulate_ok fold, with
+    main's fold_shared deferred join, packed indexer projection, draft
+    lm_head and sm_120 norm fusion. The KDA layer keeps CUDA's in-place
+    output and Metal's returned output (each the path its records were
+    measured with). Two merge mistakes surfaced in testing and were fixed:
+    the packed_kw initialisation had landed after the return of
+    `_metal_pack_inputs` (a32dc5cb43, pushed upstream while the same fix was
+    being written here), and `test_metal_router_swiglu` /
+    `test_mhc_metal_parity` / `test_metal_shard_region` tracked renamed or
+    moved code (4cac10d6d4; the shard-region gate has served 2..8 rows
+    since 1059fd213e and its Python assertion still said 4).
+  - 471e6ad71c the qgemm_sm Xcode 27 stride fix (from PR #23), 449275e2d
+    the metallib rebuilt from the branch's sources (104 kernels),
+    51f8330a1e the triton importorskip for the CUDA route-align test.
+  - ba69549273 GGUF adapter: main sets the glm5_next_mtp draft config's
+    hc_mult to 1 (the nextn head drafts from the contracted post-norm
+    state) and the adapter verified every tensor of the file, trunk blocks
+    included, against the draft's config: 180 wrong shapes at boot. The
+    trunk width is read from the GGUF's hyper_connection.count for that
+    check.
+  - 18e3124f1b `slimserve --dry-run` printed the source's DFlash2 drafter
+    ("dflash k=7") while the engine booted the record's nextn MTP k=1;
+    it prints the record's speculator now.
+  - `join_glm5_mhc_deferred` (main) asserted a tensor-parallel group; the
+    Metal kernel tests call the registered ops without one, so it returns
+    instead (4cac10d6d4).
+- Tests on this box, native build at a32dc5cb43: `tests/kernels -k metal`
+  382 passed / 7 skipped; tests/slimserve, tests/glm5_next Metal parity,
+  tests/attention/test_metal_config, test_kda_native, test_glm5_next_gguf,
+  test_metal_mla_sparse_native 291 passed / 11 skipped; the new
+  test_indexer_packed_projection_init passes.
+- Two facts about serving this record on an M4 Max:
+  - The registry blocks it: `status: in-progress` makes the CLI refuse
+    `glm53f-q2-1` (its four review holds: vision off, context capped,
+    prefix cache 0.0% hits, greedy benchmarks). The boots below ran with a
+    validation-only local edit of that status, not committed.
+  - It does not fit the default Metal working set here: macOS grants this
+    M4 Max 107.5 GiB (the author's M1 Ultra ~115 GiB), the weights and
+    runtime take 99.99 GiB, 7 GiB is reserved for activations, and the
+    8 GiB KV pool collapses to 0.53 GiB, below the 2.75 GiB one 131072
+    request needs. `sudo sysctl iogpu.wired_limit_mb=122880` (120 GiB,
+    resets at reboot) is what made it serve; the record should state the
+    working-set requirement or a min_memory gate above 128 GiB nominal.
+- Boot (nextn MTP k=1 confirmed by the engine's speculative config, KV pool
+  381,513 tokens, model load 96 s warm): text and tool canaries pass
+  (tool call get_weather {"city": "Paris"}); the image canary is refused
+  with 400 as expected for language_model_only; the trivial text canary
+  returned 9 completion tokens and no reasoning field (see the probe
+  below).
+- Sampled exact-token bench (benchmarks/benchmark_dsv4_exact.py, 1000 in /
+  1000 out, temperature 1.0 / top-p 0.95 / top-k 20, seed 42, the record's
+  MTP drafter on; every width token-exact):
+
+  | concurrency | tok/s aggregate | accepted / drafted | median request |
+  | ---: | ---: | ---: | ---: |
+  | 1 | **30.21** | 372 / 628 | 33.1 s |
+  | 4 | **54.43** | 1923 / 2076 | 71.9 s |
+  | 8 | **62.31** | 3598 / 4399 | 118.5 s |
+  | 16 | **60.59** | 7127 / 8865 | 253.6 s |
+
+  The PR's greedy M1 Ultra figures for the same shape were 27.45 / 48.38 /
+  58.16 / 63.08; sampled at the fleet settings on this M4 Max the curve is
+  the same shape (c16 no better than c8). This closes review hold (4), the
+  greedy-only benchmarks; holds (1) to (3) stand.
+- Thinking probe: thinking is on. Under the record's `reasoning_effort: low`
+  (the GGUF's own template renders "Reasoning Effort: Low", the same levels
+  the A100 records use) the trivial prompt answers in 9 tokens with no
+  reasoning, while the bat-and-ball prompt reasons at every level: 26
+  reasoning chars at low, 58 at high, 621 at max, each with the right
+  answer. `enable_thinking: true` on the request changes nothing at low
+  (already on). A one-line canary that asserts a reasoning field on a
+  trivial prompt is the wrong check for this record.
+- Raw: `perf/results/2026-10-14/pr30-metal/` on studio128 (server logs,
+  gate/canaries.json, gate/exact_c{1,4,8,16}.json, thinking_probe.json).
+
 ## 2026-10-14 - glm53f-q2-1 review round: record back to in-progress; benchmarks were greedy
 
 - Status: review fixes, no performance claim. No Metal rebuild and no
