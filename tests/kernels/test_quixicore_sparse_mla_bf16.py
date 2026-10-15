@@ -52,7 +52,7 @@ def _reference(q, kv, idx, value_width):
 
 
 @pytest.mark.parametrize("heads", [8, 16])
-@pytest.mark.parametrize("partition_size", [0, 256, 128])
+@pytest.mark.parametrize("partition_size", [0, 256, 128, 64, 32])
 def test_nope_512_matches_reference(heads, partition_size):
     q, kv, bt, idx, tlen = _inputs(512, heads)
     out = qc.mla_decode_bf16_sparse_nope(
@@ -89,7 +89,9 @@ def _packed_view(kv: torch.Tensor, stride_mult: int = 3, offset_pages: int = 1):
     n, bs, w = kv.shape
     page = bs * w
     slab = torch.zeros(n * stride_mult * page, dtype=kv.dtype, device=DEV)
-    view = slab.view(n, stride_mult * page)[:, offset_pages * page : (offset_pages + 1) * page]
+    view = slab.view(n, stride_mult * page)[
+        :, offset_pages * page : (offset_pages + 1) * page
+    ]
     view = view.view(n, bs, w)
     view.copy_(kv)
     return view
@@ -104,7 +106,14 @@ def test_nope_512_strided_pages(partition_size):
     view = _packed_view(kv)
     assert not view.is_contiguous()
     strided = qc.mla_decode_bf16_sparse_nope(
-        q, view, bt, idx, tlen, BS, 1.0 / math.sqrt(512), partition_size,
+        q,
+        view,
+        bt,
+        idx,
+        tlen,
+        BS,
+        1.0 / math.sqrt(512),
+        partition_size,
         view.stride(0) * view.element_size(),
     )
     assert torch.equal(dense, strided)
@@ -117,7 +126,14 @@ def test_glm_576_strided_pages():
     )
     view = _packed_view(kv)
     strided = qc.mla_decode_bf16_sparse_glm(
-        q, view, bt, idx, tlen, BS, 1.0 / math.sqrt(576), 128,
+        q,
+        view,
+        bt,
+        idx,
+        tlen,
+        BS,
+        1.0 / math.sqrt(576),
+        128,
         view.stride(0) * view.element_size(),
     )
     assert torch.equal(dense, strided)
@@ -141,7 +157,14 @@ def _fp8_inputs(heads, kv_scale):
 def test_nope_512_fp8_matches_reference(heads, partition_size, kv_scale):
     q, data, dequant, bt, idx, tlen = _fp8_inputs(heads, kv_scale)
     out = qc.mla_decode_fp8_sparse_nope(
-        q, data.reshape(-1), bt, idx, tlen, BS, 1.0 / math.sqrt(512), kv_scale,
+        q,
+        data.reshape(-1),
+        bt,
+        idx,
+        tlen,
+        BS,
+        1.0 / math.sqrt(512),
+        kv_scale,
         partition_size,
     )
     ref = _reference(q, dequant, idx, 512)
@@ -154,7 +177,11 @@ def test_nope_512_fp8_tracks_bf16_within_fp8_error():
     the e4m3 rounding, bounded well inside a few percent."""
     q, kv, bt, idx, tlen = _inputs(512, 16)
     data = kv.to(torch.float8_e4m3fn).view(torch.uint8)
-    a = qc.mla_decode_bf16_sparse_nope(q, kv.reshape(-1), bt, idx, tlen, BS, 1.0 / math.sqrt(512), 128)
-    b = qc.mla_decode_fp8_sparse_nope(q, data.reshape(-1), bt, idx, tlen, BS, 1.0 / math.sqrt(512), 1.0, 128)
+    a = qc.mla_decode_bf16_sparse_nope(
+        q, kv.reshape(-1), bt, idx, tlen, BS, 1.0 / math.sqrt(512), 128
+    )
+    b = qc.mla_decode_fp8_sparse_nope(
+        q, data.reshape(-1), bt, idx, tlen, BS, 1.0 / math.sqrt(512), 1.0, 128
+    )
     err = (a.float() - b.float()).abs().max().item() / a.float().abs().max().item()
     assert err < 5e-2, err
