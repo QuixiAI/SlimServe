@@ -19,7 +19,7 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class Machine:
-    # "mi300x", "a100", "rtx3090", "rtx5090", "rtx6000", "metal",
+    # "mi300x", "a100", "rtx3090", "rtx5090", "rtx6000", "b70", "metal",
     # or None when unrecognized
     platform: str | None
     device_name: str
@@ -32,21 +32,34 @@ class Machine:
         return self.platform is not None
 
 
-_VISIBLE_VARS = (
-    "ROCR_VISIBLE_DEVICES",
-    "HIP_VISIBLE_DEVICES",
-    "CUDA_VISIBLE_DEVICES",
-)
+# Each vendor's runtime honours its own device mask, so only that vendor's
+# variables may shrink the count: a CUDA_VISIBLE_DEVICES left over in the
+# environment says nothing about how many Intel cards Level Zero exposes.
+# HIP also honours CUDA_VISIBLE_DEVICES, so it stays in the AMD list.
+_VISIBLE_VARS = {
+    "amd": ("ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"),
+    "nvidia": ("CUDA_VISIBLE_DEVICES",),
+    "intel": ("ZE_AFFINITY_MASK",),
+}
 
 
-def _visible_limit() -> int | None:
-    """How many devices the environment masks us down to, if it does."""
-    for var in _VISIBLE_VARS:
+def _mask_entries(var: str, value: str) -> int:
+    entries = [item.strip() for item in value.split(",") if item.strip()]
+    if var == "ZE_AFFINITY_MASK":
+        # Level Zero masks address sub-devices as "card.tile"; "0.0,0.1" is
+        # both tiles of one card, and the probe counts cards.
+        return len({item.split(".", 1)[0] for item in entries})
+    return len(entries)
+
+
+def _visible_limit(vendor: str) -> int | None:
+    """How many of this vendor's devices the environment masks us down to."""
+    for var in _VISIBLE_VARS.get(vendor, ()):
         value = os.environ.get(var)
         if value:
-            entries = [item for item in value.split(",") if item.strip()]
-            if entries:
-                return len(entries)
+            count = _mask_entries(var, value)
+            if count:
+                return count
     return None
 
 
@@ -132,6 +145,30 @@ def _sysctl(name: str) -> str | None:
     return value or None
 
 
+def _probe_intel_xpu() -> tuple[str, int] | None:
+    """Intel discrete GPUs via xpu-smi (no torch, no SYCL context)."""
+    try:
+        out = subprocess.run(
+            ["xpu-smi", "discovery"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    names = [
+        line.split("Device Name:", 1)[1].split("|")[0].strip()
+        for line in out.stdout.splitlines()
+        if "Device Name:" in line
+    ]
+    if not names:
+        return None
+    return names[0], len(names)
+
+
 def _probe_apple() -> Machine | None:
     """Apple Silicon: one GPU, and unified memory is the number that matters.
 
@@ -172,6 +209,8 @@ def _classify(device_name: str) -> str | None:
         return "rtx5090"
     if "rtx pro 6000" in lowered:
         return "rtx6000"
+    if "b70" in lowered and "arc" in lowered:
+        return "b70"
     return None
 
 
@@ -191,11 +230,20 @@ def detect() -> Machine:
     apple = _probe_apple()
     if apple is not None:
         return apple
-    probed = _probe_amd() or _probe_nvidia()
+    probed = None
+    vendor = None
+    for vendor, probe in (
+        ("amd", _probe_amd),
+        ("nvidia", _probe_nvidia),
+        ("intel", _probe_intel_xpu),
+    ):
+        probed = probe()
+        if probed is not None:
+            break
     if probed is None:
         return Machine(platform=None, device_name="none detected", count=0)
     device_name, count = probed
-    limit = _visible_limit()
+    limit = _visible_limit(vendor)
     if limit is not None:
         count = min(count, limit)
     return Machine(

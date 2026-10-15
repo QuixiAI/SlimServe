@@ -31395,3 +31395,13 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   canaries pass, gates -2.441 / -2.457, plain 228.8 / 778.3 / 1119.8 and
   228.7 / 771.9 / 1116.2, spec eight-pass medians 301.7 / 805.3 / 1125.3,
   0.975 per draft.
+
+## 2026-09-19 - Detect Intel Arc Pro B70 without initializing a GPU context
+
+- Status: retained for review.
+- Baseline: `origin/main`; forward-port from the B70 serving integration.
+- Change: Recognize B70 through xpu-smi, honor ZE_AFFINITY_MASK and register platform memory metadata; model qualification remains profile-specific. The `b70` platform is registered `in-progress`: main has no XPU serving backend yet, so the CLI gates every B70 profile until that backend lands.
+- Correctness: Four hardware-discovery tests and 72 existing profile tests passed on CPU.
+- Results: no new throughput measurement or hardware qualification claimed.
+- Decision: submit as a focused PR; preserve current-main behavior outside this fix.
+- Raw artifacts: none. CPU unit tests only (`tests/slimserve`); no performance measurement and no on-card run backs this entry.
