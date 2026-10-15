@@ -91,7 +91,10 @@ def _compute_global_residual_mass(
         # One-hot draft. M_s is a point mass at this draft token
         # so the residual mass reduces to the closed form:
         #   p * (1 - M_b(draft_token)).
+        # A placeholder (-1) draft has p == 0 from the cumulative pass; the
+        # clamp only keeps the load in range.
         draft_token = tl.load(draft_sampled_ptr + logit_idx + 1).to(tl.int64)
+        draft_token = tl.maximum(draft_token, 0)
         target_lse = _compute_global_logsumexp(
             target_local_max_ptr,
             target_local_max_stride,
@@ -360,6 +363,10 @@ def _compute_cumulative_log_p_kernel(
     for step in range(num_draft_tokens):
         logit_idx = start_idx + step
         draft_token = tl.load(draft_sampled_ptr + logit_idx + 1).to(tl.int64)
+        # -1 is used for padded draft token ids that should be rejected: the
+        # joint ratio of any prefix through them is zero.
+        is_valid_draft = draft_token >= 0
+        draft_token = tl.maximum(draft_token, 0)
         target_logprob, draft_logprob, _, _ = _compute_global_logprobs_and_logsumexp(
             draft_token,
             True,  # mask
@@ -384,6 +391,7 @@ def _compute_cumulative_log_p_kernel(
             HAS_DRAFT_LOGITS,
         )
         log_p = tl.minimum(log_p + (target_logprob - draft_logprob), 0.0)
+        log_p = tl.where(is_valid_draft, log_p, float("-inf"))
         tl.store(cumulative_log_p_ptr + logit_idx, log_p)
 
 
@@ -547,9 +555,13 @@ def _rejection_kernel(
     target_lse = 0.0
     draft_lse = 0.0
     accepted = True
+    # -1 is used for padded draft token ids that should be rejected; block
+    # verification accepts a prefix only while every draft in it is real.
+    drafts_valid = True
     for i in range(num_draft_tokens):
         logit_idx = start_idx + i
         draft_sampled = tl.load(draft_sampled_ptr + logit_idx + 1).to(tl.int64)
+        drafts_valid &= draft_sampled >= 0
         pos = tl.load(pos_ptr + logit_idx)
         u = tl_rand32(seed, pos, includes_zero=False)
         if USE_BLOCK_VERIFICATION and not is_greedy:
@@ -578,7 +590,7 @@ def _rejection_kernel(
                 h = tl.where(denom > 0.0, residual_mass / denom, 1.0)
             else:
                 h = prefix_joint_ratio
-            accepted_length = tl.where(u <= h, i + 1, accepted_length)
+            accepted_length = tl.where((u <= h) & drafts_valid, i + 1, accepted_length)
             tl.store(sampled_ptr + req_idx * sampled_stride + i, draft_sampled)
         elif accepted:
             if is_greedy:
@@ -738,9 +750,16 @@ def _resample_kernel(
     ).to(tl.float32)
     target_logits = _sanitize_nan(target_logits)
 
+    # The rejected draft token; -1 marks a padded placeholder that carries no
+    # draft distribution, so its row resamples from the target directly.
+    rejected_draft_token = tl.load(
+        draft_sampled_ptr + resample_token_idx + 1, mask=not is_bonus, other=-1
+    )
     # Compute the residual logits to resample the rejected token from.
     if is_bonus:
         # Bonus token (no rejections). Directly use the target logits.
+        residual_logits = target_logits
+    elif rejected_draft_token < 0:
         residual_logits = target_logits
     elif HAS_DRAFT_LOGITS:
         draft_logits = tl.load(
@@ -786,7 +805,6 @@ def _resample_kernel(
         #   p_tau * M_b(x) / Z  otherwise
         # Therefore p_tau is a constant that cancels under normalization,
         # and does not need to be applied.
-        rejected_draft_token = tl.load(draft_sampled_ptr + resample_token_idx + 1)
         residual_logits = tl.where(
             block != rejected_draft_token,
             target_logits,
@@ -973,6 +991,11 @@ def _rejection_sample_mps(
     valid = j.unsqueeze(0) < nd.unsqueeze(1)  # (R, cols) draft position i < nd
     tok = draft_sampled.to(torch.int64)[(rows + 1).clamp(max=num_logits - 1)]
     tok = torch.where(valid, tok, torch.zeros_like(tok))
+    # -1 marks padded placeholder drafts: never accepted, and a rejection on
+    # one resamples from the target rather than a residual.
+    placeholder = valid & (tok < 0)
+    valid = valid & ~placeholder
+    tok = tok.clamp(min=0)
 
     state = idx_mapping.to(torch.int64)  # (R,)
     temps = temperature[state].to(torch.float32)
@@ -1005,6 +1028,9 @@ def _rejection_sample_mps(
     n_acc = torch.cumprod(accept.to(torch.int64), dim=1).sum(dim=1)  # (R,)
     all_acc = n_acc == nd
     emit_row = (starts + n_acc).clamp(max=num_logits - 1)  # bonus or rejected row
+    rejected_placeholder = placeholder.gather(
+        1, n_acc.clamp(max=cols - 1).unsqueeze(1)
+    ).squeeze(1)
 
     p_emit = torch.softmax(target[emit_row], dim=-1)  # (R, V)
     if d_rows is not None:
@@ -1017,7 +1043,7 @@ def _rejection_sample_mps(
         # Rejected one-hot draft: the target draw conditioned on != tok.
         tok_emit = tok.gather(1, n_acc.clamp(max=cols - 1).unsqueeze(1))
         residual = p_emit.scatter(1, tok_emit, 0.0)
-    dist = torch.where(all_acc.unsqueeze(1), p_emit, residual)
+    dist = torch.where((all_acc | rejected_placeholder).unsqueeze(1), p_emit, residual)
     mass = dist.sum(dim=-1)
     # One keyed scalar draw plus a CDF scan is materially cheaper on MPS than
     # constructing a keyed Gumbel field over the full vocabulary.  ``u`` is
