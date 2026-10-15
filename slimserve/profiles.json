@@ -1796,8 +1796,8 @@
       "quants": {
         "bf16-distilled": {
           "title": "bf16, distilled transformer",
-          "bytes": 71094963980,
-          "summary": "Distilled 22B transformer, Gemma-4 12B text encoder, conv video VAE, audio VAE + vocoder, spatial latent upscaler.",
+          "bytes": 72571031016,
+          "summary": "Distilled 22B transformer, Gemma-4 12B text encoder, diffusion video VAE decoder (the default) and the conv one, duration head, audio VAE + vocoder, spatial latent upscaler.",
           "min_gpus": {},
           "files": [
             {
@@ -1824,6 +1824,16 @@
               "path": "latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors",
               "bytes": 995778752,
               "sha256": "eb5a71fe4068ee87ccdb1c3aa635e547ca76bd2d30ae20ae889f2c325c0677e8"
+            },
+            {
+              "path": "vae/ltx-2.5-video-vae-bf16.safetensors",
+              "bytes": 1472223346,
+              "sha256": "847e14ca7f3355debca0cea4eaa24ac0fbcdf0061da054ac89ca638a869ddba3"
+            },
+            {
+              "path": "model_patches/ltx-2.5-duration-head-bf16.safetensors",
+              "bytes": 3843690,
+              "sha256": "2ec71e4206ed365d015f00c05a48caccfb0ee862986809d06ae376c09f5d9190"
             }
           ],
           "min_memory_bytes": {
@@ -1832,7 +1842,7 @@
         },
         "bf16-dev": {
           "title": "bf16, dev transformer + distilled LoRA",
-          "bytes": 79994853548,
+          "bytes": 81470920584,
           "summary": "Dev 22B transformer for guided stage 1, the rank-450 distilled LoRA applied at runtime in stage 2, and the shared text encoder, VAEs and upscaler.",
           "min_gpus": {},
           "files": [
@@ -1865,6 +1875,16 @@
               "path": "latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors",
               "bytes": 995778752,
               "sha256": "eb5a71fe4068ee87ccdb1c3aa635e547ca76bd2d30ae20ae889f2c325c0677e8"
+            },
+            {
+              "path": "vae/ltx-2.5-video-vae-bf16.safetensors",
+              "bytes": 1472223346,
+              "sha256": "847e14ca7f3355debca0cea4eaa24ac0fbcdf0061da054ac89ca638a869ddba3"
+            },
+            {
+              "path": "model_patches/ltx-2.5-duration-head-bf16.safetensors",
+              "bytes": 3843690,
+              "sha256": "2ec71e4206ed365d015f00c05a48caccfb0ee862986809d06ae376c09f5d9190"
             }
           ],
           "min_memory_bytes": {
@@ -1873,8 +1893,8 @@
         },
         "bf16-dfr": {
           "title": "bf16, distilled transformer + detailing IC-LoRA",
-          "bytes": 71422286620,
-          "summary": "The distilled set plus Lightricks' pixel-spatial-upscaler IC-LoRA (its own gated repository), applied at runtime at strength 0.5 in stage 2.",
+          "bytes": 73160297656,
+          "summary": "The distilled set plus Lightricks' pixel-spatial-upscaler IC-LoRA (its own gated repository), applied at runtime at strength 0.5 in stage 2., temporal latent upscaler",
           "min_gpus": {},
           "files": [
             {
@@ -1907,6 +1927,21 @@
               "path": "latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors",
               "bytes": 995778752,
               "sha256": "eb5a71fe4068ee87ccdb1c3aa635e547ca76bd2d30ae20ae889f2c325c0677e8"
+            },
+            {
+              "path": "vae/ltx-2.5-video-vae-bf16.safetensors",
+              "bytes": 1472223346,
+              "sha256": "847e14ca7f3355debca0cea4eaa24ac0fbcdf0061da054ac89ca638a869ddba3"
+            },
+            {
+              "path": "model_patches/ltx-2.5-duration-head-bf16.safetensors",
+              "bytes": 3843690,
+              "sha256": "2ec71e4206ed365d015f00c05a48caccfb0ee862986809d06ae376c09f5d9190"
+            },
+            {
+              "path": "latent_upscale_models/ltx-2.5-latent-temporal-upscaler-x2-bf16-1.0.safetensors",
+              "bytes": 261944000,
+              "sha256": "2bc3300f2b3c3c1834d72164fbf13a3b9fd73e5a741e8a2c3f4035f89a75c3fe"
             }
           ],
           "min_memory_bytes": {
