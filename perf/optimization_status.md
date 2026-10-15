@@ -31405,3 +31405,14 @@ than PyPI 1.3.0), and the FP8 GEMMs.
 - Results: no new throughput measurement or hardware qualification claimed.
 - Decision: submit as a focused PR; preserve current-main behavior outside this fix.
 - Raw artifacts: none. CPU unit tests only (`tests/slimserve`); no performance measurement and no on-card run backs this entry.
+
+
+## 2026-09-19 - Register a gated Qwen3.8 FP8 recipe for four B70 GPUs
+
+- Status: retained for review.
+- Baseline: `feat/intel-b70-detection`; forward-port from the B70 serving integration.
+- Change: Use the current variant registry, pinned safetensors, native MTP with FP8 draft KV, verification-width graph sizes and FP8 draft KV; retain the recipe behind a qualification gate (the `b70` platform itself is `in-progress` until main has an XPU backend). The Qwen3.8 tool-calling template is not wired here: it arrives with PR #61, and `registry.resolve` now rejects a `chat_template_asset` that is not checked in. Host-tier KV offload is deferred until the XPU backend exists. Throughput figures from the out-of-tree integration branch are not quoted: no raw artifacts for them are in this repository.
+- Correctness: 73 registry and FP8 recipe checks passed on CPU; current-main B70 serving remains unqualified.
+- Results: no new throughput measurement or hardware qualification claimed.
+- Decision: submit as a focused PR; preserve current-main behavior outside this fix.
+- Raw artifacts: none. CPU unit tests only (`tests/slimserve`); no performance measurement and no on-card run backs this entry.
