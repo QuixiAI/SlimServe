@@ -92,3 +92,62 @@ def test_attached_keeps_adapters_attached_outside_it(lora_mod):
     with lora_mod.attached(dit, [(a, 0.25)]):
         assert [t[2] for t in dit.lora["blocks.0.attn.to_q"]] == [1.0, 0.25]
     assert [t[2] for t in dit.lora["blocks.0.attn.to_q"]] == [1.0]
+
+
+PIPELINE_PY = LORA_PY.with_name("pipeline.py")
+
+
+def _unguarded_loop_attaches(source: str) -> list[int]:
+    """Lines where pipeline.py attaches adapters in a loop outside any `try`.
+
+    A single `Lora.attach` is atomic (it validates every target before adding
+    any term), so a lone attach followed by `try/finally: detach` is safe. A
+    loop is not: if adapter #2 raises, #1 is already on the resident DiT, so
+    loops must run inside the `try` whose `finally` detaches (or use
+    `lora.attached()`, which does exactly that)."""
+    import ast
+
+    tree = ast.parse(source)
+    parents = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[child] = node
+    bad = []
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "attach"
+        ):
+            continue
+        in_loop = in_try = False
+        child, parent = node, parents.get(node)
+        while parent is not None and not isinstance(
+            parent, (ast.FunctionDef, ast.AsyncFunctionDef)
+        ):
+            if isinstance(parent, (ast.For, ast.While)) and child in parent.body:
+                in_loop = True
+            if isinstance(parent, ast.Try) and child in parent.body:
+                in_try = True
+            child, parent = parent, parents.get(parent)
+        if in_loop and not in_try:
+            bad.append(node.lineno)
+    return bad
+
+
+def test_pipeline_never_attaches_adapters_in_a_loop_outside_a_try():
+    assert _unguarded_loop_attaches(PIPELINE_PY.read_text()) == []
+
+
+def test_the_loop_check_catches_the_alpha_pattern():
+    leaky = (
+        "def alpha(dit, adapters):\n"
+        "    for lora, strength in adapters:\n"
+        "        lora.attach(dit, strength)\n"
+        "    try:\n"
+        "        pass\n"
+        "    finally:\n"
+        "        for lora, _ in adapters:\n"
+        "            lora.detach(dit)\n"
+    )
+    assert _unguarded_loop_attaches(leaky) == [3]

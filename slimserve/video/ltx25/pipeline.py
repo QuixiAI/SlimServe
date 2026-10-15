@@ -3701,9 +3701,10 @@ class LTX25Engine:
                 sampling.Guidance(cfg=1.0, stg=0.0, modality=1.0, rescale=0.0),
                 batched,
             )
-            for lora, strength in adapters:
-                lora.attach(dit, strength)
-            try:
+            # attached() detaches whatever it attached even when a later
+            # adapter's attach raises, so a bad request adapter never leaves
+            # an earlier one on the resident DiT.
+            with lora_mod.attached(dit, adapters):
                 v = sampling.euler_loop_video(
                     guided,
                     video,
@@ -3711,9 +3712,6 @@ class LTX25Engine:
                     on_step=stepper("stage1"),
                     step_cache=fast.cache(),
                 )
-            finally:
-                for lora, _ in adapters:
-                    lora.detach(dit)
         return Result(
             sampling.unpatchify(v[:, : f * h * w], (f, h, w)),
             None,
