@@ -12,6 +12,7 @@ from vllm.triton_utils import tl, triton
 
 # Programmatic dependent launch: see vllm/triton_utils/pdl.py.
 from vllm.triton_utils.pdl import PDL as _PDL  # noqa: E402
+from vllm.triton_utils.pdl import PDL_LAUNCH as _PDL_LAUNCH  # noqa: E402
 from vllm.triton_utils.pdl import gdc_launch_dependents, gdc_wait  # noqa: E402, F401
 
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
@@ -1257,7 +1258,7 @@ def causal_conv1d_update(
         BLOCK_N=256,
     
         PDL=_PDL,
-        launch_pdl=_PDL,
+        **_PDL_LAUNCH,
     )
     if unsqueeze:
         out = out.squeeze(-1)

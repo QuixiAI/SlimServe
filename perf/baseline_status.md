@@ -3,6 +3,176 @@
 This file holds stable baseline snapshots for comparison. Raw outputs belong in
 `perf/results/`; summarize only the numbers needed to compare future work.
 
+## LTX-2.5 video / Apple M1 Ultra (Metal) - 2026-10-08
+
+- Profiles `ltx25-*` (`kind: "video"`), official Lightricks/LTX-2.5 bf16
+  weights loaded as fp16 (exact conversion), no quantization. One machine:
+  M1 Ultra 64-core GPU, 128 GiB, macOS 15.7.2, MLX 0.31.2/0.32.2; seed 42,
+  fox prompt. Not validated on any other Apple Silicon.
+- "Exact" = no output-changing approximations; fp16 operands with fp32
+  accumulate and glue, **not bit-exact**: per-forward rel-L2 vs fp32 video
+  0.0069, audio 0.0011 (baseline runner as shipped: 0.042 / 0.025).
+- Baseline: dgrauet/ltx-2-mlx v0.15.12 q8 pack, cold process.
+
+| clip | profile | baseline q8 | exact | fast |
+| --- | --- | ---: | ---: | ---: |
+| 768x512x121 | `ltx25-distilled`, conv decoder | 116.9 s | 86 s cold, 71 s resident | |
+| 768x512x121 | `ltx25-dev` (30 steps) | 606.9 s | 343 s | |
+| 768x512x121 | `ltx25-dfr` | 170.9 s | 125 s | |
+| 1536x1024x121 | `ltx25-distilled` | 504.9 s (tiled, lossy) | 413.5 s resident (406.6 s cold, diffusion decoder) | 277.9 s (29.6 dB vs exact) |
+| 1536x1024x121 | `ltx25-dev` | cannot run | 1513.4 s | 644.2 s (21.4 dB) |
+| 1536x1024x121 | `ltx25-dfr` | not measured | 680.7 s | 421.0 s (27.1 dB) |
+
+- Serving, 768x512x49, resident: distilled 40.7 s/clip (68.6 GiB), DFR
+  51.9 s (68.9 GiB), dev 194-203 s (76.9 GiB); one generation at a time.
+- Ledger: `perf/ltx25_metal_campaign.md` sections 6, 9, 13, 15-17, 22, 24.
+  Raw: `perf/results/2026-10-01-ltx25-baseline/`,
+  `perf/results/2026-10-02-ltx25-n2/` (on the validating machine).
+## GLM-5.3-Flash Q2 (antirez GGUF) Metal M1 Ultra - ds4 base-recipe bar - 2026-09-11
+
+The bar the `glm53f-q2-1` campaign must beat, measured on this box with
+clean memory. Engine: antirez ds4 upstream 6289c516 (`~/.local/scratch/ds4-upstream`,
+`make`, run from its own directory because it resolves `metal/*.metal`
+relative to cwd), `--metal --power 100`, wired limit 122880 MiB, AC power.
+Artifact: `~/models/antirez-glm-5.3-flash-gguf/GLM-5.3-Flash-Q2.gguf`
+(96,505,816,384 B, sha256 e81fd624..., ds4 plans 92.82 GiB: 89.87 model +
+2.92 buffers + 0.03 compact KV at ctx 3008). Raw:
+`perf/results/2026-09-10/glm53f-q2-bar/` (`run_bar.sh`, `*_cli.err`,
+`A_server.log`, `A_*.json`, `D_bench_2048.csv`).
+
+- ds4 CLI, no MTP (arm B): `--ctx 3008 --prompt-file prompt_1000_off1.txt
+  --raw -n 2000 --temp 0`: **prefill 143.03 t/s, generation 18.19 t/s**
+  (2000 tokens generated; full-attention argmax path).
+- ds4 CLI, `--mtp --mtp-timing` (arm C, ds4's own speculative path,
+  the number to beat): **prefill 143.11 t/s, generation 22.52 t/s**.
+  1051 MTP cycles, 947 accepted (90.1%), 104 rejected; per cycle
+  verify2 ~76 ms + head+draft ~10 ms on accept (~62 + ~53 ms on reject);
+  1.90 tokens/cycle. Output byte-identical to arm B (lossless).
+- ds4-server + exact-token harness (arm A, timing only): ds4-server
+  re-tokenizes the prompt to 1018 tokens (harness flags "did not honor
+  the exact token counts"), so shas are not comparable to ours. Its own
+  log: 1018-token prefill 7.05 s (144.5 t/s), greedy decode 19.75 t/s
+  avg over 612 tokens (EOS), 2518-token prefill 18.94 s (132.9 t/s, two
+  chunks of 2048/470). Every request re-prefilled (no prefix reuse).
+- ds4-bench 2048 frontier, 128 greedy tokens (arm D, ds4's published
+  definition): prefill 139.16 t/s, gen 17.39 t/s (first token 56.6 ms,
+  steady 17.40 t/s over 127 tokens).
+- Method note: ds4 residency drains slowly after the process exits
+  (wired pages stay ~90 GiB for minutes); the free+inactive check in
+  `run_bar.sh` warned at 26-33 GiB before each arm, and every arm still
+  loaded and ran. Budget that drain before booting SlimServe after ds4.
+
+## GLM-5.3-Flash Q2 Metal M1 Ultra - `glm53f-q2-1` bring-up baseline (N0) - 2026-09-11
+
+First serving baseline of antirez's GLM-5.3-Flash-Q2.gguf through the real
+profile (`glm53f-q2-1 --no-spec`, worktree `glm53f-metal-campaign`, metal3.1
+metallib, fp32 KDA state, block 4288, 8 GiB KV pool, 95.87 GiB pinned).
+No GLM-specific Metal kernels yet: KDA core / pooled indexer / sparse MLA
+are the torch-native paths, MoE is the existing IQ2_XXS/Q2_K GEMV path,
+mHC the existing fused kernels. Exact-token harness, temperature 0,
+concurrency 1. Raw: `perf/results/2026-09-11/glm53f-q2-baseline/`.
+
+| gate | sha | tokens | aggregate tok/s | wall |
+|---|---|---|---|---|
+| 8tok (1000/8 off1) | 7dd30ea193a6 | 1000 -> 8 | 0.38 | 20.9 s |
+| off1-2000 (1000/2000 off1) | f9282de33fed | 1000 -> 2000 | 2.94 | 680.4 s |
+| 2500x64 (2500/64 off0) | b6949a578f73 | 2500 -> 64 | 0.91 | 70.3 s |
+
+Every number in this section, the ds4 bar included, was measured at
+temperature 0 (exact-token harness, greedy). Policy requires temperature
+1.0 / top_p 0.95 / top_k 20, seeded; these are greedy reference points
+pending that rerun, not qualified baselines (the record is in-progress
+for this and three other open items, 2026-10-14).
+
+The W1-W26 per-step gate log (2026-09-11..15: W1 fused KDA through the
+merged build) is campaign history and lives in `perf/optimization_status.md`
+("2026-09-15 - glm53f-q2-1 W1-W26 gate log"). Stable snapshot of the
+review build:
+
+**REVIEW BUILD (2026-09-15, CodeRabbit + Astra rounds applied,
+`w26-shard/astra1b_k1/`): probe 39.96 tok/s at 2.000 tok/cycle; accept set
+32.49-39.97; tf 0.0830; needles 4/4; gates 7dd30ea193a6 / 393882a2ddaf
+34.28 tok/s / 1d7d58486dc7 - pins held. FIRST CONCURRENT NUMBERS on this
+profile: c=2 27.8, c=3 33.7, c=6 41.2 tok/s aggregate (96 tokens each,
+6/6 served, health 200) - multi-request serving with the drafter was dead
+before this round (engine crash), so these are the baseline, not a
+regression point.**
+
+- Decode ~3.0 tok/s (329 ms/step, streaming probe 3.04 x2). Prefill
+  ~50-55 t/s (1000 tok ~18 s; 2500 tok ~50 s) - the KDA prefill is the
+  sequential per-token torch loop.
+- Bar (same box, ds4 6289c516): decode 22.52 tok/s with MTP / 18.19
+  without, prefill 143 t/s. Gap to close: 7.5x decode, 2.7x prefill.
+- Correctness at N0: teacher-forced vs ds4 dumps 31/32 (short) and 52/64
+  (after 1000 tokens) argmax agreement, ds4 token always in our top-8;
+  needle recall PASS at 1.5k/4k/6.5k/12k. See HANDOFF 2026-09-11.
+
+### Concurrent serving vs ds4 on this box (2026-09-24)
+
+ds4 `6289c516` `ds4-server --batched-session 8 --mixed-prefill-quantum
+1024 --ctx 3008 --power 100`, same harness, 1000-token prompts, 1000
+output tokens (ds4 stops some requests at EOS despite ignore_eos, so its
+counts are inexact; tok/s is over the tokens it did produce). 16 sessions
+do not fit (ds4 plans 135 GiB against its 118 GiB guard). Raw:
+`perf/results/2026-09-24/ds4-batched/`, ours `fix4_long/`, `c4_1k_0924_long/`,
+`fix6_all_long/`, `c32_gemv_long/`.
+
+| concurrency | ds4 tok/s | glm53f-q2-1 tok/s | ratio |
+|---|---|---|---|
+| 1 | 16.15 | 27.45 | 1.70x |
+| 4 | 22.12 | 48.38 | 2.19x |
+| 8 | 23.80 | 58.16 | 2.44x |
+| 16 | does not fit | 63.08 | - |
+| 32 | does not fit | 60.16 | - |
+
+### Concurrent serving (batching campaign, 2026-09-17) - pinned 2026-09-25
+
+Same harness, temperature 0, 1000-token prompts at strided offsets, warmup
+1; the record with the campaign fixes (mixed spec+prefill batches on the
+fused KDA kernels, q8_0 NR passes at 5..8 rows, the small-M MMA GEMM at
+9..32 rows behind `VLLM_QC_Q8_MMA=1` with 16 rows per simdgroup at 16..32
+rows, `VLLM_QC_MOE_MM_MIN_TOKENS=48`, the simdgroup-MMA sparse-MLA decode
+at >= 3 rows behind `VLLM_QC_MLA_SPARSE_MQA=6`, `VLLM_QC_KDA_SPEC_ROWS=2`,
+`max_num_seqs` 16, drafting on at every batch size). Raw:
+`perf/results/2026-09-15/glm53f-q2-conc/fix6_all/` (400 output tokens),
+`fix6_all_long/` (1000 output tokens); c=2/4 and the 1000-out c=1 from
+`fix4_moe_thresh/` and `fix4_long/` (the second-round levers only apply
+at >= 3 rows / >= 16 rows). Single-stream pins unchanged on the same
+build (`fix6_all/c1` sha c6b99cdf91ac = the fix-4 build; `gates_build5b/`:
+8tok 7dd30ea193a6, off1-2000 393882a2ddaf 34.28 tok/s, 2500x64
+1d7d58486dc7; probe 39.89 tok/s at 2.000 tok/cycle).
+
+| concurrency | 400-out aggregate tok/s | x c=1 | 1000-out aggregate tok/s | x c=1 | 3000-out aggregate tok/s | x c=1 |
+|---|---|---|---|---|---|---|
+| 1 | 25.1-25.8 | 1.00 | 27.45 | 1.00 | 34.95 | 1.00 |
+| 2 | 32.6-33.2 | 1.29 | - | - | - | - |
+| 4 | 35.6-35.8 | 1.39 | - | - | - | - |
+| 8 | 41.7 (was 40.0) | 1.62 | 58.16 (was 51.66) | 2.12 | - | - |
+| 16 | 44.2 (was 42.9) | 1.71 | 61.98 (was 57.23); 63.08 at max_num_seqs 32 | 2.26-2.30 | 77.39 | 2.21 |
+| 32 | 43.9 | 1.71 | 60.16 (MoE GEMV at 64 rows), 60.59 (tile) | 2.19-2.21 | 72.91 | 2.09 |
+
+The harness submits every prompt at t=0 and prefills serialize at ~250
+tok/s, so the short-output windows carry a prefill ramp (24% of the c=32
+1000-out window); the 3000-out column is the closest to steady-state
+decode. The single stream also speeds up over a long generation (36.7
+tok/s decode-only at 3000 tokens), so the ratio at c=16 is 2.2-2.3x on
+every protocol and c=32 is below c=16 on every protocol (per-request
+latency 1030 s vs 617 s at 3000 output tokens).
+
+`max_num_seqs` is 32 (`c32_gemv/`, `c32_tile/`, 2026-09-17): the KV pool
+is unchanged (381,513 tokens), c=32 adds capacity but no aggregate over
+c=16 - past 32 rows the step cost is per-row (16.1 ms per generated token
+at 32 rows, 16.6 at 64).
+
+Per-request shas are recorded in the run directories but NOT pinned: at
+c >= 4 the per-step row count, hence the dense route, depends on arrival
+timing, so the same prompt legitimately yields different tokens run to run.
+The concurrent gate (`concurrent_gate_pin.py`) asserts `exact` at c=4/8/16
+and an aggregate floor (pin - 5%). The bar is ds4 on the same box (section
+above: 1.70x / 2.19x / 2.44x at c=1/4/8; ds4 cannot fit 16 sessions), so
+the record is `supported` and the gate is pinned (`pins.json`, 2026-09-25,
+post-merge build; run `release/`).
+
 ## Qwen3.6-35B-A3B NVFP4 / RTX 5090 TP1 V2 - 2026-09-24
 
 - Registered `qwen36-nvfp4-1`, V2 GPU runner, full 262144-token configured context, checkpoint MTP k=2, FP8 KV, 4 GiB CPU weight offload, 48 GiB pinned host and 128 GiB NVMe completed-prefix KV tiers. RTX 5090 32 GB, driver 595.91.07, CUDA toolkit 13.3, `/home/eric/.venv`; working tree based on `11e644b6c`.
