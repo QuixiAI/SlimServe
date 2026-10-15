@@ -35,7 +35,11 @@ operator started the server with an input root (`--input-root DIR` or
 SLIMSERVE_VIDEO_INPUT_ROOT); with one, a path resolves inside that directory
 (relative paths against it, symlinks followed) and anything outside it is
 refused. Base64 uploads (`video`, `audio`, `image`, `images[].image`) work
-either way. Bodies above the configured cap are answered with 413.
+either way. Bodies above the configured cap are answered with 413, chunked
+bodies without a Content-Length with 411, malformed fields with 400, and
+requests beyond the normalisation slots (SLIMSERVE_VIDEO_MAX_PREPARING) or a
+full queue with 429. The input root must be operator-owned: a path is
+checked on arrival and opened when the job runs (see docs/ltx25_metal.md).
 
 `"wait": true` in the POST body holds the request open and returns the
 finished job. `enhance_prompt` (default false, as upstream's --enhance-prompt)
@@ -75,6 +79,10 @@ from pathlib import Path
 from typing import Any
 
 MAX_QUEUED = 16
+# Requests being normalised at once (decoding base64 sources, writing them to
+# disk, probing them with ffprobe); more than this are answered 429 before
+# their body is touched. SLIMSERVE_VIDEO_MAX_PREPARING overrides it.
+DEFAULT_MAX_PREPARING = 4
 KEEP_FINISHED = 32
 # The largest POST body the server reads (base64 sources and stills travel in
 # it). SLIMSERVE_VIDEO_MAX_BODY_MB or --max-body-mb override it.
@@ -87,6 +95,14 @@ SOURCE_PIPELINES = ("retake", "dubit", "hdr_ic_lora")
 
 class BadRequest(ValueError):
     pass
+
+
+class QueueFull(OverflowError):
+    """Answered 429: the queue or the normalisation slots are full."""
+
+
+class ServiceStopped(RuntimeError):
+    """Answered 503: the server is shutting down."""
 
 
 @dataclass
@@ -899,7 +915,7 @@ A2VID_KEYS = ("audio_path", "audio", "audio_start_time", "audio_max_duration")
 
 
 def a2vid_fields(
-    body: dict[str, Any], params: dict[str, Any], cfg: dict[str, Any] | None = None
+    body: dict[str, Any], params: dict[str, Any], cfg: dict[str, Any]
 ) -> dict[str, Any]:
     """The A2Vid request: `audio_path` (a file on the server; any container
     with an audio stream) or `audio` (base64), `audio_start_time` (s),
@@ -907,7 +923,7 @@ def a2vid_fields(
     length the clip follows the audio (capped at the envelope)."""
     out: dict[str, Any] = {}
     if body.get("audio_path") is not None:
-        out["audio_path"] = server_path(body["audio_path"], "audio_path", cfg or {})
+        out["audio_path"] = server_path(body["audio_path"], "audio_path", cfg)
     elif body.get("audio") is not None:
         out["audio_path"] = str(_store_blob(body["audio"], "audio", "source"))
     else:
@@ -1045,7 +1061,7 @@ IC_LORA_KEYS = (
 
 
 def ic_lora_fields(
-    body: dict[str, Any], params: dict[str, Any], cfg: dict[str, Any] | None = None
+    body: dict[str, Any], params: dict[str, Any], cfg: dict[str, Any]
 ) -> dict[str, Any]:
     """The IC-LoRA request: `video_conditioning` ([{"path", "strength"}],
     reference clips on the server; required), `loras` (the IC-LoRA adapters;
@@ -1063,7 +1079,7 @@ def ic_lora_fields(
     for item in _list(refs, "video_conditioning"):
         if not isinstance(item, dict) or not isinstance(item.get("path"), str):
             raise BadRequest('each video_conditioning entry needs a "path"')
-        path = server_path(item["path"], "video_conditioning", cfg or {}, dirs=True)
+        path = server_path(item["path"], "video_conditioning", cfg, dirs=True)
         out["video_conditioning"].append(
             (path, _strength(item.get("strength", 1.0), "reference strength"))
         )
@@ -1075,7 +1091,7 @@ def ic_lora_fields(
         )
     if body.get("attention_mask") is not None:
         out["attention_mask"] = server_path(
-            body["attention_mask"], "attention_mask", cfg or {}
+            body["attention_mask"], "attention_mask", cfg
         )
     for key in ("skip_stage_2", "stage_2_ic_lora", "tile"):
         if key in body:
@@ -1097,7 +1113,7 @@ def ic_lora_fields(
     return out
 
 
-def lora_field(item: Any, cfg: dict[str, Any] | None = None) -> tuple[str, float]:
+def lora_field(item: Any, cfg: dict[str, Any]) -> tuple[str, float]:
     """One entry of `loras`: {"path": <.safetensors on the server>, "strength": 1.0}
     (upstream --lora PATH [STRENGTH]); the file is checked when the engine
     loads it."""
@@ -1105,13 +1121,11 @@ def lora_field(item: Any, cfg: dict[str, Any] | None = None) -> tuple[str, float
         raise BadRequest('each loras entry needs a "path"')
     if not item["path"].endswith(".safetensors"):
         raise BadRequest("loras: each path must be a .safetensors file")
-    path = server_path(item["path"], "loras", cfg or {})
+    path = server_path(item["path"], "loras", cfg)
     return path, _strength(item.get("strength", 1.0), "lora strength", 2.0)
 
 
-def still_field(
-    item: Any, frames: int | None, pipeline: str, cfg: dict[str, Any] | None = None
-):
+def still_field(item: Any, frames: int | None, pipeline: str, cfg: dict[str, Any]):
     """One entry of `images`: {"image": <base64 or data: URL>, "frame": N,
     "strength": 0-1, "crf": int} -> sampling.Still (upstream's --image PATH
     FRAME_IDX STRENGTH [CRF]). Frames must be inside the clip when its length
@@ -1131,7 +1145,7 @@ def still_field(
     if crf is not None and (not isinstance(crf, int) or not 0 <= crf <= 51):
         raise BadRequest("image crf must be an integer in [0, 51] (0: no round trip)")
     if item.get("path") is not None:
-        source: Any = server_path(item["path"], "images", cfg or {})
+        source: Any = server_path(item["path"], "images", cfg)
     else:
         source = decode_image_field(item["image"])
     return Still(source, frame, _strength(item.get("strength", 1.0)), crf)
@@ -1199,6 +1213,7 @@ class VideoService:
         engine_factory=None,
         input_root: str | os.PathLike | None = None,
         max_body: int = DEFAULT_MAX_BODY_BYTES,
+        max_preparing: int | None = None,
     ):
         # Requests may name server files only under input_root (None: never).
         cfg = {**cfg, INPUT_ROOT: resolve_input_root(input_root)}
@@ -1208,6 +1223,14 @@ class VideoService:
         self.jobs: dict[str, Job] = {}
         self.order: list[str] = []
         self.lock = threading.Lock()
+        if max_preparing is None:
+            env = os.environ.get("SLIMSERVE_VIDEO_MAX_PREPARING")
+            max_preparing = int(env) if env else DEFAULT_MAX_PREPARING
+        if max_preparing < 1:
+            raise ValueError("max_preparing must be at least 1")
+        self.preparing = threading.BoundedSemaphore(max_preparing)
+        self.stopped = False
+        self.running: Job | None = None
         self.queue: queue.Queue[Job | None] = queue.Queue()
         self.ready = threading.Event()
         self.load_error: str | None = None
@@ -1226,6 +1249,7 @@ class VideoService:
         engine = LTX25Engine(
             root=self.cfg.get("root"),
             variant="dev" if pipeline in GUIDED_PIPELINES else "distilled",
+            user_lora_cache=self.cfg.get("user_lora_cache"),
         )
         if pipeline != "hdr_ic_lora":  # no prompt: the scene embeddings stand in
             engine.load_text()
@@ -1260,9 +1284,11 @@ class VideoService:
             job = self.queue.get()
             if job is None:
                 return
-            if job.status != "queued":  # failed by stop() while waiting
-                continue
-            job.status, job.started_at = "in_progress", time.time()
+            with self.lock:
+                if job.status != "queued":  # failed by stop() while waiting
+                    continue
+                job.status, job.started_at = "in_progress", time.time()
+                self.running = job
             try:
                 self._generate(engine, job)
                 job.status = "completed"
@@ -1272,6 +1298,8 @@ class VideoService:
                 self.failed += 1
             finally:
                 _remove(job.uploads)  # the uploaded sources are spent either way
+                with self.lock:
+                    self.running = None
             job.completed_at = time.time()
             job.done.set()
             self._trim()
@@ -1352,15 +1380,27 @@ class VideoService:
 
     # ---- API ---------------------------------------------------------------
     def _queue_full(self) -> None:
+        if self.stopped:
+            raise ServiceStopped("the server is shutting down")
         waiting = sum(1 for j in self.jobs.values() if j.status == "queued")
         if waiting >= MAX_QUEUED:
-            raise OverflowError(f"{waiting} requests already queued")
+            raise QueueFull(f"{waiting} requests already queued")
 
     def submit(self, body: dict[str, Any]) -> Job:
         # Refuse a full queue before decoding anything: normalising writes the
         # request's base64 sources to disk.
         with self.lock:
             self._queue_full()
+        # Bound the requests decoding and writing sources at once: each can
+        # hold a body-sized upload in memory and on disk before it queues.
+        if not self.preparing.acquire(blocking=False):
+            raise QueueFull("too many requests are being prepared; retry shortly")
+        try:
+            return self._submit(body)
+        finally:
+            self.preparing.release()
+
+    def _submit(self, body: dict[str, Any]) -> Job:
         uploads: list[Path] = []
         token = _UPLOADS.set(uploads)
         try:
@@ -1379,12 +1419,14 @@ class VideoService:
                 )
                 self.jobs[job.id] = job
                 self.order.append(job.id)
+                # under the lock: stop() puts its sentinel under it too, so a
+                # job is never queued behind the sentinel (it would never run)
+                self.queue.put(job)
         except BaseException:
             _remove(uploads)
             raise
         finally:
             _UPLOADS.reset(token)
-        self.queue.put(job)
         return job
 
     def get(self, job_id: str) -> Job | None:
@@ -1429,6 +1471,7 @@ class VideoService:
 
     def stop(self) -> None:
         with self.lock:  # queued jobs will not run: fail them, free their uploads
+            self.stopped = True  # later submits are refused
             for job in self.jobs.values():
                 if job.status == "queued":
                     job.status = "failed"
@@ -1436,7 +1479,11 @@ class VideoService:
                     job.completed_at = time.time()
                     _remove(job.uploads)
                     job.done.set()
-        self.queue.put(None)
+            # The worker is a daemon thread: the process exits under the job
+            # it is running, so its finally never removes that job's sources.
+            if self.running is not None:
+                _remove(self.running.uploads)
+            self.queue.put(None)
 
 
 def make_handler(service: VideoService):
@@ -1497,6 +1544,13 @@ def make_handler(service: VideoService):
                 return self._error(404, "not found")
             if service.load_error:
                 return self._error(503, service.load_error)
+            if self.headers.get("Transfer-Encoding") is not None:
+                # chunked bodies are not read: without a length the request
+                # would be taken as empty and its body left on the connection
+                self.close_connection = True
+                if self.headers.get("Content-Length") is None:
+                    return self._error(411, "a Content-Length is required")
+                return self._error(400, "send Content-Length without Transfer-Encoding")
             try:
                 length = int(self.headers.get("Content-Length", "0"))
             except ValueError:
@@ -1516,10 +1570,18 @@ def make_handler(service: VideoService):
                 if not isinstance(body, dict):
                     raise BadRequest("the request body must be a JSON object")
                 job = service.submit(body)
+            except QueueFull as exc:
+                return self._error(429, str(exc))
+            except ServiceStopped as exc:
+                return self._error(503, str(exc))
             except (BadRequest, json.JSONDecodeError) as exc:
                 return self._error(400, str(exc))
-            except OverflowError as exc:
-                return self._error(429, str(exc))
+            except UnicodeDecodeError:
+                return self._error(400, "the request body must be UTF-8 JSON")
+            except (ValueError, TypeError, OverflowError) as exc:
+                # a field of the wrong type or out of range (int("wide"),
+                # float(None), round(inf)): the client's mistake, not a crash
+                return self._error(400, f"malformed request field: {exc}")
             if body.get("wait"):
                 job.done.wait()
             self._json(200, job.public(service.model_name))

@@ -339,3 +339,155 @@ def test_stopping_the_server_releases_queued_uploads(tmp_path, uploads):
     gate.set()
     assert running.done.wait(10) and running.status == "completed"
     assert uploads() == []
+
+
+# ---- malformed requests ----------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        json.dumps({"prompt": "x", "width": "wide"}).encode(),
+        json.dumps({"prompt": "x", "seconds": "long"}).encode(),
+        json.dumps({"prompt": "x", "seed": "abc"}).encode(),
+        json.dumps({"prompt": "x", "seed": None}).encode(),
+        json.dumps({"prompt": "x", "fps": [24]}).encode(),
+        b'{"prompt": "x", "seconds": 1e400}',  # inf: round() overflows
+        b'{"prompt": "\xff\xfe"}',  # not UTF-8
+    ],
+)
+def test_a_malformed_field_is_a_400_not_a_dropped_connection(http_server, body):
+    status, payload = _post(http_server, body)
+    assert status == 400, payload
+    assert payload["error"]["code"] == 400 and payload["error"]["message"]
+
+
+def _raw(port, request: bytes) -> bytes:
+    import socket
+
+    with socket.create_connection(("127.0.0.1", port), timeout=10) as sock:
+        sock.sendall(request)
+        data = b""
+        while b"\r\n\r\n" not in data:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        return data
+
+
+def test_a_chunked_body_without_a_length_is_411(http_server):
+    body = json.dumps({"prompt": "x"}).encode()
+    request = (
+        b"POST /v1/videos HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\n"
+        b"Transfer-Encoding: chunked\r\n\r\n"
+        + f"{len(body):x}\r\n".encode()
+        + body
+        + b"\r\n0\r\n\r\n"
+    )
+    assert _raw(http_server, request).startswith(b"HTTP/1.1 411")
+
+
+def test_transfer_encoding_with_a_length_is_refused(http_server):
+    request = (
+        b"POST /v1/videos HTTP/1.1\r\nHost: t\r\nContent-Length: 2\r\n"
+        b"Transfer-Encoding: chunked\r\n\r\n{}"
+    )
+    assert _raw(http_server, request).startswith(b"HTTP/1.1 400")
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda: server.lora_field({"path": "a.safetensors"}),
+        lambda: server.a2vid_fields({"audio_path": "a.wav"}, {}),
+        lambda: server.ic_lora_fields({"video_conditioning": [{"path": "a"}]}, {}),
+        lambda: server.still_field({"path": "a.png"}, None, "distilled"),
+    ],
+)
+def test_path_resolvers_have_no_fail_open_cfg_default(call):
+    # without a cfg they would treat the request as the local CLI and read
+    # any path; the caller must always pass the server's cfg
+    with pytest.raises(TypeError):
+        call()
+
+
+# ---- concurrency and shutdown ----------------------------------------------------
+
+
+def test_concurrent_normalisations_are_capped(tmp_path, monkeypatch):
+    entered, release = threading.Event(), threading.Event()
+    real = server.normalize_request
+
+    def slow(body, cfg):
+        entered.set()
+        release.wait(10)
+        return real(body, cfg)
+
+    monkeypatch.setattr(server, "normalize_request", slow)
+    service = _service(tmp_path, max_preparing=1)
+    results = []
+    thread = threading.Thread(
+        target=lambda: results.append(service.submit({"prompt": "first"}))
+    )
+    thread.start()
+    assert entered.wait(5)
+    with pytest.raises(server.QueueFull, match="being prepared"):
+        service.submit({"prompt": "second"})
+    release.set()
+    thread.join(10)
+    assert results and results[0].done.wait(10)
+    service.submit({"prompt": "third"})  # the slot was released
+    service.stop()
+
+
+def test_the_preparing_cap_comes_from_the_environment(tmp_path, monkeypatch):
+    monkeypatch.setenv("SLIMSERVE_VIDEO_MAX_PREPARING", "3")
+    service = _service(tmp_path)
+    assert service.preparing._initial_value == 3
+    service.stop()
+    with pytest.raises(ValueError):
+        _service(tmp_path, max_preparing=0)
+
+
+def test_stopping_the_server_releases_the_running_jobs_uploads(tmp_path, uploads):
+    gate = threading.Event()
+    service = _service(tmp_path, A2VID, engine=_Engine(gate))
+    running = service.submit({"prompt": "x", "seconds": 2, "audio": AUDIO})
+    deadline = time.time() + 5
+    while running.status != "in_progress" and time.time() < deadline:
+        time.sleep(0.01)
+    assert running.status == "in_progress" and len(uploads()) == 1
+    service.stop()
+    # the process exits under the running job: its source must already be gone
+    assert uploads() == []
+    gate.set()
+    assert running.done.wait(10)
+
+
+def test_a_submit_after_stop_is_refused_and_writes_nothing(tmp_path, uploads):
+    service = _service(tmp_path, A2VID)
+    service.stop()
+    with pytest.raises(server.ServiceStopped):
+        service.submit({"prompt": "x", "seconds": 2, "audio": AUDIO})
+    assert uploads() == []
+    assert service.queue.empty() or service.queue.get_nowait() is None
+
+
+def test_http_maps_stopped_to_503_and_busy_to_429(tmp_path, monkeypatch):
+    service = _service(tmp_path)
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.make_handler(service))
+    httpd.daemon_threads = True
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    port = httpd.server_address[1]
+    try:
+        monkeypatch.setattr(service.preparing, "acquire", lambda blocking=True: False)
+        status, payload = _post(port, json.dumps({"prompt": "x"}).encode())
+        assert status == 429 and "prepared" in payload["error"]["message"]
+        monkeypatch.undo()
+        service.stop()
+        status, payload = _post(port, json.dumps({"prompt": "x"}).encode())
+        assert status == 503 and "shutting down" in payload["error"]["message"]
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
