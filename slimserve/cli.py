@@ -288,7 +288,9 @@ def _show(plan: Plan) -> None:
     for key, value in sorted(plan.engine.items()):
         print(f"  {key:<9} {value}")
     if plan.speculative:
-        spec = plan.source["speculator"]
+        # The record's own speculator when it overrides the source's (the
+        # Metal GLM record drafts from the GGUF's nextn block, not DFlash2).
+        spec = plan.speculator
         method = spec["engine"].get("method", "dspark")
         print(f"  spec      {method} k={spec['engine']['num_speculative_tokens']}")
     for key, value in sorted(plan.env.items()):
