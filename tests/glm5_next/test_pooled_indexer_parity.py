@@ -73,7 +73,9 @@ def test_pooled_indexer_parity(length, page_padding, compact):
     if compact:
         cache = torch.full(
             (nblocks, 1 + page_padding, block_size, 64),
-            float("nan"), device=dev, dtype=torch.bfloat16,
+            float("nan"),
+            device=dev,
+            dtype=torch.bfloat16,
         )[:, 0]
         positions = torch.arange(length, device=dev, dtype=torch.int64)
         slots = physical[positions // block_size] * block_size + positions % block_size
@@ -100,14 +102,58 @@ def test_pooled_indexer_parity(length, page_padding, compact):
         out,
         cfg.index_kpool,
     )
+    # The reference's own pool scores, for the near-tie allowance below.
+    packed = torch.cat([k, gate, mask[0].to(k.dtype)[:, None]], -1)[None]
+    pool_keys, _, _ = ref.get_pooled_states(packed_states=packed)
+    ref_scores = torch.nn.functional.relu(
+        torch.matmul(q[None].float(), pool_keys.transpose(-1, -2).float().unsqueeze(1))
+        * ref.softmax_scale
+    )
+    ref_scores = torch.matmul(weights[None].unsqueeze(-2), ref_scores).squeeze(-2)[0]
+    kp = cfg.index_kpool
     for row, (expected, actual) in enumerate(zip(ref_idx[0].tolist(), out.tolist())):
         expected_set = {v for v in expected if v >= 0}
         actual_set = {v for v in actual if v >= 0}
-        assert actual_set == expected_set, (
+        n_pools = (row + 1) // kp
+        if n_pools <= ksel:
+            # Nothing is pruned: the selection is exactly the visible prefix.
+            assert actual_set == expected_set, (row, expected_set ^ actual_set)
+            continue
+        # Pruning rows: the kernel pools bf16 keys in fp32 while the reference
+        # stores its pooled keys in bf16, so the scores agree to bf16 noise
+        # (measured 1.5 % of the mean at 133 rows) and a pool sitting within
+        # that of the k-th score may land on either side of the cut (row 123
+        # of 133: pools 26 and 30 at 0.9213 / 0.9219). Scores must match to
+        # that tolerance, and the selections may differ only at such ties;
+        # the tail tokens after the last complete pool must match exactly.
+        r = ref_scores[row, :n_pools]
+        kl = logits[row, :n_pools]
+        tol = 0.03 * r.abs().max().item() + 0.02
+        assert (kl - r).abs().max().item() <= tol, (
             row,
-            expected_set - actual_set,
-            actual_set - expected_set,
+            (kl - r).abs().max().item(),
+            tol,
         )
+        cut = torch.topk(r, ksel).values[-1].item()
+        tail_start = n_pools * kp
+        assert {v for v in expected_set if v >= tail_start} == {
+            v for v in actual_set if v >= tail_start
+        }, (row, "tail")
+        expected_pools = {v // kp for v in expected_set if v < tail_start}
+        actual_pools = {v // kp for v in actual_set if v < tail_start}
+        assert len(actual_pools) == len(expected_pools), (
+            row,
+            expected_pools,
+            actual_pools,
+        )
+        for pool in expected_pools ^ actual_pools:
+            assert abs(r[pool].item() - cut) <= tol, (
+                row,
+                pool,
+                r[pool].item(),
+                cut,
+                tol,
+            )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

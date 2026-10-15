@@ -1458,6 +1458,10 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     INCLUDE_DIRECTORIES
       "${CMAKE_CURRENT_SOURCE_DIR}/csrc/quixicore/quant"
       "${CMAKE_CURRENT_SOURCE_DIR}/csrc/quixicore/serving"
+      # custom_all_reduce.cuh: the GLM mHC transition fused with the
+      # tensor-parallel all-reduce launches through the custom all-reduce
+      # object the stable extension created.
+      "${CMAKE_CURRENT_SOURCE_DIR}/csrc"
     WITH_SOABI)
 
   # pybind11 modules need libtorch_python, which define_extension_target
