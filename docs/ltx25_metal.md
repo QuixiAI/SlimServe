@@ -77,7 +77,25 @@ IC-LoRA, Dub-It, Alpha-Gen and HDR IC-LoRA pipelines take their adapters by
 path, so they need an input root to be served. Base64 uploads (`video`,
 `audio`, `image`, `images[].image`) work either way and are deleted when the
 job has run. Request bodies above 256 MiB (`--max-body-mb` or
-`SLIMSERVE_VIDEO_MAX_BODY_MB`) are answered with a 413.
+`SLIMSERVE_VIDEO_MAX_BODY_MB`) are answered with a 413; a body sent with
+`Transfer-Encoding` instead of a `Content-Length` gets a 411, and a field of
+the wrong type (a non-numeric `width`, `seconds` or `seed`, a body that is not
+UTF-8) a 400.
+
+The input root must be a directory the operator owns and nobody else can
+write to. The server checks a requested path when the request arrives (it
+resolves symlinks and confirms the result is inside the root) but the engine
+opens the file later, when the job runs; anyone who can rename or replace
+entries under the root in between can point an accepted request at a file
+outside it. Do not use a shared, world-writable or client-writable directory
+(an upload drop folder, `/tmp`) as the input root.
+
+At most 4 requests are prepared at once (decoding and writing their base64
+sources, probing them); more are answered 429 until one finishes
+(`SLIMSERVE_VIDEO_MAX_PREPARING`). User LoRAs stay loaded between requests,
+the 4 most recently used (`SLIMSERVE_VIDEO_LORA_CACHE`; 0 loads them per
+request); older ones are released. Once the server is stopping it refuses new
+requests with a 503 and removes the uploads of the queued and running jobs.
 
 Serving API (a clip takes minutes, so it is job-shaped):
 
