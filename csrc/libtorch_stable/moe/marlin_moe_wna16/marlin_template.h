@@ -281,6 +281,13 @@ __global__ void Marlin(
     bool use_atomic_add,  // whether to use atomic add to reduce
     bool use_fp32_reduce  // whether to use fp32 global reduce
 ) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  // Programmatic dependent launch (no-ops without the launch attribute): let
+  // the successor's prologue start now, and wait here for the routing kernels
+  // ahead of us before any of their outputs are read.
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
   // Each threadblock processes one "stripe" of the B matrix with (roughly) the
   // same size, which might involve multiple column "slices" (of width 16 *
   // `thread_n_blocks`). Stripes are defined as shown in the 3x3 matrix 5 SM

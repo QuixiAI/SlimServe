@@ -21,7 +21,6 @@ from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
-    ReplicatedLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -425,16 +424,23 @@ class DFlashQwen3Model(nn.Module):
             ]
         )
         if self.use_aux_hidden_state:
-            self.fc = ReplicatedLinear(
+            # The tap projection reads the target's concatenated aux hidden
+            # states, replicated on every rank; sharding its input columns
+            # splits the weight (the largest single read of a draft step:
+            # 5 x 4096 -> 4096 is 168 MB in bf16) across the ranks for one
+            # 8 KB per-token all-reduce.
+            self.fc = RowParallelLinear(
                 input_size=_get_dflash_fc_input_size(
                     vllm_config,
                 ),
                 output_size=self.config.hidden_size,
                 bias=False,
+                input_is_parallel=False,
                 params_dtype=vllm_config.model_config.dtype,
                 quant_config=self.quant_config,
                 prefix=maybe_prefix(prefix, "fc"),
                 return_bias=False,
+                disable_tp=self.replicate_backbone,
             )
         self.hidden_norm = RMSNorm(
             self.config.hidden_size,
@@ -461,9 +467,14 @@ class DFlashQwen3Model(nn.Module):
         self._hidden_norm_weight = self.hidden_norm.weight.data
 
         # Dense drafts concatenate K/V weights into one GEMM. Packed GGUF
-        # projections have qweight instead of weight, so retain the layers and
+        # projections have qweight instead of weight, and FP8 weights are
+        # stored transposed with their scales, so retain those layers and
         # execute their quantized methods independently in _project_context_kv.
-        if all(hasattr(a.qkv_proj, "weight") for a in layers_attn):
+        if all(
+            getattr(getattr(a.qkv_proj, "weight", None), "dtype", None)
+            in (torch.bfloat16, torch.float16)
+            for a in layers_attn
+        ):
             kv_weights = [a.qkv_proj.weight[a.q_size :] for a in layers_attn]
             self._fused_kv_weight: torch.Tensor | None = torch.cat(kv_weights, dim=0)
             if has_bias:
