@@ -31,6 +31,7 @@ using namespace metal;
 namespace qc_qkr {
 constant constexpr int THREADS = 256;
 constant constexpr int SIMDGROUPS = THREADS / 32;
+constant constexpr int MAX_HEAD_DIM = 256;  // yv[] threadgroup scratch
 }  // namespace qc_qkr
 
 template <typename T, typename IT>
@@ -43,6 +44,9 @@ inline void qk_norm_rope_gate_body(
     threadgroup T* yv) {
   const bool is_q = (int)head < num_q_heads;
   const int D = head_dim;
+  // yv is MAX_HEAD_DIM wide; the host rejects larger heads, and the whole
+  // threadgroup returns here (before any barrier) if one gets through.
+  if (D < 1 || D > qc_qkr::MAX_HEAD_DIM) return;
   const ulong row_base = (ulong)token * (ulong)qkv_row;
   device const T* x;
   device const T* w;
@@ -136,7 +140,7 @@ inline void qk_norm_rope_gate_body(
       uint sg [[simdgroup_index_in_threadgroup]],                            \
       uint lane [[thread_index_in_simdgroup]]) {                             \
     threadgroup float shm[qc_qkr::SIMDGROUPS];                               \
-    threadgroup T yv[256];                                                   \
+    threadgroup T yv[qc_qkr::MAX_HEAD_DIM];                                  \
     qk_norm_rope_gate_body<T, IT>(qkv, q_w, k_w, cos_sin, positions, q_out, \
                                   gate_out, k_out, num_q_heads,              \
                                   num_k_heads, head_dim, rot_dim, eps,       \

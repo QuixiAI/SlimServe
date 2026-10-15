@@ -162,6 +162,7 @@ kernel void gdn_recur_spec(device const T *q            [[buffer(0)]],
                            constant int   &Dv           [[buffer(13)]],
                            constant int   &state_stride [[buffer(14)]],
                            constant int   &table_stride [[buffer(15)]],
+                           constant int   &table_width  [[buffer(16)]],
                            uint3 gid [[threadgroup_position_in_grid]],
                            uint  lane [[thread_index_in_simdgroup]]) {
     static_assert(DK == 64 || DK == 128,
@@ -181,7 +182,10 @@ kernel void gdn_recur_spec(device const T *q            [[buffer(0)]],
     // num_accepted < 1 would index slots[-1] (an OOB read MPS does not
     // fault on); guard here since the hosts only validate dtype/length.
     const int na = num_accepted[req_idx];
-    if (na < 1 || na > table_stride) { return; }
+    // table_width is the logical column count (slot_table.size(1)); the row
+    // stride can be wider when the host passes a column slice of a larger
+    // table, and the entries between width and stride are other live slots.
+    if (na < 1 || na > table_width) { return; }
     const long init_slot = slots[na - 1];
     if (init_slot <= 0) { return; }
     device const float *init_ptr = state_pool + init_slot * (long)state_stride +
@@ -226,7 +230,10 @@ kernel void gdn_recur_spec(device const T *q            [[buffer(0)]],
             y_[dv_idx] = T(out);
         }
 
-        const long ckpt_slot = slots[t];
+        // slots holds table_width logical entries per request; positions
+        // past them have no checkpoint rather than reading the columns that
+        // follow in a strided slice (or the next row)
+        const long ckpt_slot = (t < table_width) ? slots[t] : 0;
         if (ckpt_slot > 0) {
             device float *ckpt = state_pool + ckpt_slot * (long)state_stride +
                 ((long)hv_idx * Dv + dv_idx) * DK;
@@ -264,6 +271,7 @@ kernel void gdn_recur_spec(device const T *q            [[buffer(0)]],
       constant int &Dv [[buffer(13)]],                                           \
       constant int &state_stride [[buffer(14)]],                                 \
       constant int &table_stride [[buffer(15)]],                                 \
+      constant int &table_width [[buffer(16)]],                                  \
       uint3 gid [[threadgroup_position_in_grid]],                                \
       uint lane [[thread_index_in_simdgroup]]);
 
@@ -594,7 +602,14 @@ kernel void gdn_fused_prepare(
   // step can rewind to any accepted point. Non-spec keeps the front ring.
   int read_off = 0;
   if (spec_mode != 0) {
-    read_off = num_accepted[request] - 1;
+    // num_accepted < 1 would start the history window before the state
+    // row, and a window past state_cols would read the next channel's
+    // columns; the hosts validate dtype/shape only, so bound it here.
+    const int na = num_accepted[request];
+    if (na < 1 || na - 1 + hist_len > state_cols) {
+      return;
+    }
+    read_off = na - 1;
   }
 
   if (lrow == 2 * Hk + Hv) {

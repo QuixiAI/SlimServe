@@ -669,10 +669,17 @@ METAL_FUNC void dsv4_indexer_topk_decode_body(
         idxtk_sort(keys, vals, tid);
     }
 
+    // Every merge round re-ranks only keys[0, IDXTK_KEEP); the upper half
+    // is the next tile's staging area. Once a merge has run, ranks at or
+    // past IDXTK_KEEP hold unranked survivors, so emit -1 for them. The
+    // host contract (width <= IDXTK_WIDTH or k_eff <= IDXTK_KEEP) keeps
+    // this a no-op for served shapes.
+    const int k_lim = (n_cand > IDXTK_WIDTH)
+                          ? metal::min(k_eff, IDXTK_KEEP) : k_eff;
     device int *out_row = out + (long)token * out_stride;
     for (int k = tid; k < out_stride; k += 256) {
         out_row[k] =
-            (k < k_eff && keys[k] != -INFINITY) ? vals[k] : -1;
+            (k < k_lim && keys[k] != -INFINITY) ? vals[k] : -1;
     }
 }
 

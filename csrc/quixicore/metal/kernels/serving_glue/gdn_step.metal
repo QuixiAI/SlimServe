@@ -27,7 +27,9 @@
 //                       after every position (the spec rollback contract;
 //                       slots <= 0 skip the store). The initial state comes
 //                       from resume_slot[n]; sequences with resume_slot <= 0
-//                       are NULL entries: zero output, no state traffic.
+//                       (or, on the verify path, num_accepted[n] < 1, for
+//                       which the conv step wrote nothing) are NULL entries:
+//                       zero output, no state traffic.
 //
 // GQA head pairing: tiled (ggml layout, i_k = i_hv % Hk) or HF grouped
 // (i_k = i_hv / (Hv / Hk)), selected per call.
@@ -91,7 +93,15 @@ kernel void qwen_gdn_conv_step(
     if (c >= conv_dim) return;
     const int slot = conv_slot[n];
     if (slot <= 0) return;  // NULL entry: the scan kernel zeroes the output
+    // S and width index the fixed local windows below. The host checks
+    // 1 <= S <= MAX_S and 2 <= width <= MAX_WIDTH; a violation degrades to
+    // a no-op here instead of writing past the stack arrays.
+    if (S < 1 || S > MAX_S || width < 1 || width > MAX_WIDTH) return;
     const int off = use_accepted ? (num_accepted[n] - 1) : 0;
+    // num_accepted < 1: no history window to read. conved stays unwritten
+    // for this sequence; qwen_gdn_scan_step applies the same test and treats
+    // the sequence as a NULL entry, so the unwritten rows are never consumed.
+    if (off < 0) return;
     const int w1 = width - 1;
 
     device TC* st = conv_state + (long)slot * cs_slot + (long)c * cs_chan;
@@ -148,6 +158,8 @@ kernel void qwen_gdn_scan_step(
     constant long&  ss_rs     [[buffer(18)]],         // store_slots row stride
     constant long&  out_rs    [[buffer(19)]],
     constant float& scale     [[buffer(20)]],
+    device const int* num_accepted [[buffer(21)]],    // (N) when use_accepted
+    constant int&   use_accepted [[buffer(22)]],
     uint3 tgid    [[threadgroup_position_in_grid]],
     uint  lane    [[thread_index_in_simdgroup]],
     uint  simd_id [[simdgroup_index_in_threadgroup]]) {
@@ -159,7 +171,11 @@ kernel void qwen_gdn_scan_step(
     if (dv >= Dv) return;
 
     const int rs = resume_slot[n];
-    if (rs <= 0) {
+    // Mirror the conv step's validity test: when it skipped this sequence
+    // (num_accepted < 1) conved holds no rows for it, so it must not drive
+    // the recurrence or touch ssm_state.
+    const bool conv_skipped = use_accepted && num_accepted[n] < 1;
+    if (rs <= 0 || conv_skipped) {
         if (lane == 0) {
             for (int t = 0; t < S; ++t) {
                 const long row = (long)token_map[n * S + t];
@@ -248,6 +264,8 @@ kernel void qwen_gdn_scan_step(
       constant long& ab_rs [[buffer(16)]], constant long& st_slot [[buffer(17)]], \
       constant long& ss_rs [[buffer(18)]], constant long& out_rs [[buffer(19)]], \
       constant float& scale [[buffer(20)]],                                     \
+      device const int* num_accepted [[buffer(21)]],                            \
+      constant int& use_accepted [[buffer(22)]],                                \
       uint3 tgid [[threadgroup_position_in_grid]],                              \
       uint lane [[thread_index_in_simdgroup]],                                  \
       uint simd_id [[simdgroup_index_in_threadgroup]]);

@@ -74,9 +74,13 @@ kernel void qgemm_sm(
     const int kb_end = metal::min(steps_total, kb_beg + chunk);
 
     // prologue: stage the slice's first step
-    G::load(sX[kb_beg & 1], gl_x, {0, 0, kb_beg, 0}, tid);
-    dequant_into_shared<FMT, RPW, BK>(sW[kb_beg & 1][warp], Wq, N, K, rb,
-                                      kb_beg, 32, lane);
+    // empty K-slice (steps_total < SPLIT_K * chunk): nothing to stage;
+    // the zeroed accumulators still write this slice's partials
+    if (kb_beg < kb_end) {
+        G::load(sX[kb_beg & 1], gl_x, {0, 0, kb_beg, 0}, tid);
+        dequant_into_shared<FMT, RPW, BK>(sW[kb_beg & 1][warp], Wq, N, K, rb,
+                                          kb_beg, 32, lane);
+    }
     threadgroup_barrier(metal::mem_flags::mem_threadgroup);
 
     for (int kb = kb_beg; kb < kb_end; kb++) {
@@ -245,9 +249,13 @@ kernel void qgemm_sm_p(
     const int kb_beg = (int)tgid.z * chunk;
     const int kb_end = metal::min(steps_total, kb_beg + chunk);
 
-    G::load(sX[kb_beg & 1], gl_x, {0, 0, kb_beg, 0}, tid);
-    dequant_into_shared_paired<FMT>(sW[kb_beg & 1][warp], Wq, N, K, rb,
-                                    kb_beg, lane);
+    // empty K-slice (steps_total < SPLIT_K * chunk): nothing to stage;
+    // the zeroed accumulators still write this slice's partials
+    if (kb_beg < kb_end) {
+        G::load(sX[kb_beg & 1], gl_x, {0, 0, kb_beg, 0}, tid);
+        dequant_into_shared_paired<FMT>(sW[kb_beg & 1][warp], Wq, N, K, rb,
+                                        kb_beg, lane);
+    }
     threadgroup_barrier(metal::mem_flags::mem_threadgroup);
 
     for (int kb = kb_beg; kb < kb_end; kb++) {
@@ -427,9 +435,13 @@ kernel void qgemm_sm_t(
         if (cT.is_valid_element(i)) cT[i] = 0.0f;
     }
 
-    G::load(sX[kb_beg & 1], gl_x, {0, 0, kb_beg, 0}, tid);
-    sm_t_stager<FMT, PAIRED>::stage(sW[kb_beg & 1][warp], Wq, N, K, rb,
-                                    kb_beg, lane);
+    // empty K-slice (steps_total < SPLIT_K * chunk): nothing to stage;
+    // the zeroed accumulators still write this slice's partials
+    if (kb_beg < kb_end) {
+        G::load(sX[kb_beg & 1], gl_x, {0, 0, kb_beg, 0}, tid);
+        sm_t_stager<FMT, PAIRED>::stage(sW[kb_beg & 1][warp], Wq, N, K, rb,
+                                        kb_beg, lane);
+    }
     threadgroup_barrier(metal::mem_flags::mem_threadgroup);
 
     for (int kb = kb_beg; kb < kb_end; kb++) {
@@ -505,12 +517,16 @@ kernel void qgemm_sm_t2(
         if (cT.is_valid_element(i)) cT[i] = 0.0f;
     }
 
-    sm_t_stager<FMT, PAIRED>::stage(sW[kb_beg & 1][warp], Wq, N, K, rb,
-                                    kb_beg, lane);
-    if (ABLATE == 1) {
-        sm_t_stager<FMT, PAIRED>::stage(
-            sW[(kb_beg & 1) ^ 1][warp], Wq, N, K, rb,
-            metal::min(kb_beg + 1, steps_total - 1), lane);
+    // empty K-slice (steps_total < SPLIT_K * chunk): nothing to stage;
+    // the zeroed accumulators still write this slice's partials
+    if (kb_beg < kb_end) {
+        sm_t_stager<FMT, PAIRED>::stage(sW[kb_beg & 1][warp], Wq, N, K, rb,
+                                        kb_beg, lane);
+        if (ABLATE == 1) {
+            sm_t_stager<FMT, PAIRED>::stage(
+                sW[(kb_beg & 1) ^ 1][warp], Wq, N, K, rb,
+                metal::min(kb_beg + 1, steps_total - 1), lane);
+        }
     }
     threadgroup_barrier(metal::mem_flags::mem_threadgroup);
 
@@ -536,8 +552,10 @@ kernel void qgemm_sm_t2(
         }
         threadgroup_barrier(metal::mem_flags::mem_threadgroup);
     }
-    if (ABLATE == 2) {
-        // tail run keeps the staged tiles live at 1/steps of the cost
+    if (ABLATE == 2 && kb_beg < kb_end) {
+        // tail run keeps the staged tiles live at 1/steps of the cost; an
+        // empty K-slice staged nothing, so it skips the tail like the main
+        // loop and writes its zeroed partials
         dev_b tBt(X, metal::extents<int32_t, M_PAD, BK>());
         if ((kb_end & 1) == 0) {
             op.run(tA0, tBt, cT);
@@ -633,8 +651,13 @@ kernel void qgemm_sm_u4(
         t_a tA((device half*)(X + g * 32),
                metal::extents<int32_t, 32, M_PAD>(),
                metal::array<int32_t, 2>{1, K});
+        // Explicit strides: Xcode 27 (Metal toolchain 32023.921) rejects the
+        // implied-packed constructor for a 4-bit format unless extent(0) is a
+        // multiple of 256 elements (128-byte rows); the strided constructor
+        // takes the same packed {1, NT} layout the kernel has always used.
         t_b tB((device uchar*)(wtile + (size_t)g * (32 * NT / 2)),
-               metal::extents<int32_t, NT, 32>());
+               metal::extents<int32_t, NT, 32>(),
+               metal::array<int32_t, 2>{1, NT});
         op.run(tA, tB, cTmp);
         device const half* sc_row = SC + (size_t)g * N + n0;
         device const half* mn_row = MN + (size_t)g * N + n0;
@@ -728,8 +751,13 @@ kernel void qgemm_sm_u4b(
         t_a tA((device bfloat*)(X + g * 32),
                metal::dextents<int32_t, 2>(32, M),
                metal::array<int32_t, 2>{1, K});
+        // Explicit strides: Xcode 27 (Metal toolchain 32023.921) rejects the
+        // implied-packed constructor for a 4-bit format unless extent(0) is a
+        // multiple of 256 elements (128-byte rows); the strided constructor
+        // takes the same packed {1, NT} layout the kernel has always used.
         t_b tB((device uchar*)(wtile + (size_t)g * (32 * NT / 2)),
-               metal::extents<int32_t, NT, 32>());
+               metal::extents<int32_t, NT, 32>(),
+               metal::array<int32_t, 2>{1, NT});
         op.run(tA, tB, cTmp);
         device const half* sc_row = SC + (size_t)g * N + n0;
         device const half* mn_row = MN + (size_t)g * N + n0;
@@ -964,26 +992,32 @@ kernel void qgemm_sm_pa(
 
     // prologue: stage once; the "staged once" ablations fill BOTH double
     // buffers with real data so the loop reads valid halves (no NaN skew)
-    G::load(sX[kb_beg & 1], gl_x, {0, 0, kb_beg, 0}, tid);
-    if (ABLATE == 1) {
-        G::load(sX[(kb_beg & 1) ^ 1], gl_x,
-                {0, 0, metal::min(kb_beg + 1, steps_total - 1), 0}, tid);
-    }
-    if (ABLATE == 2) {
-        dequant_paired_raw<FMT>(sW[kb_beg & 1][warp], Wq, N, K, rb, kb_beg,
-                                lane);
-    } else {
-        dequant_into_shared_paired<FMT>(sW[kb_beg & 1][warp], Wq, N, K, rb,
-                                        kb_beg, lane);
-    }
-    if (ABLATE == 4) {
-        dequant_into_shared_paired<FMT>(
-            sW[(kb_beg & 1) ^ 1][warp], Wq, N, K, rb,
-            metal::min(kb_beg + 1, steps_total - 1), lane);
+    // empty K-slice (steps_total < SPLIT_K * chunk): nothing to stage;
+    // the zeroed accumulators still write this slice's partials
+    if (kb_beg < kb_end) {
+        G::load(sX[kb_beg & 1], gl_x, {0, 0, kb_beg, 0}, tid);
+        if (ABLATE == 1) {
+            G::load(sX[(kb_beg & 1) ^ 1], gl_x,
+                    {0, 0, metal::min(kb_beg + 1, steps_total - 1), 0}, tid);
+        }
+        if (ABLATE == 2) {
+            dequant_paired_raw<FMT>(sW[kb_beg & 1][warp], Wq, N, K, rb, kb_beg,
+                                    lane);
+        } else {
+            dequant_into_shared_paired<FMT>(sW[kb_beg & 1][warp], Wq, N, K, rb,
+                                            kb_beg, lane);
+        }
+        if (ABLATE == 4) {
+            dequant_into_shared_paired<FMT>(
+                sW[(kb_beg & 1) ^ 1][warp], Wq, N, K, rb,
+                metal::min(kb_beg + 1, steps_total - 1), lane);
+        }
     }
     threadgroup_barrier(metal::mem_flags::mem_threadgroup);
 
-    if (ABLATE == 7) {
+    // empty K-slice: nothing was staged, so neither the hoisted fragment
+    // load (A=7) nor the tail MMA (A=3/7) may read the tiles
+    if (ABLATE == 7 && kb_beg < kb_end) {
         load(w_reg, sW[kb_beg & 1][warp], lane);
         load(x_reg, sX[kb_beg & 1], lane);
     }
@@ -1018,7 +1052,7 @@ kernel void qgemm_sm_pa(
             threadgroup_barrier(metal::mem_flags::mem_threadgroup);
         }
     }
-    if (ABLATE == 3 || ABLATE == 7) {
+    if ((ABLATE == 3 || ABLATE == 7) && kb_beg < kb_end) {
         // one tail MMA from freshly loaded fragments keeps every staged tile
         // live (runtime buffer index defeats store elimination) at 1/steps
         // of the per-step cost being ablated
@@ -1149,10 +1183,14 @@ kernel void qgemm_sm_t4_q5_K(
         if (cT.is_valid_element(i)) cT[i] = 0.0f;
     }
 
-    dequant_paired_q5k_bk128(sW[kb_beg & 1][warp], Wq, N, K, rb, 2 * kb_beg,
-                             0, lane);
-    dequant_paired_q5k_bk128(sW[kb_beg & 1][warp], Wq, N, K, rb,
-                             2 * kb_beg + 1, 64, lane);
+    // empty K-slice (steps_total < SPLIT_K * chunk): nothing to stage;
+    // the zeroed accumulators still write this slice's partials
+    if (kb_beg < kb_end) {
+        dequant_paired_q5k_bk128(sW[kb_beg & 1][warp], Wq, N, K, rb,
+                                 2 * kb_beg, 0, lane);
+        dequant_paired_q5k_bk128(sW[kb_beg & 1][warp], Wq, N, K, rb,
+                                 2 * kb_beg + 1, 64, lane);
+    }
     threadgroup_barrier(metal::mem_flags::mem_threadgroup);
 
     for (int kb = kb_beg; kb < kb_end; kb++) {
@@ -1247,10 +1285,14 @@ kernel void qgemm_sm_rm(
     const int kb_beg = (int)tgid.z * chunk;
     const int kb_end = metal::min(steps_total, kb_beg + chunk);
 
-    qgemm_sm_rm_stage_x<BK, M_PAD, GROUP_THREADS>(sX[kb_beg & 1], X, K, M,
-                                                   kb_beg, tid);
-    dequant_into_shared<FMT, RPW, BK>(sW[kb_beg & 1][warp], Wq, N, K, rb,
-                                      kb_beg, 32, lane);
+    // empty K-slice (steps_total < SPLIT_K * chunk): nothing to stage;
+    // the zeroed accumulators still write this slice's partials
+    if (kb_beg < kb_end) {
+        qgemm_sm_rm_stage_x<BK, M_PAD, GROUP_THREADS>(sX[kb_beg & 1], X, K, M,
+                                                       kb_beg, tid);
+        dequant_into_shared<FMT, RPW, BK>(sW[kb_beg & 1][warp], Wq, N, K, rb,
+                                          kb_beg, 32, lane);
+    }
     threadgroup_barrier(metal::mem_flags::mem_threadgroup);
 
     for (int kb = kb_beg; kb < kb_end; kb++) {
