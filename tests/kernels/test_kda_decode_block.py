@@ -11,6 +11,10 @@ import pytest
 import torch
 
 qc = pytest.importorskip("vllm._quixicore_C")
+pytestmark = pytest.mark.skipif(
+    not (torch.cuda.is_available() and torch.cuda.get_device_capability() >= (9, 0)),
+    reason="kda_block_decode launches thread-block clusters (sm_90+); below that kda_block_serves declines",
+)
 from einops import rearrange  # noqa: E402
 
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import (  # noqa: E402

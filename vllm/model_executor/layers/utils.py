@@ -183,7 +183,10 @@ def decode_gemm_fp8_enabled() -> bool:
     if (
         os.getenv("SLIMSERVE_DECODE_GEMM_FP8", "1") == "0"
         or not current_platform.is_cuda()
-        or not current_platform.has_device_capability(80)
+        # The op owns every M: above 16 tokens it runs the CUTLASS fp8 GEMM,
+        # which needs sm_89 (on sm_80/sm_86 the scheme serves FP8 weights
+        # through Marlin W8A16 and must keep doing so for every M).
+        or not current_platform.has_device_capability(89)
     ):
         return False
     from vllm.quixicore.ops import quixicore_ops

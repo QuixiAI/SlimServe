@@ -144,6 +144,10 @@ def test_rejects_unsupported_shapes_and_dtypes() -> None:
         quixicore_ops.decode_gemm_fp8(x, q2, s2)
 
 
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and torch.cuda.get_device_capability() >= (8, 9)),
+    reason="the op serves every M only where its M > 16 branch, the CUTLASS fp8 GEMM, exists (sm_89+)",
+)
 def test_block_fp8_op_kernel_and_cutlass_branches() -> None:
     """The custom op takes the kernel at M <= 16 and reproduces the stock
     CUTLASS w8a8 path above, for 2-D and 3-D inputs."""
@@ -174,6 +178,10 @@ def test_block_fp8_op_kernel_and_cutlass_branches() -> None:
     )  # bf16 weight: not ours
 
 
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and torch.cuda.get_device_capability() >= (8, 9)),
+    reason="the op serves every M only where its M > 16 branch, the CUTLASS fp8 GEMM, exists (sm_89+)",
+)
 def test_channel_fp8_op_kernel_and_cutlass_branches() -> None:
     """The channel-scale op takes the kernel at M <= 16 (from the scheme's
     [K, N] weight view) and the per-token quant + CUTLASS path above."""
