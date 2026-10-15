@@ -14,6 +14,7 @@ import hashlib
 import shutil
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from slimserve import term
 from slimserve.registry import ModelOverride, Plan, ProfileError, cache_root, files_for
@@ -22,16 +23,37 @@ _CHUNK = 32 << 20
 
 
 def hf_token() -> str | None:
-    """The operator's Hugging Face token, for gated repos. Never logged."""
+    """The operator's Hugging Face token, for gated repos. Never logged.
+
+    Environment variables first (HF_TOKEN, HUGGING_FACE_HUB_TOKEN,
+    HUGGINGFACE_TOKEN), then the token file `hf auth login` writes: at
+    $HF_TOKEN_PATH, else $HF_HOME/token, else ~/.cache/huggingface/token.
+    """
     import os
 
     for name in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_TOKEN"):
         if value := os.environ.get(name):
             return value.strip()
-    stored = Path.home() / ".cache/huggingface/token"
-    if stored.is_file():
-        return stored.read_text().strip() or None
+    candidates = []
+    if token_path := os.environ.get("HF_TOKEN_PATH"):
+        candidates.append(Path(token_path).expanduser())
+    if hf_home := os.environ.get("HF_HOME"):
+        candidates.append(Path(hf_home).expanduser() / "token")
+    candidates.append(Path.home() / ".cache/huggingface/token")
+    for stored in candidates:
+        if stored.is_file():
+            return stored.read_text().strip() or None
     return None
+
+
+def _gated_error(repo: str, status: int) -> ProfileError:
+    return ProfileError(
+        f"{repo} is gated or private and this machine's Hugging Face "
+        f"token cannot download it (HTTP {status}). "
+        f"Accept the repo's terms at https://huggingface.co/{repo} "
+        "with the account that owns the token, or set HF_TOKEN to one "
+        "that already has access."
+    )
 
 
 def override_entries(override: ModelOverride) -> list[dict[str, Any]]:
@@ -50,6 +72,11 @@ def override_entries(override: ModelOverride) -> list[dict[str, Any]]:
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     api = f"https://huggingface.co/api/models/{override.repo}?blobs=true"
     response = requests.get(api, headers=headers, timeout=60)
+    if response.status_code == 401 and headers:
+        # A stale token gets 401 even on a public repo; retry anonymously and,
+        # if that works, download the files anonymously too.
+        headers = {}
+        response = requests.get(api, headers=headers, timeout=60)
     if response.status_code in (401, 403):
         raise ProfileError(
             f"{override.repo} is gated or private and this machine's Hugging "
@@ -155,6 +182,40 @@ def free_bytes(path: Path) -> int:
     return shutil.disk_usage(probe).free
 
 
+def _is_huggingface(url: str) -> bool:
+    parsed = urlsplit(url)
+    return parsed.scheme == "https" and parsed.hostname == "huggingface.co"
+
+
+def _has_authorization(headers: dict[str, str]) -> bool:
+    return any(key.lower() == "authorization" for key in headers)
+
+
+def _http_status(exc: Exception) -> int | None:
+    response = getattr(exc, "response", None)
+    return getattr(response, "status_code", None)
+
+
+def _request_headers(
+    url: str, have: int, explicit: dict[str, str] | None = None
+) -> dict[str, str]:
+    headers = dict(explicit or {})
+    if have:
+        headers["Range"] = f"bytes={have}-"
+    if _is_huggingface(url) and "authorization" not in {
+        key.lower() for key in headers
+    }:
+        # hf_token() observes HF_TOKEN, HUGGING_FACE_HUB_TOKEN,
+        # HUGGINGFACE_TOKEN and the token file `hf auth login` writes
+        # ($HF_TOKEN_PATH, $HF_HOME/token, ~/.cache/huggingface/token), the same
+        # lookup the override and Hub-download paths use. requests strips
+        # Authorization if Hugging Face redirects the download to a CDN host,
+        # so the credential remains scoped to huggingface.co.
+        if token := hf_token():
+            headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
 def _download(entry: dict[str, Any], dest: Path) -> None:
     """Fetch one file, resuming a partial `.part` if there is one."""
     import requests
@@ -166,16 +227,35 @@ def _download(entry: dict[str, Any], dest: Path) -> None:
         # Xet-backed. Keep this behind an explicit source setting so existing
         # range-resumable manifests retain their established transfer path.
         from huggingface_hub import hf_hub_download
+        from huggingface_hub.errors import HfHubHTTPError
 
-        downloaded = Path(
-            hf_hub_download(
-                repo_id=repo,
-                filename=entry["path"],
-                revision=entry["hf_revision"],
-                local_dir=cache_root() / entry["local_dir"],
-                token=hf_token(),
+        def hub_get(token: str | bool | None) -> Path:
+            return Path(
+                hf_hub_download(
+                    repo_id=repo,
+                    filename=entry["path"],
+                    revision=entry["hf_revision"],
+                    local_dir=cache_root() / entry["local_dir"],
+                    token=token,
+                )
             )
-        )
+
+        token = hf_token()
+        try:
+            try:
+                downloaded = hub_get(token)
+            except HfHubHTTPError as exc:
+                if token and _http_status(exc) == 401:
+                    # A stale or revoked token makes Hugging Face answer 401
+                    # even for a public repo. Retry once anonymously.
+                    downloaded = hub_get(False)
+                else:
+                    raise
+        except HfHubHTTPError as exc:
+            status = _http_status(exc)
+            if status in (401, 403):
+                raise _gated_error(repo, status) from exc
+            raise
         if downloaded != dest or not _valid(downloaded, entry):
             raise RuntimeError(f"{entry['path']}: Hub download failed validation")
         part.unlink(missing_ok=True)
@@ -195,15 +275,29 @@ def _download(entry: dict[str, Any], dest: Path) -> None:
         _finalize(part, dest, entry, done)
         return
 
-    headers = dict(entry.get("headers") or {})
-    if have:
-        headers["Range"] = f"bytes={have}-"
-    with requests.get(
-        entry["url"], headers=headers, stream=True, timeout=60
-    ) as response:
+    headers = _request_headers(entry["url"], have, entry.get("headers"))
+    response = requests.get(entry["url"], headers=headers, stream=True, timeout=60)
+    if (
+        response.status_code == 401
+        and _is_huggingface(entry["url"])
+        and _has_authorization(headers)
+    ):
+        # Hugging Face answers 401 to a stale or revoked token even when the
+        # repo is public, so a bad token must not break public downloads.
+        # Retry once anonymously; only a failure without the token is a
+        # gated or private repo.
+        response.close()
+        headers = {k: v for k, v in headers.items() if k.lower() != "authorization"}
+        response = requests.get(
+            entry["url"], headers=headers, stream=True, timeout=60
+        )
+    with response:
         if have and response.status_code == 200:
             # Server ignored the range; start over rather than corrupt the file.
             have = 0
+        if response.status_code in (401, 403) and _is_huggingface(entry["url"]):
+            repo = "/".join(urlsplit(entry["url"]).path.strip("/").split("/")[:2])
+            raise _gated_error(repo, response.status_code)
         response.raise_for_status()
         mode = "ab" if have else "wb"
         done = have

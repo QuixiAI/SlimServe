@@ -109,6 +109,7 @@ if TYPE_CHECKING:
     VERBOSE: bool = False
     VLLM_ALLOW_LONG_MAX_MODEL_LEN: bool = False
     VLLM_HTTP_TIMEOUT_KEEP_ALIVE: int = 5  # seconds
+    VLLM_SSE_KEEPALIVE_INTERVAL_S: float = 30.0
     VLLM_MAX_N_SEQUENCES: int = 16384
     VLLM_MAX_COMPLETION_PROMPTS: int = 1024
     VLLM_PLUGINS: list[str] | None = None
@@ -1085,6 +1086,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Timeout in seconds for keeping HTTP connections alive in API server
     "VLLM_HTTP_TIMEOUT_KEEP_ALIVE": lambda: int(
         os.environ.get("VLLM_HTTP_TIMEOUT_KEEP_ALIVE", "5")
+    ),
+    # Seconds of upstream silence after which an SSE response emits a
+    # ": keepalive" comment so idle-timeout proxies keep the stream open
+    # (e.g. during a long prefill or thinking phase). <= 0 disables it.
+    "VLLM_SSE_KEEPALIVE_INTERVAL_S": lambda: float(
+        os.environ.get("VLLM_SSE_KEEPALIVE_INTERVAL_S", "30")
     ),
     # Maximum allowed value for the `n` sampling parameter (number of output
     # sequences per request). Limits resource consumption to prevent
@@ -2249,6 +2256,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS",
         "VLLM_ENGINE_ITERATION_TIMEOUT_S",
         "VLLM_HTTP_TIMEOUT_KEEP_ALIVE",
+        "VLLM_SSE_KEEPALIVE_INTERVAL_S",
         "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS",
         "VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS",
         "VLLM_KEEP_ALIVE_ON_ENGINE_DEATH",

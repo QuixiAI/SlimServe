@@ -91,6 +91,12 @@ class GGUFConfigParser(ConfigParserBase):
             config = build_qwen35_config_from_gguf(str(model))
         elif architecture == "glm-dsa":
             config = build_config_from_gguf(str(model))
+        elif architecture == "glm5-next":
+            from vllm.transformers_utils.gguf_glm5_next import (
+                build_glm5_next_config_from_gguf,
+            )
+
+            config = build_glm5_next_config_from_gguf(str(model))
         elif architecture == "qwen35":
             from vllm.transformers_utils.gguf_qwen35 import (
                 build_qwen35_config_from_gguf,
