@@ -8,6 +8,8 @@ import torch
 
 from benchmarks.glm5_next_sparse_tc_candidate import sparse_tc_nope
 
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+
 
 def reference(q, cache, table, indices, lengths, scale):
     outputs = []
@@ -24,7 +26,55 @@ def reference(q, cache, table, indices, lengths, scale):
     return torch.stack(outputs)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def _served_split(q, cache) -> int:
+    """The split the serving dispatch selects for this shape and cache dtype
+    on this device (0 when it keeps the native path)."""
+    from types import SimpleNamespace
+
+    from vllm.v1.attention.backends.mla.quixicore_mla_sparse import _sparse_tc_split
+
+    return _sparse_tc_split(True, q, cache, SimpleNamespace(num_prefills=0))
+
+
+def _skip_if_tile_does_not_fit(fn, *, served: bool):
+    """Run `fn` once; when this device cannot host the kernel's tile, skip if
+    the configuration is not served here and fail if it is.
+
+    sm_120 has 99 KB of shared memory per block against SM80's 164 KB, so the
+    SPLIT=128 tile (144 KB of gathered latents plus queries) and the fp8
+    branch's int32 assembly (147 KB even at SPLIT=64) cannot load here. Those
+    configurations are not served on this platform - the dispatch picks the
+    64-wide bf16 tile - so the suite skips them rather than reporting a
+    failure that no code path can reach. A configuration the dispatch DOES
+    select on this device (`served`) that stops fitting is a real regression,
+    so its OutOfResources propagates as a failure instead of a skip.
+    """
+    from triton.runtime.errors import OutOfResources
+
+    try:
+        return fn()
+    except OutOfResources as err:
+        if served:
+            raise
+        pytest.skip(
+            f"tile needs {err.required} B of shared memory, device has "
+            f"{err.limit} B; not a served configuration on this device"
+        )
+
+
+def test_served_configurations_fail_rather_than_skip_when_the_tile_does_not_fit():
+    from triton.runtime.errors import OutOfResources
+
+    def too_big():
+        raise OutOfResources(147456, 101376, "shared memory")
+
+    with pytest.raises(OutOfResources):
+        _skip_if_tile_does_not_fit(too_big, served=True)
+    with pytest.raises(pytest.skip.Exception):
+        _skip_if_tile_does_not_fit(too_big, served=False)
+    assert _skip_if_tile_does_not_fit(lambda: 7, served=True) == 7
+
+
 @pytest.mark.parametrize("scale_width", [256, 512])
 @pytest.mark.parametrize("split", [32, 64, 128])
 @pytest.mark.parametrize(
@@ -48,14 +98,14 @@ def test_sparse_tc_reference_native_and_changed_graph(
     table = torch.arange(pages, device="cuda", dtype=torch.int32).repeat(rows, 1)
     indices = torch.arange(width, device="cuda", dtype=torch.int32).repeat(rows, 1)
     tlen = torch.full((rows,), width, device="cuda", dtype=torch.int32)
-    # The registered model scales by its256-wide original QK head, not
-    # the512-wide absorbed latent. Also retain the legacy test's512 scale.
+    # The registered model scales by its 256-wide original QK head, not
+    # the 512-wide absorbed latent. Also retain the legacy test's 512 scale.
     scale = 1 / math.sqrt(scale_width)
 
     def candidate():
         return sparse_tc_nope(q, cache, table, indices, tlen, scale, split=split)
 
-    candidate()
+    _skip_if_tile_does_not_fit(candidate, served=_served_split(q, cache) == split)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -96,8 +146,18 @@ def test_sparse_tc_reference_native_and_changed_graph(
             error = (actual.float() - expected).abs().max().item()
             assert error == 0 if peak == 0 else error / peak < 5e-3
             torch.testing.assert_close(actual.float(), expected, atol=0.002, rtol=0.002)
-            # Existing partitioned-versus-unpartitioned NoPE comparison gate.
-            assert (actual.float() - native.float()).abs().max().item() < 1e-3
+            # Existing partitioned-versus-unpartitioned NoPE comparison gate:
+            # bf16-identical up to one rounding flip. Both kernels accumulate
+            # in fp32 in different orders, so an fp32 value on a bf16 midpoint
+            # (rows 32, split 32, replay 4: 0.272461 between 0.271484 and
+            # 0.273438, each half an ulp from the reference) rounds to opposite
+            # neighbours one ulp (2^-7 x magnitude) apart; anything wider than
+            # that, or than 1e-3 where an ulp is smaller, is a real divergence.
+            gap = (actual.float() - native.float()).abs()
+            one_ulp = torch.finfo(torch.bfloat16).eps * native.float().abs()
+            assert bool(
+                (gap <= torch.maximum(one_ulp, torch.full_like(gap, 1e-3))).all()
+            )
             assert torch.equal(backing, cache_before)
             assert torch.equal(indices, indices_before)
             for row, length in enumerate(lengths):
@@ -134,6 +194,13 @@ def test_sparse_tc_fp8_matches_native_fp8(rows, heads, kv_scale):
     native = qc.mla_decode_fp8_sparse_nope(
         q, data.reshape(-1), bt, idx, tlen, bs, scale, kv_scale, 128
     )
-    tc = sparse_tc_nope(q, data, bt, idx, tlen, scale, split=64, kv_scale=kv_scale)
-    err = (tc.float() - native.float()).abs().max().item() / native.float().abs().max().item()
+    tc = _skip_if_tile_does_not_fit(
+        lambda: sparse_tc_nope(
+            q, data, bt, idx, tlen, scale, split=64, kv_scale=kv_scale
+        ),
+        served=_served_split(q, data) == 64,
+    )
+    err = (
+        tc.float() - native.float()
+    ).abs().max().item() / native.float().abs().max().item()
     assert err < 5e-3, err
