@@ -34378,3 +34378,15 @@ than PyPI 1.3.0), and the FP8 GEMMs.
 - Results: no new throughput measurement or hardware qualification claimed.
 - Decision: submit as a focused PR; preserve current-main behavior outside this fix.
 - Raw artifacts: local test output; no traffic captures or model data committed.
+
+## 2026-09-19 - Add a Qwen tool-policy chat template with native thinking tokens
+
+- Status: retained for review.
+- Baseline: `origin/main`; forward-port from the B70 serving integration.
+- Change: Render required/named/none/auto tool policy and reasoning hints while preserving native Qwen thinking, tool history and vision placeholders.
+- Correctness: Seven Qwen policy/history/vision-placeholder tests and the existing GLM asset test passed on CPU; existing package-data glob includes the asset.
+- Review follow-up (2026-10-14): every reasoning_effort the API accepts now renders (minimal -> low, high/max -> xhigh, unknown -> default; no raise); an explicit enable_thinking wins over effort none so the template and the Qwen3 parser (which reads enable_thinking) agree, with the effort hint omitted; assistant history with inline <think>...</think> in content is lifted into the think block as the stock Qwen template does, so it is not rendered twice. 15 template tests pass on CPU (6 of the new ones fail on the pre-fix template); tests/slimserve 180 passed.
+- Review follow-up (2026-10-15): inline <think> lifting now applies only when the message has no reasoning_content/reasoning field, exactly as stock Qwen; a message with explicit (even empty) reasoning keeps its content verbatim, so a literal "</think>" in visible text is no longer truncated. 17 template tests pass (3 fail on the previous template).
+- Results: no new throughput measurement or hardware qualification claimed.
+- Decision: submit as a focused PR; preserve current-main behavior outside this fix.
+- Raw artifacts: local test output; no traffic captures or model data committed.
