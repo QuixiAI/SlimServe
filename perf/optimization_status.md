@@ -1,5 +1,52 @@
 # SlimServe Optimization Status
 
+## 2026-10-14 - PR #86 (LTX-2.5 on Apple Silicon) render and serve check on a Mac Studio M4 Max
+
+- Box: Mac Studio M4 Max (40-core GPU, 128 GiB, macOS 27.0.1), Xcode 27.0
+  / Metal toolchain 32023.921, Python 3.12.15, MLX from
+  requirements/video-metal.txt, static ffmpeg 9.0.2. Branch merged with
+  main at 288fefb51 (92352dd4ad, notebook conflict only) plus the
+  qgemm_sm stride fix cherry-picked from PR #23 (26a4a1424) so the
+  language-model extension builds on this toolchain; nothing of this PR
+  touches the Metal kernels.
+- Two fixes a fresh install needed, both pushed to the branch:
+  - 58ac6ad4dc `slimserve/fetch.py`: registry-manifest downloads sent no
+    Authorization header (only `--model` override entries did), so the
+    gated Lightricks files answered 401 with a token that had accepted the
+    terms. The token is now sent for every huggingface.co manifest URL.
+  - 24ecc16be4 `ltx25` source manifest: the diffusion video VAE decoder
+    (`vae/ltx-2.5-video-vae-bf16.safetensors`, the records' default
+    decoder since 2026-10-05), the duration head and, for `bf16-dfr`, the
+    temporal latent upscaler were missing from every quant: the first
+    render ran both stages and died at decode with FileNotFoundError.
+    Quant byte totals and summaries updated; tests/slimserve 104 passed.
+- Registry and video tests on this box: tests/slimserve 377 passed, 1
+  skipped (after building the extension; `test_turboquant_cache` imports
+  the attention stack and needs `_quixicore_C` even for a video-only
+  check).
+- Render (`slimserve ltx25-distilled -p "A red fox trotting through a snowy
+  pine forest at dawn, birds chirping" --size 768x512 --seconds 5 --seed
+  42`, cold process, diffusion decoder): 768x512x121 in **104.0 s** (text
+  5.4, load 5.9, stage 1 27.6, upscale 0.3, stage 2 42.8, VAE decode 19.6,
+  audio decode 1.9, mux 0.4). ffprobe: h264 768x512, 121 frames, 5.04 s;
+  aac 5.01 s. A mid-clip frame is a coherent fox in a snowy pine forest
+  at sunset. The PR's M1 Ultra (64-core) figure for this clip is 86 s cold
+  with the conv decoder; the diffusion decoder alone is ~20 s of the 104
+  here, so the M4 Max is in the expected band, not a same-box comparison.
+- Serving check (`perf/ltx25_harness/n6_serve_check.py distilled 2 768x512
+  2`): PASS. Ready in 6.1 s (69.4 GiB resident), the oversize request
+  (3072x2048) refused with 400, two concurrent 768x512 2 s requests served
+  one at a time (gen 45.7 s and 41.5 s, peak 72.5 / 72.0 GiB, both mp4s
+  probe h264 49 frames + aac), the follow-up in 42.0 s, resident flat at
+  41.3 GiB after the burst and after the follow-up, 0 failed.
+- Decision: the engine, the profile CLI and the job-shaped serving API work
+  on an M4 Max from a clean install once the two fixes above are in; the
+  other 22 profiles (dev, DFR, HQ, retake, IC-LoRA, ...) and the enhancer
+  were not run here. Mergeable after #23 (it carries the toolchain fix this
+  branch cherry-picked).
+- Raw: `perf/results/2026-10-14/pr86-metal/` on studio128 (render.log,
+  fox_768x512_5s.mp4, n6_serve_check.log).
+
 ## 2026-10-01..08 - LTX-2.5 audio+video generation on Apple Silicon (`kind: "video"`)
 
 Summary of the campaign ledger `perf/ltx25_metal_campaign.md` (sections cited
