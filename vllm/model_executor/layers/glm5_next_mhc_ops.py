@@ -198,7 +198,12 @@ def join_glm5_mhc_deferred() -> None:
     coefficients on a side stream; no-op without the fused path."""
     from vllm.distributed import get_tp_group
 
-    comm = get_tp_group().device_communicator
+    try:
+        comm = get_tp_group().device_communicator
+    except AssertionError:
+        # No tensor-parallel group (the Metal kernel tests call the ops
+        # directly): nothing was deferred.
+        return
     ca_comm = getattr(comm, "ca_comm", None) if comm is not None else None
     if ca_comm is not None:
         ca_comm.join_glm5_mhc()
