@@ -101,6 +101,22 @@ class FutureWrapper(Future):
                 self.set_exception(e)
 
 
+_SHUTDOWN_SIGNALS = (signal.SIGTERM, signal.SIGINT)
+
+
+def _is_requested_shutdown_exit(exitcode: int | None) -> bool:
+    """Whether a worker exit code is consistent with a requested shutdown.
+
+    Clean exit (0), or termination by SIGTERM/SIGINT, reported either as a
+    negative signal number (multiprocessing) or as 128+n (a shell wrapper).
+    """
+    if exitcode is None:
+        return False
+    if exitcode == 0:
+        return True
+    return any(exitcode in (-int(sig), 128 + int(sig)) for sig in _SHUTDOWN_SIGNALS)
+
+
 class MultiprocExecutor(Executor):
     supports_pp: bool = True
 
@@ -312,12 +328,24 @@ class MultiprocExecutor(Executor):
                 # outstanding execute_model, or the XPU quiesce RPC), and a
                 # dead rank never answers. Cancel the response queues so that
                 # read fails now instead of hanging until the grace period.
-                (logger.debug if shutting_down else logger.info)(
-                    "Worker proc %s exited during requested shutdown "
-                    "(exit code: %s).",
-                    proc.name,
-                    proc.exitcode,
-                )
+                if _is_requested_shutdown_exit(proc.exitcode):
+                    (logger.debug if shutting_down else logger.info)(
+                        "Worker proc %s exited during requested shutdown "
+                        "(exit code: %s).",
+                        proc.name,
+                        proc.exitcode,
+                    )
+                else:
+                    # A shutdown was requested, but this exit code is not a
+                    # clean exit or the shutdown signal: the worker crashed
+                    # while stopping. Still no failure callback (the engine
+                    # is going down anyway), but do not hide the crash.
+                    logger.error(
+                        "Worker proc %s exited abnormally during requested "
+                        "shutdown (exit code: %s).",
+                        proc.name,
+                        proc.exitcode,
+                    )
                 if not shutting_down or getattr(_self, "_quiesce_in_progress", False):
                     _self._cancel_response_queues()
                 return

@@ -6,6 +6,7 @@ Runs on CPU: worker processes are stand-ins, and the response queues in the
 cancellation tests are real shared-memory MessageQueues used in-process.
 """
 
+import signal
 import threading
 import time
 from collections import deque
@@ -33,10 +34,10 @@ def _bare_executor() -> MultiprocExecutor:
     return executor
 
 
-def _monitor_executor(expected: bool):
+def _monitor_executor(expected: bool, exitcode: int = 0):
     executor = _bare_executor()
     sentinel = object()
-    proc = SimpleNamespace(sentinel=sentinel, name="worker-0", exitcode=0)
+    proc = SimpleNamespace(sentinel=sentinel, name="worker-0", exitcode=exitcode)
     executor.workers = [SimpleNamespace(proc=proc)]
     if expected:
         executor.notify_shutdown_requested()
@@ -92,6 +93,43 @@ def test_monitor_still_reports_unexpected_worker_exit():
     executor.shutdown.assert_called_once_with()
     failure_callback.assert_called_once_with()
     assert executor.failure_callback is None
+
+
+_LOGGER = "vllm.v1.executor.multiproc_executor.logger"
+
+
+@pytest.mark.parametrize(
+    "exitcode, abnormal",
+    [
+        (0, False),
+        (-signal.SIGTERM, False),
+        (-signal.SIGINT, False),
+        (128 + signal.SIGTERM, False),
+        (128 + signal.SIGINT, False),
+        (1, True),
+        (-signal.SIGSEGV, True),
+        (-signal.SIGKILL, True),
+        (128 + signal.SIGSEGV, True),
+    ],
+)
+def test_monitor_logs_abnormal_exit_during_requested_shutdown(exitcode, abnormal):
+    executor, sentinel = _monitor_executor(expected=True, exitcode=exitcode)
+    mq = MagicMock()
+    executor.response_mqs = [mq]
+
+    with patch(_WAIT, return_value=[sentinel]), patch(_LOGGER) as logger:
+        executor.start_worker_monitor(inline=True)
+
+    # Either way the shutdown proceeds: no failure report, reads cancelled.
+    assert not executor.is_failed
+    executor.failure_callback.assert_not_called()
+    executor.shutdown.assert_not_called()
+    mq.shutdown.assert_called_once_with()
+    if abnormal:
+        logger.error.assert_called_once()
+        assert exitcode in logger.error.call_args.args
+    else:
+        logger.error.assert_not_called()
 
 
 def test_monitor_leaves_queues_to_shutdown_once_teardown_started():
