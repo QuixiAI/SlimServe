@@ -99,7 +99,7 @@ def test_runner_consumes_external_logits_without_skipping_shared_sync():
     runner._sequence_parallel_context = nullcontext
     runner._maybe_dispatch = lambda h, r: (h, r)
     runner._apply_quant_method = Mock(return_value=(None, x))
-    runner._maybe_combine = lambda shared, hidden: hidden
+    runner._maybe_combine = lambda shared, hidden, **kwargs: hidden  # fold_shared=
     runner._forward_impl(x, x, x)
     assert gate_call.call_count == 1
     assert runner._apply_quant_method.call_args.kwargs["router_logits"] is logits
