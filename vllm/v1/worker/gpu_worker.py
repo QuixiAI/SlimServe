@@ -488,6 +488,15 @@ class Worker(WorkerBase):
             if gc_was_enabled:
                 gc.enable()
         gc.freeze()
+        self._finish_load_model()
+
+    def _finish_load_model(self) -> None:
+        """Platform-neutral post-load steps shared with worker subclasses.
+
+        Subclasses that override ``load_model`` (the Metal worker) call this
+        after their own load so the bootstamp and the weight-transfer engine
+        named by ``weight_transfer_config`` are not silently skipped.
+        """
         bootstamp(f"worker[{self.rank}]: load_model done, gc heap frozen")
 
         if self.vllm_config.weight_transfer_config is not None:
