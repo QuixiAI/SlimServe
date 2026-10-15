@@ -493,7 +493,7 @@ def test_qwen4_exp_ple_builder_receives_spec_decode_metadata() -> None:
     )
 
 
-def test_draft_model_view_does_not_mutate_shared_subconfigs():
+def test_draft_model_view_does_not_mutate_shared_subconfigs(tmp_path):
     """dataclasses.replace(vllm_config, model_config=draft_model_config)
     re-runs __post_init__ on a view whose sub-configs are the SAME objects
     as the serving config's. The view's runner_type is "draft", so runner
@@ -505,11 +505,21 @@ def test_draft_model_view_does_not_mutate_shared_subconfigs():
     from vllm.config.compilation import CUDAGraphMode
     from vllm.engine.arg_utils import EngineArgs
 
-    model = "/home/quixi/models/Qwen3.8-Flash-Next-FP8"
+    # A tiny synthetic Qwen4Exp checkpoint config (with MTP layers) instead
+    # of a host-local Qwen3.8-Flash-Next path: the guards under test live in
+    # VllmConfig.__post_init__ and depend only on the speculative/compilation
+    # configs, not on the model's size or the parallel layout.
+    Qwen4ExpConfig(
+        text_config=_text_config(max_position_embeddings=131072).to_dict(),
+        architectures=["Qwen4ExpForConditionalGeneration"],
+    ).save_pretrained(tmp_path)
+    model = str(tmp_path)
     args = EngineArgs(
         model=model,
-        tensor_parallel_size=8,
-        enable_expert_parallel=True,
+        skip_tokenizer_init=True,
+        # No tokenizer to resolve the default reasoning parser's markers.
+        reasoning_parser="",
+        load_format="dummy",
         max_model_len=131072,
         max_num_seqs=32,
         compilation_config={
