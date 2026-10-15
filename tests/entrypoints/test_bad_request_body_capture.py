@@ -3,6 +3,7 @@
 
 import asyncio
 import json
+import os
 import stat
 
 from vllm.entrypoints.serve.utils.server_utils import (
@@ -217,5 +218,146 @@ def test_file_is_capped_and_rotated_once(tmp_path):
         for path in (log_path, rotated):
             for line in path.read_text().splitlines():
                 assert json.loads(line)["status"] == 400
+
+    asyncio.run(run())
+
+
+async def _not_found(_scope, receive, send):
+    await receive()
+    await send({"type": "http.response.start", "status": 404, "headers": []})
+    await send({"type": "http.response.body", "body": b"not found"})
+
+
+def test_unauthenticated_non_api_path_is_not_recorded(tmp_path):
+    """AuthenticationMiddleware exempts paths outside GUARDED_PREFIX, so a
+    keyless ``POST /not-v1`` reaches the app and 404s. It must not be
+    written to disk."""
+    from vllm.entrypoints.serve.utils.server_utils import AuthenticationMiddleware
+
+    async def run():
+        log_path = tmp_path / "bad-requests.jsonl"
+        middleware = BadRequestBodyCaptureMiddleware(
+            AuthenticationMiddleware(_not_found, tokens=["right-key"]),
+            path=str(log_path),
+            max_body_bytes=1024,
+            tokens=["right-key"],
+        )
+        scope = _scope(authorization="")
+        scope["headers"] = [h for h in scope["headers"] if h[0] != b"authorization"]
+        scope["path"] = "/not-v1"
+        await middleware(scope, _receive_chunks(b"{}"), _sink)
+
+        options = _scope(authorization="Bearer wrong-key")
+        options["method"] = "OPTIONS"
+        await middleware(options, _receive_chunks(b"{}"), _sink)
+        assert not log_path.exists()
+
+        # Even a valid key does not make non-API paths eligible.
+        scope = _scope(authorization="Bearer right-key")
+        scope["path"] = "/not-v1"
+        await middleware(scope, _receive_chunks(b"{}"), _sink)
+        assert not log_path.exists()
+
+        # A keyed API-path 404 is still captured.
+        scope = _scope(authorization="Bearer right-key")
+        scope["path"] = "/v1/nope"
+        await middleware(scope, _receive_chunks(b"{}"), _sink)
+        assert json.loads(log_path.read_text())["status"] == 404
+
+    asyncio.run(run())
+
+
+def test_concurrent_rotation_keeps_previous_window(tmp_path, monkeypatch):
+    """Two API-server processes (two middleware instances) that both see a
+    full file must not both rotate: the second rotation would replace
+    ``.1`` with the first one's fresh file and destroy the previous window."""
+    import threading
+
+    from vllm.entrypoints.serve.utils import server_utils
+
+    log_path = tmp_path / "bad-requests.jsonl"
+    rotated = tmp_path / "bad-requests.jsonl.1"
+    first = BadRequestBodyCaptureMiddleware(
+        _not_found, path=str(log_path), max_body_bytes=64, max_file_bytes=300
+    )
+    second = BadRequestBodyCaptureMiddleware(
+        _not_found, path=str(log_path), max_body_bytes=64, max_file_bytes=300
+    )
+    old_window = [{"window": "old", "n": n, "pad": "p" * 40} for n in range(4)]
+    for record in old_window:
+        first._write_record(record)
+    assert not rotated.exists()
+
+    real_replace = os.replace
+    other = {}
+
+    def interleaving_replace(src, dst):
+        # The first process has decided to rotate; the second process writes
+        # at this very moment. Give it a chance to run before continuing.
+        if "thread" not in other:
+            other["thread"] = threading.Thread(
+                target=second._write_record,
+                args=({"window": "second", "pad": "q" * 40},),
+            )
+            other["thread"].start()
+            other["thread"].join(timeout=0.5)
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(server_utils.os, "replace", interleaving_replace)
+    first._write_record({"window": "first", "pad": "r" * 40})
+    other["thread"].join(timeout=5)
+    assert not other["thread"].is_alive()
+    monkeypatch.setattr(server_utils.os, "replace", real_replace)
+
+    def windows(path):
+        return [json.loads(line)["window"] for line in path.read_text().splitlines()]
+
+    rotated_windows = windows(rotated)
+    live_windows = windows(log_path)
+    assert rotated_windows == ["old"] * 4
+    assert sorted(live_windows) == ["first", "second"]
+
+
+def test_write_failure_logs_once_and_disables_capture(tmp_path, monkeypatch):
+    from unittest import mock
+
+    from vllm.entrypoints.serve.utils import server_utils
+
+    fake_logger = mock.Mock()
+    monkeypatch.setattr(server_utils, "logger", fake_logger)
+
+    async def bad_request(_scope, receive, send):
+        await receive()
+        await send({"type": "http.response.start", "status": 400, "headers": []})
+        await send({"type": "http.response.body", "body": b"bad"})
+
+    async def run():
+        # Parent directory does not exist: every write would fail.
+        middleware = BadRequestBodyCaptureMiddleware(
+            bad_request,
+            path=str(tmp_path / "missing" / "bad-requests.jsonl"),
+            max_body_bytes=1024,
+        )
+        writes = []
+        real_write = middleware._write_record
+
+        def counting_write(record):
+            writes.append(record)
+            return real_write(record)
+
+        middleware._write_record = counting_write
+        sent = []
+
+        async def collect(message):
+            sent.append(message)
+
+        for _ in range(5):
+            await middleware(_scope(), _receive_chunks(b"{}"), collect)
+        # Requests keep being served normally.
+        assert sum(m["type"] == "http.response.start" for m in sent) == 5
+        assert len(writes) == 1
+        assert middleware.disabled
+        assert fake_logger.error.call_count == 1
+        assert fake_logger.exception.call_count == 0
 
     asyncio.run(run())

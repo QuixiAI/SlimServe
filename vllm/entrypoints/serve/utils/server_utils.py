@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
+import fcntl
 import hashlib
 import json
 import os
@@ -55,6 +56,28 @@ ADMISSION_GUARDED_SUFFIXES = (
 )
 
 
+def _hash_api_tokens(tokens: list[str]) -> list[bytes]:
+    return [hashlib.sha256(t.encode("utf-8")).digest() for t in tokens]
+
+
+def _verify_bearer_token(headers: Headers, token_hashes: list[bytes]) -> bool:
+    authorization_header_value = headers.get("Authorization")
+    if not authorization_header_value:
+        return False
+
+    scheme, _, param = authorization_header_value.partition(" ")
+    if scheme.lower() != "bearer":
+        return False
+
+    param_hash = hashlib.sha256(param.encode("utf-8")).digest()
+
+    token_match = False
+    for token_hash in token_hashes:
+        token_match |= secrets.compare_digest(param_hash, token_hash)
+
+    return token_match
+
+
 class BadRequestBodyCaptureMiddleware:
     """Write bounded request/response bodies for failed HTTP requests.
 
@@ -63,14 +86,24 @@ class BadRequestBodyCaptureMiddleware:
     and are written only for 4xx responses. Body hashes cover the complete
     streams even when the recorded prefix is truncated.
 
-    401/403 responses are never recorded. This middleware sits outside
-    ``AuthenticationMiddleware``, so without that exclusion any
-    unauthenticated client could make the server write to disk; the
-    exclusion holds whatever order operator ``--middleware`` entries or
-    future registrations put it in. The file is also capped at
-    ``max_file_bytes``: once the next record would exceed it, the file is
-    rotated once to ``<path>.1`` (replacing any older rotation), so the
-    capture never holds more than about twice the cap on disk.
+    Only requests to the API paths (``GUARDED_PREFIX``, excluding OPTIONS)
+    are eligible, and when the server has API keys (``tokens``) the request
+    must also carry a valid one. ``AuthenticationMiddleware`` exempts every
+    other path and OPTIONS, so without this check an unauthenticated
+    ``POST /anything`` 404 would be written to disk. 401/403 responses are
+    never recorded either. Without configured API keys the server itself is
+    open, and any client reaching an API path can trigger a record; the
+    file cap bounds that.
+
+    The file is capped at ``max_file_bytes``: once the next record would
+    exceed it, the file is rotated once to ``<path>.1`` (replacing any older
+    rotation), so the capture never holds more than about twice the cap on
+    disk. Size check, rotation and append are serialized across API-server
+    processes with ``flock`` on the sidecar ``<path>.lock``, so two
+    processes cannot both rotate and destroy the previous window.
+
+    If a record cannot be written the failure is logged once and capture is
+    disabled for this process, rather than a traceback on every 4xx.
     """
 
     SKIPPED_STATUSES = frozenset({401, 403})
@@ -81,6 +114,7 @@ class BadRequestBodyCaptureMiddleware:
         path: str,
         max_body_bytes: int,
         max_file_bytes: int = 64 * 1024 * 1024,
+        tokens: list[str] | None = None,
     ) -> None:
         if not path:
             raise ValueError("bad-request capture path must not be empty")
@@ -92,6 +126,20 @@ class BadRequestBodyCaptureMiddleware:
         self.path = os.path.abspath(path)
         self.max_body_bytes = max_body_bytes
         self.max_file_bytes = max_file_bytes
+        self.lock_path = self.path + ".lock"
+        self.api_tokens = _hash_api_tokens(tokens or [])
+        self.disabled = False
+
+    def _eligible(self, scope: Scope) -> bool:
+        if scope.get("method") == "OPTIONS":
+            return False
+        root_path = scope.get("root_path", "")
+        url_path = scope["path"].removeprefix(root_path)
+        if not url_path.startswith(GUARDED_PREFIX):
+            return False
+        if self.api_tokens:
+            return _verify_bearer_token(Headers(scope=scope), self.api_tokens)
+        return True
 
     @staticmethod
     def _append_prefix(destination: bytearray, chunk: bytes, limit: int) -> None:
@@ -99,40 +147,53 @@ class BadRequestBodyCaptureMiddleware:
         if remaining > 0:
             destination.extend(chunk[:remaining])
 
-    def _open_log(self) -> tuple[int, int]:
-        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+    @staticmethod
+    def _open_private(path: str, flags: int) -> int:
+        flags |= os.O_CREAT
         flags |= getattr(os, "O_CLOEXEC", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(self.path, flags, 0o600)
+        fd = os.open(path, flags, 0o600)
         try:
             os.fchmod(fd, 0o600)
-            st = os.fstat(fd)
-            if not stat.S_ISREG(st.st_mode):
-                raise OSError(f"diagnostic path is not a regular file: {self.path}")
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise OSError(f"diagnostic path is not a regular file: {path}")
         except BaseException:
             os.close(fd)
             raise
-        return fd, st.st_size
+        return fd
+
+    def _open_log(self) -> tuple[int, int]:
+        fd = self._open_private(self.path, os.O_WRONLY | os.O_APPEND)
+        return fd, os.fstat(fd).st_size
 
     def _write_record(self, record: dict) -> None:
         payload = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
         data = payload.encode("utf-8") + b"\n"
-        fd, size = self._open_log()
+        # Every API-server process shares the file: hold the sidecar lock
+        # across open, size check, rotation and append. The log is opened
+        # only after the lock is held, so the size seen is the current
+        # file's, never a window another process already rotated away.
+        lock_fd = self._open_private(self.lock_path, os.O_RDWR)
         try:
-            if size > 0 and size + len(data) > self.max_file_bytes:
-                # Rotate once: the previous window survives as <path>.1 and
-                # the live file starts empty. Disk use stays near 2x the cap.
-                os.close(fd)
-                fd = -1
-                os.replace(self.path, self.path + ".1")
-                fd, _ = self._open_log()
-            os.write(fd, data)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            fd, size = self._open_log()
+            try:
+                if size > 0 and size + len(data) > self.max_file_bytes:
+                    # Rotate once: the previous window survives as <path>.1
+                    # and the live file starts empty (~2x the cap on disk).
+                    os.close(fd)
+                    fd = -1
+                    os.replace(self.path, self.path + ".1")
+                    fd, _ = self._open_log()
+                os.write(fd, data)
+            finally:
+                if fd >= 0:
+                    os.close(fd)
         finally:
-            if fd >= 0:
-                os.close(fd)
+            os.close(lock_fd)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http":
+        if scope["type"] != "http" or self.disabled or not self._eligible(scope):
             return await self.app(scope, receive, send)
 
         request_prefix = bytearray()
@@ -202,12 +263,19 @@ class BadRequestBodyCaptureMiddleware:
             "response_body_truncated": response_bytes > len(response_prefix),
             "response_sha256": response_hash.hexdigest(),
         }
+        if self.disabled:
+            return
         try:
             self._write_record(record)
-        except OSError:
-            logger.exception(
-                "Failed to write bad-request diagnostic record to %s",
+        except OSError as exc:
+            # Log once and stop: a broken capture path must not turn every
+            # later 4xx into a traceback in the server log.
+            self.disabled = True
+            logger.error(
+                "Failed to write bad-request diagnostic record to %s (%s); "
+                "bad-request capture is disabled for this process.",
                 self.path,
+                exc,
             )
 
 
@@ -280,24 +348,10 @@ class AuthenticationMiddleware:
 
     def __init__(self, app: ASGIApp, tokens: list[str]) -> None:
         self.app = app
-        self.api_tokens = [hashlib.sha256(t.encode("utf-8")).digest() for t in tokens]
+        self.api_tokens = _hash_api_tokens(tokens)
 
     def verify_token(self, headers: Headers) -> bool:
-        authorization_header_value = headers.get("Authorization")
-        if not authorization_header_value:
-            return False
-
-        scheme, _, param = authorization_header_value.partition(" ")
-        if scheme.lower() != "bearer":
-            return False
-
-        param_hash = hashlib.sha256(param.encode("utf-8")).digest()
-
-        token_match = False
-        for token_hash in self.api_tokens:
-            token_match |= secrets.compare_digest(param_hash, token_hash)
-
-        return token_match
+        return _verify_bearer_token(headers, self.api_tokens)
 
     def __call__(self, scope: Scope, receive: Receive, send: Send) -> Awaitable[None]:
         if (
