@@ -7,6 +7,7 @@ import gguf
 import torch
 from gguf import GGMLQuantizationType as WeightType
 
+import vllm.envs as envs
 from vllm.model_executor.layers.linear import (
     LinearMethodBase,
     register_weight_loader_v2_supported_method,
@@ -314,12 +315,7 @@ def _xpu_q8_split_enabled() -> bool:
     """Opt-in (VLLM_XPU_GGUF_Q8_SPLIT=1): the split-plane Q8_0 layout and its
     SYCL kernels have not been built or measured on B70 yet. The same flag
     gates the raw-Q8_0 weight-stationary GEMV inside the XPU binding."""
-    return os.environ.get("VLLM_XPU_GGUF_Q8_SPLIT", "0").lower() in (
-        "1",
-        "true",
-        "on",
-        "yes",
-    )
+    return envs.VLLM_XPU_GGUF_Q8_SPLIT
 
 
 def _effective_shard_weight_types(layer: torch.nn.Module) -> list[int]:

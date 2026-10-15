@@ -25,7 +25,6 @@ from __future__ import annotations
 import dataclasses
 import functools
 import gc
-import os
 import threading
 import weakref
 from collections.abc import Callable
@@ -152,9 +151,7 @@ _XPU_SYNC_BINDINGS_INSTALLED = False
 # A variant is admissible only if greedy output stays byte-identical to `sync`
 # across batch shapes (perf notebook 2026-08-18: py-spy put 74% of worker host
 # time in the leading wait at c1).
-_XPU_REPLAY_ORDER = os.environ.get("VLLM_XPU_GRAPH_REPLAY_ORDER", "sync").lower()
-_XPU_REPLAY_SYNC_LEAD = _XPU_REPLAY_ORDER in ("sync", "lead")
-_XPU_REPLAY_SYNC_TRAIL = _XPU_REPLAY_ORDER in ("sync", "trail")
+# Set through envs.VLLM_XPU_GRAPH_REPLAY_ORDER; read when a replayer is built.
 
 
 def _xpu_graph_replayer(graph: Any) -> Callable[[], None]:
@@ -167,13 +164,16 @@ def _xpu_graph_replayer(graph: Any) -> Callable[[], None]:
     before oneCCL init deadlocks it, and each name gets its own
     ``functools.partial`` (Dynamo asserts on duplicate handler objects).
     (2) Replay is ordered against the eager oneCCL segments around it with a
-    current-stream wait before and a graph wait after (the sibling tree
-    measured this as the safe default; ``VLLM_XPU_GRAPH_REPLAY_ORDER``
-    none/lead/trail exist there for A/B and are not wired here yet).
+    current-stream wait before and a graph wait after by default (the sibling
+    tree measured this as the safe default). ``VLLM_XPU_GRAPH_REPLAY_ORDER``
+    selects lead / trail / none for A/B; it is read when the replayer is built.
     """
     import vllm._quixicore_C as qc
 
     sync = qc.synchronize_current_stream
+    order = (envs.VLLM_XPU_GRAPH_REPLAY_ORDER or "sync").lower()
+    sync_lead = order in ("sync", "lead")
+    sync_trail = order in ("sync", "trail")
 
     def replay() -> None:
         global _XPU_SYNC_BINDINGS_INSTALLED
@@ -187,10 +187,10 @@ def _xpu_graph_replayer(graph: Any) -> Callable[[], None]:
             except Exception:  # pragma: no cover - dynamo layout drift
                 pass
             _XPU_SYNC_BINDINGS_INSTALLED = True
-        if _XPU_REPLAY_SYNC_LEAD:
+        if sync_lead:
             sync()
         graph.replay()
-        if _XPU_REPLAY_SYNC_TRAIL:
+        if sync_trail:
             graph.synchronize()
 
     return replay

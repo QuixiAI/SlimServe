@@ -38,9 +38,7 @@ def _reoffload(is_xpu: bool) -> torch.Tensor:
         platform.is_xpu.return_value = is_xpu
         with loader_utils.device_loading_context(layer, torch.device("meta")):
             # What fp8.py / cutlass.py do: replace with a transposed view.
-            layer.weight = nn.Parameter(
-                torch.randn(256, 128).t(), requires_grad=False
-            )
+            layer.weight = nn.Parameter(torch.randn(256, 128).t(), requires_grad=False)
     assert layer.weight._vllm_is_uva_offloaded
     return layer.weight.data
 

@@ -309,6 +309,8 @@ if TYPE_CHECKING:
     VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: bool = True
     VLLM_NIXL_EP_MAX_NUM_RANKS: int = 32
     VLLM_XPU_ENABLE_XPU_GRAPH: bool = False
+    VLLM_XPU_GRAPH_REPLAY_ORDER: Literal["sync", "lead", "trail", "none"] = "sync"
+    VLLM_XPU_GGUF_Q8_SPLIT: bool = False
     VLLM_XPU_PER_WORKER_AFFINITY: bool = True
     VLLM_XPU_KEEP_UR_TRACING: bool = False
     VLLM_XPU_USE_SAMPLER_KERNEL: bool = True
@@ -2086,7 +2088,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_NIXL_EP_MAX_NUM_RANKS": lambda: int(
         os.getenv("VLLM_NIXL_EP_MAX_NUM_RANKS", "32")
     ),
-    # Whether enable XPU graph on Intel GPU
     # Spawn each XPU TP worker with a single-device ZE_AFFINITY_MASK so its
     # Level Zero context is single-device (VRAM is otherwise mirrored in host
     # RAM through dma-buf sharing; see vllm/platforms/xpu_affinity.py).
@@ -2098,8 +2099,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_XPU_KEEP_UR_TRACING": lambda: bool(
         int(os.getenv("VLLM_XPU_KEEP_UR_TRACING", "0"))
     ),
+    # Whether enable XPU graph on Intel GPU
     "VLLM_XPU_ENABLE_XPU_GRAPH": lambda: bool(
         int(os.getenv("VLLM_XPU_ENABLE_XPU_GRAPH", "0"))
+    ),
+    # XPU graph-segment replay ordering against the surrounding eager
+    # segments (vllm/compilation/breakable_cudagraph.py): sync = current-stream
+    # wait before replay and graph wait after (default); lead / trail = only
+    # the leading / trailing wait; none = neither (in-order queue only).
+    "VLLM_XPU_GRAPH_REPLAY_ORDER": env_with_choices(
+        "VLLM_XPU_GRAPH_REPLAY_ORDER",
+        "sync",
+        ["sync", "lead", "trail", "none"],
+        case_sensitive=False,
+    ),
+    # Opt-in split-plane GGUF Q8_0 layout and its SYCL kernels on XPU (also
+    # gates the raw-Q8_0 weight-stationary GEMV in the XPU binding).
+    "VLLM_XPU_GGUF_Q8_SPLIT": lambda: (
+        os.getenv("VLLM_XPU_GGUF_Q8_SPLIT", "0").lower() in ("1", "true", "on", "yes")
     ),
     # whether use xpu specific sample kernel
     "VLLM_XPU_USE_SAMPLER_KERNEL": lambda: bool(
