@@ -25,7 +25,7 @@ class GateLinear(ReplicatedLinear):
     4. fp32 specialized kernel  (SM90+, bf16/fp32 in, fp32 out, M<=32,
        (H, E) in {(3072, 256), (6144, 128), (6144, 256)})
     5. experimental bf16x3 CuteDSL kernel (opt-in, SM100, bf16 in, fp32 weight)
-    6. cuBLAS bf16×bf16→fp32 (SM90+, or GLM-5.3-Flash SM80 shape)
+    6. cuBLAS bf16×bf16→fp32 (SM90+, or the GLM-5.3-Flash shape elsewhere)
     7. F.linear via ReplicatedLinear (ultimate fallback)
 
     The ``out_dtype`` attribute is mutable and can be set after init
@@ -78,24 +78,36 @@ class GateLinear(ReplicatedLinear):
         )
         self.out_dtype = out_dtype
 
+        # The QuixiCore bf16 -> fp32 router GEMV (one block per expert row,
+        # 1..8 tokens): DSV4's 256 experts on A100, GLM-5.3-Flash's 288 on
+        # A100 and sm_120 (where cuBLAS runs it as a tensor-core GEMM plus a
+        # split-K reduce, 6 us per layer at decode). The dsv4_/_ampere names
+        # are historical (the kernel was written for DSV4 on A100); the op
+        # also serves the GLM pooled indexer's packed projection
+        # (glm5_next_indexer.py).
         self._dsv4_ampere_router_shape = (
             not bias
             and current_platform.is_cuda()
-            and current_platform.is_device_capability((8, 0))
+            and (
+                current_platform.is_device_capability((8, 0))
+                or current_platform.is_device_capability_family(120)
+            )
             and self.weight.dtype == torch.bfloat16
             and input_size == 4096
-            and output_size == 256
+            and output_size in (256, 288)
         )
         self.allow_dsv4_ampere_router_gemm = (
             self._dsv4_ampere_router_shape and out_dtype == torch.float32
         )
-        # GLM-5.3-Flash requires FP32 router logits. Ampere supports cuBLAS
-        # BF16 inputs with FP32 output; rounding to BF16 and then casting
-        # back loses information (and adds a copy) before expert selection.
-        self._glm5_next_ampere_router_shape = (
+        # GLM-5.3-Flash requires FP32 router logits. cuBLAS takes BF16 inputs
+        # with FP32 output on every CUDA arch (Ampere, and sm_120 which has
+        # none of the SM90/SM100 specialized kernels); rounding to BF16 and
+        # then casting back loses information (and adds a copy) before
+        # expert selection.
+        self._glm5_next_cublas_router_shape = (
             not bias
             and current_platform.is_cuda()
-            and current_platform.is_device_capability((8, 0))
+            and not can_use_specialized_kernels
             and input_size == 4096
             and output_size == 288
         )
@@ -139,7 +151,7 @@ class GateLinear(ReplicatedLinear):
 
         # cuBLAS bf16→fp32 eligibility
         self.allow_cublas_router_gemm = (
-            (self.allow_specialized_router_gemm or self._glm5_next_ampere_router_shape)
+            (self.allow_specialized_router_gemm or self._glm5_next_cublas_router_shape)
             and self.weight.dtype == torch.bfloat16
             and self.out_dtype == torch.float32
         )
@@ -176,7 +188,7 @@ class GateLinear(ReplicatedLinear):
             not self.allow_cublas_router_gemm
             and (
                 self.allow_specialized_router_gemm
-                or self._glm5_next_ampere_router_shape
+                or self._glm5_next_cublas_router_shape
             )
             and out_dtype == torch.float32
         ):
@@ -197,12 +209,11 @@ class GateLinear(ReplicatedLinear):
     def forward(
         self, x: torch.Tensor
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
-        # Tier 1: native decode router for DeepSeek-V4 on A100.
-        if (
-            self.allow_dsv4_ampere_router_gemm
-            and x.shape[0] <= 8
-            and x.dtype == torch.bfloat16
-        ):
+        # Tier 1: the QuixiCore decode router GEMV (DSV4 on A100; GLM-5.3-Flash
+        # on A100 and sm_120). The 1..8-token branch lives inside the custom op
+        # (larger batches take cuBLAS there) so torch.compile does not
+        # specialize the graph on the token count.
+        if self.allow_dsv4_ampere_router_gemm and x.dtype == torch.bfloat16:
             output = torch.ops.vllm.dsv4_ampere_router_gemm(x, self.weight)
             return output, None
 
@@ -262,17 +273,15 @@ class GateLinear(ReplicatedLinear):
 _FP32_ROUTER_GEMM_MAX_TOKENS = GateLinear.FP32_MAX_TOKENS
 
 
-def dsv4_ampere_router_gemm_impl(
-    x: torch.Tensor, weight: torch.Tensor
-) -> torch.Tensor:
-    from vllm.quixicore.ops import quixicore_ops
+def dsv4_ampere_router_gemm_impl(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    if x.shape[0] <= 8:
+        from vllm.quixicore.ops import quixicore_ops
 
-    return quixicore_ops.dsv4_router_gemm(x, weight)
+        return quixicore_ops.dsv4_router_gemm(x, weight)
+    return torch.mm(x, weight.T, out_dtype=torch.float32)
 
 
-def dsv4_ampere_router_gemm_fake(
-    x: torch.Tensor, weight: torch.Tensor
-) -> torch.Tensor:
+def dsv4_ampere_router_gemm_fake(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return x.new_empty((x.shape[0], weight.shape[0]), dtype=torch.float32)
 
 

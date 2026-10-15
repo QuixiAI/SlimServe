@@ -105,6 +105,47 @@ class FixFunctionalizationPass(VllmInductorPass):
             elif at_target == torch.ops._C.rms_norm_dynamic_per_token_quant.default:  # noqa: E501
                 mutated_args = {1: "result", 2: "scale", 3: "residual"}
                 self.defunctionalize(graph, node, mutated_args)
+            elif at_target == torch.ops._C.cutlass_scaled_mm.default:
+                # (out!, a, b, a_scales, b_scales, bias?) -> (): the FP8
+                # online-quant linear of a `quantization: fp8` drafter. The
+                # `out` argument cannot travel as a kwarg (see
+                # insert_defunctionalized), so the call is rebuilt in schema
+                # order.
+                mutated_args = {1: "out"}
+                self.defunctionalize(
+                    graph,
+                    node,
+                    mutated_args,
+                    args=("out", "a", "b", "a_scales", "b_scales", "bias"),
+                )
+            elif at_target == torch.ops.vllm.moe_forward.default:
+                # (hidden_states!, router_logits, shared_experts_input?,
+                # input_ids?, prequant_input?, layer_name, hidden_dim_unpadded)
+                # -> Tensor: the MoE op of a layer without a shared-expert
+                # module (GLM-5.3 with the shared expert served as expert E).
+                # The op declares hidden_states mutated; its result stays at
+                # getitem[0] and the mutated view resolves to the input.
+                mutated_args = {1: "hidden_states"}
+                self.defunctionalize(
+                    graph,
+                    node,
+                    mutated_args,
+                    args=(
+                        "hidden_states",
+                        "router_logits",
+                        "shared_experts_input",
+                        "input_ids",
+                        "prequant_input",
+                        "layer_name",
+                        "hidden_dim_unpadded",
+                    ),
+                )
+            elif (
+                at_target == torch.ops._C.dynamic_per_token_scaled_fp8_quant.default
+            ):
+                # (result!, input, scale!, scale_ub?) -> ()
+                mutated_args = {1: "result", 2: "scale"}
+                self.defunctionalize(graph, node, mutated_args)
             elif at_target in [
                 torch.ops._C.per_token_group_fp8_quant.default,
                 torch.ops._C.per_token_group_fp8_quant_packed.default,
