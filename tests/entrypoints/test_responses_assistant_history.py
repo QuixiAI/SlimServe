@@ -396,6 +396,40 @@ def test_empty_in_progress_final_message_does_not_resume_tool_turn(content):
     )
 
 
+def test_nonempty_in_progress_final_message_after_tool_call_keeps_call():
+    # A partial assistant message after a function call is a new turn being
+    # continued; merging it into the tool-call turn would place the
+    # continuation cut before the calls and drop them from the prompt.
+    request = ResponsesRequest.model_validate(
+        {
+            "model": "test-model",
+            "input": [
+                {"role": "user", "content": "Check inventory."},
+                history_call(1),
+                {
+                    **output_message(
+                        [{"type": "output_text", "text": "Partial", "annotations": []}]
+                    ),
+                    "id": "msg_partial",
+                    "status": "in_progress",
+                },
+            ],
+        }
+    )
+    messages = construct_input_messages(request_input=request.input)
+    assert [m["role"] for m in messages] == ["user", "assistant", "assistant"]
+    assert [c["id"] for c in messages[1]["tool_calls"]] == ["call_1"]
+    assert messages[2] == {"role": "assistant", "content": "Partial"}
+
+    continued, prompt = render_request(request)
+    assert continued
+    assert prompt == (
+        "<|user|>Check inventory.<|end|>"
+        "<|assistant|><call>inventory</call><|end|>"
+        "<|assistant|>Partial"
+    )
+
+
 def test_empty_in_progress_final_message_does_not_resume_finished_message():
     request = ResponsesRequest.model_validate(
         {
