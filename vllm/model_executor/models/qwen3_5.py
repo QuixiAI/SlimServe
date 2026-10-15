@@ -300,6 +300,24 @@ class Qwen3_5MoeProcessingInfo(Qwen3_5GGUFArtifactMixin, Qwen3VLProcessingInfo):
         return self.ctx.get_hf_config((Qwen3_5MoeConfig, Qwen3_5MoeTextConfig))
 
 
+def _qwen35_mlp_kind(config: object) -> str:
+    """Resolve dense versus MoE independently of the MTP model-type rewrite."""
+    if isinstance(config, Qwen3_5MoeTextConfig):
+        return "moe"
+    if isinstance(config, Qwen3_5TextConfig):
+        return "dense"
+
+    model_type = getattr(config, "model_type", None)
+    if model_type == "qwen3_5_moe_text":
+        return "moe"
+    if model_type == "qwen3_5_text":
+        return "dense"
+    if model_type == "qwen3_5_mtp":
+        architectures = getattr(config, "architectures", None) or []
+        return "moe" if "Qwen3_5MoeMTP" in architectures else "dense"
+    raise ValueError(f"Invalid model_type {model_type}")
+
+
 class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
     def __init__(
         self,
@@ -344,14 +362,15 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
         else:
             raise ValueError(f"Invalid layer_type {self.layer_type}")
 
-        # NOTE: Determine the MLP type based on the model type
-        # Qwen3.5 use all layers for MLP / Qwen3.5-MoE use sparse MoE blocks
-        if config.model_type == "qwen3_5_moe_text":
+        # SpeculativeConfig rewrites both dense and MoE MTP drafts to the
+        # shared qwen3_5_mtp model type. Preserve the concrete config class as
+        # the authority for selecting the decoder's feed-forward block.
+        if _qwen35_mlp_kind(config) == "moe":
             self.mlp = Qwen3NextSparseMoeBlock(
                 vllm_config=vllm_config,
                 prefix=f"{prefix}.mlp",
             )
-        elif config.model_type == "qwen3_5_text":
+        else:
             self.mlp = Qwen3NextMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
@@ -359,8 +378,6 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
             )
-        else:
-            raise ValueError(f"Invalid model_type {config.model_type}")
 
         self.input_layernorm = Qwen3_5RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
