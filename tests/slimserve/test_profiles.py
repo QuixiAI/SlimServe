@@ -691,6 +691,12 @@ def test_deepseek_metal_is_runnable_while_glm_stays_gated():
     assert registry.platform_blocked("a100") is None
 
 
+def test_b70_stays_gated_until_an_xpu_backend_lands():
+    """Detection alone must not make B70 profiles runnable."""
+    assert registry.platform_blocked("b70") is not None
+    assert registry.platform_blocked_detail("b70")
+
+
 def test_deepseek_metal_uses_dspark_fp8_settings():
     plan = resolve("dsv4-xxs-1", "metal", 1, "IQ2_XXS", 128 * GB)
     # 256K metal resize (2026-08-11 Metal-side commit).

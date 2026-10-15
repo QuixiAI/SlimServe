@@ -2013,6 +2013,17 @@
       "vram_bytes": 102642417664,
       "gate": "gpus",
       "status": "supported"
+    },
+    "b70": {
+      "title": "Intel Arc Pro B70",
+      "vram_bytes": 34242101248,
+      "gate": "gpus",
+      "status": "in-progress",
+      "status_reason": "no XPU serving backend on main yet",
+      "status_detail": "SlimServe detects the Intel Arc Pro B70, but main does not yet carry the XPU platform (worker, attention and quantized-MoE paths) that serving on it needs. The CLI keeps every B70 profile gated until that backend lands and each profile is validated on the card.",
+      "notes": [
+        "32 GiB per card (32656 MiB reported by xpu-smi). Serving requires the XPU implementation; each model profile records its own qualification status."
+      ]
     }
   },
   "profiles": {
