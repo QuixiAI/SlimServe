@@ -5,18 +5,22 @@ This is a local inventory workflow, not the external Evalhub benchmark.
 
 Sampling follows serving policy: temperature 1.0 / top_p 0.95 / top_k 20,
 seeded (request i uses seed + i), thinking left enabled. Raw output defaults
-to perf/results/<YYYY-MM-DD>/<run-id>/qwen_tool_protocol.json.
+to <repo>/perf/results/<YYYY-MM-DD>/<run-id>/qwen_tool_protocol.json, with a
+unique run id.
 
 Timing per round: ``response_created_s`` is the time to the first SSE event
 (``response.created``, emitted before any generation); ``first_output_delta_s``
 is the time to the first generated delta (reasoning, text or call arguments).
 A round that ends ``response.incomplete`` because it hit max_output_tokens is
-counted as ``incomplete_max_output_tokens``, separately from protocol errors.
+counted only as ``incomplete_max_output_tokens``: its (possibly cut-off) call
+arguments are not validated. ``completed_rounds`` counts rounds that were
+neither truncated nor carried a protocol error.
 """
 
 import argparse
 import asyncio
 import json
+import secrets
 import time
 from datetime import datetime
 from pathlib import Path
@@ -83,6 +87,61 @@ def payload(index, args):
     }
 
 
+def evaluate_round(events, index):
+    """Classify one streamed round: (final, calls, truncated, errors).
+
+    A round truncated by max_output_tokens is reported only as truncated: its
+    call arguments may legitimately be cut off, so they are not validated and
+    the round carries no protocol errors.
+    """
+    terminal = [
+        e
+        for e in events
+        if e.get("type")
+        in {"response.completed", "response.failed", "response.incomplete"}
+    ]
+    final = terminal[-1].get("response", {}) if terminal else {}
+    calls = [o for o in final.get("output", []) if o.get("type") == "function_call"]
+    truncated = (
+        final.get("status") == "incomplete"
+        and (final.get("incomplete_details") or {}).get("reason")
+        == "max_output_tokens"
+    )
+    if truncated:
+        # Not a protocol fault: the budget ran out. The round cannot be
+        # replayed, so the conversation stops here.
+        return final, calls, True, []
+    errors = []
+    if final.get("status") != "completed":
+        errors.append("missing successful terminal response")
+    elif not calls:
+        errors.append("required request returned no call")
+    for call in calls:
+        try:
+            obj = json.loads(call["arguments"])
+            if not isinstance(obj, dict):
+                errors.append("arguments not object")
+            elif obj.get("batch_id") != f"BATCH-{index}":
+                errors.append("batch_id missing or corrupted")
+        except ValueError:
+            errors.append("malformed arguments")
+    for event in events:
+        if event.get("type") == "response.function_call_arguments.done":
+            try:
+                json.loads(event["arguments"])
+            except ValueError:
+                errors.append("malformed done arguments")
+    assembled = {}
+    for event in events:
+        if event.get("type") == "response.function_call_arguments.delta":
+            item = event["item_id"]
+            assembled[item] = assembled.get(item, "") + event["delta"]
+        elif event.get("type") == "response.function_call_arguments.done":
+            if assembled.get(event["item_id"], "") != event["arguments"]:
+                errors.append("stream delta/done mismatch")
+    return final, calls, False, errors
+
+
 async def run_one(client, url, index, args):
     body = payload(index, args)
     rounds = []
@@ -108,51 +167,7 @@ async def run_one(client, url, index, args):
                     first_delta = time.perf_counter() - started
                 events.append(event)
         elapsed = time.perf_counter() - started
-        terminal = [
-            e
-            for e in events
-            if e.get("type")
-            in {"response.completed", "response.failed", "response.incomplete"}
-        ]
-        final = terminal[-1].get("response", {}) if terminal else {}
-        calls = [o for o in final.get("output", []) if o.get("type") == "function_call"]
-        errors = []
-        truncated = (
-            final.get("status") == "incomplete"
-            and (final.get("incomplete_details") or {}).get("reason")
-            == "max_output_tokens"
-        )
-        if truncated:
-            # Not a protocol fault: the budget ran out. The round cannot be
-            # replayed, so the conversation stops here.
-            pass
-        elif final.get("status") != "completed":
-            errors.append("missing successful terminal response")
-        elif not calls:
-            errors.append("required request returned no call")
-        for call in calls:
-            try:
-                obj = json.loads(call["arguments"])
-                if not isinstance(obj, dict):
-                    errors.append("arguments not object")
-                elif obj.get("batch_id") != f"BATCH-{index}":
-                    errors.append("batch_id missing or corrupted")
-            except ValueError:
-                errors.append("malformed arguments")
-        for event in events:
-            if event.get("type") == "response.function_call_arguments.done":
-                try:
-                    json.loads(event["arguments"])
-                except ValueError:
-                    errors.append("malformed done arguments")
-        assembled = {}
-        for event in events:
-            if event.get("type") == "response.function_call_arguments.delta":
-                item = event["item_id"]
-                assembled[item] = assembled.get(item, "") + event["delta"]
-            elif event.get("type") == "response.function_call_arguments.done":
-                if assembled.get(event["item_id"], "") != event["arguments"]:
-                    errors.append("stream delta/done mismatch")
+        final, calls, truncated, errors = evaluate_round(events, index)
         rounds.append(
             {
                 "turn": turn,
@@ -186,15 +201,46 @@ async def run_one(client, url, index, args):
     return {"index": index, "rounds": rounds}
 
 
-def default_output():
-    now = datetime.now()
-    run_id = now.strftime("qwen-tool-protocol-%H%M%S")
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def default_output(now=None):
+    """perf/results/<date>/<run-id>/ under the repo root, whatever the CWD.
+
+    The run id carries microseconds and a random suffix so concurrent or
+    back-to-back runs never share (and overwrite) a directory.
+    """
+    now = now or datetime.now()
+    run_id = now.strftime("qwen-tool-protocol-%H%M%S-%f-") + secrets.token_hex(3)
     return (
-        Path("perf/results")
+        REPO_ROOT
+        / "perf"
+        / "results"
         / now.strftime("%Y-%m-%d")
         / run_id
         / "qwen_tool_protocol.json"
     )
+
+
+def summarize(rows, elapsed):
+    """Round counts: a round is completed only if it was neither truncated
+    nor carried a protocol error; the three counts partition ``rounds``."""
+    rounds = [r for row in rows for r in row.get("rounds", [])]
+    tokens = sum(r["usage"].get("output_tokens", 0) for r in rounds)
+    errored = sum(bool(r["errors"]) for r in rounds)
+    truncated = sum(r["incomplete_max_output_tokens"] for r in rounds)
+    return {
+        "elapsed_s": elapsed,
+        "output_tokens": tokens,
+        "aggregate_output_tokens_per_s": tokens / elapsed if elapsed else 0.0,
+        "rounds": len(rounds),
+        "completed_rounds": sum(
+            not r["errors"] and not r["incomplete_max_output_tokens"]
+            for r in rounds
+        ),
+        "protocol_errors": errored + sum("error" in row for row in rows),
+        "incomplete_max_output_tokens": truncated,
+    }
 
 
 async def main(args):
@@ -207,39 +253,33 @@ async def main(args):
         )
     rows = [x if isinstance(x, dict) else {"error": str(x)} for x in results]
     elapsed = time.perf_counter() - started
-    rounds = [r for row in rows for r in row.get("rounds", [])]
-    tokens = sum(r["usage"].get("output_tokens", 0) for r in rounds)
-    errors = sum(bool(r["errors"]) for r in rounds) + sum(
-        "error" in row for row in rows
+    summary = summarize(rows, elapsed)
+    summary.update(
+        {
+            "started_at_unix": started_at_unix,
+            "model": args.model,
+            "sampling": {
+                "temperature": args.temperature,
+                "top_p": args.top_p,
+                "top_k": args.top_k,
+                "seed": args.seed,
+            },
+            "max_output_tokens": args.max_output_tokens,
+            "concurrency": args.concurrency,
+            "turns": args.turns,
+            "records": args.records,
+        }
     )
-    truncated = sum(r["incomplete_max_output_tokens"] for r in rounds)
-    summary = {
-        "started_at_unix": started_at_unix,
-        "elapsed_s": elapsed,
-        "output_tokens": tokens,
-        "aggregate_output_tokens_per_s": tokens / elapsed,
-        "rounds": len(rounds),
-        "completed_rounds": len(rounds) - truncated,
-        "protocol_errors": errors,
-        "incomplete_max_output_tokens": truncated,
-        "model": args.model,
-        "sampling": {
-            "temperature": args.temperature,
-            "top_p": args.top_p,
-            "top_k": args.top_k,
-            "seed": args.seed,
-        },
-        "max_output_tokens": args.max_output_tokens,
-        "concurrency": args.concurrency,
-        "turns": args.turns,
-        "records": args.records,
-    }
     output = Path(args.output) if args.output else default_output()
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps({"summary": summary, "results": rows}, indent=2))
     print(json.dumps(summary, indent=2), flush=True)
     print(f"raw: {output}", flush=True)
-    if errors or truncated or len(rounds) != args.concurrency * args.turns:
+    if (
+        summary["protocol_errors"]
+        or summary["incomplete_max_output_tokens"]
+        or summary["completed_rounds"] != args.concurrency * args.turns
+    ):
         raise SystemExit(1)
 
 
