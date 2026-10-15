@@ -41,4 +41,9 @@ else:
         pass
 
 
-__all__ = ["PDL", "gdc_launch_dependents", "gdc_wait"]
+# `launch_pdl` is a Triton launch option only the CUDA backend accepts; ROCm's
+# raises "Keyword argument launch_pdl was specified but unrecognised" even
+# for False. Splat this into the launch instead of passing the keyword.
+PDL_LAUNCH: dict[str, bool] = {"launch_pdl": True} if PDL else {}
+
+__all__ = ["PDL", "PDL_LAUNCH", "gdc_launch_dependents", "gdc_wait"]
