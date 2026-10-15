@@ -62,12 +62,188 @@ class quixicore_ops:
             return False
 
     # ------------------------------------------------------------------
+    # Marlin MoE routing and combine (glm_moe_routing.cuh, glm_moe_combine.cuh)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    @cache
+    def has_glm_route_align() -> bool:
+        return quixicore_ops.is_available() and hasattr(_qc(), "glm_route_align")
+
+    @staticmethod
+    def glm_route_align(
+        logits: torch.Tensor,
+        bias: torch.Tensor,
+        topk: int,
+        scoring: int,
+        renormalize: bool,
+        scaling: float,
+        block_size: int,
+        max_padded: int,
+        max_blocks: int,
+        fixed_expert: int = -1,
+    ) -> list[torch.Tensor]:
+        """Fused small-M routing: scored top-k with bias-only selection plus
+        the Marlin block alignment, one launch. Returns [topk_weights,
+        topk_ids, sorted_token_ids, expert_ids, num_tokens_post_padded];
+        fixed_expert >= 0 (it must be E) appends that expert to every token's
+        slots at weight 1.0 and aligns over E + 1 experts."""
+        return _qc().glm_route_align(
+            logits,
+            bias,
+            topk,
+            scoring,
+            renormalize,
+            scaling,
+            block_size,
+            max_padded,
+            max_blocks,
+            fixed_expert,
+        )
+
+    @staticmethod
+    @cache
+    def has_moe_sum_add() -> bool:
+        return quixicore_ops.is_available() and hasattr(_qc(), "moe_sum_add")
+
+    @staticmethod
+    def moe_sum_add(x: torch.Tensor, shared: torch.Tensor, out: torch.Tensor) -> None:
+        """out[t] = shared[t] + sum_k x[t, k] (bf16 in/out, fp32 accumulation):
+        the Marlin per-assignment sum and the shared-expert add in one launch."""
+        _qc().moe_sum_add(x, shared, out)
+
+    # ------------------------------------------------------------------
+    # M <= 16 decode GEMMs (bf16_decode_gemm.cuh, fp8_decode_gemm.cuh)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    @cache
+    def has_decode_gemm() -> bool:
+        return quixicore_ops.is_available() and hasattr(_qc(), "decode_gemm")
+
+    @staticmethod
+    def decode_gemm(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        fp32_out: bool = False,
+    ) -> torch.Tensor:
+        """x[M, K] @ weight[N, K]^T (+ fp32 bias) for M <= 16 on tensor cores,
+        fp32 accumulation; the decode-shaped replacement for cuBLAS on the
+        backbone projections (N in 2048..16384, K a multiple of 128 >= 512)."""
+        return _qc().decode_gemm(x, weight, bias, fp32_out)
+
+    @staticmethod
+    @cache
+    def has_decode_gemm_fp8() -> bool:
+        return quixicore_ops.is_available() and hasattr(_qc(), "decode_gemm_fp8")
+
+    @staticmethod
+    def decode_gemm_fp8(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        scale: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        fp32_out: bool = False,
+    ) -> torch.Tensor:
+        """x[M, K] (bf16) @ dequant(weight)[N, K]^T for M <= 16 on tensor cores,
+        where weight is float8_e4m3fn with fp32 128x128 block scales
+        [ceil(N/128), K/128] and dequant(w) = bf16(scale * w); fp32
+        accumulation (N in 1024..16384, N a multiple of 8, K a multiple of
+        128 >= 512)."""
+        return _qc().decode_gemm_fp8(x, weight, scale, bias, fp32_out)
+
+    @staticmethod
+    def has_decode_gemm_fp8_gated() -> bool:
+        return quixicore_ops.is_available() and hasattr(_qc(), "decode_gemm_fp8_gated")
+
+    @staticmethod
+    def decode_gemm_fp8_gated(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        scale: torch.Tensor,
+        clamp_limit: float | None = None,
+    ) -> torch.Tensor:
+        """The decode GEMM over a merged [gate; up] block-FP8 weight [N, K] with
+        silu_and_mul_with_clamp folded into its epilogue: returns
+        silu(clamp(gate)) * clamp(up) as bf16 [M, N/2] (clamp_limit None =
+        plain SiLU * up). M <= 16, N % 64 == 0."""
+        clamp = -1.0 if clamp_limit is None else float(clamp_limit)
+        return _qc().decode_gemm_fp8_gated(x, weight, scale, clamp)
+
+    # ------------------------------------------------------------------
     # DeepSeek-V4 multi-stream residual mixing (Ampere decode path)
     # ------------------------------------------------------------------
 
     @staticmethod
     def dsv4_router_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         return _qc().dsv4_router_gemm(x, weight)
+
+    # ------------------------------------------------------------------
+    # GLM mHC transition fused with the custom all-reduce
+    # (quixicore/serving/glm5_mhc_allreduce.cuh); `fa` is the custom
+    # all-reduce handle the stable extension's init_custom_ar returned.
+    # ------------------------------------------------------------------
+    @staticmethod
+    def has_glm5_mhc_allreduce() -> bool:
+        return quixicore_ops.is_available() and hasattr(_qc(), "glm5_mhc_allreduce")
+
+    @staticmethod
+    def glm5_mhc_allreduce(
+        fa: int,
+        inp: torch.Tensor,
+        residual: torch.Tensor,
+        post_mix: torch.Tensor,
+        comb_mix: torch.Tensor,
+        fn: torch.Tensor,
+        residual_out: torch.Tensor,
+        partial: torch.Tensor,
+        arrivals: torch.Tensor,
+        scale: torch.Tensor,
+        base: torch.Tensor,
+        next_post: torch.Tensor,
+        next_comb: torch.Tensor,
+        layer_input: torch.Tensor,
+        norm_weight: torch.Tensor | None,
+        rms_eps: float,
+        hc_eps: float,
+        post_multiplier: float,
+        sinkhorn_repeat: int,
+        norm_eps: float,
+        reg_buffer: int,
+        reg_buffer_sz_bytes: int,
+    ) -> None:
+        _qc().glm5_mhc_allreduce(
+            fa,
+            inp,
+            residual,
+            post_mix,
+            comb_mix,
+            fn,
+            residual_out,
+            partial,
+            arrivals,
+            scale,
+            base,
+            next_post,
+            next_comb,
+            layer_input,
+            norm_weight,
+            rms_eps,
+            hc_eps,
+            post_multiplier,
+            sinkhorn_repeat,
+            norm_eps,
+            reg_buffer,
+            reg_buffer_sz_bytes,
+        )
+
+    @staticmethod
+    def glm5_mhc_join(fa: int) -> None:
+        """Order the current stream behind the last fused transition's
+        deferred sinkhorn (the next site's comb coefficients); no-op when
+        nothing is pending."""
+        _qc().glm5_mhc_join(fa)
 
     @staticmethod
     def dsv4_hash_router(
@@ -1599,6 +1775,84 @@ class quixicore_ops:
         )
 
     @staticmethod
+    @cache
+    def mla_sparse_prefill_fp8_smem_bytes() -> int:
+        """Opt-in shared memory per block the fp8 sparse prefill kernel
+        launches with; 0 from a build that predates the query (the launch
+        itself then reports an unqualified device)."""
+        fn = getattr(_qc(), "mla_sparse_prefill_fp8_smem_bytes", None)
+        return int(fn()) if fn is not None else 0
+
+    @staticmethod
+    def has_nvfp4_moe_decode() -> bool:
+        return quixicore_ops.is_available() and hasattr(_qc(), "nvfp4_moe_gemv2")
+
+    @staticmethod
+    def nvfp4_moe_gemv1(
+        x: torch.Tensor,
+        b: torch.Tensor,
+        s: torch.Tensor,
+        g: torch.Tensor,
+        topk_ids: torch.Tensor,
+        act: torch.Tensor,
+        nj: int = 2,
+        stages: int = 4,
+        clamp_limit: float | None = None,
+        logits: torch.Tensor | None = None,
+        bias: torch.Tensor | None = None,
+        scoring: int = 0,
+        scaling: float = 1.0,
+        renormalize: bool = True,
+        topk_weights: torch.Tensor | None = None,
+        fixed_expert: int = -1,
+    ) -> torch.Tensor:
+        """Decode MoE gate/up projection + SiLU over the Marlin-packed NVFP4
+        experts: one CTA per (assignment slot, 16*nj columns), a `stages`-deep
+        cp.async ring of 16-tile chunks; clamp_limit as silu_and_mul_with_clamp
+        (gate from above, up to +/- limit); writes act[M * top_k, N] bf16 (row =
+        token * top_k + k). With `logits` (fp32 [M, E]) and `bias` (fp32 [E]) the
+        router is folded in (glm_route_align's selection: scoring 0 sigmoid / 1
+        sqrt-softplus, bias-only top-k, renormalize, scaling) and topk_ids /
+        topk_weights are OUTPUTS written by the kernel; fixed_expert >= 0 (it must
+        be E - 1, the last expert) makes the last slot of every token that expert
+        at weight 1.0, the routed slots coming from logits over E - 1 experts."""
+        clamp = -1.0 if clamp_limit is None else float(clamp_limit)
+        return _qc().nvfp4_moe_gemv1(
+            x, b, s, g, topk_ids, act, nj, stages, clamp, logits, bias, scoring, scaling, renormalize, topk_weights,
+            fixed_expert,
+        )
+
+    @staticmethod
+    def nvfp4_moe_gemv2(
+        act: torch.Tensor,
+        b: torch.Tensor,
+        s: torch.Tensor,
+        g: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor | None,
+        shared: torch.Tensor | None,
+        out: torch.Tensor,
+        nj: int = 2,
+        stages: int = 4,
+        split: int = 1,
+    ) -> torch.Tensor:
+        """Decode MoE down projection with the top-k combine (fp32, slot
+        order) and the optional shared-expert add folded in: out[M, D] bf16.
+        topk_weights None means the weights already sit on the input; split
+        (1/2/3/4/8, at most top_k) spreads a token's experts over a cluster of
+        CTAs summed in rank order: each rank takes ceil(top_k / split) slots
+        and the last rank the remainder (nine slots split in two are five and
+        four)."""
+        return _qc().nvfp4_moe_gemv2(act, b, s, g, topk_ids, topk_weights, shared, out, nj, stages, split)
+
+    @staticmethod
+    def nvfp4_moe_gemm_smem_bytes(cfg: int) -> int:
+        """Opt-in shared memory per block the NVFP4 MoE GEMM launches with
+        for `cfg`; 0 from a build that predates the query."""
+        fn = getattr(_qc(), "nvfp4_moe_gemm_smem_bytes", None)
+        return int(fn(cfg)) if fn is not None else 0
+
+    @staticmethod
     def nvfp4_moe_gemm(
         a: torch.Tensor,
         b: torch.Tensor,
@@ -1640,7 +1894,15 @@ class quixicore_ops:
         of their selected 4-token pools with a per-query mask. Same inputs as
         mla_decode_fp8_sparse_nope; q must be [T, 16, 512] (TP4 heads)."""
         return _qc().mla_sparse_prefill_fp8(
-            q, data, bt, indices, topk_length, block_size, scale, kv_scale, page_stride_bytes
+            q,
+            data,
+            bt,
+            indices,
+            topk_length,
+            block_size,
+            scale,
+            kv_scale,
+            page_stride_bytes,
         )
 
     @staticmethod
@@ -1659,8 +1921,15 @@ class quixicore_ops:
         the CUDA port of fused_recurrent_kda_packed_decode. Updates `state`
         in place for state_indices > 0; returns out [1, N, H, V] bf16."""
         return _qc().kda_decode(
-            mixed_qkv, raw_g, raw_beta, A_log, dt_bias, state, state_indices,
-            scale, 0.0 if lower_bound is None else float(lower_bound),
+            mixed_qkv,
+            raw_g,
+            raw_beta,
+            A_log,
+            dt_bias,
+            state,
+            state_indices,
+            scale,
+            0.0 if lower_bound is None else float(lower_bound),
             lower_bound is not None,
         )
 
@@ -1819,6 +2088,93 @@ class quixicore_ops:
             apply_temperature,
             per_token_col,
         )
+
+    @staticmethod
+    @cache
+    def has_kda_block() -> bool:
+        return quixicore_ops.is_available() and hasattr(_qc(), "kda_block_decode")
+
+    @staticmethod
+    def kda_block_serves(pairs: int, max_rows: int, conv_bf16: bool, state_bf16: bool) -> bool:
+        """Whether the fused KDA decode block takes a batch of `pairs`
+        (request, head) pairs of up to `max_rows` rows in one wave of clusters."""
+        return _qc().kda_block_serves(pairs, max_rows, conv_bf16, state_bf16)
+
+    @staticmethod
+    def kda_block_decode(mixed_qkv: torch.Tensor, **kwargs) -> None:
+        """The fused KDA decode block (kda_decode_block.cuh): conv update, gate
+        GEMVs, L2 norms, the gated delta recurrence and the gated RMS norm for
+        decode rows, written to `out`. Keyword arguments as the binding's."""
+        _qc().kda_block_decode(mixed_qkv, **kwargs)
+
+    @staticmethod
+    @cache
+    def has_v2_candidate_draft() -> bool:
+        return quixicore_ops.is_available() and hasattr(_qc(), "v2_candidate_draft")
+
+    @staticmethod
+    def v2_candidate_draft(
+        cand_logits: torch.Tensor,
+        cand_ids: torch.Tensor,
+        top_k: torch.Tensor,
+        top_p: torch.Tensor | None,
+        expanded_idx_mapping: torch.Tensor,
+        seeds: torch.Tensor,
+        pos: torch.Tensor,
+        temperature: torch.Tensor,
+        vocab_size: int,
+        processed_logits: torch.Tensor | None,
+        processed_logits_col: torch.Tensor | None,
+        use_fp64: bool,
+    ) -> torch.Tensor:
+        """The drafter's next token from the batch's gathered top-k candidates
+        (fp32 [T, C] untempered logits and their global ids): tempered, cut to
+        the request's top-k (ties kept) and top-p like topk_topp_mask, the
+        processed row written into processed_logits[req, col], and drawn with
+        gumbel_sample's (seed, pos, token)-keyed noise. int64 ids [T]."""
+        return _qc().v2_candidate_draft(
+            cand_logits, cand_ids, top_k, top_p, expanded_idx_mapping, seeds, pos, temperature,
+            vocab_size, processed_logits, processed_logits_col, use_fp64,
+        )
+
+    @staticmethod
+    @cache
+    def has_topk_sample() -> bool:
+        return quixicore_ops.is_available() and hasattr(_qc(), "topk_sample")
+
+    @staticmethod
+    def topk_sample(
+        logits: torch.Tensor,
+        top_k: torch.Tensor,
+        top_p: torch.Tensor | None,
+        expanded_idx_mapping: torch.Tensor,
+        seeds: torch.Tensor,
+        pos: torch.Tensor,
+        use_fp64: bool,
+    ) -> torch.Tensor:
+        """Fused top-k (<= 32, all ties kept) / top-p / Gumbel-max sampling.
+
+        The noise is the sampler's own (seed, pos, token)-keyed Philox
+        stream, so a seeded request draws what v2_gumbel_sample would.
+        Returns int64 token ids [B]."""
+        return _qc().topk_sample(
+            logits, top_k, top_p, expanded_idx_mapping, seeds, pos, use_fp64
+        )
+
+    @staticmethod
+    @cache
+    def has_topk_topp_mask() -> bool:
+        return quixicore_ops.is_available() and hasattr(_qc(), "topk_topp_mask")
+
+    @staticmethod
+    def topk_topp_mask(
+        logits: torch.Tensor,
+        top_k: torch.Tensor,
+        top_p: torch.Tensor | None,
+    ) -> None:
+        """In-place top-k (<= 32, all ties kept) / top-p mask over fp32
+        [B, V] logits: -inf over every token topk_sample would not draw."""
+        _qc().topk_topp_mask(logits, top_k, top_p)
 
     @staticmethod
     def v2_topk_log_softmax(

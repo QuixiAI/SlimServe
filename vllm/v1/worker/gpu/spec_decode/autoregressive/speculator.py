@@ -48,6 +48,14 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         self.prefill_cudagraph_manager: SpeculatorCudaGraphManager | None = None
         self.decode_cudagraph_manager: SpeculatorCudaGraphManager | None = None
 
+        # Drafters that accept `output_rows` (the GLM-5.3 MTP head) run their
+        # experts and head only on the selected rows: the request tails on
+        # the prefill step, every row (the identity) on decode steps.
+        self.selects_output_rows = False
+        self.row_identity = torch.arange(
+            self.max_num_tokens, dtype=torch.int64, device=device
+        )
+
     @property
     def advance_draft_positions(self) -> bool:
         """
@@ -57,6 +65,17 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         False for Gemma4 MTP (Q-only, shares target KV, constant positions).
         """
         return True
+
+    # Lifecycle hooks for model-specific drafter state (the MTP head's
+    # top-k index sharing). They fire in both `capture` and `propose` so any
+    # flag baked into a captured graph is identical at capture and replay.
+    def on_prefill_begin(self, num_reqs: int) -> None: ...
+
+    def on_prefill_end(self, num_reqs: int) -> None: ...
+
+    def on_multi_step_decode_begin(self, num_reqs: int) -> None: ...
+
+    def on_multi_step_decode_end(self, num_reqs: int) -> None: ...
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         # Initialize cudagraph manager for draft prefill (draft position 0).
@@ -98,6 +117,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         assert self.prefill_cudagraph_manager is not None
         if self.prefill_cudagraph_manager.use_breakable_cg:
             self.prefill_cudagraph_manager.init_breakable_cg_runner(self.model)
+        self.on_prefill_begin(self.max_num_reqs)
         self.prefill_cudagraph_manager.capture(
             self._prefill,
             self.model_state,
@@ -107,6 +127,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             self.kv_cache_config,
             progress_bar_desc="Capturing prefill CUDA graphs",
         )
+        self.on_prefill_end(self.max_num_reqs)
 
         if self.num_speculative_steps == 1:
             return
@@ -115,6 +136,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         # sample + update_draft_inputs) for a single
         # step.
         assert self.decode_cudagraph_manager is not None
+        self.on_multi_step_decode_begin(self.max_num_reqs)
         self.decode_cudagraph_manager.capture(
             self._generate_draft,
             self.model_state,
@@ -124,6 +146,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             self.kv_cache_config,
             progress_bar_desc="Capturing decode CUDA graphs",
         )
+        self.on_multi_step_decode_end(self.max_num_reqs)
 
     @torch.inference_mode()
     def propose(
@@ -191,6 +214,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             input_batch.idx_mapping,
             temperature,
             seeds,
+            input_batch.idx_mapping_np,
         )
 
         # Get the input ids and last token indices for the speculator.
@@ -227,6 +251,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
 
         self._prepare_eplb_forward(input_batch.num_tokens)
 
+        self.on_prefill_begin(num_reqs)
         if prefill_batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Replay the full graph for draft prefill.
             assert self.prefill_cudagraph_manager is not None
@@ -244,6 +269,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                 cudagraph_runtime_mode=prefill_batch_desc.cg_mode,
                 mm_inputs=mm_inputs,
             )
+        self.on_prefill_end(num_reqs)
 
         if steps == 1:
             # Early exit.
@@ -273,14 +299,18 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         )
 
         # Generate the remaining steps - 1 draft tokens.
-        self._multi_step_decode(
-            num_reqs,
-            dummy_run and skip_attn_for_dummy_run,
-            decode_batch_desc,
-            num_tokens_across_dp,
-            input_batch.seq_lens_cpu_upper_bound,
-            steps,
-        )
+        self.on_multi_step_decode_begin(num_reqs)
+        try:
+            self._multi_step_decode(
+                num_reqs,
+                dummy_run and skip_attn_for_dummy_run,
+                decode_batch_desc,
+                num_tokens_across_dp,
+                input_batch.seq_lens_cpu_upper_bound,
+                steps,
+            )
+        finally:
+            self.on_multi_step_decode_end(num_reqs)
 
         return self.draft_tokens[:num_reqs, :steps]
 
@@ -293,6 +323,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
+        output_rows: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_descriptor = BatchDescriptor(num_tokens=num_tokens)
         with set_forward_context(
@@ -324,6 +355,8 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                 hidden_states=self.hidden_states[:num_tokens],
                 inputs_embeds=inputs_embeds,
             )
+            if output_rows is not None:
+                model_inputs["output_rows"] = output_rows
             if cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE:
                 # Draft prefill with PIECEWISE cudagraph (compiled PW or breakable),
                 # chosen inside run_pw_graph.
@@ -356,6 +389,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         last_token_indices = self.last_token_indices[:num_reqs]
         positions = self.input_buffers.positions[last_token_indices]
         idx_mapping = self.idx_mapping[:num_reqs]
+        select = self.selects_output_rows
 
         last_hidden_states, hidden_states = self._run_model(
             num_tokens,
@@ -364,8 +398,13 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             num_tokens_across_dp=num_tokens_across_dp,
             cudagraph_runtime_mode=cudagraph_runtime_mode,
             mm_inputs=mm_inputs,
+            output_rows=last_token_indices if select else None,
         )
-        sample_hidden_states = last_hidden_states[last_token_indices]
+        if select:
+            # The model returned the request tails, in request order.
+            sample_hidden_states = last_hidden_states[:num_reqs]
+        else:
+            sample_hidden_states = last_hidden_states[last_token_indices]
 
         self.draft_tokens[:num_reqs, 0] = self.sample_draft(
             sample_hidden_states,
@@ -378,6 +417,8 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         )
         if last_hidden_states is hidden_states:
             self.hidden_states[:num_reqs] = sample_hidden_states
+        elif select:
+            self.hidden_states[:num_reqs] = hidden_states[:num_reqs]
         else:
             self.hidden_states[:num_reqs] = hidden_states[last_token_indices]
         self.input_buffers.positions[:num_reqs] = positions
@@ -457,6 +498,9 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             slot_mappings,
             num_tokens_across_dp,
             cudagraph_runtime_mode,
+            output_rows=self.row_identity[:num_tokens_padded]
+            if self.selects_output_rows
+            else None,
         )
         last_hidden_states = last_hidden_states[:num_reqs]
 
