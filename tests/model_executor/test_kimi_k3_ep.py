@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import inspect
 import sys
 from types import SimpleNamespace
 from unittest import mock
@@ -11,7 +12,10 @@ from torch import nn
 
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
-from vllm.model_executor.layers.quantization.gguf.fused_moe import GGUFMoEMethod
+from vllm.model_executor.layers.quantization.gguf.fused_moe import (
+    GGUFMoEMethod,
+    _fused_moe_gguf,
+)
 from vllm.model_executor.layers.quantization.gguf.params import (
     GGUFUninitializedWeightParameter,
 )
@@ -152,8 +156,12 @@ def test_gguf_moe_indexes_experts_with_the_map_not_the_aiter_mask() -> None:
 
     captured: dict[str, torch.Tensor | None] = {}
 
+    signature = inspect.signature(_fused_moe_gguf)
+
     def fake_fused_moe_gguf(*args):
-        captured["expert_map"] = args[-1]
+        # Bind by name: the op has grown trailing arguments (repack flags,
+        # quant_input, defer_down) since this test was written.
+        captured["expert_map"] = signature.bind(*args).arguments["expert_map"]
         return args[0]
 
     method = GGUFMoEMethod.__new__(GGUFMoEMethod)
@@ -164,6 +172,7 @@ def test_gguf_moe_indexes_experts_with_the_map_not_the_aiter_mask() -> None:
     layer.w13_qweight = layer.w2_qweight = torch.empty(0)
     layer.w13_qweight_type = layer.w2_qweight_type = SimpleNamespace(weight_type=0)
     layer.activation = SimpleNamespace(value="situ")
+    layer.swiglu_limit = None  # RoutedExperts.__init__ default
 
     with mock.patch.dict(
         sys.modules,
