@@ -31395,3 +31395,13 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   canaries pass, gates -2.441 / -2.457, plain 228.8 / 778.3 / 1119.8 and
   228.7 / 771.9 / 1116.2, spec eight-pass medians 301.7 / 805.3 / 1125.3,
   0.975 per draft.
+
+## 2026-09-19 - Mask unwritten tensor-descriptor tails before attention accumulation
+
+- Status: retained for review.
+- Baseline: `origin/main`; forward-port from the B70 serving integration.
+- Change: Zero invalid logical-prefix K/V positions after descriptor loads so unwritten NaNs cannot contaminate attention through zero-times-NaN products.
+- Correctness: Ruff passed; all eight XPU numerical regression cases collected and skipped locally because no XPU is available. No native/GPU requalification.
+- Results: no new throughput measurement or hardware qualification claimed.
+- Decision: submit as a focused PR; preserve current-main behavior outside this fix.
+- Raw artifacts: local test output; no traffic captures or model data committed.

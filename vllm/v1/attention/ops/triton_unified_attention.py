@@ -491,6 +491,15 @@ def kernel_unified_attention(
             )
         K = _cast_kv_tile(K_load, Q, k_scale, KV_QUANT_MODE)
         V = _cast_kv_tile(V_load, Q, v_scale, KV_QUANT_MODE)
+        if USE_TD:
+            # Descriptors bound loads by the allocated page, not the logical
+            # sequence prefix, so unwritten tail slots can carry NaN (or an
+            # fp8 NaN pattern that the cast keeps NaN). Masking only the
+            # scores still lets 0 * NaN poison the P @ V accumulation; zero
+            # the out-of-prefix slots exactly as the pointer path's masked
+            # loads do. Done after the cast so the select runs in Q's dtype.
+            K = tl.where(tile_mask[None, :], K, tl.full((), 0, K.dtype))
+            V = tl.where(tile_mask[:, None], V, tl.full((), 0, V.dtype))
 
         # Per-(token, head) scales for INT8 / FP8 per-token-head modes.
         if USE_PER_TOKEN_HEAD_SCALES:
