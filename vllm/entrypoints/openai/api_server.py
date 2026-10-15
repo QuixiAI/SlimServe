@@ -806,12 +806,16 @@ async def run_server(args, **uvicorn_kwargs) -> None:
     bootstamp("api: run_server entry (imports done)")
     decorate_logs("APIServer", skip_if_decorated=True)
 
-    # Interrupt initialization if SIGTERM arrives before uvicorn installs its
-    # own signal handlers. Once uvicorn is running it replaces this.
+    # Interrupt initialization if SIGTERM or SIGINT arrives before the HTTP
+    # server installs its own signal handlers (serve_http replaces these).
+    # Engine startup blocks the event loop, so asyncio's default SIGINT
+    # handler, which only cancels the main task, cannot take effect until the
+    # model has finished loading.
     def _interrupt_init(*_) -> None:
         raise KeyboardInterrupt("terminated")
 
     signal.signal(signal.SIGTERM, _interrupt_init)
+    signal.signal(signal.SIGINT, _interrupt_init)
 
     listen_address, sock = setup_server(args, reuse_port=False)
     await run_server_worker(listen_address, sock, args, **uvicorn_kwargs)
