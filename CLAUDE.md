@@ -178,11 +178,6 @@ behavior:
 - Human contributors keep authorship of their work. When merging,
   rebasing, squashing or cherry-picking a contributor's PR, preserve the
   original commit author; do not re-author it.
-- Commit as the human running the session, using the identity configured
-  for the repository, unless that human directs otherwise. Never set
-  `GIT_AUTHOR_*` / `GIT_COMMITTER_*` to a different person on your own
-  initiative: that forges authorship onto commits that person did not
-  write, and unsigned commits give nothing to catch it.
 
 ## Serving policy (standing)
 

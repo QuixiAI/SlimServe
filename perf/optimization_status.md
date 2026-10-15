@@ -30,6 +30,10 @@
   the CLI. Untracked: 316 force-added files under perf/results/ (raw
   artifacts stay local per perf.md). The W1-W26 gate log moved here from
   baseline_status (entry "2026-09-15 - glm53f-q2-1 W1-W26 gate log").
+- Merge order: PR #23 and this PR each commit a different
+  `vllm/quixicore_metal.metallib`. Whichever merges second must rebuild
+  the metallib on macOS from the merged sources and commit that; neither
+  side's binary is correct for the merged tree.
 - Next: on the M1 Ultra, rebuild the metallib, rerun the release gates,
   then the c=1..32 curve at 1.0/0.95/20 seeded, and close the vision,
   context and prefix-cache items before returning the record to supported.

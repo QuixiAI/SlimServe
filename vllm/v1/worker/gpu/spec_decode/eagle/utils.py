@@ -142,8 +142,11 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
                 impl = getattr(module, "impl", None)
                 if impl is None:
                     continue
-                if getattr(impl, "topk_indices_buffer", None) is not None:
+                if hasattr(impl, "topk_indices_buffer"):
                     impl.topk_indices_buffer = target_buffer
+                # The length buffer keeps the None check: a Metal impl holds
+                # None there when the valid-prefix path is disabled
+                # (_MLA_TLEN off), and re-pointing it would turn that on.
                 if (
                     target_len is not None
                     and getattr(impl, "topk_len_buffer", None) is not None

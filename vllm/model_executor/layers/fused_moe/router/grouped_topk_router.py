@@ -94,6 +94,7 @@ def grouped_topk(
     if (
         envs.VLLM_USE_FUSED_MOE_GROUPED_TOPK
         and current_platform.is_cuda()
+        and gating_output.is_cuda
         and num_expert_group <= 32
         and topk <= 32
         and e_score_correction_bias is not None

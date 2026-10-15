@@ -7,8 +7,9 @@ GLM's config (sigmoid scoring, ``noaux_tc`` => e_score_correction_bias,
 top-8 of 288, n_group 1 / topk_group 1, norm_topk_prob, routed_scaling
 2.5). Off CUDA the ``GroupedTopk`` CustomOp dispatches ``forward_mps`` ->
 ``forward_native`` -> the torch ``grouped_topk`` in
-``fused_moe/router/grouped_topk_router.py`` (the ``is_cuda`` gate at :93
-keeps the fused CUDA kernel off). This pins that torch path against an
+``fused_moe/router/grouped_topk_router.py`` (the fused CUDA kernel is
+gated on a CUDA platform *and* a CUDA ``gating_output``, so CPU and MPS
+tensors always take the torch chain). This pins that torch path against an
 independent float64 reference and checks it is total over NaN logits.
 
 SwiGLU: ``swiglu_limit`` 10 reaches ``SiluAndMulWithClamp`` (dense and
@@ -29,13 +30,6 @@ if torch.backends.mps.is_available():
     MPS_ONLY.append("mps")
 
 E, TOPK, SCALE_F = 288, 8, 2.5
-
-
-@pytest.fixture(autouse=True)
-def _torch_grouped_topk(monkeypatch):
-    # The routing tests pin the torch grouped_topk; on a CUDA host the
-    # fused CUDA kernel would otherwise take CPU tensors.
-    monkeypatch.setenv("VLLM_USE_FUSED_MOE_GROUPED_TOPK", "0")
 
 
 def _ref_route(logits: torch.Tensor, bias: torch.Tensor):
