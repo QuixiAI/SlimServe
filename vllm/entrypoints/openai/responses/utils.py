@@ -205,13 +205,12 @@ def construct_input_messages(
         for output_item in prev_response_output:
             # NOTE: We skip the reasoning output.
             if isinstance(output_item, ResponseOutputMessage):
-                for content in output_item.content:
-                    messages.append(
-                        {
-                            "role": "assistant",
-                            "content": content.text,
-                        }
-                    )
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": _response_output_message_text(output_item),
+                    }
+                )
             elif isinstance(output_item, ResponseCustomToolCall):
                 messages.append(
                     _construct_message_from_response_item(output_item)  # type: ignore[arg-type]
@@ -235,14 +234,72 @@ def construct_chat_messages_with_tool_call(
     Some chat messages span multiple response items (e.g., reasoning + tool calls).
     """
     messages: list[ChatCompletionMessageParam] = []
-    for item in input_messages:
-        message = _construct_message_from_response_item(
-            item, prev_msg=messages[-1] if messages else None
-        )
+    anchor = len(input_messages) - 1 if _continues_final_message(input_messages) else -1
+    for index, item in enumerate(input_messages):
+        prev_msg = messages[-1] if messages else None
+        if (
+            index == anchor
+            and prev_msg is not None
+            and (prev_msg.get("tool_calls") or prev_msg.get("content") is not None)
+        ):
+            # The final partial message is what continue_final_message
+            # resumes, so it must stay the final rendered message. Absorbing
+            # it into an earlier turn would resume that turn instead: an
+            # already-finished message, or a tool-call turn whose calls the
+            # template renders after the content and the continuation cut
+            # would drop. Only a reasoning-only turn takes it in, since that
+            # is the same assistant message, still being written.
+            prev_msg = None
+        message = _construct_message_from_response_item(item, prev_msg=prev_msg)
         if message is not None:
             messages.append(message)
 
     return messages
+
+
+def _continues_final_message(input_messages: list[ResponseInputOutputItem]) -> bool:
+    """True when the last item is a partial assistant message to resume."""
+    if not input_messages or not should_continue_final_message(input_messages):
+        return False
+    last = input_messages[-1]
+    if isinstance(last, ResponseOutputMessage):
+        return True
+    return isinstance(last, dict) and last.get("role") == "assistant"
+
+
+def _response_output_message_text(item: ResponseOutputMessage) -> str:
+    """Preserve every text/refusal part, including a valid empty message.
+
+    Refusal text belongs in the assistant's history just like visible output
+    text. Concatenation preserves part order without inventing separators.
+    """
+    return "".join(
+        part.text if isinstance(part, ResponseOutputText) else part.refusal
+        for part in item.content
+    )
+
+
+def _response_content_parts_text(parts: list) -> str | None:
+    """Untyped (dict) counterpart of `_response_output_message_text`.
+
+    Joins every text and refusal part in order, so a dict assistant message
+    replays exactly like a typed one. Returns None when a part carries
+    neither, leaving the item to the caller's generic handling.
+    """
+    texts: list[str] = []
+    for part in parts:
+        if isinstance(part, dict):
+            text = part.get("text")
+            if not isinstance(text, str):
+                text = part.get("refusal")
+        else:
+            text = getattr(part, "text", None)
+            if not isinstance(text, str):
+                text = getattr(part, "refusal", None)
+        if not isinstance(text, str):
+            return None
+        texts.append(text)
+    return "".join(texts)
 
 
 def _construct_message_from_response_item(
@@ -335,11 +392,15 @@ def _construct_message_from_response_item(
             "reasoning": reasoning,
         }
     elif isinstance(item, ResponseOutputMessage):
-        output_text = item.content[0].text
+        output_text = _response_output_message_text(item)
         if prev_assistant_msg:
             previous_content = prev_assistant_msg.get("content")
             if previous_content is None:
                 prev_assistant_msg["content"] = output_text
+                return None
+            if output_text == "":
+                # A trailing empty streamed item carries no new content. Keep
+                # tool results attached to the preceding assistant tool turn.
                 return None
         return {
             "role": "assistant",
@@ -371,13 +432,15 @@ def _construct_message_from_response_item(
         text: str | None = None
         if isinstance(content, str):
             text = content
-        elif isinstance(content, list) and content:
-            text = content[0].get("text")
+        elif isinstance(content, list):
+            text = _response_content_parts_text(content)
         if text is not None:
             if prev_assistant_msg:
                 previous_content = prev_assistant_msg.get("content")
                 if previous_content is None:
                     prev_assistant_msg["content"] = text
+                    return None
+                if text == "":
                     return None
             return {"role": "assistant", "content": text}
     return item  # type: ignore[arg-type]
