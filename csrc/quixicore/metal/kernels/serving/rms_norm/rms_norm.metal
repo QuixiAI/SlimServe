@@ -143,7 +143,34 @@ inline void rms_norm_w32_body(device const T* x, device const float* w,
                          in_stride);                                         \
   }
 
+// Two packed segments of one row-strided input (the MLA fused q_a|kv_a
+// projection: q_c = cols [0, d0), kv_c = cols [d0, d0 + d1)), each with its
+// own fp32 weight and packed output, in ONE dispatch: grid (tokens, 2).
+// Per segment it is exactly qc_rms_norm_w32_strided_* - bit-exact.
+#define instantiate_rms_norm_dual(tname, T)                                  \
+  [[host_name("qc_rms_norm_w32_dual_" #tname)]] kernel void                  \
+  qc_rms_norm_w32_dual_##tname(                                              \
+      device const T* x [[buffer(0)]], device const float* w0 [[buffer(1)]], \
+      device const float* w1 [[buffer(2)]], device T* y0 [[buffer(3)]],     \
+      device T* y1 [[buffer(4)]], constant uint& d0 [[buffer(5)]],           \
+      constant uint& d1 [[buffer(6)]], constant float& eps [[buffer(7)]],    \
+      constant ulong& in_stride [[buffer(8)]],                               \
+      uint3 tgid [[threadgroup_position_in_grid]],                           \
+      uint tid [[thread_index_in_threadgroup]],                              \
+      uint sg [[simdgroup_index_in_threadgroup]],                            \
+      uint lane [[thread_index_in_simdgroup]]) {                             \
+    threadgroup float shm[qc_rms::SIMDGROUPS];                               \
+    if (tgid.y == 0)                                                         \
+      rms_norm_w32_body<T>(x, w0, y0, d0, eps, tgid.x, tid, sg, lane, shm,   \
+                           in_stride);                                       \
+    else                                                                     \
+      rms_norm_w32_body<T>(x + d0, w1, y1, d1, eps, tgid.x, tid, sg, lane,   \
+                           shm, in_stride);                                  \
+  }
+
 instantiate_rms_norm(float16, half);
 instantiate_rms_norm(bfloat16, bfloat);
 instantiate_rms_norm_strided(float16, half);
 instantiate_rms_norm_strided(bfloat16, bfloat);
+instantiate_rms_norm_dual(float16, half);
+instantiate_rms_norm_dual(bfloat16, bfloat);
