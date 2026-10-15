@@ -270,6 +270,13 @@ def test_fused_model_path_matches_reference(
     output_gate_activation: str,
 ) -> None:
     """Fused MTP and its mixed/prefill/decode fallbacks match the reference."""
+    if expected_fused_calls and not hasattr(
+        torch.ops._C, "fused_gdn_decode_post_conv_mtp"
+    ):
+        # The op is only compiled for FUSED_GDN_DECODE_ARCHS (CMakeLists.txt);
+        # without it the layer falls back to Triton and the fused path under
+        # test does not exist. The fallback cases below still run.
+        pytest.skip("fused GDN decode MTP op is not built")
     torch.manual_seed(1)
     device = torch.device("cuda")
     vllm_config = _make_vllm_config()
@@ -289,6 +296,19 @@ def test_fused_model_path_matches_reference(
         batch, BLOCK_SIZE, device, arange_block_indices=True
     )
     common.block_table_tensor.add_(1)
+    # The model runner always provides is_prefilling (num_computed_tokens <
+    # num_prompt_tokens); the GDN builder requires it to tell a decode from a
+    # one-token prompt chunk. In these cases only the non-speculative rows
+    # with a multi-token query are still in their prompt.
+    common = common.replace(
+        is_prefilling=torch.tensor(
+            [
+                draft < 0 and query_len > 1
+                for draft, query_len in zip(draft_tokens, query_lens)
+            ],
+            dtype=torch.bool,
+        )
+    )
     with set_current_vllm_config(vllm_config):
         metadata = builder.build(
             common_prefix_len=0,

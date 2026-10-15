@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import functools
 import json
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import regex as re
@@ -207,7 +208,14 @@ def qwen3_config(
         },
         arg_converter=_qwen3_arg_converter,
         custom_tool_arg_converter=_qwen3_custom_input,
-        stream_arg_deltas=True,
+        # XML parameter names may repeat, including under the non-strict
+        # grammar. Conversion keeps the last value, so an earlier JSON
+        # prefix is not stable. Emit arguments once the call closes; tool
+        # headers, reasoning, and normal content still stream incrementally.
+        # nemotron_v3_config (dataclasses.replace over this config) and
+        # SeedOssParser (subclasses Qwen3Parser) inherit this setting, so
+        # they also stop streaming argument deltas.
+        stream_arg_deltas=False,
         strip_trailing_reasoning_whitespace=False,
         tool_args_json=False,
     )
@@ -267,6 +275,28 @@ class Qwen3Parser(ParserEngine):
         if not self.thinking_enabled:
             return None, model_output
         return super().extract_reasoning(model_output, request)
+
+    def count_reasoning_tokens(self, token_ids: Sequence[int]) -> int:
+        """Count the generated portion of Qwen's initial reasoning span.
+
+        The template normally supplies ``<think>`` in the prompt, so generated
+        IDs need not include it. Follow the engine's initial REASONING state,
+        absorb duplicate start markers, and honor the tool opener as an
+        implicit reasoning end. Markers and subsequent tool/content tokens do
+        not contribute to reasoning usage.
+        """
+        if (
+            not self.thinking_enabled
+            or self.parser_engine_config.initial_state != ParserState.REASONING
+        ):
+            return 0
+        count = 0
+        for token_id in token_ids:
+            if token_id in (self._reasoning_end_token_id, self._tool_call_token_id):
+                break
+            if token_id != self._reasoning_start_token_id:
+                count += 1
+        return count
 
     def is_reasoning_end(self, input_ids: list[int]) -> bool:
         if super().is_reasoning_end(input_ids):

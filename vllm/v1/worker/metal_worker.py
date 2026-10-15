@@ -94,13 +94,19 @@ class MetalWorker(Worker):
         return nullcontext()
 
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
-        """Load weights without the CUDA-only staging warmup.
+        """Load weights through the Metal path, then make them resident.
 
-        The base GPU worker allocates pinned host memory and calls
-        ``torch.cuda.synchronize()`` before constructing the model.  Neither
-        operation exists on MPS, and unified memory does not need that staging
-        path in the first place.  Keep the otherwise-useful vLLM loading
-        context and communicator initialization.
+        Differences from the base ``Worker.load_model``:
+
+        * no HSA host-staging warmup (that probe is ROCm-only);
+        * no ``_scoped_allocator_max_split`` (a CUDA caching-allocator knob);
+        * after the shared post-load step, the loaded weights are pinned and
+          swept into unified-memory residency, and the optional Metal
+          diagnostics (step tape, finite probe) are installed.
+
+        The base class's post-load step, ``_finish_load_model`` (the
+        ``load_model done`` bootstamp and the weight-transfer engine named by
+        ``weight_transfer_config``), is platform-neutral and runs here too.
         """
         gc_was_enabled = gc.isenabled()
         gc.disable()
@@ -121,6 +127,7 @@ class MetalWorker(Worker):
             if gc_was_enabled:
                 gc.enable()
         gc.freeze()
+        self._finish_load_model()
         if not load_dummy_weights:
             # Keep early pages resident while the sweep touches later ones.
             # Sweeping pageable weights first can repeatedly decompress and
