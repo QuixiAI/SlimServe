@@ -129,13 +129,14 @@
         {{- '<|im_start|>user\n' + content + '<|im_end|>\n' }}
     {%- elif message.role == 'assistant' %}
         {%- set reasoning_content = message.reasoning_content if message.reasoning_content is string else (message.reasoning if message.reasoning is string else none) %}
-        {#- As the stock Qwen template does: reasoning a client left inline as
+        {#- As the stock Qwen template does: when the message carries no
+            reasoning field, reasoning a client left inline as
             <think>...</think> in content is lifted out, so it renders once,
-            inside the think block, and not again as visible content. -#}
-        {%- if '</think>' in content %}
-            {%- if reasoning_content is none %}
-                {%- set reasoning_content = content.split('</think>')[0].rstrip('\n').split('<think>')[-1].lstrip('\n') %}
-            {%- endif %}
+            inside the think block, and not again as visible content. A
+            message that does carry reasoning (even an empty string) keeps
+            its content verbatim: a literal </think> there is text. -#}
+        {%- if reasoning_content is none and '</think>' in content %}
+            {%- set reasoning_content = content.split('</think>')[0].rstrip('\n').split('<think>')[-1].lstrip('\n') %}
             {%- set content = content.split('</think>')[-1].lstrip('\n') %}
         {%- endif %}
         {%- set reasoning_content = (reasoning_content or '')|trim %}

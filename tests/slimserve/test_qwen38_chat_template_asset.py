@@ -221,7 +221,9 @@ def test_qwen38_template_lifts_inline_think_from_history_content():
     )
 
 
-def test_qwen38_template_explicit_reasoning_wins_over_inline_think():
+def test_qwen38_template_explicit_reasoning_keeps_content_verbatim():
+    # As stock Qwen: a message with a reasoning field is never split, so the
+    # explicit reasoning renders in the think block and content is as sent.
     prompt = _render(
         [
             {"role": "user", "content": "Hi"},
@@ -236,5 +238,29 @@ def test_qwen38_template_explicit_reasoning_wins_over_inline_think():
         enable_thinking=True,
     )
 
-    assert "stale" not in prompt
-    assert "<think>\nGreet back.\n</think>\n\nHello!<|im_end|>" in prompt
+    assert (
+        "<think>\nGreet back.\n</think>\n\n<think>stale</think>Hello!<|im_end|>"
+        in prompt
+    )
+
+
+@pytest.mark.parametrize("field", ["reasoning_content", "reasoning"])
+def test_qwen38_template_empty_reasoning_keeps_literal_think_tag(field):
+    prompt = _render(
+        [
+            {"role": "user", "content": "How do I close a block?"},
+            {
+                "role": "assistant",
+                "content": "Use the </think> tag to close.",
+                field: "",
+            },
+            {"role": "user", "content": "Thanks"},
+        ],
+        tool_choice="auto",
+        enable_thinking=True,
+    )
+
+    assert (
+        "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        "Use the </think> tag to close.<|im_end|>" in prompt
+    )
