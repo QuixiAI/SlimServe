@@ -17,6 +17,7 @@ from vllm.triton_utils import tl, triton
 
 # Programmatic dependent launch: see vllm/triton_utils/pdl.py.
 from vllm.triton_utils.pdl import PDL as _PDL  # noqa: E402
+from vllm.triton_utils.pdl import PDL_LAUNCH as _PDL_LAUNCH  # noqa: E402
 from vllm.triton_utils.pdl import gdc_launch_dependents, gdc_wait  # noqa: E402, F401
 
 from vllm.utils.math_utils import RCP_LN2, cdiv, next_power_of_2
@@ -400,7 +401,7 @@ def layer_norm_gated_fwd(
             num_warps=8,
         
         PDL=_PDL,
-        launch_pdl=_PDL,
+        **_PDL_LAUNCH,
     )
     else:
         layer_norm_gated_fwd_kernel1[(T,)](
@@ -421,7 +422,7 @@ def layer_norm_gated_fwd(
             num_warps=4,
         
         PDL=_PDL,
-        launch_pdl=_PDL,
+        **_PDL_LAUNCH,
     )
     # residual_out is None if residual is None and residual_dtype == input_dtype
     return y, mean, rstd, residual_out if residual_out is not None else x

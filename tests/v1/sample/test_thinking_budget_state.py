@@ -43,6 +43,13 @@ def force_cpu_logits_path(monkeypatch):
         SimpleNamespace(is_rocm=lambda: False),
     )
 
+    # CPU state-machine tests do not need an accelerator's pinned allocator.
+    monkeypatch.setattr(
+        thinking_budget_state,
+        "async_tensor_h2d",
+        lambda data, dtype, device: torch.tensor(data, dtype=dtype, device=device),
+    )
+
 
 def make_holder(
     budget: int,
