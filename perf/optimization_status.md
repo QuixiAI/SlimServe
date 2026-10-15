@@ -34390,3 +34390,13 @@ than PyPI 1.3.0), and the FP8 GEMMs.
 - Results: no new throughput measurement or hardware qualification claimed.
 - Decision: submit as a focused PR; preserve current-main behavior outside this fix.
 - Raw artifacts: local test output; no traffic captures or model data committed.
+
+## 2026-09-19 - Limit HSA host-staging probes to ROCm workers
+
+- Status: retained for review.
+- Baseline: `origin/main`; forward-port from the B70 serving integration.
+- Change: Avoid pinned host allocations and CUDA-alias synchronization on non-ROCm workers while preserving the existing HSA warmup on ROCm.
+- Correctness: The mocked platform-selection regression passed on CPU; no hardware startup claim.
+- Results: no new throughput measurement or hardware qualification claimed.
+- Decision: submit as a focused PR; preserve current-main behavior outside this fix.
+- Raw artifacts: local test output; no traffic captures or model data committed.
