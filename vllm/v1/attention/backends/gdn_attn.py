@@ -116,6 +116,44 @@ class GDNAttentionMetadata:
     token_chunk_offset_ptr: torch.Tensor | None = None
 
 
+def promote_prompt_tail_rows(
+    is_prefilling: torch.Tensor | None,
+    query_start_loc_cpu: torch.Tensor,
+    seq_lens_cpu_upper_bound: torch.Tensor | None,
+) -> torch.Tensor | None:
+    """Return ``is_prefilling`` with one-token prompt tails that have prior
+    state cleared, or None when nothing changes.
+
+    A row still mid-prefill whose chunk is a single token and whose earlier
+    tokens are computed (the last prompt token replayed after a prefix-cache
+    hit at P-1) is a decode step for the recurrent kernels: the conv and SSM
+    state slots it reads were written at the end of its previous chunk.
+    Counting it as a decode row lets a uniform batch of such rows replay the
+    FULL decode graph (the graph's state-index buffers are refreshed only
+    when the batch has no prefills). Fresh rows (nothing computed) keep the
+    prefill path, whose kernels zero uninitialized state.
+    ``is_prefilling`` may be unpadded; padded rows are never prefilling.
+    """
+    if is_prefilling is None or seq_lens_cpu_upper_bound is None:
+        return None
+    query_lens_cpu = torch.diff(query_start_loc_cpu)
+    n = min(
+        is_prefilling.size(0),
+        query_lens_cpu.size(0),
+        seq_lens_cpu_upper_bound.size(0),
+    )
+    promote = (
+        is_prefilling[:n]
+        & (query_lens_cpu[:n] == 1)
+        & (seq_lens_cpu_upper_bound[:n] > 1)
+    )
+    if not bool(promote.any()):
+        return None
+    promoted = is_prefilling.clone()
+    promoted[:n][promote] = False
+    return promoted
+
+
 class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]):
     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
 
@@ -208,6 +246,11 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         fast_build: bool = False,
     ) -> GDNAttentionMetadata:
         m = common_attn_metadata
+        promoted = promote_prompt_tail_rows(
+            m.is_prefilling, m.query_start_loc_cpu, m.seq_lens_cpu_upper_bound
+        )
+        if promoted is not None:
+            m = m.replace(is_prefilling=promoted)
 
         query_start_loc = m.query_start_loc
         query_start_loc_cpu = m.query_start_loc_cpu
@@ -262,9 +305,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             # treat_short_extends_as_decodes=False: the decode kernels
             # (causal_conv1d_update, fused recurrent decode) read the conv and
             # SSM state slots unconditionally, so a request that has not
-            # finished its prefill (a 1-token prompt, or a 1-token tail chunk)
-            # must take the prefill path, whose kernels zero uninitialized
-            # state via has_initial_state.
+            # finished its prefill must take the prefill path, whose kernels
+            # zero uninitialized state via has_initial_state. A 1-token tail
+            # chunk with prior state was promoted to a decode row above.
             num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
                 split_decodes_and_prefills(
                     m, decode_threshold=1, treat_short_extends_as_decodes=False
@@ -294,9 +337,10 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             non_spec_query_lens_cpu = query_lens_cpu[~spec_sequence_masks_cpu]
             decode_rows = non_spec_query_lens_cpu == 1
             if m.is_prefilling is not None:
-                # A 1-token row still mid-prefill (fresh 1-token prompt or a
-                # 1-token tail chunk) must count as prefill: the decode
+                # A 1-token row still mid-prefill with no prior state (a
+                # fresh 1-token prompt) must count as prefill: the decode
                 # kernels read state slots the request has not written yet.
+                # (A 1-token tail chunk with prior state was promoted above.)
                 # The batch reorder already places such rows behind the true
                 # decodes, so the contiguous split stays valid. is_prefilling
                 # may be unpadded; padded rows are never prefilling.

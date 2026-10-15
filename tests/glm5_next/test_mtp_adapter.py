@@ -35,12 +35,16 @@ def test_mtp_config_preserves_quantization_and_mla(multimodal):
     assert draft.n_predict == 1
     assert draft.quantization_config == quant
     assert not draft.index_share_for_mtp_iteration
+    # The speculator widens its hidden buffer by the draft config's hc_mult;
+    # GLM's head takes the contracted post-norm state, one stream.
+    assert draft.hc_mult == 1
     assert ModelArchConfigConvertorBase(draft, draft).is_deepseek_mla()
     converter = MODEL_ARCH_CONFIG_CONVERTORS[draft.model_type](draft, draft)
     assert converter.get_num_hidden_layers() == 1
     if multimodal:
         assert root.text_config.model_type == "glm5_next_text"
         assert root.text_config.index_share_for_mtp_iteration
+        assert root.text_config.hc_mult == 4
         assert draft.quantization_config is not root.quantization_config
 
 
@@ -48,6 +52,7 @@ def _loader_fixture():
     model = Glm5NextMTP.__new__(Glm5NextMTP)
     nn.Module.__init__(model)
     model.config = SimpleNamespace(num_hidden_layers=45, num_nextn_predict_layers=1)
+    model._model_path = None  # no checkpoint directory: no MTP experts sidecar
     indexer = nn.Module()
     indexer.wk = nn.Linear(8, 4, bias=False)
     indexer.weights_proj = nn.Linear(8, 2, bias=False)
@@ -57,6 +62,7 @@ def _loader_fixture():
     block.self_attn = attention
     layer.mtp_block = block
     predictor.layers = nn.ModuleDict({"45": layer})
+    predictor.load_draft_lm_head = lambda: set()  # no draft-head sidecar
     model.model = predictor
     return model, indexer
 
