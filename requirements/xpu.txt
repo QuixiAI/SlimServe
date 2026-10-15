@@ -18,5 +18,18 @@
 #   pip uninstall -y triton triton-xpu && \
 #   pip install --pre triton-xpu --index-url https://download.pytorch.org/whl/nightly/xpu
 
+# vllm-xpu-kernels (torch.ops._xpu_C: nvfp4_gemm, gdn_attention, the FLASH_ATTN
+# flash_attn_varlen_func, NVFP4 grouped GEMM) is REQUIRED for the B70 serving
+# paths. It is not pinned as a requirement line because no published artifact
+# builds against the serving torch: the validated build is QuixiAI/vllm-xpu-kernels
+# branch b60-serving-port @ 48ef52d9c193 (or later), rebuilt against the torch
+# 2.15 nightly with C++20 and -Wno-error=deprecated-this-capture (a wheel built
+# for torch 2.11 loads but registers every op on the wrong dispatch key). Build:
+#   git clone -b b60-serving-port https://github.com/QuixiAI/vllm-xpu-kernels
+#   cd vllm-xpu-kernels && pip install --no-build-isolation -e . -v
+# Without it every such op silently falls back (NVFP4 dequant emulation,
+# Triton GDN, TRITON_ATTN); XPUPlatform warns at startup when they are missing
+# (vllm/platforms/xpu_c_ops.py: warn_if_xpu_kernels_missing).
+
 # GGUF metadata parsing for the loader and the config parsers.
 gguf >= 0.10.0

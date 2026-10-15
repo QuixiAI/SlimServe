@@ -300,3 +300,38 @@ def register_xpu_c_ops() -> None:
     logger.info_once("Registered %d torch.ops._C XPU ops: %s", len(registered), ", ".join(registered))
     # The DeepSeek indexer logits ops (torch.ops.vllm.xpu_fp8_*).
     import vllm.v1.attention.ops.xpu_mla_sparse  # noqa: F401
+
+
+# torch.ops._xpu_C ops that only vllm-xpu-kernels provides and that a SlimServe
+# XPU serving path dispatches to; without them the path silently falls back
+# (NVFP4 linears to dequant emulation, GDN to Triton). See
+# requirements/xpu.txt for the required build.
+XPU_KERNELS_REQUIRED_OPS = ("nvfp4_gemm", "gdn_attention")
+XPU_KERNELS_BUILD = (
+    "QuixiAI/vllm-xpu-kernels branch b60-serving-port (48ef52d or later), "
+    "built against the serving torch; see requirements/xpu.txt"
+)
+
+
+def missing_xpu_kernel_ops() -> list[str]:
+    """Required vllm-xpu-kernels _xpu_C ops that are not registered."""
+    try:
+        import vllm_xpu_kernels._xpu_C  # noqa: F401
+    except Exception:
+        return list(XPU_KERNELS_REQUIRED_OPS)
+    return [n for n in XPU_KERNELS_REQUIRED_OPS if not hasattr(torch.ops._xpu_C, n)]
+
+
+def warn_if_xpu_kernels_missing() -> list[str]:
+    """Warn once at startup when the vllm-xpu-kernels build is absent or old."""
+    missing = missing_xpu_kernel_ops()
+    if missing:
+        logger.warning_once(
+            "XPU: vllm-xpu-kernels does not provide torch.ops._xpu_C.%s; the "
+            "XPU paths that use them fall back to slower kernels (NVFP4 "
+            "dequant emulation, Triton GDN; FLASH_ATTN falls back to "
+            "TRITON_ATTN). Install %s.",
+            ", ".join(missing),
+            XPU_KERNELS_BUILD,
+        )
+    return missing

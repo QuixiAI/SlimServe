@@ -204,9 +204,13 @@ class XPUPlatform(Platform):
 
         # vLLM is fully imported by now: the only safe point to define the
         # torch.ops._C elementwise ops the shared layers call by name.
-        from vllm.platforms.xpu_c_ops import register_xpu_c_ops
+        from vllm.platforms.xpu_c_ops import (
+            register_xpu_c_ops,
+            warn_if_xpu_kernels_missing,
+        )
 
         register_xpu_c_ops()
+        warn_if_xpu_kernels_missing()
 
         compilation_config = vllm_config.compilation_config
         if compilation_config.compile_sizes is None:
