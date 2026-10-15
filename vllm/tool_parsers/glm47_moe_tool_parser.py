@@ -27,8 +27,11 @@ from vllm.entrypoints.openai.engine.protocol import (
 from vllm.entrypoints.openai.tool_thinking_compat import (
     glm53_tool_compat_enabled,
 )
+import regex as re
+
 from vllm import envs
 from vllm.logger import init_logger
+from vllm.parser.engine.parser_engine import ParserEngine
 from vllm.parser.engine.registered_adapters import Glm47MoeParserToolAdapter
 from vllm.tool_parsers.structural_tag_registry import (
     custom_tool_as_function_schema,
@@ -39,6 +42,7 @@ from vllm.tool_parsers.structural_tag_registry import (
 from vllm.tool_parsers.utils import (
     allowed_tool_choice_names,
     find_tool_name,
+    find_tool_properties,
     named_tool_choice_name,
     tool_choice_mode,
 )
@@ -277,6 +281,93 @@ class Glm47MoeModelToolParser(Glm47MoeParserToolAdapter):  # type: ignore[valid-
     # into the text we hand back, the call was MISSED, not absent.
     _MISSED_CALL_MARKUP = ("<tool_call>", "</tool_call>", "<arg_key>", "<arg_value>")
 
+    # Last-resort recovery of a call the state machine did not claim. Tolerates
+    # what the engine will not: a missing closing tag (truncated reply), the
+    # attribute spelling <tool_call name="x">, and whitespace anywhere.
+    _LEAKED_CALL_RE = re.compile(
+        r"<tool_call\b(?:\s+name\s*=\s*[\"'](?P<attr_name>[^\"']+)[\"'])?\s*>"
+        r"\s*(?P<name>[^<\s]*)\s*(?P<args>(?:(?!</?tool_call\b).)*)"
+        r"(?:</tool_call>|\Z)",
+        re.DOTALL,
+    )
+    _LEAKED_ARG_RE = re.compile(
+        r"<arg_key>(?P<key>(?:(?!</arg_key>).)*)</arg_key>\s*"
+        r"<arg_value>(?P<value>(?:(?!</arg_value>).)*)(?:</arg_value>|\Z)",
+        re.DOTALL,
+    )
+
+    def _recover_leaked_native_calls(self, model_output, request):
+        """Rebuild tool calls from markup the state machine left as text.
+
+        The engine only claims output that matches GLM's grammar exactly. When
+        the model deviates - and under sampling it sometimes does - every call
+        in the reply is handed to the client as XML in `content` instead of
+        `tool_calls`, which is a silent failure for an agent loop (HexisPro
+        measured ~10% of real turns, 2026-10-15). Recovering here is strictly
+        better than leaking: the arguments are parsed with the same regex the
+        engine's converter uses and typed with the same schema coercion, so a
+        recovered call is indistinguishable from a parsed one.
+
+        Only calls naming a tool the request actually offered are recovered;
+        an unrecognized name is logged and left alone rather than invented.
+        """
+        if "<tool_call" not in model_output:
+            return None
+        offered = {
+            name
+            for tool in (request.tools or [])
+            for name in (
+                getattr(tool, "name", None)
+                or getattr(getattr(tool, "function", None), "name", None),
+            )
+            if name
+        }
+        calls, spans, unknown = [], [], []
+        for match in self._LEAKED_CALL_RE.finditer(model_output):
+            name = (match.group("attr_name") or match.group("name") or "").strip()
+            if not name:
+                continue
+            if name not in offered:
+                unknown.append(name)
+                continue
+            args: dict[str, object] = {}
+            for arg in self._LEAKED_ARG_RE.finditer(match.group("args") or ""):
+                args[arg.group("key").strip()] = arg.group("value")
+            properties = find_tool_properties(request.tools, name)
+            if properties:
+                ParserEngine._coerce_dict(args, properties)
+            calls.append(
+                ToolCall(
+                    function=FunctionCall(
+                        name=name, arguments=json.dumps(args, ensure_ascii=False)
+                    )
+                )
+            )
+            spans.append(match.span())
+        if not calls:
+            if unknown:
+                logger.warning(
+                    "glm47 tool parser: leaked call names no offered tool %r; "
+                    "left as text (offered %d tools)",
+                    unknown,
+                    len(offered),
+                )
+            return None
+        content = model_output
+        for start, end in reversed(spans):
+            content = content[:start] + content[end:]
+        content = content.strip()
+        logger.warning(
+            "glm47 tool parser: RECOVERED %d tool call(s) the state machine "
+            "missed %r; raw output: %r",
+            len(calls),
+            [c.function.name for c in calls],
+            model_output[:2000],
+        )
+        return ExtractedToolCallInformation(
+            tools_called=True, tool_calls=calls, content=content or None
+        )
+
     def _warn_if_call_leaked(self, result, model_output, request) -> None:
         """Log the raw output when tool markup is returned as ordinary text.
 
@@ -311,6 +402,7 @@ class Glm47MoeModelToolParser(Glm47MoeParserToolAdapter):  # type: ignore[valid-
         recovered = (
             self._extract_glm53_json_array_calls(model_output, request)
             or self._extract_glm53_raw_custom_call(model_output, request)
+            or self._recover_leaked_native_calls(model_output, request)
         )
         if recovered is not None:
             return recovered
