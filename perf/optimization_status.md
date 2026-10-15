@@ -34276,3 +34276,24 @@ than PyPI 1.3.0), and the FP8 GEMMs.
 - Results: no new throughput measurement or hardware qualification claimed.
 - Decision: submit as a focused PR; preserve current-main behavior outside this fix.
 - Raw artifacts: local test output; no traffic captures or model data committed.
+
+## 2026-09-19 - Preserve empty and multipart Responses assistant history
+
+- Status: retained for review.
+- Baseline: `origin/main`; forward-port from the B70 serving integration.
+- Change: Replay every text and refusal part as one assistant message, including empty content; preserve current custom-tool history handling.
+- Correctness: 20 assistant-history regression tests passed on CPU.
+- Results: no new throughput measurement or hardware qualification claimed.
+- Decision: submit as a focused PR; preserve current-main behavior outside this fix.
+- Raw artifacts: local test output; no traffic captures or model data committed.
+
+
+## 2026-09-19 - Keep trailing empty Responses items with their assistant tool turn
+
+- Status: retained for review.
+- Baseline: `fix/responses-assistant-history`; forward-port from the B70 serving integration.
+- Change: Forward-port 4c41dad47: absorb empty typed and dictionary assistant items into the preceding turn without losing tool calls or separating their results; retain nonempty message boundaries and orphan-result rejection.
+- Correctness: 36 conversion regressions passed on the PR base; all 49 conversion/template tests passed with the Qwen template from PR #61. The 13 template cases skip when that separate asset is absent. Ruff passed.
+- Results: no new throughput measurement or hardware qualification claimed.
+- Decision: submit as a focused PR; preserve current-main behavior outside this fix.
+- Raw artifacts: local test output; no traffic captures or model data committed.
