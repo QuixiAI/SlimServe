@@ -407,3 +407,151 @@ def test_explicit_minus_one_budget_is_inactive():
     st.apply_staged_writes()
     run_tokens(st, 0, [10, 11, 12])
     assert forced_now(st, 0) is None
+
+
+@pytest.mark.parametrize("speculative", [False, True])
+@pytest.mark.parametrize("nudge", [False, True])
+def test_grammar_mask_wins_over_close_and_nudge_forcing(speculative, nudge):
+    st = make_state(nudge=NUDGE if nudge else (), fraction=0.5)
+    for slot in (0, 1):
+        st.add_request(slot, [START], sp(2 if nudge else 0))
+    st.add_request(2, [START], sp(None))
+    st.apply_staged_writes()
+    if nudge:
+        for slot in (0, 1):
+            step(st, slot, 10)
+    spans = [3, 1, 1] if speculative else [1, 1, 1]
+    tokens = [0, 12, 13, 0, 0] if speculative else [0, 0, 0]
+    batch = make_batch([0, 1, 2], spans, tokens)
+    forced = NUDGE[0] if nudge else END
+    logits = torch.zeros(sum(spans), VOCAB, device=DEV)
+    logits[0, forced] = -torch.inf
+    before = logits.clone()
+    st.apply_mask(logits, batch)
+    sync()
+    # Preserve allowed alternatives and the original prohibition in this row.
+    assert torch.equal(logits[0], before[0])
+    # An allowed forced token in another request still takes effect.
+    allowed_row = spans[0]
+    assert logits[allowed_row].argmax().item() == forced
+    assert torch.isneginf(logits[allowed_row]).sum().item() == VOCAB - 1
+    # A request with no budget stays unchanged.
+    assert torch.equal(logits[-1], before[-1])
+
+
+# ------------------------------------- forced tokens the grammar blocked
+#
+# apply_mask leaves a row unchanged when the grammar prohibits the forced
+# token, so the sampled token can differ from it. The state must follow what
+# was emitted, never what was requested.
+
+BLOCKED = 13  # what the model samples when the forced token is prohibited
+
+
+def test_blocked_first_closer_token_is_forced_again_not_half_closer():
+    st = make_state(starts=(80, 81), ends=(90, 91))
+    st.add_request(0, [80, 81], sp(1))
+    st.apply_staged_writes()
+    run_tokens(st, 0, [10])  # exhausted
+    assert forced_now(st, 0) == 90
+    step(st, 0, BLOCKED)  # the grammar blocked 90
+    # Forcing 91 now would emit half a closer; restart at the first token.
+    assert forced_now(st, 0) == 90
+    step(st, 0, 90)
+    assert forced_now(st, 0) == 91
+    step(st, 0, 91)
+    assert forced_now(st, 0) is None  # DONE
+
+
+def test_blocked_second_closer_token_releases_the_block():
+    st = make_state(starts=(80, 81), ends=(90, 91))
+    st.add_request(0, [80, 81], sp(1))
+    st.apply_staged_writes()
+    run_tokens(st, 0, [10, 90])  # exhausted, first closer token landed
+    assert forced_now(st, 0) == 91
+    step(st, 0, BLOCKED)  # the grammar blocked 91 after 90 landed
+    # Restarting would splice another lone 90 into the reasoning; the block
+    # is released instead.
+    assert forced_now(st, 0) is None
+
+
+def test_permanently_blocked_closer_tail_is_never_spliced_repeatedly():
+    # Grammar allows 90 but always forbids 91. Previously the closer was
+    # restarted forever: (90,90),(91,13),(90,90),(91,13),... until max_tokens.
+    st = make_state(starts=(80, 81), ends=(90, 91))
+    st.add_request(0, [80, 81], sp(1))
+    st.apply_staged_writes()
+    step(st, 0, 10)  # exhausted
+    trace = []
+    for _ in range(12):
+        forced = forced_now(st, 0)
+        emitted = BLOCKED if forced == 91 else (forced if forced else 10)
+        trace.append((forced, emitted))
+        step(st, 0, emitted)
+    assert trace[:2] == [(90, 90), (91, BLOCKED)]
+    assert all(forced is None for forced, _ in trace[2:])
+    # A later reasoning block gets a fresh budget and is enforced again.
+    run_tokens(st, 0, [90, 91, 80, 81, 10])
+    assert forced_now(st, 0) == 90
+
+
+def test_blocked_closer_tail_in_speculative_span_releases_later_rows():
+    st = make_state(starts=(80, 81), ends=(90, 91))
+    st.add_request(0, [80, 81], sp(1))
+    st.apply_staged_writes()
+    step(st, 0, 10)  # exhausted
+    # Row 0 forces 90, row 1 forces 91 (draft 90 assumed landed); a draft
+    # that ends up accepted at row 1 as BLOCKED means 91 was blocked, so
+    # row 2 must not restart the closer.
+    batch = make_batch([0], [3], [0, 90, BLOCKED])
+    assert forced_map(st, batch) == {0: 90, 1: 91}
+
+
+def test_blocked_single_token_closer_keeps_the_budget_enforced():
+    st = make_state()
+    st.add_request(0, [START], sp(1))
+    st.apply_staged_writes()
+    step(st, 0, 10)  # exhausted
+    assert forced_now(st, 0) == END
+    run_tokens(st, 0, [BLOCKED, BLOCKED])  # the grammar blocked END twice
+    # The budget is not dropped: END is forced again as soon as it is allowed.
+    assert forced_now(st, 0) == END
+    step(st, 0, END)
+    assert forced_now(st, 0) is None
+
+
+def test_blocked_closer_in_speculative_span_keeps_forcing_later_rows():
+    st = make_state()
+    st.add_request(0, [START], sp(1))
+    st.apply_staged_writes()
+    step(st, 0, 10)  # exhausted: every row of the span is forced
+    batch = make_batch([0], [3], [0, BLOCKED, BLOCKED])
+    assert forced_map(st, batch) == {0: END, 1: END, 2: END}
+
+
+def test_blocked_nudge_is_abandoned_and_budget_keeps_counting():
+    st = make_state(nudge=NUDGE, fraction=0.5)
+    st.add_request(0, [START], sp(10))  # nudge at remaining <= 5
+    st.apply_staged_writes()
+    run_tokens(st, 0, [10, 11, 12, 13, 14])  # remaining 5: trigger
+    assert forced_now(st, 0) == NUDGE[0]
+    step(st, 0, BLOCKED)  # the grammar blocked the nudge: charged, remaining 4
+    # The advisory message is abandoned (not resumed mid-text later) and is
+    # not re-triggered in this block.
+    assert forced_now(st, 0) is None
+    run_tokens(st, 0, [20, 21, 22])  # remaining 1
+    assert forced_now(st, 0) is None
+    step(st, 0, 23)  # remaining 0: hard cutoff still lands on budget
+    assert forced_now(st, 0) == END
+
+
+def test_nudge_blocked_mid_message_is_abandoned():
+    st = make_state(nudge=NUDGE, fraction=0.5)
+    st.add_request(0, [START], sp(4))  # nudge at remaining <= 2
+    st.apply_staged_writes()
+    run_tokens(st, 0, [10, 11, NUDGE[0]])
+    assert forced_now(st, 0) == NUDGE[1]
+    step(st, 0, BLOCKED)  # remaining 1
+    assert forced_now(st, 0) is None
+    step(st, 0, 20)  # remaining 0
+    assert forced_now(st, 0) == END

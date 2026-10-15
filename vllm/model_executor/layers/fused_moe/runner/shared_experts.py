@@ -191,6 +191,16 @@ class SharedExperts(torch.nn.Module):
         self._output[self._output_idx] = None
         return output
 
+    # Set per call by the runner: the quant method may accumulate the routed
+    # result straight into the shared-expert output (no routed scaling left
+    # to apply to the routed part alone, no deferred add).
+    accumulate_ok: bool = False
+
+    def peek_output(self) -> torch.Tensor | None:
+        """The stored output without consuming it (None if not computed yet
+        or already taken). The Metal GGUF q2_K sum kernel accumulates the
+        routed result into it when `accumulate_ok`."""
+        return self._output[self._output_idx]
     def discard(self) -> None:
         """Drop an unconsumed output: a routed forward that raised after
         forward() / forward_deferred_join() filled the slot would otherwise

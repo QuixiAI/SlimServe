@@ -24,6 +24,14 @@ REGISTRY_PATH = Path(__file__).with_name("profiles.json")
 # repo. The file is git-ignored; SLIMSERVE_LOCAL_PROFILES points elsewhere.
 LOCAL_REGISTRY_PATH = Path(__file__).with_name("profiles.local.json")
 _MERGED_SECTIONS = ("sources", "platforms", "profiles")
+# The engines a source may name with `kind`. "llm" (the default) is served by
+# vLLM and carries the LLM serving policy; every other kind is a non-LLM
+# generation engine and must name the module that runs it: `parser()` returns
+# the argparse parser for its own options, `prepare(plan, args)` returns the
+# plan to fetch (optional file groups), and `run(plan, args)` serves or
+# renders.
+SOURCE_KINDS = frozenset({"llm", "video"})
+ENGINE_MODULES: dict[str, str] = {"video": "slimserve.video.cli"}
 CHAT_TEMPLATE_DIR = Path(__file__).with_name("chat_templates")
 
 
@@ -63,6 +71,12 @@ def _registry() -> dict[str, Any]:
     local = _local_registry_path()
     if local.is_file():
         _merge_local(registry, local)
+    for name, source in registry["sources"].items():
+        kind = source.get("kind", "llm")
+        if kind not in SOURCE_KINDS:
+            raise ValueError(
+                f"source {name!r}: kind {kind!r} is not one of {sorted(SOURCE_KINDS)}"
+            )
     return registry
 
 
@@ -187,6 +201,9 @@ class Plan:
     variant_speculator: dict[str, Any] | None = None
     # Operator-supplied checkpoint served in place of the registered one.
     model_override: "ModelOverride | None" = None
+    # Groups of the source's `optional` files this run fetches as well (the
+    # LTX-2.5 prompt enhancer); the rest are never downloaded.
+    optional: tuple[str, ...] = ()
 
     @property
     def speculator(self) -> dict[str, Any] | None:
@@ -475,6 +492,45 @@ _SERVING_DEFAULTS: dict[str, Any] = {
 }
 
 
+def source_kind(source: dict[str, Any]) -> str:
+    """The engine family a source is served by; one of SOURCE_KINDS."""
+    kind = source.get("kind", "llm")
+    if kind not in SOURCE_KINDS:
+        raise ProfileError(f"kind {kind!r} is not one of {sorted(SOURCE_KINDS)}")
+    return kind
+
+
+def is_language_model(source: dict[str, Any]) -> bool:
+    """False for sources served by a non-LLM engine (`"kind": "video"`).
+
+    The LLM serving policy (prefix caching, tool calling, thinking, drafters,
+    KV tiers) is defined for chat endpoints and does not apply to them.
+    """
+    return source_kind(source) == "llm"
+
+
+def profile_kind(profile_id: str) -> str:
+    """The engine family of a profile's source (see SOURCE_KINDS)."""
+    entry = describe(profile_id)
+    return source_kind(_registry()["sources"][entry["source"]])
+
+
+def engine_module(kind: str) -> str:
+    """The module that runs a non-LLM kind."""
+    if kind not in ENGINE_MODULES:
+        raise ProfileError(f"no engine is registered for kind {kind!r}")
+    return ENGINE_MODULES[kind]
+
+
+def language_model_profile_ids() -> list[str]:
+    data = _registry()
+    return [
+        pid
+        for pid, entry in data["profiles"].items()
+        if is_language_model(data["sources"][entry["source"]])
+    ]
+
+
 def validate_cache_policy(config: dict[str, Any]) -> None:
     """Reject prohibited target/draft cache settings, including overrides."""
     for key, value in config.items():
@@ -594,10 +650,13 @@ def resolve(
         for key, value in (quant_override.get("env") or {}).items():
             merged["env"][key] = value
 
-    # Thinking and tool calling are on by default for every profile on every
-    # platform. A profile sets these keys itself only to opt out.
-    for key, value in _SERVING_DEFAULTS.items():
-        merged["engine"].setdefault(key, copy.deepcopy(value))
+    # Thinking and tool calling are on by default for every language-model
+    # profile on every platform. A profile sets these keys itself only to opt
+    # out. Video profiles have no chat surface; their engine block is the
+    # pipeline configuration and nothing is added to it.
+    if is_language_model(source):
+        for key, value in _SERVING_DEFAULTS.items():
+            merged["engine"].setdefault(key, copy.deepcopy(value))
 
     if template_asset := source.get("chat_template_asset"):
         merged["engine"].setdefault(
@@ -662,7 +721,9 @@ def files_for(plan: Plan) -> list[dict[str, Any]]:
         wanted.append(
             {
                 **entry,
-                "url": f"{base}/{entry['path']}",
+                # A file may live in another repository (an adapter published
+                # on its own): it then names its own URL.
+                "url": entry.get("url") or f"{base}/{entry['path']}",
                 "local_dir": plan.source["local_dir"],
                 "role": "model",
                 **(
@@ -675,21 +736,41 @@ def files_for(plan: Plan) -> list[dict[str, Any]]:
                 ),
             }
         )
+    optional = plan.source.get("optional") or {}
+    for group in plan.optional:
+        if group not in optional:
+            raise ProfileError(
+                f"{plan.profile_id} has no optional file group {group!r}; "
+                f"it has {', '.join(sorted(optional)) or 'none'}"
+            )
+        for entry in optional[group]:
+            wanted.append(
+                {
+                    **entry,
+                    "url": entry.get("url") or f"{base}/{entry['path']}",
+                    "local_dir": plan.source["local_dir"],
+                    "role": "optional",
+                }
+            )
     for entry in plan.source.get("shared") or []:
         entry_base = entry.get("base_url", base)
         wanted.append(
             {
                 **entry,
-                "url": f"{entry_base}/{entry['path']}",
+                # A shared file from another repository names its own URL and
+                # keeps its own local path.
+                "url": entry.get("url") or f"{entry_base}/{entry['path']}",
                 "local_dir": plan.source["local_dir"],
                 "role": "shared",
             }
         )
     spec = plan.speculator if plan.speculative else None
     if spec:
+        # A drafter inside the target checkpoint (model: target) has no files
+        # and no repo of its own.
         entries = [spec["file"]] if spec.get("file") else spec.get("files", [])
         spec_base = spec.get("base_url")
-        if not spec_base:
+        if entries and not spec_base:
             spec_base = (
                 f"https://huggingface.co/{spec['repo']}/resolve/"
                 f"{spec.get('revision', 'main')}"

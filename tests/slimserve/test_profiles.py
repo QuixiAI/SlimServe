@@ -5,6 +5,7 @@ that is not a tested configuration, before a multi-hundred-GiB load finds out.
 """
 
 import hashlib
+import json
 import signal
 from dataclasses import replace
 from unittest.mock import Mock
@@ -28,6 +29,56 @@ def _big_enough(profile_id: str, platform: str) -> int:
     source = registry._registry()["sources"][entry["source"]]
     default_quant = registry.variant(profile_id, platform)["default_quant"]
     return source["quants"][default_quant]["min_memory_bytes"][platform]
+
+
+def _language_model_ids():
+    """The profiles the LLM serving policy applies to. Asserting a non-zero
+    count keeps an exemption of every profile (say, a wrong default kind)
+    from passing the policy tests vacuously."""
+    ids = registry.language_model_profile_ids()
+    assert ids, "no language-model profiles: the LLM policy tests would be vacuous"
+    return ids
+
+
+def _language_model_records():
+    """Chat-serving policy (prefix caching, tool calling, thinking, graph
+    modes) is defined for language-model profiles; video profiles are covered
+    by tests/slimserve/test_video_profiles.py."""
+    profiles = registry._registry()["profiles"]
+    return [(pid, profiles[pid]) for pid in _language_model_ids()]
+
+
+def test_every_source_kind_is_allowlisted():
+    sources = registry._registry()["sources"]
+    for name, source in sources.items():
+        assert source.get("kind", "llm") in registry.SOURCE_KINDS, name
+    assert set(registry.ENGINE_MODULES) == registry.SOURCE_KINDS - {"llm"}
+
+
+def test_every_non_llm_source_dispatches_to_a_registered_non_vllm_engine():
+    import importlib
+
+    sources = registry._registry()["sources"]
+    for name, source in sources.items():
+        kind = registry.source_kind(source)
+        if kind == "llm":
+            continue
+        module_name = registry.engine_module(kind)
+        assert not module_name.startswith(("vllm", "slimserve.server")), name
+        module = importlib.import_module(module_name)
+        for hook in ("parser", "prepare", "run"):
+            assert callable(getattr(module, hook, None)), (name, hook)
+
+
+def test_an_unknown_kind_is_a_validation_error(monkeypatch, tmp_path):
+    local = tmp_path / "profiles.local.json"
+    local.write_text(json.dumps({"sources": {"x-audio": {"kind": "audio"}}}))
+    monkeypatch.setenv("SLIMSERVE_LOCAL_PROFILES", str(local))
+    registry._registry.cache_clear()
+    with pytest.raises(ValueError, match="kind 'audio'"):
+        registry._registry()
+    with pytest.raises(registry.ProfileError):
+        registry.source_kind({"kind": "audio"})
 
 
 def test_every_profile_resolves_on_a_platform_it_claims():
@@ -189,6 +240,15 @@ def test_glm53_profiles_select_glm53_tool_calling_compatibility():
         assert plan.env["VLLM_TOOL_CALLING_PROFILE"] == "glm53"
 
 
+def test_in_target_drafter_adds_no_download():
+    # glm53f-q2-1's drafter is the GGUF's own nextn block (model: target): no
+    # repo, no files. The download planner must not build a hub URL for it.
+    plan = resolve("glm53f-q2-1", "metal", 1, None, memory_bytes=128 * (1 << 30))
+    plan = replace(plan, speculative=True)
+    assert plan.speculator["model"] == "target"
+    assert not [f for f in files_for(plan) if f["role"] == "speculator"]
+
+
 def test_spec_cli_flags_are_mutually_exclusive():
     with pytest.raises(SystemExit):
         cli._parser().parse_args(["--spec", "--no-spec"])
@@ -199,6 +259,7 @@ def test_every_source_declares_its_live_smoke_modalities():
     assert sources["glm52-vision"]["modalities"] == ["text", "image"]
     assert sources["kimi-k3"]["modalities"] == ["text", "image"]
     assert sources["glm53f-nvfp4"]["modalities"] == ["text", "image"]
+    assert sources["glm53f-gguf"]["modalities"] == ["text"]
     assert sources["dsv4-flash"]["modalities"] == ["text"]
     assert sources["muse-glimmer"]["modalities"] == ["text", "image"]
     assert sources["qwen38-27b"]["modalities"] == ["text", "image"]
@@ -446,6 +507,7 @@ def test_registry_contains_only_the_supported_model_artifacts():
         "qwen38-flash-next-nvfp4",
         "glm53f-nvfp4",
         "glm53f-gguf",
+        "ltx25",
     }
     glm = data["sources"]["glm52-vision"]
     kimi = data["sources"]["kimi-k3"]
@@ -729,7 +791,7 @@ def test_engine_kwargs_drop_server_only_settings():
 
 
 def _all_plans():
-    for profile_id in registry.profile_ids():
+    for profile_id in _language_model_ids():
         for platform in registry.describe(profile_id)["platforms"]:
             yield resolve(profile_id, platform, 8, None, memory_bytes=512 * 1024**3)
 
@@ -792,7 +854,7 @@ def test_profiles_use_their_validated_graph_mode():
     """Graph mode is per-platform evidence: DSpark/TurboQuant DSV4 runs eager
     on MI300X/Metal, while the A100 profiles qualified PIECEWISE capture
     (128K lifecycle, perf/optimization_status.md)."""
-    for profile_id in registry.profile_ids():
+    for profile_id in _language_model_ids():
         for platform in registry.describe(profile_id)["platforms"]:
             engine = resolve(
                 profile_id,
@@ -1137,7 +1199,7 @@ def test_every_profile_states_prefix_caching_explicitly():
     returns True for hybrid generative models -- so an off record is a
     stale default, never a capability limit.
     """
-    for profile_id, entry in registry._registry()["profiles"].items():
+    for profile_id, entry in _language_model_records():
         for platform, record in entry.get("variants", {}).items():
             engine = record.get("engine", {})
             assert "enable_prefix_caching" in engine, (
@@ -1166,7 +1228,7 @@ def test_every_profile_serves_with_tool_calling_and_thinking():
     kwargs = _SERVING_DEFAULTS.get("default_chat_template_kwargs", {})
     assert kwargs.get("thinking") is True and kwargs.get("enable_thinking") is True
 
-    for profile_id, entry in registry._registry()["profiles"].items():
+    for profile_id, entry in _language_model_records():
         for platform, record in entry.get("variants", {}).items():
             engine = record.get("engine", {})
             assert engine.get("tool_call_parser"), (
