@@ -27,6 +27,8 @@ from vllm.entrypoints.openai.engine.protocol import (
 from vllm.entrypoints.openai.tool_thinking_compat import (
     glm53_tool_compat_enabled,
 )
+from vllm import envs
+from vllm.logger import init_logger
 from vllm.parser.engine.registered_adapters import Glm47MoeParserToolAdapter
 from vllm.tool_parsers.structural_tag_registry import (
     custom_tool_as_function_schema,
@@ -40,6 +42,9 @@ from vllm.tool_parsers.utils import (
     named_tool_choice_name,
     tool_choice_mode,
 )
+
+
+logger = init_logger(__name__)
 
 
 @lru_cache(maxsize=128)
@@ -268,15 +273,49 @@ class Glm47MoeModelToolParser(Glm47MoeParserToolAdapter):  # type: ignore[valid-
             content=None,
         )
 
+    # Markup that means the model intended a tool call. If any of it survives
+    # into the text we hand back, the call was MISSED, not absent.
+    _MISSED_CALL_MARKUP = ("<tool_call>", "</tool_call>", "<arg_key>", "<arg_value>")
+
+    def _warn_if_call_leaked(self, result, model_output, request) -> None:
+        """Log the raw output when tool markup is returned as ordinary text.
+
+        A missed call is invisible server-side otherwise: the request is a
+        200, the client just gets XML in `content` instead of `tool_calls`
+        (HexisPro saw ~10% of real agent turns like this, 2026-10-15). The
+        raw output is the only thing that says WHICH shape the parser failed
+        to claim, so capture it here, where the failure is certain, rather
+        than logging every response.
+        """
+        text = result.content or ""
+        if not any(token in text for token in self._MISSED_CALL_MARKUP):
+            return
+        tool_names = sorted(
+            getattr(tool, "name", None) or getattr(getattr(tool, "function", None), "name", "?")
+            for tool in (request.tools or [])
+        )
+        logger.warning(
+            "glm47 tool parser: MISSED a tool call - returning markup as text. "
+            "tools=%d tool_choice=%r profile=%r len=%d\nraw output: %r",
+            len(tool_names),
+            getattr(request, "tool_choice", None),
+            envs.VLLM_TOOL_CALLING_PROFILE,
+            len(model_output),
+            model_output[:4000],
+        )
+
     def extract_tool_calls(self, model_output, request):
         result = super().extract_tool_calls(model_output, request)
         if result.tools_called:
             return result
-        return (
+        recovered = (
             self._extract_glm53_json_array_calls(model_output, request)
             or self._extract_glm53_raw_custom_call(model_output, request)
-            or result
         )
+        if recovered is not None:
+            return recovered
+        self._warn_if_call_leaked(result, model_output, request)
+        return result
 
     def _stream_raw_custom_payload(
         self,
