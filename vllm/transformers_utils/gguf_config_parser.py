@@ -13,6 +13,7 @@ nothing at the metadata level. Standalone DSpark drafts use the `dflash` or
 `dflash-draft` schemas and carry no tokenizer vocabulary.
 """
 
+import copy
 from pathlib import Path
 
 from transformers import PretrainedConfig
@@ -105,4 +106,12 @@ class GGUFConfigParser(ConfigParserBase):
             config = build_qwen35_config_from_gguf(str(model))
         else:
             raise ValueError(f"Unsupported GGUF architecture: {architecture}")
+        # GGUF config builders are @cache'd, and an embedded MTP draft parses
+        # the same file as its target. SpeculativeConfig.hf_config_override
+        # then rewrites model_type/architectures in place; on a shared object
+        # that turns the target into Qwen3_5MTP too (get_model_architecture
+        # reads hf_config.architectures at load), and the real draft then
+        # collides with it on "mtp.layers.0.self_attn.attn". Hand every
+        # ModelConfig its own copy.
+        config = copy.deepcopy(config)
         return config.to_dict(), config

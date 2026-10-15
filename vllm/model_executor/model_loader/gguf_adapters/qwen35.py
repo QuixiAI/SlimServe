@@ -27,6 +27,7 @@ perf/qwen38_metal_design.md):
   kernel).
 """
 
+import math
 from collections.abc import Iterable
 
 import gguf
@@ -144,6 +145,122 @@ def _vision_linear_modules(depth: int) -> list[str]:
     return names
 
 
+_MTP_EXTRA_RENAMES = {
+    "nextn.eh_proj.weight": "fc.weight",
+    "nextn.enorm.weight": "pre_fc_norm_embedding.weight",
+    "nextn.hnorm.weight": "pre_fc_norm_hidden.weight",
+    "nextn.shared_head_norm.weight": "norm.weight",
+}
+
+
+def _untile_v_head_runs(
+    tensor: torch.Tensor, *, axis: int, repeats: int, runs: int, run_width: int
+) -> torch.Tensor:
+    """Swap ``[repeats][runs]`` to ``[runs][repeats]`` over chunks of an axis."""
+    moved = tensor.movedim(axis, 0)
+    expected = repeats * runs * run_width
+    assert moved.shape[0] == expected, (moved.shape, expected)
+    rest = moved.shape[1:]
+    grouped = (
+        moved.reshape(repeats, runs, run_width, *rest)
+        .transpose(0, 1)
+        .reshape(expected, *rest)
+    )
+    return grouped.movedim(0, axis).contiguous()
+
+
+def _untile_v_head_axis(
+    tensor: torch.Tensor,
+    *,
+    axis: int,
+    num_k_heads: int,
+    num_v_heads: int,
+    values_per_head: int,
+    group: int = 1,
+) -> torch.Tensor:
+    """Restore llama.cpp's [repeat, K-head] tiling toward HF [K-head, repeat].
+
+    With ``group == 1`` the result is HF grouped order: value head ``(k, j)``
+    lands at ``k * R + j``. With ``group == g > 1`` K-heads move in runs of
+    ``g`` and stay tiled inside each run: the order becomes
+    ``[k // g][j][k % g]``. That is what a packed GGUF axis whose quant block
+    spans ``g`` heads can reach without splitting a block; see
+    ``_out_proj_v_head_group``.
+    """
+    repeats = num_v_heads // num_k_heads
+    assert repeats * num_k_heads == num_v_heads
+    assert num_k_heads % group == 0, (num_k_heads, group)
+    return _untile_v_head_runs(
+        tensor,
+        axis=axis,
+        repeats=repeats,
+        runs=num_k_heads // group,
+        run_width=group * values_per_head,
+    )
+
+
+def _quant_block_heads(weight_type: str, head_dim: int) -> int:
+    """Smallest run of value heads that a GGUF quant block never straddles."""
+    quant_type = getattr(gguf.GGMLQuantizationType, weight_type)
+    block_size, _ = gguf.GGML_QUANT_SIZES[quant_type]
+    return block_size // math.gcd(head_dim, block_size)
+
+
+def _out_proj_v_head_group(weight_types: Iterable[str], head_dim: int) -> int:
+    """K-head run length the out_proj columns are restored in.
+
+    out_proj is quantized along its input (value-head) axis, so its tiled
+    columns can only be moved in whole quant blocks. Q8_0 (32) and
+    unquantized tensors divide head_dim=128 and restore fully (1); every
+    super-block format (K-quants, IQ*, block 256) spans two value heads (2),
+    which is all of the published UD-Q2_K_XL ssm_out tensors. One value is
+    used for every layer so the runtime needs a single activation order.
+    """
+    group = 1
+    for weight_type in weight_types:
+        group = math.lcm(group, _quant_block_heads(weight_type, head_dim))
+    return group
+
+
+def _untile_packed_v_head_columns(
+    qweight: torch.Tensor,
+    *,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_dim: int,
+    weight_type: str,
+    group: int = 1,
+) -> torch.Tensor:
+    """Untile input-head columns without decoding GGUF quant blocks."""
+    quant_type = getattr(gguf.GGMLQuantizationType, weight_type)
+    block_size, type_size = gguf.GGML_QUANT_SIZES[quant_type]
+    run = group * head_dim
+    if run % block_size:
+        raise ValueError(
+            f"cannot untile {weight_type} columns in runs of {group} heads: "
+            f"{run} values are not aligned to quant block_size={block_size}"
+        )
+    repeats = num_v_heads // num_k_heads
+    assert repeats * num_k_heads == num_v_heads
+    assert num_k_heads % group == 0, (num_k_heads, group)
+    return _untile_v_head_runs(
+        qweight,
+        axis=1,
+        repeats=repeats,
+        runs=num_k_heads // group,
+        run_width=run // block_size * type_size,
+    )
+
+
+def _pipeline_parallel_size() -> int:
+    from vllm.config import get_current_vllm_config_or_none
+
+    vllm_config = get_current_vllm_config_or_none()
+    if vllm_config is None:
+        return 1
+    return int(vllm_config.parallel_config.pipeline_parallel_size)
+
+
 class Qwen35GGUFAdapter(GGUFWeightsAdapter):
     """The qwen35 hybrid target GGUF (dense Qwen3.5 family)."""
 
@@ -151,11 +268,47 @@ class Qwen35GGUFAdapter(GGUFWeightsAdapter):
         # The config was built from this same GGUF; nothing to patch.
         return hf_config
 
+    @staticmethod
+    def _is_mtp_model(model_config: ModelConfig) -> bool:
+        config = model_config.hf_config
+        architectures = getattr(config, "architectures", None) or []
+        return (
+            getattr(config, "model_type", None) == "qwen3_5_mtp"
+            or "Qwen3_5MTP" in architectures
+            or "Qwen3_5MoeMTP" in architectures
+        )
+
     def build_name_map(self, model_config: ModelConfig) -> dict[str, str]:
         config = model_config.hf_config
         text_config = (
             config.get_text_config() if hasattr(config, "get_text_config") else config
         )
+        if self._is_mtp_model(model_config):
+            # The appended GGUF block is numbered after the target backbone,
+            # while Qwen3_5MTP numbers its compact draft layers from zero.
+            mtp_idx = int(text_config.num_hidden_layers)
+            # Without pipeline parallelism token_embd / output stay unmapped:
+            # both runners (V1 _maybe_share_embeddings/_maybe_share_lm_head,
+            # V2 load_eagle_model) replace the draft's embed_tokens and
+            # lm_head with the target's, so loading them would only
+            # dequantize a second ~2.5 GB embedding table and a second
+            # lm_head that are discarded right after.
+            # With PP > 1 neither runner shares the embedding (the target's
+            # embed_tokens lives on the first rank, the draft on the last),
+            # so the draft must load its own or run on an uninitialised
+            # table. lm_head is still shared under PP: both runners share it
+            # unconditionally and the target's lm_head lives on the same
+            # (last) rank as the draft, so output stays unmapped.
+            name_map: dict[str, str] = {}
+            if _pipeline_parallel_size() > 1:
+                name_map["token_embd.weight"] = "model.embed_tokens.weight"
+            per_layer = {**_COMMON_BLK_RENAMES, **_FULL_ATTN_BLK_RENAMES}
+            for gguf_part, hf_part in per_layer.items():
+                name_map[f"blk.{mtp_idx}.{gguf_part}"] = f"mtp.layers.0.{hf_part}"
+            for gguf_part, hf_part in _MTP_EXTRA_RENAMES.items():
+                name_map[f"blk.{mtp_idx}.{gguf_part}"] = f"mtp.{hf_part}"
+            return name_map
+
         # When the mmproj was found the config is the composite
         # Qwen3_5ForConditionalGeneration; the text half lives under
         # `language_model.` (Muse-Glimmer pattern).
@@ -187,6 +340,22 @@ class Qwen35GGUFAdapter(GGUFWeightsAdapter):
         weight_type_map = self.get_weight_type_map(
             model_path, spec.gguf_to_hf_name_map or {}
         )
+        self._weight_type_map = weight_type_map
+        text_config = model_config.hf_config.get_text_config()
+        self._untile_v_heads = bool(
+            getattr(
+                text_config,
+                "gguf_gdn_tiled_weights",
+                getattr(text_config, "gdn_tiled_v_head_layout", False),
+            )
+        )
+        # Preserve the on-disk convention if this cached config object is used
+        # for another loader after the runtime flag below has been cleared.
+        text_config.gguf_gdn_tiled_weights = self._untile_v_heads
+        # Restore the HF grouped layout in the adapter so every runtime,
+        # including XPU's optimized GDN kernel, can use hv // (HV/H).
+        if self._untile_v_heads:
+            text_config.gdn_tiled_v_head_layout = False
         self._dequant_stems = {
             name.removesuffix(".weight")
             for name, weight_type in weight_type_map.items()
@@ -219,6 +388,32 @@ class Qwen35GGUFAdapter(GGUFWeightsAdapter):
             len(self._dequant_stems),
             sorted(_DEQUANT_TYPES),
         )
+        # out_proj columns are the one per-value-head axis that is quantized,
+        # so they can only be restored in whole quant blocks. When a block
+        # spans more than one head (every block-256 format at head_dim 128),
+        # the K-heads move in runs and the GDN module puts its out_proj input
+        # into the same order (QwenGatedDeltaNetAttention._out_proj_input). This keeps
+        # the weights quantized and is TP-safe: runs never straddle a rank.
+        self._out_proj_group = 1
+        if self._untile_v_heads:
+            self._out_proj_group = _out_proj_v_head_group(
+                (
+                    "F16"
+                    if name.removesuffix(".weight") in self._dequant_stems
+                    else weight_type
+                    for name, weight_type in weight_type_map.items()
+                    if name.endswith("linear_attn.out_proj.weight")
+                ),
+                int(text_config.linear_value_head_dim),
+            )
+        text_config.gdn_out_proj_v_head_group = self._out_proj_group
+        if self._out_proj_group > 1:
+            logger.info(
+                "qwen35 GGUF: out_proj quant blocks span %d value heads; "
+                "restoring its columns in K-head runs of %d",
+                self._out_proj_group,
+                self._out_proj_group,
+            )
         # The mmproj tower is entirely F16/F32 and is streamed by
         # `_vision_weights` rather than through `gguf_to_hf_name_map`, so the
         # base class's weight-type scan never sees it. Mark it unquantized
@@ -259,11 +454,23 @@ class Qwen35GGUFAdapter(GGUFWeightsAdapter):
                 for shard in ("q", "k", "v"):
                     yield (
                         f"{stem[: -len('in_proj_qkv')]}in_proj_{shard}_shard.{leaf}",
-                        weight,
+                        # WeightsMapper records shard_id on the tensor object.
+                        # Each shard needs its own scalar rather than three
+                        # aliases whose shard_id is overwritten by the last
+                        # mapping.
+                        weight.clone(),
                     )
                 return
             assert weight.shape[0] == 2 * key_dim + value_dim, (name, weight.shape)
-            splits = torch.split(weight, [key_dim, key_dim, value_dim], dim=0)
+            splits = list(torch.split(weight, [key_dim, key_dim, value_dim], dim=0))
+            if getattr(self, "_untile_v_heads", False):
+                splits[2] = _untile_v_head_axis(
+                    splits[2],
+                    axis=0,
+                    num_k_heads=text_config.linear_num_key_heads,
+                    num_v_heads=text_config.linear_num_value_heads,
+                    values_per_head=text_config.linear_value_head_dim,
+                )
             for shard, part in zip(("q", "k", "v"), splits):
                 yield (
                     f"{stem[: -len('in_proj_qkv')]}in_proj_{shard}_shard.{leaf}",
@@ -287,6 +494,10 @@ class Qwen35GGUFAdapter(GGUFWeightsAdapter):
             if name.rsplit(".", 1)[0].endswith("linear_attn.in_proj_qkv"):
                 yield from split_qkv(name, weight)
                 continue
+            if getattr(self, "_untile_v_heads", False) and not name.endswith(
+                ".qweight_type"
+            ):
+                weight = self._untile_gdn_weight(name, weight, text_config)
             yield name, weight
 
         if getattr(model_config.hf_config, "vision_config", None) is not None:
@@ -343,6 +554,70 @@ class Qwen35GGUFAdapter(GGUFWeightsAdapter):
         fused = torch.stack([taps[name] for name in _PATCH_EMBD_TAPS], dim=2)
         yield "visual.patch_embed.proj.weight", fused
         logger.info("Loaded %d vision tensors from mmproj", count)
+
+    def _untile_gdn_weight(
+        self, name: str, weight: torch.Tensor, config
+    ) -> torch.Tensor:
+        num_k = config.linear_num_key_heads
+        num_v = config.linear_num_value_heads
+        head_dim = config.linear_value_head_dim
+        if name.endswith(".qweight"):
+            stem = name.removesuffix(".qweight")
+        elif name.endswith(".weight"):
+            stem = name.removesuffix(".weight")
+        else:
+            stem = name
+
+        row_chunks = {
+            "linear_attn.in_proj_z": head_dim,
+            "linear_attn.in_proj_b": 1,
+            "linear_attn.in_proj_a": 1,
+            "linear_attn.A_log": 1,
+            "linear_attn.dt_bias": 1,
+        }
+        for suffix, chunk in row_chunks.items():
+            if stem.endswith(suffix):
+                return _untile_v_head_axis(
+                    weight,
+                    axis=0,
+                    num_k_heads=num_k,
+                    num_v_heads=num_v,
+                    values_per_head=chunk,
+                )
+
+        if stem.endswith("linear_attn.conv1d"):
+            key_dim = num_k * config.linear_key_head_dim
+            q, k, v = torch.split(weight, [key_dim, key_dim, num_v * head_dim], dim=0)
+            v = _untile_v_head_axis(
+                v,
+                axis=0,
+                num_k_heads=num_k,
+                num_v_heads=num_v,
+                values_per_head=head_dim,
+            )
+            return torch.cat((q, k, v), dim=0)
+
+        if stem.endswith("linear_attn.out_proj"):
+            group = getattr(self, "_out_proj_group", 1)
+            if name.endswith(".qweight"):
+                weight_type = self._weight_type_map[stem + ".weight"]
+                return _untile_packed_v_head_columns(
+                    weight,
+                    num_k_heads=num_k,
+                    num_v_heads=num_v,
+                    head_dim=head_dim,
+                    weight_type=weight_type,
+                    group=group,
+                )
+            return _untile_v_head_axis(
+                weight,
+                axis=1,
+                num_k_heads=num_k,
+                num_v_heads=num_v,
+                values_per_head=head_dim,
+                group=group,
+            )
+        return weight
 
     def transform_weight(self, hf_name: str, weight: torch.Tensor) -> torch.Tensor:
         if hf_name.endswith("linear_attn.conv1d.weight") and weight.dim() == 2:
