@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Iterable
 from functools import cache
 
@@ -14,6 +15,8 @@ from vllm.v1.worker.gpu.buffer_utils import (
     UvaBackedTensor,
     _load_ptr,
 )
+
+_METAL_KV_META: bool | None = None
 
 
 def _quixicore_disabled() -> bool:
@@ -188,6 +191,87 @@ class BlockTables:
             self._slot_mapping_enabled, dtype=torch.bool, device=self.device
         )
         self.input_block_table_ptrs = self._make_ptr_tensor(self.input_block_tables)
+        self._metal_meta_params: torch.Tensor | None = None
+        if self.device.type == "mps" and self.num_kv_cache_groups <= 8:
+            # kv_meta_prepare's per-group layout (rebuilt here so a wake-up
+            # reallocation is picked up): src stride, dst stride, columns,
+            # kernel block size, slot-mapping enabled.
+            rows = [
+                [
+                    b.gpu.stride(0),
+                    d.stride(0),
+                    b.gpu.shape[1],
+                    kbs,
+                    int(en),
+                    0,
+                    0,
+                    0,
+                ]
+                for b, d, kbs, en in zip(
+                    self.block_tables,
+                    self.input_block_tables,
+                    self.kernel_block_sizes,
+                    self._slot_mapping_enabled,
+                )
+            ]
+            self._metal_meta_params = torch.tensor(
+                rows, dtype=torch.int32, device=self.device
+            )
+
+    def metal_fused_prepare_ok(self) -> bool:
+        """The single-launch Metal metadata route (kv_meta_prepare) applies:
+        no context parallelism, <= 8 groups, kernel present, and the profile
+        opted in (VLLM_METAL_KV_META=1, the glm53f-q2-1 env block); every
+        other profile keeps the torch chain it was gated with."""
+        global _METAL_KV_META
+        if self._metal_meta_params is None or self.cp_size != 1:
+            return False
+        if _METAL_KV_META is None:
+            _METAL_KV_META = False
+            enabled = os.getenv("VLLM_METAL_KV_META", "0") == "1"
+            if enabled and not _quixicore_disabled():
+                from vllm.quixicore import quixicore_ops
+
+                _METAL_KV_META = quixicore_ops.is_available() and quixicore_ops.has(
+                    "kv_meta_prepare"
+                )
+        return _METAL_KV_META
+
+    def prepare_metal(
+        self,
+        idx_mapping: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        positions: torch.Tensor,
+        num_reqs_padded: int,
+        num_tokens_padded: int,
+        num_tokens: int,
+    ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+        """gather_block_tables + compute_slot_mappings in one Metal launch
+        (same outputs: the per-group [num_reqs_padded, blocks] batch tables
+        with padded rows zeroed, and slot_mappings[:, :num_tokens_padded]
+        with PAD past num_tokens)."""
+        from vllm.quixicore import quixicore_ops
+
+        num_reqs = idx_mapping.shape[0]
+        quixicore_ops.kv_meta_prepare(
+            idx_mapping,
+            query_start_loc,
+            positions,
+            self._metal_meta_params,
+            self.slot_mappings,
+            [b.gpu for b in self.block_tables],
+            self.input_block_tables,
+            num_reqs,
+            num_reqs_padded,
+            num_tokens,
+            num_tokens_padded,
+        )
+        if _integrity_checks_enabled():
+            _check_slot_mappings(self.slot_mappings, num_tokens_padded)
+        return (
+            tuple(bt[:num_reqs_padded] for bt in self.input_block_tables),
+            self.slot_mappings[:, :num_tokens_padded],
+        )
 
     def enable_cpu_mirror(self, group_id: int) -> None:
         """Keep a CPU copy of one group's block ids (host-resident main KV

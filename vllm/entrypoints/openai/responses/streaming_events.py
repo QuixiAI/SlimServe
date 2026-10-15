@@ -55,7 +55,9 @@ from openai.types.responses import (
     ResponseWebSearchCallInProgressEvent,
     ResponseWebSearchCallSearchingEvent,
     response_function_web_search,
+    response_output_text,
     response_text_delta_event,
+    response_text_done_event,
 )
 from openai.types.responses.response_output_item import McpCall
 from openai.types.responses.response_reasoning_item import (
@@ -822,6 +824,11 @@ class SimpleStreamingState:
     current_item_id: str = ""
     content_index: int = 0
     accumulated_text: str = ""
+    # Logprobs streamed with the current message's text deltas, so the done
+    # events and terminal output carry them like the non-streaming response.
+    accumulated_logprobs: list[response_text_delta_event.Logprob] = field(
+        default_factory=list
+    )
     tool_call_id: str = ""
     tool_call_name: str = ""
     tool_call_namespace: str | None = None
@@ -838,6 +845,7 @@ def emit_simple_content_open(
     state.current_item_id = random_uuid()
     state.content_index = 0
     state.accumulated_text = ""
+    state.accumulated_logprobs = []
     return [
         ResponseOutputItemAddedEvent(
             type="response.output_item.added",
@@ -873,6 +881,8 @@ def emit_simple_content_delta(
     logprobs: list[response_text_delta_event.Logprob] | None = None,
 ) -> list[StreamingResponsesResponse]:
     state.accumulated_text += delta
+    if logprobs:
+        state.accumulated_logprobs.extend(logprobs)
     return [
         ResponseTextDeltaEvent(
             type="response.output_text.delta",
@@ -886,13 +896,46 @@ def emit_simple_content_delta(
     ]
 
 
+def _output_text_logprobs(
+    logprobs: list[response_text_delta_event.Logprob],
+) -> list[response_output_text.Logprob]:
+    """Streamed delta logprobs in the output_text form, with token bytes."""
+
+    def token_bytes(token: str) -> list[int]:
+        # Same encoding the non-streaming response uses for its logprobs.
+        return list(token.encode("utf-8", errors="replace"))
+
+    return [
+        response_output_text.Logprob(
+            token=logprob.token,
+            logprob=logprob.logprob,
+            bytes=token_bytes(logprob.token),
+            top_logprobs=[
+                response_output_text.LogprobTopLogprob(
+                    token=top.token,
+                    logprob=top.logprob,
+                    bytes=token_bytes(top.token),
+                )
+                for top in logprob.top_logprobs or []
+            ],
+        )
+        for logprob in logprobs
+    ]
+
+
 def emit_simple_content_done(
     state: SimpleStreamingState,
 ) -> list[StreamingResponsesResponse]:
+    streamed_logprobs = state.accumulated_logprobs
     part = ResponseOutputText(
         type="output_text",
         text=state.accumulated_text,
         annotations=[],
+        # None when none were streamed (not requested), as in the
+        # non-streaming response.
+        logprobs=_output_text_logprobs(streamed_logprobs)
+        if streamed_logprobs
+        else None,
     )
     events: list[StreamingResponsesResponse] = [
         ResponseTextDoneEvent(
@@ -901,7 +944,10 @@ def emit_simple_content_done(
             output_index=state.output_index,
             content_index=state.content_index,
             text=state.accumulated_text,
-            logprobs=[],
+            logprobs=[
+                response_text_done_event.Logprob.model_validate(logprob.model_dump())
+                for logprob in streamed_logprobs
+            ],
             item_id=state.current_item_id,
         ),
         ResponseContentPartDoneEvent(
@@ -1092,9 +1138,32 @@ def emit_simple_tool_call_delta(
     ]
 
 
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"Invalid JSON constant: {value}")
+
+
+def valid_function_call_arguments(arguments: str) -> bool:
+    """Check that arguments are one JSON object; nothing more.
+
+    Function arguments are a JSON object of named parameters, so other JSON
+    values ("[]", "42", "null") are not callable arguments. Schema adherence
+    beyond that belongs to strict decoding.
+    """
+    try:
+        parsed = json.loads(arguments, parse_constant=_reject_json_constant)
+    except (ValueError, RecursionError):
+        return False
+    return isinstance(parsed, dict)
+
+
 def emit_simple_tool_call_done(
     state: SimpleStreamingState,
+    *,
+    incomplete: bool = False,
 ) -> list[StreamingResponsesResponse]:
+    # Streamed deltas may end halfway through JSON when the token budget is
+    # exhausted. Never announce those arguments as a completed function call.
+    completed = not incomplete and valid_function_call_arguments(state.accumulated_text)
     events: list[StreamingResponsesResponse] = []
     is_custom = state.tool_call_name in state.custom_tool_names
     if is_custom:
@@ -1107,7 +1176,7 @@ def emit_simple_tool_call_done(
                 input=state.accumulated_text,
             )
         )
-    elif state.has_emitted_tool_call_delta:
+    elif completed and state.has_emitted_tool_call_delta:
         events.append(
             ResponseFunctionCallArgumentsDoneEvent(
                 type="response.function_call_arguments.done",
@@ -1132,7 +1201,7 @@ def emit_simple_tool_call_done(
             name=state.tool_call_name,
             namespace=state.tool_call_namespace,
             arguments=state.accumulated_text,
-            status="completed",
+            status="completed" if completed else "incomplete",
             id=state.current_item_id,
             call_id=state.tool_call_id,
         )
@@ -1273,8 +1342,12 @@ class SimpleStreamingEventProcessor:
             and self.state.tool_call_index != tool_call.index
         )
 
-    def close_current(self) -> list[StreamingResponsesResponse]:
-        """Close the current state and emit its 'done' event sequence."""
+    def close_current(
+        self, *, incomplete: bool = False
+    ) -> list[StreamingResponsesResponse]:
+        """Close the current item without completing interrupted tool calls."""
+        if self.state.current_state == _StateType.TOOL_CALL:
+            return emit_simple_tool_call_done(self.state, incomplete=incomplete)
         handlers = self._STATE_HANDLERS.get(self.state.current_state)
         if handlers is None:
             return []
