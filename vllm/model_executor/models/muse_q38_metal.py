@@ -86,6 +86,26 @@ def _available() -> bool:
         return False
 
 
+def _plain_out_proj(la: torch.nn.Module, idx: int) -> torch.nn.Module:
+    """The GDN out_proj, provided its columns are in grouped head order.
+
+    A GGUF out_proj whose quant blocks span several value heads keeps its
+    columns run-ordered (``out_proj_v_head_group > 1``) and the eager module
+    gathers its input before the GEMM (``_out_proj_input``). The muse
+    command buffer feeds the gated-norm output straight into out_proj and
+    has no such gather, so it must refuse these layers rather than produce
+    a silently permuted projection.
+    """
+    group = int(getattr(la, "out_proj_v_head_group", 1) or 1)
+    if group > 1:
+        raise RuntimeError(
+            f"layer {idx}: muse_q38 does not support a run-ordered GDN "
+            f"out_proj (out_proj_v_head_group={group}); its input gather "
+            "exists only on the eager path"
+        )
+    return la.out_proj
+
+
 def _qproj(linear: torch.nn.Module, what: str) -> tuple[list[torch.Tensor], int]:
     """Extract the registered GEMV operands of a serving linear: the CT
     fp8ch/nvfp4 operands, or the raw bf16 weight for the few projections
@@ -226,7 +246,7 @@ def _register(model: torch.nn.Module) -> None:
             st = la._metal_gdn
             qkvz_t, qkvz_f = _qproj(la.in_proj_qkvz, f"layers.{idx}.qkvz")
             ba_t, ba_f = _qproj(la.in_proj_ba, f"layers.{idx}.ba")
-            out_t, out_f = _qproj(la.out_proj, f"layers.{idx}.out")
+            out_t, out_f = _qproj(_plain_out_proj(la, idx), f"layers.{idx}.out")
             conv_state, ssm_state = la.kv_cache[0], la.kv_cache[1]
             qc.muse_q38_layer_gdn(
                 idx,
@@ -746,7 +766,9 @@ def _debug_report(
                 f"| snapshot conv {cache.conv_slots.tolist()} ssm "
                 f"{sorted(set(cache.slot_table.reshape(-1).tolist()))}"
             )
-        parts.append(_stats("mixer", _host_gemv(la.out_proj, gn), t4))
+        parts.append(
+            _stats("mixer", _host_gemv(_plain_out_proj(la, layer_idx), gn), t4)
+        )
     else:
         parts.append("mixer: n/a (no host reference at this cap)")
 

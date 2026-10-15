@@ -353,6 +353,20 @@ class ChunkGatedDeltaRule(CustomOp):
         return o, final_state
 
 
+def out_proj_v_head_order(num_k_heads: int, repeats: int, group: int) -> torch.Tensor:
+    """Gather index from grouped value heads to out_proj's run-tiled order.
+
+    Target position ``(k // group, j, k % group)`` reads grouped head
+    ``k * repeats + j``. ``group == 1`` is the identity.
+    """
+    return (
+        torch.arange(num_k_heads * repeats)
+        .reshape(num_k_heads // group, group, repeats)
+        .transpose(1, 2)
+        .reshape(-1)
+    )
+
+
 @PluggableLayer.register("qwen_gated_delta_net_attention")
 class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     def get_state_shape(
@@ -406,6 +420,33 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.tiled_v_head_layout and not self.gdn_core_honors_tiled
         )
         self._v_head_perms: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {}
+        # GGUF out_proj whose quant blocks span several value heads keeps its
+        # columns in K-head runs of this length, tiled inside each run
+        # ([k // g][j][k % g], see the qwen35 GGUF adapter). Every other
+        # per-value-head tensor is in HF grouped order, so only the out_proj
+        # input is reordered, with one gather per layer. The order is per
+        # rank and identical on every rank as long as no run straddles a TP
+        # boundary.
+        self.out_proj_v_head_group = int(
+            getattr(config, "gdn_out_proj_v_head_group", 1) or 1
+        )
+        self._out_proj_head_order: torch.Tensor | None = None
+        if self.out_proj_v_head_group > 1:
+            assert not self.tiled_v_head_layout, (
+                "gdn_out_proj_v_head_group applies to untiled GGUF weights only"
+            )
+            local_k = self.num_k_heads // self.tp_size
+            group = self.out_proj_v_head_group
+            if local_k % group:
+                raise ValueError(
+                    f"{prefix}: GGUF out_proj quant blocks span {group} value "
+                    f"heads, which needs a multiple of {group} key heads per "
+                    f"rank; {self.num_k_heads} key heads at TP="
+                    f"{self.tp_size} leaves {local_k}."
+                )
+            self._out_proj_head_order = out_proj_v_head_order(
+                local_k, self.num_v_heads // self.num_k_heads, group
+            )
         if current_platform.is_xpu():
             self._forward_method = self.forward_xpu
         elif current_platform.is_cpu():
@@ -935,6 +976,22 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         core_attn_out = core_attn_out.reshape(z_shape_og)
         return core_attn_out.flatten(-2)  # ... h d -> ... (h d)
 
+    def _out_proj_input(self, x: torch.Tensor) -> torch.Tensor:
+        """[..., Hv*Dv] rows in grouped head order -> out_proj column order."""
+        order = self._out_proj_head_order
+        if order is None:
+            return x
+        if order.device != x.device:
+            order = order.to(x.device)
+            self._out_proj_head_order = order
+        lead = x.shape[:-1]
+        heads = x.reshape(*lead, order.numel(), self.head_v_dim)
+        return heads.index_select(-2, order).reshape(*lead, -1)
+
+    def _project_out(self, x: torch.Tensor) -> torch.Tensor:
+        output, _ = self.out_proj(self._out_proj_input(x))
+        return output
+
     def _output_projection(
         self,
         core_attn_out: torch.Tensor,
@@ -945,8 +1002,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         The RMSNormGated + quant sequence is eligible for fusion
         by the compilation pass when fuse_norm_quant is enabled.
         """
-        output, _ = self.out_proj(self._gated_norm(core_attn_out, z))
-        return output
+        return self._project_out(self._gated_norm(core_attn_out, z))
 
     def _fused_gdn_norm_ok(self, x: torch.Tensor, z: torch.Tensor) -> bool:
         ok = self.__dict__.get("_fused_gdn_norm_flag")
@@ -1046,8 +1102,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 core_attn_out,
                 layer_name=_encode_layer_name(self.prefix),
             )
-            output, _ = self.out_proj(core_attn_out.flatten(-2))
-            return output
+            return self._project_out(core_attn_out.flatten(-2))
 
         if self.gqa_interleaved_layout:
             # Qwen3-Next: unpack the interleaved GQA layout
@@ -1139,8 +1194,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.flatten(-2)  # ... h d -> ... (h d)
-        out, _ = self.out_proj(core_attn_out)
-        return out
+        return self._project_out(core_attn_out)
 
     def forward_cpu(
         self,
@@ -1189,8 +1243,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.flatten(-2)  # ... h d -> ... (h d)
-        out, _ = self.out_proj(core_attn_out)
-        return out
+        return self._project_out(core_attn_out)
 
     def forward_mps(
         self,
@@ -1215,8 +1268,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         z = z.view(num_tokens, -1, self.head_v_dim)
 
         core = self._forward_core_mps(mixed_qkv, ba, z, num_tokens)
-        output, _ = self.out_proj(core)
-        return output
+        return self._project_out(core)
 
     def _forward_core_mps(
         self,
