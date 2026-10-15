@@ -4,27 +4,38 @@ Optional streaming capture proxy and read-only protocol analyzers for SlimServe.
 The tools are independent of the model profile. They require Python; the proxy
 also uses `httpx`, `starlette`, and `uvicorn` from the serving environment.
 
-## Proxy on port 8000, SlimServe on port 8001
+## Capture proxy in front of SlimServe
 
 Start the registered SlimServe profile on a loopback backend port, then launch
-this proxy in another terminal. Substitute the profile for your hardware:
+this proxy in another terminal. `PROFILE`, `BACKEND_PORT`, and `PROXY_PORT` are
+yours to choose; nothing here assumes a host, port, or service layout:
 
 ```bash
-python -m slimserve.cli qwen38-abliterated-b70-4 --serve --host 127.0.0.1 --port 8001 -y
-python -m uvicorn slimserve_traffic_proxy:app \
-  --app-dir tools/serving_diagnostics --host 0.0.0.0 --port 8000
+slimserve PROFILE --host 127.0.0.1 --port BACKEND_PORT -y
+PROXY_UPSTREAM=http://127.0.0.1:BACKEND_PORT \
+  python -m uvicorn slimserve_traffic_proxy:app \
+  --app-dir tools/serving_diagnostics --host 127.0.0.1 --port PROXY_PORT
 ```
 
-The proxy forwards to `http://127.0.0.1:8001`. Override this with `PROXY_UPSTREAM`.
+`PROXY_UPSTREAM` is required; the proxy refuses to start without it.
 It records `/v1/responses` and `/v1/chat/completions` in rotating JSONL files.
-Defaults are portable: `~/.cache/slimserve/traffic-proxy/traffic.jsonl`; set
-`PROXY_LOG_DIR` to use another directory. The analyzers honor the same variable
-and also accept explicit log paths as positional arguments.
+By default captures go to the git-ignored notebook area,
+`perf/results/<UTC date>/traffic-proxy/traffic.jsonl`; set `PROXY_LOG_DIR` to use
+another directory (for example `perf/results/<date>/<run-id>/`). The analyzers
+honor the same variable and also accept explicit log paths as positional
+arguments. Note that the default directory is dated, so analyze a previous day's
+capture by passing its path or `PROXY_LOG_DIR`.
+
+The proxy is passive: it forwards request bodies unchanged and never sets or
+rewrites sampling parameters. Any traffic you drive through it for diagnostics
+must follow the repository's sampling policy (temperature 1.0, top_p 0.95,
+top_k 20, seeded; thinking enabled; never temperature 0).
 
 Capture controls: `PROXY_CAPTURE_LIMIT_BYTES` defaults to 32 MiB per response,
 `PROXY_LOG_MAX_BYTES` to 256 MiB per file, and `PROXY_LOG_BACKUPS` to 8. Reaching
 the capture limit does not stop forwarding. This directory contains no service
-installation, credentials, captures, or machine-specific configuration.
+installation, credentials, captures, or machine-specific configuration, and
+none may be added here: deployment configuration stays on operator machines.
 
 ## Compact analysis
 
@@ -79,7 +90,7 @@ at the configured byte limit; analyzers flag this separately.
 
 Capture finalization runs once even after stream errors or cancellation. Cleanup
 is shielded with a bounded 10-second explicit upstream close; close failures are
-recorded. This lifecycle uses asyncio, matching the Uvicorn deployment. The proxy
+recorded. This lifecycle uses asyncio, matching Uvicorn. The proxy
 preserves raw response bytes and duplicate response headers; it adds no heartbeat
 or synthetic model events. A disconnected, unfinished request body is recorded
 as client-abandoned input (499), not a model-generation failure.
@@ -111,13 +122,19 @@ resets rearm detection. Missing metrics are reported separately.
 
 ```bash
 python tools/serving_diagnostics/watch_progress.py \
-  --service-unit slimserve-abliterated.service \
-  --journal-unit slimserve-abliterated.service \
-  --duration 3600 --output /private/path/progress.jsonl \
-  --py-spy /absolute/path/to/py-spy --sudo-py-spy
+  --metrics-url http://127.0.0.1:BACKEND_PORT/metrics \
+  --pid SLIMSERVE_PID --duration 3600 \
+  --py-spy "$(command -v py-spy)"
 ```
 
-The user service MainPID is discovered anew at each stall. Alternatively, use
+`--metrics-url` is required and must be plain HTTP on loopback. Output defaults
+to `perf/results/<UTC date>/progress-watchdog/progress.jsonl` (mode 0600); pass
+`--output` to choose a run directory. If the server runs under a systemd user
+unit, `--service-unit UNIT` and `--journal-unit UNIT` can replace `--pid`; the
+unit itself is operator configuration and is not part of this repository.
+
+With `--service-unit`, the user service MainPID is discovered anew at each
+stall. Alternatively, use
 `--pid PID` for a fixed process-tree root. Optional py-spy captures native/Python
 frames without locals, prioritizing workers before engine/API helpers, up to 12
 processes. Explicit `--sudo-py-spy` enables `sudo -n` only for stack capture when
@@ -130,3 +147,19 @@ pauses during bounded diagnostic subprocesses; each stack attempt has an eight
 second limit, subject to the overall one-hour run limit. Start under a service
 manager to survive the invoking terminal. The detector is diagnostic, not proof
 of a deadlock: unusually long prefill can also cross the threshold.
+
+## Worker phase records
+
+For multiprocess (`MultiprocExecutor`) workers, setting
+`VLLM_WORKER_PROGRESS_DIR=DIR` before the server starts makes each worker keep a
+fixed-size, payload-free ring of host phase entry/exit records (RPC execute /
+sample / draft-ids, sampling, prior-output and prior-draft waits, MTP drafting,
+draft copy, async output) in `DIR/worker-<pid>.bin`. It never queries the
+device, stores no RPC names, arguments, or model data, and is fully inert when
+the variable is unset. Read a snapshot while the server is stalled with:
+
+```bash
+python vllm/utils/worker_progress.py --directory DIR --pids WORKER_PID [...]
+```
+
+Records mark host entry/exit, not GPU completion.

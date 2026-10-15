@@ -21,6 +21,8 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from capture_paths import results_dir
+
 METRIC_NAMES = {
     "vllm:generation_tokens_total": "generation_tokens",
     "vllm:prompt_tokens_total": "prompt_tokens",
@@ -447,7 +449,10 @@ def positive_seconds(value: str) -> float:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--metrics-url", type=local_metrics_url, default="http://127.0.0.1:8001/metrics"
+        "--metrics-url",
+        type=local_metrics_url,
+        required=True,
+        help="loopback SlimServe metrics URL, e.g. http://127.0.0.1:PORT/metrics",
     )
     parser.add_argument("--interval", type=positive_seconds, default=5.0)
     parser.add_argument("--stall-seconds", type=positive_seconds, default=45.0)
@@ -455,7 +460,8 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path.home() / ".cache/slimserve/progress-watchdog/progress.jsonl",
+        default=None,
+        help="JSONL output; default perf/results/<UTC date>/progress-watchdog/",
     )
     roots = parser.add_mutually_exclusive_group()
     roots.add_argument(
@@ -487,6 +493,8 @@ def main(argv=None) -> int:
         parser.error("duration must be <=3600 seconds and interval <=60 seconds")
     if len(args.pid) > 4 or any(pid <= 0 for pid in args.pid):
         parser.error("provide at most four positive process IDs")
+    if args.output is None:
+        args.output = results_dir("progress-watchdog") / "progress.jsonl"
     detector = ProgressDetector(args.stall_seconds)
     started = time.monotonic()
     deadline = started + args.duration

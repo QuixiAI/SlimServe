@@ -28,7 +28,8 @@ from starlette.routing import Route
 if sys.version_info < (3, 11):
     from exceptiongroup import BaseExceptionGroup
 
-UPSTREAM = os.environ.get("PROXY_UPSTREAM", "http://127.0.0.1:8001").rstrip("/")
+# No site-specific default: the operator names the backend explicitly.
+UPSTREAM = os.environ.get("PROXY_UPSTREAM", "").rstrip("/")
 LOG_DIR = DEFAULT_LOG_DIR
 CAPTURE_LIMIT = int(os.environ.get("PROXY_CAPTURE_LIMIT_BYTES", str(32 * 1024 * 1024)))
 LOG_MAX_BYTES = int(os.environ.get("PROXY_LOG_MAX_BYTES", str(256 * 1024 * 1024)))
@@ -131,6 +132,8 @@ CLIENT: httpx.AsyncClient | None = None
 
 async def startup() -> None:
     global CLIENT
+    if not UPSTREAM:
+        raise RuntimeError("PROXY_UPSTREAM must name the SlimServe backend URL")
     CLIENT = httpx.AsyncClient(
         timeout=httpx.Timeout(connect=10.0, read=None, write=None, pool=None),
         limits=httpx.Limits(
