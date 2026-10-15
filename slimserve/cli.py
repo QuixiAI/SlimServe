@@ -13,6 +13,7 @@ anything that is not in there, before a 244 GiB load discovers it the hard way.
 from __future__ import annotations
 
 import argparse
+import importlib
 import os
 import sys
 from dataclasses import replace
@@ -101,7 +102,11 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--engine-log",
-        help="write the engine's own log here instead of discarding it",
+        help=(
+            "write the engine's own log here instead of discarding it; when "
+            "serving, the server's stdout/stderr are redirected (not copied) "
+            "to this file, which is truncated on each start"
+        ),
     )
     parser.add_argument(
         "--torch-profile-dir",
@@ -113,6 +118,60 @@ def _parser() -> argparse.ArgumentParser:
         help="diagnostic: return per-token MoE expert IDs (adds memory and copies)",
     )
     return parser
+
+
+# Options that configure the vLLM engine (or its plan) and mean nothing to a
+# non-LLM engine. A video profile refuses them rather than ignoring them.
+_LLM_ONLY = (
+    ("model", "--model"),
+    ("spec", "--spec"),
+    ("no_spec", "--no-spec"),
+    ("ctx", "--ctx"),
+    ("thinking", "--thinking"),
+    ("engine_log", "--engine-log"),
+    ("torch_profile_dir", "--torch-profile-dir"),
+    ("enable_return_routed_experts", "--enable-return-routed-experts"),
+)
+
+
+def _engine_options(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+    extra: list[str],
+    profile_id: str,
+) -> argparse.Namespace:
+    """Check the options against the profile's engine family.
+
+    The main parser holds the options every profile shares plus the LLM ones.
+    A non-LLM engine parses what is left with its own parser; an LLM profile
+    has nothing left over, as before.
+    """
+    kind = registry.profile_kind(profile_id)
+    if kind == "llm":
+        if extra:
+            parser.error(f"unrecognized arguments: {' '.join(extra)}")
+        return args
+    used = [flag for dest, flag in _LLM_ONLY if getattr(args, dest)]
+    if used:
+        parser.error(
+            f"{profile_id} is a {kind} profile; {', '.join(used)} "
+            "configure the LLM engine and do not apply to it"
+        )
+    engine = importlib.import_module(registry.engine_module(kind))
+    own = engine.parser().parse_args(extra)
+    return argparse.Namespace(**{**vars(args), **vars(own)})
+
+
+def _engine_help(profile_id: str) -> bool:
+    """Print a non-LLM profile's own options; False for an LLM profile."""
+    try:
+        kind = registry.profile_kind(profile_id)
+    except ProfileError:
+        return False
+    if kind == "llm":
+        return False
+    importlib.import_module(registry.engine_module(kind)).parser().print_help()
+    return True
 
 
 def _help() -> None:
@@ -136,7 +195,11 @@ def _help() -> None:
         ("--download-only", "Fetch the weights and stop."),
         ("-y, --yes", "Do not ask before downloading."),
         ("--dry-run", "Print the resolved plan and stop."),
-        ("--engine-log FILE", "Keep the engine's own log instead of discarding it."),
+        (
+            "--engine-log FILE",
+            "Keep the engine's own log instead of discarding it. When serving,"
+            " output is redirected (not copied) here; truncated on each start.",
+        ),
         ("--torch-profile-dir DIR", "Capture a bounded engine profile trace."),
         (
             "--enable-return-routed-experts",
@@ -287,10 +350,14 @@ def _show(plan: Plan) -> None:
     print(f"  model     {plan.entry_file}")
     for key, value in sorted(plan.engine.items()):
         print(f"  {key:<9} {value}")
-    if plan.speculative:
-        spec = plan.source["speculator"]
+    if plan.speculative and plan.speculator:
+        # The record's own speculator when it overrides the source's (the
+        # Metal GLM record drafts from the GGUF's nextn block, not DFlash2).
+        spec = plan.speculator
         method = spec["engine"].get("method", "dspark")
         print(f"  spec      {method} k={spec['engine']['num_speculative_tokens']}")
+    for group in plan.optional:
+        print(f"  optional  {group}")
     for key, value in sorted(plan.env.items()):
         print(f"  env       {key}={value}")
     for note in plan.notes:
@@ -320,12 +387,17 @@ def _chat(plan: Plan, prompt: str | None, log_path: str | None) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
-    args = parser.parse_args(argv)
+    # Options left over belong to a non-LLM profile's own parser (video); they
+    # are checked against the profile once it is known.
+    args, extra = parser.parse_known_args(argv)
     if args.serve and args.prompt:
         parser.error("--prompt runs one conversation and cannot be combined with --serve")
+    if extra and not args.profile:
+        parser.error(f"unrecognized arguments: {' '.join(extra)}")
 
     if args.help:
-        _help()
+        if not (args.profile and _engine_help(args.profile)):
+            _help()
         return 0
 
     if args.cache:
@@ -348,7 +420,13 @@ def main(argv: list[str] | None = None) -> int:
         registry.describe(profile_id)
     except ProfileError as error:
         term.fail(str(error))
+        if extra:
+            term.fail(
+                f"unrecognized arguments: {' '.join(extra)} "
+                "(profile options go after the profile id)"
+            )
         return 2
+    args = _engine_options(parser, args, extra, profile_id)
 
     if not machine.known:
         term.die(
@@ -441,6 +519,11 @@ def main(argv: list[str] | None = None) -> int:
             },
         )
 
+    if not registry.is_language_model(plan.source):
+        # a non-LLM engine may add optional files (the LTX-2.5 prompt enhancer)
+        engine = importlib.import_module(registry.engine_module(plan.source["kind"]))
+        plan = engine.prepare(plan, args)
+
     if args.dry_run:
         _show(plan)
         return 0
@@ -476,12 +559,15 @@ def main(argv: list[str] | None = None) -> int:
         term.ok(f"ready: {plan.entry_file}")
         return 0
 
+    if not registry.is_language_model(plan.source):
+        return engine.run(plan, args)
+
     if args.chat or args.prompt:
         return _chat(plan, args.prompt, args.engine_log)
 
     from slimserve.server import exec_server
 
-    return exec_server(plan, args.host, args.port)
+    return exec_server(plan, args.host, args.port, args.engine_log)
 
 
 if __name__ == "__main__":
