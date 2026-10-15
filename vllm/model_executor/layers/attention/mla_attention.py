@@ -287,6 +287,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     get_kv_quant_mode,
 )
+from vllm.v1.worker.metal_phaseprof import phase as _qc_phase
 
 logger = init_logger(__name__)
 
@@ -821,6 +822,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
 
             # Convert from (B, N, P) to (N, B, P)
             mqa_q_nope = mqa_q_nope.transpose(0, 1)
+            if current_platform.is_metal():
+                # The Metal sparse backend attends fresh-prefill rows in the
+                # per-head (kv_b-decompressed) space; hand it the un-absorbed
+                # query (heads-first view, same token order as mqa_q).
+                self._metal_q_nope = mqa_q_nope
 
             if self.q_pad_num_heads is not None:
                 B, N, L = mqa_q_pe.shape
@@ -863,7 +869,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     mqa_ql_nope = mqa_q_nope.new_empty((N, B, L))
 
                 # Multiply (N, B, P) x (N, P, L) -> (N, B, L)
-                torch.bmm(mqa_q_nope, W_UK_T, out=mqa_ql_nope)
+                with _qc_phase("mla_absorb_bmm"):
+                    torch.bmm(mqa_q_nope, W_UK_T, out=mqa_ql_nope)
 
                 # Convert from (N, B, L) to (B, N, L)
                 mqa_ql_nope = mqa_ql_nope.transpose(0, 1)
@@ -894,7 +901,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             # call decode attn
             if not self.impl.is_sparse:
                 assert attn_metadata.decode is not None
-            attn_out, lse = self.impl.forward_mqa(mqa_q, kv_cache, attn_metadata, self)  # type: ignore[attr-defined]
+            with _qc_phase("mla_mqa"):
+                attn_out, lse = self.impl.forward_mqa(  # type: ignore[attr-defined]
+                    mqa_q, kv_cache, attn_metadata, self
+                )
 
             # correct dcp attn_out with lse.
             if self.impl.dcp_world_size > 1:
@@ -924,7 +934,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     attn_out = finalize_mla_pcp_decode(attn_out, self.num_heads)
 
             # v_up projection
-            self._v_up_proj(attn_out, out=mqa_output_slice)
+            with _qc_phase("mla_vup"):
+                self._v_up_proj(attn_out, out=mqa_output_slice)
 
         if quant_key is not None:
             quant_idx = num_mqa_tokens if mha_use_quant_output else num_actual_toks

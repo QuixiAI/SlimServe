@@ -69,12 +69,18 @@ def ggml_dequantize_into(
 
 
 def ggml_mul_mat_vec_a8(
-    W: torch.Tensor, X: torch.Tensor, quant_type: int, row: int
+    W: torch.Tensor,
+    X: torch.Tensor,
+    quant_type: int,
+    row: int,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if _is_metal():
         from vllm.quixicore import quixicore_ops
 
-        return quixicore_ops.ggml_mul_mat_vec_a8(W, X, quant_type, row)
+        return quixicore_ops.ggml_mul_mat_vec_a8(W, X, quant_type, row, out)
+    if out is not None:
+        raise NotImplementedError("ggml_mul_mat_vec_a8(out=) is Metal-only.")
     _load_stable_libtorch()
     return torch.ops._C.ggml_mul_mat_vec_a8(W, X, quant_type, row)
 
@@ -148,6 +154,20 @@ def ggml_mul_mat_sm(
     from vllm.quixicore import quixicore_ops
 
     return quixicore_ops.ggml_mul_mat_sm(W, X, quant_type, row)
+
+
+def ggml_mul_mat_mma(
+    W: torch.Tensor,
+    X: torch.Tensor,
+    quant_type: int,
+    row: int,
+    out: torch.Tensor | None = None,
+    variant: int = 0,
+) -> torch.Tensor:
+    """Metal-only small-M MMA GEMM, q8_0 x bf16 row-major (the 9..32 band)."""
+    from vllm.quixicore import quixicore_ops
+
+    return quixicore_ops.ggml_mul_mat_mma(W, X, quant_type, row, out, variant)
 
 
 def muse_u4_repack(
@@ -255,6 +275,7 @@ def ggml_moe_a8_vec_swiglu(
     row: int,
     tokens: int,
     clamp_limit: float | None = None,
+    group_nb: int = 0,
 ) -> torch.Tensor:
     """Metal-only: iq2_xxs MoE GEMV with the SwiGLU epilogue fused in
     (bit-exact vs ggml_moe_a8_vec + the qc_swiglu SILU form)."""
@@ -263,7 +284,7 @@ def ggml_moe_a8_vec_swiglu(
     from vllm.quixicore import quixicore_ops
 
     return quixicore_ops.ggml_moe_a8_vec_swiglu(
-        X, W, topk_ids, top_k, quant_type, row, tokens, clamp_limit
+        X, W, topk_ids, top_k, quant_type, row, tokens, clamp_limit, group_nb=group_nb
     )
 
 
@@ -278,16 +299,28 @@ def ggml_moe_a8_vec_sum(
     tokens: int,
     out: torch.Tensor,
     soa: bool = False,
+    accumulate: bool = False,
 ) -> torch.Tensor:
     """Metal-only: q2_K MoE down GEMV with the weighted expert-slot sum
     folded into the epilogue, writing (tokens, row) into `out` directly
-    (replaces down vec + reshape + moe_weighted_sum)."""
+    (replaces down vec + reshape + moe_weighted_sum). `accumulate` adds
+    into `out` (out = out + T(sum)) instead of overwriting it."""
     if not _is_metal():
         raise NotImplementedError("ggml_moe_a8_vec_sum is Metal-only.")
     from vllm.quixicore import quixicore_ops
 
     return quixicore_ops.ggml_moe_a8_vec_sum(
-        X, W, topk_ids, topk_weights, top_k, quant_type, row, tokens, out, soa
+        X,
+        W,
+        topk_ids,
+        topk_weights,
+        top_k,
+        quant_type,
+        row,
+        tokens,
+        out,
+        soa,
+        accumulate,
     )
 
 
