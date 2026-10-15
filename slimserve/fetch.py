@@ -196,6 +196,14 @@ def _download(entry: dict[str, Any], dest: Path) -> None:
         return
 
     headers = dict(entry.get("headers") or {})
+    if "Authorization" not in headers and entry["url"].startswith(
+        "https://huggingface.co/"
+    ):
+        # Registry manifests carry no headers of their own; a gated repo
+        # (LTX-2.5) answers 401 without the operator's token. Override
+        # entries already arrive with theirs.
+        if token := hf_token():
+            headers["Authorization"] = f"Bearer {token}"
     if have:
         headers["Range"] = f"bytes={have}-"
     with requests.get(
