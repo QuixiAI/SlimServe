@@ -490,6 +490,16 @@ class Glm47MoeModelToolParser(Glm47MoeParserToolAdapter):  # type: ignore[valid-
         self._glm53_custom_streaming_passthrough = True
         return False, None
 
+    def _in_native_tool_call(self) -> bool:
+        """Whether the state machine is already inside a native tool call."""
+        engine = getattr(self, "_parser_engine", None)
+        inner = getattr(engine, "_engine", None)
+        state = getattr(inner, "state", None)
+        tool_states = getattr(type(inner), "_TOOL_STATES", None)
+        if state is None or tool_states is None:
+            return False
+        return state in tool_states
+
     def extract_tool_calls_streaming(
         self,
         previous_text,
@@ -511,6 +521,16 @@ class Glm47MoeModelToolParser(Glm47MoeParserToolAdapter):  # type: ignore[valid-
             and bool(request.tools)
             and not any(isinstance(tool, CustomTool) for tool in request.tools)
             and json_candidate.lstrip().startswith("[")
+            # ...but only when the reply ITSELF is a JSON array, never when a
+            # native <tool_call> envelope is already open. An <arg_value>
+            # holding an array (sources=["memory"], chunk_ids=[...]) makes the
+            # text the parser sees start with "[" mid-call; this branch then
+            # latched into array mode and buffered the rest of the stream
+            # forever, so the value, the closing delimiters and every later
+            # call were dumped into message content with no tool_calls - ~10%
+            # of real agent turns, every captured case having an array
+            # argument (HexisPro, 2026-10-15).
+            and not self._in_native_tool_call()
         )
         if self._glm53_json_streaming or is_candidate:
             self._glm53_json_streaming = True

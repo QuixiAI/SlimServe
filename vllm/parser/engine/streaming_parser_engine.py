@@ -284,26 +284,7 @@ class StreamingParserEngine:
         events: list[SemanticEvent] = []
         strict = self._token_id_terminal_names if self._ever_had_token_ids else None
         for tok in tokens:
-            force_content = (
-                bool(strict)
-                and tok.terminal in strict
-                # Once token IDs are available, a terminal configured as a
-                # token ID is normally only structure when it ARRIVES as that
-                # token: a model discussing "<tool_call>" in prose must not
-                # open a call. That protection costs real calls once the
-                # machine is already inside one. GLM-5.3 sometimes spells a
-                # mid-call delimiter with ordinary tokens - most often right
-                # after an array-valued argument, where "]" shifts the
-                # distribution away from the special token - and forcing that
-                # spelling to content dropped the machine out of the call: the
-                # held-back argument value, the remaining delimiters and every
-                # later call all arrived as raw XML in the message text, with
-                # no tool_calls at all (HexisPro: ~10% of real agent turns,
-                # 2026-10-15). Inside a tool there is no prose to protect, so
-                # the textual spelling is structure there.
-                and self.state not in self._TOOL_STATES
-            )
-            if tok.terminal == CONTENT_TERMINAL or force_content:
+            if tok.terminal == CONTENT_TERMINAL or (strict and tok.terminal in strict):
                 events.extend(self._on_content(tok.value))
             else:
                 events.extend(self._on_terminal(tok.terminal, tok.value))
