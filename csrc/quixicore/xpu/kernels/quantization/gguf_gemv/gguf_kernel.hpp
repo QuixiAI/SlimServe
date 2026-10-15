@@ -1,0 +1,41 @@
+#pragma once
+
+#include <cstddef>
+
+#include <sycl/sycl.hpp>
+
+#include "quixicore/xpu/runtime.hpp"
+
+// ---- SlimServe GGUF path (gguf_routed.sycl.cpp) ----------------------------
+// ggml type ids: 8 = Q8_0, 10 = Q2_K, 16 = IQ2_XXS.
+namespace quixicore::xpu::kernels {
+
+bool gguf_routed_supports(int ggml_type);
+
+// y[r, :] = W[expert_ids ? expert_ids[r] : 0][:, :] . x[r / top_k, :]
+// W is [E, N, row_bytes] (E = 1 for a dense matrix), x [R / top_k, K], y [R, N].
+// Negative expert ids write zero rows. `iq2xxs_grid_dev` is the 256-entry
+// uint64 iq2xxs grid on the device (only read for IQ2_XXS).
+sycl::event gguf_routed_gemv_sycl(sycl::queue& q, const void* w, const void* x,
+                                  void* y, const std::int32_t* expert_ids,
+                                  std::size_t R, std::size_t N, std::size_t K,
+                                  std::size_t top_k, int ggml_type, DType act_dt,
+                                  const std::uint64_t* iq2xxs_grid_dev);
+
+// out[n, k] = decode(W[n, k]), out dtype out_dt.
+sycl::event gguf_dequantize_sycl(sycl::queue& q, const void* w, void* out,
+                                 std::size_t N, std::size_t K, int ggml_type,
+                                 DType out_dt, const std::uint64_t* iq2xxs_grid_dev);
+
+// Byte-neutral Q8_0 split layout: fp16 scales [N,K/32], followed by aligned
+// int8 quants [N,K] in one allocation.
+sycl::event q8_split_repack_sycl(sycl::queue& q, const void* raw, void* split,
+                                 std::size_t N, std::size_t K);
+sycl::event q8_split_gemv_sycl(sycl::queue& q, const void* split, const void* x,
+                               void* y, std::size_t R, std::size_t N,
+                               std::size_t K, DType act_dt);
+sycl::event q8_split_dequantize_sycl(sycl::queue& q, const void* split,
+                                     void* out, std::size_t N, std::size_t K,
+                                     DType out_dt);
+
+}  // namespace quixicore::xpu::kernels

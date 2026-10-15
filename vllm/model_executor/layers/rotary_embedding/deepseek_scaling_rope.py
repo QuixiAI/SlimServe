@@ -187,6 +187,9 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbeddingBase):
         key: torch.Tensor | None = None,
         offsets: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if not hasattr(torch.ops.vllm, "xpu_ops_deepseek_scaling_rope"):
+            # No vllm-xpu-kernels op: torch reference (this fork's XPU build).
+            return self.forward_native(positions, query, key, offsets)
         return torch.ops.vllm.xpu_ops_deepseek_scaling_rope(
             positions,
             query,

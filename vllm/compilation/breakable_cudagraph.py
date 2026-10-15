@@ -117,6 +117,85 @@ def eager_break_during_capture(fn: F) -> F:
     return wrapper  # type: ignore[return-value]
 
 
+def eager_break_during_capture_tensor_output(fn: F) -> F:
+    """Like :func:`eager_break_during_capture` for an op returning one tensor
+    (a collective): the capture-time output is the static buffer, replay copies
+    the fresh result into it. See ``add_eager_tensor_output``."""
+    if not is_breakable_cudagraph_enabled():
+        return fn
+
+    @functools.wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        capture = BreakableCUDAGraphCapture.current()
+        if capture is None or not capture._capturing:
+            return fn(*args, **kwargs)
+        weak_args = tuple(
+            weak_ref_tensor(a) if isinstance(a, torch.Tensor) else a for a in args
+        )
+        weak_kwargs = {
+            k: weak_ref_tensor(v) if isinstance(v, torch.Tensor) else v
+            for k, v in kwargs.items()
+        }
+        return capture.add_eager_tensor_output(lambda: fn(*weak_args, **weak_kwargs))
+
+    return wrapper  # type: ignore[return-value]
+
+
+_XPU_SYNC_BINDINGS_INSTALLED = False
+
+# XPU graph-segment replay ordering against the eager segments around it.
+#   sync  = current-stream wait before replay AND graph wait after (the
+#           conservative default the sibling XPU tree shipped)
+#   lead  = leading wait only; trail = trailing wait only; none = neither
+#           (pure in-order-queue ordering)
+# A variant is admissible only if greedy output stays byte-identical to `sync`
+# across batch shapes (perf notebook 2026-08-18: py-spy put 74% of worker host
+# time in the leading wait at c1).
+# Set through envs.VLLM_XPU_GRAPH_REPLAY_ORDER; read when a replayer is built.
+
+
+def _xpu_graph_replayer(graph: Any) -> Callable[[], None]:
+    """Replay closure for one XPU graph segment.
+
+    Two host-side facts from the Intel bring-up: (1) torch's device-wide
+    ``torch.xpu.synchronize`` walks transient SYCL queues and faults in
+    ``urQueueRelease``; every name Dynamo or vLLM might call for a sync is
+    rebound to a current-stream wait, lazily on first replay because rebinding
+    before oneCCL init deadlocks it, and each name gets its own
+    ``functools.partial`` (Dynamo asserts on duplicate handler objects).
+    (2) Replay is ordered against the eager oneCCL segments around it with a
+    current-stream wait before and a graph wait after by default (the sibling
+    tree measured this as the safe default). ``VLLM_XPU_GRAPH_REPLAY_ORDER``
+    selects lead / trail / none for A/B; it is read when the replayer is built.
+    """
+    import vllm._quixicore_C as qc
+
+    sync = qc.synchronize_current_stream
+    order = (envs.VLLM_XPU_GRAPH_REPLAY_ORDER or "sync").lower()
+    sync_lead = order in ("sync", "lead")
+    sync_trail = order in ("sync", "trail")
+
+    def replay() -> None:
+        global _XPU_SYNC_BINDINGS_INSTALLED
+        if not _XPU_SYNC_BINDINGS_INSTALLED:
+            torch.xpu.synchronize = functools.partial(sync)  # type: ignore[assignment]
+            torch.accelerator.synchronize = functools.partial(sync)  # type: ignore[assignment]
+            try:
+                from torch._dynamo.device_interface import XpuInterface
+
+                XpuInterface.synchronize = staticmethod(functools.partial(sync))  # type: ignore[assignment]
+            except Exception:  # pragma: no cover - dynamo layout drift
+                pass
+            _XPU_SYNC_BINDINGS_INSTALLED = True
+        if sync_lead:
+            sync()
+        graph.replay()
+        if sync_trail:
+            graph.synchronize()
+
+    return replay
+
+
 # ---------------------------------------------------------------------------
 # Capture context
 # ---------------------------------------------------------------------------
@@ -187,10 +266,35 @@ class BreakableCUDAGraphCapture:
             return
         assert self._current_graph is not None
         self._current_graph.capture_end()
-        self.segments.append(self._current_graph.replay)
+        graph = self._current_graph
+        if current_platform.is_xpu():
+            self.segments.append(_xpu_graph_replayer(graph))
+        else:
+            self.segments.append(graph.replay)
         self._num_graphs += 1
         self._current_graph = None
         self._capturing = False
+
+    def add_eager_tensor_output(self, fn: Callable[[], torch.Tensor]) -> torch.Tensor:
+        """Eager segment whose single tensor output must keep a stable address.
+
+        The capture-time result becomes the static tensor downstream graph
+        segments read; on replay the eager op may allocate a fresh result,
+        which is copied back into that static tensor before the next segment
+        launches. Used for collectives that cannot be captured (oneCCL on XPU).
+        """
+        self._end_segment()
+        output = fn()
+        if not isinstance(output, torch.Tensor):
+            raise TypeError("Tensor-output eager break must return one tensor")
+
+        def replay() -> None:
+            output.copy_(fn())
+
+        self.segments.append(replay)
+        self._num_eager_breaks += 1
+        self._begin_segment()
+        return output
 
     def add_eager(self, fn: Callable[[], Any]) -> Any:
         """End the current capture segment, run ``fn`` eagerly on the
@@ -373,7 +477,9 @@ class BreakableCUDAGraphWrapper:
         # and repeated gc would tank capture time the way it did for the
         # pre-`gc_disable` piecewise path.
         gc.collect()
-        torch.accelerator.empty_cache()
+        if not current_platform.is_xpu():
+            # XPU: a device-wide cache purge walks transient SYCL queues.
+            torch.accelerator.empty_cache()
         # Sync the offloader's copy stream before capture so any in-flight
         # pre-capture prefetches are complete and don't leak into the graph.
         get_offloader().sync_prev_onload()

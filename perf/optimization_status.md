@@ -31395,3 +31395,26 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   canaries pass, gates -2.441 / -2.457, plain 228.8 / 778.3 / 1119.8 and
   228.7 / 771.9 / 1116.2, spec eight-pass medians 301.7 / 805.3 / 1125.3,
   0.975 per draft.
+
+## 2026-10-14 - Intel Arc Pro B70 (XPU) port forward-ported onto main
+
+- Status: retained for review (draft PR); unvalidated on B70 hardware.
+- Baseline: none on this tree. The B70 numbers recorded in PR #21's branch
+  (Qwen3.8-27B-NVFP4 TP4 c1 59.0 / c8 260.5 / c32 548.5 tok/s, 2026-09-01)
+  were measured on pre-rewrite history with the full QuixiCore-XPU tree and
+  do not transfer to this code.
+- Change: the XPU build (cmake/xpu.cmake), a serving-path subset of the
+  QuixiCore-XPU kernels (rms_norm, GGUF routed GEMV/dequant), the XPU
+  platform/worker/runner, shared-layer guards, GGUF and NVFP4 W4A16 routing,
+  the DeepSeek-V4 Triton sparse-MLA boundary, Rob's Qwen3.8 bring-up fixes,
+  and PRs #62/#63/#81 with their review fixes (split Q8 opt-in; shutdown
+  cancels reads on expected exits and quiesces only on XPU; only
+  UR_LAYER_TRACING stripped, before the first torch.xpu call).
+- Correctness: CPU only, on a CUDA host: tests/slimserve, the split-Q8,
+  shutdown-coordination, XPU worker lifecycle and UR-tracing tests; import
+  smoke with the platform still resolving CUDA. No SYCL compile, no B70 run.
+- Results: no throughput measured; nothing claimed.
+- Decision: hold as a draft until a B70 host builds it (icpx), serves the
+  registered Qwen3.8 B70 profiles (PRs #65-#68) with text and image
+  requests, and records exact-harness TPS against the #21 numbers above.
+- Raw artifacts: none (no hardware run).

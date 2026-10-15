@@ -280,6 +280,16 @@ class cmake_build_ext(build_ext):
             cmake_args += [f"-DCMAKE_CUDA_COMPILER={CUDA_HOME}/bin/nvcc"]
         elif _is_hip() and ROCM_HOME is not None:
             cmake_args += [f"-DROCM_PATH={ROCM_HOME}"]
+        elif _is_xpu():
+            # The vendored QuixiCore-XPU SYCL kernels need the oneAPI DPC++
+            # driver as the project C++ compiler (cmake/xpu.cmake).
+            icpx = shutil.which("icpx")
+            if icpx is None:
+                raise RuntimeError(
+                    "VLLM_TARGET_DEVICE=xpu requires icpx on PATH: "
+                    "source /opt/intel/oneapi/setvars.sh"
+                )
+            cmake_args += [f"-DCMAKE_CXX_COMPILER={icpx}"]
 
         other_cmake_args = os.environ.get("CMAKE_ARGS")
         if other_cmake_args:
@@ -353,6 +363,14 @@ class cmake_build_ext(build_ext):
             # pybind module, but editable builds can omit non-extension files
             # from the same component.  Metal needs its precompiled shaders
             # beside `_quixicore_C`, so copy that build artifact explicitly.
+            # XPU keeps its SYCL kernels in a shared library beside the
+            # binding (a static archive would not self-register its device
+            # images); copy it the same way.
+            if _is_xpu() and ext.name == "vllm._quixicore_C":
+                ops_lib = Path(self.build_temp) / "libquixicore_xpu_ops.so"
+                if not ops_lib.is_file():
+                    raise RuntimeError(f"XPU op library was not built: {ops_lib}")
+                self.copy_file(str(ops_lib), str(outdir / ops_lib.name))
             if _is_metal() and ext.name == "vllm._quixicore_C":
                 metallib = Path(self.build_temp) / "quixicore_metal.metallib"
                 if not metallib.is_file():
@@ -1022,7 +1040,7 @@ def get_requirements() -> list[str]:
                 resolved_requirements.append(line)
         return resolved_requirements
 
-    # This fork builds for ROCm, CUDA and Apple Metal; the other device
+    # This fork builds for ROCm, CUDA, Apple Metal and Intel XPU; the other device
     # requirement files are gone along with their platform support.
     if _no_device():
         requirements = _read_requirements("common.txt")
@@ -1032,9 +1050,11 @@ def get_requirements() -> list[str]:
         requirements = _read_requirements("cuda.txt")
     elif _is_metal():
         requirements = _read_requirements("metal.txt")
+    elif _is_xpu():
+        requirements = _read_requirements("xpu.txt")
     else:
         raise ValueError(
-            "Unsupported platform: this build targets ROCm, CUDA or Metal."
+            "Unsupported platform: this build targets ROCm, CUDA, Metal or XPU."
         )
     return requirements
 
@@ -1054,9 +1074,9 @@ if sys.version_info >= (3, 11):
 if _is_hip():
     ext_modules.append(CMakeExtension(name="vllm._rocm_C"))
 
-if _is_cuda() or _is_hip() or _is_metal():
+if _is_cuda() or _is_hip() or _is_metal() or _is_xpu():
     # pybind11 module (not stable-ABI): must keep the full SOABI filename.
-    # All three targets build it; each carries its own subset of the ops.
+    # All four targets build it; each carries its own subset of the ops.
     ext_modules.append(CMakeExtension(name="vllm._quixicore_C", py_limited_api=False))
 
 if _is_cuda():

@@ -113,7 +113,11 @@ class TopKTopPSampler(nn.Module):
             else:
                 self.forward = self.forward_cpu
         elif current_platform.is_xpu():
-            if envs.VLLM_XPU_USE_SAMPLER_KERNEL:
+            # The vllm-xpu-kernels sampler op is used only when that package
+            # registered it; this fork's XPU build samples with the native path.
+            if envs.VLLM_XPU_USE_SAMPLER_KERNEL and hasattr(
+                torch.ops.vllm, "xpu_topk_topp_sampler"
+            ):
                 self.forward = self.forward_xpu
             else:
                 self.forward = self.forward_native

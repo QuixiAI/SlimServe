@@ -309,7 +309,16 @@ if TYPE_CHECKING:
     VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: bool = True
     VLLM_NIXL_EP_MAX_NUM_RANKS: int = 32
     VLLM_XPU_ENABLE_XPU_GRAPH: bool = False
+    VLLM_XPU_GRAPH_REPLAY_ORDER: Literal["sync", "lead", "trail", "none"] = "sync"
+    VLLM_XPU_GGUF_Q8_SPLIT: bool = False
+    VLLM_XPU_PER_WORKER_AFFINITY: bool = True
+    VLLM_XPU_KEEP_UR_TRACING: bool = False
     VLLM_XPU_USE_SAMPLER_KERNEL: bool = True
+    VLLM_NVFP4_LINEAR_PREFILL_DPAS: bool = False
+    VLLM_NVFP4_DPAS_ROWS_CACHE: bool = False
+    VLLM_NVFP4_DPAS_ROWS_FULL: bool = False
+    VLLM_NVFP4_LINEAR_DPAS_BF16_SCALE: bool = False
+    VLLM_XPU_GEMMA_NORM_FUSED: bool = False
     VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
     VLLM_NIC_SELECTION_VARS: str = ""
@@ -2079,13 +2088,65 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_NIXL_EP_MAX_NUM_RANKS": lambda: int(
         os.getenv("VLLM_NIXL_EP_MAX_NUM_RANKS", "32")
     ),
+    # Spawn each XPU TP worker with a single-device ZE_AFFINITY_MASK so its
+    # Level Zero context is single-device (VRAM is otherwise mirrored in host
+    # RAM through dma-buf sharing; see vllm/platforms/xpu_affinity.py).
+    "VLLM_XPU_PER_WORKER_AFFINITY": lambda: bool(
+        int(os.getenv("VLLM_XPU_PER_WORKER_AFFINITY", "1"))
+    ),
+    # Keep the Unified Runtime / XPTI tracing layer that XPU workers otherwise
+    # strip from their environment (vllm/platforms/xpu_env.py). Debug only.
+    "VLLM_XPU_KEEP_UR_TRACING": lambda: bool(
+        int(os.getenv("VLLM_XPU_KEEP_UR_TRACING", "0"))
+    ),
     # Whether enable XPU graph on Intel GPU
     "VLLM_XPU_ENABLE_XPU_GRAPH": lambda: bool(
         int(os.getenv("VLLM_XPU_ENABLE_XPU_GRAPH", "0"))
     ),
+    # XPU graph-segment replay ordering against the surrounding eager
+    # segments (vllm/compilation/breakable_cudagraph.py): sync = current-stream
+    # wait before replay and graph wait after (default); lead / trail = only
+    # the leading / trailing wait; none = neither (in-order queue only).
+    "VLLM_XPU_GRAPH_REPLAY_ORDER": env_with_choices(
+        "VLLM_XPU_GRAPH_REPLAY_ORDER",
+        "sync",
+        ["sync", "lead", "trail", "none"],
+        case_sensitive=False,
+    ),
+    # Opt-in split-plane GGUF Q8_0 layout and its SYCL kernels on XPU (also
+    # gates the raw-Q8_0 weight-stationary GEMV in the XPU binding).
+    "VLLM_XPU_GGUF_Q8_SPLIT": lambda: (
+        os.getenv("VLLM_XPU_GGUF_Q8_SPLIT", "0").lower() in ("1", "true", "on", "yes")
+    ),
     # whether use xpu specific sample kernel
     "VLLM_XPU_USE_SAMPLER_KERNEL": lambda: bool(
         int(os.getenv("VLLM_XPU_USE_SAMPLER_KERNEL", "1"))
+    ),
+    # XPU NVFP4 W4A16 linears (vllm/model_executor/kernels/linear/nvfp4/xpu.py):
+    # route prefill (M > VLLM_NVFP4_LINEAR_NATIVE_M_MAX) through the
+    # vllm-xpu-kernels DPAS grouped GEMM as a single-group GEMM instead of
+    # dequant -> oneDNN emulation. Off by default (emulation unchanged).
+    "VLLM_NVFP4_LINEAR_PREFILL_DPAS": lambda: bool(
+        int(os.getenv("VLLM_NVFP4_LINEAR_PREFILL_DPAS", "0"))
+    ),
+    # The DPAS prefill builds a 1-element int32 rows_per_expert tensor per
+    # call; on XPU torch.tensor([m], device=dev) is a blocking 4-byte H2D.
+    # ROWS_CACHE memoizes it per (m, device); ROWS_FULL builds it on device.
+    "VLLM_NVFP4_DPAS_ROWS_CACHE": lambda: bool(
+        int(os.getenv("VLLM_NVFP4_DPAS_ROWS_CACHE", "0"))
+    ),
+    "VLLM_NVFP4_DPAS_ROWS_FULL": lambda: bool(
+        int(os.getenv("VLLM_NVFP4_DPAS_ROWS_FULL", "0"))
+    ),
+    # Fold the per-tensor NVFP4 global scale onto the DPAS output in bf16
+    # instead of an fp32 round trip. Off by default.
+    "VLLM_NVFP4_LINEAR_DPAS_BF16_SCALE": lambda: bool(
+        int(os.getenv("VLLM_NVFP4_LINEAR_DPAS_BF16_SCALE", "0"))
+    ),
+    # GemmaRMSNorm.forward_xpu: cache (1 + w) in the activation dtype so the
+    # fused rms_norm / fused_add_rms_norm kernels are selected. Off by default.
+    "VLLM_XPU_GEMMA_NORM_FUSED": lambda: bool(
+        int(os.getenv("VLLM_XPU_GEMMA_NORM_FUSED", "0"))
     ),
     # Enable simple KV offload.
     "VLLM_USE_SIMPLE_KV_OFFLOAD": lambda: bool(

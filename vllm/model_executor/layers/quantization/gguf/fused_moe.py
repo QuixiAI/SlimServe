@@ -35,6 +35,15 @@ from .params import (
 from .utils import MMVQ_QUANT_TYPES, MOE_MMQ_QUANT_TYPES, logger
 
 
+def _ampere_native_platform() -> bool:
+    """The fused DSV4 MoE kernels (dsv4_moe_ampere.cuh & co.) are CUDA-only.
+
+    ROCm, Metal and XPU take the generic vec/MMQ route below with their own
+    kernels behind the ops.
+    """
+    return current_platform.is_cuda()
+
+
 def _moe_vec_row_limit(default: int, env: str, cuda_default: int = 64) -> int:
     override = os.environ.get(env)
     if override:
@@ -286,11 +295,12 @@ def _fused_moe_gguf(
         qweight_type in MOE_MMQ_QUANT_TYPES and qweight_type2 in MOE_MMQ_QUANT_TYPES
     )
     vec_ok = qweight_type in MMVQ_QUANT_TYPES and qweight_type2 in MMVQ_QUANT_TYPES
-    if current_platform.is_metal():
+    if current_platform.is_metal() or current_platform.is_xpu():
         # Metal's grouped path reads the selected raw GGUF expert blocks with
         # one device-resident GEMV dispatch. It is vector-only for now, but it
         # avoids the per-route host synchronization that made startup and
-        # decode unusable.
+        # decode unusable. XPU (QuixiCore-XPU SYCL) is at the same stage: a
+        # routed GGUF GEMV, no grouped tile GEMM yet.
         mmq_ok = False
     if mmq_ok or vec_ok:
         num_tokens, _ = x.shape
@@ -309,8 +319,7 @@ def _fused_moe_gguf(
             and activation_enum == MoEActivation.SILU
             and activation_situ_beta is None
             and activation_situ_linear_beta is None
-            and not current_platform.is_rocm()
-            and not current_platform.is_metal()
+            and _ampere_native_platform()
             and not defer_down
             and _use_dsv4_ampere_q4k()
             and num_tokens <= _dsv4_q4k_row_limit()
@@ -340,8 +349,7 @@ def _fused_moe_gguf(
             and activation_enum == MoEActivation.SILU
             and activation_situ_beta is None
             and activation_situ_linear_beta is None
-            and not current_platform.is_rocm()
-            and not current_platform.is_metal()
+            and _ampere_native_platform()
             and _use_dsv4_ampere_mxfp4()
             and num_tokens <= _dsv4_mxfp4_row_limit()
             and top_k in (6, 8)
@@ -373,8 +381,7 @@ def _fused_moe_gguf(
             and activation_enum == MoEActivation.SILU
             and activation_situ_beta is None
             and activation_situ_linear_beta is None
-            and not current_platform.is_rocm()
-            and not current_platform.is_metal()
+            and _ampere_native_platform()
             and _use_dsv4_mxfp4_seg()
             and x.shape[1] % 256 == 0
             and (N // 2) % 256 == 0
@@ -438,8 +445,7 @@ def _fused_moe_gguf(
             and activation_enum == MoEActivation.SILU
             and activation_situ_beta is None
             and activation_situ_linear_beta is None
-            and not current_platform.is_rocm()
-            and not current_platform.is_metal()
+            and _ampere_native_platform()
             and _use_dsv4_ampere_fused()
         )
         if dsv4_fused_native:
@@ -838,6 +844,9 @@ def _fused_moe_gguf(
             if not _metal_weighted_sum(out, topk_weights, out_hidden_states):
                 reduced = (out.float() * topk_weights.unsqueeze(-1)).sum(dim=1)
                 out_hidden_states.copy_(reduced.to(out_hidden_states.dtype))
+        elif current_platform.is_xpu():
+            reduced = (out.float() * topk_weights.unsqueeze(-1)).sum(dim=1)
+            out_hidden_states.copy_(reduced.to(out_hidden_states.dtype))
         elif _use_quixi_weighted_sum(out, topk_weights, out_hidden_states):
             from vllm.quixicore import quixicore_ops
 
@@ -856,7 +865,7 @@ def _fused_moe_gguf(
             "Falling back to slow implementation. "
         )
         local_topk_ids = expert_map[topk_ids] if expert_map is not None else topk_ids
-        if current_platform.is_metal():
+        if current_platform.is_metal() or current_platform.is_xpu():
             # Iterating MPS scalar tensors performs a device/host sync for each
             # `ii < 0` test and again when the tensor is used as a Python
             # index.  DSV4 has six routes in 43 layers, making those tiny
@@ -1063,7 +1072,7 @@ class GGUFMoEMethod(FusedMoEMethodBase):
                 torch.mps.synchronize()
                 torch.mps.empty_cache()
             return
-        if current_platform.is_rocm():
+        if current_platform.is_rocm() or current_platform.is_xpu():
             return
         # NOTE: MXFP4 experts stay in the raw AoS layout for now. The fused
         # MXFP4 path only covers decode widths (tokens <= 8); prefill still
