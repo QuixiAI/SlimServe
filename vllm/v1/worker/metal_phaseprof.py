@@ -160,6 +160,52 @@ _INTERESTING = {
     "aten.to.device",
     "aten.to.dtype",
     "aten.to.dtype_layout",
+    # GLM-5.3-Flash decode glue (2026-09-11): every non-view op costs ~20 us
+    # on Metal, so attribute the arithmetic/gather glue to its call sites.
+    "aten.add.Tensor",
+    "aten.sub.Tensor",
+    "aten.mul.Tensor",
+    "aten.div.Tensor",
+    "aten.bmm.out",
+    "aten.bmm.default",
+    "aten.index_select.default",
+    "aten.index.Tensor",
+    "aten.layer_norm.default",
+    "aten.softmax.int",
+    "aten._softmax.default",
+    "aten.topk.default",
+    "aten.sigmoid.default",
+    "aten.exp.default",
+    "aten.sum.dim_IntList",
+    "aten.where.self",
+    "aten.gather.default",
+    "aten.masked_fill.Scalar",
+    "aten.clamp_min.default",
+    "aten.zero_.default",
+    "aten.fill_.Scalar",
+    "aten.arange.default",
+    "aten.einsum.default",
+    "aten.rsqrt.default",
+    "aten.pow.Tensor_Scalar",
+    "aten.mean.dim",
+    "aten.silu.default",
+    "aten.contiguous.default",
+    "aten.clone.default",
+    "aten.remainder.Scalar",
+    "aten.floor_divide.default",
+    "aten.div.Tensor_mode",
+    "aten.scatter_.src",
+    "aten.scatter_.value",
+    "aten.gt.Scalar",
+    "aten.ge.Scalar",
+    "aten.lt.Scalar",
+    "aten.repeat_interleave.Tensor",
+    "aten.zeros_like.default",
+    "aten.zeros.default",
+    "aten.full.default",
+    "aten.new_empty.default",
+    "aten.empty.memory_format",
+    "aten.empty_like.default",
 }
 _op_stacks: dict[str, int] = defaultdict(int)
 _op_stack_time: dict[str, float] = defaultdict(float)
@@ -193,7 +239,7 @@ def _census_mode():
                 out = func(*args, **(kwargs or {}))
                 dt = time.perf_counter() - t0
                 sk = _stack_key(key)
-                if sk in _op_stacks or len(_op_stacks) < 400:
+                if sk in _op_stacks or len(_op_stacks) < 1200:
                     _op_stacks[sk] += 1
                     _op_stack_time[sk] += dt
                 _op_counts[key] += 1
