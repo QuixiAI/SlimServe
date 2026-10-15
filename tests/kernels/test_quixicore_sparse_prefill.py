@@ -9,6 +9,20 @@ import pytest
 import torch
 
 qc = pytest.importorskip("vllm._quixicore_C")
+_NEED = getattr(qc, "mla_sparse_prefill_fp8_smem_bytes", lambda: 0)()
+_HAVE = (
+    torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).shared_memory_per_block_optin
+    if torch.cuda.is_available()
+    else 0
+)
+if _NEED and _HAVE and _HAVE < _NEED:
+    pytest.skip(
+        f"the fp8 sparse prefill kernel needs {_NEED} B of shared memory per "
+        f"block; this device opts in to {_HAVE} (the serving path skips it too)",
+        allow_module_level=True,
+    )
 from tests.kernels.test_quixicore_sparse_mla_bf16 import (  # noqa: E402
     BS,
     DEV,
