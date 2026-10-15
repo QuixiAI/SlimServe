@@ -335,6 +335,13 @@ class StructuredOutputManager:
 
                 state_advancements = 0
                 post_reasoning_end_in_window = False
+                # Drafts in this window were proposed before a reasoning-end
+                # marker made the grammar active. Once one of those drafts is
+                # invalid, every later draft row is unreachable: speculative
+                # verification stops at the first rejection and samples a
+                # replacement there. Do not advance the simulated matcher
+                # along an impossible suffix.
+                draft_path_valid = True
                 req_tokens = scheduled_spec_decode_tokens.get(req_id, ())
                 for i, token in enumerate(req_tokens):
                     self._fill_bitmasks(((grammar, cumulative_index, apply_bitmask),))
@@ -363,14 +370,26 @@ class StructuredOutputManager:
                             apply_bitmask = True
                             advance_grammar = False
                             post_reasoning_end_in_window = True
-                    if advance_grammar and not grammar.is_terminated():
-                        accepted = grammar.accept_tokens(req_id, [token])
-                        if accepted:
+                    if (
+                        advance_grammar
+                        and draft_path_valid
+                        and not grammar.is_terminated()
+                    ):
+                        if (
+                            post_reasoning_end_in_window
+                            and not grammar.validate_tokens([token])
+                        ):
+                            # Rejection is expected here because these drafts
+                            # were made while reasoning was still unconstrained.
+                            # validate_tokens is non-mutating and silent.
+                            draft_path_valid = False
+                        else:
+                            accepted = grammar.accept_tokens(req_id, [token])
+                            if not accepted:
+                                raise AssertionError(
+                                    (token, req_id, scheduled_spec_decode_tokens)
+                                )
                             state_advancements += 1
-                        elif not post_reasoning_end_in_window:
-                            raise AssertionError(
-                                (token, req_id, scheduled_spec_decode_tokens)
-                            )
                     cumulative_index += 1
                 # Diffusion LLMs don't sample a bonus token after the
                 # scheduled positions, so skip its bitmask in that case.
