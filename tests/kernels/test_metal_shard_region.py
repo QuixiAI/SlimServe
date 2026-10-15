@@ -2,7 +2,8 @@
 """The hetero-quant shard GEMVs may share a concurrent region only when every
 shard writes its column slice in place: a ring copy inside the region is a
 TORCH_CHECK. The Python gate must mirror the native strided-output rule
-(q8_0 NR batch kernel at M 2..4, q4_K NR chunks at M <= 8, batch 1 always);
+(q8_0 NR batch kernel at M 2..8, 5..8 as {4, 3, 2}-row launches; q4_K NR
+chunks at M <= 8; batch 1 always);
 the subprocess check runs the native op inside a region for M = 1..8."""
 
 import os
@@ -29,7 +30,7 @@ def test_gate_mirrors_the_native_strided_rule(monkeypatch):
     shards = [_shard(16384, WT.Q4_K), _shard(8448, WT.Q8_0)]
     for batch in range(1, 9):
         x = torch.empty(batch, K, dtype=torch.bfloat16)
-        assert gl._metal_shard_region_ok(x, shards) is (batch <= 4), batch
+        assert gl._metal_shard_region_ok(x, shards) is (batch <= 8), batch
     # q4_K alone rides its 2/4/8-row chunks at any M <= 8
     for batch in range(1, 9):
         x = torch.empty(batch, K, dtype=torch.bfloat16)

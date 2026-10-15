@@ -68,7 +68,7 @@ def test_metal_route_is_quixicore_not_sm80_simt():
 
     if current_platform.is_cuda():
         pytest.skip("CUDA box: the SM80 SIMT route is expected there")
-    assert ops._USE_SM80_SIMT is False
+    assert ops._USE_SPLIT_SIMT is False
 
 
 @needs_metal_mhc
