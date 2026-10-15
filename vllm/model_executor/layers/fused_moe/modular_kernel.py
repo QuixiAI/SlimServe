@@ -1,3 +1,5 @@
+import functools
+import os
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from abc import ABC, abstractmethod
@@ -1093,6 +1095,21 @@ class FusedMoEExpertsMonolithic(FusedMoEExperts):
 
 
 @final
+@functools.cache
+def _cuda_output_alias_enabled() -> bool:
+    # QC_MOE_OUTPUT_ALIAS=0 restores finalize's copy on CUDA (A/B switch).
+    return os.environ.get("QC_MOE_OUTPUT_ALIAS", "1") != "0"
+
+
+def _noop_reduce_cls():
+    # topk_weight_and_reduce imports this module: resolve the class lazily.
+    from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
+        TopKWeightAndReduceNoOP,
+    )
+
+    return TopKWeightAndReduceNoOP
+
+
 class FusedMoEKernelModularImpl:
     def __init__(
         self,
@@ -1323,18 +1340,26 @@ class FusedMoEKernelModularImpl:
         # to skip the redundant copy in TopKWeightAndReduceNoOP.apply downstream.
         # This eliminates ~94% of __amd_rocclr_copyBuffer events (Copy 2 of the
         # double-copy MoE write-back path).
+        alias_ok = (
+            output_alias is not None
+            and output_alias.shape == fused_out.shape
+            and output_alias.dtype == fused_out.dtype
+            and output_alias.device == fused_out.device
+            and output_alias.is_contiguous()
+        )
         if current_platform.is_rocm():
             from vllm._aiter_ops import rocm_aiter_ops
 
-            if (
-                rocm_aiter_ops.is_fused_moe_enabled()
-                and output_alias is not None
-                and output_alias.shape == fused_out.shape
-                and output_alias.dtype == fused_out.dtype
-                and output_alias.device == fused_out.device
-                and output_alias.is_contiguous()
-            ):
+            if rocm_aiter_ops.is_fused_moe_enabled() and alias_ok:
                 fused_out = output_alias
+        elif alias_ok and _cuda_output_alias_enabled() and isinstance(
+            self.fused_experts.finalize_weight_and_reduce_impl(), _noop_reduce_cls()
+        ):
+            # CUDA: an experts implementation that reduces on its own (Marlin's
+            # moe_sum, the NVFP4 decode pair) writes the op's output directly;
+            # finalize's copy is then a self-copy it skips (one memcpy per MoE
+            # layer per step in the 2026-09-18 c1 trace).
+            fused_out = output_alias
 
         self.fused_experts.apply(
             output=fused_out,
