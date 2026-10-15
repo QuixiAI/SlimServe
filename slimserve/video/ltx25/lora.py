@@ -14,7 +14,9 @@ User LoRAs (upstream --lora PATH [STRENGTH]) load the same way from a path.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator
+import os
+from collections import OrderedDict
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -113,3 +115,46 @@ def attached(dit: LTX25DiT, adapters: Iterable[tuple[Lora, float]]) -> Iterator[
     finally:
         for lora in reversed(done):
             lora.detach(dit)
+
+
+# Loaded user adapters kept between requests. A user LoRA can be several GiB
+# and every distinct path a client names would otherwise stay resident for
+# the life of the server; SLIMSERVE_VIDEO_LORA_CACHE overrides the bound.
+DEFAULT_USER_LORA_CACHE = 4
+
+
+class LoraCache:
+    """User adapters by resolved path, bounded, least recently used out first.
+
+    Evicting drops the cache's reference, which releases the adapter's arrays
+    as soon as no running request holds it: an adapter evicted while attached
+    stays alive (and detachable) until that request detaches it. 0 entries
+    disables reuse: every request loads its adapters afresh."""
+
+    def __init__(self, max_entries: int | None = None):
+        if max_entries is None:
+            env = os.environ.get("SLIMSERVE_VIDEO_LORA_CACHE")
+            max_entries = int(env) if env else DEFAULT_USER_LORA_CACHE
+        if max_entries < 0:
+            raise ValueError("the user LoRA cache size must be >= 0")
+        self.max_entries = max_entries
+        self._entries: OrderedDict[str, Lora] = OrderedDict()
+
+    def get(
+        self, path: str | Path, loader: Callable[[str], Lora] | None = None
+    ) -> Lora:
+        key = str(Path(path).expanduser().resolve())
+        lora = self._entries.pop(key, None)
+        if lora is None:
+            lora = (loader or (lambda k: Lora.from_path(k).load()))(key)
+        if self.max_entries:
+            self._entries[key] = lora  # most recently used last
+            while len(self._entries) > self.max_entries:
+                self._entries.popitem(last=False)
+        return lora
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def __contains__(self, path: object) -> bool:
+        return str(Path(str(path)).expanduser().resolve()) in self._entries

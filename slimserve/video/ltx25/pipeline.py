@@ -13,7 +13,6 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any
 
 import mlx.core as mx
 import numpy as np
@@ -514,6 +513,7 @@ class LTX25Engine:
         variant: str = "distilled",
         bf16_noise: bool = False,
         decoder: str = "diffusion",
+        user_lora_cache: int | None = None,
     ):
         self.root = root or checkpoints.model_root()
         # Metal memory is wired: it cannot be compressed or swapped, and MLX's
@@ -535,7 +535,8 @@ class LTX25Engine:
         self.enhancer = None
         self.temporal_upscaler = None
         self.decoder = decoder
-        self.user_lora_cache: dict[str, Any] = {}  # path -> loaded Lora
+        # path -> loaded Lora, LRU-bounded (SLIMSERVE_VIDEO_LORA_CACHE)
+        self.user_lora_cache = lora_mod.LoraCache(user_lora_cache)
 
     # ---- user LoRAs (upstream --lora PATH [STRENGTH]) ------------------------
     @contextmanager
@@ -547,16 +548,12 @@ class LTX25Engine:
         if not specs:
             yield
             return
-        from slimserve.video.ltx25.lora import Lora
 
         dit = self.load_dit()
         attached = []
         try:
             for path, strength in specs:
-                key = str(Path(path).expanduser().resolve())
-                lora = self.user_lora_cache.get(key)
-                if lora is None:
-                    lora = self.user_lora_cache[key] = Lora.from_path(key).load()
+                lora = self.user_lora_cache.get(path)
                 lora.attach(dit, strength)
                 attached.append(lora)
             yield
@@ -2500,7 +2497,6 @@ class LTX25Engine:
         full-resolution stage needs `stage_2_ic_lora`. Stills condition as
         on `distilled`."""
         from slimserve.video.ltx25 import media
-        from slimserve.video.ltx25.lora import Lora
 
         if self.variant != "distilled":
             raise ValueError("the IC-LoRA pipeline runs on the distilled transformer")
@@ -2516,10 +2512,7 @@ class LTX25Engine:
         adapters = []
         downscale, temporal_scale = 1, 1
         for path, strength in loras:
-            key = str(Path(path).expanduser().resolve())
-            lora = self.user_lora_cache.get(key)
-            if lora is None:
-                lora = self.user_lora_cache[key] = Lora.from_path(key).load()
+            lora = self.user_lora_cache.get(path)
             for name, have, got in (
                 ("reference_downscale_factor", downscale, lora.reference_downscale),
                 (
@@ -2848,17 +2841,13 @@ class LTX25Engine:
         reference's voice and scene) and the picture re-rendered to it, lips
         included; the stage-1 audio ships."""
         from slimserve.video.ltx25 import media
-        from slimserve.video.ltx25.lora import Lora
 
         if self.variant != "distilled":
             raise ValueError("Dub-It runs on the distilled transformer")
         if len(loras) != 1:
             raise ValueError("Dub-It takes exactly one adapter (the Dub-It IC-LoRA)")
         fast = fast or Fast()
-        key = str(Path(loras[0][0]).expanduser().resolve())
-        lora = self.user_lora_cache.get(key)
-        if lora is None:
-            lora = self.user_lora_cache[key] = Lora.from_path(key).load()
+        lora = self.user_lora_cache.get(loras[0][0])
         lora_strength = loras[0][1]
         downscale = lora.reference_downscale
         info = media.probe(reference_video, fps_hint)
@@ -3599,7 +3588,6 @@ class LTX25Engine:
         rescale 0.7; the negative prompt "worst quality, ..."), no audio
         modality at all; the matte ships as a silent clip."""
         from slimserve.video.ltx25 import media
-        from slimserve.video.ltx25.lora import Lora
 
         if self.variant != "dev":
             raise ValueError("alpha-gen runs on the dev transformer")
@@ -3620,10 +3608,7 @@ class LTX25Engine:
         adapters = []
         downscale = temporal_scale = 1
         for path, strength in loras:
-            key = str(Path(path).expanduser().resolve())
-            lora = self.user_lora_cache.get(key)
-            if lora is None:
-                lora = self.user_lora_cache[key] = Lora.from_path(key).load()
+            lora = self.user_lora_cache.get(path)
             for have, got in (
                 (downscale, lora.reference_downscale),
                 (temporal_scale, lora.reference_temporal_scale),
@@ -3761,7 +3746,6 @@ class LTX25Engine:
         from slimserve.video.ltx25 import hdr as hdr_mod
         from slimserve.video.ltx25 import image as image_mod
         from slimserve.video.ltx25 import media
-        from slimserve.video.ltx25.lora import Lora
         from slimserve.video.ltx25.vae import Tiling
 
         if self.variant != "distilled":
@@ -3777,10 +3761,7 @@ class LTX25Engine:
         if exr_colorspace not in hdr_mod.COLOR_SPACES:
             raise ValueError(f"exr_colorspace must be one of {hdr_mod.COLOR_SPACES}")
         fast = fast or Fast()
-        key = str(Path(loras[0][0]).expanduser().resolve())
-        lora = self.user_lora_cache.get(key)
-        if lora is None:
-            lora = self.user_lora_cache[key] = Lora.from_path(key).load()
+        lora = self.user_lora_cache.get(loras[0][0])
         tm = Timings()
         with tm.span("text"):
             video_text = self._load_video_context(text_embeddings)

@@ -151,3 +151,74 @@ def test_the_loop_check_catches_the_alpha_pattern():
         "            lora.detach(dit)\n"
     )
     assert _unguarded_loop_attaches(leaky) == [3]
+
+
+# ---- the user LoRA cache ------------------------------------------------------
+
+
+def _loader(lora_mod, loads):
+    def load(key):
+        loads.append(Path(key).name)
+        return _adapter(lora_mod, Path(key).stem)
+
+    return load
+
+
+def test_user_lora_cache_is_bounded_lru(lora_mod, tmp_path):
+    loads = []
+    cache = lora_mod.LoraCache(2)
+    load = _loader(lora_mod, loads)
+    a = cache.get(tmp_path / "a.safetensors", load)
+    cache.get(tmp_path / "b.safetensors", load)
+    assert cache.get(tmp_path / "a.safetensors", load) is a  # hit; a is now newest
+    cache.get(tmp_path / "c.safetensors", load)  # evicts b, the least recent
+    assert len(cache) == 2
+    assert tmp_path / "a.safetensors" in cache
+    assert tmp_path / "b.safetensors" not in cache
+    cache.get(tmp_path / "b.safetensors", load)
+    assert loads == ["a.safetensors", "b.safetensors", "c.safetensors", "b.safetensors"]
+
+
+def test_evicting_releases_the_reference_but_an_attached_adapter_detaches(
+    lora_mod, tmp_path
+):
+    import gc
+    import weakref
+
+    cache = lora_mod.LoraCache(1)
+    load = _loader(lora_mod, [])
+    dit = _DiT()
+    a = cache.get(tmp_path / "a.safetensors", load)
+    a.attach(dit, 1.0)
+    cache.get(tmp_path / "b.safetensors", load)  # a evicted while attached
+    a.detach(dit)
+    assert dit.lora == {}
+    ref = weakref.ref(a)
+    del a
+    gc.collect()
+    assert ref() is None  # nothing but the request held it
+
+
+def test_user_lora_cache_size_comes_from_the_environment(lora_mod, monkeypatch):
+    monkeypatch.delenv("SLIMSERVE_VIDEO_LORA_CACHE", raising=False)
+    assert lora_mod.LoraCache().max_entries == lora_mod.DEFAULT_USER_LORA_CACHE
+    monkeypatch.setenv("SLIMSERVE_VIDEO_LORA_CACHE", "7")
+    assert lora_mod.LoraCache().max_entries == 7
+    assert lora_mod.LoraCache(0).max_entries == 0
+    with pytest.raises(ValueError):
+        lora_mod.LoraCache(-1)
+
+
+def test_a_zero_sized_cache_keeps_nothing(lora_mod, tmp_path):
+    loads = []
+    cache = lora_mod.LoraCache(0)
+    load = _loader(lora_mod, loads)
+    cache.get(tmp_path / "a.safetensors", load)
+    cache.get(tmp_path / "a.safetensors", load)
+    assert len(cache) == 0 and loads == ["a.safetensors", "a.safetensors"]
+
+
+def test_the_engine_has_no_unbounded_adapter_dict():
+    source = PIPELINE_PY.read_text()
+    assert "user_lora_cache[" not in source
+    assert "self.user_lora_cache = lora_mod.LoraCache(" in source
