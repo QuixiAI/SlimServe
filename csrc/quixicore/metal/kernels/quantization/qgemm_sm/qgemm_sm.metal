@@ -651,8 +651,13 @@ kernel void qgemm_sm_u4(
         t_a tA((device half*)(X + g * 32),
                metal::extents<int32_t, 32, M_PAD>(),
                metal::array<int32_t, 2>{1, K});
+        // Explicit strides: Xcode 27 (Metal toolchain 32023.921) rejects the
+        // implied-packed constructor for a 4-bit format unless extent(0) is a
+        // multiple of 256 elements (128-byte rows); the strided constructor
+        // takes the same packed {1, NT} layout the kernel has always used.
         t_b tB((device uchar*)(wtile + (size_t)g * (32 * NT / 2)),
-               metal::extents<int32_t, NT, 32>());
+               metal::extents<int32_t, NT, 32>(),
+               metal::array<int32_t, 2>{1, NT});
         op.run(tA, tB, cTmp);
         device const half* sc_row = SC + (size_t)g * N + n0;
         device const half* mn_row = MN + (size_t)g * N + n0;
@@ -746,8 +751,13 @@ kernel void qgemm_sm_u4b(
         t_a tA((device bfloat*)(X + g * 32),
                metal::dextents<int32_t, 2>(32, M),
                metal::array<int32_t, 2>{1, K});
+        // Explicit strides: Xcode 27 (Metal toolchain 32023.921) rejects the
+        // implied-packed constructor for a 4-bit format unless extent(0) is a
+        // multiple of 256 elements (128-byte rows); the strided constructor
+        // takes the same packed {1, NT} layout the kernel has always used.
         t_b tB((device uchar*)(wtile + (size_t)g * (32 * NT / 2)),
-               metal::extents<int32_t, NT, 32>());
+               metal::extents<int32_t, NT, 32>(),
+               metal::array<int32_t, 2>{1, NT});
         op.run(tA, tB, cTmp);
         device const half* sc_row = SC + (size_t)g * N + n0;
         device const half* mn_row = MN + (size_t)g * N + n0;
