@@ -263,6 +263,161 @@ __global__ void partials_batched_ws(
     }
 }
 
+// Prefill form of partials_batched_ws: a block owns ONE split for the
+// whole call and walks the token tiles with a grid stride, so its fn slice
+// (CHUNK x NOUT values, 48 per lane) is loaded into registers once per
+// block instead of once per (split, tile). With TT = 4 the per-tile kernel
+// re-reads 1.5 MiB of fp32 fn from L2 for every 4 tokens - ten times the
+// activation bytes it moves - which held it at 102 us for 1000 tokens
+// against a 41 us HBM floor (GLM-5.3 TP4, RTX PRO 6000, 2026-09-14).
+// Elements are chunked contiguously (split s owns flats [s * CHUNK,
+// (s + 1) * CHUNK)), so every stream load, the residual_out store and the
+// fn reads are 4-byte bf16 pairs / coalesced rows; the chunk lies inside
+// one stream (CHUNK divides hidden_size). Same per-element arithmetic and
+// bf16 rounding as partials_batched; the partial sums group by chunk
+// instead of by strided set (finalize tolerates any grouping).
+template <int NOUT, int TT, typename FnT = float>
+__global__ void __launch_bounds__(THREADS, 2) partials_batched_persistent(
+    const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ residual,
+    const float* __restrict__ post,
+    const float* __restrict__ comb,
+    const FnT* __restrict__ fn,
+    __nv_bfloat16* __restrict__ residual_out,
+    float* __restrict__ partial,
+    int hidden_size,
+    int tokens) {
+    constexpr int WARPS = THREADS / 32;
+    constexpr int OPW = NOUT / WARPS;   // outputs per warp
+    static_assert(NOUT % WARPS == 0, "outputs must split evenly across warps");
+    constexpr int EPT = 2;              // one bf16 pair per thread
+    constexpr int CHUNK = THREADS * EPT;
+    constexpr int ITERS = CHUNK / 32;
+    constexpr int COEFFS = HC + HC * HC;
+    const int split = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int total = HC * hidden_size;
+    const int ntiles = (tokens + TT - 1) / TT;
+    const int last_token = tokens - 1;
+    // The chunk sits inside one stream: stream index and the dim of this
+    // thread's pair within it.
+    const int flat0 = split * CHUNK;
+    const int stream = flat0 / hidden_size;
+    const int dim0 = flat0 - stream * hidden_size + EPT * tid;
+    const bool in = flat0 + EPT * tid + 1 < total;
+    __shared__ float mix_coeffs[TT][COEFFS];
+    __shared__ __align__(16) float values[TT][CHUNK];
+
+    // Hoisted fn slice: warp w streams rows [w * OPW, (w + 1) * OPW) over
+    // the chunk, lane l owning columns it * 32 + l.
+    float f[ITERS][OPW];
+#pragma unroll
+    for (int it = 0; it < ITERS; ++it) {
+        const int flat = flat0 + it * 32 + lane;
+        const bool fin = flat < total;
+#pragma unroll
+        for (int j = 0; j < OPW; ++j) {
+            f[it][j] = fin ? float(fn[(warp * OPW + j) * total + flat]) : 0.0f;
+        }
+    }
+
+    for (int tile = blockIdx.y; tile < ntiles; tile += gridDim.y) {
+        const int token0 = tile * TT;
+        for (int i = tid; i < TT * COEFFS; i += THREADS) {
+            const int t = i / COEFFS;
+            const int j = i - t * COEFFS;
+            const int token = token0 + t;
+            float v = 0.0f;
+            if (token < tokens) {
+                v = (j < HC) ? post[token * HC + j] : comb[token * HC * HC + (j - HC)];
+            }
+            mix_coeffs[t][j] = v;
+        }
+        __syncthreads();
+        // Phase 1: every load of the tile is issued up front with clamped
+        // token indices; the token bound gates the store and the staged
+        // value.
+        __nv_bfloat162 xv[TT];
+        __nv_bfloat162 rv[TT][HC];
+#pragma unroll
+        for (int t = 0; t < TT; ++t) {
+            const int token = min(token0 + t, last_token);
+            const int dim = in ? dim0 : 0;
+            xv[t] = *reinterpret_cast<const __nv_bfloat162*>(
+                x + token * hidden_size + dim);
+#pragma unroll
+            for (int input_stream = 0; input_stream < HC; ++input_stream) {
+                rv[t][input_stream] = *reinterpret_cast<const __nv_bfloat162*>(
+                    residual + (token * HC + input_stream) * hidden_size + dim);
+            }
+        }
+#pragma unroll
+        for (int t = 0; t < TT; ++t) {
+            const int token = token0 + t;
+            float2 value = make_float2(0.0f, 0.0f);
+            if (in && token < tokens) {
+                const float2 xf = __bfloat1622float2(xv[t]);
+                const float px = mix_coeffs[t][stream];
+                value.x = px * xf.x;
+                value.y = px * xf.y;
+#pragma unroll
+                for (int input_stream = 0; input_stream < HC; ++input_stream) {
+                    const float c = mix_coeffs[t][HC + input_stream * HC + stream];
+                    const float2 rf = __bfloat1622float2(rv[t][input_stream]);
+                    value.x += c * rf.x;
+                    value.y += c * rf.y;
+                }
+                const __nv_bfloat162 rounded = __float22bfloat162_rn(value);
+                *reinterpret_cast<__nv_bfloat162*>(
+                    residual_out + token * total + flat0 + EPT * tid) = rounded;
+                value = __bfloat1622float2(rounded);
+            }
+            *reinterpret_cast<float2*>(&values[t][EPT * tid]) = value;
+        }
+        __syncthreads();
+        // Phase 2: warp w owns outputs [w * OPW, (w + 1) * OPW).
+        float acc[TT][OPW];
+        float sq[TT];
+#pragma unroll
+        for (int t = 0; t < TT; ++t) {
+            sq[t] = 0.0f;
+#pragma unroll
+            for (int j = 0; j < OPW; ++j) acc[t][j] = 0.0f;
+        }
+#pragma unroll
+        for (int it = 0; it < ITERS; ++it) {
+            const int c = it * 32 + lane;
+#pragma unroll
+            for (int t = 0; t < TT; ++t) {
+                const float value = values[t][c];
+#pragma unroll
+                for (int j = 0; j < OPW; ++j) acc[t][j] += value * f[it][j];
+                if (warp == 0) sq[t] += value * value;
+            }
+        }
+#pragma unroll
+        for (int t = 0; t < TT; ++t) {
+            const int token = token0 + t;
+#pragma unroll
+            for (int j = 0; j < OPW; ++j) {
+                const float sum = warp_sum(acc[t][j]);
+                if (lane == 0 && token < tokens) {
+                    partial[(token * SPLITS + split) * (NOUT + 1) + warp * OPW + j] = sum;
+                }
+            }
+            if (warp == 0) {
+                const float sum = warp_sum(sq[t]);
+                if (lane == 0 && token < tokens) {
+                    partial[(token * SPLITS + split) * (NOUT + 1) + NOUT] = sum;
+                }
+            }
+        }
+        __syncthreads();   // values / mix_coeffs are rewritten by the next tile
+    }
+}
+
 // Batched form of `partials` for decode batches: one block owns (split,
 // tile of TT tokens) and loads each fn column once for all TT tokens. The
 // per-token kernel re-reads the whole fn matrix (NOUT x 4 x hidden fp32,
@@ -389,7 +544,10 @@ __device__ __forceinline__ void finalize_pre_mix_block(
         for (int split = 0; split < NSPLITS; ++split) {
             const float* source =
                 partial + (token * NSPLITS + split) * (MIXES + 1);
-            value += source[lane];
+            // Read past L1: other blocks wrote the split partials. Shared
+            // with the A100 (sm_80) transition paths, which have not been
+            // re-measured since this change (rtx6000 branch).
+            value += __ldcg(source + lane);
         }
         mixes[lane] = value;
         if (lane == MIXES) {
@@ -729,9 +887,12 @@ finalize_apply_pre_mix_rms_norm(
     }
 }
 
-template <bool FUSED_POST, bool RMS_NORM, int HIDDEN_SIZE = 4096,
-          int NSPLITS = SPLITS, typename FnT = float>
-__global__ void fused_pre_transition(
+// Phase 1 of a small-batch transition, one split of one token per block:
+// the post mix (x and the four residual streams into residual_out) rides
+// along when FUSED_POST, and the block leaves its 24 fn projections and
+// square sum in partial[token][split].
+template <bool FUSED_POST, int HIDDEN_SIZE, int NSPLITS, typename FnT>
+__device__ __forceinline__ void transition_partials_phase(
     const __nv_bfloat16* x,
     const __nv_bfloat16* residual,
     const float* post_mix,
@@ -739,27 +900,13 @@ __global__ void fused_pre_transition(
     const FnT* fn,
     __nv_bfloat16* residual_out,
     float* partial,
-    const float* scale,
-    const float* base,
-    float* next_post,
-    float* next_comb,
-    __nv_bfloat16* layer_input,
-    const __nv_bfloat16* norm_weight,
-    float rms_eps,
-    float pre_eps,
-    float sinkhorn_eps,
-    float post_multiplier,
-    int sinkhorn_repeat,
-    float norm_eps) {
-    static_assert(HIDDEN_SIZE % THREADS == 0);
+    int split,
+    int token) {
     constexpr int NOUT = MIXES;
-    constexpr int VALUES = HIDDEN_SIZE / THREADS;
-    const int split = blockIdx.x;
-    const int token = blockIdx.y;
+    constexpr int TOTAL = HC * HIDDEN_SIZE;
     const int tid = threadIdx.x;
     const int lane = tid & 31;
     const int warp = tid >> 5;
-    constexpr int TOTAL = HC * HIDDEN_SIZE;
 
     __shared__ float mix_coeffs[HC + HC * HC];
     if constexpr (FUSED_POST) {
@@ -821,9 +968,36 @@ __global__ void fused_pre_transition(
                 block_sum;
         }
     }
+}
 
-    cooperative_groups::this_grid().sync();
-    if (split != 0) return;
+// Phase 2, one block per token once every split's partial is in: the
+// finalize (sinkhorn, next post/comb) and the pre-mix with the optional
+// RMSNorm into layer_input. The mixed residual is read past L1 (__ldcg):
+// other blocks wrote it.
+template <bool FUSED_POST, bool RMS_NORM, int HIDDEN_SIZE, int NSPLITS>
+__device__ __forceinline__ void transition_finalize_phase(
+    const __nv_bfloat16* residual,
+    const __nv_bfloat16* residual_out,
+    float* partial,
+    const float* scale,
+    const float* base,
+    float* next_post,
+    float* next_comb,
+    __nv_bfloat16* layer_input,
+    const __nv_bfloat16* norm_weight,
+    int token,
+    float rms_eps,
+    float pre_eps,
+    float sinkhorn_eps,
+    float post_multiplier,
+    int sinkhorn_repeat,
+    float norm_eps) {
+    static_assert(HIDDEN_SIZE % THREADS == 0);
+    constexpr int NOUT = MIXES;
+    constexpr int VALUES = HIDDEN_SIZE / THREADS;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
 
     finalize_pre_mix_block<NSPLITS>(
         partial, scale, base, next_post, next_comb, token, HIDDEN_SIZE,
@@ -842,9 +1016,8 @@ __global__ void fused_pre_transition(
 #pragma unroll
         for (int stream = 0; stream < HC; ++stream) {
             value += pre[stream] *
-                     float(mixed_residual[(token * HC + stream) *
-                                              HIDDEN_SIZE +
-                                          dim]);
+                     float(__ldcg(mixed_residual +
+                                  (token * HC + stream) * HIDDEN_SIZE + dim));
         }
         values[i] = __float2bfloat16_rn(value);
         if constexpr (RMS_NORM) {
@@ -881,6 +1054,45 @@ __global__ void fused_pre_transition(
             layer_input[token * HIDDEN_SIZE + dim] = values[i];
         }
     }
+}
+
+// The single-token transition as one cooperative launch: NSPLITS blocks,
+// a grid sync, then block 0 finalizes.
+template <bool FUSED_POST, bool RMS_NORM, int HIDDEN_SIZE = 4096,
+          int NSPLITS = SPLITS, typename FnT = float>
+__global__ void fused_pre_transition(
+    const __nv_bfloat16* x,
+    const __nv_bfloat16* residual,
+    const float* post_mix,
+    const float* comb_mix,
+    const FnT* fn,
+    __nv_bfloat16* residual_out,
+    float* partial,
+    const float* scale,
+    const float* base,
+    float* next_post,
+    float* next_comb,
+    __nv_bfloat16* layer_input,
+    const __nv_bfloat16* norm_weight,
+    float rms_eps,
+    float pre_eps,
+    float sinkhorn_eps,
+    float post_multiplier,
+    int sinkhorn_repeat,
+    float norm_eps) {
+    const int split = blockIdx.x;
+    const int token = blockIdx.y;
+    transition_partials_phase<FUSED_POST, HIDDEN_SIZE, NSPLITS, FnT>(
+        x, residual, post_mix, comb_mix, fn, residual_out, partial, split,
+        token);
+
+    cooperative_groups::this_grid().sync();
+    if (split != 0) return;
+
+    transition_finalize_phase<FUSED_POST, RMS_NORM, HIDDEN_SIZE, NSPLITS>(
+        residual, residual_out, partial, scale, base, next_post, next_comb,
+        layer_input, norm_weight, token, rms_eps, pre_eps, sinkhorn_eps,
+        post_multiplier, sinkhorn_repeat, norm_eps);
 }
 
 __global__ void post(

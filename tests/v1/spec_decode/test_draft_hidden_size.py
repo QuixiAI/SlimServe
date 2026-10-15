@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 from types import SimpleNamespace
 
+from transformers import PretrainedConfig
+
+from vllm.config.speculative import SpeculativeConfig
 from vllm.v1.worker.gpu.spec_decode.speculator import _get_draft_hidden_size
 
 
@@ -12,9 +15,16 @@ def _config(**hf_fields):
 
 
 def test_glm5_next_mtp_uses_contracted_hidden_size() -> None:
-    # GLM-5.3-Flash's target returns the mean-contracted mHC state to its MTP
-    # head. hc_mult describes the trunk and must not widen the proposer buffer.
-    assert _get_draft_hidden_size(_config(model_type="glm5_next_mtp", hc_mult=4)) == 4096
+    # GLM-5.3-Flash's target returns the contracted mHC state to its MTP
+    # head. The trunk's hc_mult (4) must not widen the proposer buffer: the
+    # draft config override sets the draft's hc_mult to 1.
+    trunk = PretrainedConfig(
+        num_nextn_predict_layers=1, hc_mult=4, architectures=["Glm5NextForCausalLM"]
+    )
+    trunk.model_type = "glm5_next_text"
+    draft = SpeculativeConfig.hf_config_override(trunk)
+    assert draft.model_type == "glm5_next_mtp"
+    assert _get_draft_hidden_size(_config(**draft.to_dict())) == 4096
 
 
 def test_deepseek_v4_mtp_uses_expanded_hidden_size() -> None:
