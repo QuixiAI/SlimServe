@@ -185,14 +185,43 @@ def exact_prompts(
         raise ValueError(f"prompt offset must be between 0 and {max_start}")
     stride = max(1, (max_start - prompt_offset) // max(1, count - 1))
     prompts: list[str] = []
+    seen: set[str] = set()
+    attempted_starts: set[int] = set()
+
+    def try_window(start: int) -> bool:
+        """Keep the window at `start` if it round-trips and is new."""
+        attempted_starts.add(start)
+        text = tokenizer.decode(source_ids[start : start + token_count])
+        if len(tokenizer.encode(text, add_special_tokens=False)) != token_count:
+            return False
+        # A short or periodic source repeats its windows; identical prompts
+        # would turn concurrent requests into prefix-cache hits.
+        if text in seen:
+            return False
+        seen.add(text)
+        prompts.append(text)
+        return True
+
     candidate = prompt_offset
     while len(prompts) < count and candidate <= max_start:
-        text = tokenizer.decode(source_ids[candidate : candidate + token_count])
-        if len(tokenizer.encode(text, add_special_tokens=False)) == token_count:
-            prompts.append(text)
+        try_window(candidate)
         candidate += stride if prompts else 1
+    # Some tokenizers do not round-trip every arbitrary token boundary: a
+    # decode followed by encode can merge or split boundary tokens, and a
+    # periodic source repeats windows.  The evenly spaced first pass keeps
+    # its historical selection when it succeeds; any deficit is filled from
+    # untried starts so every returned prompt is a distinct exact window.
+    for candidate in range(prompt_offset, max_start + 1):
+        if len(prompts) == count:
+            break
+        if candidate not in attempted_starts:
+            try_window(candidate)
     if len(prompts) != count:
-        raise ValueError(f"could only construct {len(prompts)} exact prompts")
+        raise ValueError(
+            f"source yields only {len(prompts)} distinct exact "
+            f"{token_count}-token prompts from offset {prompt_offset}; "
+            f"need {count}. Use a longer or less repetitive source."
+        )
     return prompts
 
 

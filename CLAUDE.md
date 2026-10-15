@@ -160,6 +160,9 @@ behavior:
 
 - Live validation must discover every registry profile compatible with the
   current machine. Do not substitute one tensor-parallel size for another.
+  It covers LLM (`kind: "llm"`) profiles by serving and smoking each one;
+  video profiles are validated by `perf/ltx25_harness/n6_serve_check.py`
+  run on a Mac against the real profile.
 - Every supported profile must run with its registered DSpark drafter and
   registered draft KV configuration. FP8 is the only permitted KV cache
   quantization; TurboQuant is prohibited for targets and drafters.
@@ -167,6 +170,26 @@ behavior:
   text and image requests.
 - For vision profiles, test both text and image requests. For text-only
   profiles, test text requests.
+
+## Non-LLM generation engines
+
+- SlimServe also hosts non-LLM generation engines. A source declares its
+  engine with `kind`: `"llm"` (the default, served by vLLM) or `"video"`
+  (LTX-2.5 audio+video generation on Metal, `slimserve/video/`). The
+  registry rejects any other kind, and every non-LLM kind must dispatch to
+  a registered non-vLLM engine; a test enforces both.
+- The LLM serving policies (prefix caching, tool calling, thinking,
+  non-greedy sampling, KV cache dtype, default context, drafters, KV tiers)
+  apply to `kind: "llm"` sources and are not meaningful for video sources.
+  The LLM policy tests assert a non-zero count of LLM profiles so a mass
+  exemption is visible.
+- Video profiles still follow every other rule: one record per platform,
+  pinned revisions for every download, no deployment configuration in the
+  repo, and notebook entries with raw-artifact evidence for every measured
+  claim.
+- The LTX-2.5 prompt enhancer (Gemma) decodes greedily because the upstream
+  pipeline does; that is a model-level exception for the enhancer, not a
+  precedent for any chat model.
 
 ## Commit authorship
 
@@ -185,8 +208,9 @@ behavior:
   calling, and thinking enabled, and NEVER uses greedy sampling. These are
   enforced as registry-level `_SERVING_DEFAULTS` plus explicit per-profile
   values and a registry test. Prefix caching admits NO opt-out: every
-  platform record states `enable_prefix_caching: true` and the registry
-  test rejects anything else (operator directive 2026-08-30). For the
+  LLM (`kind: "llm"`) platform record states `enable_prefix_caching: true`
+  and the registry test rejects anything else (operator directive
+  2026-08-30). For the
   others, a profile may opt out only for a model-level impossibility,
   stated in a note.
 - Never rely on engine-layer defaults for these: vLLM silently defaults
