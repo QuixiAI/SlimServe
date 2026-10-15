@@ -6,7 +6,7 @@ import sys
 
 import pytest
 from openai.types.responses import ResponseCustomToolCall
-from xgrammar import Grammar
+from xgrammar import Grammar, GrammarCompiler, GrammarMatcher, TokenizerInfo
 
 from vllm.entrypoints.chat_utils import (
     adapt_custom_tool_calls_for_chat_template,
@@ -94,6 +94,28 @@ def custom_request(**updates) -> ResponsesRequest:
     }
     data.update(updates)
     return ResponsesRequest.model_validate(data)
+
+
+GLM_PATCH_CALL = (
+    "<tool_call>apply_patch<arg_key>input</arg_key>"
+    f"<arg_value>{RAW_PATCH}</arg_value></tool_call>"
+)
+
+
+def _grammar_outcome(structural_tag, text: str) -> tuple[bool, bool]:
+    """Return ``(accepted_as_prefix, complete)`` for ``text``.
+
+    Uses a byte vocabulary so the assertions are about the language the
+    grammar accepts, not about which XGrammar container node a given XGrammar
+    release chooses to express it with.
+    """
+    compiler = GrammarCompiler(TokenizerInfo([bytes([i]) for i in range(256)]))
+    matcher = GrammarMatcher(
+        compiler.compile_structural_tag(structural_tag),
+        terminate_without_stop_token=True,
+    )
+    accepted = matcher.accept_string(text)
+    return accepted, accepted and matcher.is_completed()
 
 
 def _walk_format(format_dict):
@@ -338,12 +360,18 @@ def test_glm_custom_tool_can_stop_after_one_call(tool_choice):
     )
     assert structural_tag is not None
     dumped = structural_tag.model_dump()["format"]
-    expected_format = (
-        "tags_with_separator" if tool_choice == "required" else "triggered_tags"
-    )
-    assert dumped["type"] == expected_format
+    # XGrammar 0.2.1 expresses GLM "required" as tags_with_separator; later
+    # releases use triggered_tags(at_least_one=True). Either way the top-level
+    # tool-call container must carry stop_after_first.
+    assert dumped["type"] in ("tags_with_separator", "triggered_tags")
     assert dumped["stop_after_first"] is True
     Grammar.from_structural_tag(structural_tag)
+
+    # One complete call is a complete response; a second call is rejected.
+    assert _grammar_outcome(structural_tag, GLM_PATCH_CALL) == (True, True)
+    assert _grammar_outcome(structural_tag, GLM_PATCH_CALL * 2)[0] is False
+    # "required" must not accept a turn without a call; "auto" may.
+    assert _grammar_outcome(structural_tag, "")[1] is (tool_choice == "auto")
 
 
 def test_glm_required_parallel_tools_allow_native_turn_stop():
@@ -376,13 +404,24 @@ def test_glm_required_parallel_custom_ignores_builtin_max_tool_calls():
     dumped = structural_tag.model_dump()["format"]
     assert dumped["type"] == "sequence"
     assert len(dumped["elements"]) == 2
-    assert dumped["elements"][0]["type"] == "tags_with_separator"
+    assert dumped["elements"][0]["type"] in (
+        "tags_with_separator",
+        "triggered_tags",
+    )
     assert dumped["elements"][0]["stop_after_first"] is False
     assert dumped["elements"][1] == {
         "type": "const_string",
         "value": "<|observation|>",
     }
     Grammar.from_structural_tag(structural_tag)
+
+    # max_tool_calls is a builtin-tool limit: two custom calls are allowed,
+    # and the GLM turn sentinel terminates after one or more calls.
+    end = "<|observation|>"
+    assert _grammar_outcome(structural_tag, GLM_PATCH_CALL * 2) == (True, False)
+    assert _grammar_outcome(structural_tag, GLM_PATCH_CALL + end) == (True, True)
+    assert _grammar_outcome(structural_tag, GLM_PATCH_CALL * 2 + end) == (True, True)
+    assert _grammar_outcome(structural_tag, end)[0] is False
 
 
 def test_generic_chat_template_adapter_function_shapes_custom_tools_and_history():
