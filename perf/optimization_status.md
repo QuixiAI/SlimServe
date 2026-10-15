@@ -34400,3 +34400,15 @@ than PyPI 1.3.0), and the FP8 GEMMs.
 - Results: no new throughput measurement or hardware qualification claimed.
 - Decision: submit as a focused PR; preserve current-main behavior outside this fix.
 - Raw artifacts: local test output; no traffic captures or model data committed.
+
+## 2026-09-19 - Add a multi-turn Responses tool protocol benchmark
+
+- Status: retained for review.
+- Baseline: `origin/main`; forward-port from the B70 serving integration.
+- Change: Exercise required inventory-summary tool calls at configurable concurrency and model ID, retain raw events and exact API usage, and fail on missing calls or argument delta/done mismatches.
+- Revision (2026-10-14): samples at serving policy (temperature 1.0 / top_p 0.95 / top_k 20, seed + request index) instead of temperature 0; `--model` defaults to `Qwen3.8-27B` (served by the qwen38-27b profiles); raw JSON defaults to `perf/results/<YYYY-MM-DD>/<run-id>/`; per-round timing is `response_created_s` (first SSE event) plus `first_output_delta_s`; rounds truncated by `max_output_tokens` are counted as `incomplete_max_output_tokens`, separately from `protocol_errors`.
+- Revision (2026-10-15): raw JSON defaults to `<repo>/perf/results/<YYYY-MM-DD>/<run-id>/` regardless of CWD, with a microsecond + random-suffix run id; `completed_rounds` excludes rounds with protocol errors as well as truncated rounds; truncated rounds skip argument validation and count only as `incomplete_max_output_tokens`. Accounting covered by `tests/slimserve/test_qwen_tool_protocol_benchmark.py` (mocked SSE).
+- Correctness: CLI help, Ruff and a mock-SSE two-turn call/replay check passed; no fresh live throughput measurement.
+- Results: no new throughput measurement or hardware qualification claimed.
+- Decision: submit as a focused PR; preserve current-main behavior outside this fix.
+- Raw artifacts: local test output; no traffic captures or model data committed.
