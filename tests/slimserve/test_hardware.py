@@ -68,3 +68,81 @@ def test_xpu_smi_probe_detects_b70s(monkeypatch):
 
     assert hardware._probe_intel_xpu() == ("Intel(R) Arc(TM) Pro B70 Graphics", 4)
     assert hardware._classify("Intel(R) Arc(TM) Pro B70 Graphics") == "b70"
+
+
+_ALL_MASKS = (
+    "ROCR_VISIBLE_DEVICES",
+    "HIP_VISIBLE_DEVICES",
+    "CUDA_VISIBLE_DEVICES",
+    "ZE_AFFINITY_MASK",
+)
+
+
+def _clear_masks(monkeypatch):
+    for var in _ALL_MASKS:
+        monkeypatch.delenv(var, raising=False)
+
+
+def test_intel_count_ignores_cuda_and_hip_masks(monkeypatch):
+    """A stray CUDA/HIP mask must not shrink the number of Intel cards."""
+    _clear_masks(monkeypatch)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "0")
+    assert hardware._visible_limit("intel") is None
+    monkeypatch.setenv("ZE_AFFINITY_MASK", "0,1")
+    assert hardware._visible_limit("intel") == 2
+
+
+def test_ze_affinity_mask_counts_cards_not_tiles(monkeypatch):
+    _clear_masks(monkeypatch)
+    monkeypatch.setenv("ZE_AFFINITY_MASK", "0.0,0.1")
+    assert hardware._visible_limit("intel") == 1
+    monkeypatch.setenv("ZE_AFFINITY_MASK", "0.0,0.1,1,2.1")
+    assert hardware._visible_limit("intel") == 3
+
+
+def test_nvidia_and_amd_ignore_ze_affinity_mask(monkeypatch):
+    _clear_masks(monkeypatch)
+    monkeypatch.setenv("ZE_AFFINITY_MASK", "0")
+    assert hardware._visible_limit("nvidia") is None
+    assert hardware._visible_limit("amd") is None
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1,2")
+    assert hardware._visible_limit("nvidia") == 3
+    # HIP honours CUDA_VISIBLE_DEVICES too.
+    assert hardware._visible_limit("amd") == 3
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "0,1")
+    assert hardware._visible_limit("nvidia") == 3
+    assert hardware._visible_limit("amd") == 2
+
+
+def test_detect_applies_only_the_probed_vendors_mask(monkeypatch):
+    _clear_masks(monkeypatch)
+    monkeypatch.setattr(hardware, "_probe_apple", lambda: None)
+    monkeypatch.setattr(hardware, "_probe_amd", lambda: None)
+    monkeypatch.setattr(hardware, "_probe_nvidia", lambda: None)
+    monkeypatch.setattr(
+        hardware,
+        "_probe_intel_xpu",
+        lambda: ("Intel(R) Arc(TM) Pro B70 Graphics", 4),
+    )
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
+    machine = hardware.detect()
+    assert (machine.platform, machine.count) == ("b70", 4)
+    monkeypatch.setenv("ZE_AFFINITY_MASK", "0.0,0.1,1.0,1.1")
+    assert hardware.detect().count == 2
+
+
+def test_unrecognized_hardware_message_lists_b70(monkeypatch, capsys):
+    import pytest
+
+    from slimserve import cli
+
+    monkeypatch.setattr(
+        cli.hardware,
+        "detect",
+        lambda: hardware.Machine(platform=None, device_name="mystery", count=1),
+    )
+    with pytest.raises(SystemExit):
+        cli.main(["dsv4-xxs-1", "--dry-run"])
+    captured = capsys.readouterr()
+    assert "Intel Arc Pro B70" in captured.out + captured.err
