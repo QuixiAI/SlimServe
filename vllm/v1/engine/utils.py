@@ -1219,6 +1219,33 @@ def launch_core_engines(
         )
 
 
+def poll_engine_socket_or_exit(
+    socket: zmq.Socket,
+    procs: list[BaseProcess],
+    timeout_ms: int,
+) -> bool:
+    """Wait for ``socket`` to become readable while watching ``procs``.
+
+    Returns True when a message is ready and False on timeout. Raises
+    RuntimeError as soon as any watched process exits first, so a caller
+    waiting on an engine that died -- crashed, or was terminated by a stop
+    request during model load -- fails now instead of after its timeout.
+    """
+    poller = zmq.Poller()
+    poller.register(socket, zmq.POLLIN)
+    for proc in procs:
+        poller.register(proc.sentinel, zmq.POLLIN)
+    events = dict(poller.poll(timeout=timeout_ms))
+    finished = {proc.name: proc.exitcode for proc in procs if proc.sentinel in events}
+    if finished:
+        raise RuntimeError(
+            "Engine core initialization failed. "
+            "See root cause above. "
+            f"Failed core proc(s): {finished}"
+        )
+    return socket in events
+
+
 def wait_for_engine_startup(
     handshake_socket: zmq.Socket,
     addresses: EngineZmqAddresses,

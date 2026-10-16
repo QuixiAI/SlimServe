@@ -325,7 +325,13 @@ def zmq_socket_ctx(
     identity: bytes | None = None,
     router_handover: bool = False,
 ) -> Iterator[zmq.Socket]:
-    """Context manager for a ZMQ socket"""
+    """Context manager for a ZMQ socket.
+
+    Exceptions raised in the body, including KeyboardInterrupt, propagate.
+    The API server turns SIGTERM/SIGINT during startup into KeyboardInterrupt;
+    swallowing it here made the caller carry on as if the engine handshake
+    had completed, so a stop request during model load was lost.
+    """
 
     ctx = zmq.Context()  # type: ignore[attr-defined]
     try:
@@ -337,8 +343,5 @@ def zmq_socket_ctx(
             identity=identity,
             router_handover=router_handover,
         )
-    except KeyboardInterrupt:
-        logger.debug("Got Keyboard Interrupt.")
-
     finally:
         ctx.destroy(linger=linger)

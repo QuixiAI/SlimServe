@@ -12,6 +12,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass
 from multiprocessing.connection import Connection
+from multiprocessing.process import BaseProcess
 from multiprocessing.queues import Queue
 from threading import Thread
 from typing import Any, TypeAlias, TypeVar
@@ -57,6 +58,7 @@ from vllm.v1.engine.utils import (
     CoreEngineProcManager,
     get_engine_zmq_addresses,
     launch_core_engines,
+    poll_engine_socket_or_exit,
 )
 from vllm.v1.executor import Executor
 from vllm.v1.fault_tolerance.engine_core_sentinel import FT_UTILITY_METHOD
@@ -631,9 +633,19 @@ class MPClient(EngineCoreClient):
             # Wait for ready messages from each engine on the input socket.
             identities = set(self.core_engines)
             sync_input_socket = zmq.Socket.shadow(self.input_socket)
+            # Also watch the engine (and coordinator) processes this client
+            # launched, so an engine that dies before sending READY fails
+            # startup now instead of after VLLM_ENGINE_READY_TIMEOUT_S.
+            watched_procs: list[BaseProcess] = []
+            if isinstance(self.resources.engine_manager, CoreEngineProcManager):
+                watched_procs.extend(self.resources.engine_manager.processes)
+            if self.resources.coordinator is not None:
+                watched_procs.append(self.resources.coordinator.proc)
             while identities:
-                if not sync_input_socket.poll(
-                    timeout=VLLM_ENGINE_READY_TIMEOUT_S * 1000  # convert to ms
+                if not poll_engine_socket_or_exit(
+                    sync_input_socket,
+                    watched_procs,
+                    timeout_ms=VLLM_ENGINE_READY_TIMEOUT_S * 1000,
                 ):
                     raise TimeoutError(
                         f"Timed out waiting for engine core processes to "

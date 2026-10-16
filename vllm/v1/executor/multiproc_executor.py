@@ -66,6 +66,10 @@ from vllm.v1.worker.worker_base import WorkerWrapperBase
 
 logger = init_logger(__name__)
 
+# How long a worker whose parent died during startup waits for SIGTERM to
+# unwind its main thread before exiting hard.
+_ORPHANED_WORKER_EXIT_GRACE_S = 10.0
+
 
 class FutureWrapper(Future):
     def __init__(
@@ -792,27 +796,57 @@ class WorkerProc:
         destroy_model_parallel()
         destroy_distributed_environment()
 
-    def monitor_death_pipe(self, death_pipe, shutdown_requested: threading.Event):
+    @staticmethod
+    def monitor_death_pipe(
+        death_pipe: Connection | None,
+        shutdown_requested: threading.Event,
+        startup_done: threading.Event,
+        queues_to_shutdown: list[MessageQueue | None],
+    ) -> None:
+        """Watch for the parent (the executor's process) exiting.
+
+        Started before the worker is constructed so that a parent which dies
+        or is terminated while this worker is still starting -- loading
+        weights, compiling, capturing graphs -- does not leave an orphan that
+        keeps the device busy until startup finishes. ``queues_to_shutdown``
+        is filled in once the worker is built; queue references are passed
+        rather than ``self`` to avoid gc issues.
+        """
         if death_pipe is None:
             return
 
-        def death_pipe_monitor(queues_to_shutdown: list[MessageQueue]):
+        def death_pipe_monitor():
             try:
                 # This will block until parent process exits (pipe closes)
                 death_pipe.recv()
             except EOFError:
+                if not startup_done.is_set():
+                    logger.warning(
+                        "Parent process exited during worker startup, "
+                        "terminating worker"
+                    )
+                    # The SIGTERM handler raises SystemExit in the main
+                    # thread, which unwinds startup through the normal path.
+                    os.kill(os.getpid(), signal.SIGTERM)
+                    # A main thread blocked in a native call (e.g. a
+                    # collective waiting on a peer that is gone) never sees
+                    # it; do not outlive the parent indefinitely.
+                    time.sleep(_ORPHANED_WORKER_EXIT_GRACE_S)
+                    os._exit(1)
                 logger.info_once("Parent process exited, terminating worker queues")
                 shutdown_requested.set()
                 for mq in queues_to_shutdown:
                     if mq is not None:
                         mq.shutdown()
+            except OSError:
+                # worker_main closed the pipe while exiting.
+                if not death_pipe.closed:
+                    logger.warning("Death monitoring error", exc_info=True)
             except Exception as e:
                 logger.warning("Death monitoring error: %s", e)
 
-        # Pass queue references directly to avoid gc issues if passing self
         Thread(
             target=death_pipe_monitor,
-            args=([self.rpc_broadcast_mq, self.worker_response_mq],),
             daemon=True,
             name="DeathPipeMonitor",
         ).start()
@@ -899,6 +933,8 @@ class WorkerProc:
         set_worker_net_device(kwargs.get("local_rank", 0), kwargs["vllm_config"])
 
         worker = None
+        startup_done = threading.Event()
+        death_pipe_queues: list[MessageQueue | None] = []
         ready_writer = kwargs.pop("ready_pipe")
         death_pipe = kwargs.pop("death_pipe", None)
 
@@ -921,12 +957,19 @@ class WorkerProc:
                 process_name=f"Worker_{rank}",
             )
 
+            WorkerProc.monitor_death_pipe(
+                death_pipe, shutdown_requested, startup_done, death_pipe_queues
+            )
+
             worker = WorkerProc(*args, **kwargs)
             assert worker.worker_response_mq is not None
             if kwargs["vllm_config"].parallel_config.numa_bind:
                 numa_utils.log_current_affinity_state(f"Worker_{worker.rank}")
 
-            worker.monitor_death_pipe(death_pipe, shutdown_requested)
+            death_pipe_queues.extend(
+                (worker.rpc_broadcast_mq, worker.worker_response_mq)
+            )
+            startup_done.set()
 
             # Send READY once we know everything is loaded
             ready_writer.send(
