@@ -35366,3 +35366,50 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   columns: 38.7 to 39.5 against 38.0 at 4, no change at 2 and 1. The "L2" weight bit layout
   re-timed on these kernels: 3 / 4 / 5 / 6 / 8 rows -0.6 / -0.3 to -1.0 / -0.8 / -0.5 / -0.1 ms,
   about 1% of a cycle; stays parked.
+
+## 2026-11-18 - Qwen3.8-27B native engine: outside baselines, image and video parity, drafter with a 5-bit head
+
+- Outside baselines on the same M1 Ultra, same four prompts, default sampling (T 1.0, top-p 0.95,
+  top-k 20, seed 42, thinking on), 600 tokens each, decode tok/s:
+  - MLX (mlx-lm, 4-bit conversion of `mlx-community/Qwen3.8-27B-bf16`, 4.5 bits a weight): 31.5
+    plain on every prompt; prefill 221 tok/s at 2,048 tokens.
+  - MTPLX 0.3.7 on that 4-bit model with the checkpoint's own MTP head grafted in as
+    `mtp.safetensors` (its "family-compatible, unverified" tier, forced; `sustained` profile, no
+    fan control): plain 25.2; one draft 24.6 / 23.8 / 28.5 / 24.4 (essay / code / math / explain);
+    two drafts 20.3 / 18.4 / 21.9 / 18.9; three 15.3 / 14.7 / 21.3 / 15.6. MTPLX publishes a tuned
+    model only for Qwen3.6-27B; this is its generic path, not a tuned one.
+  - llama.cpp Q4_K_M (2026-11-10): 20.8 plain, prefill 254.
+  - This engine, mix1 pack: 67.3 with the DSpine drafter (3 seeds), 62.6 with the MTP head,
+    prefill 266.
+  The converted MLX model and the MTPLX environment were deleted after the runs; scripts and
+  logs: `perf/results/2026-11-18/q38-baselines/`.
+- Image and video against the Hugging Face reference (`tools/mm_parity.py`, new): the reference
+  model (transformers, fp16 on MPS) and the engine (BF16 pack) on an image prompt (321 tokens,
+  260 vision rows) and a synthetic video prompt (179 tokens, 2 frame groups of 49 rows). Vision
+  rows from `slimserve/native/vision.py` against the reference's: cosine at least 0.9998. Logits
+  at the text positions after the vision rows: image KL mean 0.00007 (max 0.0009), video 0.0006
+  (max 0.006), top-1 agreement 100% on both, same next token. At the vision-row positions
+  themselves (never sampled from) a few positions differ widely between the fp16 reference and
+  the BF16 engine (KL up to 8 and 19); the positions after them agree, so this is those
+  positions' own sensitivity, not a state error.
+- Video input: `vision.plan` takes a (t, h, w) grid and positions each frame group as an image
+  of its own with the timestamp text between, as the reference `get_rope_index` does; the server
+  accepts the `video` modality. Unit test added. Through the HTTP server: a 16-frame clip of a
+  white square moving right is described correctly; the repeat request reuses all 491 prompt
+  tokens. HTTP smoke ALL PASS on this build; 4 concurrent requests 92.2 tok/s.
+- Drafter with a u4/u5 target LM head (was refused at load): the sub-vocabulary head copies the
+  low-bit plane, the host tail decodes uniform rows, and a single-row head pass uses the half
+  input the uniform kernels need. All-5-bit pack (`gptq3-u5`, KL 0.0048): 61.4 tok/s with the
+  drafter (essay 52.4, code 58.4, math 88.3, explain 56.9; acceptance 66 / 75 / 93 / 74%),
+  57.4 with the MTP head; replay identical. Default pack unchanged (66.7 on this run).
+- Measurements for larger levers (no change kept):
+  - Draft sampling temperature 0.7 / 0.85 / 1.0 / 1.15, two seeds, tok/s aggregate: 60.5, 61.9 /
+    66.9, 63.2 / 67.1, 67.7 / 65.7, 68.1. Draft top-k 8: 67.0. Nothing above 1.0 and top-k 16.
+  - A more faithful target does not raise acceptance: the 5-bit pack's acceptance is the same
+    or slightly lower than mix1's (68 / 78 / 93 / 76%), so the drafter is not losing drafts to
+    the quantization of the hiddens it reads.
+  - Ceiling with these kernels: a drafter whose 7 drafts were always accepted would give 8
+    tokens per 59.8 + 7 ms, about 118 tok/s single stream; the math prompt (93% acceptance) is
+    at 92.6, prose (68 to 76%) at 57 to 64. Acceptance on prose is the only large quantity left.
+- Artifacts: `perf/results/2026-11-18/` (`q38-baselines`, `q38-mm-parity`, `q38-u5-head-drafter`,
+  `q38-levers`).
