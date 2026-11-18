@@ -1895,7 +1895,8 @@ static int topk_bf16(const uint16_t* lg, int vocab, int k, int32_t* hk, int32_t*
 }
 
 bool Engine::load_dspine(const char* path) {
-  if (lm_head.fmt != 1) return fail("the DSpine sampling tail reads NVFP4 LM head rows; this pack's head is another format");
+  if (lm_head.fmt != 1 && !lm_head.uniform())
+    return fail("the DSpine sampling tail reads NVFP4, u4 or u5 LM head rows; this pack's head is another format");
   auto s_map = map; auto s_len = map_len; auto s_base = data_base; auto s_fd = fd;
   NSDictionary* s_t = tensors; NSDictionary* s_m = meta;
   bool ok = open_pack(path);
@@ -1999,12 +2000,16 @@ bool Engine::load_dspine(const char* path) {
     d_head.N = (int)nv;
     d_head.w = alloc(nv * wb);
     d_head.scale = alloc(nv * sb);
+    const size_t bb = (size_t)hidden / 8;  // u5: the low-bit plane
+    if (lm_head.fmt == 4) d_head.bits = alloc(nv * bb);
     d_in_vocab.assign(vocab, 0);
     for (size_t i = 0; i < nv; ++i) {
       const size_t t = (size_t)d_vocab[i];
       if (t >= (size_t)vocab) return fail("DSpine draft vocabulary has a token id out of range");
       memcpy((uint8_t*)d_head.w.ptr() + i * wb, (const uint8_t*)lm_head.w.ptr() + t * wb, wb);
       memcpy((uint8_t*)d_head.scale.ptr() + i * sb, (const uint8_t*)lm_head.scale.ptr() + t * sb, sb);
+      if (lm_head.fmt == 4)
+        memcpy((uint8_t*)d_head.bits.ptr() + i * bb, (const uint8_t*)lm_head.bits.ptr() + t * bb, bb);
       d_in_vocab[t] = 1;
     }
   }
@@ -2306,7 +2311,8 @@ int Engine::dspine_draft_groups(DReq* rq, int ng, const q38_sampling* sp, float 
     dr0[gi] = hn;
     hn += rq[gi].k;
   }
-  const bool head_h = hn >= 2;  // the LM head's wide kernels read half rows
+  // the LM head's wide kernels read half rows; a u4/u5 head has no other input format
+  const bool head_h = hn >= 2 || lm_head.uniform();
   const size_t hb = (size_t)H * 2;
   double gpu = 0;
   @autoreleasepool {
@@ -2500,6 +2506,13 @@ int Engine::dspine_draft_groups(DReq* rq, int ng, const q38_sampling* sp, float 
   const float gs = ((const float*)lm_head.gscale.ptr())[0];
   const uint8_t* hw = (const uint8_t*)lm_head.w.ptr();
   const uint8_t* hs = (const uint8_t*)lm_head.scale.ptr();
+  const uint8_t* hbits = lm_head.fmt == 4 ? (const uint8_t*)lm_head.bits.ptr() : nullptr;
+  static float u_scale[256];
+  static bool u_scale_ok = false;
+  if (!u_scale_ok) {
+    for (int c = 0; c < 256; ++c) u_scale[c] = exp2f(-0.0625f * (float)c);
+    u_scale_ok = true;
+  }
   const uint16_t* tsvb = (const uint16_t*)d_tsv.ptr();
   const uint16_t* tgb = (const uint16_t*)d_tg.ptr();
   const float* cmat = (const float*)d_c.ptr();
@@ -2557,14 +2570,31 @@ int Engine::dspine_draft_groups(DReq* rq, int ng, const q38_sampling* sp, float 
       const uint8_t* wr = hw + (size_t)cand[c] * (H / 2);
       const uint8_t* sr = hs + (size_t)cand[c] * (H / 16);
       float acc = 0;
-      for (int gI = 0; gI < H / 16; ++gI) {
-        float a = 0;
-        const float* xx = rw.data() + gI * 16;
-        for (int b = 0; b < 8; ++b) {
-          const uint8_t by = wr[gI * 8 + b];
-          a += e2m1[by & 15] * xx[2 * b] + e2m1[by >> 4] * xx[2 * b + 1];
+      if (lm_head.fmt == 1) {
+        for (int gI = 0; gI < H / 16; ++gI) {
+          float a = 0;
+          const float* xx = rw.data() + gI * 16;
+          for (int b = 0; b < 8; ++b) {
+            const uint8_t by = wr[gI * 8 + b];
+            a += e2m1[by & 15] * xx[2 * b] + e2m1[by >> 4] * xx[2 * b + 1];
+          }
+          acc += a * e4m3[sr[gI]];
         }
-        acc += a * e4m3[sr[gI]];
+      } else {
+        // uniform grid: value = (n + 0.5 - L/2) * 2^(-c/16) * gscale, n = n4 (u4) or 2 n4 + b (u5)
+        const bool b5 = lm_head.fmt == 4;
+        const uint8_t* br = b5 ? hbits + (size_t)cand[c] * (H / 8) : nullptr;
+        const float mid = b5 ? 15.5f : 7.5f;
+        for (int gI = 0; gI < H / 16; ++gI) {
+          float a = 0;
+          const float* xx = rw.data() + gI * 16;
+          for (int j = 0; j < 16; ++j) {
+            int nq = (wr[gI * 8 + j / 2] >> (4 * (j & 1))) & 15;
+            if (b5) nq = 2 * nq + ((br[gI * 2 + j / 8] >> (j & 7)) & 1);
+            a += ((float)nq - mid) * xx[j];
+          }
+          acc += a * u_scale[sr[gI]];
+        }
       }
       const uint16_t* tgr = tgb + (size_t)cand[c] * kDRank;
       float resp = 0;

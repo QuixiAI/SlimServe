@@ -18,11 +18,12 @@ every chat turn boundary leaves a snapshot, a finished conversation's sequence
 stays alive, and a prompt resumes from the longest of those that is a prefix
 of it.
 
-Images are supported: the vision tower runs in this process (PyTorch,
-slimserve/native/vision.py) and the engine takes its rows as input embeddings.
+Images and videos are supported: the vision tower runs in this process
+(PyTorch, slimserve/native/vision.py) and the engine takes its rows as input
+embeddings.
 
 Not supported, and rejected or ignored explicitly rather than silently:
-video inputs (rejected), logprobs (rejected), n > 1 (rejected), structured
+logprobs (rejected), n > 1 (rejected), structured
 outputs / logit bias / repetition penalties / min_p (ignored with a warning).
 """
 from __future__ import annotations
@@ -131,8 +132,8 @@ class Q38EngineClient(EngineClient):
 
     def _check(self, params: SamplingParams, request: EngineCoreRequest) -> None:
         for f in request.mm_features or ():
-            if f.modality != "image":
-                raise ValueError(f"the q38 native engine accepts image inputs only, not {f.modality}")
+            if f.modality not in ("image", "video"):
+                raise ValueError(f"the q38 native engine accepts image and video inputs only, not {f.modality}")
         if params.n != 1:
             raise ValueError("the q38 native engine supports n = 1 only")
         if params.logprobs is not None or params.prompt_logprobs is not None:
@@ -161,15 +162,17 @@ class Q38EngineClient(EngineClient):
                 raise ValueError("image data missing for an image this engine has not seen")
             if f.data is not None:
                 d = f.data.get_data()
-                grid = d["image_grid_thw"].reshape(-1).tolist()
+                video = f.modality == "video"
+                gkey, pkey = ("video_grid_thw", "pixel_values_videos") if video else ("image_grid_thw", "pixel_values")
+                grid = d[gkey].reshape(-1).tolist()
                 if rows is None:
-                    rows = self._vision.encode(f.identifier, d["pixel_values"], d["image_grid_thw"])
+                    rows = self._vision.encode(f.identifier, d[pkey], d[gkey])
                 h, w = grid[1] // self._vision.merge, grid[2] // self._vision.merge
-                self._grids[f.identifier] = (h, w)
-            h, w = self._grids[f.identifier]
+                # a video's rows come as grid[0] frame groups of h x w
+                self._grids[f.identifier] = (grid[0], h, w) if video else (h, w)
             mask = f.mm_position.is_embed
             images.append((f.mm_position.offset, f.mm_position.length,
-                           None if mask is None else mask.numpy(), f.identifier, rows, (h, w)))
+                           None if mask is None else mask.numpy(), f.identifier, rows, self._grids[f.identifier]))
         return vision.plan(ids, images)
 
     # ---- worker thread ----

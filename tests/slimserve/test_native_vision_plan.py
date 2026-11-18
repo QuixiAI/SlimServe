@@ -70,3 +70,18 @@ def test_mask_selects_the_embedding_rows():
 def test_a_grid_that_does_not_fit_its_range_is_rejected():
     with pytest.raises(ValueError):
         vision.plan([IMG] * 5 + [1], [(0, 5, None, "a", _rows(4), (2, 2))])
+
+
+def test_video_frames_are_positioned_as_separate_grids():
+    # <t0> [start] frame0 [end] <t1> [start] frame1 [end] tail: 2 frame groups of 2 x 3
+    h, w, t = 2, 3, 2
+    frame = [IMG] * (h * w)
+    ids = [10, 11, 20, *frame, 21, 12, 20, *frame, 21, 30, 31]
+    offset, length = 2, len(ids) - 4
+    mask = np.asarray([i == IMG for i in ids[offset:offset + length]])
+    tokens, embeds, pos3 = vision.plan(ids, [(offset, length, mask, "vid", _rows(t * h * w), (t, h, w))])
+    types = [1 if i == IMG else 0 for i in ids]
+    np.testing.assert_array_equal(pos3, _reference_positions(types, [(h, w), (h, w)]))
+    assert embeds.shape == (t * h * w, 8)
+    assert (tokens[np.asarray(types) == 1] < 0).all() and len(set(tokens[tokens < 0].tolist())) == t * h * w
+    assert (tokens[np.asarray(types) == 0] == np.asarray(ids)[np.asarray(types) == 0]).all()

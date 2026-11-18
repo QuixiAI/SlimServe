@@ -94,7 +94,7 @@ Quality (teacher-forced KL against BF16 reference logits):
 
     python tools/kld.py engine --ref ref_eval.npz --set eval_set.json --pack W.q38w --chunk 4
 
-Server (text and images; see the module docstring for what is rejected):
+Server (text, images and video; see the module docstring for what is rejected):
 
     PYTHONPATH=../.. python -m slimserve.native.server --model <hf dir> \
         --q38-pack W.q38w --q38-mtp-pack MTP.q38w --enable-auto-tool-choice \
@@ -121,3 +121,9 @@ While the tree is being changed, tools take the engine binaries from
   `Q38_NORM_OFF`, `Q38_GU_OFF`, `Q38_NV`, `Q38_SKIP`, `Q38_KLOG`) are
   diagnostics; defaults are the measured-best paths. Results and rejected
   experiments are in `perf/optimization_status.md`.
+
+Image and video prompts against the Hugging Face reference (each step loads the
+whole model; run them one after the other):
+
+    tools/mm_parity.py ref    --model ~/models/Qwen3.8-27B --image a.png --out ref.npz
+    tools/mm_parity.py engine --model ~/models/Qwen3.8-27B --ref ref.npz --pack bf16.q38w

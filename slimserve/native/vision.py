@@ -1,4 +1,4 @@
-"""Image inputs for the q38 native engine.
+"""Image and video inputs for the q38 native engine.
 
 The language model runs in the q38 library; the vision tower (a 27-block ViT,
 0.45 B parameters) runs here through the reference PyTorch module, in the
@@ -15,7 +15,8 @@ What the engine needs for a prompt with images (`plan`):
           Text advances all three together; an image at position p with an
           h x w grid of merged patches puts row (y, x) at (p, p + y, p + x) and
           moves the next text token to p + max(h, w) (the reference
-          get_rope_index of Qwen3.5).
+          get_rope_index of Qwen3.5). A video is a sequence of such grids, one
+          per frame group, with its timestamp text between them.
 """
 from __future__ import annotations
 
@@ -62,7 +63,7 @@ class VisionTower:
 
     @torch.inference_mode()
     def encode(self, key: str, pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> np.ndarray:
-        """BF16 bits [rows, out_dim] of one image; `key` is its content hash."""
+        """BF16 bits [rows, out_dim] of one image or video (grid t, h, w); `key` is its content hash."""
         hit = self._cache.get(key)
         if hit is not None:
             self._cache.move_to_end(key)
@@ -86,12 +87,16 @@ def _row_ids(key: str, n: int) -> np.ndarray:
     return (-1 - ((base + np.arange(n, dtype=np.uint64)) % np.uint64(0x7FFFFFFF)).astype(np.int64)).astype(np.int32)
 
 
-def plan(ids: list[int], images: list[tuple[int, int, np.ndarray | None, str, np.ndarray, tuple[int, int]]]):
-    """Engine inputs for a prompt with images.
+def plan(ids: list[int], images: list[tuple[int, int, np.ndarray | None, str, np.ndarray, tuple[int, ...]]]):
+    """Engine inputs for a prompt with images and videos.
 
-    `images`: one (offset, length, is_embed mask or None, key, rows, (h, w))
-    per image, where [offset, offset + length) is its placeholder range in
-    `ids`, `rows` its embedding rows and (h, w) its merged-patch grid.
+    `images`: one (offset, length, is_embed mask or None, key, rows, grid) per
+    image or video, where [offset, offset + length) is its placeholder range in
+    `ids`, `rows` its embedding rows and `grid` its merged-patch grid: (h, w)
+    for an image, (t, h, w) for a video of t frame groups. A video's rows sit
+    in the prompt as t runs of h * w placeholders with text (timestamps, vision
+    start / end markers) between them; every run is positioned as an image of
+    its own, as the reference does.
     Returns (tokens int32 [n], embeds uint16 [rows, hidden], pos3 int32 [n, 3]).
     """
     n = len(ids)
@@ -100,26 +105,30 @@ def plan(ids: list[int], images: list[tuple[int, int, np.ndarray | None, str, np
     parts = []
     cur = 0   # next rotary position
     at = 0    # next prompt index
-    for offset, length, mask, key, rows, (h, w) in sorted(images, key=lambda im: im[0]):
+    for offset, length, mask, key, rows, grid in sorted(images, key=lambda im: im[0]):
+        t, h, w = (1, *grid) if len(grid) == 2 else grid
         where = np.arange(offset, offset + length)
         if mask is not None:
             where = where[np.asarray(mask, dtype=bool)]
-        if offset < at or len(where) != h * w or rows.shape[0] != h * w:
+        if offset < at or len(where) != t * h * w or rows.shape[0] != t * h * w:
             raise ValueError("image placeholder ranges do not match the image grids")
-        # text up to the first image row, and any non-image tokens inside the range
-        first = int(where[0])
-        pos3[at:first] = (cur + np.arange(first - at, dtype=np.int32))[:, None]
-        cur += first - at
-        if not np.array_equal(where, np.arange(first, first + h * w)):
-            raise ValueError("image rows are not contiguous in the prompt")
+        row_ids = _row_ids(key, t * h * w)
         k = np.arange(h * w, dtype=np.int32)
-        pos3[where, 0] = cur
-        pos3[where, 1] = cur + k // w
-        pos3[where, 2] = cur + k % w
-        cur += max(h, w)
-        tokens[where] = _row_ids(key, h * w)
+        for f in range(t):
+            run = where[f * h * w:(f + 1) * h * w]
+            first = int(run[0])
+            if first < at or not np.array_equal(run, np.arange(first, first + h * w)):
+                raise ValueError("image rows are not contiguous in the prompt")
+            # text up to this run: before the image, or between two frames of a video
+            pos3[at:first] = (cur + np.arange(first - at, dtype=np.int32))[:, None]
+            cur += first - at
+            pos3[run, 0] = cur
+            pos3[run, 1] = cur + k // w
+            pos3[run, 2] = cur + k % w
+            cur += max(h, w)
+            tokens[run] = row_ids[f * h * w:(f + 1) * h * w]
+            at = first + h * w
         parts.append(rows)
-        at = first + h * w
     pos3[at:] = (cur + np.arange(n - at, dtype=np.int32))[:, None]
     embeds = np.ascontiguousarray(np.concatenate(parts, axis=0))
     return tokens, embeds, np.ascontiguousarray(pos3)
