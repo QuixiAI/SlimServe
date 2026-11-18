@@ -35223,7 +35223,7 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   code and not quite on prose. `scratch dspine/policy.py` reproduces the
   aggregate from logged chains (60.4 simulated) and shows no stop rule that
   does better at these costs.
-- Decision: keep; DSpine is the drafter going forward (Sean, 2026-11-10: use
+- Decision: keep; DSpine is the drafter going forward (operator, 2026-11-10: use
   it for whatever it wins). Default: block up to 7, marginal rule at 0.06.
   Not done: a u4/u5 target head (the tail and the vocabulary copy read NVFP4
   head rows; loading fails with a message).
