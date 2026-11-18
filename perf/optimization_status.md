@@ -34629,3 +34629,740 @@ than PyPI 1.3.0), and the FP8 GEMMs.
   reverted: the tool_call_parser name (glm47 is correct and is what vLLM's
   own GLM-5.3-Flash recipe specifies), and an ordinary-token-spelling
   relaxation in the engine (wrong hypothesis, fixed nothing).
+
+
+## 2026-11-09 - Qwen3.8-27B native Metal engine (M1 Ultra): bring-up and kernel round 1
+
+- Status: retained (branch `qwen38-m1u-native`, `native/q38/`); work in progress.
+- Baseline: `qwen38-nvfp4-1` on this box, same unsloth NVFP4 checkpoint: plain
+  decode 11.06 tok/s, DFlash2 k=3 17.10 tok/s; llama.cpp Q4_K_M plain 20.9 tok/s.
+- Hypothesis: the torch-MPS step spends most of its time outside the weight
+  reads (about 240 command buffers a step). A purpose-built engine that encodes
+  the whole step into one command buffer over mmap'd no-copy weights should
+  put plain decode near the bandwidth floor of the checkpoint (19.1 GB a token).
+- Change: `native/q38` engine (C ABI, one command buffer per step for 64 layers
+  + final norm + LM head, step(m)/commit(n) sequence model shared by decode,
+  prefill chunks and verify), a numpy CPU oracle and KLD harness, and three
+  new kernels: single-pass half-precision NVFP4 batch GEMV for 2-8 rows, a
+  fused GDN core (gates + conv + recurrence + gated norm, one dispatch), and a
+  512-thread residual-add RMSNorm (the one-simdgroup norm cost 8 ms a step).
+- Correctness: teacher-forced logits against the CPU oracle on the same
+  weights: top-1 5/5, mean KL 1.5e-4 (chunkings 8, 3+2, 2+2+1 and 1 all agree);
+  per-layer residual cosine 0.999998 after layers 3 and 4. Sampled essay output
+  is coherent. Synthetic parity only; no serving path or long-context run yet.
+- Results (GPU ms per step, unsloth NVFP4 pack, 64-token prompt): M=1 34.0,
+  M=2 36.5, M=3 42.5, M=4 47.9, M=8 85.4. Plain decode at the model's default
+  sampling (temperature 1.0, top-p 0.95, top-k 20, seed 42, thinking on),
+  essay prompt, 400 tokens: 27.02 tok/s end to end (2.44x the SlimServe
+  profile, 1.29x llama.cpp). Decode profile: FP8 GEMVs 15.9 ms and NVFP4
+  GEMVs 13.4 ms (632-675 GB/s, at the measured roofline), all other kernels
+  4.0 ms. Multi-row steps are ALU-bound in the GEMVs, not bandwidth-bound.
+- Decision: kill gate passed (plain decode above llama.cpp on the same
+  checkpoint); continue with our own quantization (bytes per token are now 88%
+  of the decode step) and speculation in the native engine.
+- Raw artifacts: `perf/results/2026-11-09/q38-native-bringup/`.
+
+
+## 2026-11-09 - Qwen3.8-27B native engine: MTP speculation and kernel round 2
+
+- Status: retained (branch `qwen38-m1u-native`); speed numbers are on a pack
+  that does NOT meet the quality bar (see Correctness), so they are engine
+  results, not a shippable configuration.
+- Baseline: native engine round 1 on our own plain all-NVFP4 pack
+  (`qwen38-27b-q38nvfp4.q38w`, 14.45 GB read per token): plain 33.9 tok/s,
+  GPU ms per step M=1 27.5, M=2 31.0, M=3 38.6 to 39.7, M=4 46.7.
+- Hypothesis: (a) the model's own 1-layer MTP head, verified with lossless
+  rejection sampling, beats plain decode once a 2-4 row verify step costs
+  little more than one row; (b) multi-row steps are held back by per-group
+  BF16 -> half conversion of the activations and by the serial `ba` gate dots
+  in the GDN kernel, not by the weight reads.
+- Change: MTP head (sidecar pack, own KV cache, chained drafts, adaptive
+  depth); half-precision activation path (`hh`, `mvx`/`gux` kernels, GDN half
+  output); `ba` dots spread over 13 simdgroups; GDN state kept as base + rank-1
+  update log instead of one state copy per row; row counts above 4 split evenly
+  across passes; residual-norm folding into the GEMVs, kept for M=1 only.
+- Correctness: teacher-forced KL against the BF16 oracle is unchanged by the
+  kernel changes within path-to-path noise (eval1, 1023 tokens: 0.0356 to
+  0.0370 across chunk 1/3/4 and fold on/off). The plain pack itself scores mean
+  KL 0.036 (eval1) / 0.055 (eval2, 6651 tokens), top-1 94.2% / 90.4%, against a
+  bar of 0.015 / 95%: not shippable. Speculation is distribution-preserving by
+  construction (rejection sampling); no long-context or serving run yet.
+- Results (GPU ms per step, 64-token prompt): M=1 26.05, M=2 28.45, M=3 33.4,
+  M=4 38.0, M=6 55.3, M=8 66.6. Decode at default sampling (temperature 1.0,
+  top-p 0.95, top-k 20, seed 42, thinking on), 4 prompts x 600 tokens:
+  plain 36.11 tok/s; MTP depth 2, adaptive 0.5: 60.37 tok/s aggregate (essay
+  57.42, explain 56.12, code 60.69, math 68.76); depth 3, adaptive 0.65: 61.74;
+  depth 4: 54.30. Acceptance by draft position on prose about 73% / 65%.
+  Before round 2 the same depth-2 run was 53.34. GDN kernel 5.9 -> 3.4 ms at
+  M=4. Prefill is about 120 tok/s of GPU time at 8 rows a step.
+- Rejected, measured: 6 and 8 columns per GEMV pass (8 rows 51 ms vs 33 ms as
+  2 x 4), 2 weight rows per simdgroup (M=3 40 ms), dropping the weight 2^14
+  rescale by pre-scaling activations (-1 ms at M=3, none at M=4, range
+  |x| < 1023), 16-byte activation loads (no change), scale groups of 32 or 64
+  weights (RTN error +18% / +33% for 5.5% / 8% fewer bytes), norm folding at
+  M >= 3 (+0.7 to +2 ms), a half-precision FP8 multi-row kernel in the same
+  style (mixed unsloth pack, M=3: 39.2 ms vs 39.8 ms with the QuixiCore mv4r
+  kernel, M=2 and M=4 slightly slower; removed).
+- Mixed unsloth NVFP4+FP8 pack (19.1 GB a token, the only pack that passes the
+  quality bar today, KL 0.016) with the round 2 kernels: MTP depth 2 50.30
+  tok/s aggregate (essay 47.07, explain 47.42, code 50.20, math 57.93), up
+  from 41.8; M=1 33.1 ms, M=3 39.3 ms.
+- Decision: keep. The 55 tok/s prose target is met on speed; the open item is a
+  4-bit pack that passes the quality bar (GPTQ run in progress).
+- Raw artifacts: `perf/results/2026-11-09/q38-native-bringup/` (`bench_xh_d2`,
+  `bench_xh_plain`).
+
+
+## 2026-11-09 - Qwen3.8-27B native engine: grouped-query attention kernel
+
+- Status: retained (default on; `Q38_ATTN_OFF=1` restores the QuixiCore
+  paged-attention kernels).
+- Baseline: native engine round 2, plain all-NVFP4 pack, `--ctx 262144`. With
+  6.6k tokens of context a decode step was 34.2 ms (26.05 ms at 64 tokens) and
+  an 8-row prefill step 134 ms (66.6 ms); prefill of 6651 tokens ran at 76.8
+  tok/s.
+- Hypothesis: the generic kernel walks the KV cache once per query head; the
+  model has 6 query heads per KV head, so K and V are read 6 times per row.
+- Change: `native/q38/kernels/q38_attn.metal`: one simdgroup per (key
+  partition, KV head, row) holds 8 dims per lane for all 6 queries, reads K and
+  V once, accumulates the softmax online; the reduce kernel merges partitions
+  and applies the sigmoid output gate.
+- Correctness: same argmax as the old kernels on the last 8 rows of a 2048
+  token prefill; teacher-forced KL on eval1 0.0359 (0.0359 before).
+- Results: 4169-token chat prompt, default sampling, seed 42: prefill 107.1
+  tok/s (old 85.2), plain decode 27.36 ms GPU per step (old 31.25), MTP depth
+  2 61.81 tok/s. 6600 tokens of raw text: prefill 107.3 tok/s (old 76.8).
+  Remaining context cost is about 0.31 ms per decode step per 1k tokens (the
+  K+V walk runs at roughly 210 GB/s, a third of the weight-read rate).
+- Decision: keep. A faster KV walk is open for very long contexts.
+- Raw artifacts: `perf/results/2026-11-09/q38-native-bringup/` (commands in
+  this entry; logs for the long runs are under
+  `~/.local/scratch/qwen38-campaign/tmp/`).
+
+
+## 2026-11-09 - Qwen3.8-27B native engine: our own quantization, round 1 (GPTQ NVFP4)
+
+- Status: in progress; nothing shippable yet (quality bar: mean KL <= 0.015
+  against BF16 on our harness; the unsloth mixed NVFP4+FP8 checkpoint scores
+  0.0160 on the same harness and reads 19.1 GB a token).
+- Baseline: plain round-to-nearest all-NVFP4 from BF16 (group-16 E2M1, E4M3
+  group scales searched for squared error), 14.45 GB read per token: mean KL
+  0.0355 on eval1 (1023 tokens) and 0.0546 on eval2 (6651 tokens, half model
+  chat output, half local prose/code), top-1 94.2% / 90.2%. An activation-
+  weighted (imatrix) variant: 0.0301 / 0.0456.
+- Hypothesis: error feedback against the calibration Hessian (GPTQ), with the
+  layers upstream already quantized, cuts the output error of every projection
+  several-fold at the same bytes.
+- Change: `native/q38/tools/gptq.py` (CPU, torch): one calibrated forward pass
+  over 19,050 tokens, group scale searched on the error-compensated weights,
+  damping 0.01; 7372 s. Also `quantize_fp8.py` (FP8 sidecar packs),
+  `mixpack.py`, `sens_sweep.sh`, `layer_sweep.sh`, `mix_eval.sh`.
+- Correctness: scored through the GPU engine, which matches the CPU oracle on
+  the unsloth pack (0.0158 vs 0.0158 on eval1).
+- Results: GPTQ all-NVFP4, same 14.45 GB a token: eval2 mean KL 0.0245, median
+  0.0050, top-1 93.2%; eval1 0.0321 / 93.8%. Restoring one class to BF16 from
+  that pack (eval2 mean KL): down 0.0160, gate_up 0.0171, lm_head 0.0225,
+  gdn_out 0.0223, qkvz 0.0224, qkv 0.0231, o 0.0241. Held-out relative output
+  error on early projections (eval2 activations; calibration activations in
+  brackets): MLP gate_up rounding 0.0043, GPTQ 0.0022 (0.0012); MLP down
+  (17408 inputs) rounding 0.0046, GPTQ damping 0.01 0.0046 (0.0006), damping
+  0.2 0.0029, damping 1.0 0.0028; GDN qkvz GPTQ 0.0009; FP8 E4M3 rounding
+  0.0004; per-row int8 rounding 0.00005 to 0.0001. A uniform 16-level 4-bit
+  grid is 17% better than E2M1 on the MLP projections under GPTQ, none on
+  qkvz.
+- Decision: GPTQ is kept as the 4-bit method but run 1 is not the pack to
+  ship: with damping 0.01 and 19k tokens the wide down projections overfit
+  completely (no better than rounding out of sample). Run 2 uses 40.9k
+  calibration tokens and per-class damping (down 0.5, gate_up / gdn_out / o
+  0.2, others 0.03, lm_head 0.05). The uniform grid is parked (new kernel
+  family for a 17% gain on two classes).
+- MLP sensitivity by depth (restore gate_up + down of 8 layers to BF16, eval2
+  mean KL from 0.0245): layers 0-7 0.0242, 8-15 0.0240, 16-23 0.0230, 24-31
+  0.0223, 32-39 0.0225, 40-47 0.0219, 48-55 0.0215, 56-63 0.0197.
+- Raw artifacts: `perf/results/2026-11-09/q38-quant/` (`sens2_results.jsonl`,
+  `layer_sens2_results.jsonl`, `kld2_results.jsonl`, `gptq_holdout.log`,
+  `grid_holdout.log`, `gptq_nvfp4.log`).
+
+## 2026-11-09 - Qwen3.8-27B native engine: image input
+
+- Baseline: the native server rejected image requests; a SlimServe profile
+  cannot be registered without vision.
+- Hypothesis: the language side needs only two things for images - input rows
+  taken from the vision tower instead of the token table, and the model's
+  three-axis rotary positions - so the tower itself can run through the
+  reference PyTorch module in the server process.
+- Change: engine `q38_step_mm` / `q38_mtp_feed_mm` (a negative token takes its
+  row from a BF16 embedding array; optional per-row (t, h, w) positions, with
+  the rotary rows built on the host; the text position shift after an image is
+  part of the sequence state and of snapshots); generator
+  `q38_gen_prompt_mm` (the negative ids are derived from the image content
+  hash, so prefix snapshots never match across different images);
+  `slimserve/native/vision.py` (tower on MPS in fp32, rows cached by content
+  hash; prompt planning); the server accepts images and rejects video.
+  torchvision 0.28.0 was added to the venv (the HF processor needs it).
+- Correctness: functional only. A generated 640x416 image (260 image tokens):
+  the model read the text "CODE 7421", named both shapes, their colours and
+  their relative placement, and answered a follow-up about vertical order.
+  Turn 2 reused 335 of 444 prompt tokens from the snapshot. Planner unit tests
+  (`tests/slimserve/test_native_vision_plan.py`, 5 passed) compare positions
+  with a transcription of the reference `get_rope_index`. Text regression:
+  snapshot test 0 of 1,241,600 logits differ. NOT done: logit parity of an
+  image prompt against the HF reference; video; the draft head keeps plain
+  sequence positions after an image (affects acceptance only, not output).
+- Measured: first image turn 23.7 s for 508 completion tokens including the
+  one-time tower load; second turn 2.8 s for 100 tokens.
+- Decision: kept.
+- Raw artifacts: `perf/results/2026-11-09/q38-vision/` (`server_vis.log`,
+  `vis_test.png`).
+
+## 2026-11-10 - Qwen3.8-27B native engine: concurrent requests in one pass
+
+- Baseline: the native server decoded one sequence at a time; a second
+  request waited for the first to finish (aggregate 58-63 tok/s at any
+  concurrency, unbounded time to first token).
+- Hypothesis: the weight read is the cost of a pass and extra rows are cheap
+  (26 ms for 1 row, 38 ms for 4, 66 ms for 8), so rows of different
+  sequences in the same pass multiply throughput; only the stateful kernels
+  (GDN state, conv history, attention K/V) need to know about sequences.
+- Change: per-sequence state (`Seq`: position, rotary offset, GDN conv /
+  state / log, K/V grown on demand from 4096 tokens, MTP K/V); a step takes
+  groups (sequence, rows); `q38_attn_part_ms` and `q38_gdn_core` serve all
+  groups in one dispatch each (per-sequence dispatches cost 12 ms at 8
+  sequences); `q38_pool` (include/q38/pool.h) schedules decode rows, MTP
+  drafts (depth 2 for one stream, 1 for two or three, none from four) and
+  prompt chunks into each pass, with snapshots and idle sequences shared for
+  prefix reuse; the server runs one worker thread over the pool
+  (`--q38-max-streams`, default 8).
+- Correctness: single-stream sampled output is token-identical to the
+  previous build (speculative and plain), snapshot test exact (0 of 1,241,600
+  logits differ), one pool stream token-identical to the single-stream
+  generator; `q38_lab --multi-test N`: sequence 0's logits are bit-identical
+  when the other sequences are replaced by unrelated content (0 of 5,959,680
+  differ) for N = 2, 4, 8; against solo runs the argmax differs in 1/48, 2/96,
+  4/192 rows (the solo run uses the 1-row folded-norm kernels, the joint run
+  the multi-row ones; the worst rows follow an end-of-turn token).
+- Measured (GPTQ2 NVFP4 pack, essay prompt, 300 tokens per stream, default
+  sampling, `q38_lab --pool-bench N`, aggregate while all streams decode):
+  1 stream 63.0 tok/s, 2: 83.1, 3: 86.3, 4: 98.0, 8: 110.9. GPU time per
+  pass with one plain row per sequence: 30.6 ms (2), 39.7 ms (4), 70.9 ms (8).
+  Through HTTP (streamed chat, 8 different prompts, 400 tokens each, wall
+  time including prefill, `http_final.log`): c1 57.3 tok/s, c2 78.6, c4
+  92.1, c8 97.7 aggregate; every request streams from the start (time to
+  first token 0.2-2.4 s at c8). Before the single-dispatch kernels the same
+  test gave c2 72.0, c4 81.6, c8 89.2. Server footprint after the c8 run:
+  8.9 GB (5.3 GB Metal buffers) on top of the mapped weights.
+- Side finding: Metal counts whole buffers in the process footprint; the
+  previous engine carried 17 GB for full-context K/V at the default 262,144
+  context on a 76-token prompt. K/V is now allocated as sequences grow.
+- Decision: kept.
+- Raw artifacts: `perf/results/2026-11-10/q38-concurrency/`.
+
+## 2026-11-10 - Qwen3.8-27B native engine: prompt prefill through the 8x8 matrix kernels
+
+- Baseline: prompt rows went through the decode kernels, 8 rows per pass:
+  105.9 tok/s on a 2,048-token prompt (`q38_lab --big-test`, GPTQ2 NVFP4
+  pack). llama.cpp (Metal, Q4_K_M GGUF of the same model, same machine,
+  `llama-bench`): pp512 254.5, pp2048 253.2 tok/s, tg128 20.8 tok/s
+  (`perf/results/2026-11-10/q38-baselines/llama_bench_q4km.log`). Decode was
+  3x ahead of llama.cpp, prefill 2.4x behind.
+- Hypothesis: the register-resident GEMV kernels top out at 4 activation rows
+  per pass over the weights; the GPU's 8x8 matrix primitive
+  (`simdgroup_multiply_accumulate`, llama.cpp's `kernel_mul_mm` tile: 64 weight
+  rows x 32 activation rows, 128 threads) with our own weight decode should
+  bring prefill to llama.cpp's level without touching decode.
+- Change: `kernels/q38_gemm.metal` (`q38_gemm_{nvfp4,u4,u5}[_xh]`); an engine
+  step of ONE sequence may carry up to 64 rows ("big" step): every projection
+  through the GEMM kernels, the GDN core in 8-row sub-steps, attention over
+  all rows, LM head on the last row only. The pool gives a prefilling stream
+  64-row passes (every pass while nothing decodes, one after every
+  `big_every` = 2 ordinary passes while streams decode) and leaves the last
+  128 prompt rows (8 before a snapshot mark) to ordinary passes, so the MTP
+  head sees the end of the prompt and snapshots are taken as before.
+- Correctness: rows after a 192-token big prefill score the same KL against
+  the BF16 reference as after an 8-row prefill (eval2, 3,771 rows: 0.02088
+  big, 0.02092 8-row; `kld_big_head.log`). One pool stream on a short prompt
+  is still token-identical to the generator API; snapshot test exact;
+  multi-sequence test unchanged. Per-row logit cosine between kernel routes is
+  not a usable check at full depth: two established routes (half-activation
+  GEMV and the QuixiCore float kernels) differ by 0.998 on one sensitive row
+  of the test prompt.
+- Bugs found: the GDN sub-step dispatches have to re-register every buffer
+  range with the encoder's dependency tracker (it forgets a dispatch's ranges
+  once issued); without that the output projection raced the later sub-steps
+  (prefill rows 0.99 cosine after one layer).
+- Measured (2,048-token prompt, GPTQ2 NVFP4): 8-row 105.9 tok/s, 32-row
+  chunks 162, 64-row chunks 213.4 tok/s (`big_test_64_final.log`). Through
+  the pool with the MTP head: time to first token 17.6 s -> 10.3 s
+  (`pool_c1_long2k_big-1.log`, `pool_c1_long2k_keep128_s42.log`); three
+  staggered requests with the same 2k prompt 28.3 s -> 20.3 s in total
+  (`pool_stagger3_long2k_big.log`).
+- Profile of a 64-row pass (kernel classes dropped one at a time): GEMM 86%,
+  GDN core 7% (8 sub-step dispatches x 48 layers), norm+residual 5%, attention
+  2%. Inside the GEMM kernel the multiply rounds are 56% of the time; decode,
+  block stores and weight traffic are the rest.
+- Rejected kernel variants (tok/s on the same prompt; kept kernel 213): 64x64
+  tile with 256 threads 181-187; 64x64 tile with 16 accumulators per
+  simdgroup 186; 64 columns of K per step 172; two alternating block sets
+  (one barrier per step) 202 vs 208; float blocks 179 vs 201; a 16 KB staging
+  array 137 (threadgroup memory above ~16 KB costs a third). Kept: output
+  staged through the weight-block memory (201 -> 208) and a one-multiply NVFP4
+  decode (208 -> 213).
+- MTP tail: drafts kept / decode speed on the 2k prompt (2 seeds x 500
+  tokens) with the head shown the last 32 prompt pairs 61% / 48.9 tok/s, 128
+  pairs 64% / 50.8, 256 pairs 66% / 52.4; default 128.
+- Mixed load through HTTP (one request decoding 700 tokens, a second arrives
+  4 s later with a 1,456-token prompt; `http_mixed_be*.log`, `http_mix1.log`):
+  big passes off: newcomer's first token after 14.9 s, the decoding request
+  runs at 21.9 tok/s meanwhile and finishes in 24.3 s; one big pass per 6
+  ordinary: 10.2 s / 14.3 tok/s / 22.8 s; one per 2 (default): 8.6 s / 9.6
+  tok/s / 20.9 s, longest pause of the decoding stream 0.42 s. Both requests
+  finish sooner with big passes, so the default stays at 2
+  (`--q38-big-prefill-every`).
+- Chunk size: the same kernels with more rows per pass (GPU time for the
+  2,048-token prompt): 64 rows 9.53 s, 128 rows 8.62 s, 256 rows 7.86 s, 512
+  rows 7.73 s; wall 259.6 tok/s at 256 rows and 263.8 at 512
+  (`big_test_256.log`, `big_test_512.log`), decode rows after it match the
+  8-row path as before, and KL after a 256-row head is 0.02093 against 0.02103
+  (2,847 rows). The engine limit is now 512 rows; the pool uses 256-row passes
+  while nothing decodes (a pass of about one second) and 64-row passes
+  between decode passes. On the 6,600-token prompt with the mix1 pack:
+  197.8 tok/s at 64 rows (`big_test_64_long6600_mix1.log`).
+- MTP pairs are fed from the rows of the big pass itself
+  (`q38_mtp_feed_big`), so only the last 8 to 23 prompt rows go through
+  ordinary passes. Pool, 2k prompt, mix1 pack: first token after 8.31 s
+  (246 prompt tok/s end to end; 17.6 s before this work), drafts kept 63%
+  over two seeds as before (`pool_c1_long2k_big256_feed_s*.log`); three
+  staggered requests with the same prompt 19.5 s in total.
+- Serving smoke through HTTP with the mix1 pack (`http_smoke_mix1.log`): a
+  code planted a third of the way into a 1,492-token prompt is recalled, the
+  second turn and a repeat of the prompt are served from the prefix cache
+  (1,487 and 1,492 cached tokens), image and tool-call requests pass; 8
+  concurrent requests 90.9 tok/s aggregate (`http_c8_mix1.log`).
+- GDN core for big steps in one dispatch (`q38_gdn_core_big`: the rows are
+  walked in runs of 8 inside the kernel, conv history read from the chunk's
+  own rows, recurrent state stored to the base after every run, the update
+  log replayed once and left empty): the 8-row sub-step dispatches were 11%
+  of a 256-row pass. 256-row chunks 259.6 -> 265.8 tok/s, 512-row 263.8 ->
+  271.3 (`big_test_256_gdnloop.log`, `big_test_512_gdnloop.log`); every
+  prefill row matches the 8-row path after one and three layers, KL after a
+  256-row head unchanged (0.02093).
+- Bug found on the way: Metal gave this kernel's pipeline a limit of 384
+  threads per threadgroup (the 8-row kernel: 512) and a 512-thread dispatch
+  ran garbage without any error. The kernel now uses 12 simdgroups, and the
+  encoder aborts on any dispatch above its pipeline's
+  `maxTotalThreadsPerThreadgroup` (`Q38_KLOG=1` prints the limits).
+- End to end with the mix1 pack: pool, 2,048-token prompt, first token after
+  8.08 s (`pool_c1_long2k_final_s42.log`); 6,600-token prompt 27.3 s against
+  60.9 s with big passes off (`pool_c1_long6600_final.log`); through HTTP a
+  code planted a third of the way into a 7,972-token prompt is recalled and
+  the next turn reuses 7,967 cached tokens (`http_smoke_mix1_6k.log`).
+- Decision: kept. Prefill is 266 tok/s in 256-row chunks (271 in 512-row)
+  against llama.cpp's 253-254 on the same machine (was 106), with decode 3x
+  ahead. Remaining candidate: the norm dispatches (about 3% of a pass).
+- Raw artifacts: `perf/results/2026-11-10/q38-gemm-prefill/`.
+
+## 2026-11-10 - Qwen3.8-27B native engine: quantization round 2 (GPTQ 5-bit uniform, mixed packs)
+
+- Baseline: GPTQ2 NVFP4 pack (all projections 4.5 bits a weight): eval2 KL
+  0.0225, eval1 0.0259, 14.45 GB read per token, 60.9 tok/s speculative
+  aggregate (`tools/bench.sh`, 4 prompts x 600 tokens, default sampling), 37.1
+  plain. Plain-rounded 5-bit uniform (u5, 5.5 bits a weight): KL 0.0159 at
+  17.65 GB.
+- Hypothesis: GPTQ on the u5 grid with the round-1 damping map gives a pack
+  well under the 0.015 bar, and using it only for the tensors that matter most
+  per byte gets under the bar at close to 4-bit speed.
+- Change: `tools/gptq.py --fmt u5` on the 40.9k-token calibration set, damping
+  0.03 with `L*.down=0.5;L*.gate_up=0.2;L*.gdn_out=0.2;L*.o=0.2;lm_head=0.05`
+  (8,261 s on 12 CPU threads) -> `qwen38-27b-gptq3-u5.q38w`; mixes with
+  `tools/mixpack.py`, scored with `tools/mix_eval.sh` (KL on the two held-out
+  sets through the engine, then the speed bench).
+- Measured (5-bit tensors named, the rest GPTQ2 NVFP4; GB read per token /
+  eval2 KL / eval1 KL / top-1 on eval2 / speculative aggregate tok/s / plain):
+
+      all 4-bit (GPTQ2)                       14.45  0.0225  0.0259  -      60.9  37.1
+      MLP of layers 48-63                     14.98  0.0175  0.0211  0.933  61.3  35.5
+      down                                    15.16  0.0178  0.0170  0.937  60.2  35.1
+      down + gate_up 48-63        ("mix1")    15.52  0.0148  0.0152  0.942  59.7  34.4
+      down + lm_head + gdn_out                15.51  0.0157  0.0141  0.940  57.7  34.4
+      down + gate_up 48-63 + lm_head + gdn_out 15.86 0.0119  0.0122  0.948  57.3  33.6
+      down + gate_up 32-63                    15.87  0.0124  0.0118  0.946  58.2  33.7
+      down + gate_up 48-63 + late mixers + head 15.90 0.0117 0.0122  0.951  57.2  33.6
+      down + gate_up                          16.59  0.0111  0.0099  0.948  56.3  32.7
+      all 5-bit (GPTQ3)                       17.65  0.0048  0.0047  0.964  53.5  31.1
+
+  Per-prompt speeds vary by 2-3 tok/s between packs because the sampled text
+  differs; the aggregate is the comparable number. KL noise between runs of
+  the same pack is about 0.001.
+- Reading: GPTQ helps the uniform grid more than NVFP4 (plain rounding ->
+  GPTQ: 0.0159 -> 0.0048 for u5, 0.0546 -> 0.0225 for NVFP4). Per byte, the
+  late gate_up tensors buy the most KL (0.008 per GB), then down (0.0067),
+  then the head and GDN output (0.006); speed falls slowly up to 15.5 GB and
+  about 3 tok/s per GB after that.
+- Decision: `mix1` (down + gate_up of layers 48-63 at 5 bits) is the default
+  pack: KL 0.0148 / 0.0152 against the 0.015 bar at 59.7 tok/s aggregate
+  (essay 56.0, explain 56.5 tok/s). The all-5-bit pack is kept as the quality
+  option (KL 0.0048, top-1 96.4%, 53.5 tok/s). Through HTTP with mix1: one
+  request 55.8 tok/s after the first token, four at once 86.5 tok/s aggregate
+  (`perf/results/2026-11-10/q38-gemm-prefill/http_mix1.log`).
+- Raw artifacts: `perf/results/2026-11-10/q38-quant-gptq3/`
+  (`mix_results_g3.jsonl`, `gptq3_u5.log`, `mix_g3*.log`).
+
+## 2026-11-10 - Qwen3.8-27B native engine: draft settings sweep (no change)
+
+- Baseline: mix1 pack, MTP head (NVFP4), depth 2, adaptive threshold 0.5:
+  59.8 tok/s speculative aggregate (`tools/bench.sh`, 4 prompts x 600 tokens,
+  default sampling, seed 42); first-draft acceptance 72-78% on prose, 94% on
+  math.
+- Hypothesis: acceptance, not kernel time, is what is left for decode; a more
+  precise draft head, a different depth or threshold, or different draft
+  sampling might raise tokens per cycle.
+- Measured (aggregate tok/s, seed 42): BF16 draft head 55.1 (acceptance not
+  higher, each draft costs more); threshold 0.3 58.3, 0.7 58.6; draft
+  temperature 0.8 59.4, 1.2 59.2; draft top-k 8 59.0; depth 3 threshold 0.6
+  62.2, 0.8 60.5. Three more seeds: depth 2 59.4 / 60.0 / 59.7 (mean 59.7);
+  depth 3 threshold 0.6 62.0 / 58.6 / 60.6 (60.4), threshold 0.5 62.4 / 59.8 /
+  58.7 (60.3); depth 4 55.5 / 55.9 / 55.7.
+- Reading: run-to-run spread is about 1.5 tok/s (the sampled text differs),
+  so depth 3 is +1% at best and the seed-42 result was noise. Depth 4 is
+  clearly worse: five rows need a second pass over the weights (the GEMV
+  kernels carry at most four rows per pass). The draft head's quantization is
+  not what limits acceptance.
+- Decision: defaults unchanged (depth 2, threshold 0.5). More tokens per
+  cycle needs a better drafter and a cheaper verify step for 5-8 rows, not
+  tuning.
+- Raw artifacts: `perf/results/2026-11-10/q38-draft-sweep/`.
+
+## 2026-11-10 - Qwen3.8-27B native engine: 5 to 8 verify rows in one pass over the weights
+
+- Baseline (mix1 pack, 840-token prompt fed in m-row steps, GPU ms per step):
+  1 row 28.4, 2: 30.5, 3: 35.0, 4: 40.2; 5 to 8 rows took two passes: 58.2,
+  58.7, 67.6, 69.0. MTP depth 4 ran at 55.6 tok/s against 59.7 for depth 2.
+- Hypothesis (from the 8-row kernels in lair PR #100): one pass for up to 8
+  rows costs a few ms per extra row; target 8 rows under 50 ms.
+- Change: `q38_nvfp4_*_w<GW>c<R1>` and `q38_u{4,5}_*_w<GW>c<R1>` kernel
+  variants (half-input plain and fused gate/up). GW is the number of weights a
+  lane decodes per iteration: 16 (one scale group, as before) for 5 rows, 8
+  for 6 to 8 rows. The engine picks them by row count (`Q38_COLS_MAX=4`
+  restores two passes, `Q38_GW` forces a variant). The BF16-input fused
+  kernels (MTP head, 1-row norm fold) stay at 4 rows a pass.
+- Measured, ms per step for 5 / 6 / 7 / 8 rows:
+  whole group (GW 16), 4 weight rows per simdgroup: 51.4 / 71.0 / - / 111;
+  whole group, 2 weight rows per simdgroup: 62 / 73.6 / - / 104;
+  half group (GW 8), half-precision group sums: 51.0 / 55.3 / 61.4 / 67.6;
+  kept (GW 16 at 5 rows, GW 8 with fp32 group sums above): 49.9 / 55.4 / 61.3 / 68.8.
+  The half-group kernel is slower where the whole-group one fits (4 rows 44.8
+  against 40.2), so 1 to 4 rows are unchanged.
+- Correctness: eval2 KL against BF16 with the prompt fed in 5-row steps
+  0.01480 (4-row steps 0.01480); 6-row and 8-row steps 0.01471. The half-group
+  kernel with half-precision sums scored 0.01496 (eval1 0.01543 against
+  0.01517), which is why its group sums are fp32 (1.2 ms at 8 rows). Snapshot
+  test exact. Top-1 agreement moves by 0.4% between these routes (0.9423 /
+  0.9390), the same size as other route changes.
+- Reading: the target was not reachable. Beyond 4 rows every extra row costs
+  5.5 to 6 ms of arithmetic (about 5e12 multiply-adds a second); one row on top
+  of the weight read costs 2 to 5 ms. PR #100 reports 3 ms a row on an M4 Max
+  on top of a 58 ms pass; here the pass is 28 ms, so rows are relatively four
+  times as expensive and deep verification pays much less.
+- Decode bench on the new build (MTP head, threshold 0.5, seed 42, tok/s
+  aggregate): depth 2 60.0, depth 4 58.0 (was 55.6), depth 5 58.8. Acceptance
+  per draft position on prose stays at 67-77% at every depth; math 86-93%.
+  Defaults unchanged (depth 2).
+- Decision: kept (5 to 7 rows are 6 to 8 ms cheaper; concurrent serving with
+  5 to 8 rows in a pass gains the same).
+- Raw artifacts: `perf/results/2026-11-10/q38-wide-verify/`.
+
+## 2026-11-10 - Qwen3.8-27B native engine: DSpine-b16 drafter, acceptance measured offline (kill gate: prose fails)
+
+- Baseline: MTP head, depth 2, mix1 pack: 59.7-60.0 tok/s aggregate (essay
+  56-57, explain 57-58, code 58-59, math 68-69), 2.1-2.2 tokens per cycle on
+  prose, 2.7 on math.
+- Hypothesis: `tencent/Qwen3.8-27B-DSpine-b16` raises tokens per cycle enough
+  to clear +10% on prose (the gate set before building a Metal drafter).
+- Method (no Metal drafter built): the upstream MLX drafter code
+  (Tencent/DSpine at 321b0fc, `dspine_mlx`, unchanged; config patched to
+  full attention, valid below its 8,192-token window) driven with the five tap
+  residuals (layers 1/16/31/46/61) and the filtered target distributions
+  (T 1.0, top-k 20, top-p 0.95) from our CPU reference on the mix1 pack, along
+  the four bench trajectories (prompt + 600 sampled tokens each). At every
+  anchor the draft chain is forced along the trajectory and
+  min(1, q/p) recorded per draft position; the running product estimates the
+  probability that the first k drafts are accepted under speculative sampling.
+  Draft LM head and embeddings: the BF16 originals.
+- Measured, expected tokens per cycle with k drafts verified (k = 1 / 2 / 3 /
+  4 / 5 / 7 / 15): essay 1.74 / 2.22 / 2.52 / 2.73 / 2.88 / 3.08 / 3.42;
+  explain 1.79 / 2.36 / 2.77 / 3.06 / 3.26 / 3.53 / 4.00; code 1.82 / 2.43 /
+  2.87 / 3.17 / 3.38 / 3.69 / 4.39; math 1.95 / 2.82 / 3.61 / 4.34 / 4.98 /
+  6.08 / 8.85. Conditional acceptance per draft position: essay 0.63-0.77,
+  explain 0.70-0.79, code 0.69-0.82, math 0.89-0.95. The uncapped values agree
+  with the model card (4.0 on chat, 5.4-6.3 on code and math benchmarks).
+- Projection (verify cost by rows from the entry above, 1.1 ms host, drafter
+  assumed 4 ms + 0.6 ms a row; k chosen per cycle from the drafter's own
+  confidence, threshold fitted on the same data): essay 56.5 tok/s, explain
+  62.0, code 64.0, math 85.8, aggregate 68.4. With a drafter at 3 ms + 0.4 ms a
+  row: 59.6 / 65.2 / 67.2 / 89.4, aggregate 71.8. With 6 ms + 0.8: 52.7 / 58.0
+  / 59.9 / 81.4, aggregate 64.2. Best fixed k is 2-3 on prose and code, 6 on
+  math. A per-cycle choice that knew the outcome in advance would reach 60.7 /
+  66.5 / 68.5 / 89.0 at the middle cost.
+- Reading: against the MTP head the drafter is worth about 0% on the essay,
+  +7% on the explanation, +9% on code and +25% on math at the middle cost
+  assumption. Prose does not clear +10% even with the optimistic drafter cost.
+  The limit is the cost of a verify row on this GPU, not the drafter.
+- Limits of the measurement: one 600-token trajectory per prompt; the
+  confidence threshold is fitted in-sample; the drafter cost on our engine is
+  an assumption (its weights are 3.2 GB in BF16 plus the head pass); the
+  drafter saw mix1 hiddens with a BF16 draft head.
+- Decision: kill gate triggered for prose; Metal drafter not started, pending
+  the user's call (the case for building it is code and math only).
+- Raw artifacts: `perf/results/2026-11-10/q38-dspine-gate/`.
+
+## 2026-11-10 - Qwen3.8-27B native engine: what a verify row costs and why (ablations, no change kept)
+
+- Baseline (all-NVFP4 GPTQ2 pack, GPU ms per step by rows): 1: 26.0, 2: 28.4,
+  3: 32.4, 4: 38.0, 6: 53.7, 8: 67.1.
+- Question: is the cost of rows 3 to 8 weight decode, activation loads,
+  memory latency, register footprint (the "residency cliffs" of lair PR #100's
+  playbook) or the multiply-adds themselves.
+- Measured at 4 rows unless noted (timing-only kernel variants, outputs wrong
+  by construction except where stated):
+  - no 2^14 rescale multiply: 38.2 (the compiler already folds it);
+  - trivial decode (one mask, no nibble extraction): 33.2, so decode is 4.8 ms;
+  - no scale byte: 36.1;
+  - table decode (256-entry byte -> two halves, correct output): 45.3, and
+    31.7 at 1 row against 26.0 (rejected: the lookups cost more than the bit
+    operations);
+  - constant activations: 28.3, but the compiler collapses the 16-term dot
+    into one sum, so this removes the multiply-adds as well as the loads;
+  - activations loaded once and held in registers: 36.5 (8 rows 64.0);
+  - weight words of the next iteration requested one iteration early: 38.6;
+  - the 4-row kernel on 2 live rows: 36.5 computing the pad columns, 37.3
+    skipping them with a run-time branch (the 2-row kernel: 28.4);
+  - the 2-row kernel carrying 8 / 16 / 32 idle live registers (thread limit
+    832 -> 640 / 576 / 512, the 4-row kernel's class is 576): 29.7 / 29.9 /
+    31.2.
+- Reading: register footprint costs 1.5 to 3 ms, not 10; memory latency and
+  activation loads are not the limit; what scales is executed arithmetic,
+  about 4.5 to 5 ms per row in these kernels. The prefill GEMM path, a
+  different kernel family built on the matrix primitive, lands at 3.3 to 3.8 ms
+  per row at 256 rows, so the GPU's ceiling is about 7 to 8e12 multiply-adds a
+  second and a verify row cannot cost much under 3.5 ms here. Rows 1 to 4 are at
+  that level already (increments 2.4 / 4.0 / 5.6 ms); rows 5 to 8 are 20 to 25%
+  above it (8 rows 67-69 ms against about 55).
+- Side finding: `maxTotalThreadsPerThreadgroup` is a usable proxy for a
+  kernel's register count (c1 1024, c2 832, c3/c4 576, w16c5/w8c8 448, w16c8
+  384); the whole-group 8-column kernel's 111 ms is not explained by residency
+  alone (probably stack spills).
+- Not done: instruction-level inspection. Running a disassembler for the M1
+  GPU (dougallj/applegpu, or the kasm tool in lair) was blocked by the
+  permission classifier as external code.
+- Decision: no kernel change kept; scaffolding removed. Saved copy of the
+  experimental kernel: `~/.local/scratch/qwen38-campaign/agx/q38_gemv_experiments.metal`.
+- Note on the reference numbers in lair PR #100: its DSpine table (59 to 87
+  tok/s) lists 3.00 / 4.00 / 5.00 / 7.00 accepted drafts for K = 3 / 4 / 5 / 7,
+  i.e. every draft accepted. With the acceptance measured here (2.5 to 2.9
+  tokens per cycle at K = 3 on prose and code) the same step times give about
+  37 to 43 tok/s on that engine.
+
+## 2026-11-10 - Qwen3.8-27B native engine: DSpine-b16 block drafter on Metal (single stream)
+
+- Baseline: MTP head, depth 2, adaptive 0.5: 60.0 tok/s aggregate over the
+  four bench prompts x 600 tokens at default sampling (essay 56, explain 57,
+  code 58.5, math 68.5; one seed, run-to-run spread about 1.5).
+- Hypothesis: the DSpine drafter proposes a whole block per pass with higher
+  acceptance than the one-layer MTP head (offline: 2.5 to 3.6 tokens per cycle
+  at 3 drafts); if a draft call can be kept near 4 ms it beats MTP on code and
+  math and matches it on prose.
+- What was built (`native/q38`): `tools/pack_dspine.py` (+ `quantize.py`):
+  drafter as an NVFP4 sidecar pack, 1.83 GB, with the reference's sampling-tail
+  tables and a 65,536-token draft vocabulary (`tools/draft_vocab.py`);
+  `kernels/q38_dspine.metal`; engine `q38_load_dspine` /
+  `q38_seq_dspine_draft`; generator uses it when loaded. The five residual taps
+  are written by the next layer's existing norm kernel (no extra dispatch).
+  One command buffer per draft call: pending context rows, block of
+  [anchor, mask x k] through five layers on the half-activation weight path,
+  code bridge, LM head on the draft vocabulary. The serial sampling tail runs
+  on the host from two table rows per drawn token.
+- Correctness: teacher-forced comparison against the upstream MLX drafter on
+  the same target hiddens (`q38_lab --dspine-accept`, scratch
+  `dspine/cmp_engine.py`). Expected tokens per cycle at k = 1/2/3/4/5/7 drafts:
+  essay upstream 1.74 2.22 2.52 2.73 2.88 3.08, engine 1.73 2.21 2.52 2.72
+  2.87 3.07; code upstream 1.82 2.43 2.87 3.17 3.38 3.69, engine 1.82 2.44 2.86
+  3.16 3.38 3.69. NVFP4 drafter weights, the quantized target head and the
+  reduced vocabulary cost nothing measurable. Decode stays lossless by
+  construction (accept min(1, p/q), residual on reject).
+- Steps and measured effect (aggregate tok/s, drafter ms per call at 5 rows):
+  - first working version, fixed 4 drafts, stop at joint probability 0.3:
+    54.2; drafter GPU 6.0 + host tail 1.45 + ~1 wait;
+  - taps folded into the norm seam, half-activation path, bridge as 4 wide
+    dispatches, merged q/k/v kernel: 55.0; GPU 5.3;
+  - tail tables (two matrix products per drawn token were 1.2 ms a call,
+    memory bound): tail 0.36 -> 0.30 ms; 56.6;
+  - warm-up call at load (the first call wired the weights: 180 ms);
+  - marginal stop rule (keep a draft while its estimated chance of being
+    accepted pays for the verify row; row costs measured; acceptance estimate
+    0.25 + 0.72 q fitted on logged depth-7 chains) + block size following the
+    recent number of verified drafts: 59.0 (three seeds 58.8 / 60.0 / 58.3);
+  - draft vocabulary of 65,536 tokens (covers 99.9% of a 126M-token count,
+    100% of the bench trajectories; a sequence with more than 2% of recent
+    tokens outside it drafts with the full head): drafter GPU 5.3 -> 4.25 ms
+    (3.6 at 3 drafts); 60.1 (three seeds 60.06 / 60.41 / 59.90).
+- Result, three-seed means: aggregate 60.1 against MTP 60.0. Essay 52.2
+  (MTP 56), explain 57.7 (57), code 59.0 (58.5), math 76.4 (68.5). Drafter
+  call 4.9 to 6.3 ms wall; tokens per cycle 2.2 (essay) to 4.3 (math).
+- Rejected with numbers: whole bridge write in one threadgroup per row: 11 ms
+  a call (each thread re-reads the activation rows; GPU mostly idle); a narrow
+  512-thread middle kernel with threadgroup-memory loops: 2.5 ms a call;
+  one-dispatch attention (norm + rotary + attention + merge): same time as
+  three dispatches (kept, simpler data flow); 8 outputs per threadgroup in the
+  dense kernel: -0.08 ms. Skip-one-kernel timings overstate small kernels
+  here: removing a link of the serial chain lets the weight kernels overlap.
+  Reusing left-over block rows as free drafts when the bonus token matches was
+  costed and not built (the extra block rows cost more than the saved call).
+- Reading: the drafter is as accurate as upstream measured, and on this GPU a
+  draft call costs 5 ms against about 3 for the MTP head, while each verify
+  row costs 4.5 to 10 ms. The extra accepted tokens pay for that on math and
+  code and not quite on prose. `scratch dspine/policy.py` reproduces the
+  aggregate from logged chains (60.4 simulated) and shows no stop rule that
+  does better at these costs.
+- Decision: keep; DSpine is the drafter going forward (Sean, 2026-11-10: use
+  it for whatever it wins). Default: block up to 7, marginal rule at 0.06.
+  Not done: a u4/u5 target head (the tail and the vocabulary copy read NVFP4
+  head rows; loading fails with a message).
+- Serving: the pool drafts with it when loaded (lone stream: blocks; two
+  streams: one draft each; more: none), context rows are appended inside the
+  next target pass, snapshots carry the drafter's context window (up to
+  164 MB at 8,192 positions) and restore exactly (generator replay identical;
+  pool single stream identical to the generator API). Essay, 300 tokens,
+  through the pool: one stream 62.6 tok/s (MTP 58.0), two streams 73.6
+  aggregate (MTP 79.2, whose grouped feed is cheaper than a draft call per
+  stream), four 91.7. Server flag `--q38-dspine-pack`.
+- Regression on the final code: KL 0.01480 (unchanged), snapshot test exact,
+  multi-sequence isolation exact, HTTP smoke all pass (9,672-token recall,
+  prefix reuse, image, tool call), four concurrent requests 77.9 tok/s.
+- Artifacts: `perf/results/2026-11-10/q38-dspine-metal/` (v0..v6 bench logs,
+  glog7 chains, parity files).
+
+## 2026-11-17 - Qwen3.8-27B native engine: one DSpine pass for several streams; replay fix
+
+- Baseline: two pool streams each made their own drafter call: 73.6 tok/s aggregate, draft
+  6.98 ms/pass (MTP pack: 79.2). One stream 62.6.
+- Hypothesis: the drafter is arithmetic-bound like the target, so two blocks in one pass
+  (attention, bridge message and bridge write dispatched per block over row views; fc, qkv,
+  MLP and LM head once over all rows) cost little more than one.
+- Change: `Engine::dspine_draft_groups` / `q38_dspine_draft_groups` (up to 4 blocks, at most
+  8 rows); the pool calls it once per pass. The last layer writes each block's draft rows
+  packed into `d_hin`, so the LM head reads draft rows only (no anchor rows).
+- Result (essay, 300 tokens, seed 42, depth 7, adaptive -0.06): two streams 77.46 tok/s,
+  draft 4.61 ms/pass, acceptance 78.8% (unchanged). One stream 62.47, identical tokens to the
+  generator API. Three streams 78.4 and four 91.8 (no drafting, unchanged).
+- Correctness: parity vs upstream unchanged (essay 1.73 2.21 2.52 2.72 2.87 3.07, code
+  1.82 2.44 2.86 3.16 3.38 3.69); snap-test 0 logits differ.
+- Bug found by the replay test (present before this change): the same prompt replayed with the
+  same seed gave different tokens. Two pieces of drafter state leaked across requests: the
+  generator's block-size average (now reset per prompt) and the sequence's out-of-vocabulary
+  average (now saved in and restored from snapshots). gen-api: repeat IDENTICAL, repeat after
+  unrelated prompt IDENTICAL.
+- Decision: kept. Two streams remain 2% behind the MTP pack (77.5 vs 79.2); remaining cost is
+  the target pass at 4.4 rows (57.8 ms), i.e. the 5-8-row verify kernels.
+- Artifacts: `perf/results/2026-11-10/q38-dspine-metal/pool/dspine_c{1,2,3,4}_grouped2.log`,
+  `regress2/`.
+
+## 2026-11-17 - Qwen3.8-27B native engine: 32-bit indexed loads in the verify kernels; drafts for 3 and 4 streams
+
+- Baseline (mix1 pack, GPU ms per step by rows 1..8): 27.5 / 29.0-30.5 / 35.0 / 40.2 / 49.9 /
+  55.4 / 61.3 / 68.8. DSpine single stream 60.1 tok/s (3 seeds), MTP head 60.0.
+- Finding (disassembly of the compiled kernels, scratch `agx/`): every weight, scale and
+  activation load computed a 64-bit address, which the GPU splits into 3 to 4 integer
+  instructions (add low, compare for carry, add high) and which holds two registers per
+  pointer. The load instruction itself takes base + 32-bit index.
+- Change: `q38_gemv.metal` (NVFP4) and `q38_gemu.metal` (u4/u5) index one base pointer per
+  buffer with 32-bit offsets (`widx`, `sidx`, `bidx`, `xq`). Same arithmetic in the same order.
+- Result, GPU ms per step by rows 1..8: 27.5 / 29.7 / 33.2 / 38.3 / 45.7 / 50.8 / 56.4 / 62.6
+  (8 rows -9%, 5 rows -8%, 4 rows -5%, 1 row unchanged). Loop instructions: 8-row NVFP4 kernel
+  479 -> 459, u4 443 -> 423; the 8-row gain is larger than the instruction count because the
+  freed registers matter there.
+- Correctness: bit-identical. eval2 KL 0.014799 at 4-row steps and 0.014713 at 8-row steps
+  (same digits as before), snap-test 0 logits differ, drafter parity unchanged.
+- Decode (600 tokens x 4 prompts, default sampling): DSpine depth 7, rate 0.06, seeds 42 / 7 /
+  123: 65.48 / 64.87 / 63.42 = 64.6 tok/s aggregate (was 60.1). Seed 42 by prompt: essay 57.3,
+  code 65.1, math 86.7, explain 59.8. MTP head on the same build, seed 42: depth 2 threshold 0.5
+  62.9; depth 3: 61.0; depth 4: 61.0. Stop rule row costs updated to the new step times.
+- Pool (essay, 300 tokens, tok/s aggregate, DSpine / MTP depth 2): 1 stream 64.4 / 60.4;
+  2 streams 79.9 / 81.9; 3 streams 91.1 / 92.5; 4 streams 100.9 / 96.6; 5 streams 99.3;
+  8 streams 113.6. Three and four streams now take one draft each through the shared drafter
+  pass (without drafts: 82.2 and 94.7). Two drafts each at 2 streams: 80.1 (not kept).
+- HTTP server: smoke ALL PASS (9,672-token recall, prefix reuse 9,667 cached, same prompt
+  again, image, tool call); concurrent requests end to end 1 / 2 / 3 / 4: 45.3 / 70.7 / 83.1 /
+  93.2 tok/s (4 was 77.9).
+- Measured and not kept (timing-only unless noted):
+  - whole-group 8-row kernel (GW 16): 96.7 ms against 62.7. Its loop issues 15 to 22 loads each
+    followed at once by a wait (the 4-row kernel: 16 loads, 2 waits), so loads do not overlap;
+    barriers between column groups (108.5 -> 105-107) and two weight rows per pass (104.7) did
+    not change that.
+  - the matrix-primitive kernel at 8 rows with its 32-row tile: 142.8 ms; its own notes put
+    decode and block traffic at about half its time, so an 8-row tile would land near 98 ms.
+    Not built.
+  - a weight bit layout that decodes in 9 integer instructions per 8 weights instead of 20
+    (sign and magnitude fields placed so that one mask, one shift and two multiply-and-mask
+    steps give the four half pairs): 4 rows 38.7 -> 37.7, 8 rows 64.7 -> 63.3. It needs every
+    pack rewritten and every decoder changed; parked as a known 2% lever.
+  - exp2 of the u4/u5 group scale replaced by a plain conversion: no change.
+- Decision: kept (addressing, row costs, 3- and 4-stream drafts). `build.stable` refreshed.
+- Note: a file search was running on the CPU during the first DSpine and MTP decode runs of
+  this entry; the step timings and the later pool runs were taken without it.
+- Artifacts: `perf/results/2026-11-17/q38-index-addressing/`; disassembly and experiment
+  kernels in `~/.local/scratch/qwen38-campaign/agx/` (`exp/`, `q38_gemv.experiments_1117.metal`).
+
+## 2026-11-17 - Qwen3.8-27B native engine: barrier between activation columns in the verify kernels
+
+- Baseline (same day, after the indexed loads), GPU ms per step by rows 1..8: 27.5 / 29.7 /
+  33.2 / 38.3 / 45.7 / 50.8 / 56.4 / 62.6. DSpine 64.6 tok/s (3 seeds).
+- Finding: `simdgroup_barrier(mem_flags::mem_none)` between the per-column blocks of a lane
+  iteration pins the order the compiler emits the columns in. The compiled loop keeps its
+  instruction count (8-row NVFP4 kernel 458) but issues all 16 loads at the top and waits twice
+  (it waited three times, with loads spread through the loop).
+- Change: the barrier in `q38_gemv.metal` and `q38_gemu.metal` for 3 columns and for 5 or more.
+  Also the u4/u5 decode drops the OR of the exponent bits: the bare field is a subnormal half
+  and one fused multiply-add per weight gives the same value (u5 4-row loop 603 -> 559
+  instructions, 0.3 ms a step, bit-identical KL 0.014799 / 0.014713).
+- Result, GPU ms per step by rows 1..8: 27.4 / 29.1 / 32.4 / 38.0 / 43.1 / 48.6 / 53.9 / 59.8
+  (start of the day: 27.5 / 30.5 / 35.0 / 40.2 / 49.9 / 55.4 / 61.3 / 68.8). With the barrier
+  at 4 columns: 38.7 to 39.4 (left out); at 2: no change; a barrier per weight row or after
+  the decode on top of the column one: no change; whole-group kernel at 6 / 8 rows with it:
+  58.4 / 87.5 (half-group stays).
+- Correctness: the barrier changes the order of floating-point sums the compiler picks, so
+  logits are not bit-identical to the previous build. KL against BF16, previous -> new:
+  8-row steps eval2 0.014713 -> 0.015019 (top-1 0.9390 -> 0.9418), eval1 0.015405 -> 0.015328;
+  5-row steps eval2 0.014800 -> 0.014665, eval1 0.015169 -> 0.015213. Mixed sign on both
+  routes: rounding noise between equivalent routes, the size seen before between routes.
+  4-row steps unchanged (0.014799). Snap-test exact, replay identical, drafter parity unchanged
+  (essay 1.73 2.22 2.52 2.72 2.87 3.07; code 1.82 2.44 2.87 3.16 3.38 3.69).
+- Stop rule: row costs {2.15, 3.65, 5.95, 5.45, 5.85, 5.65, 6.25} ms; the joint decision for
+  rows 5 and 6 is gone (the fifth row is no longer the expensive one). Rate sweep before the
+  barrier, 2 seeds, 0.05 / 0.06 / 0.07 / 0.08: 63.8 / 65.2 / 64.5 / 65.2 (plateau; 0.06 kept).
+- Decode (600 tokens x 4 prompts, default sampling): DSpine seeds 42 / 7 / 123: 67.14 / 67.70 /
+  67.09 = 67.3 tok/s aggregate (start of day 60.1). Seed 42: essay 57.4, code 64.0, math 92.6,
+  explain 63.5. MTP head depth 2 threshold 0.5: 62.6.
+- Pool (essay, 300 tokens, tok/s aggregate), DSpine / MTP depth 2: 1 stream 66.0 / -;
+  2 streams 82.4 (two drafts each; 79.3 with one) / 83.8; 3 streams 90.2 / 93.5; 4 streams
+  99.4 / 97.2; 5 streams 104.5; 8 streams 118.4.
+- Where a decode cycle's time goes now (essay, seed 42): target step about 36 ms, drafter call
+  5.3 ms. Outside GPU execution per cycle: target encode 0.5 ms, submit-to-start 0.3, end-to-wake
+  0.2; drafter encode 0.1, submit 0.2, wake 0.15, host sampling tail 0.3. Polling the command
+  buffer status instead of sleeping did not shorten the wake (the latency is in the driver);
+  freeing the command buffers costs 0.005 ms. `Q38_TLOG=1` prints these.
+- Step breakdown by skipping kernel classes (4 rows, 38.3 ms): projections alone 30.8 to 33.7,
+  of which gate/up 13.6; GDN core 3.0, norm 4.2, attention 0.9 when skipped one at a time (these
+  overstate: the glue kernels alone run in 4.6 ms).
+- Decision: kept. `build.stable` refreshed.
+- Artifacts: `perf/results/2026-11-17/q38-column-barrier/`.
+- Addendum (same build, `build.stable`): HTTP smoke ALL PASS (9,672-token recall, prefix reuse
+  9,667 cached, same prompt again, image, tool call); concurrent requests end to end, time to
+  first token included, 1 / 2 / 3 / 4 / 8: 50.7 / 73.3 / 86.7 / 95.9 / 106.5 tok/s (this
+  morning's build at 4: 77.9). Logs in the same directory.
+- Measured after this entry and not kept (timing-only): activation loads hoisted to the top of
+  the u4/u5 loop, and a load phase split from the decode by a barrier: the compiler still issues
+  that kernel's 20 loads as two batches with four waits (4 rows 38.1 against 38.0, 5 rows 44.4 to
+  45.0 against 43.1). Barrier between column pairs, after the decode, or per column at 4 / 2 / 1
+  columns: 38.7 to 39.5 against 38.0 at 4, no change at 2 and 1. The "L2" weight bit layout
+  re-timed on these kernels: 3 / 4 / 5 / 6 / 8 rows -0.6 / -0.3 to -1.0 / -0.8 / -0.5 / -0.1 ms,
+  about 1% of a cycle; stays parked.
